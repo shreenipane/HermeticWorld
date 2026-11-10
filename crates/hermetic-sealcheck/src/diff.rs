@@ -139,9 +139,45 @@ pub fn parse_patch(diff_text: &str) -> Result<Patch, DiffParseError> {
 
     let lines: Vec<&str> = diff_text.lines().collect();
     let mut idx = 0;
+    // Lines still owed to the current hunk, from its header ranges. While either is
+    // non-zero, `--- x` and `+++ x` are body lines (a removed `-- x`, an added `++ x`),
+    // not file headers.
+    let mut old_left: usize = 0;
+    let mut new_left: usize = 0;
 
     while idx < lines.len() {
         let line = lines[idx];
+
+        if (old_left > 0 || new_left > 0) && current_hunk.is_some() {
+            let body = if let Some(content) = line.strip_prefix('-') {
+                old_left = old_left.saturating_sub(1);
+                Some((DiffLineType::Removed, content))
+            } else if let Some(content) = line.strip_prefix('+') {
+                new_left = new_left.saturating_sub(1);
+                Some((DiffLineType::Added, content))
+            } else if line.is_empty() || line.starts_with(' ') {
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+                Some((DiffLineType::Context, line.get(1..).unwrap_or("")))
+            } else {
+                None
+            };
+            if let Some((line_type, content)) = body {
+                if let Some(ref mut hunk) = current_hunk {
+                    hunk.lines.push(DiffLine {
+                        line_type,
+                        content: content.to_string(),
+                    });
+                }
+                idx += 1;
+                continue;
+            }
+            // `\ No newline at end of file` stays inside the body; anything else ends it.
+            if !line.starts_with('\\') {
+                old_left = 0;
+                new_left = 0;
+            }
+        }
 
         if let Some(git_header) = line.strip_prefix("diff --git ") {
             if let Some(hunk) = current_hunk.take() {
@@ -195,6 +231,8 @@ pub fn parse_patch(diff_text: &str) -> Result<Patch, DiffParseError> {
                 }
             }
             let header = parse_hunk_header(line)?;
+            old_left = header.old_range.count;
+            new_left = header.new_range.count;
             current_hunk = Some(Hunk {
                 header,
                 raw_header: line.to_string(),

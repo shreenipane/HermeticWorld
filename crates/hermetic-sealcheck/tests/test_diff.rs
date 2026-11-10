@@ -91,3 +91,28 @@ fn test_diff_parsing_real_grader_fixtures() {
         "should have tested at least one fixture row.json"
     );
 }
+
+#[test]
+fn test_body_lines_that_look_like_file_headers() {
+    // A removed SQL comment `-- x` serialises as `--- x`; an added `++ y` as `+++ y`.
+    let diff = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,3 @@\n SELECT 1;\n--- drop the old view\n+++ counter\n SELECT 2;\n";
+    let patch = parse_patch(diff).expect("parses");
+    assert_eq!(patch.files.len(), 1);
+    let file = &patch.files[0];
+    assert_eq!(file.old_path.as_deref(), Some("q.sql"));
+    assert_eq!(file.new_path.as_deref(), Some("q.sql"));
+    let lines = &file.hunks[0].lines;
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[1].content, "-- drop the old view");
+    assert_eq!(lines[2].content, "++ counter");
+}
+
+#[test]
+fn test_second_file_header_after_counted_hunk() {
+    let diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old_value_line = 1\n+new_value_line = 2\n\\ No newline at end of file\ndiff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n keep_this_context_line()\n-b_removed_line_text = 3\n+b_added_line_text = 4\n";
+    let patch = parse_patch(diff).expect("parses");
+    assert_eq!(patch.files.len(), 2);
+    assert_eq!(patch.files[0].hunks[0].lines.len(), 2);
+    assert_eq!(patch.files[1].old_path.as_deref(), Some("b.py"));
+    assert_eq!(patch.files[1].hunks[0].lines.len(), 3);
+}

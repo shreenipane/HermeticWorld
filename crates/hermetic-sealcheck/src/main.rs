@@ -79,15 +79,6 @@ struct ScanArgs {
 }
 
 fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let task = TaskInput::load(&args.task)?;
-    let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
-
-    let d0_opts = ScanOptions {
-        visibility: Visibility::AgentVisible,
-        ..Default::default()
-    };
-    let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
-
     // Either no --root-visibility (every root is agent-visible) or exactly one per --root.
     if !args.root_visibilities.is_empty() && args.root_visibilities.len() != args.roots.len() {
         return Err(format!(
@@ -97,6 +88,15 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
         .into());
     }
+
+    let task = TaskInput::load(&args.task)?;
+    let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+
+    let d0_opts = ScanOptions {
+        visibility: Visibility::AgentVisible,
+        ..Default::default()
+    };
+    let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
 
     for (idx, root) in args.roots.iter().enumerate() {
         let vis = args

@@ -236,3 +236,43 @@ fn test_unreadable_file_is_reported_not_skipped() {
         "unreadable file must produce a scan_error info finding: {findings:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_symlink_to_outside_leak_is_scanned() {
+    let base_dir = tempdir().expect("tempdir");
+    let base_tree = base_dir.path();
+    fs::write(
+        base_tree.join("core.py"),
+        "def run():\n    return compute_the_answer()\n",
+    )
+    .expect("write base");
+    let gold_patch = "diff --git a/core.py b/core.py\n--- a/core.py\n+++ b/core.py\n@@ -1,2 +1,3 @@\n def run():\n+    validate_item_security_checks(item)\n     return compute_the_answer()\n";
+    let fp = FingerprintSet::from_task(gold_patch, "", base_tree).expect("fingerprints built");
+
+    // The leak lives outside every scanned root; the root only holds links to it.
+    let outside = tempdir().expect("tempdir");
+    let leak = outside.path().join("gold.patch");
+    fs::write(&leak, gold_patch).expect("write leak");
+    let root = tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&leak, root.path().join("innocent.txt")).expect("symlink");
+    std::os::unix::fs::symlink(outside.path(), root.path().join("dirlink")).expect("symlink");
+    std::os::unix::fs::symlink(root.path().join("missing"), root.path().join("broken"))
+        .expect("symlink");
+
+    let findings = scan_tree(root.path(), &fp, &ScanOptions::default());
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.severity == Severity::Gate && f.path.ends_with("innocent.txt")),
+        "link to a leaked file must gate: {findings:?}"
+    );
+    for name in ["dirlink", "broken"] {
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.channel == "scan_error" && f.path.ends_with(name)),
+            "{name} must be reported: {findings:?}"
+        );
+    }
+}

@@ -172,4 +172,7 @@ fn test_cli_usage_errors_exit_1_not_2() {
         .output()
         .expect("run");
     assert_eq!(mismatch.status.code(), Some(1));
+    // The visibility check runs before the task is loaded, so it is what fails here.
+    let stderr = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(stderr.contains("--root-visibility"), "stderr: {stderr}");
 }

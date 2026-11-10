@@ -67,9 +67,7 @@ fn apply_patch_to_base(
 
     let base_file_path = base_tree_root.join(rel_path);
     let base_lines: Option<Vec<String>> = if base_file_path.exists() {
-        fs::read_to_string(&base_file_path)
-            .ok()
-            .map(|s| s.lines().map(|l| l.to_string()).collect())
+        read_text_like_scanner(&base_file_path).map(|s| s.lines().map(|l| l.to_string()).collect())
     } else {
         None
     };

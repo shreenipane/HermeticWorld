@@ -423,19 +423,37 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                findings.push(error_finding(display_path, format!("metadata error: {e}")));
-                continue;
+        // The agent reads through symlinks, so a link to a file is scanned as that file
+        // (std::fs follows links). Links to directories are not followed (cycles) and,
+        // like broken links, are reported.
+        let metadata = if entry.path_is_symlink() {
+            match std::fs::metadata(file_path) {
+                Ok(m) if m.is_file() => m,
+                Ok(_) => {
+                    findings.push(error_finding(
+                        display_path,
+                        "symlink to a non-file not followed".into(),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    findings.push(error_finding(display_path, format!("broken symlink: {e}")));
+                    continue;
+                }
             }
+        } else if entry.file_type().is_file() {
+            match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    findings.push(error_finding(display_path, format!("metadata error: {e}")));
+                    continue;
+                }
+            }
+        } else {
+            continue;
         };
 
         // Size check
