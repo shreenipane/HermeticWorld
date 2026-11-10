@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import shutil
 import subprocess
 
@@ -40,10 +41,26 @@ def run_docker(
     check: bool = True,
     timeout: float | None = None,
     combine_output: bool = False,
+    stdout_path: Path | None = None,
 ) -> bytes:
     """Execute docker CLI and return stdout bytes."""
     cmd = ["docker", *args]
     stderr_dest = subprocess.STDOUT if combine_output else subprocess.PIPE
+    if stdout_path is not None:
+        with open(stdout_path, "wb") as out_f:
+            proc = subprocess.run(
+                cmd,
+                input=input,
+                stdout=out_f,
+                stderr=stderr_dest,
+                shell=False,
+                timeout=timeout,
+            )
+        if check and proc.returncode != 0:
+            stderr_str = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+            raise DockerError(cmd, proc.returncode, stderr_str)
+        return b""
+
     proc = subprocess.run(
         cmd,
         input=input,

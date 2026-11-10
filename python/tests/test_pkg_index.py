@@ -272,3 +272,12 @@ def test_world_probe_cli_unknown_id(tmp_path: Path) -> None:
     ])
     assert exit_code == 1
 
+
+
+def test_wheel_compatible_pymalloc_abi_for_old_cpython() -> None:
+    whl = "numpy-1.17.0-cp36-cp36m-manylinux1_x86_64.whl"
+    assert wheel_compatible(whl, "3.6") is True
+    assert wheel_compatible("numpy-1.21.0-cp37-cp37m-manylinux2010_x86_64.whl", "3.7") is True
+    # The m suffix went away in 3.8.
+    assert wheel_compatible("numpy-1.21.0-cp38-cp38m-manylinux2010_x86_64.whl", "3.8") is False
+    assert wheel_compatible(whl, "3.7") is False

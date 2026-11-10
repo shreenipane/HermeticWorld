@@ -139,6 +139,9 @@ def wheel_compatible(filename: str, py: str) -> bool:
 
     # ABI check: must be none, abi3, or cp<major><minor>
     allowed_abi = {"none", "abi3", f"cp{major}{minor}"}
+    if (major, minor) <= (3, 7):
+        # CPython 3.7 and earlier tag pymalloc builds as cp3Xm (numpy-1.17.0-cp36-cp36m-...).
+        allowed_abi.add(f"cp{major}{minor}m")
     if not any(a in allowed_abi for a in abi_tags):
         return False
 
