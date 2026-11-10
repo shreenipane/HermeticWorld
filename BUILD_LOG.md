@@ -54,6 +54,23 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 - **Sphinx links in the title only:** `Fix #8720: …` appears in the PR title, so today the task gets `issue_source: none` and a cutoff 11 minutes late. This is part of G1.
 - **Django:** `#N` means a Trac ticket, not a GitHub issue. This is latent for 309 of the 500 Verified tasks (G1).
 
+### T0.2a review fixes (accepted)
+- agy fixed G1–G11:
+  - Django `#N` and `Refs #N` now map to Trac;
+  - PR titles are parsed for every repo;
+  - HTML comments are stripped before matching;
+  - a 404 or 410 on an issue gives a warning instead of a failure;
+  - cache writes are atomic;
+  - a missing `num_rows_total` is rejected;
+  - existing clones aren't re-fetched;
+  - `agent/` and `staging/` are recreated on every run;
+  - `issue_source` is written to `task.json`.
+- Tests: **46 passed** on Windows and Linux. CodeRabbit: **0 findings**.
+- **Live re-run:** exit 0 in **2 s**, since the clones and HTTP cache are reused.
+  - All 10 tasks now resolve an issue date, up from 9 of 10.
+  - Sphinx-8721 now resolves `github#8720`, moving `T_world` 11 minutes earlier.
+  - SymPy-20590 no longer picks up the template's `#1234`.
+
 ---
 
 ## 2026-11-10: T0.1 cutoffs and repo sealer (Phase 0)

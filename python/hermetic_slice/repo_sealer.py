@@ -33,26 +33,20 @@ class SealReport:
     dropped_tags: dict[str, str]
 
 
+def _make_writable_and_retry(func, path, _exc):
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
+
+
 def _rmtree(path: Path) -> None:
     """Remove a directory tree, clearing read-only flags and retrying on failure."""
-    def _handle_onexc(func, p, exc):
-        try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
-        except OSError:
-            pass
-
-    def _handle_onerror(func, p, exc_info):
-        try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
-        except OSError:
-            pass
-
     if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_handle_onexc)
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:
-        shutil.rmtree(path, onerror=_handle_onerror)
+        shutil.rmtree(path, onerror=_make_writable_and_retry)
 
 
 def _clean_directory(path: Path) -> None:

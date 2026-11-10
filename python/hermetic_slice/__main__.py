@@ -86,15 +86,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 t_world = task_data["cutoffs"]["t_world"]
                 t_clock = task_data["cutoffs"]["t_clock"]
-                issue_created = task_data["dates"]["issue_created"]
-
-                issue_source = "none"
-                if issue_created is not None:
-                    for ref in task_data["sources"].get("issue_refs", []):
-                        if ref.get("created_at") == issue_created:
-                            issue_source = f"{ref['kind']}#{ref['number']}"
-                            break
-
+                issue_source = task_data.get("issue_source", "none")
                 n_warnings = len(task_data.get("warnings", []))
                 print(f"{task_id}  {t_world}  {t_clock}  {issue_source}  {n_warnings}")
             except Exception as exc:

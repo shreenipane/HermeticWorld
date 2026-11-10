@@ -34,8 +34,8 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 **Runs on.** A laptop, in containers, with `clock: real`.
 
 ### Deliverables
-- [ ] Pick 5–10 SWE-bench Verified tasks, spread across repositories and years
-- [x] Minimal cutoff computation (`T_world`, base commit, `T_clock`): the function is done (T0.1); it still needs task data to feed it
+- [x] Pick 5–10 SWE-bench Verified tasks, spread across repositories and years: 10 tasks in `phase0/tasks.txt`, one per repo, 2014–2022
+- [x] Minimal cutoff computation (`T_world`, base commit, `T_clock`): done; T0.2 intake feeds it real GitHub, Trac and git dates for all 10 tasks
 - [x] Repo sealer: reachable-objects copy, tag filter, strip refs and reflog (TR-SEAL-1 to TR-SEAL-3, TR-SEAL-6), done in T0.1, 25 tests
 - [ ] Local frozen pip index, built with `uv --exclude-newer` at the cutoff
 - [ ] Docker network with no outside route; the agent container reaches only the index

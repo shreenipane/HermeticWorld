@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import hashlib
+import os
 from pathlib import Path
 import socket
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +23,26 @@ class HttpError(Exception):
 
 
 HttpGet = Callable[[str], bytes]
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write data to a temp file in path's parent directory and atomically replace destination."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, prefix=f".{path.name}.", suffix=".tmp") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def make_http_get(
@@ -50,14 +72,10 @@ def make_http_get(
         for attempt in range(max_attempts):
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    status = getattr(resp, "status", None)
-                    if status is None:
-                        getcode = getattr(resp, "getcode", None)
-                        status = getcode() if callable(getcode) else getattr(resp, "code", 200)
+                    status = resp.status
                     body = resp.read()
                     if status == 200:
-                        http_cache_dir.mkdir(parents=True, exist_ok=True)
-                        cache_file.write_bytes(body)
+                        _atomic_write_bytes(cache_file, body)
                     return body
             except urllib.error.HTTPError as exc:
                 last_status = exc.code
