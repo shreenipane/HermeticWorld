@@ -9,7 +9,7 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 
 | Phase | Name | Runs on | Exit criterion | Status |
 |---|---|---|---|---|
-| 0 | Vertical slice | Laptop (no KVM) | Oracle passes on every slice task; one agent run graded | Not started |
+| 0 | Vertical slice | WSL2 Ubuntu + Docker | Oracle passes on every slice task; one agent run graded | In progress |
 | 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | Not started |
 | 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
 | 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
@@ -35,8 +35,8 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 
 ### Deliverables
 - [ ] Pick 5–10 SWE-bench Verified tasks, spread across repositories and years
-- [ ] Minimal cutoff computation (`T_world`, base commit, `T_clock`) for those tasks
-- [ ] Repo sealer: reachable-objects copy, tag filter, strip refs and reflog (TR-SEAL-1 to TR-SEAL-3, TR-SEAL-6)
+- [x] Minimal cutoff computation (`T_world`, base commit, `T_clock`): the function is done (T0.1); it still needs task data to feed it
+- [x] Repo sealer: reachable-objects copy, tag filter, strip refs and reflog (TR-SEAL-1 to TR-SEAL-3, TR-SEAL-6), done in T0.1, 25 tests
 - [ ] Local frozen pip index, built with `uv --exclude-newer` at the cutoff
 - [ ] Docker network with no outside route; the agent container reaches only the index
 - [ ] Clean container as grader: apply the extracted diff, run `FAIL_TO_PASS` and `PASS_TO_PASS`
