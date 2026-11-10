@@ -134,6 +134,14 @@ def test_validate_patch_rejection_rules() -> None:
         validate_patch(diff_submodule, test_files=test_files)
 
 
+def test_validate_patch_headerless_nonempty_is_rejected() -> None:
+    headerless = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+    with pytest.raises(PatchRejected):
+        validate_patch(headerless, test_files=set())
+    assert validate_patch("", test_files=set()) == ("", [])
+    assert validate_patch("\n", test_files=set()) == ("", [])
+
+
 def test_validate_patch_drop_rules() -> None:
     """Verify test infrastructure drops with D11 finding, including renames and nesting."""
     test_files = {"tests/test_unit.py"}
@@ -354,7 +362,7 @@ def docker_test_env(tmp_path_factory: pytest.TempPathFactory):
     # Dockerfile
     dockerfile = (
         "FROM python:3.9-slim\n"
-        "RUN apt-get update && apt-get install -y --no-install-recommends git \\\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends git patch \\\n"
         " && rm -rf /var/lib/apt/lists/* \\\n"
         " && pip install --no-cache-dir pytest\n"
         "COPY testbed /testbed\n"
@@ -501,6 +509,36 @@ def test_docker_grade_and_oracle_integration(tmp_path: Path, docker_test_env: di
     assert oracle_res["gold_resolved"] is True
     assert oracle_res["empty_f2p_all_fail"] is True
     assert (task_dir / "oracle" / "oracle.json").exists()
+
+    # Check 5: a fallback apply attempt keeps the sealed tree's unstaged env edits and untracked
+    # files. The derived image mimics a sealed SWE-bench image (kept setup.py edit, extra file);
+    # the patch's trailing context does not exist, so only `patch --fuzz` applies it.
+    env_image = f"{image}-envedit"
+    cid = f"hermetic-t05-envedit-{uuid.uuid4().hex[:8]}"
+    run_docker(["run", "--name", cid, "--entrypoint", "/bin/bash", image, "-c",
+                "cd /testbed && echo '# env pin' >> setup.py && echo keep > extra_untracked.txt"])
+    try:
+        run_docker(["commit", cid, env_image])
+    finally:
+        run_docker(["rm", "-f", cid], check=False)
+    try:
+        fuzzy_patch = (
+            "diff --git a/target.py b/target.py\n"
+            "--- a/target.py\n"
+            "+++ b/target.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " def solve(x):\n"
+            "-    return x\n"
+            "+    return x + 1\n"
+            " # context line that is not in the file\n"
+        )
+        fuzzy_grade = grade(task_dir, fuzzy_patch, image=env_image, out_dir=tmp_path / "out_fuzzy")
+        log = (tmp_path / "out_fuzzy" / "test_output.txt").read_text(encoding="utf-8")
+        assert fuzzy_grade["resolved"] is True, log
+        assert "modified:   setup.py" in log
+        assert "extra_untracked.txt" in log
+    finally:
+        run_docker(["rmi", "-f", env_image], check=False)
 
 
 def _fake_grades(monkeypatch, gold: dict, empty: dict) -> None:

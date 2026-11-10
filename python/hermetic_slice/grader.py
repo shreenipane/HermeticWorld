@@ -178,6 +178,9 @@ def validate_patch(diff: str, *, test_files: set[str]) -> tuple[str, list[dict]]
     """Validate patch according to architecture §10 rules; return kept diff and findings."""
     patches = split_patch(diff)
     if not patches:
+        if diff.strip():
+            # Never silently grade a non-empty submission as the empty patch.
+            raise PatchRejected("Non-empty patch has no 'diff --git' file sections")
         return ("", [])
 
     # 1. Whole patch rejection rules
@@ -476,12 +479,27 @@ def grade(
                     "git apply --verbose --reject",
                     "patch --batch --forward --fuzz=5 -p1 -i",
                 ]
+                # The sealed tree carries kept env-setup edits (unstaged) and may hold untracked
+                # files. Snapshot it as a throwaway commit so a failed fallback attempt is undone
+                # back to exactly this state, not to the index; HEAD and index are restored after.
+                snap_script = (
+                    "set -e; ORIG=$(git rev-parse HEAD); "
+                    "git -c core.hooksPath=/dev/null add -A; "
+                    "git -c core.hooksPath=/dev/null -c user.name=hermetic -c user.email=hermetic@localhost "
+                    "commit -q --allow-empty --no-verify -m pre-apply; "
+                    "echo $ORIG $(git rev-parse HEAD)"
+                )
+                orig_sha, snap_sha = (
+                    run_docker(["exec", "-w", "/testbed", cid_name, "/bin/bash", "-c", snap_script])
+                    .decode("ascii").split()[-2:]
+                )
                 applied = False
                 last_apply_out = ""
                 for attempt, cmd in enumerate(apply_chain):
                     if attempt > 0:
                         run_docker(
-                            ["exec", "-w", "/testbed", cid_name, "/bin/bash", "-c", "git checkout -- . ; git clean -fd"],
+                            ["exec", "-w", "/testbed", cid_name, "/bin/bash", "-c",
+                             f"git reset -q --hard {snap_sha} && git clean -fdq"],
                             check=False,
                         )
                     try:
@@ -503,6 +521,10 @@ def grade(
                         applied = True
                     except DockerError:
                         pass
+
+                run_docker(
+                    ["exec", "-w", "/testbed", cid_name, "/bin/bash", "-c", f"git reset -q --mixed {orig_sha}"],
+                )
 
                 if not applied:
                     duration_s = time.time() - t0

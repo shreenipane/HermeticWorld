@@ -68,7 +68,16 @@ def run_task(
         except Exception:
             probe_ok = False
 
-    if not index_report_path.exists() or not probe_ok:
+    def build_record(
+        *,
+        agent: dict[str, Any],
+        status: str,
+        error: str | None,
+        sealed_image_id: str = "",
+        digests: dict[str, Any] | None = None,
+        extract: dict[str, Any] | None = None,
+        grade: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "schema": "hermetic-slice-run/v0-unsigned",
             "instance_id": instance_id,
@@ -86,26 +95,28 @@ def run_task(
                 "model": getattr(model, "model", str(model)),
                 "limits": asdict(limits),
             },
-            "agent": {
-                "agent_status": "world_not_ready",
-                "steps": 0,
-                "usage_totals": {},
-                "wall_s": 0.0,
-            },
+            "agent": agent,
             "images": {
                 "sealed_image": sealed_image,
-                "sealed_image_id": "",
+                "sealed_image_id": sealed_image_id,
             },
-            "digests": {},
-            "extract": {},
-            "grade": {},
-            "status": "error",
-            "error": "world_not_ready",
+            "digests": digests or {},
+            "extract": extract or {},
+            "grade": grade or {},
+            "status": status,
+            "error": error,
             "date_leak_observed": None,
             "notes": "Phase 0: unsigned; transcript audit not run",
         }
         (run_dir / "run.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
         return record
+
+    if not index_report_path.exists() or not probe_ok:
+        return build_record(
+            agent={"agent_status": "world_not_ready", "steps": 0, "usage_totals": {}, "wall_s": 0.0},
+            status="error",
+            error="world_not_ready",
+        )
 
     short_id = instance_id.replace("__", "-").replace("_", "-")[:20]
     rand_suffix = secrets.token_hex(4)
@@ -129,13 +140,26 @@ def run_task(
             limits=limits,
             trajectory_path=trajectory_path,
         )
+        agent_info = {
+            "agent_status": agent_res.status,
+            "steps": agent_res.steps,
+            "usage_totals": agent_res.usage_totals,
+            "wall_s": agent_res.wall_s,
+        }
 
         # 6. Extract patch from agent container BEFORE stop_world
-        patch_text, extract_report = extract_patch(
-            world.agent_container,
-            sealed_image,
-            run_dir,
-        )
+        try:
+            patch_text, extract_report = extract_patch(
+                world.agent_container,
+                sealed_image,
+                run_dir,
+            )
+        except Exception as exc:
+            # Keep the run on record: agent status and usage survive a harness failure.
+            return build_record(
+                agent=agent_info, status="error", error=f"extract_failed: {exc}",
+                extract={"error": str(exc)},
+            )
 
         patch_path = run_dir / "patch.diff"
         patch_path.write_text(patch_text, encoding="utf-8")
@@ -143,12 +167,18 @@ def run_task(
         # 7. grade_fn returns grade dict
         grade_out_dir = run_dir / "grade"
         grade_out_dir.mkdir(parents=True, exist_ok=True)
-        grade_res = grade_fn(
-            task_dir,
-            patch_text,
-            image=sealed_image,
-            out_dir=grade_out_dir,
-        )
+        try:
+            grade_res = grade_fn(
+                task_dir,
+                patch_text,
+                image=sealed_image,
+                out_dir=grade_out_dir,
+            )
+        except Exception as exc:
+            return build_record(
+                agent=agent_info, status="error", error=f"grade_failed: {exc}",
+                extract=extract_report, grade={"error": str(exc)},
+            )
 
         # Retrieve sealed image ID from docker
         sealed_image_id = ""
@@ -184,47 +214,16 @@ def run_task(
             "test_exit_code": grade_res.get("test_exit_code"),
         }
 
-        status_val = "completed" if agent_res.error is None else "error"
-
         # 8. Write run.json
-        record = {
-            "schema": "hermetic-slice-run/v0-unsigned",
-            "instance_id": instance_id,
-            "seal_level": "repo_only",
-            "agent_mode": "H",
-            "clock": "real",
-            "grader_isolation": "clean_container",
-            "deployment": "single_host",
-            "task": {
-                "t_world": task_json.get("cutoffs", {}).get("t_world") or task_json.get("t_world"),
-                "t_clock": task_json.get("cutoffs", {}).get("t_clock") or task_json.get("t_clock"),
-                "base_commit": task_json.get("base_commit", ""),
-            },
-            "model": {
-                "model": getattr(model, "model", str(model)),
-                "limits": asdict(limits),
-            },
-            "agent": {
-                "agent_status": agent_res.status,
-                "steps": agent_res.steps,
-                "usage_totals": agent_res.usage_totals,
-                "wall_s": agent_res.wall_s,
-            },
-            "images": {
-                "sealed_image": sealed_image,
-                "sealed_image_id": sealed_image_id,
-            },
-            "digests": digests,
-            "extract": extract_report,
-            "grade": grade_dict,
-            "status": status_val,
-            "error": agent_res.error,
-            "date_leak_observed": None,
-            "notes": "Phase 0: unsigned; transcript audit not run",
-        }
-
-        (run_dir / "run.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
-        return record
+        return build_record(
+            agent=agent_info,
+            status="completed" if agent_res.error is None else "error",
+            error=agent_res.error,
+            sealed_image_id=sealed_image_id,
+            digests=digests,
+            extract=extract_report,
+            grade=grade_dict,
+        )
 
     finally:
         if world is not None:
