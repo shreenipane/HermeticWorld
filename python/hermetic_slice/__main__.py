@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 from hermetic_slice.http import make_http_get
+from hermetic_slice.image_sealer import _rmtree, seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
 from hermetic_slice.repo_sealer import VerificationError, seal_repo
 
@@ -30,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     intake_parser.add_argument("--tasks", type=Path, required=True, help="Path to tasks file")
     intake_parser.add_argument("--out", type=Path, required=True, help="Output directory")
     intake_parser.add_argument("--cache", type=Path, required=True, help="Cache directory")
+
+    seal_images_parser = subparsers.add_parser("seal-images", help="Seal SWE-bench task images")
+    seal_images_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    seal_images_parser.add_argument("--work", type=Path, required=True, help="Directory for working files")
+    seal_images_parser.add_argument("--only", nargs="*", default=None, help="Optional instance IDs to process")
 
     try:
         args = parser.parse_args(argv)
@@ -91,6 +97,45 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{task_id}  {t_world}  {t_clock}  {issue_source}  {n_warnings}")
             except Exception as exc:
                 print(f"Error processing {task_id}: {exc}", file=sys.stderr)
+                has_failure = True
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "seal-images":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        work_dir = args.work
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        only_set = set(args.only) if args.only is not None else None
+        task_dirs = []
+        for d in sorted(tasks_dir.iterdir()):
+            if d.is_dir() and (d / "task.json").exists():
+                if only_set is None or d.name in only_set:
+                    task_dirs.append(d)
+
+        has_failure = False
+        for tdir in task_dirs:
+            instance_id = tdir.name
+            task_work = work_dir / instance_id
+            if task_work.exists():
+                _rmtree(task_work)
+            task_work.mkdir(parents=True, exist_ok=True)
+
+            try:
+                report = seal_image(tdir, task_work)
+                before = report["before"]
+                head_was_base = before["head_is_base"]
+                extra_commits = len(before["extra_commits"])
+                gold_lines_count = report["gold_lines_checked"]
+                before_after_status = "unsealed→sealed"
+                sealed_image = report["sealed_image"]
+                print(f"{instance_id}  {head_was_base}  {extra_commits}  {gold_lines_count}  {before_after_status}  {sealed_image}")
+            except Exception as exc:
+                print(f"Error sealing {instance_id}: {exc}", file=sys.stderr)
                 has_failure = True
 
         return 1 if has_failure else 0
