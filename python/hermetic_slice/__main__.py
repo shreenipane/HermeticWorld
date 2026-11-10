@@ -13,7 +13,9 @@ import sys
 from hermetic_slice.http import make_http_get
 from hermetic_slice.image_sealer import _rmtree, seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
+from hermetic_slice.pkg_index import build_index, env_info
 from hermetic_slice.repo_sealer import VerificationError, seal_repo
+from hermetic_slice.world import probe, start_world, stop_world
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +38,16 @@ def main(argv: list[str] | None = None) -> int:
     seal_images_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     seal_images_parser.add_argument("--work", type=Path, required=True, help="Directory for working files")
     seal_images_parser.add_argument("--only", nargs="*", default=None, help="Optional instance IDs to process")
+
+    build_index_parser = subparsers.add_parser("build-index", help="Build frozen package index for tasks")
+    build_index_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    build_index_parser.add_argument("--cache", type=Path, required=True, help="Cache directory for HTTP downloads")
+    build_index_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
+
+    world_probe_parser = subparsers.add_parser("world-probe", help="Probe world isolation and package index for tasks")
+    world_probe_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    world_probe_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
+    world_probe_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
 
     try:
         args = parser.parse_args(argv)
@@ -137,6 +149,118 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"Error sealing {instance_id}: {exc}", file=sys.stderr)
                 has_failure = True
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "build-index":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        all_tasks = {
+            d.name: d
+            for d in sorted(tasks_dir.iterdir())
+            if d.is_dir() and (d / "task.json").exists()
+        }
+
+        if args.only is not None:
+            task_dirs = []
+            for tid in args.only:
+                if tid not in all_tasks:
+                    print(f"Error: Unknown instance_id: {tid}", file=sys.stderr)
+                    return 1
+                task_dirs.append(all_tasks[tid])
+        else:
+            task_dirs = list(all_tasks.values())
+
+        http_get = make_http_get(args.cache)
+        has_failure = False
+
+        for tdir in task_dirs:
+            instance_id = tdir.name
+            try:
+                task = json.loads((tdir / "task.json").read_text(encoding="utf-8"))
+                image = task["image"]
+                env = env_info(image)
+                index_dir = tdir / "index"
+                report = build_index(task, env, http_get, index_dir)
+                totals = report.get("totals", {})
+                served_packages = totals.get("served_packages", 0)
+                served_files = totals.get("served_files", 0)
+                newer_than_t_world = totals.get("newer_than_t_world", 0)
+                excluded_str = ",".join(report.get("excluded", [])) or "none"
+                print(f"{instance_id}  {served_packages}  {served_files}  {newer_than_t_world}  {excluded_str}")
+            except Exception as exc:
+                print(f"Error building index for {instance_id}: {exc}", file=sys.stderr)
+                has_failure = True
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "world-probe":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        all_tasks = {
+            d.name: d
+            for d in sorted(tasks_dir.iterdir())
+            if d.is_dir() and (d / "task.json").exists()
+        }
+
+        if args.only is not None:
+            task_dirs = []
+            for tid in args.only:
+                if tid not in all_tasks:
+                    print(f"Error: Unknown instance_id: {tid}", file=sys.stderr)
+                    return 1
+                task_dirs.append(all_tasks[tid])
+        else:
+            task_dirs = list(all_tasks.values())
+
+        has_failure = False
+
+        for tdir in task_dirs:
+            instance_id = tdir.name
+            world = None
+            try:
+                task = json.loads((tdir / "task.json").read_text(encoding="utf-8"))
+                index_dir = tdir / "index"
+                report_path = index_dir / "index-report.json"
+                if not report_path.exists():
+                    raise FileNotFoundError(f"Missing index-report.json in {index_dir}")
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+
+                sealed_image = args.image_tag_format.format(id=instance_id)
+                world_name = f"hermetic-world-{instance_id.replace('__', '-').replace('_', '-')}"
+
+                world = start_world(task, sealed_image, index_dir, name=world_name)
+                probe_res = probe(world, task, report)
+
+                probe_path = tdir / "world" / "probe.json"
+                probe_path.parent.mkdir(parents=True, exist_ok=True)
+                probe_path.write_text(json.dumps(probe_res, indent=2), encoding="utf-8")
+
+                all_ok = probe_res.get("all_ok", False)
+                failed_checks_list = [
+                    k for k, v in probe_res.items()
+                    if k != "all_ok" and isinstance(v, dict) and not v.get("ok")
+                ]
+                failed_checks_str = ",".join(failed_checks_list) if failed_checks_list else "none"
+
+                print(f"{instance_id}  {all_ok}  {failed_checks_str}")
+                if not all_ok:
+                    has_failure = True
+            except Exception as exc:
+                print(f"Error probing world for {instance_id}: {exc}", file=sys.stderr)
+                has_failure = True
+            finally:
+                if world is not None:
+                    try:
+                        stop_world(world)
+                    except Exception:
+                        pass
 
         return 1 if has_failure else 0
 
