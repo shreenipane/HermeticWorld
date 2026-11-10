@@ -29,6 +29,33 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-10: T0.2 task intake (Phase 0)
+
+- **Phase:** 0
+- **Type:** build + measurement
+- **Requirements:** TR-CUT-1 to TR-CUT-3 fed with real data; §4 thread scrub (the agent never sees `hints_text`)
+- **Briefs:** `agy-tasks/T0.2-task-intake.md`; fixes queued in `agy-tasks/T0.2a-review-fixes.md`
+
+### Done
+- `http.py`: fetching with a disk cache, retries (2/4/8/16 s on 429, 5xx and timeouts), and a GitHub token sent to `api.github.com` only.
+- `intake.py`: loads SWE-bench Verified from the Hugging Face datasets-server, rejecting partial pages and truncated cells. It resolves PR, commit and issue dates from the GitHub API and Django Trac dates from `/ticket/N` (allowed by robots.txt), and reads repo dates from blobless bare clones. It writes `task.json`, `agent/problem_statement.md` and `staging/{gold.patch,test.patch,hints.txt}`.
+- CLI: `python -m hermetic_slice intake --tasks phase0/tasks.txt --out … --cache …`.
+- `phase0/tasks.txt`: 10 Verified tasks, one per repository, 2014–2022.
+- Real-API fixtures recorded by the reviewer in `python/tests/fixtures/intake/`.
+
+### Results
+- Tests: **37 passed** on Windows and Linux.
+- **Live intake of all 10 tasks: exit 0 in 252 s.** It made about 35 HTTP requests unauthenticated, and the blobless clones total 314 MB. Output is in `~/hermetic/out` (WSL).
+- In 9 of 10 tasks, `T_world` is the linked issue's creation date, earlier than the PR in every case. Examples: pytest-6202, issue 11-14 vs PR 11-16; django-11099, Trac ticket 03-15 vs PR 03-20.
+- Every `agent/` folder holds only `problem_statement.md`, and no gold-patch line appears in any `task.json`.
+
+### Found by the live run (not catchable by the offline tests)
+- **SymPy PR template comment:** `Fixes #1234` sits inside an HTML comment in the PR template. It was harmless only because #1234 is a 2012 PR; had it been an issue, `T_world` would have been 8 years early. This is fix G11.
+- **Sphinx links in the title only:** `Fix #8720: …` appears in the PR title, so today the task gets `issue_source: none` and a cutoff 11 minutes late. This is part of G1.
+- **Django:** `#N` means a Trac ticket, not a GitHub issue. This is latent for 309 of the 500 Verified tasks (G1).
+
+---
+
 ## 2026-11-10: T0.1 cutoffs and repo sealer (Phase 0)
 
 - **Phase:** 0

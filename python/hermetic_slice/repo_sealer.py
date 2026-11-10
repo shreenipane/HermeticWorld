@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shutil
+import stat
+import sys
 from typing import Mapping
 
 from hermetic_slice.cutoffs import ensure_utc
@@ -31,33 +33,38 @@ class SealReport:
     dropped_tags: dict[str, str]
 
 
+def _rmtree(path: Path) -> None:
+    """Remove a directory tree, clearing read-only flags and retrying on failure."""
+    def _handle_onexc(func, p, exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    def _handle_onerror(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_handle_onexc)
+    else:
+        shutil.rmtree(path, onerror=_handle_onerror)
+
+
 def _clean_directory(path: Path) -> None:
     """Remove all contents within a directory, handling read-only files."""
     if not path.exists():
         return
     for item in list(path.iterdir()):
         if item.is_dir():
-            for root, dirs, files in os.walk(item, topdown=False):
-                for name in files:
-                    p = Path(root) / name
-                    try:
-                        p.chmod(0o777)
-                        p.unlink()
-                    except OSError:
-                        pass
-                for name in dirs:
-                    d = Path(root) / name
-                    try:
-                        d.rmdir()
-                    except OSError:
-                        pass
-            try:
-                item.rmdir()
-            except OSError:
-                pass
+            _rmtree(item)
         else:
             try:
-                item.chmod(0o777)
+                os.chmod(item, stat.S_IWRITE)
                 item.unlink()
             except OSError:
                 pass
@@ -229,15 +236,17 @@ def seal_repo(
 
         obj_out = run_git(["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"], cwd=dest).decode("ascii")
         object_count = len([line for line in obj_out.splitlines() if line.strip()])
-    except BaseException:
+    except BaseException as exc:
         if not dest_existed:
-            _clean_directory(dest)
-            try:
-                dest.rmdir()
-            except OSError:
-                pass
+            if dest.exists():
+                _rmtree(dest)
+            if dest.exists():
+                exc.add_note(f"cleanup incomplete: {dest}")
         else:
-            _clean_directory(dest)
+            if dest.exists():
+                _clean_directory(dest)
+                if any(dest.iterdir()):
+                    exc.add_note(f"cleanup incomplete: {dest}")
         raise
 
     return SealReport(

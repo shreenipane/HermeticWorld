@@ -1,0 +1,8 @@
+{
+ "number": 6202,
+ "title": "Fix incorrect result of getmodpath method.",
+ "created_at": "2019-11-16T07:45:21Z",
+ "merged_at": "2019-11-18T23:14:53Z",
+ "body": "<!--\r\nThanks for submitting a PR, your contribution is really appreciated!\r\n\r\nHere is a quick checklist that should be present in PRs.\r\n\r\n- [x] Target the `master` branch for bug fixes, documentation updates and trivial changes.\r\n- [ ] Target the `features` branch for new features, improvements, and removals/deprecations.\r\n- [ ] Include documentation when adding new features.\r\n- [ ] Include new tests or update existing tests when applicable.\r\n\r\nUnless your change is trivial or a small documentation fix (e.g., a typo or reword of a small section) please:\r\n\r\n- [x] Create a new changelog file in the `changelog` folder, with a name like `<ISSUE NUMBER>.<TYPE>.rst`. See [changelog/README.rst](https://github.com/pytest-dev/pytest/blob/master/changelog/README.rst) for details.\r\n- [x] Add yourself to `AUTHORS` in alphabetical order.\r\n-->\r\n\r\nResolves #6189 ",
+ "html_url": "https://github.com/pytest-dev/pytest/pull/6202"
+}

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.gitutil import run_git
 
 
@@ -114,3 +115,65 @@ def build_synthetic_repo(tmp_path: Path) -> SyntheticRepo:
         tag_ann_c2_after=tag_ann_c2_after,
         tag_c4=tag_c4,
     )
+
+
+@dataclass(frozen=True)
+class IntakeSyntheticRepo:
+    """Synthetic repository fixture for intake tests with merged root histories."""
+
+    path: Path
+    base_sha: str
+    root1_sha: str
+    root2_sha: str
+    base_commit_time: datetime
+    repo_first_commit_time: datetime
+
+
+def build_intake_synthetic_repo(tmp_path: Path, base_date: str = "2019-11-15T00:00:00Z") -> IntakeSyntheticRepo:
+    """Build a synthetic git repo with two root commits and a base commit."""
+    src = tmp_path / "intake_synthetic_src"
+    run_git(["init", "-b", "main", str(src)], cwd=tmp_path)
+    run_git(["config", "user.name", "Intake Tester"], cwd=src)
+    run_git(["config", "user.email", "tester@example.com"], cwd=src)
+
+    (src / "base_file.txt").write_text("Intake base file\n", encoding="utf-8")
+    run_git(["add", "base_file.txt"], cwd=src)
+    tree = run_git(["write-tree"], cwd=src).decode("ascii").strip()
+
+    d_r1_a = "2015-01-01T00:00:00Z"
+    d_r1_c = "2015-01-02T00:00:00Z"
+    d_r2_a = "2015-03-01T00:00:00Z"
+    d_r2_c = "2015-03-02T00:00:00Z"
+
+    r1 = run_git(
+        ["commit-tree", tree, "-m", "root 1"],
+        cwd=src,
+        env={"GIT_AUTHOR_DATE": d_r1_a, "GIT_COMMITTER_DATE": d_r1_c},
+    ).decode("ascii").strip()
+
+    r2 = run_git(
+        ["commit-tree", tree, "-m", "root 2"],
+        cwd=src,
+        env={"GIT_AUTHOR_DATE": d_r2_a, "GIT_COMMITTER_DATE": d_r2_c},
+    ).decode("ascii").strip()
+
+    base_sha = run_git(
+        ["commit-tree", tree, "-p", r1, "-p", r2, "-m", "base commit"],
+        cwd=src,
+        env={"GIT_AUTHOR_DATE": base_date, "GIT_COMMITTER_DATE": base_date},
+    ).decode("ascii").strip()
+
+    run_git(["update-ref", "refs/heads/main", base_sha], cwd=src)
+
+    base_dt = ensure_utc(datetime.fromisoformat(base_date), "base_date")
+    r1_dt = ensure_utc(datetime.fromisoformat(d_r1_a), "r1_dt")
+
+    return IntakeSyntheticRepo(
+        path=src,
+        base_sha=base_sha,
+        root1_sha=r1,
+        root2_sha=r2,
+        base_commit_time=base_dt,
+        repo_first_commit_time=r1_dt,
+    )
+
