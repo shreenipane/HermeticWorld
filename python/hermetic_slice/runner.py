@@ -167,15 +167,21 @@ def run_task(
             "patch.diff": _sha256_of_file(patch_path),
         }
 
+        # grade() reports test names per bucket; the run record keeps counts (grade.json has the names).
+        def _count(bucket: str, outcome: str) -> int:
+            return len(grade_res.get(bucket, {}).get(outcome, []))
+
         grade_dict = {
             "status": grade_res.get("status"),
             "resolution": grade_res.get("resolution"),
             "resolved": grade_res.get("resolved", False),
-            "f2p_success": grade_res.get("f2p_success", 0),
-            "f2p_failure": grade_res.get("f2p_failure", 0),
-            "p2p_success": grade_res.get("p2p_success", 0),
-            "p2p_failure": grade_res.get("p2p_failure", 0),
-            **{k: v for k, v in grade_res.items() if k not in ("status", "resolution", "resolved", "f2p_success", "f2p_failure", "p2p_success", "p2p_failure")},
+            "f2p_success": _count("f2p", "success"),
+            "f2p_failure": _count("f2p", "failure"),
+            "p2p_success": _count("p2p", "success"),
+            "p2p_failure": _count("p2p", "failure"),
+            "findings": grade_res.get("findings", []),
+            "patch_sha256": grade_res.get("patch_sha256"),
+            "test_exit_code": grade_res.get("test_exit_code"),
         }
 
         status_val = "completed" if agent_res.error is None else "error"

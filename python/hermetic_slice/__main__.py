@@ -9,14 +9,16 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any
 
+from hermetic_slice.eval_spec import load_eval_rows, prepare_eval_script, write_eval_spec
+from hermetic_slice.grader import oracle_check
 from hermetic_slice.http import make_http_get
 from hermetic_slice.image_sealer import seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
 from hermetic_slice.pkg_index import build_index, env_info
 from hermetic_slice.repo_sealer import VerificationError, rmtree_force, seal_repo
 from hermetic_slice.world import probe, start_world, stop_world
+import time
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,6 +59,16 @@ def main(argv: list[str] | None = None) -> int:
     run_agent_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
     run_agent_parser.add_argument("--max-steps", type=int, default=60, help="Maximum agent steps")
     run_agent_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
+
+    fetch_parser = subparsers.add_parser("fetch-eval-specs", help="Fetch official eval specs and write to staging")
+    fetch_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    fetch_parser.add_argument("--cache", type=Path, required=True, help="Cache directory")
+    fetch_parser.add_argument("--only", action="append", default=None, help="Optional instance ID to process")
+
+    oracle_parser = subparsers.add_parser("oracle", help="Run oracle checks for tasks")
+    oracle_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    oracle_parser.add_argument("--only", action="append", default=None, help="Optional instance ID to process")
+    oracle_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Image tag format")
 
     try:
         args = parser.parse_args(argv)
@@ -118,6 +130,84 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{task_id}  {t_world}  {t_clock}  {issue_source}  {n_warnings}")
             except Exception as exc:
                 print(f"Error processing {task_id}: {exc}", file=sys.stderr)
+                has_failure = True
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "fetch-eval-specs":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        existing_dirs = {d.name: d for d in sorted(tasks_dir.iterdir()) if d.is_dir() and (d / "task.json").exists()}
+        only_set = set(args.only) if args.only is not None else None
+        if only_set is not None:
+            unknown_ids = only_set - set(existing_dirs.keys())
+            if unknown_ids:
+                print(f"Error: Unknown instance ID(s): {', '.join(sorted(unknown_ids))}", file=sys.stderr)
+                return 1
+
+        token = os.environ.get("GITHUB_TOKEN")
+        http_get = make_http_get(args.cache, token=token)
+        try:
+            rows = load_eval_rows(http_get, args.cache)
+        except Exception as exc:
+            print(f"Error loading official verified dataset: {exc}", file=sys.stderr)
+            return 1
+
+        target_dirs = [d for name, d in existing_dirs.items() if (only_set is None or name in only_set)]
+        has_failure = False
+        for tdir in target_dirs:
+            inst_id = tdir.name
+            if inst_id not in rows:
+                print(f"Error: Instance ID {inst_id} not found in dataset rows", file=sys.stderr)
+                return 1
+            try:
+                row = rows[inst_id]
+                spec = write_eval_spec(tdir, row)
+                _, removed_lines = prepare_eval_script(row["eval_script"])
+                removed_line = removed_lines[0].strip() if removed_lines else ""
+                print(f"{inst_id}  {spec['log_parser']}  {removed_line}")
+            except Exception as exc:
+                print(f"Error processing eval spec for {inst_id}: {exc}", file=sys.stderr)
+                has_failure = True
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "oracle":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        existing_dirs = {d.name: d for d in sorted(tasks_dir.iterdir()) if d.is_dir() and (d / "task.json").exists()}
+        only_set = set(args.only) if args.only is not None else None
+        if only_set is not None:
+            unknown_ids = only_set - set(existing_dirs.keys())
+            if unknown_ids:
+                print(f"Error: Unknown instance ID(s): {', '.join(sorted(unknown_ids))}", file=sys.stderr)
+                return 1
+
+        target_dirs = [d for name, d in existing_dirs.items() if (only_set is None or name in only_set)]
+        has_failure = False
+        for tdir in target_dirs:
+            inst_id = tdir.name
+            image = args.image_tag_format.format(id=inst_id.lower())
+            t0 = time.time()
+            try:
+                res = oracle_check(tdir, image=image, out_root=tdir / "oracle")
+                secs = f"{time.time() - t0:.2f}"
+                oracle_ok = res["oracle_ok"]
+                gold = res["gold_resolved"]
+                empty_f2p_all_fail = res["empty_f2p_all_fail"]
+                gold_f2p_fail = len(res["gold_f2p_failures"])
+                gold_p2p_fail = len(res["gold_p2p_failures"])
+                print(f"{inst_id}  {oracle_ok}  {gold}  {empty_f2p_all_fail}  {gold_f2p_fail}  {gold_p2p_fail}  {secs}")
+                if not oracle_ok:
+                    has_failure = True
+            except Exception as exc:
+                print(f"Error running oracle check for {inst_id}: {exc}", file=sys.stderr)
                 has_failure = True
 
         return 1 if has_failure else 0
@@ -343,12 +433,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error loading API key: {exc}", file=sys.stderr)
             return 1
 
-        # Lazy import of grade from hermetic_slice.grader
-        try:
-            from hermetic_slice.grader import grade as grade_fn
-        except ImportError:
-            def grade_fn(*_a: Any, **_kw: Any) -> dict[str, Any]:
-                return {"status": "unresolved", "resolution": "unresolved", "resolved": False}
+        from hermetic_slice.grader import grade as grade_fn
 
         model_client = GeminiClient(args.model, api_key)
         limits = Limits(max_steps=args.max_steps)

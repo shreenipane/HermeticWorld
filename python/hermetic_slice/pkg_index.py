@@ -68,7 +68,8 @@ impl = "cp" if sys.implementation.name == "cpython" else sys.implementation.name
 impl_tag = f"{impl}{sys.version_info.major}{sys.version_info.minor}"
 
 def get_pip(args):
-    proc = subprocess.run([sys.executable, "-m", "pip", "list", *args, "--format=json"], capture_output=True, text=True)
+    # Must run on Python 3.6 (the django-11099 env): no capture_output or text kwargs.
+    proc = subprocess.run([sys.executable, "-m", "pip", "list", *args, "--format=json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     if proc.returncode != 0:
         return []
     try:

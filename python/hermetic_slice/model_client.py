@@ -143,7 +143,7 @@ class GeminiClient:
             "contents": contents,
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 8192,
+                "maxOutputTokens": 16384,
             },
         }
         if system:

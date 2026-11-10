@@ -200,13 +200,12 @@ def test_run_task_docker_end_to_end(tmp_path: Path, fake_sealed_image: str) -> N
             "out_dir": out_dir,
         })
         return {
-            "status": "resolved",
-            "resolution": "resolved",
+            "status": "graded",
+            "resolution": "RESOLVED_FULL",
             "resolved": True,
-            "f2p_success": 1,
-            "f2p_failure": 0,
-            "p2p_success": 1,
-            "p2p_failure": 0,
+            "f2p": {"success": ["test_a"], "failure": []},
+            "p2p": {"success": ["test_b", "test_c"], "failure": []},
+            "findings": [],
         }
 
     run_dir = tmp_path / "run_dir"
@@ -245,7 +244,10 @@ def test_run_task_docker_end_to_end(tmp_path: Path, fake_sealed_image: str) -> N
     assert "extract" in saved_record
     assert saved_record["extract"]["files_changed"] == 1
     assert "grade" in saved_record
-    assert saved_record["grade"]["resolution"] == "resolved"
+    assert saved_record["grade"]["resolution"] == "RESOLVED_FULL"
+    assert saved_record["grade"]["f2p_success"] == 1
+    assert saved_record["grade"]["p2p_success"] == 2
+    assert saved_record["grade"]["p2p_failure"] == 0
     assert saved_record["status"] == "completed"
     assert saved_record["date_leak_observed"] is None
     assert "Phase 0: unsigned; transcript audit not run" in saved_record["notes"]
