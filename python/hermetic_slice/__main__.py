@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 from hermetic_slice.http import make_http_get
 from hermetic_slice.image_sealer import seal_image
@@ -48,6 +49,14 @@ def main(argv: list[str] | None = None) -> int:
     world_probe_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     world_probe_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
     world_probe_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
+
+    run_agent_parser = subparsers.add_parser("run-agent", help="Run model agent on tasks")
+    run_agent_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    run_agent_parser.add_argument("--runs-dir", type=Path, required=True, help="Directory for storing run outputs")
+    run_agent_parser.add_argument("--model", default="gemma-4-31b-it", help="Model name")
+    run_agent_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
+    run_agent_parser.add_argument("--max-steps", type=int, default=60, help="Maximum agent steps")
+    run_agent_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
 
     try:
         args = parser.parse_args(argv)
@@ -299,6 +308,88 @@ def main(argv: list[str] | None = None) -> int:
                         stop_world(world)
                     except Exception:
                         pass
+
+        return 1 if has_failure else 0
+
+    if args.subcommand == "run-agent":
+        tasks_dir = args.tasks_dir
+        if not tasks_dir.exists():
+            print(f"Error: Tasks directory {tasks_dir} does not exist", file=sys.stderr)
+            return 1
+
+        all_tasks = {
+            d.name: d
+            for d in sorted(tasks_dir.iterdir())
+            if d.is_dir() and (d / "task.json").exists()
+        }
+
+        if args.only is not None:
+            task_dirs = []
+            for tid in args.only:
+                if tid not in all_tasks:
+                    print(f"Error: Unknown instance_id: {tid}", file=sys.stderr)
+                    return 1
+                task_dirs.append(all_tasks[tid])
+        else:
+            task_dirs = list(all_tasks.values())
+
+        from hermetic_slice.model_client import GeminiClient, ModelError, load_api_key
+        from hermetic_slice.agent_loop import Limits
+        from hermetic_slice.runner import run_task
+
+        try:
+            api_key = load_api_key()
+        except ModelError as exc:
+            print(f"Error loading API key: {exc}", file=sys.stderr)
+            return 1
+
+        # Lazy import of grade from hermetic_slice.grader
+        try:
+            from hermetic_slice.grader import grade as grade_fn
+        except ImportError:
+            def grade_fn(*_a: Any, **_kw: Any) -> dict[str, Any]:
+                return {"status": "unresolved", "resolution": "unresolved", "resolved": False}
+
+        model_client = GeminiClient(args.model, api_key)
+        limits = Limits(max_steps=args.max_steps)
+
+        runs_dir = args.runs_dir
+        runs_dir.mkdir(parents=True, exist_ok=True)
+
+        has_failure = False
+        for tdir in task_dirs:
+            instance_id = tdir.name
+            timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            task_run_dir = runs_dir / instance_id / timestamp_str
+            task_run_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                record = run_task(
+                    tdir,
+                    model=model_client,
+                    grade_fn=grade_fn,
+                    run_dir=task_run_dir,
+                    image_tag_format=args.image_tag_format,
+                    limits=limits,
+                )
+
+                agent_info = record.get("agent", {})
+                agent_status = agent_info.get("agent_status", "unknown")
+                steps = agent_info.get("steps", 0)
+                usage_totals = agent_info.get("usage_totals", {})
+                total_tokens = usage_totals.get("totalTokenCount", 0)
+                wall_s = agent_info.get("wall_s", 0.0)
+
+                grade_info = record.get("grade", {})
+                resolution = grade_info.get("resolution", "unresolved")
+
+                print(f"{instance_id}  {agent_status}  {steps}  {total_tokens}  {resolution}  {wall_s:.1f}")
+
+                if record.get("status") == "error":
+                    has_failure = True
+            except Exception as exc:
+                print(f"Error running task {instance_id}: {exc}", file=sys.stderr)
+                has_failure = True
 
         return 1 if has_failure else 0
 
