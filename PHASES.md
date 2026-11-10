@@ -1,7 +1,7 @@
 # Hermetic World: Phases
 
 - **Status:** derived from §15 of [HERMETIC_WORLD_ARCHITECTURE.md](HERMETIC_WORLD_ARCHITECTURE.md). Requirement IDs refer to [TRD.md](TRD.md).
-- **Last updated:** 2026-11-10
+- **Last updated:** 2026-11-11
 
 Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -38,11 +38,11 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 - [x] Image sealer (T0.3/T0.3a): all 10 real images sealed and verified. It removes the extra SWE-bench commit, the reflog and future history, and restores file modes.
 - [x] Minimal cutoff computation (`T_world`, base commit, `T_clock`): done; T0.2 intake feeds it real GitHub, Trac and git dates for all 10 tasks
 - [x] Repo sealer: reachable-objects copy, tag filter, strip refs and reflog (TR-SEAL-1 to TR-SEAL-3, TR-SEAL-6), done in T0.1, 25 tests
-- [ ] Local frozen pip index, built with `uv --exclude-newer` at the cutoff
-- [ ] Docker network with no outside route; the agent container reaches only the index
-- [ ] Clean container as grader: apply the extracted diff, run `FAIL_TO_PASS` and `PASS_TO_PASS`
-- [ ] Unsigned JSON run record
-- [ ] Oracle run: the gold patch passes in the sealed world for every slice task
+- [x] Local frozen pip index at the cutoff (T0.4; PEP 503 index of PyPI files uploaded at or before `T_world`, up to 5 versions per installed package, target project excluded; all 10 tasks, 25 MB to 1.5 GB each, 4.4 GB total)
+- [x] Docker network with no outside route; the agent container reaches only the index (T0.4; `world-probe` all_ok: positive install, newer version blocked, target blocked, egress blocked)
+- [x] Clean container as grader: apply the extracted diff, run `FAIL_TO_PASS` and `PASS_TO_PASS` (T0.5; official SWE-bench eval scripts minus the pip line, swebench 5.0.2 grading rules)
+- [x] Unsigned JSON run record (T0.6; `hermetic-slice-run/v0-unsigned`)
+- [x] Oracle run: the gold patch passes in the sealed world for every slice task (10/10 on 2026-11-11; django-11099 lists one FAIL_TO_PASS test that already passes without the fix, recorded as `f2p_pass_without_fix`)
 - [ ] One real agent run, graded
 
 ### Exit
@@ -62,7 +62,7 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** A laptop.
 
 ### Deliverables
-- [ ] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain
+- [x] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain (T1.1)
 - [ ] Both modes: dated and undated (TR-SC-9)
 - [ ] Fingerprints with baseline subtraction (TR-SC-1)
   - [ ] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2)
