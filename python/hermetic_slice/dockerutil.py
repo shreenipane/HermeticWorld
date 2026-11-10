@@ -38,17 +38,26 @@ def run_docker(
     *,
     input: bytes | None = None,
     check: bool = True,
+    timeout: float | None = None,
+    combine_output: bool = False,
 ) -> bytes:
     """Execute docker CLI and return stdout bytes."""
     cmd = ["docker", *args]
+    stderr_dest = subprocess.STDOUT if combine_output else subprocess.PIPE
     proc = subprocess.run(
         cmd,
         input=input,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr_dest,
         shell=False,
+        timeout=timeout,
     )
     if check and proc.returncode != 0:
-        stderr_str = proc.stderr.decode("utf-8", errors="replace")
+        if proc.stderr:
+            stderr_str = proc.stderr.decode("utf-8", errors="replace")
+        elif proc.stdout:
+            stderr_str = proc.stdout.decode("utf-8", errors="replace")
+        else:
+            stderr_str = ""
         raise DockerError(cmd, proc.returncode, stderr_str, stdout=proc.stdout)
     return proc.stdout
