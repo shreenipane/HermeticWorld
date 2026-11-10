@@ -1,0 +1,78 @@
+{
+ "with_systemInstruction": {
+  "status": 200,
+  "response": {
+   "candidates": [
+    {
+     "content": {
+      "parts": [
+       {
+        "text": "*   Goal: Reply with exactly one fenced bash code block.\n    *   Content: The code block must print the word \"READY\".\n    *   Constraint: Nothing else in the response.\n    *   Persona: Terse assistant.\n\n    *   `echo READY`\n\n    *   Fenced bash code block:\n        ```bash\n        echo READY\n        ```\n\n    *   Exactly one fenced bash code block? Yes.\n    *   Prints \"READY\"? Yes.\n    *   Nothing else? Yes.",
+        "thought": true
+       },
+       {
+        "text": "```bash\necho READY\n```"
+       }
+      ],
+      "role": "model"
+     },
+     "finishReason": "STOP",
+     "index": 0
+    }
+   ],
+   "usageMetadata": {
+    "promptTokenCount": 25,
+    "candidatesTokenCount": 7,
+    "totalTokenCount": 144,
+    "promptTokensDetails": [
+     {
+      "modality": "TEXT",
+      "tokenCount": 25
+     }
+    ],
+    "thoughtsTokenCount": 112,
+    "serviceTier": "standard"
+   },
+   "modelVersion": "gemma-4-31b-it",
+   "responseId": "cnDzav77FY6-694P9_bn-Qo"
+  }
+ },
+ "no_systemInstruction": {
+  "status": 200,
+  "response": {
+   "candidates": [
+    {
+     "content": {
+      "parts": [
+       {
+        "text": "*   Goal: Reply with exactly one fenced bash code block.\n    *   Content of the block: A command that prints the word \"READY\".\n    *   Constraint: Nothing else in the response.\n\n    *   `echo READY`\n\n    *   Fenced bash code block:\n        ```bash\n        echo READY\n        ```\n\n    *   Exactly one fenced bash code block? Yes.\n    *   Prints \"READY\"? Yes.\n    *   Nothing else? Yes.",
+        "thought": true
+       },
+       {
+        "text": "```bash\necho READY\n```"
+       }
+      ],
+      "role": "model"
+     },
+     "finishReason": "STOP",
+     "index": 0
+    }
+   ],
+   "usageMetadata": {
+    "promptTokenCount": 19,
+    "candidatesTokenCount": 7,
+    "totalTokenCount": 130,
+    "promptTokensDetails": [
+     {
+      "modality": "TEXT",
+      "tokenCount": 19
+     }
+    ],
+    "thoughtsTokenCount": 104,
+    "serviceTier": "standard"
+   },
+   "modelVersion": "gemma-4-31b-it",
+   "responseId": "zHDzaoa-BcX6694Pvb--wQs"
+  }
+ }
+}
