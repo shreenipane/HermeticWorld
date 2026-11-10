@@ -29,6 +29,54 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-11: T0.3a image sealer accepted, T0.4 frozen index and offline world merged, task swap (Phase 0)
+
+- **Phase:** 0
+- **Type:** build + measurement + decision
+- **Requirements:** TR-SEAL-1 to TR-SEAL-3 applied to real images; §6.3 package world; §9.6 mini escape probe
+- **Briefs:** `agy-tasks/T0.3a-review-fixes.md`, `agy-tasks/T0.4-frozen-index-and-world.md`. agy ran in parallel git worktrees: T0.3a, T0.4 and T0.5 at once; T0.6 later.
+
+### Done
+- **T0.3a** (commit 732f960): agy's fixes H1–H7, plus reviewer fixes after the live run.
+  - The leak scan covers only objects unreachable from the base, streamed.
+  - The report is always written.
+  - Executable bits are restored from the base tree.
+  - SWE-bench's env-setup edits are allowed only when the original image already had them, and are listed.
+- **T0.4** (commit 3299e18, merged in b22878d):
+  - `pkg_index.py` builds a PEP 503 index from PyPI files uploaded on or before `T_world`. It excludes the target project and lists packages newer than `T_world` (class B).
+  - `world.py` runs the index and the agent container on a `--internal` Docker network, with a probe.
+  - Reviewer fixes:
+    - `world_exec` enforces timeouts inside the container (process-group kill);
+    - the agent container runs with `--init`;
+    - PyPI 404s are recorded as `on_pypi: false` instead of aborting.
+
+### Results / measurements
+- **All 10 slice images seal and verify.**
+  - Sealing: pytest-6202 took 8 s and 320 MB RSS (it ran out of memory before H1). The 8 other images took 3–5 min in total, at about 1.1 GB peak RSS.
+  - Before sealing, every image has HEAD on an extra "SWE-bench" commit dated 2026-08, plus a reflog, ORIG_HEAD and COMMIT_EDITMSG. All are gone after sealing.
+  - **Leftover future history removed:** sympy-20590 had 59 commits and 33 blobs unreachable from the base; matplotlib-24149 had 89 commits and 20 blobs. No gold line was found in them.
+  - **SWE-bench's HEAD commit flips every tracked file to 100755** in 8 of the 9 images it was measured on, with identical content: django 6061 files, matplotlib 4349, pylint 3315, astropy 1861, sympy 1758, sphinx 1470, sklearn 1201, xarray 254. pytest-6202's SWE-bench commit is empty. Without the restore, the agent's `git status` would list thousands of changes.
+  - **SWE-bench env-setup edits kept:**
+    - astropy: `pyproject.toml` pins `setuptools==68.0.0`;
+    - sphinx: `setup.py` pins sphinxcontrib-*, Jinja2 and markupsafe, and `tox.ini` adds `-rA`, which the log parser needs.
+- **Official eval scripts offline:** the SWE-bench 5.x dataset `SWE-bench/SWE-bench_Verified` ships each task's `eval_script`, `log_parser` and `eval_type`.
+  - Every script's `pip install` line fails offline: build isolation fetches setuptools.
+  - The tests still run against the existing editable install: pytest-6202 gold gives 73 passed, 1 xfailed.
+
+### Decisions
+- **Replaced `psf__requests-2317` with `pallets__flask-5014`** (user choice). requests' tests call httpbin.org: offline, the gold patch gives 62 failed, 81 passed. flask-5014 passes offline (gold 60 passed; empty patch fails only the `FAIL_TO_PASS` test), and adds a 2023 task. The slice now spans 2019–2023.
+- **The grader drops the eval script's reinstall line** (§10: "the grader doesn't reinstall the target package"), and records that it did. Specified in T0.5.
+- The agent runs are on **Gemma 4 31B** (`gemma-4-31b-it`) through the Gemini API, 1 run per task (user choice). The key is kept in a user-only file outside the repo.
+
+### Problems / open questions
+- The sealed image still has the original layers underneath (Phase 2 flattens it), and file mtimes are 2026 (`clock: real`).
+- **Class B:** the env packages are far newer than `T_world` (pytest-6202: attrs 23.1.0, packaging 23.1 and more). They are reported, not rebuilt, because Phase 0 is `repo_only`.
+
+### Next
+- Live `build-index` and `world-probe` on all 10 tasks.
+- Merge T0.5 (grader and oracle) and run the oracle on every sealed task.
+- Merge T0.6 (agent loop) and do one Gemma run per task.
+
 ## 2026-11-10: T0.2 task intake (Phase 0)
 
 - **Phase:** 0
