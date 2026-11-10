@@ -1,0 +1,1069 @@
+{
+ "info": {
+  "name": "py"
+ },
+ "releases": {
+  "0.8.0-alpha2": [],
+  "0.9.0": [],
+  "0.9.1": [
+   {
+    "filename": "py-0.9.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/64/d8/c5375e0d035a028e9f02b604eded5056e8472c72bd05c50e5fb1e13124cd/py-0.9.1.tar.gz",
+    "upload_time_iso_8601": "2008-03-30T19:46:45Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "8a71f26930be0cd5dd4819567b87c8f688dc71bb246b7a7c32f6df42d16876c0"
+    }
+   }
+  ],
+  "0.9.2": [
+   {
+    "filename": "py-0.9.2-py2.4-win32.egg",
+    "url": "https://files.pythonhosted.org/packages/a0/e5/023437e029995689debf9569473c6fb0652afa6a1b730ce1f12aa0706f7e/py-0.9.2-py2.4-win32.egg",
+    "upload_time_iso_8601": "2008-08-22T10:57:44Z",
+    "yanked": false,
+    "packagetype": "bdist_egg",
+    "requires_python": null,
+    "digests": {
+     "sha256": "356728a6f0c61e0ef42b9448d1d92496087bb385cd057b88288cc094b895f389"
+    }
+   },
+   {
+    "filename": "py-0.9.2-py2.5-win32.egg",
+    "url": "https://files.pythonhosted.org/packages/be/60/1873c698c52917405270ead01e1c04e4d481dbbd3d7ed54461eab99400e5/py-0.9.2-py2.5-win32.egg",
+    "upload_time_iso_8601": "2008-08-22T10:56:54Z",
+    "yanked": false,
+    "packagetype": "bdist_egg",
+    "requires_python": null,
+    "digests": {
+     "sha256": "f5219cb34fcdef4030a73c525b20051eaa70a1409c0b699bf20ac33c99b8b880"
+    }
+   },
+   {
+    "filename": "py-0.9.2.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/18/0d/e73c7c110a716a4b96020a8d664f934b12a9fc8f1b61787a53c19f2e5773/py-0.9.2.tar.gz",
+    "upload_time_iso_8601": "2008-08-22T10:54:56Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "11da9ecdd3414674c5bed51d318fd4b2cec5f29e7dc3985c663c25dc60ef653a"
+    }
+   },
+   {
+    "filename": "py-0.9.2.zip",
+    "url": "https://files.pythonhosted.org/packages/b8/35/0b486eb364d26fca21a0890b88e3840cae6e7e7aed1d2593b2df95947b2e/py-0.9.2.zip",
+    "upload_time_iso_8601": "2008-08-22T10:55:09Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "b5a688f95a735edbe841e7e9aefbd5a59fae1d28d8fab8473db6ba892e6a1300"
+    }
+   }
+  ],
+  "1.0.0": [
+   {
+    "filename": "py-1.0.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/21/8b/e5e089859387e3bb6edbdd9c7e0089891d4a52c0eb90030334755779b8d8/py-1.0.0.tar.gz",
+    "upload_time_iso_8601": "2009-08-04T12:01:18.291790Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "85c0fb1d8db15f18b23d51017aeba8531bf5598ac758f2e0d5202dae4157a05f"
+    }
+   }
+  ],
+  "1.0.1": [
+   {
+    "filename": "py-1.0.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/7f/02/e83ce9a461ee157462088dca5d343db31f760b82c59e5849b2dd7efcdee2/py-1.0.1.tar.gz",
+    "upload_time_iso_8601": "2009-08-19T18:20:37.433309Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "43be1aee5f9f4ad1c80651bf3c3f6d024f49eaea96bc274803ac6cac999072df"
+    }
+   }
+  ],
+  "1.0.2": [
+   {
+    "filename": "py-1.0.2.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/63/8b/79e7ab18dac856c0069e13c8afba46950050d6dea98f5f932c1ca0c9b338/py-1.0.2.tar.gz",
+    "upload_time_iso_8601": "2009-08-27T11:46:54.150380Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "0f20effdd80d016cbc821301753988d66182680d64f3b2f91a5a31698f127597"
+    }
+   }
+  ],
+  "1.1.0": [
+   {
+    "filename": "py-1.1.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/28/e2/852238966afe6711ef45b563a6d5baccbb2a112725abf8b3cc49d33d86fd/py-1.1.0.tar.gz",
+    "upload_time_iso_8601": "2009-11-05T17:49:34.837548Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "f37c61e88d1ad4f243fd98b72728a1d4b4bcf47704b71ecfcf5145de2a5d8db4"
+    }
+   }
+  ],
+  "1.1.1": [
+   {
+    "filename": "py-1.1.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/ec/62/cb9fbfe0af6b561150b98ce3e0379ca5f84e03066df3c30b7d4c296670c8/py-1.1.1.tar.gz",
+    "upload_time_iso_8601": "2009-11-24T18:05:16.261315Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "e94260bd81c9d87047da6e7e90145da95f0f382b820aed832124ba4948b346ff"
+    }
+   }
+  ],
+  "1.10.0": [
+   {
+    "filename": "py-1.10.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/67/32/6fe01cfc3d1a27c92fdbcdfc3f67856da8cbadf0dd9f2e18055202b2dc62/py-1.10.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2020-12-12T12:12:36.333666Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "3b80836aa6d1feeaa108e046da6423ab8f6ceda6468545ae8d02d9d58d18818a"
+    }
+   },
+   {
+    "filename": "py-1.10.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/0d/8c/50e9f3999419bb7d9639c37e83fa9cdcf0f601a9d407162d6c37ad60be71/py-1.10.0.tar.gz",
+    "upload_time_iso_8601": "2020-12-12T12:12:37.484947Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "21b81bda15b66ef5e1a777a21c4dcd9c20ad3efd0b3f817e7a809035269e1bd3"
+    }
+   }
+  ],
+  "1.11.0": [
+   {
+    "filename": "py-1.11.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/f6/f0/10642828a8dfb741e5f3fbaac830550a518a775c7fff6f04a007259b0548/py-1.11.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2021-11-04T17:17:00.152107Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*",
+    "digests": {
+     "sha256": "607c53218732647dff4acdfcd50cb62615cedf612e72d1724fb1a0cc6405b378"
+    }
+   },
+   {
+    "filename": "py-1.11.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/98/ff/fec109ceb715d2a6b4c4a85a61af3b40c723a961e8828319fbcb15b868dc/py-1.11.0.tar.gz",
+    "upload_time_iso_8601": "2021-11-04T17:17:01.377437Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*",
+    "digests": {
+     "sha256": "51c75c4126074b472f746a24399ad32f6053d1b34b68d2fa41e558e6f4a98719"
+    }
+   }
+  ],
+  "1.2.0": [
+   {
+    "filename": "py-1.2.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/b7/56/93be3c5172d88656b572c1b4aea10ac6c320158ac74989010661eef04076/py-1.2.0.tar.gz",
+    "upload_time_iso_8601": "2010-01-18T17:24:27.527755Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "1b7349b52aeee1fc69d2fb6e30e6c642179ae78f8a671041c4759fe0fcd1d287"
+    }
+   }
+  ],
+  "1.2.1": [
+   {
+    "filename": "py-1.2.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/fa/cb/f4af601f060dc63d905f18baf97661ae62b209a02fbc0a5af034cb64eddf/py-1.2.1.tar.gz",
+    "upload_time_iso_8601": "2010-02-08T17:29:04.288915Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "d00f34e4828b1274dcbf0a3e3812d2464cc0d457160df682824e28c29d52ee7f"
+    }
+   }
+  ],
+  "1.3.0": [
+   {
+    "filename": "py-1.3.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/d4/28/78bb5f4b6f764953b7a8882c34a32c923b1986b2fd26ce6015fae884941b/py-1.3.0.tar.gz",
+    "upload_time_iso_8601": "2010-05-05T21:36:13.470882Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "9c0ecb5b9176c521aa50089418d944f63c80ec82550b5c12dcc6897215259a37"
+    }
+   }
+  ],
+  "1.3.1": [
+   {
+    "filename": "py-1.3.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/d8/25/87160d586dfc4db2d7eb4d1ae825e31dd012c819d8d0afb47e3703080def/py-1.3.1.tar.gz",
+    "upload_time_iso_8601": "2010-05-25T21:11:07.693585Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "238094dffb39a1b3cdecac651170f5469329c9ecaf6d1e84381f62a9f6106028"
+    }
+   }
+  ],
+  "1.3.2": [
+   {
+    "filename": "py-1.3.2.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/4c/c6/6d3222b278472e40a6c8fb317fec4829c49c3e72fee388757c582d021881/py-1.3.2.tar.gz",
+    "upload_time_iso_8601": "2010-07-08T17:18:58.538919Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "6d446de2055e48cf95f708b7ac386549522c3463ffb1dfd031edfb798ced1cb3"
+    }
+   }
+  ],
+  "1.3.3": [
+   {
+    "filename": "py-1.3.3.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/03/c2/065817032d142b62c0e8fe9aa6a8b7c12c6d7134f0ce01e6ff9fa3211d5c/py-1.3.3.tar.gz",
+    "upload_time_iso_8601": "2010-07-31T01:37:40.114757Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "a34382aed817b3e0fca47255f388b79025095d415c6be326f1379078913f3845"
+    }
+   }
+  ],
+  "1.3.4": [
+   {
+    "filename": "py-1.3.4.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/2c/ca/34d7b7828e191cb8c8c18ab4f78afe54e50ed9bb8935ced46d854a4b0b85/py-1.3.4.tar.gz",
+    "upload_time_iso_8601": "2010-09-14T17:36:26.673849Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "ee7153605b7ca7de441e91f63d5686cfd993e4694ab19318280ac4c551555450"
+    }
+   }
+  ],
+  "1.4.0": [
+   {
+    "filename": "py-1.4.0.zip",
+    "url": "https://files.pythonhosted.org/packages/3c/9e/612d711561c695e9de25faf469dbf074727b9542355494d3ec6e931d4cd4/py-1.4.0.zip",
+    "upload_time_iso_8601": "2010-11-25T20:58:41.056164Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "df1d2e69e8ac1db1860604da6b5170b3f79c3e4731c8217b6f6771d4945090a6"
+    }
+   }
+  ],
+  "1.4.1": [
+   {
+    "filename": "py-1.4.1.zip",
+    "url": "https://files.pythonhosted.org/packages/91/0d/b2e872ec2bb37d21d7c543779a1def232c5a9a3de3157bc10561b5088f7c/py-1.4.1.zip",
+    "upload_time_iso_8601": "2011-02-07T11:30:17.030500Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "4c9a11b7ff05f0febafa77cd8ef8205d3c47b3dbcfaca6fdce02f036e7c5190a"
+    }
+   }
+  ],
+  "1.4.10": [
+   {
+    "filename": "py-1.4.10.zip",
+    "url": "https://files.pythonhosted.org/packages/39/88/f91b541600fd078196ec23378a61707a99f4d93021a76eb739cf104a7358/py-1.4.10.zip",
+    "upload_time_iso_8601": "2012-10-19T09:00:49.413715Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "b4607de3fe00363067e4e3f1eb6940ce096a8e3f3f835ed777b06a70387cd162"
+    }
+   }
+  ],
+  "1.4.11": [
+   {
+    "filename": "py-1.4.11.zip",
+    "url": "https://files.pythonhosted.org/packages/1a/4f/dab08b49cd5a4ff8f9da05d59da60923400560ef87c109e26053110bd178/py-1.4.11.zip",
+    "upload_time_iso_8601": "2012-10-25T11:32:04.810119Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "47cbcc8d8a29b319c561a32c514e2f83a364a04baa4345e78b3d6b8c7f781290"
+    }
+   }
+  ],
+  "1.4.12": [
+   {
+    "filename": "py-1.4.12.zip",
+    "url": "https://files.pythonhosted.org/packages/f2/eb/ae600335f8a6725b8efb2ecd437ffd91aa21b12d6724884bf115ad320ecd/py-1.4.12.zip",
+    "upload_time_iso_8601": "2012-11-06T13:59:53.222672Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "36767367ba7517375dc5c1cb066e4f8fe3e05b7eacf3600c011fb510cc45122f"
+    }
+   }
+  ],
+  "1.4.13": [
+   {
+    "filename": "py-1.4.13.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/a9/44/132620a9f9f7d8bd4fe2299fbc2906ead29a2cbb49152fe89da8f23bbe8e/py-1.4.13.tar.gz",
+    "upload_time_iso_8601": "2013-03-01T09:41:13.517814Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "ec1dc7fe04066e7ab93e1ac457f04bc301778a48bf368bf1796e84f500fda6f1"
+    }
+   }
+  ],
+  "1.4.14": [
+   {
+    "filename": "py-1.4.14.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/60/25/10939561aeaab98364bcd1b104b9b631a57a6c30f4b2be8fcb8e27d4d278/py-1.4.14.tar.gz",
+    "upload_time_iso_8601": "2013-05-07T08:47:52.733754Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "a1915fffc0590a104fd033466469c7f074a1b524d1a08c7fc501f406a0d8526f"
+    }
+   }
+  ],
+  "1.4.15": [
+   {
+    "filename": "py-1.4.15.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/8f/9c/7102fb8fc77b624a0fa4bfdea0f6ba6abab2cf1a7a2e731e27d1b40ef628/py-1.4.15.tar.gz",
+    "upload_time_iso_8601": "2013-06-21T14:38:57.779471Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "656634e1846d568ed22c872b5e158a4d5eef174dd5b245186e78b94a0258c042"
+    }
+   }
+  ],
+  "1.4.16": [
+   {
+    "filename": "py-1.4.16.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/b4/9e/dbadedb54fc9cc1984a85a5fab8faf1728bc067a23a543bbb5e16db87b5b/py-1.4.16.tar.gz",
+    "upload_time_iso_8601": "2013-10-01T08:41:52.528604Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "d6f8d0debce6659577f842ac6845698ec3775894aed72206706b2c7262dd4f5b"
+    }
+   }
+  ],
+  "1.4.17": [
+   {
+    "filename": "py-1.4.17.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/85/10/2da35967cb3280f505d1b8f22f7e2d3c3e00de27dcb097c39a3e26a08da4/py-1.4.17.tar.gz",
+    "upload_time_iso_8601": "2013-10-04T11:55:33.647144Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "45d74855a614c73f97b0cbbe5615e5be34fa623ecf5ee6b7a4417f9a52665fb7"
+    }
+   }
+  ],
+  "1.4.18": [
+   {
+    "filename": "py-1.4.18.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/3d/06/b2f87e4dd090b5f61fa78591909ff875ed6e881f5d1fc2b34250fe2a5b35/py-1.4.18.tar.gz",
+    "upload_time_iso_8601": "2013-10-30T05:46:36.115729Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "2aa6e23a43fd8582e5ef35ce08e72d9184abea532a1e337397b0c15460f91ca2"
+    }
+   }
+  ],
+  "1.4.19": [
+   {
+    "filename": "py-1.4.19.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/e1/57/d85d0f91d0d429b2397887179478e43562904967931109fd62d3f0bd0897/py-1.4.19.tar.gz",
+    "upload_time_iso_8601": "2013-12-12T12:01:24.467809Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "a1c4c1d2c218b1939fc466c46d4697026fbc09a3b17cdee298a08e62570eefa6"
+    }
+   }
+  ],
+  "1.4.2": [
+   {
+    "filename": "py-1.4.2.zip",
+    "url": "https://files.pythonhosted.org/packages/39/46/86f53682f1a01d8a0b41c7d42be4c4f9404ffcdf8aabc1f2d75712c1fe86/py-1.4.2.zip",
+    "upload_time_iso_8601": "2011-03-09T13:54:11.804130Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "44576ecaf065edf8f081b67525de6aa9642eab257d1997128c55f74ea32c956c"
+    }
+   }
+  ],
+  "1.4.20": [
+   {
+    "filename": "py-1.4.20.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/5a/23/b55385bcadffcea8c2b9bc51d44ec31a8e3f294a12fb5b3313b6b3618111/py-1.4.20.tar.gz",
+    "upload_time_iso_8601": "2014-01-29T13:06:32.865657Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "23c99d99ebb2a60eb7023b7577bfc988acb0092082257a57189f100ce84b72f1"
+    }
+   }
+  ],
+  "1.4.21": [
+   {
+    "filename": "py-1.4.21.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/64/25/88d307ed06cd49fcafa1f8e494ce5acf6ccabb8c18a373d84aab3ce86fba/py-1.4.21.tar.gz",
+    "upload_time_iso_8601": "2014-07-14T20:19:30.330827Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "9e701a3b155998db34e3c34c24df72bdddea14650064e14c73237fc27643e805"
+    }
+   }
+  ],
+  "1.4.22": [
+   {
+    "filename": "py-1.4.22.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/46/a7/a8e030ef1163f0e28c49a098422e0d5307c4925b3a3e44df0a06f602258d/py-1.4.22.tar.gz",
+    "upload_time_iso_8601": "2014-07-17T08:55:05.498388Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "1ef0c4eb8f12f970dd831f32755f95a36af66a8ca9c35991100146428fd42474"
+    }
+   }
+  ],
+  "1.4.23": [
+   {
+    "filename": "py-1.4.23.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/99/2d/0177b1bee5200f65d077641cc9f689f8c60522227a8410d7348b06ed3714/py-1.4.23.tar.gz",
+    "upload_time_iso_8601": "2014-08-04T11:32:23.117086Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "ba8f2a3894caf1121799a2b239d67873a56bd0dfa24e1673d92990a8ae7370ca"
+    }
+   }
+  ],
+  "1.4.24": [
+   {
+    "filename": "py-1.4.24.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/3d/cd/4f34e57b16c42a13c826dd4714eeb49d6c1d9f8cea81896f4e1410481829/py-1.4.24.tar.gz",
+    "upload_time_iso_8601": "2014-09-05T10:57:29.717141Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "7e28cf1511e5fe6119212a44793ec4a1b6199ead4d23d6dd4093a9d45486b855"
+    }
+   }
+  ],
+  "1.4.25": [
+   {
+    "filename": "py-1.4.25.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/53/a5/1c50691baf0c5ceaae8ce4a4dd61b3332f01e959245f078fba552f5b665c/py-1.4.25.tar.gz",
+    "upload_time_iso_8601": "2014-09-24T11:45:16.723751Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "da6ea727748e00f79fef987adb6970e8b081f829de8ea39f5405718fa9e50c85"
+    }
+   }
+  ],
+  "1.4.26": [
+   {
+    "filename": "py-1.4.26.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/2f/f3/cdc7d90b0a01572d5494a88c08ae3e56e0c430e6ff31d71fea7b41d0aca9/py-1.4.26.tar.gz",
+    "upload_time_iso_8601": "2014-10-24T13:10:14.838753Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "28dd0b90d29b386afb552efc4e355c889f4639ce93658a7872a2150ece28bb89"
+    }
+   }
+  ],
+  "1.4.27": [
+   {
+    "filename": "py-1.4.27-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/23/33/e150ac936d998caff090430b88681482baa076919f7f5454f03737060a32/py-1.4.27-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2015-05-07T09:40:26.687396Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "0d912c3ac0d2c2b1d683ba8d7cd575996493941c7c14a23c4435677072a0b9e5"
+    }
+   },
+   {
+    "filename": "py-1.4.27.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/68/1f/4b80e6ef9b4ab41e8921041974aaffea3735bd5615fe5e1ab91e192fde55/py-1.4.27.tar.gz",
+    "upload_time_iso_8601": "2015-05-07T09:40:30.366927Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "55c648870ba47375c52001d05a1adeedaa930937749ad66eb3327e8dea28ac79"
+    }
+   }
+  ],
+  "1.4.28": [
+   {
+    "filename": "py-1.4.28-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/f9/b3/5e7c611879473a2ad04665584bad04458dd43a6913217ba47059f0b4a6bb/py-1.4.28-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2015-05-27T13:20:49.958083Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "b41a766042ce79cbe618dfe5d0dab60170e8159a25f77c2c9032f96e6e67cd78"
+    }
+   },
+   {
+    "filename": "py-1.4.28.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/79/1f/aa18a97aada0e2b5f3bac9bc991c64a38e37f92428152126a39564de6626/py-1.4.28.tar.gz",
+    "upload_time_iso_8601": "2015-05-27T13:20:45.921343Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "664dbb9fd86c26d26e90aa93d15b8a19c859128bb66b3905bef954eba737eeb5"
+    }
+   }
+  ],
+  "1.4.29": [
+   {
+    "filename": "py-1.4.29-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/23/0f/40dfda5ef6be6ccee6d7fc46b57a043dde0b8ff7ad1ce63d9c164b9807e3/py-1.4.29-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2015-06-23T14:38:23.869017Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "5ba4f7b0c5ca2606cd487611fa0d26aabe573f80082b86009c3c358f8df6aa3a"
+    }
+   },
+   {
+    "filename": "py-1.4.29.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/2a/bc/a1a4a332ac10069b8e5e25136a35e08a03f01fd6ab03d819889d79a1fd65/py-1.4.29.tar.gz",
+    "upload_time_iso_8601": "2015-06-23T14:38:27.805062Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "279e117233f205de1e46ec36eb7ffa5999f1bc53ae6bcf06889477ff28e45d83"
+    }
+   }
+  ],
+  "1.4.3": [
+   {
+    "filename": "py-1.4.3.zip",
+    "url": "https://files.pythonhosted.org/packages/00/db/ebec2d573e5c6df968638a69edbc8bb23524ce1dc8349f007d8a5393f43d/py-1.4.3.zip",
+    "upload_time_iso_8601": "2011-04-17T23:07:32.750735Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "5db1b4268a955e3f9fefe5fa18ed130ab68db10f4f99a752dba0650564b0d529"
+    }
+   }
+  ],
+  "1.4.30": [
+   {
+    "filename": "py-1.4.30-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/9c/ce/4f442f1e6d569fdacb6be412ac93f14246bd0c31e168f22226a9cbd4ad4c/py-1.4.30-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2015-06-26T10:44:24.349762Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "07e20ab90a550bd3c21891e0d887f0931b4098f148aec95e29b5188f161bb075"
+    }
+   },
+   {
+    "filename": "py-1.4.30.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/35/24/f5918a3d91f67fb379d33eba111f6b517517d7d3ea156aec97f7724cebc3/py-1.4.30.tar.gz",
+    "upload_time_iso_8601": "2015-06-26T10:40:36.890147Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "b703e57685ed7c280b1a51c496a4984d83d89def2a930b5e9e5da5a6ca151514"
+    }
+   }
+  ],
+  "1.4.31": [
+   {
+    "filename": "py-1.4.31-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/19/f2/4b71181a49a4673a12c8f5075b8744c5feb0ed9eba352dd22512d2c04d47/py-1.4.31-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2015-11-27T21:13:32.348930Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "4a3e4f3000c123835ac39cab5ccc510642153bc47bc1f13e2bbb53039540ae69"
+    }
+   },
+   {
+    "filename": "py-1.4.31.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/f4/9a/8dfda23f36600dd701c6722316ba8a3ab4b990261f83e7d3ffc6dfedf7ef/py-1.4.31.tar.gz",
+    "upload_time_iso_8601": "2015-11-27T21:13:39.391063Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "a6501963c725fc2554dabfece8ae9a8fb5e149c0ac0a42fd2b02c5c1c57fc114"
+    }
+   }
+  ],
+  "1.4.32": [
+   {
+    "filename": "py-1.4.32-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/02/79/ea0c2750dde4b19bf2e305d201e4dd488f6671b51f52d8cf87aba174a158/py-1.4.32-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2016-12-16T16:31:54.445087Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "2d4bba2e25fff58140e6bdce1e485e89bb59776adbe01d490baa6b1f37a3dd6b"
+    }
+   },
+   {
+    "filename": "py-1.4.32.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/93/bd/8a90834a287e0c1682eab8e20ada672e4f4cf7d5b99f2833ddbf31ed1a6d/py-1.4.32.tar.gz",
+    "upload_time_iso_8601": "2016-12-16T16:31:56.707488Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "c4b89fd1ff1162375115608d01f77c38cca1d0f28f37fd718005e19b28be41a7"
+    }
+   }
+  ],
+  "1.4.32.dev1": [],
+  "1.4.33": [
+   {
+    "filename": "py-1.4.33-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/92/8b/ac214296ed28a05efd36e8b55a7820eda62d7028ecf10e5a98afb1982e93/py-1.4.33-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2017-03-17T02:45:48.035144Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "81b5e37db3cc1052de438375605fb5d3b3e97f950f415f9143f04697c684d7eb"
+    }
+   },
+   {
+    "filename": "py-1.4.33.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/2a/a5/139ca93a9ffffd9fc1d3f14be375af3085f53cc490c508cf1c988b886baa/py-1.4.33.tar.gz",
+    "upload_time_iso_8601": "2017-03-17T02:45:49.287644Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "1f9a981438f2acc20470b301a07a496375641f902320f70e31916fe3377385a9"
+    }
+   }
+  ],
+  "1.4.34": [
+   {
+    "filename": "py-1.4.34-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/53/67/9620edf7803ab867b175e4fd23c7b8bd8eba11cb761514dcd2e726ef07da/py-1.4.34-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2017-06-04T15:48:32.240603Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": null,
+    "digests": {
+     "sha256": "2ccb79b01769d99115aa600d7eed99f524bf752bba8f041dc1c184853514655a"
+    }
+   },
+   {
+    "filename": "py-1.4.34.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/68/35/58572278f1c097b403879c1e9369069633d1cbad5239b9057944bb764782/py-1.4.34.tar.gz",
+    "upload_time_iso_8601": "2017-06-04T15:48:34.852549Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "0f2d585d22050e90c7d293b6451c83db097df77871974d90efd5a30dc12fcde3"
+    }
+   }
+  ],
+  "1.4.4": [
+   {
+    "filename": "py-1.4.4.zip",
+    "url": "https://files.pythonhosted.org/packages/12/e9/ac1a086c8deb69db24a9871b323e05a0efbb97ef5ce34b667eade253fedc/py-1.4.4.zip",
+    "upload_time_iso_8601": "2011-07-09T11:57:30.209030Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "6e688e8d037d23a7fc2c79d321eae91ba3b5f2d797101f6e2c9a8189839d6a22"
+    }
+   }
+  ],
+  "1.4.5": [
+   {
+    "filename": "py-1.4.5.zip",
+    "url": "https://files.pythonhosted.org/packages/86/4f/9a727689fe572e21a90bd48e07a60cbf2b9eb578ff062eb95dd3e8b57b4a/py-1.4.5.zip",
+    "upload_time_iso_8601": "2011-08-20T18:10:55.241104Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "8425c7140cfc5acf5b67cfb2f2af8d835ab2f6663ee2ca3d7206c1d81e1d35ea"
+    }
+   }
+  ],
+  "1.4.6": [
+   {
+    "filename": "py-1.4.6.zip",
+    "url": "https://files.pythonhosted.org/packages/03/89/36292385915c48e5093c9c01f6a3353b7b85730b1d08d2cea41bf846c447/py-1.4.6.zip",
+    "upload_time_iso_8601": "2011-12-16T12:40:21.213853Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "59304dd3102b4604da2b11e515f5f44093a8f627a8dc08bd5dcdd964f8960c78"
+    }
+   }
+  ],
+  "1.4.7": [
+   {
+    "filename": "py-1.4.7.zip",
+    "url": "https://files.pythonhosted.org/packages/1b/36/703ac1bc369e514ad4b8d1cb36ddfd7bf2e3e9f458abfda9c47fec2d8869/py-1.4.7.zip",
+    "upload_time_iso_8601": "2012-02-06T13:46:27.092565Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "b66ec2289357146be31a5a2050e1e298654da33c95a50b890bc09c764b905ff2"
+    }
+   }
+  ],
+  "1.4.7.dev3": [
+   {
+    "filename": "py-1.4.7.dev3.zip",
+    "url": "https://files.pythonhosted.org/packages/1a/17/3efad47ffc6e2af272369c47efa49a4bebb09f53595b7f3a6c107619c23c/py-1.4.7.dev3.zip",
+    "upload_time_iso_8601": "2012-02-06T05:30:10.300121Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "30fba90c9e56d29e91fbaf1bb8f2e15c671159feee9e140c9c660a5eb6fde0b2"
+    }
+   }
+  ],
+  "1.4.8": [
+   {
+    "filename": "py-1.4.8.zip",
+    "url": "https://files.pythonhosted.org/packages/2c/0d/a0b7eceb89ca0562e95f1bc6953fe6d2dd6f65f4555c686fc90675a2349e/py-1.4.8.zip",
+    "upload_time_iso_8601": "2012-05-22T18:13:11.620324Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "e29f881fc54919e0faecc2c44913d1c32ff6fbb7097889bc9b384ddadb4949a5"
+    }
+   }
+  ],
+  "1.4.9": [
+   {
+    "filename": "py-1.4.9.zip",
+    "url": "https://files.pythonhosted.org/packages/0c/a1/255f40e3f34e263575ce8d66d0550ec8e1f42e468eea66eb52544abf50f8/py-1.4.9.zip",
+    "upload_time_iso_8601": "2012-06-13T15:40:56.714205Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": null,
+    "digests": {
+     "sha256": "75ad266f591624b6d8c62a99819558e1266aa043bbaf0185bb649b36f1bdded0"
+    }
+   }
+  ],
+  "1.5.1": [
+   {
+    "filename": "py-1.5.1-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/dc/c6/0ec4ab40928d292dd3da9cf91d10d54fb2a531fcc21be6a452b48687e410/py-1.5.1-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2017-11-15T14:41:47.281098Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "e6fda4487ef65a3dc89f95dc9a27141e7b0fb365a3e2c619f78288d959c7092d"
+    }
+   },
+   {
+    "filename": "py-1.5.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/56/d7/a20e836f5489f5d9d9ac7a6326ca9a1c36762dd182be5507da03a09785a9/py-1.5.1.tar.gz",
+    "upload_time_iso_8601": "2017-11-15T14:41:49.279818Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "e85aaa3c2e837413c6387eb2a4efbe7ff93658813d13986da004984ffe84b3a3"
+    }
+   }
+  ],
+  "1.5.2": [
+   {
+    "filename": "py-1.5.2-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/41/70/adacedf6cdc13700d40303f78b241f98c959e2745fdebbe56af74c08344d/py-1.5.2-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2017-11-15T23:46:26.901320Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "8cca5c229d225f8c1e3085be4fcf306090b00850fefad892f9d96c7b6e2f310f"
+    }
+   },
+   {
+    "filename": "py-1.5.2.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/90/e3/e075127d39d35f09a500ebb4a90afd10f9ef0a1d28a6d09abeec0e444fdd/py-1.5.2.tar.gz",
+    "upload_time_iso_8601": "2017-11-15T23:46:32.690294Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "ca18943e28235417756316bfada6cd96b23ce60dd532642690dcfdaba988a76d"
+    }
+   }
+  ],
+  "1.5.3": [
+   {
+    "filename": "py-1.5.3-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/67/a5/f77982214dd4c8fd104b066f249adea2c49e25e8703d284382eb5e9ab35a/py-1.5.3-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2018-03-22T10:06:50.318783Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "983f77f3331356039fdd792e9220b7b8ee1aa6bd2b25f567a963ff1de5a64f6a"
+    }
+   },
+   {
+    "filename": "py-1.5.3.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/f7/84/b4c6e84672c4ceb94f727f3da8344037b62cee960d80e999b1cd9b832d83/py-1.5.3.tar.gz",
+    "upload_time_iso_8601": "2018-03-22T10:06:52.627078Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "29c9fab495d7528e80ba1e343b958684f4ace687327e6f789a94bf3d1915f881"
+    }
+   }
+  ],
+  "1.5.4": [
+   {
+    "filename": "py-1.5.4-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/f3/bd/83369ff2dee18f22f27d16b78dd651e8939825af5f8b0b83c38729069962/py-1.5.4-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2018-06-27T11:24:19.298202Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "e31fb2767eb657cbde86c454f02e99cb846d3cd9d61b318525140214fdc0e98e"
+    }
+   },
+   {
+    "filename": "py-1.5.4.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/35/77/a0a2a4126cf454e6ac772942898379e2fe78f2b7885df0461a5b8f8a8040/py-1.5.4.tar.gz",
+    "upload_time_iso_8601": "2018-06-27T11:24:20.605631Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "3fd59af7435864e1a243790d322d763925431213b6b8529c6ca71081ace3bbf7"
+    }
+   }
+  ],
+  "1.6.0": [
+   {
+    "filename": "py-1.6.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/c8/47/d179b80ab1dc1bfd46a0c87e391be47e6c7ef5831a9c138c5c49d1756288/py-1.6.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2018-08-27T20:40:11.850153Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "50402e9d1c9005d759426988a492e0edaadb7f4e68bcddfea586bc7432d009c6"
+    }
+   },
+   {
+    "filename": "py-1.6.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/4f/38/5f427d1eedae73063ce4da680d2bae72014995f9fdeaa57809df61c968cd/py-1.6.0.tar.gz",
+    "upload_time_iso_8601": "2018-08-27T20:40:13.262719Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "06a30435d058473046be836d3fc4f27167fd84c45b99704f2fb5509ef61f9af1"
+    }
+   }
+  ],
+  "1.7.0": [
+   {
+    "filename": "py-1.7.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/3e/c7/3da685ef117d42ac8d71af525208759742dd235f8094221fdaafcd3dba8f/py-1.7.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2018-10-12T10:52:20.204518Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "e76826342cefe3c3d5f7e8ee4316b80d1dd8a300781612ddbc765c17ba25a6c6"
+    }
+   },
+   {
+    "filename": "py-1.7.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/c7/fa/eb6dd513d9eb13436e110aaeef9a1703437a8efa466ce6bb2ff1d9217ac7/py-1.7.0.tar.gz",
+    "upload_time_iso_8601": "2018-10-12T10:52:21.630545Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "bf92637198836372b520efcba9e020c330123be8ce527e535d185ed4b6f45694"
+    }
+   }
+  ],
+  "1.8.0": [
+   {
+    "filename": "py-1.8.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/76/bc/394ad449851729244a97857ee14d7cba61ddb268dce3db538ba2f2ba1f0f/py-1.8.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2019-02-22T01:34:01.536202Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "64f65755aee5b381cea27766a3a147c3f15b9b6b9ac88676de66ba2ae36793fa"
+    }
+   },
+   {
+    "filename": "py-1.8.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/f1/5a/87ca5909f400a2de1561f1648883af74345fe96349f34f737cdfc94eba8c/py-1.8.0.tar.gz",
+    "upload_time_iso_8601": "2019-02-22T01:34:03.968738Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "dc639b046a6e2cff5bbe40194ad65936d6ba360b52b3c3fe1d08a82dd50b5e53"
+    }
+   }
+  ],
+  "1.8.1": [
+   {
+    "filename": "py-1.8.1-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/99/8d/21e1767c009211a62a8e3067280bfce76e89c9f876180308515942304d2d/py-1.8.1-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2019-12-27T12:07:31.467251Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "c20fdd83a5dbc0af9efd622bee9a5564e278f6380fffcacc43ba6f43db2813b0"
+    }
+   },
+   {
+    "filename": "py-1.8.1.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/bd/8f/169d08dcac7d6e311333c96b63cbe92e7947778475e1a619b674989ba1ed/py-1.8.1.tar.gz",
+    "upload_time_iso_8601": "2019-12-27T12:07:33.782851Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "5e27081401262157467ad6e7f851b7aa402c5852dbcb3dae06768434de5752aa"
+    }
+   }
+  ],
+  "1.8.2": [
+   {
+    "filename": "py-1.8.2-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/ae/12/76710702ccf77dab01246ecb55fbe43175131c0738d0be29f3de50d31071/py-1.8.2-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2020-06-15T12:31:45.004762Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "a673fa23d7000440cc885c17dbd34fafcb7d7a6e230b29f6766400de36a33c44"
+    }
+   },
+   {
+    "filename": "py-1.8.2.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/1b/2b/396ff4b82f58c1152daf3b335999b493541a9d141bf102e22b4294b3b6aa/py-1.8.2.tar.gz",
+    "upload_time_iso_8601": "2020-06-15T12:31:46.440977Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "f3b3a4c36512a4c4f024041ab51866f11761cc169670204b235f6b20523d4e6b"
+    }
+   }
+  ],
+  "1.9.0": [
+   {
+    "filename": "py-1.9.0-py2.py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/68/0f/41a43535b52a81e4f29e420a151032d26f08b62206840c48d14b70e53376/py-1.9.0-py2.py3-none-any.whl",
+    "upload_time_iso_8601": "2020-06-25T11:26:22.126776Z",
+    "yanked": false,
+    "packagetype": "bdist_wheel",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "366389d1db726cd2fcfc79732e75410e5fe4d31db13692115529d34069a043c2"
+    }
+   },
+   {
+    "filename": "py-1.9.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/97/a6/ab9183fe08f69a53d06ac0ee8432bc0ffbb3989c575cc69b73a0229a9a99/py-1.9.0.tar.gz",
+    "upload_time_iso_8601": "2020-06-25T11:26:23.612594Z",
+    "yanked": false,
+    "packagetype": "sdist",
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+    "digests": {
+     "sha256": "9ca6883ce56b4e8da7e79ac18787889fa5206c79dcc67fb065376cd2fe03f342"
+    }
+   }
+  ]
+ }
+}
