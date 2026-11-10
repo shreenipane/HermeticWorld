@@ -45,9 +45,6 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-_atomic_write_bytes = atomic_write_bytes
-
-
 def make_http_get(
     cache_dir: Path,
     *,
