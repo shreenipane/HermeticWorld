@@ -11,9 +11,9 @@ from pathlib import Path
 import sys
 
 from hermetic_slice.http import make_http_get
-from hermetic_slice.image_sealer import _rmtree, seal_image
+from hermetic_slice.image_sealer import seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
-from hermetic_slice.repo_sealer import VerificationError, seal_repo
+from hermetic_slice.repo_sealer import VerificationError, rmtree_force, seal_repo
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     seal_images_parser = subparsers.add_parser("seal-images", help="Seal SWE-bench task images")
     seal_images_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     seal_images_parser.add_argument("--work", type=Path, required=True, help="Directory for working files")
-    seal_images_parser.add_argument("--only", nargs="*", default=None, help="Optional instance IDs to process")
+    seal_images_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
 
     try:
         args = parser.parse_args(argv)
@@ -110,19 +110,38 @@ def main(argv: list[str] | None = None) -> int:
         work_dir = args.work
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        only_set = set(args.only) if args.only is not None else None
-        task_dirs = []
-        for d in sorted(tasks_dir.iterdir()):
-            if d.is_dir() and (d / "task.json").exists():
-                if only_set is None or d.name in only_set:
-                    task_dirs.append(d)
+        if args.only is not None:
+            requested_ids: list[str] = list(args.only)
+
+            unknown_ids: list[str] = []
+            for req_id in requested_ids:
+                tdir = tasks_dir / req_id
+                if not (tdir.is_dir() and (tdir / "task.json").exists()):
+                    unknown_ids.append(req_id)
+
+            if unknown_ids:
+                for bad_id in unknown_ids:
+                    print(f"Error: Unknown or missing task directory for --only ID: {bad_id}", file=sys.stderr)
+                return 1
+
+            seen_ids = set()
+            task_dirs = []
+            for req_id in requested_ids:
+                if req_id not in seen_ids:
+                    seen_ids.add(req_id)
+                    task_dirs.append(tasks_dir / req_id)
+        else:
+            task_dirs = [
+                d for d in sorted(tasks_dir.iterdir())
+                if d.is_dir() and (d / "task.json").exists()
+            ]
 
         has_failure = False
         for tdir in task_dirs:
             instance_id = tdir.name
             task_work = work_dir / instance_id
             if task_work.exists():
-                _rmtree(task_work)
+                rmtree_force(task_work)
             task_work.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -131,12 +150,31 @@ def main(argv: list[str] | None = None) -> int:
                 head_was_base = before["head_is_base"]
                 extra_commits = len(before["extra_commits"])
                 gold_lines_count = report["gold_lines_checked"]
-                before_after_status = "unsealed→sealed"
+                status = report.get("status", "sealed")
                 sealed_image = report["sealed_image"]
-                print(f"{instance_id}  {head_was_base}  {extra_commits}  {gold_lines_count}  {before_after_status}  {sealed_image}")
+                print(f"{instance_id}  {head_was_base}  {extra_commits}  {gold_lines_count}  {status}  {sealed_image}")
             except Exception as exc:
-                print(f"Error sealing {instance_id}: {exc}", file=sys.stderr)
                 has_failure = True
+                report_file = tdir / "seal" / "report.json"
+                problems = []
+                if report_file.exists():
+                    try:
+                        rep = json.loads(report_file.read_text(encoding="utf-8"))
+                        before = rep.get("before", {})
+                        head_was_base = before.get("head_is_base", False)
+                        extra_commits = len(before.get("extra_commits", []))
+                        gold_lines_count = rep.get("gold_lines_checked", 0)
+                        status = rep.get("status", "failed")
+                        sealed_image = rep.get("sealed_image", "")
+                        problems = rep.get("problems", [])
+                        print(f"{instance_id}  {head_was_base}  {extra_commits}  {gold_lines_count}  {status}  {sealed_image}")
+                        for p in problems:
+                            print(f"  problem: {p}")
+                    except Exception:
+                        print(f"{instance_id}  False  0  0  failed  ")
+                else:
+                    print(f"{instance_id}  False  0  0  failed  ")
+                print(f"Error sealing {instance_id}: {exc}", file=sys.stderr)
 
         return 1 if has_failure else 0
 

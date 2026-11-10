@@ -25,7 +25,7 @@ class HttpError(Exception):
 HttpGet = Callable[[str], bytes]
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write data to a temp file in path's parent directory and atomically replace destination."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,6 +43,9 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             except OSError:
                 pass
         raise
+
+
+_atomic_write_bytes = atomic_write_bytes
 
 
 def make_http_get(
@@ -75,7 +78,7 @@ def make_http_get(
                     status = resp.status
                     body = resp.read()
                     if status == 200:
-                        _atomic_write_bytes(cache_file, body)
+                        atomic_write_bytes(cache_file, body)
                     return body
             except urllib.error.HTTPError as exc:
                 last_status = exc.code

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import urllib.error
 import pytest
 
-from hermetic_slice.http import HttpError, _atomic_write_bytes, make_http_get
+from hermetic_slice.http import HttpError, atomic_write_bytes, make_http_get
 
 
 def test_make_http_get_retry_and_backoff(tmp_path: Path) -> None:
@@ -125,7 +125,7 @@ def test_atomic_write_bytes_failure_leaves_no_file(tmp_path: Path) -> None:
     cache_path = tmp_path / "cache" / "sample.txt"
     with patch("os.replace", side_effect=OSError("replace failed")):
         with pytest.raises(OSError, match="replace failed"):
-            _atomic_write_bytes(cache_path, b"some content")
+            atomic_write_bytes(cache_path, b"some content")
 
     assert not cache_path.exists()
     # Ensure no partial or temporary files left in parent directory

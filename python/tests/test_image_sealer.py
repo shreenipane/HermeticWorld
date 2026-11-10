@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -41,6 +43,8 @@ def test_render_dockerfile() -> None:
         "RUN rm -rf /testbed/.git /root/.cache /root/.bash_history \\\n"
         " && (conda clean --all --yes || true)\n"
         "COPY sealed.git /testbed/.git\n"
+        "COPY restore-modes.sh /tmp/restore-modes.sh\n"
+        "RUN bash /tmp/restore-modes.sh && rm -f /tmp/restore-modes.sh\n"
     )
     assert rendered == expected
 
@@ -52,16 +56,32 @@ def test_verification_problems() -> None:
         "extra_commits": [],
         "refs_not_ancestor_of_base": 0,
         "commits_in_store_not_reachable_from_base": 0,
+        "objects_not_reachable_from_base": {"commit": 0, "tree": 0, "blob": 0, "tag": 1},
         "fix_commits_present": [],
         "remotes": [],
         "reflog_entries": 0,
         "stash_entries": 0,
         "git_meta_files_present": [],
         "tracked_modified_vs_base": 0,
-        "gold_lines_found_in_git": 0,
+        "gold_lines_found_in_unreachable": 0,
         "gold_lines_found_in_tree": 0,
     }
     assert verification_problems(clean_after) == []
+
+    # Content edits the original image already had (SWE-bench env setup) are allowed;
+    # new ones, or leftover executable-bit flips, are not.
+    with_env_edits = dict(clean_after, tracked_modified_vs_base=1,
+                          tracked_content_modified_vs_base=["tox.ini"], tracked_mode_changes_vs_base=0)
+    before_env = {"tracked_content_modified_vs_base": ["setup.py", "tox.ini"]}
+    assert verification_problems(with_env_edits, before_env) == []
+    assert verification_problems(with_env_edits) != []
+    assert verification_problems(dict(with_env_edits, tracked_content_modified_vs_base=["src/x.py"]), before_env) != []
+    assert verification_problems(dict(with_env_edits, tracked_mode_changes_vs_base=3), before_env) != []
+
+    # Tag objects unreachable from base are allowed
+    clean_with_more_tags = dict(clean_after)
+    clean_with_more_tags["objects_not_reachable_from_base"] = {"commit": 0, "tree": 0, "blob": 0, "tag": 5}
+    assert verification_problems(clean_with_more_tags) == []
 
     # Test each failing field produces at least one problem
     flaws = [
@@ -69,13 +89,17 @@ def test_verification_problems() -> None:
         ("extra_commits", [{"sha": "abc", "author": "dev", "author_date": "2024", "subject": "msg"}]),
         ("refs_not_ancestor_of_base", 1),
         ("commits_in_store_not_reachable_from_base", 2),
+        ("objects_not_reachable_from_base", {"commit": 1, "tree": 0, "blob": 0, "tag": 0}),
+        ("objects_not_reachable_from_base", {"commit": 0, "tree": 1, "blob": 0, "tag": 0}),
+        ("objects_not_reachable_from_base", {"commit": 0, "tree": 0, "blob": 1, "tag": 0}),
+        ("objects_not_reachable_from_base", {"commit": 0, "tree": 0, "blob": 0, "tag": 0, "unexpected": 1}),
         ("fix_commits_present", ["deadbeef"]),
         ("remotes", ["origin"]),
         ("reflog_entries", 3),
         ("stash_entries", 1),
         ("git_meta_files_present", ["ORIG_HEAD"]),
         ("tracked_modified_vs_base", 1),
-        ("gold_lines_found_in_git", 1),
+        ("gold_lines_found_in_unreachable", 1),
         ("gold_lines_found_in_tree", 1),
     ]
 
@@ -84,6 +108,129 @@ def test_verification_problems() -> None:
         bad_after[key] = bad_val
         problems = verification_problems(bad_after)
         assert len(problems) >= 1, f"Expected verification problem for failing field {key}={bad_val!r}"
+
+
+def test_gold_lines_no_staging_fallback(tmp_path: Path) -> None:
+    """Test gold_lines ignores patches in task_dir root and does not fall back (H6)."""
+    repo_dir = tmp_path / "test_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    (repo_dir / "base.py").write_text("print('base')\n", encoding="utf-8")
+    run_git(["add", "base.py"], cwd=repo_dir)
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "base commit"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+    base_sha = run_git(["rev-parse", "HEAD"], cwd=repo_dir).decode("ascii").strip()
+
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    # Write a patch in task_dir root (which would be used under the old fallback)
+    (task_dir / "test.patch").write_text("+should_not_be_loaded_from_task_root\n", encoding="utf-8")
+
+    # Staging dir exists but test.patch is missing
+    staging_dir = task_dir / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "gold.patch").write_text("+gold_secret_line_twelve_chars\n", encoding="utf-8")
+
+    result = gold_lines(task_dir, repo_dir, base_sha)
+    assert "should_not_be_loaded_from_task_root" not in result
+    assert "gold_secret_line_twelve_chars" in result
+
+
+def test_cli_only_append_multiple(tmp_path: Path) -> None:
+    """Test --only action=append handles multiple --only flags (H3)."""
+    tasks_dir = tmp_path / "tasks"
+    work_dir = tmp_path / "work"
+    for name in ["task-alpha", "task-beta", "task-gamma"]:
+        td = tasks_dir / name
+        td.mkdir(parents=True, exist_ok=True)
+        (td / "task.json").write_text('{"instance_id": "' + name + '"}', encoding="utf-8")
+
+    with patch("hermetic_slice.__main__.seal_image") as mock_seal:
+        mock_seal.return_value = {
+            "before": {"head_is_base": True, "extra_commits": []},
+            "gold_lines_checked": 0,
+            "status": "sealed",
+            "sealed_image": "mock:sealed",
+        }
+        code = main([
+            "seal-images",
+            "--tasks-dir", str(tasks_dir),
+            "--work", str(work_dir),
+            "--only", "task-alpha",
+            "--only", "task-beta",
+        ])
+        assert code == 0
+        assert mock_seal.call_count == 2
+        called_names = [call[0][0].name for call in mock_seal.call_args_list]
+        assert called_names == ["task-alpha", "task-beta"]
+
+
+def test_cli_only_unknown_id(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Test --only with unknown ID prints error naming the ID and exits 1 (H7)."""
+    tasks_dir = tmp_path / "tasks"
+    work_dir = tmp_path / "work"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    code = main([
+        "seal-images",
+        "--tasks-dir", str(tasks_dir),
+        "--work", str(work_dir),
+        "--only", "does-not-exist",
+    ])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "does-not-exist" in captured.err
+
+
+def test_cli_status_column_and_problems_on_failure(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Test CLI status column prints ASCII status and lists problems on failure (H4)."""
+    tasks_dir = tmp_path / "tasks"
+    work_dir = tmp_path / "work"
+
+    for name in ["task_ok", "task_fail"]:
+        td = tasks_dir / name
+        td.mkdir(parents=True, exist_ok=True)
+        (td / "task.json").write_text('{"instance_id": "' + name + '"}', encoding="utf-8")
+
+    def fake_seal_image(tdir: Path, work_dir: Path, **kwargs) -> dict:
+        if tdir.name == "task_ok":
+            return {
+                "before": {"head_is_base": True, "extra_commits": []},
+                "gold_lines_checked": 10,
+                "status": "sealed",
+                "sealed_image": "hermetic/task_ok:sealed",
+            }
+        else:
+            seal_dir = tdir / "seal"
+            seal_dir.mkdir(parents=True, exist_ok=True)
+            report = {
+                "before": {"head_is_base": False, "extra_commits": ["abc"]},
+                "gold_lines_checked": 5,
+                "status": "failed",
+                "sealed_image": "hermetic/task_fail:sealed",
+                "problems": ["gold lines leaked in unreachable", "extra commit present"],
+            }
+            (seal_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            raise ImageSealError("Sealed image verification failed:\n" + "\n".join(report["problems"]))
+
+    with patch("hermetic_slice.__main__.seal_image", side_effect=fake_seal_image):
+        code = main([
+            "seal-images",
+            "--tasks-dir", str(tasks_dir),
+            "--work", str(work_dir),
+        ])
+        assert code == 1
+
+    captured = capsys.readouterr()
+    captured.out.encode("ascii")
+    assert "→" not in captured.out
+    assert "task_ok  True  0  10  sealed  hermetic/task_ok:sealed" in captured.out
+    assert "task_fail  False  1  5  failed  hermetic/task_fail:sealed" in captured.out
+    assert "problem: gold lines leaked in unreachable" in captured.out
+    assert "problem: extra commit present" in captured.out
 
 
 def test_gold_lines(tmp_path: Path) -> None:
@@ -162,6 +309,7 @@ def test_gold_lines(tmp_path: Path) -> None:
 
 FAKE_IMAGE_TAG = "hermetic-test/fake-swebench:latest"
 DISTINCTIVE_DANGLING_LINE = "SECRET_DISTINCTIVE_DANGLING_LINE_987654"
+PRE_BASE_SECRET_LINE = "SECRET_PRE_BASE_HISTORIC_LINE_12345"
 
 
 @pytest.fixture(scope="module")
@@ -183,15 +331,16 @@ def fake_swebench_image(tmp_path_factory: pytest.TempPathFactory):
     d3 = "2024-01-03T00:00:00Z"
     d_swe = "2026-08-13T00:00:00Z"
 
-    # c1
-    (repo_dir / "file1.txt").write_text("file 1 content\n", encoding="utf-8")
+    # c1: contains pre_base_line
+    (repo_dir / "file1.txt").write_text(f"file 1 content\n{PRE_BASE_SECRET_LINE}\n", encoding="utf-8")
     run_git(["add", "file1.txt"], cwd=repo_dir)
     run_git(["commit", "-m", "commit c1"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d1, "GIT_COMMITTER_DATE": d1})
     c1 = run_git(["rev-parse", "HEAD"], cwd=repo_dir).decode("ascii").strip()
 
-    # c2
+    # c2: pre_base_line removed
+    (repo_dir / "file1.txt").write_text("file 1 content\n", encoding="utf-8")
     (repo_dir / "file2.txt").write_text("file 2 content\n", encoding="utf-8")
-    run_git(["add", "file2.txt"], cwd=repo_dir)
+    run_git(["add", "file1.txt", "file2.txt"], cwd=repo_dir)
     run_git(["commit", "-m", "commit c2"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d2, "GIT_COMMITTER_DATE": d2})
     c2 = run_git(["rev-parse", "HEAD"], cwd=repo_dir).decode("ascii").strip()
 
@@ -216,9 +365,14 @@ def fake_swebench_image(tmp_path_factory: pytest.TempPathFactory):
         env={"GIT_AUTHOR_DATE": d3, "GIT_COMMITTER_DATE": d3},
     )
 
-    # SWE-bench commit on top of c3 with 2026 date (HEAD != base)
+    # SWE-bench commit on top of c3 with 2026 date (HEAD != base). Like the real
+    # django/sympy/astropy images, it flips tracked files to 100755 with no
+    # content change.
+    for name in ("file1.txt", "file2.txt"):
+        os.chmod(repo_dir / name, 0o755)
+        run_git(["update-index", "--chmod=+x", name], cwd=repo_dir)
     run_git(
-        ["commit", "--allow-empty", "-m", "SWE-bench"],
+        ["commit", "-m", "SWE-bench"],
         cwd=repo_dir,
         env={"GIT_AUTHOR_DATE": d_swe, "GIT_COMMITTER_DATE": d_swe},
     )
@@ -244,6 +398,7 @@ def fake_swebench_image(tmp_path_factory: pytest.TempPathFactory):
         "c2": c2,
         "c3_base": c3_base,
         "distinctive_line": DISTINCTIVE_DANGLING_LINE,
+        "pre_base_line": PRE_BASE_SECRET_LINE,
     }
 
     # Teardown: remove images
@@ -256,13 +411,14 @@ def test_measure_fake_image(fake_swebench_image: dict) -> None:
     image = fake_swebench_image["image"]
     c3_base = fake_swebench_image["c3_base"]
     distinctive_line = fake_swebench_image["distinctive_line"]
+    pre_base_line = fake_swebench_image["pre_base_line"]
 
     task = {
         "base_commit": c3_base,
         "dates": {"fix_commits": []},
     }
 
-    report = measure(image, task, lines=[distinctive_line])
+    report = measure(image, task, lines=[distinctive_line, pre_base_line])
 
     # head_is_base is false
     assert report["head_is_base"] is False
@@ -275,8 +431,11 @@ def test_measure_fake_image(fake_swebench_image: dict) -> None:
     # the reflog is non-empty
     assert report["reflog_entries"] > 0
 
-    # gold_lines_found_in_git >= 1
-    assert report["gold_lines_found_in_git"] >= 1
+    # gold_lines_found_in_unreachable >= 1
+    assert report["gold_lines_found_in_unreachable"] >= 1
+
+    # The SWE-bench commit's mode flips show as changes against the base
+    assert report["tracked_modified_vs_base"] == 2
 
 
 @pytest.mark.docker
@@ -287,6 +446,7 @@ def test_seal_image_end_to_end(tmp_path: Path, fake_swebench_image: dict) -> Non
     c2 = fake_swebench_image["c2"]
     c3_base = fake_swebench_image["c3_base"]
     distinctive_line = fake_swebench_image["distinctive_line"]
+    pre_base_line = fake_swebench_image["pre_base_line"]
 
     instance_id = "test-fake__task-1"
     task_dir = tmp_path / "tasks" / instance_id
@@ -310,9 +470,10 @@ def test_seal_image_end_to_end(tmp_path: Path, fake_swebench_image: dict) -> Non
 
     test_patch_text = f"""--- a/file3.txt
 +++ b/file3.txt
-@@ -1 +1,2 @@
+@@ -1 +1,3 @@
  file 3 content
 +{distinctive_line}
++{pre_base_line}
 """
     (staging_dir / "test.patch").write_text(test_patch_text, encoding="utf-8")
 
@@ -334,8 +495,22 @@ def test_seal_image_end_to_end(tmp_path: Path, fake_swebench_image: dict) -> Non
         assert saved_report["schema"] == "hermetic-slice-seal/v1"
         assert saved_report["instance_id"] == instance_id
         assert saved_report["sealed_image"] == sealed_tag
-        assert saved_report["gold_lines_checked"] == 1
-        assert saved_report["after"]["gold_lines_found_in_git"] == 0
+        assert saved_report["status"] == "sealed"
+        assert saved_report["problems"] == []
+        assert saved_report["gold_lines_checked"] == 2
+        assert saved_report["after"]["gold_lines_found_in_unreachable"] == 0
+
+        # Modes flipped by the SWE-bench commit are restored from the base tree
+        assert saved_report["before"]["tracked_modified_vs_base"] == 2
+        assert saved_report["before"]["tracked_mode_changes_vs_base"] == 2
+        assert saved_report["before"]["tracked_content_modified_vs_base"] == []
+        assert saved_report["after"]["tracked_modified_vs_base"] == 0
+        assert saved_report["after"]["tracked_mode_changes_vs_base"] == 0
+        modes_out = run_docker([
+            "run", "--rm", "--network", "none", "--entrypoint", "/bin/bash", sealed_tag,
+            "-c", "cd /testbed && stat -c '%a %n' file1.txt file2.txt file3.txt && git status --porcelain",
+        ]).decode("utf-8")
+        assert modes_out.splitlines() == ["644 file1.txt", "644 file2.txt", "644 file3.txt"]
 
         # Running git log --all --format=%H inside the sealed image shows exactly c3, c2 and c1
         git_log_out = run_docker([
@@ -349,6 +524,51 @@ def test_seal_image_end_to_end(tmp_path: Path, fake_swebench_image: dict) -> Non
         ])
         commits = [s.strip() for s in git_log_out.decode("ascii").splitlines() if s.strip()]
         assert commits == [c3_base, c2, c1]
+    finally:
+        run_docker(["rmi", "-f", sealed_tag], check=False)
+
+
+@pytest.mark.docker
+def test_seal_image_failure_writes_report(tmp_path: Path, fake_swebench_image: dict) -> None:
+    """Test that a failed seal writes report.json with status failed and raises ImageSealError (H2)."""
+    image = fake_swebench_image["image"]
+    c3_base = fake_swebench_image["c3_base"]
+    distinctive_line = fake_swebench_image["distinctive_line"]
+
+    instance_id = "test-fail__task-1"
+    task_dir = tmp_path / "tasks" / instance_id
+    staging_dir = task_dir / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    task_json_data = {
+        "base_commit": c3_base,
+        "cutoffs": {
+            "t_clock": "2024-01-05T00:00:00Z",
+            "t_world": "2024-01-04T00:00:00Z",
+        },
+        "dates": {"fix_commits": []},
+        "image": image,
+        "instance_id": instance_id,
+        "schema": "hermetic-slice-task/v1",
+    }
+    (task_dir / "task.json").write_text(json.dumps(task_json_data, indent=2), encoding="utf-8")
+    (staging_dir / "test.patch").write_text(f"+{distinctive_line}\n", encoding="utf-8")
+
+    work_dir = tmp_path / "work" / instance_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    sealed_tag = f"hermetic/{instance_id.lower()}:sealed"
+
+    try:
+        with patch("hermetic_slice.image_sealer.verification_problems", return_value=["Simulated verification failure"]):
+            with pytest.raises(ImageSealError) as exc_info:
+                seal_image(task_dir, work_dir, tag=sealed_tag)
+            assert "Simulated verification failure" in str(exc_info.value)
+
+        report_file = task_dir / "seal" / "report.json"
+        assert report_file.exists()
+        saved_report = json.loads(report_file.read_text(encoding="utf-8"))
+        assert saved_report["status"] == "failed"
+        assert saved_report["problems"] == ["Simulated verification failure"]
     finally:
         run_docker(["rmi", "-f", sealed_tag], check=False)
 
@@ -392,6 +612,9 @@ def test_cli_seal_images(tmp_path: Path, fake_swebench_image: dict) -> None:
             "--only", instance_id,
         ])
         assert ret == 0
-        assert (task_dir / "seal" / "report.json").exists()
+        report_file = task_dir / "seal" / "report.json"
+        assert report_file.exists()
+        saved_report = json.loads(report_file.read_text(encoding="utf-8"))
+        assert saved_report["status"] == "sealed"
     finally:
         run_docker(["rmi", "-f", sealed_tag], check=False)

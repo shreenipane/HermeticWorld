@@ -35,14 +35,16 @@ class SealReport:
 
 def _make_writable_and_retry(func, path, _exc):
     try:
-        os.chmod(path, stat.S_IWRITE)
+        os.chmod(path, stat.S_IRWXU)  # S_IWRITE alone would strip r/x from directories on POSIX
         func(path)
     except OSError:
         pass
 
 
-def _rmtree(path: Path) -> None:
+def rmtree_force(path: Path) -> None:
     """Remove a directory tree, clearing read-only flags and retrying on failure."""
+    if not path.exists():
+        return
     if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:
@@ -55,10 +57,10 @@ def _clean_directory(path: Path) -> None:
         return
     for item in list(path.iterdir()):
         if item.is_dir():
-            _rmtree(item)
+            rmtree_force(item)
         else:
             try:
-                os.chmod(item, stat.S_IWRITE)
+                os.chmod(item, stat.S_IRWXU)
                 item.unlink()
             except OSError:
                 pass
@@ -233,7 +235,7 @@ def seal_repo(
     except BaseException as exc:
         if not dest_existed:
             if dest.exists():
-                _rmtree(dest)
+                rmtree_force(dest)
             if dest.exists():
                 exc.add_note(f"cleanup incomplete: {dest}")
         else:

@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime
 import json
-import os
 from pathlib import Path
 import shutil
-import stat
-import sys
 
 from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.dockerutil import run_docker
 from hermetic_slice.gitutil import run_git
-from hermetic_slice.repo_sealer import SealReport, seal_repo
+from hermetic_slice.repo_sealer import SealReport, rmtree_force, seal_repo
 
 
 class ImageSealError(Exception):
@@ -110,19 +107,35 @@ for l in refs_out.splitlines():
     if target not in base_ancestors:
         refs_not_ancestor_of_base += 1
 
-# commits in store vs reachable
+# base reachable objects
+base_reachable_objects = set()
+if base:
+    code, rev_obj_out, _ = run_git_cmd("rev-list", "--objects", "--no-object-names", base)
+    if code == 0:
+        base_reachable_objects = {l.strip() for l in rev_obj_out.decode("ascii", "replace").splitlines() if l.strip()}
+
+# objects in store vs reachable
 cat_out = git_stdout("cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)").decode("ascii", "replace")
+objects_not_reachable_from_base = {
+    "commit": 0,
+    "tree": 0,
+    "blob": 0,
+    "tag": 0,
+}
+unreachable_shas_to_scan = []
 store_commits = set()
-all_blob_shas = []
 for l in cat_out.splitlines():
     parts = l.strip().split()
     if len(parts) >= 2:
-        if parts[1] == "commit":
-            store_commits.add(parts[0])
-        elif parts[1] == "blob":
-            all_blob_shas.append(parts[0])
+        sha, otype = parts[0], parts[1]
+        if otype == "commit":
+            store_commits.add(sha)
+        if sha not in base_reachable_objects:
+            objects_not_reachable_from_base[otype] = objects_not_reachable_from_base.get(otype, 0) + 1
+            if otype in ("blob", "commit", "tag"):
+                unreachable_shas_to_scan.append(sha)
 
-commits_in_store_not_reachable_from_base = len(store_commits - base_ancestors) if base else len(store_commits)
+commits_in_store_not_reachable_from_base = objects_not_reachable_from_base.get("commit", 0) if base else len(store_commits)
 
 # fix_commits_present
 fix_commits_present = []
@@ -168,39 +181,68 @@ git_meta_files_present = meta_present
 if base:
     diff_out = git_stdout("diff", "--name-only", base).decode("utf-8", "replace")
     tracked_modified_vs_base = len([l for l in diff_out.splitlines() if l.strip()])
+    # Split into content edits and executable-bit-only flips. SWE-bench's env
+    # setup edits some files on purpose (version pins in setup.py, -rA in
+    # tox.ini); those are kept. Mode flips are restored by the sealer.
+    # numstat, not core.fileMode=false: the index may itself carry the flipped
+    # modes. A mode-only change is "0<TAB>0<TAB>path".
+    numstat_out = git_stdout("diff", "--no-renames", "--numstat", base).decode("utf-8", "replace")
+    tracked_content_modified_vs_base = sorted(
+        parts[2] for parts in (l.split("\t", 2) for l in numstat_out.splitlines())
+        if len(parts) == 3 and (parts[0], parts[1]) != ("0", "0")
+    )
+    summary_out = git_stdout("diff", "--summary", base).decode("utf-8", "replace")
+    tracked_mode_changes_vs_base = sum(1 for l in summary_out.splitlines() if l.strip().startswith("mode change"))
 else:
     tracked_modified_vs_base = 0
+    tracked_content_modified_vs_base = []
+    tracked_mode_changes_vs_base = 0
 
-# gold_lines_found_in_git
-found_in_git = set()
-if gold_lines_set and all_blob_shas:
+# gold_lines_found_in_unreachable (streaming git cat-file --batch)
+found_in_unreachable = set()
+if gold_lines_set and unreachable_shas_to_scan:
     p = subprocess.Popen(
         ["git", "-C", "/testbed", "cat-file", "--batch"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
     )
-    in_bytes = b"\n".join(s.encode("ascii") for s in all_blob_shas) + b"\n"
-    stdout_data, _ = p.communicate(input=in_bytes)
-    idx = 0
-    total_len = len(stdout_data)
-    while idx < total_len and len(found_in_git) < len(gold_lines_set):
-        newline_idx = stdout_data.find(b"\n", idx)
-        if newline_idx == -1:
-            break
-        header = stdout_data[idx:newline_idx].decode("ascii", "replace")
-        idx = newline_idx + 1
-        parts = header.split()
-        if len(parts) >= 3 and parts[1] == "blob":
-            size = int(parts[2])
-            content = stdout_data[idx:idx + size]
-            idx += size + 1
-            for bline in content.splitlines():
-                stripped = bline.strip().decode("utf-8", "ignore")
-                if stripped in gold_lines_set:
-                    found_in_git.add(stripped)
-        else:
-            break
-gold_lines_found_in_git = len(found_in_git)
+    try:
+        for sha in unreachable_shas_to_scan:
+            if len(found_in_unreachable) == len(gold_lines_set):
+                break
+            p.stdin.write(sha.encode("ascii") + b"\n")
+            p.stdin.flush()
+            header = p.stdout.readline()
+            if not header:
+                break
+            parts = header.split()
+            if len(parts) >= 3:
+                size = int(parts[2])
+                to_read = size + 1
+                chunks = []
+                while to_read > 0:
+                    chunk = p.stdout.read(to_read)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    to_read -= len(chunk)
+                content = b"".join(chunks)
+                data = content[:size]
+                for bline in data.splitlines():
+                    stripped = bline.strip().decode("utf-8", "ignore")
+                    if stripped in gold_lines_set:
+                        found_in_unreachable.add(stripped)
+            # "<sha> missing" carries no body: skip it and keep scanning.
+    finally:
+        try:
+            if p.stdin:
+                p.stdin.close()
+            if p.stdout:
+                p.stdout.close()
+            p.wait()
+        except OSError:
+            pass
+gold_lines_found_in_unreachable = len(found_in_unreachable)
 
 # gold_lines_found_in_tree
 found_in_tree = set()
@@ -262,13 +304,16 @@ result = {
     "refs_total": refs_total,
     "refs_not_ancestor_of_base": refs_not_ancestor_of_base,
     "commits_in_store_not_reachable_from_base": commits_in_store_not_reachable_from_base,
+    "objects_not_reachable_from_base": objects_not_reachable_from_base,
     "fix_commits_present": fix_commits_present,
     "remotes": remotes,
     "reflog_entries": reflog_entries,
     "stash_entries": stash_entries,
     "git_meta_files_present": git_meta_files_present,
     "tracked_modified_vs_base": tracked_modified_vs_base,
-    "gold_lines_found_in_git": gold_lines_found_in_git,
+    "tracked_content_modified_vs_base": tracked_content_modified_vs_base,
+    "tracked_mode_changes_vs_base": tracked_mode_changes_vs_base,
+    "gold_lines_found_in_unreachable": gold_lines_found_in_unreachable,
     "gold_lines_found_in_tree": gold_lines_found_in_tree,
     "newest_mtime": newest_mtime,
     "cache_sizes": cache_sizes,
@@ -278,24 +323,6 @@ EOF_PYTHON
 
 exec "$PY_BIN" /tmp/measure_inner.py
 '''
-
-
-def _make_writable_and_retry(func, path, _exc):
-    try:
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-    except OSError:
-        pass
-
-
-def _rmtree(path: Path) -> None:
-    """Remove a directory tree, clearing read-only flags and retrying on failure."""
-    if not path.exists():
-        return
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_make_writable_and_retry)
-    else:
-        shutil.rmtree(path, onerror=_make_writable_and_retry)
 
 
 def gold_lines(task_dir: Path, sealed_repo: Path, base: str) -> list[str]:
@@ -310,11 +337,7 @@ def gold_lines(task_dir: Path, sealed_repo: Path, base: str) -> list[str]:
 
     for p in patch_paths:
         if not p.exists():
-            fallback = task_dir / p.name
-            if fallback.exists():
-                p = fallback
-            else:
-                continue
+            continue
         text = p.read_text(encoding="utf-8", errors="replace")
         for line in text.splitlines():
             if line.startswith("+") and not line.startswith("+++"):
@@ -392,6 +415,30 @@ def measure(image: str, task: dict, lines: list[str]) -> dict:
     return json.loads(stdout.decode("utf-8"))
 
 
+# SWE-bench's extra HEAD commit flips every tracked file to 100755 in many images
+# (django, sympy, astropy, ...): content equals the base, only the executable bit
+# differs. With HEAD reset to the base, `git status` would list thousands of
+# changes, so restore each tracked file's mode from the base tree. Content is
+# never touched.
+RESTORE_MODES_SH = r"""#!/bin/bash
+set -euo pipefail
+cd /testbed
+: > /tmp/hermetic-644; : > /tmp/hermetic-755
+git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
+  mode=${entry%% *}
+  path=${entry#*$'\t'}
+  case "$mode" in
+    100644) printf '%s\0' "$path" >> /tmp/hermetic-644 ;;
+    100755) printf '%s\0' "$path" >> /tmp/hermetic-755 ;;
+  esac
+done
+xargs -0 -r chmod a-x -- < /tmp/hermetic-644
+xargs -0 -r chmod a+x -- < /tmp/hermetic-755
+rm -f /tmp/hermetic-644 /tmp/hermetic-755
+git update-index -q --refresh || true
+"""
+
+
 def render_dockerfile(image: str) -> str:
     """Render Dockerfile text for building the sealed image."""
     return (
@@ -399,10 +446,12 @@ def render_dockerfile(image: str) -> str:
         "RUN rm -rf /testbed/.git /root/.cache /root/.bash_history \\\n"
         " && (conda clean --all --yes || true)\n"
         "COPY sealed.git /testbed/.git\n"
+        "COPY restore-modes.sh /tmp/restore-modes.sh\n"
+        "RUN bash /tmp/restore-modes.sh && rm -f /tmp/restore-modes.sh\n"
     )
 
 
-def verification_problems(after: dict) -> list[str]:
+def verification_problems(after: dict, before: dict | None = None) -> list[str]:
     """Verify after report meets all hermetic sealing requirements."""
     problems: list[str] = []
     if not after.get("head_is_base"):
@@ -413,6 +462,13 @@ def verification_problems(after: dict) -> list[str]:
         problems.append(f"refs_not_ancestor_of_base is {after.get('refs_not_ancestor_of_base')}")
     if after.get("commits_in_store_not_reachable_from_base", 0) != 0:
         problems.append(f"commits_in_store_not_reachable_from_base is {after.get('commits_in_store_not_reachable_from_base')}")
+    unreachable_objs = after.get("objects_not_reachable_from_base", {})
+    for otype in ("commit", "tree", "blob"):
+        if unreachable_objs.get(otype, 0) != 0:
+            problems.append(f"unreachable {otype} objects present: {unreachable_objs.get(otype)}")
+    for otype, count in unreachable_objs.items():
+        if otype not in ("commit", "tree", "blob", "tag") and count != 0:
+            problems.append(f"unreachable unexpected {otype} objects present: {count}")
     if after.get("fix_commits_present") != []:
         problems.append(f"fix_commits_present is not empty: {after.get('fix_commits_present')}")
     if after.get("remotes"):
@@ -423,10 +479,21 @@ def verification_problems(after: dict) -> list[str]:
         problems.append(f"stash entries present: {after.get('stash_entries')}")
     if after.get("git_meta_files_present") != []:
         problems.append(f"git_meta_files_present is not empty: {after.get('git_meta_files_present')}")
-    if after.get("tracked_modified_vs_base", 0) != 0:
-        problems.append(f"tracked_modified_vs_base is {after.get('tracked_modified_vs_base')}")
-    if after.get("gold_lines_found_in_git", 0) != 0:
-        problems.append(f"gold_lines_found_in_git is {after.get('gold_lines_found_in_git')}")
+    if after.get("tracked_mode_changes_vs_base", 0) != 0:
+        problems.append(f"tracked_mode_changes_vs_base is {after.get('tracked_mode_changes_vs_base')}")
+    content_modified = after.get("tracked_content_modified_vs_base")
+    if content_modified is None:
+        if after.get("tracked_modified_vs_base", 0) != 0:
+            problems.append(f"tracked_modified_vs_base is {after.get('tracked_modified_vs_base')}")
+    else:
+        # Content edits already in the original image (SWE-bench's env setup) are
+        # allowed; anything else means the seal changed the tree.
+        allowed = set((before or {}).get("tracked_content_modified_vs_base") or [])
+        extra = sorted(set(content_modified) - allowed)
+        if extra:
+            problems.append(f"tracked files modified vs base that the original image did not modify: {extra[:20]}")
+    if after.get("gold_lines_found_in_unreachable", 0) != 0:
+        problems.append(f"gold_lines_found_in_unreachable is {after.get('gold_lines_found_in_unreachable')}")
     if after.get("gold_lines_found_in_tree", 0) != 0:
         problems.append(f"gold_lines_found_in_tree is {after.get('gold_lines_found_in_tree')}")
     return problems
@@ -450,11 +517,13 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
     context_dir = work_dir / "context"
 
     if orig_dir.exists():
-        _rmtree(orig_dir)
+        rmtree_force(orig_dir)
     if sealed_dir.exists():
-        _rmtree(sealed_dir)
+        rmtree_force(sealed_dir)
     if context_dir.exists():
-        _rmtree(context_dir)
+        rmtree_force(context_dir)
+    # A report left by an earlier run must not be read as this run's result.
+    (task_dir / "seal" / "report.json").unlink(missing_ok=True)
 
     orig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -476,6 +545,7 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
     context_dir.mkdir(parents=True, exist_ok=True)
     df_content = render_dockerfile(image)
     (context_dir / "Dockerfile").write_text(df_content, encoding="utf-8", newline="\n")
+    (context_dir / "restore-modes.sh").write_text(RESTORE_MODES_SH, encoding="utf-8", newline="\n")
     shutil.copytree(sealed_dir / ".git", context_dir / "sealed.git")
 
     sealed_tag = tag or f"hermetic/{instance_id.lower()}:sealed"
@@ -483,14 +553,15 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
 
     # Step 6: Verify sealed image
     after = measure(sealed_tag, task, lines)
-    problems = verification_problems(after)
-    if problems:
-        raise ImageSealError("Sealed image verification failed:\n" + "\n".join(problems))
+    problems = verification_problems(after, before)
 
-    # Step 7: Write report.json
-    inspect_out = run_docker(["image", "inspect", sealed_tag])
-    inspect_data = json.loads(inspect_out.decode("utf-8"))
-    sealed_image_id = inspect_data[0]["Id"]
+    # Step 7: Write report.json (always written before potential raise)
+    try:
+        inspect_out = run_docker(["image", "inspect", sealed_tag])
+        inspect_data = json.loads(inspect_out.decode("utf-8"))
+        sealed_image_id = inspect_data[0]["Id"]
+    except Exception:
+        sealed_image_id = ""
 
     notes = [
         "file mtimes not normalised (Phase 0, clock: real)",
@@ -498,7 +569,14 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
     ]
     if len(lines) == 0:
         notes.append("no checkable gold/test lines after baseline subtraction")
+    kept_edits = after.get("tracked_content_modified_vs_base") or []
+    if kept_edits:
+        notes.append(
+            "kept SWE-bench env-setup edits to tracked files (present in the original image, "
+            f"checked for gold lines): {', '.join(kept_edits)}"
+        )
 
+    status = "failed" if problems else "sealed"
     report_data = {
         "after": after,
         "before": before,
@@ -506,10 +584,12 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
         "instance_id": instance_id,
         "notes": notes,
         "original_image": image,
+        "problems": problems,
         "schema": "hermetic-slice-seal/v1",
         "seal_report": asdict(seal_report),
         "sealed_image": sealed_tag,
         "sealed_image_id": sealed_image_id,
+        "status": status,
     }
 
     seal_out_dir = task_dir / "seal"
@@ -519,5 +599,8 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
         encoding="utf-8",
         newline="\n",
     )
+
+    if problems:
+        raise ImageSealError("Sealed image verification failed:\n" + "\n".join(problems))
 
     return report_data

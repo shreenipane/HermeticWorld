@@ -13,7 +13,7 @@ import urllib.parse
 
 from hermetic_slice.cutoffs import Cutoffs, FixCommit, compute_cutoffs, ensure_utc
 from hermetic_slice.gitutil import GitError, run_git
-from hermetic_slice.http import HttpError, HttpGet, _atomic_write_bytes
+from hermetic_slice.http import HttpError, HttpGet, atomic_write_bytes
 
 
 class IntakeError(Exception):
@@ -109,7 +109,7 @@ def load_verified(http_get: HttpGet, cache_dir: Path) -> dict[str, dict]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     sorted_rows = sorted(rows_collected.values(), key=lambda r: r["instance_id"])
     content_bytes = "".join(json.dumps(r, sort_keys=True) + "\n" for r in sorted_rows).encode("utf-8")
-    _atomic_write_bytes(cache_file, content_bytes)
+    atomic_write_bytes(cache_file, content_bytes)
 
     return rows_collected
 

@@ -394,9 +394,9 @@ def test_cleanup_incomplete_note(tmp_path: Path) -> None:
     synth = build_intake_synthetic_repo(tmp_path)
     dest = tmp_path / "stubborn_dest"
 
-    # Inject verification failure and patch _rmtree to fail to delete dest
+    # Inject verification failure and patch rmtree_force to fail to delete dest
     with patch("hermetic_slice.repo_sealer.verify_sealed_repo", return_value=["Injected failure"]):
-        with patch("hermetic_slice.repo_sealer._rmtree", side_effect=lambda p: None):
+        with patch("hermetic_slice.repo_sealer.rmtree_force", side_effect=lambda p: None):
             with pytest.raises(VerificationError) as exc_info:
                 seal_repo(
                     src=synth.path,
