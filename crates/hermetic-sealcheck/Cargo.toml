@@ -1,0 +1,23 @@
+[package]
+name = "hermetic-sealcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hermetic-sealcheck"
+path = "src/main.rs"
+
+[dependencies]
+hermetic-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+walkdir = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
