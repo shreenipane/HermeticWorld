@@ -639,15 +639,22 @@ def oracle_check(
     gold_resolved = bool(gold_grade.get("resolved", False))
     empty_f2p_success = empty_grade.get("f2p", {}).get("success", [])
     empty_f2p_all_fail = (len(empty_f2p_success) == 0)
+    empty_f2p_failures = empty_grade.get("f2p", {}).get("failure", [])
 
     empty_p2p_failures = empty_grade.get("p2p", {}).get("failure", [])
     gold_f2p_failures = gold_grade.get("f2p", {}).get("failure", [])
     gold_p2p_failures = gold_grade.get("p2p", {}).get("failure", [])
 
-    oracle_ok = bool(gold_resolved and empty_f2p_all_fail)
+    # Some upstream FAIL_TO_PASS lists include tests that already pass without the fix
+    # (django__django-11099 lists test_help_text). The task still discriminates as long as
+    # the empty patch is not resolved; those tests are recorded, not hidden.
+    empty_resolved = bool(empty_grade.get("resolved", False))
+    oracle_ok = bool(gold_resolved and not empty_resolved and empty_f2p_failures)
 
     oracle_result = {
         "empty_f2p_all_fail": empty_f2p_all_fail,
+        "empty_resolved": empty_resolved,
+        "f2p_pass_without_fix": sorted(empty_f2p_success),
         "empty_p2p_failures": empty_p2p_failures,
         "gold_f2p_failures": gold_f2p_failures,
         "gold_p2p_failures": gold_p2p_failures,

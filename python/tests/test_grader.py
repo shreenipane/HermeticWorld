@@ -501,3 +501,37 @@ def test_docker_grade_and_oracle_integration(tmp_path: Path, docker_test_env: di
     assert oracle_res["gold_resolved"] is True
     assert oracle_res["empty_f2p_all_fail"] is True
     assert (task_dir / "oracle" / "oracle.json").exists()
+
+
+def _fake_grades(monkeypatch, gold: dict, empty: dict) -> None:
+    import hermetic_slice.grader as grader_mod
+
+    def fake_grade(task_dir, patch_text, *, image, out_dir, timeout=1800):
+        return gold if patch_text else empty
+
+    monkeypatch.setattr(grader_mod, "grade", fake_grade)
+
+
+@pytest.mark.parametrize(
+    ("empty_f2p", "empty_resolved", "expected_ok"),
+    [
+        ({"success": [], "failure": ["a", "b"]}, False, True),
+        # django__django-11099: one listed FAIL_TO_PASS test already passes without the fix.
+        ({"success": ["help"], "failure": ["a", "b"]}, False, True),
+        ({"success": ["a", "b"], "failure": []}, False, False),
+        ({"success": ["a", "b"], "failure": []}, True, False),
+    ],
+)
+def test_oracle_check_f2p_passing_without_fix(tmp_path, monkeypatch, empty_f2p, empty_resolved, expected_ok):
+    task_dir = tmp_path / "task"
+    (task_dir / "staging").mkdir(parents=True)
+    (task_dir / "staging" / "gold.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+    gold = {"resolved": True, "f2p": {"success": ["a", "b", "help"], "failure": []}, "p2p": {"failure": []}}
+    empty = {"resolved": empty_resolved, "f2p": empty_f2p, "p2p": {"failure": []}}
+    _fake_grades(monkeypatch, gold, empty)
+
+    res = oracle_check(task_dir, image="unused", out_root=tmp_path / "oracle")
+
+    assert res["oracle_ok"] is expected_ok
+    assert res["f2p_pass_without_fix"] == sorted(empty_f2p["success"])
+    assert json.loads((tmp_path / "oracle" / "oracle.json").read_text(encoding="utf-8")) == res
