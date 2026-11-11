@@ -1,6 +1,5 @@
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -622,7 +621,8 @@ fn test_h6_sqlite_escaping_and_multiline_and_sqliteleak() {
 
 #[test]
 fn test_h7_d9_path_checks_exclude_scan_root() {
-    let fp = FingerprintSet::from_task("", "", Path::new("/tmp")).expect("fp");
+    let empty_base = tempdir().expect("tempdir");
+    let fp = FingerprintSet::from_task("", "", empty_base.path()).expect("fp");
     let opts = ScanOptions {
         visibility: Visibility::AgentVisible,
         ..Default::default()

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use hermetic_common::hash::sha256_hex;
@@ -56,6 +56,8 @@ pub struct ScanOptions {
     pub max_total_expanded_bytes: u64,
     pub max_ratio: f64,
     pub signatures: BenchmarkSignatures,
+    /// Canonical directories never entered by `scan_tree`
+    pub exclude_dirs: Vec<PathBuf>,
 }
 
 impl Default for ScanOptions {
@@ -70,6 +72,7 @@ impl Default for ScanOptions {
             max_total_expanded_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
             max_ratio: 200.0,
             signatures: BenchmarkSignatures::new(None),
+            exclude_dirs: Vec::new(),
         }
     }
 }
@@ -451,6 +454,11 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             let path_str = path.to_string_lossy();
             if path_str == "/proc" || path_str == "/sys" || path_str == "/dev" {
                 return false;
+            }
+        }
+        if e.file_type().is_dir() && !opts.exclude_dirs.is_empty() {
+            if let Ok(canon) = path.canonicalize() {
+                return !opts.exclude_dirs.iter().any(|d| canon.starts_with(d));
             }
         }
         true

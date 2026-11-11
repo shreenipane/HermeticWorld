@@ -112,24 +112,17 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let canonical_task_dir = args.task.canonicalize().ok();
 
     for (idx, root) in args.roots.iter().enumerate() {
-        // Allowlist check: paths under the sealcheck's own --task dir are never scanned
-        if let Some(ref task_dir) = canonical_task_dir {
-            if let Ok(canon_root) = root.canonicalize() {
-                if canon_root.starts_with(task_dir) {
-                    continue;
-                }
-            }
-        }
-
         let vis = args
             .root_visibilities
             .get(idx)
             .copied()
             .unwrap_or(CliVisibility::AgentVisible);
 
+        // Paths under the sealcheck's own --task dir are never scanned, wherever the root is
         let opts = ScanOptions {
             visibility: vis.into(),
             signatures: signatures.clone(),
+            exclude_dirs: canonical_task_dir.iter().cloned().collect(),
             ..Default::default()
         };
         let tree_findings = scan_tree(root, &fp, &opts);
