@@ -28,6 +28,9 @@ from hermetic_slice.dockerutil import run_docker
 from hermetic_slice.gitutil import run_git
 
 TOOL_VERSION = "0.1.0"
+# Detectors scored per case. D0 is excluded: it reads the task's problem statement, not the
+# case root, so it would score every case of a task the same way. It's reported per task.
+SCORED_DETECTORS = ("D2", "D3b")
 Z_95 = 1.959963984540054  # 95% Wilson score z-value
 
 
@@ -713,8 +716,11 @@ def _build_variant_p04(
     return "".join(diff_output)
 
 
-def _build_variant_p05(gold_patch: str) -> str:
-    """Generate p05_hunk_in_prose: added lines of first hunk pasted between filler prose."""
+def _build_variant_p05(gold_patch: str) -> str | None:
+    """Generate p05_hunk_in_prose: added lines of first hunk pasted between filler prose.
+
+    Returns None when the first hunk adds nothing (a deletion-only hunk).
+    """
     added_lines: list[str] = []
     in_first_hunk = False
 
@@ -729,15 +735,8 @@ def _build_variant_p05(gold_patch: str) -> str:
                 added_lines.append(line[1:])
 
     if not added_lines:
-        # Fallback if deletion-only: extract hunk body without markers
-        for line in gold_patch.splitlines():
-            if line.startswith("@@"):
-                in_first_hunk = True
-                continue
-            if in_first_hunk and line.startswith("-") and not line.startswith("---"):
-                added_lines.append(line[1:])
-
-    middle = "\n".join(added_lines) if added_lines else "No added lines."
+        return None
+    middle = "\n".join(added_lines)
     return f"{FILLER_PROSE_1}\n\n{middle}\n\n{FILLER_PROSE_2}\n"
 
 
@@ -959,7 +958,7 @@ def build_corpus(
             for rel, content in postfix_contents.items():
                 dst = root / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_text(content, encoding="utf-8")
+                dst.write_text(content, encoding="utf-8", newline="")
 
         _write_case(
             f"{task_id}__p01_postfix_file",
@@ -1008,7 +1007,7 @@ def build_corpus(
                 for rel, content in reformatted_map.items():
                     dst = root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_text(content, encoding="utf-8")
+                    dst.write_text(content, encoding="utf-8", newline="")
 
             _write_case(
                 f"{task_id}__p02_reformatted",
@@ -1020,20 +1019,22 @@ def build_corpus(
                 write_p02,
             )
 
-            # p05_hunk_in_prose
-            def write_p05(root: Path) -> None:
-                notes_text = _build_variant_p05(gold_patch)
-                (root / "notes.txt").write_text(notes_text, encoding="utf-8")
+            # p05_hunk_in_prose, unless the first hunk only deletes
+            notes_text = _build_variant_p05(gold_patch)
 
-            _write_case(
-                f"{task_id}__p05_hunk_in_prose",
-                task_id,
-                "positive",
-                "p05_hunk_in_prose",
-                "gate",
-                "Added lines of first hunk in filler prose in notes.txt",
-                write_p05,
-            )
+            def write_p05(root: Path) -> None:
+                (root / "notes.txt").write_text(notes_text or "", encoding="utf-8", newline="")
+
+            if notes_text is not None:
+                _write_case(
+                    f"{task_id}__p05_hunk_in_prose",
+                    task_id,
+                    "positive",
+                    "p05_hunk_in_prose",
+                    "gate",
+                    "Added lines of first hunk in filler prose in notes.txt",
+                    write_p05,
+                )
 
             # p06_zip
             def write_p06(root: Path) -> None:
@@ -1097,20 +1098,22 @@ def build_corpus(
                 write_p09,
             )
 
-            # p10_hidden_tests
-            def write_p10(root: Path) -> None:
-                tests_leak_code = _build_variant_p10(test_patch)
-                (root / "tests_leak.py").write_text(tests_leak_code, encoding="utf-8")
+            # p10_hidden_tests, unless the test patch adds nothing
+            tests_leak_code = _build_variant_p10(test_patch)
 
-            _write_case(
-                f"{task_id}__p10_hidden_tests",
-                task_id,
-                "positive",
-                "p10_hidden_tests",
-                "gate",
-                "Added lines of staging/test.patch as tests_leak.py",
-                write_p10,
-            )
+            def write_p10(root: Path) -> None:
+                (root / "tests_leak.py").write_text(tests_leak_code, encoding="utf-8", newline="")
+
+            if tests_leak_code.strip():
+                _write_case(
+                    f"{task_id}__p10_hidden_tests",
+                    task_id,
+                    "positive",
+                    "p10_hidden_tests",
+                    "gate",
+                    "Added lines of staging/test.patch as tests_leak.py",
+                    write_p10,
+                )
 
             # p11_pyc: only if any touched file is .py
             py_touched = [rel for rel in touched if rel.endswith(".py")]
@@ -1209,7 +1212,7 @@ def build_corpus(
                 for rel, content in next_info["postfix_contents"].items():
                     dst = root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_text(content, encoding="utf-8")
+                    dst.write_text(content, encoding="utf-8", newline="")
                 # Other task's fix.patch
                 (root / "fix.patch").write_text(next_info["gold_patch"], encoding="utf-8", newline="\n")
 
@@ -1367,10 +1370,10 @@ def _scan_single_case(
     base_tree_dir: Path,
     case_root: Path,
     timeout: float = 300.0,
-) -> tuple[str, int | None, list[str], float]:
+) -> tuple[str, int | None, list[str], float, bool]:
     """Execute sealcheck scan on a single case root.
 
-    Returns (call, exit_code, scored_channels, wall_time).
+    Returns (call, exit_code, scored_channels, wall_time, d0_gate).
     """
     cmd_str = str(sealcheck_bin)
     if cmd_str.endswith(".py"):
@@ -1418,7 +1421,7 @@ def _scan_single_case(
         exit_code = proc.returncode
 
         if exit_code not in (0, 2):
-            return ("error", exit_code, [], wall_time)
+            return ("error", exit_code, [], wall_time, False)
 
         try:
             output_json = json.loads(proc.stdout.decode("utf-8", errors="replace"))
@@ -1428,20 +1431,21 @@ def _scan_single_case(
                 for f in findings
                 if f.get("severity") == "gate"
                 and f.get("visibility") == "agent_visible"
-                and f.get("detector") in ("D0", "D2", "D3b")
+                and f.get("detector") in SCORED_DETECTORS
             ]
+            d0_gate = any(f.get("detector") == "D0" and f.get("severity") == "gate" for f in findings)
             channels = sorted(list({f.get("channel", "") for f in scored_findings if f.get("channel")}))
             call = "gate" if len(scored_findings) > 0 else "clean"
-            return (call, exit_code, channels, wall_time)
+            return (call, exit_code, channels, wall_time, d0_gate)
         except Exception:
-            return ("error", exit_code, [], wall_time)
+            return ("error", exit_code, [], wall_time, False)
 
     except subprocess.TimeoutExpired:
         wall_time = time.perf_counter() - t0
-        return ("error", -1, [], wall_time)
+        return ("error", -1, [], wall_time, False)
     except Exception:
         wall_time = time.perf_counter() - t0
-        return ("error", -1, [], wall_time)
+        return ("error", -1, [], wall_time, False)
 
 
 def run_e3(
@@ -1479,7 +1483,7 @@ def run_e3(
             bd = base_trees_dir / task_id
             is_synth = False
 
-        call, exit_code, channels, wall_time = _scan_single_case(
+        call, exit_code, channels, wall_time, d0_gate = _scan_single_case(
             sealcheck_bin,
             task_dir=td,
             base_tree_dir=bd,
@@ -1496,11 +1500,13 @@ def run_e3(
             "exit_code": exit_code,
             "channels": channels,
             "wall_time": round(wall_time, 4),
+            "d0_gate": d0_gate,
         }
         results.append(res_item)
 
     # Handle blind evaluation if requested
     blind_results: list[dict[str, Any]] = []
+    blind_unlabeled: list[str] = []
     if blind_dir is not None and blind_dir.exists():
         blind_cases_dir = blind_dir / "cases" if (blind_dir / "cases").exists() else blind_dir
         blind_case_dirs = sorted([d for d in blind_cases_dir.iterdir() if d.is_dir() and (d / "root").exists()])
@@ -1525,7 +1531,7 @@ def run_e3(
                 td = tasks_dir / b_task_id
                 bd = base_trees_dir / b_task_id
 
-            call, exit_code, channels, wall_time = _scan_single_case(
+            call, exit_code, channels, wall_time, _ = _scan_single_case(
                 sealcheck_bin,
                 task_dir=td,
                 base_tree_dir=bd,
@@ -1550,7 +1556,10 @@ def run_e3(
 
         for b_cdir, call, exit_code, channels, wall_time in blind_scans:
             b_case_id = b_cdir.name
-            expected_label = blind_labels.get(b_case_id, "clean")
+            expected_label = blind_labels.get(b_case_id)
+            if expected_label not in ("gate", "clean"):
+                blind_unlabeled.append(b_case_id)
+                continue
             blind_results.append(
                 {
                     "case_id": b_case_id,
@@ -1575,6 +1584,7 @@ def run_e3(
                 "exit_code": r["exit_code"],
                 "channels": r["channels"],
                 "wall_time": r["wall_time"],
+                "d0_gate": r["d0_gate"],
             }
             f.write(json.dumps(line_dict) + "\n")
 
@@ -1608,8 +1618,13 @@ def run_e3(
         "per_task": per_task_metrics,
     }
 
+    # D0 depends only on the task, so report it once per task.
+    metrics_output["d0_gate_tasks"] = sorted({r["task_id"] for r in results if r["d0_gate"]})
+
     if blind_results:
         metrics_output["blind"] = _compute_metrics_block(blind_results)
+    if blind_unlabeled:
+        metrics_output["blind_unlabeled"] = sorted(blind_unlabeled)
 
     # Write metrics.json
     (out_dir / "metrics.json").write_text(json.dumps(metrics_output, indent=2) + "\n", encoding="utf-8")

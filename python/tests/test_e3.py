@@ -362,6 +362,10 @@ def test_e3_run_against_stub_sealcheck(tmp_path: Path) -> None:
     assert pv["n03_cross_task"]["errors_negative"] > 0
     assert pv["p05_hunk_in_prose"]["errors"] > 0
     assert pv["p05_hunk_in_prose"]["errors_positive"] > 0
+    # The stub reports only D0 for p03: D0 is not scored per case, so p03 is a miss,
+    # and the task is listed once under d0_gate_tasks.
+    assert pv["p03_patch_file"]["tp"] == 0
+    assert metrics["d0_gate_tasks"]
 
     # Hand-computed Wilson interval verification
     ov = metrics["overall"]
@@ -581,3 +585,11 @@ def test_e3_basetrees_mocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert exit_code == 0
     # Because task_2 already existed, no docker command should have been run!
     assert len(commands_run) == 0
+
+
+def test_p05_and_p10_are_skipped_when_they_add_nothing() -> None:
+    from hermetic_slice.e3 import _build_variant_p05, _build_variant_p10
+
+    deletion_only = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,1 @@\n keep\n-gone\n"
+    assert _build_variant_p05(deletion_only) is None
+    assert _build_variant_p10("").strip() == ""
