@@ -398,7 +398,7 @@ fn test_index_round_trip_member_time_and_query_equivalence() {
 
     // Verify format version and member-time records in reader
     let mut reader = IndexReader::open(&idx_path).expect("open index");
-    assert_eq!(FORMAT_VERSION, 4);
+    assert_eq!(FORMAT_VERSION, 5);
 
     let mut found_member_times = Vec::new();
     let root_str = reader.root().to_string();

@@ -16,6 +16,7 @@ pub mod fingerprint;
 pub mod gitstore;
 pub mod index;
 pub mod normalize;
+pub mod pyc_marshal;
 pub mod sarif;
 pub mod scan;
 pub mod winnow;
@@ -42,7 +43,7 @@ pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
 };
 pub use ext4::{scan_ext4_image, scan_ext4_slice, Ext4Error};
-pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
+pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints, PycFunctionFingerprint};
 pub use gitstore::{
     apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,
     ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
@@ -52,6 +53,7 @@ pub use index::{
     IndexReader, IndexRecord, IndexStats, MAX_UNIT_BYTES, NOT_COVERED,
 };
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
+pub use pyc_marshal::{parse_pyc_code_objects, HashedPycCodeObject, PycCodeObject};
 pub use sarif::{
     generate_sarif, generate_sarif_with_options, generate_sarif_with_properties, SarifLog,
     SarifRunProperties,

@@ -263,6 +263,8 @@ pub trait UnitSink {
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]);
     /// An archive member's modification time (tar mtime or zip DOS date-time), for D4.
     fn member_time(&mut self, path: &str, unix_secs: i64);
+    /// Parsed code objects from a .pyc container, for D3b binary_pyc_function.
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]);
 }
 
 /// The sink `scan` uses: matches every unit against one task's fingerprints at once.
@@ -352,6 +354,13 @@ impl UnitSink for MatchSink<'_> {
             }
         }
     }
+
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]) {
+        self.findings
+            .extend(crate::pyc_marshal::match_pyc_code_objects(
+                objects, self.fp, self.opts, path,
+            ));
+    }
 }
 
 /// Convert a zip entry DOS date-time to Unix seconds.
@@ -431,6 +440,10 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     // Names and constants, matched exactly by the binary tier
                     self.sink
                         .binary(path, "binary_pyc", crate::binary::pyc_binary_strings(bytes));
+                    let code_objects = crate::pyc_marshal::parse_pyc_code_objects(bytes);
+                    if !code_objects.is_empty() {
+                        self.sink.pyc_code_objects(path, &code_objects);
+                    }
                 }
                 ContainerType::Sqlite => {
                     self.scan_sqlite(path, bytes);

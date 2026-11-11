@@ -515,6 +515,9 @@ impl UnitSink for TreeMatchSink<'_> {
     fn member_time(&mut self, path: &str, unix_secs: i64) {
         self.inner.member_time(path, unix_secs);
     }
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]) {
+        self.inner.pyc_code_objects(path, objects);
+    }
 }
 
 impl TreeSink for TreeMatchSink<'_> {

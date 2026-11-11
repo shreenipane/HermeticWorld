@@ -38,6 +38,15 @@ pub enum FingerprintError {
     Io(#[from] std::io::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PycFunctionFingerprint {
+    pub function_name: String,
+    pub added: HashSet<String>,
+    pub removed: HashSet<String>,
+    pub added_u64: Vec<u64>,
+    pub removed_u64: Vec<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HunkFingerprints {
     pub hunk_index: usize,
@@ -57,6 +66,8 @@ pub struct HunkFingerprints {
     pub winnow_fingerprints: HashSet<u64>,
     /// Binary tier items (identifiers and string literals)
     pub binary_items: Vec<String>,
+    /// .pyc function fingerprint (D3b)
+    pub pyc_fingerprint: Option<PycFunctionFingerprint>,
     /// Preconverted 64-bit line fingerprints: hash -> (weight, orig_hex_hash). Ordered, so
     /// matching (and so the evidence a finding keeps) is the same on every run.
     pub line_u64: BTreeMap<u64, (f64, String)>,
@@ -93,12 +104,13 @@ struct CandidateHunk {
     diff_shapes: Vec<(String, String)>,     // (hash, description)
     winnow_candidates: Vec<(u64, String)>,  // (hash, evidence)
     binary_items: Vec<String>,
+    pyc_fingerprint: Option<PycFunctionFingerprint>,
 }
 
 fn apply_patch_to_base(
     file_patch: &FilePatch,
     base_tree_root: &Path,
-) -> (Vec<String>, Vec<Vec<usize>>) {
+) -> (Vec<String>, Vec<Vec<usize>>, Option<Vec<String>>) {
     let rel_path = file_patch
         .old_path
         .as_deref()
@@ -115,7 +127,7 @@ fn apply_patch_to_base(
     let mut post_fix = Vec::new();
     let mut hunk_changed_positions = Vec::new();
 
-    if let Some(base) = base_lines {
+    if let Some(base) = &base_lines {
         let mut base_idx = 0; // 0-based line index in base file
 
         for hunk in &file_patch.hunks {
@@ -192,7 +204,7 @@ fn apply_patch_to_base(
         }
     }
 
-    (post_fix, hunk_changed_positions)
+    (post_fix, hunk_changed_positions, base_lines)
 }
 
 /// Read a file as the tree scanner does: skip it if a NUL byte occurs in the first 8 KiB,
@@ -204,6 +216,346 @@ fn read_text_like_scanner(path: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const PYC_STOP_LIST: &[&str] = &["self", "cls", "None", "True", "False", "0", "1", ""];
+
+fn get_line_indent(line: &str) -> Option<usize> {
+    let mut count = 0;
+    for c in line.chars() {
+        if c == ' ' {
+            count += 1;
+        } else if c == '\t' {
+            count += 8;
+        } else if c == '#' {
+            return None;
+        } else {
+            return Some(count);
+        }
+    }
+    None
+}
+
+fn parse_def_or_class(line: &str) -> Option<(String, bool)> {
+    let trimmed = line.trim_start();
+    let (ident_part, is_class) = if let Some(rest) = trimmed.strip_prefix("def ") {
+        (rest.trim_start(), false)
+    } else if let Some(rest) = trimmed.strip_prefix("async def ") {
+        (rest.trim_start(), false)
+    } else {
+        let rest = trimmed.strip_prefix("class ")?;
+        (rest.trim_start(), true)
+    };
+
+    let mut end = 0;
+    for (i, c) in ident_part.char_indices() {
+        if i == 0 {
+            if c.is_alphabetic() || c == '_' {
+                end = c.len_utf8();
+            } else {
+                return None;
+            }
+        } else if c.is_alphanumeric() || c == '_' {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end > 0 {
+        Some((ident_part[..end].to_string(), is_class))
+    } else {
+        None
+    }
+}
+
+fn is_py_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+            | "match"
+            | "case"
+            | "type"
+    )
+}
+
+fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
+    let text = lines.join("\n");
+    let tokens = crate::winnow::tokenize(&text);
+    let mut symbols = HashSet::new();
+    let mut prev_is_dot = false;
+
+    for tok in &tokens {
+        if let Some(content) = crate::binary::extract_string_literal_content(&tok.text) {
+            symbols.insert(content);
+            prev_is_dot = false;
+        } else if tok.text.starts_with(|c: char| c.is_ascii_digit()) {
+            symbols.insert(tok.text.clone());
+            prev_is_dot = false;
+        } else if crate::binary::is_identifier(&tok.text) {
+            if prev_is_dot || !is_py_keyword(&tok.text) {
+                symbols.insert(tok.text.clone());
+            }
+            prev_is_dot = false;
+        } else {
+            prev_is_dot = tok.text == ".";
+        }
+    }
+
+    symbols
+}
+
+fn find_enclosing_function(
+    lines: &[String],
+    hunk_lines: &[usize],
+) -> Option<(String, usize, usize)> {
+    if lines.is_empty() {
+        return None;
+    }
+    for &idx in hunk_lines {
+        if let Some(line) = lines.get(idx) {
+            if let Some(indent) = get_line_indent(line) {
+                if let Some((name, _)) = parse_def_or_class(line) {
+                    return Some((name, indent, idx));
+                }
+                break;
+            }
+        }
+    }
+
+    let min_hunk_indent = hunk_lines
+        .iter()
+        .filter_map(|&idx| lines.get(idx).and_then(|l| get_line_indent(l)))
+        .min()
+        .unwrap_or(0);
+
+    let start_pos = hunk_lines.first().copied().unwrap_or(0);
+    let mut ref_indent = min_hunk_indent;
+
+    for i in (0..start_pos).rev() {
+        if let Some(indent) = get_line_indent(&lines[i]) {
+            if indent < ref_indent {
+                if let Some((name, _)) = parse_def_or_class(&lines[i]) {
+                    return Some((name, indent, i));
+                }
+                if indent == 0 {
+                    break;
+                }
+                ref_indent = indent;
+            }
+        }
+    }
+
+    Some(("<module>".to_string(), 0, 0))
+}
+
+fn extract_symbols_for_function(
+    lines: &[String],
+    function_name: &str,
+    hint_pos: usize,
+) -> HashSet<String> {
+    if lines.is_empty() {
+        return HashSet::new();
+    }
+    if function_name == "<module>" {
+        let mut module_lines = Vec::new();
+        let mut skip_until_indent: Option<usize> = None;
+        for line in lines {
+            if let Some(indent) = get_line_indent(line) {
+                if let Some(skip_indent) = skip_until_indent {
+                    if indent > skip_indent {
+                        continue;
+                    } else {
+                        skip_until_indent = None;
+                    }
+                }
+                if indent == 0 {
+                    module_lines.push(line.as_str());
+                    if parse_def_or_class(line).is_some() {
+                        skip_until_indent = Some(0);
+                    }
+                }
+            } else if skip_until_indent.is_none() {
+                module_lines.push(line.as_str());
+            }
+        }
+        return collect_symbol_set(&module_lines);
+    }
+
+    let mut candidates = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some((name, _)) = parse_def_or_class(line) {
+            if name == function_name {
+                if let Some(indent) = get_line_indent(line) {
+                    candidates.push((idx, indent));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+
+    let &(def_line, base_indent) = candidates
+        .iter()
+        .min_by_key(|(idx, _)| idx.abs_diff(hint_pos))
+        .unwrap_or(&candidates[0]);
+
+    let mut end_line = lines.len();
+    for (j, line) in lines.iter().enumerate().skip(def_line + 1) {
+        if let Some(indent) = get_line_indent(line) {
+            if indent <= base_indent {
+                end_line = j;
+                break;
+            }
+        }
+    }
+
+    let mut func_lines = Vec::new();
+    func_lines.push(lines[def_line].as_str());
+    let mut skip_until_indent: Option<usize> = None;
+
+    for line in lines.iter().take(end_line).skip(def_line + 1) {
+        if let Some(indent) = get_line_indent(line) {
+            if let Some(skip_indent) = skip_until_indent {
+                if indent > skip_indent {
+                    continue;
+                } else {
+                    skip_until_indent = None;
+                }
+            }
+            if parse_def_or_class(line).is_some() {
+                func_lines.push(line.as_str());
+                skip_until_indent = Some(indent);
+                continue;
+            }
+        } else if skip_until_indent.is_some() {
+            continue;
+        }
+        func_lines.push(line.as_str());
+    }
+
+    collect_symbol_set(&func_lines)
+}
+
+fn compute_pyc_function_fingerprint(
+    hunk: &crate::diff::Hunk,
+    post_fix_lines: &[String],
+    changed_pos: &[usize],
+    base_lines: Option<&[String]>,
+) -> Option<PycFunctionFingerprint> {
+    let fixed_func = if !changed_pos.is_empty() {
+        find_enclosing_function(post_fix_lines, changed_pos)
+    } else {
+        None
+    };
+
+    let base_start = if hunk.header.old_range.start > 0 {
+        hunk.header.old_range.start - 1
+    } else {
+        0
+    };
+
+    let base_func = if let Some(base) = base_lines {
+        let mut base_hunk_lines = Vec::new();
+        let mut cur = base_start;
+        for line in &hunk.lines {
+            match line.line_type {
+                crate::diff::DiffLineType::Context => {
+                    cur += 1;
+                }
+                crate::diff::DiffLineType::Removed => {
+                    base_hunk_lines.push(cur);
+                    cur += 1;
+                }
+                crate::diff::DiffLineType::Added => {}
+            }
+        }
+        if base_hunk_lines.is_empty() {
+            base_hunk_lines.push(base_start);
+        }
+        find_enclosing_function(base, &base_hunk_lines)
+    } else {
+        None
+    };
+
+    let function_name = match (&fixed_func, &base_func) {
+        (Some((f_name, _, _)), _) if f_name != "<module>" => f_name.clone(),
+        (_, Some((b_name, _, _))) if b_name != "<module>" => b_name.clone(),
+        (Some((f_name, _, _)), _) => f_name.clone(),
+        (_, Some((b_name, _, _))) => b_name.clone(),
+        _ => "<module>".to_string(),
+    };
+
+    let hint_fixed = changed_pos.first().copied().unwrap_or(0);
+    let fixed_symbols = extract_symbols_for_function(post_fix_lines, &function_name, hint_fixed);
+
+    let base_symbols = if let Some(base) = base_lines {
+        extract_symbols_for_function(base, &function_name, base_start)
+    } else {
+        HashSet::new()
+    };
+
+    let mut added: HashSet<String> = fixed_symbols.difference(&base_symbols).cloned().collect();
+    let mut removed: HashSet<String> = base_symbols.difference(&fixed_symbols).cloned().collect();
+
+    for stop in PYC_STOP_LIST {
+        added.remove(*stop);
+        removed.remove(*stop);
+    }
+
+    if added.is_empty() && removed.is_empty() {
+        return None;
+    }
+
+    let mut added_u64: Vec<u64> = added.iter().map(|s| sha256_u64(s.as_bytes())).collect();
+    added_u64.sort_unstable();
+    added_u64.dedup();
+
+    let mut removed_u64: Vec<u64> = removed.iter().map(|s| sha256_u64(s.as_bytes())).collect();
+    removed_u64.sort_unstable();
+    removed_u64.dedup();
+
+    Some(PycFunctionFingerprint {
+        function_name,
+        added,
+        removed,
+        added_u64,
+        removed_u64,
+    })
 }
 
 impl FingerprintSet {
@@ -228,7 +580,7 @@ impl FingerprintSet {
                 .unwrap_or("")
                 .to_string();
 
-            let (post_fix_lines, hunk_changed_positions) =
+            let (post_fix_lines, hunk_changed_positions, base_lines) =
                 apply_patch_to_base(file, base_tree_root);
 
             let post_fix_text = post_fix_lines.join("\n");
@@ -437,6 +789,20 @@ impl FingerprintSet {
                     }
                 }
 
+                let pyc_fingerprint = if file_path.ends_with(".py") {
+                    compute_pyc_function_fingerprint(
+                        hunk,
+                        &post_fix_lines,
+                        hunk_changed_positions
+                            .get(hunk_idx)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]),
+                        base_lines.as_deref(),
+                    )
+                } else {
+                    None
+                };
+
                 candidate_hunks.push(CandidateHunk {
                     hunk_index: global_hunk_counter,
                     file_path: file_path.clone(),
@@ -446,6 +812,7 @@ impl FingerprintSet {
                     diff_shapes,
                     winnow_candidates,
                     binary_items,
+                    pyc_fingerprint,
                 });
                 global_hunk_counter += 1;
             }
@@ -480,6 +847,7 @@ impl FingerprintSet {
                         diff_shapes: Vec::new(),
                         winnow_candidates: Vec::new(),
                         binary_items: Vec::new(),
+                        pyc_fingerprint: None,
                     });
                     global_hunk_counter += 1;
                 }
@@ -709,6 +1077,7 @@ impl FingerprintSet {
                 diff_shapes: diff_shapes_map,
                 winnow_fingerprints,
                 binary_items: surviving_binary_items,
+                pyc_fingerprint: ch.pyc_fingerprint,
                 line_u64,
                 window_u64,
                 removed_u64,
