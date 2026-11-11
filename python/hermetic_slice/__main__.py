@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     run_agent_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     run_agent_parser.add_argument("--runs-dir", type=Path, required=True, help="Directory for storing run outputs")
     run_agent_parser.add_argument("--model", default="gemma-4-31b-it", help="Model name")
+    run_agent_parser.add_argument("--provider", choices=["gemini", "openrouter"], default="gemini", help="Model API to call; openrouter accepts only ':free' models")
     run_agent_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
     run_agent_parser.add_argument("--max-steps", type=int, default=60, help="Maximum agent steps")
     run_agent_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
@@ -423,19 +424,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             task_dirs = list(all_tasks.values())
 
-        from hermetic_slice.model_client import GeminiClient, ModelError, load_api_key
+        from hermetic_slice.model_client import GeminiClient, ModelError, OpenRouterClient, load_api_key
         from hermetic_slice.agent_loop import Limits
         from hermetic_slice.runner import run_task
 
         try:
-            api_key = load_api_key()
+            if args.provider == "openrouter":
+                model_client = OpenRouterClient(args.model, load_api_key(var="HERMETIC_OPENROUTER_KEY_FILE"))
+            else:
+                model_client = GeminiClient(args.model, load_api_key())
         except ModelError as exc:
             print(f"Error loading API key: {exc}", file=sys.stderr)
             return 1
 
         from hermetic_slice.grader import grade as grade_fn
 
-        model_client = GeminiClient(args.model, api_key)
         limits = Limits(max_steps=args.max_steps)
 
         runs_dir = args.runs_dir

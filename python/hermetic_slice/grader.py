@@ -650,7 +650,8 @@ def oracle_check(
     gold_patch_path = task_dir / "staging" / "gold.patch"
     if not gold_patch_path.exists():
         raise GraderError(f"Missing gold.patch in {task_dir / 'staging'}")
-    gold_patch = gold_patch_path.read_text(encoding="utf-8")
+    # Bytes, not read_text: universal newlines would turn a CRLF file's \r\n into \n.
+    gold_patch = gold_patch_path.read_bytes().decode("utf-8")
 
     gold_out = out_root / "gold"
     gold_grade = grade(task_dir, gold_patch, image=image, out_dir=gold_out, timeout=timeout)
