@@ -607,6 +607,9 @@ def test_fix1_symlinks_in_cleanup_d_history_symlink_to_host_file(tmp_path: Path)
 def test_fix2_readonly_parent_made_writable_in_staging_never_in_src(tmp_path: Path) -> None:
     """FIX 2: A history file in a read-only directory inside source is still removed
     (parent made writable in staging, never in src)."""
+    if os.geteuid() == 0:
+        pytest.skip("Read-only directory test requires non-root user")
+
     src = tmp_path / "src_ro"
     src.mkdir()
     user_dir = src / "home" / "user"
@@ -873,3 +876,183 @@ def test_fix6_many_empty_files_automatic_sizing(tmp_path: Path) -> None:
     assert out_image.exists()
     assert out_image.stat().st_size > 0
     print(f"\n[20000_FILES_BUILD_TIME] Elapsed: {elapsed:.3f} s")
+
+
+def test_readonly_cleanup_with_injected_permission_error_triggers_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (Finding 1): chmod retry succeeds when unlink initially fails with PermissionError."""
+    src = tmp_path / "src_retry"
+    src.mkdir()
+    user_dir = src / "home" / "user"
+    user_dir.mkdir(parents=True)
+    hist = user_dir / ".bash_history"
+    hist.write_text("history")
+
+    staging = tmp_path / "staging_retry"
+    copy_to_staging(src, staging)
+    staging_user = staging / "home" / "user"
+    os.chmod(staging_user, 0o555)
+
+    real_unlink = os.unlink
+    first_call = True
+
+    def mock_unlink(path, *args, **kwargs):
+        nonlocal first_call
+        if first_call and Path(path).name == ".bash_history":
+            first_call = False
+            raise PermissionError("Simulated permission error")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", mock_unlink)
+
+    removed = clean_rootfs_staging(staging)
+    assert "home/user/.bash_history" in removed
+    assert not (staging / "home" / "user" / ".bash_history").exists()
+    assert (staging_user.stat().st_mode & stat.S_IWUSR) != 0
+
+
+def test_clean_rootfs_staging_nested_pkgs_cache_directories(tmp_path: Path) -> None:
+    """Regression test (Finding 2): cache directories nested beneath other cleanup targets
+    do not cause FileNotFoundError or traversal errors."""
+    staging = tmp_path / "staging_nested_pkgs"
+    staging.mkdir()
+
+    # Case A: miniconda3/pkgs/nested_pkg/miniconda3/pkgs
+    outer_pkgs = staging / "miniconda3" / "pkgs"
+    inner_pkgs = outer_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
+    inner_pkgs.mkdir(parents=True)
+    (outer_pkgs / "outer.tar.bz2").write_text("outer package")
+    (inner_pkgs / "inner.tar.bz2").write_text("inner package")
+
+    # Case B: opt/conda/pkgs/nested_pkg/miniconda3/pkgs
+    opt_pkgs = staging / "opt" / "conda" / "pkgs"
+    opt_inner = opt_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
+    opt_inner.mkdir(parents=True)
+    (opt_pkgs / "opt_pkg.tar.bz2").write_text("opt package")
+    (opt_inner / "nested_opt.tar.bz2").write_text("nested opt package")
+
+    # urls.txt in outer_pkgs should be preserved
+    (outer_pkgs / "urls.txt").write_text("https://example.com/repo\n")
+
+    removed = clean_rootfs_staging(staging)
+
+    assert "miniconda3/pkgs/outer.tar.bz2" in removed
+    assert "miniconda3/pkgs/nested_pkg" in removed
+    assert "opt/conda/pkgs/opt_pkg.tar.bz2" in removed
+    assert "opt/conda/pkgs/nested_pkg" in removed
+    # urls.txt preserved
+    assert (outer_pkgs / "urls.txt").exists()
+    assert not (outer_pkgs / "outer.tar.bz2").exists()
+    assert not (opt_pkgs / "opt_pkg.tar.bz2").exists()
+
+
+def test_calculate_image_size_mib_inode_overhead_when_min_mib_exceeds_base_mib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (Finding 3): when entry count causes min_mib to exceed base_mib,
+    the resulting size includes sufficient filesystem metadata/journal overhead."""
+    staging = tmp_path / "staging_huge_entries"
+    staging.mkdir()
+
+    # 300,000 empty files: staging_bytes = 0, entry_count = 300,000
+    # base_mib = 0 * 1.3 + 64 = 64 MiB
+    # requested_inodes = ceil(300,000 * 1.25 + 1024) = 376,024 inodes
+    # Inode table alone = 376,024 * 256 = 96,262,144 bytes (~91.8 MiB)
+    monkeypatch.setattr(
+        "hermetic_slice.rootfs.compute_tree_stats",
+        lambda _: (0, 300_000),
+    )
+
+    size = calculate_image_size_mib(staging)
+
+    # Inode table alone takes ~91.8 MiB.
+    # The calculated size must exceed base_mib (64 MiB) and provide 64 MiB overhead
+    # beyond the inode table requirement (156 MiB).
+    assert size > 64
+    inode_table_mib = (calculate_inode_count(300_000) * 256) / (1024 * 1024)
+    assert size >= math.ceil(inode_table_mib) + 63
+    assert size == 156
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_build_rootfs_metadata_computed_from_tmp_image_under_concurrent_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (Finding 4): result metadata is computed from tmp_image before os.replace,
+    so concurrent image replacement after publication does not corrupt returned sha256/size."""
+    src1 = tmp_path / "src1"
+    src1.mkdir()
+    (src1 / "file1.txt").write_text("build 1 data")
+
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    (src2 / "file2.txt").write_text("build 2 data with different content and size")
+
+    out_image = tmp_path / "out.img"
+    t_clock = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Build image 2 first as an independent file to get its content
+    img2_standalone = tmp_path / "standalone2.img"
+    res2 = build_rootfs(
+        src=src2,
+        out_image=img2_standalone,
+        t_clock=t_clock,
+        world_id="world-2",
+        size_mib=64,
+    )
+    img2_bytes = img2_standalone.read_bytes()
+
+    real_replace = os.replace
+
+    def replace_interleaving(src_path, dst_path):
+        # Perform the real replace of tmp_image -> out_image
+        real_replace(src_path, dst_path)
+        # Simulate another build immediately overwriting out_image with img2
+        if Path(dst_path) == out_image:
+            with open(dst_path, "wb") as f:
+                f.write(img2_bytes)
+
+    monkeypatch.setattr(os, "replace", replace_interleaving)
+
+    res1 = build_rootfs(
+        src=src1,
+        out_image=out_image,
+        t_clock=t_clock,
+        world_id="world-1",
+        size_mib=64,
+    )
+
+    # res1 must report build 1's sha256 and size, NOT build 2's sha256 or size
+    assert res1["sha256"] != res2["sha256"]
+    assert res1["size_bytes"] == 64 * 1024 * 1024
+    assert out_image.read_bytes() == img2_bytes
+
+
+def test_build_rootfs_rejects_out_image_symlink_inside_src(tmp_path: Path) -> None:
+    """Regression test (Finding 5): out_image inside src is rejected even if out_image is a symlink
+    pointing outside src."""
+    src = tmp_path / "src_symlink_parent"
+    src.mkdir()
+    (src / "data.txt").write_text("original data")
+    nested_dir = src / "nested"
+    nested_dir.mkdir()
+
+    outside_target = tmp_path / "outside_target.img"
+    symlink_out = nested_dir / "out.img"
+    symlink_out.symlink_to(outside_target)
+
+    t_clock = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="Output image and staging directory cannot be inside source directory"):
+        build_rootfs(
+            src=src,
+            out_image=symlink_out,
+            t_clock=t_clock,
+            world_id="world-symlink-check",
+            size_mib=64,
+        )
+
+    # Verify no staging directory or files were created inside src/nested
+    assert list(nested_dir.iterdir()) == [symlink_out]
+    assert not outside_target.exists()

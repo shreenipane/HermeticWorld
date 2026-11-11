@@ -352,19 +352,33 @@ def clean_rootfs_staging(staging_dir: Path) -> list[str]:
         pkgs_dirs.append(opt_conda_pkgs)
 
     for dirpath, dirs, files in _safe_walk(staging_dir):
+        if opt_conda_pkgs is not None and dirpath == opt_conda_pkgs:
+            dirs.clear()
+            continue
         if dirpath.name == "pkgs" and dirpath.parent.name == "miniconda3":
             if dirpath not in pkgs_dirs:
                 pkgs_dirs.append(dirpath)
+            dirs.clear()
+
+    # Prune any directory beneath another selected cleanup target
+    filtered_pkgs_dirs: list[Path] = []
+    for d in pkgs_dirs:
+        if not any(d != other and d.is_relative_to(other) for other in pkgs_dirs):
+            filtered_pkgs_dirs.append(d)
+    pkgs_dirs = filtered_pkgs_dirs
 
     for pkgs_dir in pkgs_dirs:
-        with os.scandir(pkgs_dir) as it:
-            for entry in it:
-                if entry.name == "urls.txt":
-                    continue
-                entry_path = Path(entry.path)
-                rel = entry_path.relative_to(staging_dir).as_posix()
-                _remove_entry(entry_path, staging_dir)
-                removed.add(rel)
+        try:
+            with os.scandir(pkgs_dir) as it:
+                for entry in it:
+                    if entry.name == "urls.txt":
+                        continue
+                    entry_path = Path(entry.path)
+                    rel = entry_path.relative_to(staging_dir).as_posix()
+                    _remove_entry(entry_path, staging_dir)
+                    removed.add(rel)
+        except OSError:
+            continue
 
     # 6. shell histories anywhere under root/ and home/
     for base_name in ("root", "home"):
@@ -427,7 +441,11 @@ def calculate_image_size_mib(staging_dir: Path, size_mib: int | None = None) -> 
     base_mib = math.ceil(staging_mib * 1.3 + 64)
 
     requested_inodes = calculate_inode_count(entry_count)
-    min_bytes = requested_inodes * 256 + staging_bytes
+    # The base 64 MiB overhead covers filesystem metadata, directory entries, default
+    # journal, and the initial baseline inodes (1024). Extra requested inodes require
+    # 256 bytes each in addition to the base overhead and staging bytes.
+    extra_inodes = max(0, requested_inodes - 1024)
+    min_bytes = extra_inodes * 256 + staging_bytes + (64 * 1024 * 1024)
     min_mib = math.ceil(min_bytes / (1024 * 1024))
 
     return max(base_mib, min_mib)
@@ -462,9 +480,14 @@ def build_rootfs(
     out_image = Path(out_image)
     resolved_src = src.resolve()
     resolved_out = out_image.resolve()
+    resolved_out_parent = out_image.parent.resolve()
 
-    # FIX 5: Reject before creating anything if out_image or staging would be inside src
-    if resolved_out.is_relative_to(resolved_src) or resolved_out.parent.is_relative_to(resolved_src):
+    # Reject before creating anything if out_image, resolved symlink target, or staging parent would be inside src
+    if (
+        resolved_out.is_relative_to(resolved_src)
+        or resolved_out.parent.is_relative_to(resolved_src)
+        or resolved_out_parent.is_relative_to(resolved_src)
+    ):
         raise ValueError(
             f"Output image and staging directory cannot be inside source directory: "
             f"out_image={out_image} (resolved: {resolved_out}), src={src} (resolved: {resolved_src})"
@@ -593,20 +616,21 @@ def build_rootfs(
             err_msg = sc_proc.stderr.strip() or sc_proc.stdout.strip() or f"exit code {sc_proc.returncode}"
             raise RuntimeError(f"sealcheck d4-image failed ({sc_proc.returncode}): {err_msg}")
 
-        # Gate passed! Publish temporary image to out_image (FIX 3, FIX 4)
-        os.replace(tmp_image, out_image)
-
-        # 6. Result
+        # 6. Result metadata from tmp_image BEFORE publication to prevent concurrent overwrite races
         h = hashlib.sha256()
-        with open(out_image, "rb") as f:
+        with open(tmp_image, "rb") as f:
             while chunk := f.read(65536):
                 h.update(chunk)
         sha256_hex = h.hexdigest()
+        size_bytes = tmp_image.stat().st_size
+
+        # Gate passed! Publish temporary image to out_image (FIX 3, FIX 4)
+        os.replace(tmp_image, out_image)
 
         return {
             "image": str(out_image),
             "sha256": sha256_hex,
-            "size_bytes": out_image.stat().st_size,
+            "size_bytes": size_bytes,
             "uuid": rootfs_uuid,
             "hash_seed": hash_seed,
             "t_clock": t_clock_str,
