@@ -71,6 +71,25 @@ def main(argv: list[str] | None = None) -> int:
     oracle_parser.add_argument("--only", action="append", default=None, help="Optional instance ID to process")
     oracle_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Image tag format")
 
+    e3_basetrees_parser = subparsers.add_parser("e3-basetrees", help="Extract base trees from sealed images")
+    e3_basetrees_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    e3_basetrees_parser.add_argument("--out", type=Path, required=True, help="Output directory for base trees")
+    e3_basetrees_parser.add_argument("--only", nargs="*", action="extend", default=None, help="Optional instance IDs to process")
+
+    e3_build_parser = subparsers.add_parser("e3-build", help="Build E3 leak corpus")
+    e3_build_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    e3_build_parser.add_argument("--base-trees", type=Path, required=True, help="Directory containing base trees")
+    e3_build_parser.add_argument("--out", type=Path, required=True, help="Output directory for corpus")
+    e3_build_parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic corpus generation")
+
+    e3_run_parser = subparsers.add_parser("e3-run", help="Run E3 accuracy evaluation against sealcheck")
+    e3_run_parser.add_argument("--corpus", type=Path, required=True, help="Directory containing leak corpus")
+    e3_run_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    e3_run_parser.add_argument("--base-trees", type=Path, required=True, help="Directory containing base trees")
+    e3_run_parser.add_argument("--sealcheck", type=str, required=True, help="Path to sealcheck binary or stub")
+    e3_run_parser.add_argument("--out", type=Path, required=True, help="Output directory for metrics and results")
+    e3_run_parser.add_argument("--blind", type=Path, default=None, help="Optional directory containing blind cases")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -480,6 +499,43 @@ def main(argv: list[str] | None = None) -> int:
                 has_failure = True
 
         return 1 if has_failure else 0
+
+    if args.subcommand == "e3-basetrees":
+        from hermetic_slice.e3 import extract_basetrees
+
+        try:
+            extract_basetrees(args.tasks_dir, args.out, only=args.only)
+            return 0
+        except Exception as exc:
+            print(f"Error extracting basetrees: {exc}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "e3-build":
+        from hermetic_slice.e3 import build_corpus
+
+        try:
+            build_corpus(args.tasks_dir, args.base_trees, args.out, seed=args.seed)
+            return 0
+        except Exception as exc:
+            print(f"Error building corpus: {exc}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "e3-run":
+        from hermetic_slice.e3 import run_e3
+
+        try:
+            run_e3(
+                args.corpus,
+                args.tasks_dir,
+                args.base_trees,
+                args.sealcheck,
+                args.out,
+                blind_dir=args.blind,
+            )
+            return 0
+        except Exception as exc:
+            print(f"Error running e3: {exc}", file=sys.stderr)
+            return 1
 
     return 1
 
