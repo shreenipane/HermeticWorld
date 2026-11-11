@@ -31,6 +31,8 @@ enum Commands {
     Index(IndexArgs),
     /// Match one task against layer indexes instead of scanning the trees again
     Query(QueryArgs),
+    /// Check coherence tells (D8) under a rootfs
+    D8(D8Args),
 }
 
 #[derive(Parser, Debug)]
@@ -359,6 +361,91 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     )
 }
 
+#[derive(Parser, Debug)]
+struct D8Args {
+    /// Root directory to inspect
+    #[arg(long)]
+    root: PathBuf,
+
+    /// Clock cutoff in RFC 3339 format
+    #[arg(long = "t-clock")]
+    t_clock: String,
+
+    /// Visibility for root
+    #[arg(long = "root-visibility", default_value = "agent_visible")]
+    root_visibility: CliVisibility,
+
+    /// Output format: json or sarif
+    #[arg(long, default_value = "json")]
+    format: OutputFormat,
+
+    /// Output file path (defaults to stdout)
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+fn run_d8(args: D8Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let t_clock = match time::OffsetDateTime::parse(
+        &args.t_clock,
+        &time::format_description::well_known::Rfc3339,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(format!(
+                "invalid --t-clock RFC3339 timestamp '{}': {}",
+                args.t_clock, e
+            )
+            .into());
+        }
+    };
+
+    let findings = hermetic_sealcheck::check_d8(&args.root, t_clock, args.root_visibility.into());
+
+    let output_str = match args.format {
+        OutputFormat::Sarif => {
+            let sarif = generate_sarif_with_properties(
+                &findings,
+                Some(SarifRunProperties {
+                    mode: "d8".to_string(),
+                    not_covered: Vec::new(),
+                }),
+            );
+            serde_json::to_string_pretty(&sarif)?
+        }
+        OutputFormat::Json => {
+            let summary = FingerprintSummary {
+                lines: 0,
+                windows: 0,
+                removed_markers: 0,
+                diff_shapes: 0,
+                subtracted: 0,
+                winnow: 0,
+                winnow_subtracted: 0,
+                binary_items: 0,
+                binary_subtracted: 0,
+            };
+            let report = SealcheckReport {
+                schema: "hermetic-sealcheck/v0".to_string(),
+                instance_id: String::new(),
+                fingerprints: summary,
+                findings,
+                gate: false,
+                mode: Some("d8".to_string()),
+                not_covered: Vec::new(),
+            };
+            serde_json::to_string_pretty(&report)?
+        }
+    };
+
+    if let Some(out_path) = args.out {
+        fs::write(out_path, format!("{}\n", output_str))?;
+    } else {
+        println!("{}", output_str);
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     // Exit code 2 means "agent-visible gate finding", so usage errors (clap's default
     // exit code 2) must exit 1 instead. --help and --version still exit 0.
@@ -374,6 +461,7 @@ fn main() -> ExitCode {
         Commands::Scan(args) => run_scan(args),
         Commands::Index(args) => run_index(args),
         Commands::Query(args) => run_query(args),
+        Commands::D8(args) => run_d8(args),
     };
     match result {
         Ok(code) => code,
