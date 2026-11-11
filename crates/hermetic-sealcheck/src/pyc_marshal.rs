@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::fingerprint::{sha256_u64, FingerprintSet};
+use crate::fingerprint::{sha256_u64, FingerprintSet, PycFunctionFingerprint};
 use crate::scan::{Finding, ScanOptions, Severity};
 
 /// A parsed code object from a `.pyc` file.
@@ -52,7 +53,7 @@ enum MarshalValue {
     Float(String),
     String(String),
     Bytes(Vec<u8>),
-    Tuple(Vec<MarshalValue>),
+    Tuple(Arc<[MarshalValue]>),
     List,
     Dict,
     Set,
@@ -75,6 +76,7 @@ struct MarshalParser<'a> {
     pos: usize,
     magic: u16,
     depth: usize,
+    work_budget: usize,
     refs: Vec<Option<MarshalValue>>,
     code_objects: Vec<PycCodeObject>,
 }
@@ -86,6 +88,7 @@ impl<'a> MarshalParser<'a> {
             pos: 0,
             magic,
             depth: 0,
+            work_budget: 100_000 + bytes.len().saturating_mul(10),
             refs: Vec::new(),
             code_objects: Vec::new(),
         }
@@ -132,9 +135,10 @@ impl<'a> MarshalParser<'a> {
     }
 
     fn read_object(&mut self) -> Result<MarshalValue, MarshalError> {
-        if self.depth > 64 {
+        if self.depth > 64 || self.work_budget == 0 {
             return Err(MarshalError::RecursionLimit);
         }
+        self.work_budget -= 1;
         self.depth += 1;
         let raw_type = self.read_u8()?;
         let flag_ref = (raw_type & 0x80) != 0;
@@ -256,7 +260,7 @@ impl<'a> MarshalParser<'a> {
                 for _ in 0..count {
                     items.push(self.read_object()?);
                 }
-                MarshalValue::Tuple(items)
+                MarshalValue::Tuple(items.into())
             }
             b')' => {
                 let count = self.read_u8()? as usize;
@@ -267,7 +271,7 @@ impl<'a> MarshalParser<'a> {
                 for _ in 0..count {
                     items.push(self.read_object()?);
                 }
-                MarshalValue::Tuple(items)
+                MarshalValue::Tuple(items.into())
             }
             b'[' => {
                 let count = self.read_u32()? as usize;
@@ -421,7 +425,7 @@ impl<'a> MarshalParser<'a> {
 
         // 1. co_names
         if let MarshalValue::Tuple(items) = names_obj {
-            for it in items {
+            for it in items.iter() {
                 if let Some(s) = it.as_string() {
                     symbols.insert(s);
                 }
@@ -431,7 +435,7 @@ impl<'a> MarshalParser<'a> {
         // 2. co_varnames / co_localsplusnames / co_freevars / co_cellvars
         for vt in var_tuples {
             if let MarshalValue::Tuple(items) = vt {
-                for it in items {
+                for it in items.iter() {
                     if let Some(s) = it.as_string() {
                         symbols.insert(s);
                     }
@@ -441,21 +445,32 @@ impl<'a> MarshalParser<'a> {
 
         // 3. co_consts
         if let MarshalValue::Tuple(items) = consts_obj {
-            for it in items {
-                match it {
+            let mut stack: Vec<(&MarshalValue, usize)> = items.iter().map(|it| (it, 0)).collect();
+            let mut walk_budget = 10_000usize;
+            while let Some((val, depth)) = stack.pop() {
+                if walk_budget == 0 || depth > 16 {
+                    continue;
+                }
+                walk_budget -= 1;
+                match val {
                     MarshalValue::String(s) => {
-                        symbols.insert(s);
+                        symbols.insert(s.clone());
                     }
                     MarshalValue::Bytes(b) => {
-                        if let Ok(s) = std::str::from_utf8(&b) {
+                        if let Ok(s) = std::str::from_utf8(b) {
                             symbols.insert(s.to_string());
                         }
                     }
                     MarshalValue::Int(s) => {
-                        symbols.insert(s);
+                        symbols.insert(s.clone());
                     }
                     MarshalValue::Float(s) => {
-                        symbols.insert(s);
+                        symbols.insert(s.clone());
+                    }
+                    MarshalValue::Tuple(sub_items) => {
+                        for sub in sub_items.iter().rev() {
+                            stack.push((sub, depth + 1));
+                        }
                     }
                     MarshalValue::Code => {
                         // Nested code objects are collected separately when read
@@ -504,83 +519,88 @@ pub fn match_pyc_code_objects(
     let mut findings = Vec::new();
 
     for hunk in &fp.hunks {
-        let pyc_fp = match &hunk.pyc_fingerprint {
-            Some(f) => f,
-            None => continue,
+        let pyc_fps: Vec<&PycFunctionFingerprint> = if !hunk.pyc_fingerprints.is_empty() {
+            hunk.pyc_fingerprints.iter().collect()
+        } else if let Some(f) = &hunk.pyc_fingerprint {
+            vec![f]
+        } else {
+            Vec::new()
         };
 
-        for co in objects {
-            let matches_name = co.name == pyc_fp.function_name;
-            if !matches_name {
-                continue;
-            }
-
-            let hit_added = pyc_fp
-                .added
-                .iter()
-                .filter(|s| co.symbols.contains(*s))
-                .count();
-            let hit_removed_absent = pyc_fp
-                .removed
-                .iter()
-                .filter(|s| !co.symbols.contains(*s))
-                .count();
-            let total = pyc_fp.added.len() + pyc_fp.removed.len();
-            if total == 0 {
-                continue;
-            }
-            let confidence = (hit_added + hit_removed_absent) as f64 / total as f64;
-            let rounded_conf = (confidence * 100.0).round() / 100.0;
-
-            if !pyc_fp.added.is_empty() {
-                if confidence >= opts.binary_threshold && hit_added >= 1 {
-                    let mut matched: Vec<&String> = pyc_fp
-                        .added
-                        .iter()
-                        .filter(|s| co.symbols.contains(*s))
-                        .collect();
-                    matched.sort();
-                    let mut evidence = Vec::new();
-                    evidence.push(pyc_fp.function_name.clone());
-                    for sym in matched.into_iter().take(5) {
-                        evidence.push(sym.clone());
-                    }
-                    findings.push(Finding {
-                        detector: "D3b".into(),
-                        channel: "binary_pyc_function".into(),
-                        path: path.to_string(),
-                        visibility: opts.visibility,
-                        severity: Severity::Gate,
-                        confidence: rounded_conf,
-                        hunk: Some(hunk.hunk_index),
-                        evidence,
-                    });
+        for pyc_fp in pyc_fps {
+            for co in objects {
+                let matches_name = co.name == pyc_fp.function_name;
+                if !matches_name {
+                    continue;
                 }
-            } else {
-                // When added is empty (a pure deletion): report Review, not Gate, when confidence >= 0.60
-                if confidence >= opts.binary_threshold {
-                    let mut absent: Vec<&String> = pyc_fp
-                        .removed
-                        .iter()
-                        .filter(|s| !co.symbols.contains(*s))
-                        .collect();
-                    absent.sort();
-                    let mut evidence = Vec::new();
-                    evidence.push(pyc_fp.function_name.clone());
-                    evidence.push("pure deletion: absence of names is weak evidence".into());
-                    for sym in absent.into_iter().take(5) {
-                        evidence.push(sym.clone());
+
+                let hit_added = pyc_fp
+                    .added
+                    .iter()
+                    .filter(|s| co.symbols.contains(*s))
+                    .count();
+                let hit_removed_absent = pyc_fp
+                    .removed
+                    .iter()
+                    .filter(|s| !co.symbols.contains(*s))
+                    .count();
+                let total = pyc_fp.added.len() + pyc_fp.removed.len();
+                if total == 0 {
+                    continue;
+                }
+                let confidence = (hit_added + hit_removed_absent) as f64 / total as f64;
+                let rounded_conf = (confidence * 100.0).round() / 100.0;
+
+                if !pyc_fp.added.is_empty() {
+                    if confidence >= opts.binary_threshold && hit_added >= 1 {
+                        let mut matched: Vec<&String> = pyc_fp
+                            .added
+                            .iter()
+                            .filter(|s| co.symbols.contains(*s))
+                            .collect();
+                        matched.sort();
+                        let mut evidence = Vec::new();
+                        evidence.push(pyc_fp.function_name.clone());
+                        for sym in matched.into_iter().take(5) {
+                            evidence.push(sym.clone());
+                        }
+                        findings.push(Finding {
+                            detector: "D3b".into(),
+                            channel: "binary_pyc_function".into(),
+                            path: path.to_string(),
+                            visibility: opts.visibility,
+                            severity: Severity::Gate,
+                            confidence: rounded_conf,
+                            hunk: Some(hunk.hunk_index),
+                            evidence,
+                        });
                     }
-                    findings.push(Finding {
-                        detector: "D3b".into(),
-                        channel: "binary_pyc_function".into(),
-                        path: path.to_string(),
-                        visibility: opts.visibility,
-                        severity: Severity::Review,
-                        confidence: rounded_conf,
-                        hunk: Some(hunk.hunk_index),
-                        evidence,
-                    });
+                } else {
+                    // When added is empty (a pure deletion): report Review, not Gate, when confidence >= 0.60
+                    if confidence >= opts.binary_threshold {
+                        let mut absent: Vec<&String> = pyc_fp
+                            .removed
+                            .iter()
+                            .filter(|s| !co.symbols.contains(*s))
+                            .collect();
+                        absent.sort();
+                        let mut evidence = Vec::new();
+                        evidence.push(pyc_fp.function_name.clone());
+                        evidence.push("pure deletion: absence of names is weak evidence".into());
+                        for sym in absent.into_iter().take(5) {
+                            evidence.push(sym.clone());
+                        }
+                        findings.push(Finding {
+                            detector: "D3b".into(),
+                            channel: "binary_pyc_function".into(),
+                            path: path.to_string(),
+                            visibility: opts.visibility,
+                            severity: Severity::Review,
+                            confidence: rounded_conf,
+                            hunk: Some(hunk.hunk_index),
+                            evidence,
+                        });
+                    }
                 }
             }
         }
@@ -599,89 +619,94 @@ pub fn match_hashed_pyc_code_objects(
     let mut findings = Vec::new();
 
     for hunk in &fp.hunks {
-        let pyc_fp = match &hunk.pyc_fingerprint {
-            Some(f) => f,
-            None => continue,
+        let pyc_fps: Vec<&PycFunctionFingerprint> = if !hunk.pyc_fingerprints.is_empty() {
+            hunk.pyc_fingerprints.iter().collect()
+        } else if let Some(f) = &hunk.pyc_fingerprint {
+            vec![f]
+        } else {
+            Vec::new()
         };
 
-        for co in objects {
-            let matches_name = co.name == pyc_fp.function_name;
-            if !matches_name {
-                continue;
-            }
-
-            let hit_added = pyc_fp
-                .added_u64
-                .iter()
-                .filter(|h| co.symbols.contains(h))
-                .count();
-            let hit_removed_absent = pyc_fp
-                .removed_u64
-                .iter()
-                .filter(|h| !co.symbols.contains(h))
-                .count();
-            let total = pyc_fp.added_u64.len() + pyc_fp.removed_u64.len();
-            if total == 0 {
-                continue;
-            }
-            let confidence = (hit_added + hit_removed_absent) as f64 / total as f64;
-            let rounded_conf = (confidence * 100.0).round() / 100.0;
-
-            if !pyc_fp.added.is_empty() {
-                if confidence >= opts.binary_threshold && hit_added >= 1 {
-                    let mut matched: Vec<&String> = pyc_fp
-                        .added
-                        .iter()
-                        .filter(|s| {
-                            let h = sha256_u64(s.as_bytes());
-                            co.symbols.contains(&h)
-                        })
-                        .collect();
-                    matched.sort();
-                    let mut evidence = Vec::new();
-                    evidence.push(pyc_fp.function_name.clone());
-                    for sym in matched.into_iter().take(5) {
-                        evidence.push(sym.clone());
-                    }
-                    findings.push(Finding {
-                        detector: "D3b".into(),
-                        channel: "binary_pyc_function".into(),
-                        path: path.to_string(),
-                        visibility: opts.visibility,
-                        severity: Severity::Gate,
-                        confidence: rounded_conf,
-                        hunk: Some(hunk.hunk_index),
-                        evidence,
-                    });
+        for pyc_fp in pyc_fps {
+            for co in objects {
+                let matches_name = co.name == pyc_fp.function_name;
+                if !matches_name {
+                    continue;
                 }
-            } else {
-                // When added is empty (a pure deletion): report Review, not Gate, when confidence >= 0.60
-                if confidence >= opts.binary_threshold {
-                    let mut absent: Vec<&String> = pyc_fp
-                        .removed
-                        .iter()
-                        .filter(|s| {
-                            let h = sha256_u64(s.as_bytes());
-                            !co.symbols.contains(&h)
-                        })
-                        .collect();
-                    absent.sort();
-                    let mut evidence = Vec::new();
-                    evidence.push(pyc_fp.function_name.clone());
-                    evidence.push("pure deletion: absence of names is weak evidence".into());
-                    for sym in absent.into_iter().take(5) {
-                        evidence.push(sym.clone());
+
+                let hit_added = pyc_fp
+                    .added_u64
+                    .iter()
+                    .filter(|h| co.symbols.contains(h))
+                    .count();
+                let hit_removed_absent = pyc_fp
+                    .removed_u64
+                    .iter()
+                    .filter(|h| !co.symbols.contains(h))
+                    .count();
+                let total = pyc_fp.added_u64.len() + pyc_fp.removed_u64.len();
+                if total == 0 {
+                    continue;
+                }
+                let confidence = (hit_added + hit_removed_absent) as f64 / total as f64;
+                let rounded_conf = (confidence * 100.0).round() / 100.0;
+
+                if !pyc_fp.added.is_empty() {
+                    if confidence >= opts.binary_threshold && hit_added >= 1 {
+                        let mut matched: Vec<&String> = pyc_fp
+                            .added
+                            .iter()
+                            .filter(|s| {
+                                let h = sha256_u64(s.as_bytes());
+                                co.symbols.contains(&h)
+                            })
+                            .collect();
+                        matched.sort();
+                        let mut evidence = Vec::new();
+                        evidence.push(pyc_fp.function_name.clone());
+                        for sym in matched.into_iter().take(5) {
+                            evidence.push(sym.clone());
+                        }
+                        findings.push(Finding {
+                            detector: "D3b".into(),
+                            channel: "binary_pyc_function".into(),
+                            path: path.to_string(),
+                            visibility: opts.visibility,
+                            severity: Severity::Gate,
+                            confidence: rounded_conf,
+                            hunk: Some(hunk.hunk_index),
+                            evidence,
+                        });
                     }
-                    findings.push(Finding {
-                        detector: "D3b".into(),
-                        channel: "binary_pyc_function".into(),
-                        path: path.to_string(),
-                        visibility: opts.visibility,
-                        severity: Severity::Review,
-                        confidence: rounded_conf,
-                        hunk: Some(hunk.hunk_index),
-                        evidence,
-                    });
+                } else {
+                    // When added is empty (a pure deletion): report Review, not Gate, when confidence >= 0.60
+                    if confidence >= opts.binary_threshold {
+                        let mut absent: Vec<&String> = pyc_fp
+                            .removed
+                            .iter()
+                            .filter(|s| {
+                                let h = sha256_u64(s.as_bytes());
+                                !co.symbols.contains(&h)
+                            })
+                            .collect();
+                        absent.sort();
+                        let mut evidence = Vec::new();
+                        evidence.push(pyc_fp.function_name.clone());
+                        evidence.push("pure deletion: absence of names is weak evidence".into());
+                        for sym in absent.into_iter().take(5) {
+                            evidence.push(sym.clone());
+                        }
+                        findings.push(Finding {
+                            detector: "D3b".into(),
+                            channel: "binary_pyc_function".into(),
+                            path: path.to_string(),
+                            visibility: opts.visibility,
+                            severity: Severity::Review,
+                            confidence: rounded_conf,
+                            hunk: Some(hunk.hunk_index),
+                            evidence,
+                        });
+                    }
                 }
             }
         }

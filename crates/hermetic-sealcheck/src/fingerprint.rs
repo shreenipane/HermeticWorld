@@ -68,6 +68,8 @@ pub struct HunkFingerprints {
     pub binary_items: Vec<String>,
     /// .pyc function fingerprint (D3b)
     pub pyc_fingerprint: Option<PycFunctionFingerprint>,
+    /// .pyc function fingerprints (D3b) for all functions changed by this hunk
+    pub pyc_fingerprints: Vec<PycFunctionFingerprint>,
     /// Preconverted 64-bit line fingerprints: hash -> (weight, orig_hex_hash). Ordered, so
     /// matching (and so the evidence a finding keeps) is the same on every run.
     pub line_u64: BTreeMap<u64, (f64, String)>,
@@ -104,7 +106,7 @@ struct CandidateHunk {
     diff_shapes: Vec<(String, String)>,     // (hash, description)
     winnow_candidates: Vec<(u64, String)>,  // (hash, evidence)
     binary_items: Vec<String>,
-    pyc_fingerprint: Option<PycFunctionFingerprint>,
+    pyc_fingerprints: Vec<PycFunctionFingerprint>,
 }
 
 fn apply_patch_to_base(
@@ -312,6 +314,214 @@ fn is_py_keyword(s: &str) -> bool {
     )
 }
 
+fn decode_py_string_literal(tok_text: &str) -> Option<String> {
+    let bytes = tok_text.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut quote_start = 0;
+    while quote_start < bytes.len() && bytes[quote_start].is_ascii_alphabetic() {
+        quote_start += 1;
+    }
+    if quote_start >= bytes.len() {
+        return None;
+    }
+    let quote_char = bytes[quote_start];
+    if quote_char != b'\'' && quote_char != b'"' {
+        return None;
+    }
+    let prefix = &tok_text[..quote_start];
+    let is_raw = prefix.contains('r') || prefix.contains('R');
+
+    let rest = &tok_text[quote_start..];
+    let content = if rest.starts_with("\"\"\"") {
+        let c = rest.strip_prefix("\"\"\"").unwrap_or(rest);
+        c.strip_suffix("\"\"\"").unwrap_or(c)
+    } else if rest.starts_with("'''") {
+        let c = rest.strip_prefix("'''").unwrap_or(rest);
+        c.strip_suffix("'''").unwrap_or(c)
+    } else if rest.starts_with('"') {
+        let c = rest.strip_prefix('"').unwrap_or(rest);
+        c.strip_suffix('"').unwrap_or(c)
+    } else if rest.starts_with('\'') {
+        let c = rest.strip_prefix('\'').unwrap_or(rest);
+        c.strip_suffix('\'').unwrap_or(c)
+    } else {
+        return None;
+    };
+
+    if is_raw {
+        return Some(content.to_string());
+    }
+
+    // Decode escapes
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('a') => out.push('\x07'),
+                Some('b') => out.push('\x08'),
+                Some('f') => out.push('\x0c'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('v') => out.push('\x0b'),
+                Some('\n') => {} // Line continuation
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                Some('x') => {
+                    let mut hex = String::new();
+                    for _ in 0..2 {
+                        if let Some(&h) = chars.peek() {
+                            if h.is_ascii_hexdigit() {
+                                hex.push(h);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if hex.len() == 2 {
+                        if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                            out.push(b as char);
+                        } else {
+                            out.push_str("\\x");
+                            out.push_str(&hex);
+                        }
+                    } else {
+                        out.push_str("\\x");
+                        out.push_str(&hex);
+                    }
+                }
+                Some('u') => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(&h) = chars.peek() {
+                            if h.is_ascii_hexdigit() {
+                                hex.push(h);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if hex.len() == 4 {
+                        if let Ok(u) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(u) {
+                                out.push(ch);
+                            } else {
+                                out.push_str("\\u");
+                                out.push_str(&hex);
+                            }
+                        } else {
+                            out.push_str("\\u");
+                            out.push_str(&hex);
+                        }
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+                Some('U') => {
+                    let mut hex = String::new();
+                    for _ in 0..8 {
+                        if let Some(&h) = chars.peek() {
+                            if h.is_ascii_hexdigit() {
+                                hex.push(h);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if hex.len() == 8 {
+                        if let Ok(u) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(u) {
+                                out.push(ch);
+                            } else {
+                                out.push_str("\\U");
+                                out.push_str(&hex);
+                            }
+                        } else {
+                            out.push_str("\\U");
+                            out.push_str(&hex);
+                        }
+                    } else {
+                        out.push_str("\\U");
+                        out.push_str(&hex);
+                    }
+                }
+                Some(oct @ '0'..='7') => {
+                    let mut octal = String::new();
+                    octal.push(oct);
+                    for _ in 0..2 {
+                        if let Some(&d) = chars.peek() {
+                            if ('0'..='7').contains(&d) {
+                                octal.push(d);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(u) = u32::from_str_radix(&octal, 8) {
+                        if let Some(ch) = char::from_u32(u) {
+                            out.push(ch);
+                        } else {
+                            out.push('\\');
+                            out.push_str(&octal);
+                        }
+                    } else {
+                        out.push('\\');
+                        out.push_str(&octal);
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => {
+                    out.push('\\');
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn normalize_py_numeric_literal(text: &str) -> String {
+    let s = text.replace('_', "");
+    if s.starts_with("0x") || s.starts_with("0X") {
+        if let Ok(v) = i128::from_str_radix(&s[2..], 16) {
+            return v.to_string();
+        }
+    } else if s.starts_with("0o") || s.starts_with("0O") {
+        if let Ok(v) = i128::from_str_radix(&s[2..], 8) {
+            return v.to_string();
+        }
+    } else if s.starts_with("0b") || s.starts_with("0B") {
+        if let Ok(v) = i128::from_str_radix(&s[2..], 2) {
+            return v.to_string();
+        }
+    } else if s.contains('.') || s.contains('e') || s.contains('E') {
+        if let Ok(f) = s.parse::<f64>() {
+            return f.to_string();
+        }
+    } else if let Ok(v) = s.parse::<i128>() {
+        return v.to_string();
+    }
+    text.to_string()
+}
+
 fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     let text = lines.join("\n");
     let tokens = crate::winnow::tokenize(&text);
@@ -319,11 +529,11 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     let mut prev_is_dot = false;
 
     for tok in &tokens {
-        if let Some(content) = crate::binary::extract_string_literal_content(&tok.text) {
+        if let Some(content) = decode_py_string_literal(&tok.text) {
             symbols.insert(content);
             prev_is_dot = false;
         } else if tok.text.starts_with(|c: char| c.is_ascii_digit()) {
-            symbols.insert(tok.text.clone());
+            symbols.insert(normalize_py_numeric_literal(&tok.text));
             prev_is_dot = false;
         } else if crate::binary::is_identifier(&tok.text) {
             if prev_is_dot || !is_py_keyword(&tok.text) {
@@ -338,38 +548,386 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     symbols
 }
 
-fn find_enclosing_function(
+fn compute_line_continuation(lines: &[String]) -> Vec<bool> {
+    let mut is_cont = vec![false; lines.len()];
+    let mut paren_depth = 0usize;
+    let mut backslash_cont = false;
+    let mut in_triple_single = false;
+    let mut in_triple_double = false;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if paren_depth > 0 || backslash_cont || in_triple_single || in_triple_double {
+            is_cont[idx] = true;
+        }
+        backslash_cont = false;
+
+        let trimmed_end = line.trim_end();
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            if in_triple_single {
+                if i + 2 < len
+                    && bytes[i] == b'\''
+                    && bytes[i + 1] == b'\''
+                    && bytes[i + 2] == b'\''
+                {
+                    in_triple_single = false;
+                    i += 3;
+                    continue;
+                }
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_triple_double {
+                if i + 2 < len && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    in_triple_double = false;
+                    i += 3;
+                    continue;
+                }
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            let b = bytes[i];
+            if b == b'#' {
+                break;
+            }
+            if b == b'\'' || b == b'"' {
+                let quote = b;
+                if i + 2 < len && bytes[i + 1] == quote && bytes[i + 2] == quote {
+                    if quote == b'\'' {
+                        in_triple_single = true;
+                    } else {
+                        in_triple_double = true;
+                    }
+                    i += 3;
+                    continue;
+                } else {
+                    i += 1;
+                    while i < len {
+                        if bytes[i] == b'\\' && i + 1 < len {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == quote {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            if b == b'(' || b == b'[' || b == b'{' {
+                paren_depth += 1;
+            } else if b == b')' || b == b']' || b == b'}' {
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            i += 1;
+        }
+
+        if !in_triple_single && !in_triple_double && trimmed_end.ends_with('\\') {
+            backslash_cont = true;
+        }
+    }
+
+    is_cont
+}
+
+struct ParsedDefHeader {
+    is_class: bool,
+    func_symbols: HashSet<String>,
+    enclosing_symbols: HashSet<String>,
+    header_end: usize,
+    inline_body: Option<String>,
+}
+
+fn parse_def_or_class_header(
     lines: &[String],
-    hunk_lines: &[usize],
-) -> Option<(String, usize, usize)> {
-    if lines.is_empty() {
+    def_line: usize,
+    _is_cont: &[bool],
+) -> Option<ParsedDefHeader> {
+    if def_line >= lines.len() {
         return None;
     }
-    for &idx in hunk_lines {
-        if let Some(line) = lines.get(idx) {
-            if let Some(indent) = get_line_indent(line) {
-                if let Some((name, _)) = parse_def_or_class(line) {
-                    return Some((name, indent, idx));
-                }
+    let (name, is_class) = parse_def_or_class(&lines[def_line])?;
+
+    let mut depth = 0usize;
+    let mut header_end = def_line;
+    let mut colon_byte_idx = None;
+
+    for (idx, line) in lines.iter().enumerate().skip(def_line) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let len = bytes.len();
+
+        while i < len {
+            let b = bytes[i];
+            if b == b'#' {
                 break;
+            }
+            if b == b'\'' || b == b'"' {
+                let quote = b;
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'(' || b == b'[' || b == b'{' {
+                depth += 1;
+            } else if b == b')' || b == b']' || b == b'}' {
+                depth = depth.saturating_sub(1);
+            } else if b == b':' && depth == 0 {
+                colon_byte_idx = Some(i);
+                header_end = idx;
+                break;
+            }
+            i += 1;
+        }
+
+        if colon_byte_idx.is_some() {
+            break;
+        }
+    }
+
+    let end_col = colon_byte_idx.unwrap_or_else(|| lines[header_end].len());
+    let mut header_parts = Vec::new();
+    for line in lines.iter().take(header_end).skip(def_line) {
+        header_parts.push(line.as_str());
+    }
+    let last_slice = &lines[header_end][..end_col.min(lines[header_end].len())];
+    header_parts.push(last_slice);
+    let header_text = header_parts.join("\n");
+
+    let inline_body = if end_col + 1 < lines[header_end].len() {
+        let rest = lines[header_end][end_col + 1..].trim();
+        if !rest.is_empty() {
+            Some(rest.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut func_symbols = HashSet::new();
+    let mut enclosing_symbols = HashSet::new();
+    enclosing_symbols.insert(name.clone());
+
+    let tokens = crate::winnow::tokenize(&header_text);
+
+    if is_class {
+        let mut in_parens = false;
+        let mut prev_is_dot = false;
+        for tok in &tokens {
+            if tok.text == "(" {
+                in_parens = true;
+                continue;
+            }
+            if tok.text == ")" {
+                in_parens = false;
+                continue;
+            }
+            if in_parens {
+                if let Some(content) = decode_py_string_literal(&tok.text) {
+                    enclosing_symbols.insert(content);
+                    prev_is_dot = false;
+                } else if tok.text.starts_with(|c: char| c.is_ascii_digit()) {
+                    enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
+                    prev_is_dot = false;
+                } else if crate::binary::is_identifier(&tok.text) {
+                    if prev_is_dot || !is_py_keyword(&tok.text) {
+                        enclosing_symbols.insert(tok.text.clone());
+                    }
+                    prev_is_dot = false;
+                } else {
+                    prev_is_dot = tok.text == ".";
+                }
+            }
+        }
+    } else {
+        let mut paren_start = None;
+        let mut paren_end = None;
+        let mut p_depth = 0usize;
+
+        for (idx, tok) in tokens.iter().enumerate() {
+            if tok.text == "(" {
+                if p_depth == 0 && paren_start.is_none() {
+                    paren_start = Some(idx);
+                }
+                p_depth += 1;
+            } else if tok.text == ")" {
+                p_depth = p_depth.saturating_sub(1);
+                if p_depth == 0 && paren_start.is_some() && paren_end.is_none() {
+                    paren_end = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if let (Some(start), Some(end)) = (paren_start, paren_end) {
+            let param_tokens = &tokens[start + 1..end];
+            let mut state_depth = 0usize;
+            #[derive(PartialEq, Eq)]
+            enum ParamState {
+                ExpectingName,
+                InParam,
+                InAnnotation,
+                InDefault,
+            }
+            let mut state = ParamState::ExpectingName;
+            let mut prev_is_dot = false;
+
+            for tok in param_tokens {
+                if tok.text == "(" || tok.text == "[" || tok.text == "{" {
+                    state_depth += 1;
+                    continue;
+                } else if tok.text == ")" || tok.text == "]" || tok.text == "}" {
+                    state_depth = state_depth.saturating_sub(1);
+                    continue;
+                }
+
+                if state_depth == 0 {
+                    if tok.text == "," {
+                        state = ParamState::ExpectingName;
+                        prev_is_dot = false;
+                        continue;
+                    }
+                    if state == ParamState::ExpectingName {
+                        if tok.text == "*" || tok.text == "**" || tok.text == "/" {
+                            continue;
+                        }
+                        if crate::binary::is_identifier(&tok.text) && !is_py_keyword(&tok.text) {
+                            func_symbols.insert(tok.text.clone());
+                            state = ParamState::InParam;
+                            continue;
+                        }
+                    } else if state == ParamState::InParam {
+                        if tok.text == ":" {
+                            state = ParamState::InAnnotation;
+                            prev_is_dot = false;
+                            continue;
+                        } else if tok.text == "=" {
+                            state = ParamState::InDefault;
+                            prev_is_dot = false;
+                            continue;
+                        }
+                    } else if state == ParamState::InAnnotation && tok.text == "=" {
+                        state = ParamState::InDefault;
+                        prev_is_dot = false;
+                        continue;
+                    }
+                }
+
+                if state == ParamState::InAnnotation || state == ParamState::InDefault {
+                    if let Some(content) = decode_py_string_literal(&tok.text) {
+                        enclosing_symbols.insert(content);
+                        prev_is_dot = false;
+                    } else if tok.text.starts_with(|c: char| c.is_ascii_digit()) {
+                        enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
+                        prev_is_dot = false;
+                    } else if crate::binary::is_identifier(&tok.text) {
+                        if prev_is_dot || !is_py_keyword(&tok.text) {
+                            enclosing_symbols.insert(tok.text.clone());
+                        }
+                        prev_is_dot = false;
+                    } else {
+                        prev_is_dot = tok.text == ".";
+                    }
+                }
+            }
+
+            let after_tokens = &tokens[end + 1..];
+            let mut in_return_ann = false;
+            let mut prev_is_dot = false;
+            let mut prev_was_dash = false;
+            for tok in after_tokens {
+                if tok.text == "->" || (prev_was_dash && tok.text == ">") {
+                    in_return_ann = true;
+                    prev_was_dash = false;
+                    continue;
+                }
+                prev_was_dash = tok.text == "-";
+                if in_return_ann {
+                    if let Some(content) = decode_py_string_literal(&tok.text) {
+                        enclosing_symbols.insert(content);
+                        prev_is_dot = false;
+                    } else if tok.text.starts_with(|c: char| c.is_ascii_digit()) {
+                        enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
+                        prev_is_dot = false;
+                    } else if crate::binary::is_identifier(&tok.text) {
+                        if prev_is_dot || !is_py_keyword(&tok.text) {
+                            enclosing_symbols.insert(tok.text.clone());
+                        }
+                        prev_is_dot = false;
+                    } else {
+                        prev_is_dot = tok.text == ".";
+                    }
+                }
             }
         }
     }
 
-    let min_hunk_indent = hunk_lines
-        .iter()
-        .filter_map(|&idx| lines.get(idx).and_then(|l| get_line_indent(l)))
-        .min()
-        .unwrap_or(0);
+    Some(ParsedDefHeader {
+        is_class,
+        func_symbols,
+        enclosing_symbols,
+        header_end,
+        inline_body,
+    })
+}
 
-    let start_pos = hunk_lines.first().copied().unwrap_or(0);
-    let mut ref_indent = min_hunk_indent;
+fn find_enclosing_function_for_pos(
+    lines: &[String],
+    pos: usize,
+    is_cont: &[bool],
+) -> (String, usize, usize) {
+    if lines.is_empty() {
+        return ("<module>".to_string(), 0, 0);
+    }
+    let target = pos.min(lines.len() - 1);
+    if !is_cont.get(target).copied().unwrap_or(false) {
+        if let Some(indent) = get_line_indent(&lines[target]) {
+            if let Some((name, _)) = parse_def_or_class(&lines[target]) {
+                return (name, indent, target);
+            }
+        }
+    }
 
-    for i in (0..start_pos).rev() {
+    let mut ref_indent = if !is_cont.get(target).copied().unwrap_or(false) {
+        get_line_indent(&lines[target]).unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    };
+
+    for i in (0..target).rev() {
+        if is_cont.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         if let Some(indent) = get_line_indent(&lines[i]) {
             if indent < ref_indent {
                 if let Some((name, _)) = parse_def_or_class(&lines[i]) {
-                    return Some((name, indent, i));
+                    return (name, indent, i);
                 }
                 if indent == 0 {
                     break;
@@ -379,7 +937,28 @@ fn find_enclosing_function(
         }
     }
 
-    Some(("<module>".to_string(), 0, 0))
+    ("<module>".to_string(), 0, 0)
+}
+
+fn find_candidate_def(
+    lines: &[String],
+    function_name: &str,
+    hint_pos: usize,
+    is_cont: &[bool],
+) -> Option<usize> {
+    let mut candidates = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !is_cont.get(idx).copied().unwrap_or(false) {
+            if let Some((name, _)) = parse_def_or_class(line) {
+                if name == function_name {
+                    candidates.push(idx);
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by_key(|&idx| idx.abs_diff(hint_pos))
 }
 
 fn extract_symbols_for_function(
@@ -390,37 +969,60 @@ fn extract_symbols_for_function(
     if lines.is_empty() {
         return HashSet::new();
     }
+    let is_cont = compute_line_continuation(lines);
+
     if function_name == "<module>" {
-        let mut module_lines = Vec::new();
+        let mut module_symbols = HashSet::new();
         let mut skip_until_indent: Option<usize> = None;
-        for line in lines {
-            if let Some(indent) = get_line_indent(line) {
-                if let Some(skip_indent) = skip_until_indent {
+        let mut line_idx = 0;
+
+        while line_idx < lines.len() {
+            let line = &lines[line_idx];
+
+            if let Some(skip_indent) = skip_until_indent {
+                if is_cont[line_idx] {
+                    line_idx += 1;
+                    continue;
+                }
+                if let Some(indent) = get_line_indent(line) {
                     if indent > skip_indent {
+                        line_idx += 1;
                         continue;
                     } else {
                         skip_until_indent = None;
                     }
+                } else {
+                    line_idx += 1;
+                    continue;
                 }
-                if indent == 0 {
-                    module_lines.push(line.as_str());
-                    if parse_def_or_class(line).is_some() {
-                        skip_until_indent = Some(0);
-                    }
-                }
-            } else if skip_until_indent.is_none() {
-                module_lines.push(line.as_str());
             }
+
+            if !is_cont[line_idx] && parse_def_or_class(line).is_some() {
+                let def_indent = get_line_indent(line).unwrap_or(0);
+                if let Some(parsed) = parse_def_or_class_header(lines, line_idx, &is_cont) {
+                    module_symbols.extend(parsed.enclosing_symbols);
+                    skip_until_indent = Some(def_indent);
+                    line_idx = parsed.header_end + 1;
+                    continue;
+                }
+            }
+
+            let syms = collect_symbol_set(&[line.as_str()]);
+            module_symbols.extend(syms);
+            line_idx += 1;
         }
-        return collect_symbol_set(&module_lines);
+
+        return module_symbols;
     }
 
     let mut candidates = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        if let Some((name, _)) = parse_def_or_class(line) {
-            if name == function_name {
-                if let Some(indent) = get_line_indent(line) {
-                    candidates.push((idx, indent));
+        if !is_cont[idx] {
+            if let Some((name, _)) = parse_def_or_class(line) {
+                if name == function_name {
+                    if let Some(indent) = get_line_indent(line) {
+                        candidates.push((idx, indent));
+                    }
                 }
             }
         }
@@ -436,6 +1038,9 @@ fn extract_symbols_for_function(
 
     let mut end_line = lines.len();
     for (j, line) in lines.iter().enumerate().skip(def_line + 1) {
+        if is_cont[j] {
+            continue;
+        }
         if let Some(indent) = get_line_indent(line) {
             if indent <= base_indent {
                 end_line = j;
@@ -444,44 +1049,71 @@ fn extract_symbols_for_function(
         }
     }
 
-    let mut func_lines = Vec::new();
-    func_lines.push(lines[def_line].as_str());
-    let mut skip_until_indent: Option<usize> = None;
+    let mut symbols = HashSet::new();
+    let parsed_header = parse_def_or_class_header(lines, def_line, &is_cont);
+    let (header_end, inline_body) = if let Some(parsed) = parsed_header {
+        if !parsed.is_class {
+            symbols.extend(parsed.func_symbols);
+        }
+        (parsed.header_end, parsed.inline_body)
+    } else {
+        (def_line, None)
+    };
 
-    for line in lines.iter().take(end_line).skip(def_line + 1) {
-        if let Some(indent) = get_line_indent(line) {
-            if let Some(skip_indent) = skip_until_indent {
+    if let Some(body_text) = inline_body {
+        let syms = collect_symbol_set(&[&body_text]);
+        symbols.extend(syms);
+    }
+
+    let mut skip_until_indent: Option<usize> = None;
+    let mut line_idx = header_end + 1;
+    while line_idx < end_line {
+        let line = &lines[line_idx];
+
+        if let Some(skip_indent) = skip_until_indent {
+            if is_cont[line_idx] {
+                line_idx += 1;
+                continue;
+            }
+            if let Some(indent) = get_line_indent(line) {
                 if indent > skip_indent {
+                    line_idx += 1;
                     continue;
                 } else {
                     skip_until_indent = None;
                 }
-            }
-            if parse_def_or_class(line).is_some() {
-                func_lines.push(line.as_str());
-                skip_until_indent = Some(indent);
+            } else {
+                line_idx += 1;
                 continue;
             }
-        } else if skip_until_indent.is_some() {
-            continue;
         }
-        func_lines.push(line.as_str());
+
+        if !is_cont[line_idx] && parse_def_or_class(line).is_some() {
+            let nested_indent = get_line_indent(line).unwrap_or(base_indent + 1);
+            if let Some(parsed) = parse_def_or_class_header(lines, line_idx, &is_cont) {
+                symbols.extend(parsed.enclosing_symbols);
+                skip_until_indent = Some(nested_indent);
+                line_idx = parsed.header_end + 1;
+                continue;
+            }
+        }
+
+        let syms = collect_symbol_set(&[line.as_str()]);
+        symbols.extend(syms);
+        line_idx += 1;
     }
 
-    collect_symbol_set(&func_lines)
+    symbols
 }
 
-fn compute_pyc_function_fingerprint(
+fn compute_pyc_function_fingerprints(
     hunk: &crate::diff::Hunk,
     post_fix_lines: &[String],
     changed_pos: &[usize],
     base_lines: Option<&[String]>,
-) -> Option<PycFunctionFingerprint> {
-    let fixed_func = if !changed_pos.is_empty() {
-        find_enclosing_function(post_fix_lines, changed_pos)
-    } else {
-        None
-    };
+) -> Vec<PycFunctionFingerprint> {
+    let post_fix_cont = compute_line_continuation(post_fix_lines);
+    let base_cont = base_lines.map(compute_line_continuation);
 
     let base_start = if hunk.header.old_range.start > 0 {
         hunk.header.old_range.start - 1
@@ -489,73 +1121,144 @@ fn compute_pyc_function_fingerprint(
         0
     };
 
-    let base_func = if let Some(base) = base_lines {
-        let mut base_hunk_lines = Vec::new();
-        let mut cur = base_start;
-        for line in &hunk.lines {
-            match line.line_type {
-                crate::diff::DiffLineType::Context => {
-                    cur += 1;
-                }
-                crate::diff::DiffLineType::Removed => {
-                    base_hunk_lines.push(cur);
-                    cur += 1;
-                }
-                crate::diff::DiffLineType::Added => {}
+    let mut base_hunk_lines = Vec::new();
+    let mut cur = base_start;
+    for line in &hunk.lines {
+        match line.line_type {
+            crate::diff::DiffLineType::Context => {
+                cur += 1;
             }
+            crate::diff::DiffLineType::Removed => {
+                base_hunk_lines.push(cur);
+                cur += 1;
+            }
+            crate::diff::DiffLineType::Added => {}
         }
-        if base_hunk_lines.is_empty() {
-            base_hunk_lines.push(base_start);
-        }
-        find_enclosing_function(base, &base_hunk_lines)
-    } else {
-        None
-    };
-
-    let function_name = match (&fixed_func, &base_func) {
-        (Some((f_name, _, _)), _) if f_name != "<module>" => f_name.clone(),
-        (_, Some((b_name, _, _))) if b_name != "<module>" => b_name.clone(),
-        (Some((f_name, _, _)), _) => f_name.clone(),
-        (_, Some((b_name, _, _))) => b_name.clone(),
-        _ => "<module>".to_string(),
-    };
-
-    let hint_fixed = changed_pos.first().copied().unwrap_or(0);
-    let fixed_symbols = extract_symbols_for_function(post_fix_lines, &function_name, hint_fixed);
-
-    let base_symbols = if let Some(base) = base_lines {
-        extract_symbols_for_function(base, &function_name, base_start)
-    } else {
-        HashSet::new()
-    };
-
-    let mut added: HashSet<String> = fixed_symbols.difference(&base_symbols).cloned().collect();
-    let mut removed: HashSet<String> = base_symbols.difference(&fixed_symbols).cloned().collect();
-
-    for stop in PYC_STOP_LIST {
-        added.remove(*stop);
-        removed.remove(*stop);
+    }
+    if base_hunk_lines.is_empty() {
+        base_hunk_lines.push(base_start);
     }
 
-    if added.is_empty() && removed.is_empty() {
-        return None;
+    let base_defs: Vec<(String, usize)> = if let Some(base) = base_lines {
+        let cont = base_cont.as_deref().unwrap_or(&[]);
+        base_hunk_lines
+            .iter()
+            .map(|&b_pos| {
+                let (b_name, _, b_def_pos) = find_enclosing_function_for_pos(base, b_pos, cont);
+                (b_name, b_def_pos)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let fixed_defs: Vec<(String, usize)> = changed_pos
+        .iter()
+        .map(|&pos| {
+            let (f_name, _, f_def_pos) =
+                find_enclosing_function_for_pos(post_fix_lines, pos, &post_fix_cont);
+            (f_name, f_def_pos)
+        })
+        .collect();
+
+    let mut targets: Vec<(String, Option<usize>, Option<usize>)> = Vec::new();
+
+    // 1. From fixed_defs
+    for (f_name, f_def_pos) in fixed_defs {
+        let b_hint = if let Some((_, b_pos)) = base_defs.iter().find(|(name, _)| *name == f_name) {
+            Some(*b_pos)
+        } else if let Some(base) = base_lines {
+            if f_name == "<module>" {
+                Some(0)
+            } else {
+                let cont = base_cont.as_deref().unwrap_or(&[]);
+                find_candidate_def(base, &f_name, f_def_pos, cont)
+            }
+        } else {
+            None
+        };
+
+        if !targets
+            .iter()
+            .any(|(name, f_h, _)| *name == f_name && *f_h == Some(f_def_pos))
+        {
+            targets.push((f_name, Some(f_def_pos), b_hint));
+        }
     }
 
-    let mut added_u64: Vec<u64> = added.iter().map(|s| sha256_u64(s.as_bytes())).collect();
-    added_u64.sort_unstable();
-    added_u64.dedup();
+    // 2. From base_defs
+    for (b_name, b_def_pos) in base_defs {
+        if !targets
+            .iter()
+            .any(|(name, _, b_h)| *name == b_name && *b_h == Some(b_def_pos))
+        {
+            let f_hint = if b_name == "<module>" {
+                Some(0)
+            } else {
+                find_candidate_def(post_fix_lines, &b_name, b_def_pos, &post_fix_cont)
+            };
+            targets.push((b_name, f_hint, Some(b_def_pos)));
+        }
+    }
 
-    let mut removed_u64: Vec<u64> = removed.iter().map(|s| sha256_u64(s.as_bytes())).collect();
-    removed_u64.sort_unstable();
-    removed_u64.dedup();
+    if targets.is_empty() {
+        targets.push(("<module>".to_string(), Some(0), Some(0)));
+    }
 
-    Some(PycFunctionFingerprint {
-        function_name,
-        added,
-        removed,
-        added_u64,
-        removed_u64,
-    })
+    let mut result = Vec::new();
+
+    for (function_name, f_hint, b_hint) in targets {
+        let fixed_symbols = if let Some(f_pos) = f_hint {
+            extract_symbols_for_function(post_fix_lines, &function_name, f_pos)
+        } else if function_name == "<module>" {
+            extract_symbols_for_function(post_fix_lines, "<module>", 0)
+        } else {
+            HashSet::new()
+        };
+
+        let base_symbols = if let Some(base) = base_lines {
+            if let Some(b_pos) = b_hint {
+                extract_symbols_for_function(base, &function_name, b_pos)
+            } else if function_name == "<module>" {
+                extract_symbols_for_function(base, "<module>", 0)
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
+        let mut added: HashSet<String> = fixed_symbols.difference(&base_symbols).cloned().collect();
+        let mut removed: HashSet<String> =
+            base_symbols.difference(&fixed_symbols).cloned().collect();
+
+        for stop in PYC_STOP_LIST {
+            added.remove(*stop);
+            removed.remove(*stop);
+        }
+
+        if added.is_empty() && removed.is_empty() {
+            continue;
+        }
+
+        let mut added_u64: Vec<u64> = added.iter().map(|s| sha256_u64(s.as_bytes())).collect();
+        added_u64.sort_unstable();
+        added_u64.dedup();
+
+        let mut removed_u64: Vec<u64> = removed.iter().map(|s| sha256_u64(s.as_bytes())).collect();
+        removed_u64.sort_unstable();
+        removed_u64.dedup();
+
+        result.push(PycFunctionFingerprint {
+            function_name,
+            added,
+            removed,
+            added_u64,
+            removed_u64,
+        });
+    }
+
+    result
 }
 
 impl FingerprintSet {
@@ -789,8 +1492,8 @@ impl FingerprintSet {
                     }
                 }
 
-                let pyc_fingerprint = if file_path.ends_with(".py") {
-                    compute_pyc_function_fingerprint(
+                let pyc_fingerprints = if file_path.ends_with(".py") {
+                    compute_pyc_function_fingerprints(
                         hunk,
                         &post_fix_lines,
                         hunk_changed_positions
@@ -800,7 +1503,7 @@ impl FingerprintSet {
                         base_lines.as_deref(),
                     )
                 } else {
-                    None
+                    Vec::new()
                 };
 
                 candidate_hunks.push(CandidateHunk {
@@ -812,7 +1515,7 @@ impl FingerprintSet {
                     diff_shapes,
                     winnow_candidates,
                     binary_items,
-                    pyc_fingerprint,
+                    pyc_fingerprints,
                 });
                 global_hunk_counter += 1;
             }
@@ -847,7 +1550,7 @@ impl FingerprintSet {
                         diff_shapes: Vec::new(),
                         winnow_candidates: Vec::new(),
                         binary_items: Vec::new(),
-                        pyc_fingerprint: None,
+                        pyc_fingerprints: Vec::new(),
                     });
                     global_hunk_counter += 1;
                 }
@@ -1077,7 +1780,8 @@ impl FingerprintSet {
                 diff_shapes: diff_shapes_map,
                 winnow_fingerprints,
                 binary_items: surviving_binary_items,
-                pyc_fingerprint: ch.pyc_fingerprint,
+                pyc_fingerprint: ch.pyc_fingerprints.first().cloned(),
+                pyc_fingerprints: ch.pyc_fingerprints,
                 line_u64,
                 window_u64,
                 removed_u64,
