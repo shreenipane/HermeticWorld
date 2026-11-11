@@ -28,8 +28,13 @@ pub const MAX_REDACTION_FRACTION: f64 = 0.50;
 /// the statement is considered destroyed. Exactly 20 remaining characters (`chars >= 20`) is eligible for repair.
 pub const MIN_REMAINING_CHARS: usize = 20;
 
+pub const MAX_STATEMENT_BYTES: usize = 1024 * 1024;
+pub const MAX_REDACTION_SPANS: usize = 4096;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DispositionError {
+    #[error("Disposition resource cap exceeded")]
+    ResourceCap,
     #[error("Span offset {0}..{1} out of bounds for statement of length {2}")]
     OutOfBounds(usize, usize, usize),
     #[error("Span offset {0} is not at a UTF-8 character boundary in statement")]
@@ -76,6 +81,9 @@ pub fn validate_and_merge_spans(
     statement: &str,
     mut spans: Vec<(usize, usize)>,
 ) -> Result<Vec<(usize, usize)>, DispositionError> {
+    if statement.len() > MAX_STATEMENT_BYTES || spans.len() > MAX_REDACTION_SPANS {
+        return Err(DispositionError::ResourceCap);
+    }
     for &(s, e) in &spans {
         if s > e || e > statement.len() {
             return Err(DispositionError::OutOfBounds(s, e, statement.len()));
@@ -96,7 +104,9 @@ pub fn validate_and_merge_spans(
     spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-    let (mut cur_s, mut cur_e) = spans[0];
+    let Some(&(mut cur_s, mut cur_e)) = spans.first() else {
+        return Ok(merged);
+    };
 
     for (s, e) in spans.into_iter().skip(1) {
         if s <= cur_e {
@@ -117,38 +127,49 @@ pub fn validate_and_merge_spans(
 ///
 /// Returns `true` (excluded) if `fraction > MAX_REDACTION_FRACTION` or
 /// `remaining_non_whitespace_chars < MIN_REMAINING_CHARS`.
-pub fn should_exclude_d0(statement: &str, merged_spans: &[(usize, usize)]) -> bool {
-    let stmt_bytes = statement.len();
-    if stmt_bytes == 0 {
-        return true;
-    }
+pub fn should_exclude_d0(statement: &str, spans: &[(usize, usize)]) -> bool {
+    // Preserve the boolean API: unverifiable spans always exclude the task.
+    !matches!(checked_should_exclude_d0(statement, spans), Ok(false))
+}
 
-    let redacted_bytes: usize = merged_spans.iter().map(|&(s, e)| e - s).sum();
-    let fraction = redacted_bytes as f64 / stmt_bytes as f64;
-    if fraction > MAX_REDACTION_FRACTION {
-        return true;
+/// Validate and merge untrusted spans before threshold evaluation.
+pub fn checked_should_exclude_d0(
+    statement: &str,
+    spans: &[(usize, usize)],
+) -> Result<bool, DispositionError> {
+    if spans.len() > MAX_REDACTION_SPANS {
+        return Err(DispositionError::ResourceCap);
     }
-
-    // Count non-whitespace chars outside the spans
-    let mut non_ws_count = 0;
-    let mut last_idx = 0;
-    for &(s, e) in merged_spans {
-        if s > last_idx {
-            non_ws_count += statement[last_idx..s]
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .count();
-        }
-        last_idx = e;
+    let merged = validate_and_merge_spans(statement, spans.to_vec())?;
+    if statement.is_empty() {
+        return Ok(true);
     }
-    if last_idx < statement.len() {
-        non_ws_count += statement[last_idx..]
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .count();
+    let mut redacted_bytes = 0usize;
+    let mut remaining = String::new();
+    let mut last = 0;
+    for (start, end) in merged {
+        let size = end
+            .checked_sub(start)
+            .ok_or(DispositionError::ResourceCap)?;
+        redacted_bytes = redacted_bytes
+            .checked_add(size)
+            .ok_or(DispositionError::ResourceCap)?;
+        remaining.push_str(
+            statement
+                .get(last..start)
+                .ok_or(DispositionError::InvalidCharBoundary(start))?,
+        );
+        last = end;
     }
-
-    non_ws_count < MIN_REMAINING_CHARS
+    remaining.push_str(
+        statement
+            .get(last..)
+            .ok_or(DispositionError::InvalidCharBoundary(last))?,
+    );
+    Ok(
+        redacted_bytes as f64 / statement.len() as f64 > MAX_REDACTION_FRACTION
+            || remaining.chars().filter(|c| !c.is_whitespace()).count() < MIN_REMAINING_CHARS,
+    )
 }
 
 /// Redact spans from a problem statement string.
@@ -164,7 +185,9 @@ pub fn redact_statement(
 
     let mut metadata = Vec::with_capacity(merged_spans.len());
     for &(s, e) in &merged_spans {
-        let slice = &statement[s..e];
+        let slice = statement
+            .get(s..e)
+            .ok_or(DispositionError::InvalidCharBoundary(s))?;
         let digest = sha256_hex(slice.as_bytes());
         metadata.push(RedactedSpan {
             start: s,
@@ -174,11 +197,22 @@ pub fn redact_statement(
         });
     }
 
-    // Apply redactions in reverse offset order so earlier byte offsets remain unchanged
-    let mut out = statement.to_string();
-    for &(s, e) in merged_spans.iter().rev() {
-        out.replace_range(s..e, "[REDACTED]");
+    let mut out = String::new();
+    let mut last = 0;
+    for &(start, end) in &merged_spans {
+        out.push_str(
+            statement
+                .get(last..start)
+                .ok_or(DispositionError::InvalidCharBoundary(start))?,
+        );
+        out.push_str("[REDACTED]");
+        last = end;
     }
+    out.push_str(
+        statement
+            .get(last..)
+            .ok_or(DispositionError::InvalidCharBoundary(last))?,
+    );
 
     Ok((out, metadata))
 }

@@ -256,3 +256,36 @@ fn test_task_disposition_record_json_schema() {
     assert_eq!(json_val["reason"], "gate passed");
     assert_eq!(json_val["world_version"], "blake3:abcdef");
 }
+
+#[test]
+fn test_should_exclude_rejects_untrusted_spans_without_panicking() {
+    use hermetic_common::disposition::checked_should_exclude_d0;
+    for spans in [
+        vec![(1, 1)],
+        vec![(1, 2)],
+        vec![(2, 1)],
+        vec![(0, usize::MAX)],
+    ] {
+        assert!(checked_should_exclude_d0("é", &spans).is_err());
+        assert!(should_exclude_d0("é", &spans));
+    }
+    let statement = "a".repeat(100);
+    let overlapping = [(20, 40), (0, 30), (10, 20)];
+    assert_eq!(
+        checked_should_exclude_d0(&statement, &overlapping),
+        Ok(false)
+    );
+    assert!(!should_exclude_d0(&statement, &overlapping));
+    assert!(should_exclude_d0("a", &vec![(0, 0); 4097]));
+    assert!(should_exclude_d0(&"a".repeat(1024 * 1024 + 1), &[]));
+}
+
+#[test]
+fn test_clean_disposition_manifest_roundtrip() {
+    let mut manifest = sample_manifest();
+    manifest.add_disposition(DispositionKind::Clean, "none", "gate passed");
+    let serialized = serde_json::to_string(&manifest).expect("serialize manifest");
+    let loaded = WorldManifest::from_json_str(&serialized).expect("load manifest");
+    assert_eq!(loaded.dispositions[0].kind, DispositionKind::Clean);
+    assert_eq!(loaded.world_root().unwrap(), manifest.world_root().unwrap());
+}

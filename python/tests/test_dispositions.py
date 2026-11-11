@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import pytest
 
+from tests.disposition_fixtures import complete_manifest, complete_task
+
 from hermetic_slice import (
     DispositionsError,
     MalformedGateOutputError,
@@ -53,11 +55,7 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
     )
     (t1_dir / "agent" / "problem_statement.md").write_text(t1_stmt, encoding="utf-8")
     (t1_dir / "task.json").write_text(
-        json.dumps({
-            "instance_id": "task__clean-repair-01",
-            "gold_patch": "",
-            "test_patch": "",
-        }),
+        json.dumps(complete_task("task__clean-repair-01")),
         encoding="utf-8",
     )
 
@@ -74,11 +72,7 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
     )
     (t2_dir / "agent" / "problem_statement.md").write_text(t2_stmt, encoding="utf-8")
     (t2_dir / "task.json").write_text(
-        json.dumps({
-            "instance_id": "task__dirty-rescan-02",
-            "gold_patch": "",
-            "test_patch": "",
-        }),
+        json.dumps(complete_task("task__dirty-rescan-02")),
         encoding="utf-8",
     )
 
@@ -103,12 +97,12 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
         "instance_id = task_dir.name\n"
         "\n"
         "if 'task__dirty-rescan' in instance_id:\n"
-        "    findings = [{'detector': 'D0', 'severity': 'gate', 'visibility': 'agent_visible'}]\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': findings}))\n"
+        "    findings = [{'detector': 'D0', 'severity': 'gate', 'visibility': 'agent_visible', 'channel': 'problem_statement', 'path': 'agent/problem_statement.md', 'confidence': 1.0, 'evidence': []}]\n"
+        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': findings, 'gate': True, 'not_covered': []}))\n"
         "    sys.exit(2)\n"
         "else:\n"
         "    # Clean re-scan\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': []}))\n"
+        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': [], 'gate': False, 'not_covered': []}))\n"
         "    sys.exit(0)\n"
     )
     stub_sealcheck.write_text(stub_content, encoding="utf-8")
@@ -116,10 +110,10 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
 
     gate_file = tmp_path / "gate_input.json"
     gate_data = [
-        {
+        {"not_covered": [],
             "task_id": "task__clean-repair-01",
             "findings": [
-                {
+                {"path": "agent/problem_statement.md", "confidence": 1.0,
                     "detector": "D0",
                     "channel": "problem_statement",
                     "severity": "gate",
@@ -129,10 +123,10 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
             ],
             "gate": True,
         },
-        {
+        {"not_covered": [],
             "task_id": "task__dirty-rescan-02",
             "findings": [
-                {
+                {"path": "agent/problem_statement.md", "confidence": 1.0,
                     "detector": "D0",
                     "channel": "problem_statement",
                     "severity": "gate",
@@ -143,6 +137,17 @@ def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys
             "gate": True,
         },
     ]
+    base_tree = tmp_path / "base"
+    base_tree.mkdir()
+    world_root = tmp_path / "world"
+    world_root.mkdir()
+    os.utime(world_root, (1704067200, 1704067200))
+    for task_dir, item in zip((t1_dir, t2_dir), gate_data):
+        (task_dir / "staging").mkdir()
+        (task_dir / "staging" / "gold.patch").write_text("", encoding="utf-8")
+        (task_dir / "staging" / "test.patch").write_text("", encoding="utf-8")
+        (task_dir / "manifest.json").write_text(json.dumps(complete_manifest(item["task_id"])), encoding="utf-8")
+        item["scan_config"] = {"base_tree": str(base_tree), "roots": [{"path": str(world_root), "visibility": "agent_visible"}]}
     gate_file.write_text(json.dumps(gate_data), encoding="utf-8")
 
     out_file = tmp_path / "dispositions.json"
@@ -298,7 +303,7 @@ def test_no_leaked_text_in_errors_or_stderr(tmp_path: Path, capsys: pytest.Captu
     """Malformed entry containing a secret string must NOT appear in stderr or exception text."""
     secret_text = "SUPER_SECRET_TOKEN_DO_NOT_LEAK"
 
-    malformed_entry = {
+    malformed_entry = {"gate": False, "not_covered": [],
         "task_id": "valid_task_id",
         "findings": "invalid_non_list_type_with_secret_" + secret_text,
     }
@@ -311,7 +316,7 @@ def test_no_leaked_text_in_errors_or_stderr(tmp_path: Path, capsys: pytest.Captu
 
     # Also check CLI stderr output
     bad_file = tmp_path / "secret_bad.json"
-    bad_file.write_text(json.dumps([{"task_id": "t1", "findings": secret_text}]), encoding="utf-8")
+    bad_file.write_text(json.dumps([{"gate": False, "not_covered": [], "task_id": "t1", "findings": secret_text}]), encoding="utf-8")
 
     code = cli_main(["dispositions", "--gate-output", str(bad_file)])
     assert code != 0
@@ -359,8 +364,8 @@ def test_denominator_guarding_duplicate_and_missing(tmp_path: Path) -> None:
     """Duplicate task_ids fail; every task under tasks-dir must have a report."""
     # Duplicate task_id
     dup_reports = [
-        {"task_id": "task_dup", "findings": []},
-        {"task_id": "task_dup", "findings": []},
+        {"gate": False, "not_covered": [], "task_id": "task_dup", "findings": []},
+        {"gate": False, "not_covered": [], "task_id": "task_dup", "findings": []},
     ]
     with pytest.raises(MalformedGateOutputError, match="Duplicate task_id"):
         process_dispositions(dup_reports)
@@ -372,7 +377,7 @@ def test_denominator_guarding_duplicate_and_missing(tmp_path: Path) -> None:
     (tasks_dir / "task_missing").mkdir()
 
     reports_partial = [
-        {"task_id": "task_present", "findings": []},
+        {"gate": False, "not_covered": [], "task_id": "task_present", "findings": []},
     ]
 
     with pytest.raises(MissingDispositionError, match="Missing gate report for task"):
@@ -398,9 +403,9 @@ def test_atomicity_malformed_task_leaves_no_disk_changes(tmp_path: Path) -> None
 
     # Input: task_a (valid) followed by task_b (malformed, missing findings)
     reports = [
-        {
+        {"gate": True, "not_covered": [],
             "task_id": "task_a",
-            "findings": [{"detector": "D0", "severity": "gate", "evidence": ["SECRET_LEAK"]}],
+            "findings": [{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["SECRET_LEAK"]}],
         },
         {
             "task_id": "task_b",
@@ -413,7 +418,7 @@ def test_atomicity_malformed_task_leaves_no_disk_changes(tmp_path: Path) -> None
             reports,
             out_path=out_file,
             tasks_dir=tasks_dir,
-            rescan_fn=lambda tid, stmt: {"findings": []},
+            rescan_fn=lambda tid, stmt: {"gate": False, "not_covered": [], "findings": []},
         )
 
     # Out file must NOT exist
@@ -435,11 +440,12 @@ def test_idempotent_rerun(tmp_path: Path) -> None:
     leak = "LEAK_XYZ"
     stmt = "Extensive problem description for calculation module.\n" + leak + "\nTrailing context."
     (t_dir / "agent" / "problem_statement.md").write_text(stmt, encoding="utf-8")
+    (t_dir / "manifest.json").write_text(json.dumps(complete_manifest(task_id)), encoding="utf-8")
 
     reports = [
-        {
+        {"gate": True, "not_covered": [],
             "task_id": task_id,
-            "findings": [{"detector": "D0", "severity": "gate", "evidence": [leak]}],
+            "findings": [{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": [leak]}],
         }
     ]
 
@@ -448,18 +454,28 @@ def test_idempotent_rerun(tmp_path: Path) -> None:
         reports,
         out_path=out_file,
         tasks_dir=tasks_dir,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert entries1[0]["disposition"] == "repaired"
 
+    (t_dir / "task.json").write_text(json.dumps(complete_task(task_id)), encoding="utf-8")
+    (t_dir / "staging").mkdir()
+    (t_dir / "staging" / "gold.patch").write_text("", encoding="utf-8")
+    (t_dir / "staging" / "test.patch").write_text("", encoding="utf-8")
+    base_tree = tmp_path / "base"
+    base_tree.mkdir()
+    world_root = tmp_path / "world"
+    world_root.mkdir()
+    os.utime(world_root, (1704067200, 1704067200))
     # Second run: gate report on already-redacted task reports clean findings
     clean_reports = [
-        {
+        {"not_covered": [],
             "task_id": task_id,
             "findings": [],
             "gate": False,
         }
     ]
+    clean_reports[0]["scan_config"] = {"base_tree": str(base_tree), "roots": [{"path": str(world_root), "visibility": "agent_visible"}]}
     entries2, _ = process_dispositions(
         clean_reports,
         out_path=out_file,
@@ -477,15 +493,15 @@ def test_idempotent_rerun(tmp_path: Path) -> None:
 def test_dirty_rescan_retains_d0_and_all_firing_detectors() -> None:
     """When re-scan is still dirty, keep original D0 in detectors together with re-scan's detectors."""
     task_id = "task_dirty_multi"
-    findings = [{"detector": "D0", "severity": "gate", "evidence": ["LEAK_FOO"]}]
+    findings = [{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["LEAK_FOO"]}]
     stmt = "Valid problem description text here for testing.\nLEAK_FOO\nMore description."
 
     # Rescan fires D2 and D5a
     def dirty_rescan(tid: str, s: str) -> dict:
-        return {
+        return {"gate": True, "not_covered": [],
             "findings": [
-                {"detector": "D2", "severity": "gate"},
-                {"detector": "D5a", "severity": "gate"},
+                {"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "evidence": [], "detector": "D2", "severity": "gate"},
+                {"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "evidence": [], "detector": "D5a", "severity": "gate"},
             ]
         }
 
@@ -530,7 +546,7 @@ def test_task_id_and_symlink_refusal(tmp_path: Path) -> None:
     symlink_file = t_dir / "agent" / "problem_statement.md"
     symlink_file.symlink_to(secret_target)
 
-    reports = [{"task_id": "task_symlink", "findings": []}]
+    reports = [{"gate": False, "not_covered": [], "task_id": "task_symlink", "findings": []}]
     with pytest.raises(DispositionsError, match="Symlink rejected"):
         process_dispositions(reports, tasks_dir=tasks_dir)
 
@@ -548,20 +564,21 @@ def test_exact_threshold_boundaries_python() -> None:
     # 50% redacted: remaining non-ws chars = 50 (>= 20) -> eligible (not excluded on fraction)
     res_50 = decide_task_disposition(
         task_id="t_50",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        manifest=complete_manifest("t_50"),
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 50)],
         problem_statement=stmt_100,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_50.disposition == "repaired"
 
     # 51% redacted: fraction > 0.50 -> excluded!
     res_51 = decide_task_disposition(
         task_id="t_51",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 51)],
         problem_statement=stmt_100,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_51.disposition == "excluded"
     assert "issue text is the fix" in res_51.reason
@@ -569,10 +586,11 @@ def test_exact_threshold_boundaries_python() -> None:
     # 49% redacted -> eligible
     res_49 = decide_task_disposition(
         task_id="t_49",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        manifest=complete_manifest("t_49"),
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 49)],
         problem_statement=stmt_100,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_49.disposition == "repaired"
 
@@ -581,10 +599,11 @@ def test_exact_threshold_boundaries_python() -> None:
     stmt_20 = "LEAK123456" + ("X" * 20) + (" " * 50)
     res_rem_20 = decide_task_disposition(
         task_id="t_rem_20",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        manifest=complete_manifest("t_rem_20"),
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 10)],
         problem_statement=stmt_20,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_rem_20.disposition == "repaired"
 
@@ -592,10 +611,10 @@ def test_exact_threshold_boundaries_python() -> None:
     stmt_19 = "LEAK123456" + ("X" * 19) + (" " * 50)
     res_rem_19 = decide_task_disposition(
         task_id="t_rem_19",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 10)],
         problem_statement=stmt_19,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_rem_19.disposition == "excluded"
     assert "leaves 19 < 20 chars" in res_rem_19.reason
@@ -604,9 +623,10 @@ def test_exact_threshold_boundaries_python() -> None:
     stmt_21 = "LEAK123456" + ("X" * 21) + (" " * 50)
     res_rem_21 = decide_task_disposition(
         task_id="t_rem_21",
-        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        manifest=complete_manifest("t_rem_21"),
+        findings=[{"visibility": "agent_visible", "channel": "problem_statement", "path": "agent/problem_statement.md", "confidence": 1.0, "detector": "D0", "severity": "gate", "evidence": ["x"]}],
         explicit_spans=[(0, 10)],
         problem_statement=stmt_21,
-        rescan_fn=lambda tid, s: {"findings": []},
+        rescan_fn=lambda tid, s: {"gate": False, "not_covered": [], "findings": []},
     )
     assert res_rem_21.disposition == "repaired"
