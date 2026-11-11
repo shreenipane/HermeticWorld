@@ -116,6 +116,12 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
             },
         },
         SarifRule {
+            id: "D1".to_string(),
+            short_description: SarifMessage {
+                text: "Git state leak".to_string(),
+            },
+        },
+        SarifRule {
             id: "D2".to_string(),
             short_description: SarifMessage {
                 text: "Files and archives leak".to_string(),
@@ -125,6 +131,12 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
             id: "D3".to_string(),
             short_description: SarifMessage {
                 text: "Stale bytecode".to_string(),
+            },
+        },
+        SarifRule {
+            id: "D6".to_string(),
+            short_description: SarifMessage {
+                text: "OCI and VM metadata leak".to_string(),
             },
         },
         SarifRule {

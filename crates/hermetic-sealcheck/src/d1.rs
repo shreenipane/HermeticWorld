@@ -1,0 +1,923 @@
+use std::collections::{HashSet, VecDeque};
+use std::path::Path;
+
+use crate::benchmark::check_d9_content;
+use crate::containers::scan_container_or_unit_with_root_prefix;
+use crate::fingerprint::FingerprintSet;
+use crate::gitstore::{compute_git_sha1, GitError, GitStore, ObjectType};
+use crate::scan::{match_unit, Finding, ScanOptions, Severity};
+
+pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let git_dir_str = git_dir.display().to_string();
+
+    let gate_finding = |channel: &str, p: String, ev: String| Finding {
+        detector: "D1".into(),
+        channel: channel.into(),
+        path: p,
+        visibility: opts.visibility,
+        severity: Severity::Gate,
+        confidence: 1.0,
+        hunk: None,
+        evidence: vec![ev],
+    };
+
+    // 1. Check config file
+    let config_path = git_dir.join("config");
+    findings.extend(check_git_config(&config_path, &git_dir_str, opts));
+
+    // 2. Check state files
+    findings.extend(check_git_state_files(git_dir, opts));
+
+    // 3. Check shallow
+    let shallow_path = git_dir.join("shallow");
+    if shallow_path.is_file() {
+        findings.push(Finding {
+            detector: "D1".into(),
+            channel: "git_shallow".into(),
+            path: shallow_path.display().to_string(),
+            visibility: opts.visibility,
+            severity: Severity::Info,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["shallow file present".into()],
+        });
+    }
+
+    // 4. Check unknown files in objects/
+    let objects_dir = git_dir.join("objects");
+    findings.extend(check_unknown_files_in_objects(&objects_dir, opts));
+
+    // 5. Open GitStore
+    let mut store = match GitStore::open(git_dir, opts) {
+        Ok(s) => s,
+        Err(GitError::Unsupported(msg)) => {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_unsupported".into(),
+                path: git_dir_str.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Review,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec![msg],
+            });
+            return findings;
+        }
+        Err(GitError::Corrupt(msg)) => {
+            findings.push(gate_finding("git_corrupt", git_dir_str.clone(), msg));
+            return findings;
+        }
+        Err(e) => {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_store_error".into(),
+                path: git_dir_str.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!("failed to open git store: {e}")],
+            });
+            return findings;
+        }
+    };
+
+    // 6. Check base commit presence
+    let base_commit = match &opts.base_commit {
+        Some(bc) if !bc.is_empty() => bc.to_lowercase(),
+        _ => {
+            findings.push(gate_finding(
+                "git_base_missing",
+                git_dir_str.clone(),
+                "base commit not specified".into(),
+            ));
+            return findings;
+        }
+    };
+
+    let all_object_ids = match store.enumerate_object_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_store_error".into(),
+                path: git_dir_str.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!("failed to enumerate object ids: {e}")],
+            });
+            return findings;
+        }
+    };
+
+    if !all_object_ids.contains(&base_commit) {
+        findings.push(gate_finding(
+            "git_base_missing",
+            git_dir_str.clone(),
+            format!("base commit {} is not in the store", base_commit),
+        ));
+        return findings;
+    }
+
+    // 7. Read refs (loose and packed)
+    let (all_refs, packed_ref_names) = read_all_refs(git_dir);
+
+    // 8. Resolve HEAD and check git_head
+    let head_path = git_dir.join("HEAD");
+    let resolved_head = resolve_head(&head_path, &all_refs);
+    match resolved_head {
+        Some(head_oid) if head_oid == base_commit => {}
+        Some(head_oid) => {
+            findings.push(gate_finding(
+                "git_head",
+                head_path.display().to_string(),
+                format!(
+                    "HEAD resolves to {} instead of base commit {}",
+                    head_oid, base_commit
+                ),
+            ));
+        }
+        None => {
+            findings.push(gate_finding(
+                "git_head",
+                head_path.display().to_string(),
+                "HEAD cannot be resolved".into(),
+            ));
+        }
+    }
+
+    // 9. Ancestor walk from base commit to populate ancestors set
+    let mut ancestors = HashSet::new();
+    let mut commit_walk_queue = VecDeque::new();
+    commit_walk_queue.push_back(base_commit.clone());
+
+    while let Some(c_oid) = commit_walk_queue.pop_front() {
+        if !ancestors.insert(c_oid.clone()) {
+            continue;
+        }
+        if let Ok(obj) = store.read_object(&c_oid) {
+            if obj.obj_type == ObjectType::Commit {
+                if let Ok(commit) = store.parse_commit(&obj.data) {
+                    for parent in commit.parents {
+                        commit_walk_queue.push_back(parent.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    // 10. Validate refs and identify allowed tags
+    let mut allowed_tags = HashSet::new(); // set of tag oids or peeled target oids
+
+    for (ref_name, ref_oid) in &all_refs {
+        if ref_name.starts_with("refs/heads/") {
+            if ref_oid != &base_commit {
+                findings.push(gate_finding(
+                    "git_ref",
+                    ref_name.clone(),
+                    format!(
+                        "branch {} points to {} instead of base commit {}",
+                        ref_name, ref_oid, base_commit
+                    ),
+                ));
+            }
+        } else if let Some(tag_name) = ref_name.strip_prefix("refs/tags/") {
+            // Check §6.1 tag rule
+            match check_tag(
+                &mut store,
+                ref_oid,
+                tag_name,
+                &ancestors,
+                opts.t_clock,
+                fp,
+                opts,
+            ) {
+                Ok(allowed_oid) => {
+                    allowed_tags.insert(ref_oid.clone());
+                    if let Some(target) = allowed_oid {
+                        allowed_tags.insert(target);
+                    }
+                }
+                Err(tag_finding) => {
+                    findings.push(*tag_finding);
+                }
+            }
+        } else {
+            // Any other ref: refs/pull/*, refs/original/*, refs/stash, refs/notes/*, remote refs, etc.
+            findings.push(gate_finding(
+                "git_ref",
+                ref_name.clone(),
+                format!("unallowed ref: {}", ref_name),
+            ));
+        }
+    }
+
+    // Ensure packed-refs only refs are also validated (already in all_refs, but verify packed-refs presence)
+    let _ = packed_ref_names;
+
+    // 11. Reachability walk from base_commit and allowed tags
+    let mut reachable = HashSet::new();
+    let mut commit_queue = VecDeque::new();
+    let mut tree_queue = VecDeque::new();
+
+    commit_queue.push_back(base_commit.clone());
+    for tag_oid in &allowed_tags {
+        reachable.insert(tag_oid.clone());
+        if let Ok(obj) = store.read_object(tag_oid) {
+            match obj.obj_type {
+                ObjectType::Commit => commit_queue.push_back(tag_oid.clone()),
+                ObjectType::Tree => tree_queue.push_back(tag_oid.clone()),
+                ObjectType::Blob => {
+                    reachable.insert(tag_oid.clone());
+                }
+                ObjectType::Tag => {
+                    if let Ok(tag) = store.parse_tag(&obj.data) {
+                        match tag.target_type {
+                            ObjectType::Commit => {
+                                commit_queue.push_back(tag.target_oid.to_lowercase())
+                            }
+                            ObjectType::Tree => tree_queue.push_back(tag.target_oid.to_lowercase()),
+                            ObjectType::Blob | ObjectType::Tag => {
+                                reachable.insert(tag.target_oid.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Walk commits
+    while let Some(c_oid) = commit_queue.pop_front() {
+        if !reachable.insert(c_oid.clone()) {
+            continue;
+        }
+
+        let obj = match store.read_object(&c_oid) {
+            Ok(o) => o,
+            Err(e) => {
+                findings.push(gate_finding(
+                    "git_corrupt",
+                    git_dir_str.clone(),
+                    format!("failed to read commit {}: {}", c_oid, e),
+                ));
+                continue;
+            }
+        };
+
+        if compute_git_sha1(obj.obj_type, &obj.data) != c_oid {
+            findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("hash mismatch for commit {}", c_oid),
+            ));
+        }
+
+        if let Ok(commit) = store.parse_commit(&obj.data) {
+            tree_queue.push_back(commit.tree.to_lowercase());
+            for parent in commit.parents {
+                commit_queue.push_back(parent.to_lowercase());
+            }
+        }
+    }
+
+    // Walk trees
+    while let Some(t_oid) = tree_queue.pop_front() {
+        if !reachable.insert(t_oid.clone()) {
+            continue;
+        }
+
+        let obj = match store.read_object(&t_oid) {
+            Ok(o) => o,
+            Err(e) => {
+                findings.push(gate_finding(
+                    "git_corrupt",
+                    git_dir_str.clone(),
+                    format!("failed to read tree {}: {}", t_oid, e),
+                ));
+                continue;
+            }
+        };
+
+        if compute_git_sha1(obj.obj_type, &obj.data) != t_oid {
+            findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("hash mismatch for tree {}", t_oid),
+            ));
+        }
+
+        if let Ok(tree) = store.parse_tree(&obj.data) {
+            for entry in tree.entries {
+                let entry_oid = entry.oid.to_lowercase();
+                if entry.mode == 0o160000 {
+                    // Gitlink mode 160000: recorded and not followed
+                    reachable.insert(entry_oid);
+                } else if entry.mode & 0o170000 == 0o040000 {
+                    tree_queue.push_back(entry_oid);
+                } else {
+                    reachable.insert(entry_oid);
+                }
+            }
+        }
+    }
+
+    // 12. Find unreachable objects
+    let mut unreachable_ids: Vec<String> = all_object_ids
+        .into_iter()
+        .filter(|id| !reachable.contains(id))
+        .collect();
+    unreachable_ids.sort();
+
+    if !unreachable_ids.is_empty() {
+        let count = unreachable_ids.len();
+        let preview: Vec<String> = unreachable_ids.iter().take(20).cloned().collect();
+        findings.push(gate_finding(
+            "git_unreachable_object",
+            git_dir_str.clone(),
+            format!("{} unreachable object(s): {}", count, preview.join(", ")),
+        ));
+
+        // Unreachable content scan (TR-SC-6)
+        for oid in &unreachable_ids {
+            let item_path = format!("{}#{}", git_dir_str, oid);
+            if let Ok(obj) = store.read_object(oid) {
+                match obj.obj_type {
+                    ObjectType::Blob => {
+                        let unit_findings = scan_container_or_unit_with_root_prefix(
+                            &item_path,
+                            &obj.data,
+                            fp,
+                            &opts.signatures,
+                            opts,
+                            0,
+                        );
+                        findings.extend(unit_findings);
+                    }
+                    ObjectType::Commit => {
+                        if let Ok(commit) = store.parse_commit(&obj.data) {
+                            findings.extend(check_d9_content(
+                                &item_path,
+                                &commit.message,
+                                &opts.signatures,
+                                opts.visibility,
+                            ));
+                            findings.extend(match_unit(
+                                &commit.message,
+                                fp,
+                                opts,
+                                "D2",
+                                "commit_message",
+                                &item_path,
+                            ));
+                        }
+                    }
+                    ObjectType::Tag => {
+                        if let Ok(tag) = store.parse_tag(&obj.data) {
+                            findings.extend(check_d9_content(
+                                &item_path,
+                                &tag.message,
+                                &opts.signatures,
+                                opts.visibility,
+                            ));
+                            findings.extend(match_unit(
+                                &tag.message,
+                                fp,
+                                opts,
+                                "D2",
+                                "tag_message",
+                                &item_path,
+                            ));
+                        }
+                    }
+                    ObjectType::Tree => {}
+                }
+            }
+        }
+    }
+
+    // 13. Check commit-graph
+    findings.extend(check_commit_graphs(git_dir, &reachable, opts));
+
+    findings
+}
+
+fn check_tag(
+    store: &mut GitStore,
+    tag_oid: &str,
+    _tag_name: &str,
+    ancestors: &HashSet<String>,
+    t_clock: Option<time::OffsetDateTime>,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+) -> Result<Option<String>, Box<Finding>> {
+    let gate_finding = |ev: String| {
+        Box::new(Finding {
+            detector: "D1".into(),
+            channel: "git_tag".into(),
+            path: format!("refs/tags/{}", _tag_name),
+            visibility: opts.visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec![ev],
+        })
+    };
+
+    let obj = match store.read_object(tag_oid) {
+        Ok(o) => o,
+        Err(_) => return Err(gate_finding("tag object not found in store".into())),
+    };
+
+    match obj.obj_type {
+        ObjectType::Commit => {
+            // Lightweight tag pointing directly to a commit
+            if !ancestors.contains(tag_oid) {
+                return Err(gate_finding(format!(
+                    "tag points to non-ancestor commit {}",
+                    tag_oid
+                )));
+            }
+            Ok(None)
+        }
+        ObjectType::Tag => {
+            // Annotated tag object
+            let tag = match store.parse_tag(&obj.data) {
+                Ok(t) => t,
+                Err(e) => return Err(gate_finding(format!("failed to parse tag object: {e}"))),
+            };
+
+            // Check tagger date
+            match (tag.tagger_time, t_clock) {
+                (None, _) => {
+                    return Err(gate_finding("annotated tag has no tagger date".into()));
+                }
+                (Some(ts), Some(tc)) if ts > tc.unix_timestamp() => {
+                    return Err(gate_finding(format!(
+                        "annotated tagger date {} is after T_clock {}",
+                        ts,
+                        tc.unix_timestamp()
+                    )));
+                }
+                _ => {}
+            }
+
+            // Check tag message matching fingerprint tier
+            let msg_findings = match_unit(
+                &tag.message,
+                fp,
+                opts,
+                "D1",
+                "git_tag",
+                &format!("refs/tags/{}", _tag_name),
+            );
+            if !msg_findings.is_empty() {
+                return Err(gate_finding(
+                    "tag message matches leaked fingerprint".into(),
+                ));
+            }
+
+            // Peel target to verify ancestor
+            let target_oid = tag.target_oid.to_lowercase();
+            let mut current_target = target_oid.clone();
+
+            loop {
+                if ancestors.contains(&current_target) {
+                    break;
+                }
+                match store.read_object(&current_target) {
+                    Ok(next_obj) if next_obj.obj_type == ObjectType::Tag => {
+                        if let Ok(next_tag) = store.parse_tag(&next_obj.data) {
+                            current_target = next_tag.target_oid.to_lowercase();
+                        } else {
+                            return Err(gate_finding(format!(
+                                "peeled tag points to non-ancestor {}",
+                                current_target
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(gate_finding(format!(
+                            "tag points to non-ancestor {}",
+                            current_target
+                        )));
+                    }
+                }
+            }
+
+            Ok(Some(target_oid))
+        }
+        _ => Err(gate_finding("tag points to unsupported object type".into())),
+    }
+}
+
+fn check_git_config(config_path: &Path, gitdir: &str, opts: &ScanOptions) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !config_path.is_file() {
+        return findings;
+    }
+
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(_) => return findings,
+    };
+
+    let mut in_remote_section = false;
+    let mut in_extensions_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = trimmed[1..trimmed.len() - 1].trim();
+            if section.starts_with("remote") {
+                in_remote_section = true;
+                findings.push(Finding {
+                    detector: "D1".into(),
+                    channel: "git_config".into(),
+                    path: config_path.display().to_string(),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec![format!("remote section found: {}", trimmed)],
+                });
+            } else {
+                in_remote_section = false;
+            }
+
+            in_extensions_section = section == "extensions";
+        }
+
+        if in_extensions_section && trimmed.starts_with("objectformat") {
+            if let Some((_, val)) = trimmed.split_once('=') {
+                if val.trim().eq_ignore_ascii_case("sha256") {
+                    findings.push(Finding {
+                        detector: "D1".into(),
+                        channel: "git_unsupported".into(),
+                        path: gitdir.to_string(),
+                        visibility: opts.visibility,
+                        severity: Severity::Review,
+                        confidence: 1.0,
+                        hunk: None,
+                        evidence: vec!["extensions.objectformat = sha256".into()],
+                    });
+                }
+            }
+        }
+
+        // Check for embedded credentials in URLs: ://[^/@\s]+:[^/@\s]+@
+        if let Some(pos) = trimmed.find("://") {
+            let rest = &trimmed[pos + 3..];
+            if let Some(at_pos) = rest.find('@') {
+                let user_info = &rest[..at_pos];
+                if !user_info.contains('/') && user_info.contains(':') {
+                    findings.push(Finding {
+                        detector: "D1".into(),
+                        channel: "git_config".into(),
+                        path: config_path.display().to_string(),
+                        visibility: opts.visibility,
+                        severity: Severity::Gate,
+                        confidence: 1.0,
+                        hunk: None,
+                        evidence: vec!["URL with embedded credentials in config".into()],
+                    });
+                }
+            }
+        }
+    }
+
+    let _ = in_remote_section;
+    findings
+}
+
+fn check_git_state_files(git_dir: &Path, opts: &ScanOptions) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let gate_finding = |p: String, ev: String| Finding {
+        detector: "D1".into(),
+        channel: "git_state_file".into(),
+        path: p,
+        visibility: opts.visibility,
+        severity: Severity::Gate,
+        confidence: 1.0,
+        hunk: None,
+        evidence: vec![ev],
+    };
+
+    // 1. logs/ holding any file
+    let logs_dir = git_dir.join("logs");
+    if logs_dir.is_dir() {
+        let has_files = walkdir::WalkDir::new(&logs_dir)
+            .into_iter()
+            .flatten()
+            .any(|e| e.file_type().is_file());
+        if has_files {
+            findings.push(gate_finding(
+                logs_dir.display().to_string(),
+                "logs/ directory contains reflog files".into(),
+            ));
+        }
+    }
+
+    // 2. State files
+    let state_file_names = [
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    ];
+    for name in state_file_names {
+        let p = git_dir.join(name);
+        if p.is_file() {
+            findings.push(gate_finding(
+                p.display().to_string(),
+                format!("{} exists", name),
+            ));
+        }
+    }
+
+    // 3. worktrees/
+    let wt_dir = git_dir.join("worktrees");
+    if wt_dir.is_dir() {
+        if let Ok(mut rd) = std::fs::read_dir(&wt_dir) {
+            if rd.next().is_some() {
+                findings.push(gate_finding(
+                    wt_dir.display().to_string(),
+                    "worktrees/ directory contains entries".into(),
+                ));
+            }
+        }
+    }
+
+    // 4. modules/ holding a repository
+    let modules_dir = git_dir.join("modules");
+    if modules_dir.is_dir() {
+        let has_repo = walkdir::WalkDir::new(&modules_dir)
+            .into_iter()
+            .flatten()
+            .any(|e| e.file_type().is_file() && e.file_name() == "HEAD");
+        if has_repo {
+            findings.push(gate_finding(
+                modules_dir.display().to_string(),
+                "modules/ directory holds a repository".into(),
+            ));
+        }
+    }
+
+    // 5. objects/info/alternates
+    let alternates = git_dir.join("objects").join("info").join("alternates");
+    if alternates.is_file() {
+        findings.push(gate_finding(
+            alternates.display().to_string(),
+            "objects/info/alternates file exists".into(),
+        ));
+    }
+
+    // 6. lfs/objects/
+    let lfs_dir = git_dir.join("lfs").join("objects");
+    if lfs_dir.is_dir() {
+        let has_lfs = walkdir::WalkDir::new(&lfs_dir)
+            .into_iter()
+            .flatten()
+            .any(|e| e.file_type().is_file());
+        if has_lfs {
+            findings.push(gate_finding(
+                lfs_dir.display().to_string(),
+                "unreferenced LFS objects in lfs/objects/".into(),
+            ));
+        }
+    }
+
+    findings
+}
+
+fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !objects_dir.is_dir() {
+        return findings;
+    }
+
+    for entry in walkdir::WalkDir::new(objects_dir).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let rel = match path.strip_prefix(objects_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let parts: Vec<&str> = rel_str.split('/').collect();
+
+        let is_allowed = (parts.len() == 2
+            && parts[0].len() == 2
+            && parts[1].len() == 38
+            && parts[0].chars().all(|c| c.is_ascii_hexdigit())
+            && parts[1].chars().all(|c| c.is_ascii_hexdigit()))
+            || (parts.len() == 2
+                && parts[0] == "pack"
+                && (parts[1].ends_with(".pack")
+                    || parts[1].ends_with(".idx")
+                    || parts[1].ends_with(".rev")
+                    || parts[1].ends_with(".mtimes")))
+            || rel_str == "info/packs"
+            || rel_str == "info/commit-graph"
+            || rel_str.starts_with("info/commit-graphs/")
+            || rel_str == "commit-graph"
+            || rel_str.starts_with("commit-graphs/");
+
+        if !is_allowed {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_unknown_file".into(),
+                path: path.display().to_string(),
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec![format!("unknown file under objects: {}", rel_str)],
+            });
+        }
+    }
+
+    findings
+}
+
+fn read_all_refs(git_dir: &Path) -> (Vec<(String, String)>, HashSet<String>) {
+    let mut all_refs = Vec::new();
+    let mut packed_ref_names = HashSet::new();
+
+    // 1. Loose refs
+    let refs_dir = git_dir.join("refs");
+    if refs_dir.is_dir() {
+        for entry in walkdir::WalkDir::new(&refs_dir).into_iter().flatten() {
+            if entry.file_type().is_file() {
+                let path = entry.path();
+                if let Ok(rel) = path.strip_prefix(git_dir) {
+                    let ref_name = rel.to_string_lossy().replace('\\', "/");
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        let trimmed = content.trim();
+                        if !trimmed.starts_with("ref: ") && trimmed.len() == 40 {
+                            all_refs.push((ref_name, trimmed.to_lowercase()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Packed refs
+    let packed_refs_path = git_dir.join("packed-refs");
+    if packed_refs_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&packed_refs_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('^') {
+                    continue;
+                }
+                if let Some((oid, ref_name)) = trimmed.split_once(' ') {
+                    let oid_clean = oid.trim().to_lowercase();
+                    let ref_clean = ref_name.trim().to_string();
+                    packed_ref_names.insert(ref_clean.clone());
+                    // Only add if not already present from loose
+                    if !all_refs.iter().any(|(r, _)| r == &ref_clean) {
+                        all_refs.push((ref_clean, oid_clean));
+                    }
+                }
+            }
+        }
+    }
+
+    (all_refs, packed_ref_names)
+}
+
+fn resolve_head(head_path: &Path, all_refs: &[(String, String)]) -> Option<String> {
+    let content = std::fs::read_to_string(head_path).ok()?;
+    let trimmed = content.trim();
+
+    if let Some(ref_target) = trimmed.strip_prefix("ref: ") {
+        let target_name = ref_target.trim();
+        for (name, oid) in all_refs {
+            if name == target_name {
+                return Some(oid.clone());
+            }
+        }
+        None
+    } else if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(trimmed.to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn check_commit_graphs(
+    git_dir: &Path,
+    reachable: &HashSet<String>,
+    opts: &ScanOptions,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let candidates = [
+        git_dir.join("objects").join("info").join("commit-graph"),
+        git_dir.join("objects").join("commit-graph"),
+    ];
+
+    for path in &candidates {
+        if path.is_file() {
+            if let Ok(bytes) = std::fs::read(path) {
+                match parse_commit_graph_oidl(&bytes) {
+                    Ok(oids) => {
+                        let mut unreachable_graph_oids = Vec::new();
+                        for oid in oids {
+                            if !reachable.contains(&oid) {
+                                unreachable_graph_oids.push(oid);
+                            }
+                        }
+                        if !unreachable_graph_oids.is_empty() {
+                            findings.push(Finding {
+                                detector: "D1".into(),
+                                channel: "git_commit_graph".into(),
+                                path: path.display().to_string(),
+                                visibility: opts.visibility,
+                                severity: Severity::Gate,
+                                confidence: 1.0,
+                                hunk: None,
+                                evidence: vec![format!(
+                                    "commit-graph contains unreachable commit(s): {}",
+                                    unreachable_graph_oids.join(", ")
+                                )],
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        findings.push(Finding {
+                            detector: "D1".into(),
+                            channel: "git_commit_graph".into(),
+                            path: path.display().to_string(),
+                            visibility: opts.visibility,
+                            severity: Severity::Gate,
+                            confidence: 1.0,
+                            hunk: None,
+                            evidence: vec![format!("corrupt commit graph: {e}")],
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+fn parse_commit_graph_oidl(bytes: &[u8]) -> Result<Vec<String>, GitError> {
+    if bytes.len() < 8 || &bytes[0..4] != b"CGPH" {
+        return Err(GitError::Corrupt("invalid commit graph magic".into()));
+    }
+
+    let num_chunks = bytes[6] as usize;
+    let chunk_table_start = 8;
+    let chunk_table_len = (num_chunks + 1) * 12;
+
+    if chunk_table_start + chunk_table_len > bytes.len() {
+        return Err(GitError::Corrupt(
+            "truncated commit graph chunk table".into(),
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    for i in 0..=num_chunks {
+        let entry_offset = chunk_table_start + i * 12;
+        let chunk_id = &bytes[entry_offset..entry_offset + 4];
+        let offset = u64::from_be_bytes(
+            bytes[entry_offset + 4..entry_offset + 12]
+                .try_into()
+                .map_err(|_| GitError::Corrupt("chunk offset read error".into()))?,
+        );
+        chunks.push((chunk_id.to_vec(), offset));
+    }
+
+    let mut oidl_range = None;
+    for i in 0..num_chunks {
+        if &chunks[i].0 == b"OIDL" {
+            oidl_range = Some((chunks[i].1 as usize, chunks[i + 1].1 as usize));
+            break;
+        }
+    }
+
+    let mut oids = Vec::new();
+    if let Some((start, end)) = oidl_range {
+        if start > bytes.len() || end > bytes.len() || start > end {
+            return Err(GitError::Corrupt("invalid OIDL chunk offsets".into()));
+        }
+        for chunk in bytes[start..end].as_chunks::<20>().0 {
+            oids.push(hex::encode(chunk));
+        }
+    }
+
+    Ok(oids)
+}
