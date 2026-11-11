@@ -1458,6 +1458,9 @@ fn query_record(
             name,
             version,
         } => {
+            if opts.undated {
+                return;
+            }
             let display = path.display(root);
             findings.extend(check_d5a_name_and_version(
                 name,

@@ -7,9 +7,10 @@ use std::process::ExitCode;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    generate_sarif, generate_sarif_with_properties, query_index, scan_problem_statement, scan_tree,
-    write_index, BenchmarkSignatures, Finding, FingerprintSet, FingerprintSummary,
-    SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility, NOT_COVERED,
+    generate_sarif, generate_sarif_with_properties, load_undated_task, query_index,
+    scan_problem_statement, scan_tree, write_index, BenchmarkSignatures, Finding, FingerprintSet,
+    FingerprintSummary, SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility,
+    NOT_COVERED, UNDATED_NOT_COVERED,
 };
 
 #[derive(Parser, Debug)]
@@ -48,6 +49,10 @@ struct IndexArgs {
 
 #[derive(Parser, Debug)]
 struct QueryArgs {
+    /// Undated task mode (no gold patch; fingerprints from solution/ and tests/)
+    #[arg(long)]
+    undated: bool,
+
     /// Path to task directory containing task.json, staging/, agent/
     #[arg(long)]
     task: PathBuf,
@@ -102,6 +107,10 @@ impl From<CliVisibility> for Visibility {
 
 #[derive(Parser, Debug)]
 struct ScanArgs {
+    /// Undated task mode (no gold patch; fingerprints from solution/ and tests/)
+    #[arg(long)]
+    undated: bool,
+
     /// Path to task directory containing task.json, staging/, agent/ (paths under --task are never scanned)
     #[arg(long)]
     task: PathBuf,
@@ -154,76 +163,162 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .into());
     }
 
-    let task = TaskInput::load(&args.task)?;
-    let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+    if args.undated {
+        let undated_task = load_undated_task(&args.task)?;
+        let fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
 
-    let signatures = if let Some(ref sig_file) = args.signatures {
-        BenchmarkSignatures::load_from_file(Some(task.instance_id.clone()), sig_file)?
-    } else {
-        BenchmarkSignatures::new(Some(task.instance_id.clone()))
-    };
+        let signatures = if let Some(ref sig_file) = args.signatures {
+            BenchmarkSignatures::load_from_file(Some(undated_task.instance_id.clone()), sig_file)?
+        } else {
+            BenchmarkSignatures::new(Some(undated_task.instance_id.clone()))
+        };
 
-    let d0_opts = ScanOptions {
-        visibility: Visibility::AgentVisible,
-        signatures: signatures.clone(),
-        ..Default::default()
-    };
-    let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
-
-    let canonical_task_dir = args.task.canonicalize().ok();
-
-    let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
-    let mut target_packages = vec![repo_pkg.to_string()];
-    target_packages.extend(args.target_package);
-
-    for (idx, root) in args.roots.iter().enumerate() {
-        let vis = args
-            .root_visibilities
-            .get(idx)
-            .copied()
-            .unwrap_or(CliVisibility::AgentVisible);
-
-        // Paths under the sealcheck's own --task dir are never scanned, wherever the root is
-        let opts = ScanOptions {
-            visibility: vis.into(),
+        let d0_opts = ScanOptions {
+            visibility: Visibility::AgentVisible,
             signatures: signatures.clone(),
-            exclude_dirs: canonical_task_dir.iter().cloned().collect(),
-            base_commit: Some(task.base_commit.clone()),
-            t_clock: Some(task.cutoffs.t_clock),
-            target_packages: target_packages.clone(),
-            task_version: task.version.clone(),
+            undated: true,
             ..Default::default()
         };
-        let tree_findings = scan_tree(root, &fp, &opts);
-        all_findings.extend(tree_findings);
-    }
+        let mut all_findings = scan_problem_statement(&undated_task.instruction, &fp, &d0_opts);
 
-    if args.oci_inspect.is_some() || args.oci_history.is_some() {
-        let oci_opts = ScanOptions {
-            visibility: Visibility::ImageOnly,
-            signatures: signatures.clone(),
-            t_clock: Some(task.cutoffs.t_clock),
-            ..Default::default()
-        };
-        let oci_findings = hermetic_sealcheck::scan_oci(
-            args.oci_inspect.as_deref(),
-            args.oci_history.as_deref(),
-            Some(task.cutoffs.t_clock),
+        if fp.skipped_files_count > 0 {
+            all_findings.push(Finding {
+                detector: "D2".into(),
+                channel: "task_file_skipped".into(),
+                path: args.task.display().to_string(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!(
+                    "skipped {} task files exceeding size limit",
+                    fp.skipped_files_count
+                )],
+            });
+        }
+
+        let canonical_task_dir = args.task.canonicalize().ok();
+
+        for (idx, root) in args.roots.iter().enumerate() {
+            let vis = args
+                .root_visibilities
+                .get(idx)
+                .copied()
+                .unwrap_or(CliVisibility::AgentVisible);
+
+            let opts = ScanOptions {
+                visibility: vis.into(),
+                signatures: signatures.clone(),
+                exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+                undated: true,
+                ..Default::default()
+            };
+            let tree_findings = scan_tree(root, &fp, &opts);
+            all_findings.extend(tree_findings);
+        }
+
+        if args.oci_inspect.is_some() || args.oci_history.is_some() {
+            let oci_opts = ScanOptions {
+                visibility: Visibility::ImageOnly,
+                signatures: signatures.clone(),
+                undated: true,
+                ..Default::default()
+            };
+            let oci_findings = hermetic_sealcheck::scan_oci(
+                args.oci_inspect.as_deref(),
+                args.oci_history.as_deref(),
+                None,
+                &fp,
+                &signatures,
+                &oci_opts,
+            )?;
+            all_findings.extend(oci_findings);
+        }
+
+        all_findings.retain(|f| !matches!(f.detector.as_str(), "D1" | "D3" | "D4" | "D5a"));
+
+        write_report(
+            all_findings,
             &fp,
-            &signatures,
-            &oci_opts,
-        )?;
-        all_findings.extend(oci_findings);
-    }
+            undated_task.instance_id,
+            args.format,
+            args.out,
+            Some("undated".to_string()),
+            UNDATED_NOT_COVERED.iter().map(|s| s.to_string()).collect(),
+        )
+    } else {
+        let task = TaskInput::load(&args.task)?;
+        let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
 
-    write_report(
-        all_findings,
-        &fp,
-        task.instance_id,
-        args.format,
-        args.out,
-        None,
-    )
+        let signatures = if let Some(ref sig_file) = args.signatures {
+            BenchmarkSignatures::load_from_file(Some(task.instance_id.clone()), sig_file)?
+        } else {
+            BenchmarkSignatures::new(Some(task.instance_id.clone()))
+        };
+
+        let d0_opts = ScanOptions {
+            visibility: Visibility::AgentVisible,
+            signatures: signatures.clone(),
+            ..Default::default()
+        };
+        let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
+
+        let canonical_task_dir = args.task.canonicalize().ok();
+
+        let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
+        let mut target_packages = vec![repo_pkg.to_string()];
+        target_packages.extend(args.target_package);
+
+        for (idx, root) in args.roots.iter().enumerate() {
+            let vis = args
+                .root_visibilities
+                .get(idx)
+                .copied()
+                .unwrap_or(CliVisibility::AgentVisible);
+
+            // Paths under the sealcheck's own --task dir are never scanned, wherever the root is
+            let opts = ScanOptions {
+                visibility: vis.into(),
+                signatures: signatures.clone(),
+                exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+                base_commit: Some(task.base_commit.clone()),
+                t_clock: Some(task.cutoffs.t_clock),
+                target_packages: target_packages.clone(),
+                task_version: task.version.clone(),
+                ..Default::default()
+            };
+            let tree_findings = scan_tree(root, &fp, &opts);
+            all_findings.extend(tree_findings);
+        }
+
+        if args.oci_inspect.is_some() || args.oci_history.is_some() {
+            let oci_opts = ScanOptions {
+                visibility: Visibility::ImageOnly,
+                signatures: signatures.clone(),
+                t_clock: Some(task.cutoffs.t_clock),
+                ..Default::default()
+            };
+            let oci_findings = hermetic_sealcheck::scan_oci(
+                args.oci_inspect.as_deref(),
+                args.oci_history.as_deref(),
+                Some(task.cutoffs.t_clock),
+                &fp,
+                &signatures,
+                &oci_opts,
+            )?;
+            all_findings.extend(oci_findings);
+        }
+
+        write_report(
+            all_findings,
+            &fp,
+            task.instance_id,
+            args.format,
+            args.out,
+            None,
+            Vec::new(),
+        )
+    }
 }
 
 fn write_report(
@@ -232,7 +327,8 @@ fn write_report(
     instance_id: String,
     format: OutputFormat,
     out: Option<PathBuf>,
-    query_mode: Option<&[&str]>,
+    mode: Option<String>,
+    not_covered: Vec<String>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let gate = all_findings
         .iter()
@@ -240,12 +336,12 @@ fn write_report(
 
     let output_str = match format {
         OutputFormat::Sarif => {
-            let sarif = match query_mode {
-                Some(not_covered) => generate_sarif_with_properties(
+            let sarif = match mode.as_ref() {
+                Some(m) => generate_sarif_with_properties(
                     &all_findings,
                     Some(SarifRunProperties {
-                        mode: "query".to_string(),
-                        not_covered: not_covered.iter().map(|s| s.to_string()).collect(),
+                        mode: m.clone(),
+                        not_covered: not_covered.clone(),
                     }),
                 ),
                 None => generate_sarif(&all_findings),
@@ -270,12 +366,8 @@ fn write_report(
                 fingerprints: summary,
                 findings: all_findings,
                 gate,
-                mode: query_mode.map(|_| "query".to_string()),
-                not_covered: query_mode
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                mode,
+                not_covered,
             };
             serde_json::to_string_pretty(&report)?
         }
@@ -315,50 +407,120 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .into());
     }
 
-    let task = TaskInput::load(&args.task)?;
-    let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+    if args.undated {
+        let undated_task = load_undated_task(&args.task)?;
+        let fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
 
-    // The instance id is not matched in the trees (D9:instance_id is not covered),
-    // but D0 on the problem statement runs exactly as in `scan`.
-    let signatures = BenchmarkSignatures::new(Some(task.instance_id.clone()));
-    let d0_opts = ScanOptions {
-        visibility: Visibility::AgentVisible,
-        signatures,
-        ..Default::default()
-    };
-    let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
-
-    let canonical_task_dir = args.task.canonicalize().ok();
-    let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
-    let mut target_packages = vec![repo_pkg.to_string()];
-    target_packages.extend(args.target_package);
-
-    for (idx, index) in args.indexes.iter().enumerate() {
-        let vis = args
-            .root_visibilities
-            .get(idx)
-            .copied()
-            .unwrap_or(CliVisibility::AgentVisible);
-        let opts = ScanOptions {
-            visibility: vis.into(),
-            exclude_dirs: canonical_task_dir.iter().cloned().collect(),
-            base_commit: Some(task.base_commit.clone()),
-            t_clock: Some(task.cutoffs.t_clock),
-            target_packages: target_packages.clone(),
-            task_version: task.version.clone(),
+        let signatures = BenchmarkSignatures::new(Some(undated_task.instance_id.clone()));
+        let d0_opts = ScanOptions {
+            visibility: Visibility::AgentVisible,
+            signatures,
+            undated: true,
             ..Default::default()
         };
-        all_findings.extend(query_index(index, &fp, &opts)?);
-    }
+        let mut all_findings = scan_problem_statement(&undated_task.instruction, &fp, &d0_opts);
 
-    write_report(
-        all_findings,
-        &fp,
-        task.instance_id,
-        args.format,
-        args.out,
-        Some(NOT_COVERED),
-    )
+        if fp.skipped_files_count > 0 {
+            all_findings.push(Finding {
+                detector: "D2".into(),
+                channel: "task_file_skipped".into(),
+                path: args.task.display().to_string(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!(
+                    "skipped {} task files exceeding size limit",
+                    fp.skipped_files_count
+                )],
+            });
+        }
+
+        let canonical_task_dir = args.task.canonicalize().ok();
+
+        for (idx, index) in args.indexes.iter().enumerate() {
+            let vis = args
+                .root_visibilities
+                .get(idx)
+                .copied()
+                .unwrap_or(CliVisibility::AgentVisible);
+            let opts = ScanOptions {
+                visibility: vis.into(),
+                exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+                undated: true,
+                ..Default::default()
+            };
+            all_findings.extend(query_index(index, &fp, &opts)?);
+        }
+
+        all_findings.retain(|f| !matches!(f.detector.as_str(), "D1" | "D3" | "D4" | "D5a"));
+
+        let mut not_covered = Vec::new();
+        for d in NOT_COVERED {
+            not_covered.push(d.to_string());
+        }
+        for d in UNDATED_NOT_COVERED {
+            if !not_covered.iter().any(|c| c == d) {
+                not_covered.push(d.to_string());
+            }
+        }
+
+        write_report(
+            all_findings,
+            &fp,
+            undated_task.instance_id,
+            args.format,
+            args.out,
+            Some("undated".to_string()),
+            not_covered,
+        )
+    } else {
+        let task = TaskInput::load(&args.task)?;
+        let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+
+        // The instance id is not matched in the trees (D9:instance_id is not covered),
+        // but D0 on the problem statement runs exactly as in `scan`.
+        let signatures = BenchmarkSignatures::new(Some(task.instance_id.clone()));
+        let d0_opts = ScanOptions {
+            visibility: Visibility::AgentVisible,
+            signatures,
+            ..Default::default()
+        };
+        let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
+
+        let canonical_task_dir = args.task.canonicalize().ok();
+        let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
+        let mut target_packages = vec![repo_pkg.to_string()];
+        target_packages.extend(args.target_package);
+
+        for (idx, index) in args.indexes.iter().enumerate() {
+            let vis = args
+                .root_visibilities
+                .get(idx)
+                .copied()
+                .unwrap_or(CliVisibility::AgentVisible);
+            let opts = ScanOptions {
+                visibility: vis.into(),
+                exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+                base_commit: Some(task.base_commit.clone()),
+                t_clock: Some(task.cutoffs.t_clock),
+                target_packages: target_packages.clone(),
+                task_version: task.version.clone(),
+                ..Default::default()
+            };
+            all_findings.extend(query_index(index, &fp, &opts)?);
+        }
+
+        write_report(
+            all_findings,
+            &fp,
+            task.instance_id,
+            args.format,
+            args.out,
+            Some("query".to_string()),
+            NOT_COVERED.iter().map(|s| s.to_string()).collect(),
+        )
+    }
 }
 
 #[derive(Parser, Debug)]

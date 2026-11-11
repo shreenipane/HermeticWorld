@@ -318,6 +318,9 @@ impl UnitSink for MatchSink<'_> {
     }
 
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
+        if self.opts.undated {
+            return;
+        }
         self.findings.extend(crate::d5a::check_d5a_metadata(
             Path::new(path),
             bytes,

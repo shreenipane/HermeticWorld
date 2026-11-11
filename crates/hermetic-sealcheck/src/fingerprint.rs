@@ -82,6 +82,7 @@ pub struct FingerprintSet {
     pub binary_subtracted_count: usize,
     /// Maps fingerprint hash to representative evidence text
     pub hash_to_evidence: HashMap<String, String>,
+    pub skipped_files_count: usize,
 }
 
 struct CandidateHunk {
@@ -486,256 +487,437 @@ impl FingerprintSet {
             }
         }
 
-        // 3. Baseline subtraction (TR-SC-1, TR-SC-4 & TR-SC-5): walk base_tree_root
-        let mut base_line_counts: HashMap<String, usize> = HashMap::new();
-        let mut base_line_hashes: HashSet<String> = HashSet::new();
-        let mut base_window_hashes: HashSet<String> = HashSet::new();
-        let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
-        let mut base_binary_tokens: HashSet<String> = HashSet::new();
+        Ok(finish_fingerprint_set(candidate_hunks, base_tree_root, 0))
+    }
 
-        if base_tree_root.exists() {
-            for entry in WalkDir::new(base_tree_root)
-                .into_iter()
-                .filter_entry(|e| e.file_name() != ".git")
-                .flatten()
+    /// Build tier 1, tier 3, and binary tier fingerprints from task files in undated mode (TR-SC-9).
+    pub fn from_files(
+        files: &[(String, String)],
+        base_tree: &Path,
+    ) -> Result<Self, FingerprintError> {
+        const MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+        const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+        let mut total_bytes = 0usize;
+        let mut skipped_files_count = 0usize;
+        let mut candidate_hunks: Vec<CandidateHunk> = Vec::new();
+        let mut global_hunk_counter = 0;
+
+        for (file_path, text) in files {
+            let file_bytes = text.len();
+            if file_bytes > MAX_FILE_BYTES
+                || total_bytes.saturating_add(file_bytes) > MAX_TOTAL_BYTES
             {
-                if entry.file_type().is_file() {
-                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
-                    if let Some(content) = read_text_like_scanner(entry.path()) {
-                        let file_lines: Vec<&str> = content.lines().collect();
+                skipped_files_count += 1;
+                continue;
+            }
+            total_bytes += file_bytes;
 
-                        // Line hashes & counts
-                        for line in &file_lines {
-                            if let Some(norm) = normalize_line(line) {
-                                *base_line_counts.entry(norm.clone()).or_insert(0) += 1;
-                                base_line_hashes.insert(sha256_hex(norm.as_bytes()));
-                            }
-                        }
+            let bytes = text.as_bytes();
+            let head = &bytes[..bytes.len().min(8192)];
+            let is_binary = head.contains(&0);
 
-                        // Window hashes
-                        for i in 0..file_lines.len() {
-                            if i + 1 < file_lines.len() {
-                                let w = [file_lines[i], file_lines[i + 1]];
-                                if !w.iter().all(|l| normalize_line(l).is_none()) {
-                                    let norm_w = w
-                                        .iter()
-                                        .map(|l| clean_line(l, false))
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
-                                }
-                            }
-                            if i + 2 < file_lines.len() {
-                                let w = [file_lines[i], file_lines[i + 1], file_lines[i + 2]];
-                                if !w.iter().all(|l| normalize_line(l).is_none()) {
-                                    let norm_w = w
-                                        .iter()
-                                        .map(|l| clean_line(l, false))
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
-                                }
+            if is_binary {
+                // Files that are binary (NUL in the first 8 KiB) contribute only binary-tier items
+                // from their printable runs of 8+ characters.
+                let runs = crate::binary::extract_printable_runs(bytes, 8);
+                let mut seen_items = HashSet::new();
+                let mut binary_items = Vec::new();
+                for run in runs {
+                    if !run.chars().any(char::is_control) && seen_items.insert(run.clone()) {
+                        binary_items.push(run.clone());
+                    }
+                    for token in crate::binary::word_tokens(&run) {
+                        if token.len() >= 8 && !token.chars().any(char::is_control) {
+                            let token_str = token.to_string();
+                            if seen_items.insert(token_str.clone()) {
+                                binary_items.push(token_str);
                             }
                         }
+                    }
+                }
+                candidate_hunks.push(CandidateHunk {
+                    hunk_index: global_hunk_counter,
+                    file_path: file_path.clone(),
+                    lines: Vec::new(),
+                    windows: Vec::new(),
+                    removed_markers: Vec::new(),
+                    diff_shapes: Vec::new(),
+                    winnow_candidates: Vec::new(),
+                    binary_items,
+                });
+                global_hunk_counter += 1;
+            } else {
+                let file_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
-                        // Winnow hashes and binary tokens for base tree
-                        let base_tokens = tokenize(&content);
-                        for tok in &base_tokens {
-                            base_binary_tokens.insert(tok.text.clone());
-                            if let Some(literal_content) =
-                                crate::binary::extract_string_literal_content(&tok.text)
-                            {
-                                base_binary_tokens.insert(literal_content);
+                let mut lines = Vec::new();
+                for line in &file_lines {
+                    if let Some(norm) = normalize_line(line) {
+                        let hash = sha256_hex(norm.as_bytes());
+                        lines.push((hash, norm));
+                    }
+                }
+
+                let mut windows = Vec::new();
+                let mut seen_windows = HashSet::new();
+                for i in 0..file_lines.len() {
+                    if i + 1 < file_lines.len() {
+                        let w = vec![file_lines[i].clone(), file_lines[i + 1].clone()];
+                        if !w.iter().all(|l| normalize_line(l).is_none()) {
+                            let norm_w = w
+                                .iter()
+                                .map(|l| clean_line(l, false))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let hash = sha256_hex(norm_w.as_bytes());
+                            if seen_windows.insert(hash.clone()) {
+                                windows.push((hash, w));
                             }
                         }
-                        let base_token_texts: Vec<String> =
-                            base_tokens.into_iter().map(|t| t.text).collect();
-                        for hash in kgram_hashes(&base_token_texts) {
-                            base_winnow_hashes.insert(hash);
+                    }
+                    if i + 2 < file_lines.len() {
+                        let w = vec![
+                            file_lines[i].clone(),
+                            file_lines[i + 1].clone(),
+                            file_lines[i + 2].clone(),
+                        ];
+                        if !w.iter().all(|l| normalize_line(l).is_none()) {
+                            let norm_w = w
+                                .iter()
+                                .map(|l| clean_line(l, false))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let hash = sha256_hex(norm_w.as_bytes());
+                            if seen_windows.insert(hash.clone()) {
+                                windows.push((hash, w));
+                            }
                         }
+                    }
+                }
+
+                let mut diff_shapes = Vec::new();
+                if !file_lines.is_empty() {
+                    let raw_header = if file_lines.len() == 1 {
+                        "@@ -0,0 +1 @@".to_string()
+                    } else {
+                        format!("@@ -0,0 +1,{} @@", file_lines.len())
+                    };
+                    let diff_shape_headers =
+                        sha256_hex(format!("{}\n{}", file_path, raw_header).as_bytes());
+
+                    let mut diff_lines_seq = Vec::new();
+                    for line in &file_lines {
+                        if let Some(norm) = normalize_line(line) {
+                            diff_lines_seq.push(format!("+{}", norm));
+                        }
+                    }
+                    let diff_shape_seq = sha256_hex(
+                        format!("{}\n{}", file_path, diff_lines_seq.join("\n")).as_bytes(),
+                    );
+
+                    diff_shapes.push((
+                        diff_shape_headers,
+                        format!("diff-shape:headers:{}", file_path),
+                    ));
+                    diff_shapes.push((diff_shape_seq, format!("diff-shape:seq:{}", file_path)));
+                }
+
+                let all_tokens = tokenize(text);
+                let token_texts: Vec<String> = all_tokens.iter().map(|t| t.text.clone()).collect();
+                let fps = winnow_tokens(&token_texts);
+                let mut winnow_candidates = Vec::new();
+                for fp in fps {
+                    let ev_end = (fp.token_pos + 8).min(token_texts.len());
+                    let ev = token_texts[fp.token_pos..ev_end].join(" ");
+                    winnow_candidates.push((fp.hash, ev));
+                }
+
+                let raw_items = crate::binary::extract_binary_items(text);
+                let mut seen_items = HashSet::new();
+                let mut binary_items = Vec::new();
+                for it in raw_items {
+                    if seen_items.insert(it.clone()) {
+                        binary_items.push(it);
+                    }
+                }
+
+                candidate_hunks.push(CandidateHunk {
+                    hunk_index: global_hunk_counter,
+                    file_path: file_path.clone(),
+                    lines,
+                    windows,
+                    removed_markers: Vec::new(),
+                    diff_shapes,
+                    winnow_candidates,
+                    binary_items,
+                });
+                global_hunk_counter += 1;
+            }
+        }
+
+        Ok(finish_fingerprint_set(
+            candidate_hunks,
+            base_tree,
+            skipped_files_count,
+        ))
+    }
+}
+
+fn finish_fingerprint_set(
+    candidate_hunks: Vec<CandidateHunk>,
+    base_tree_root: &Path,
+    skipped_files_count: usize,
+) -> FingerprintSet {
+    // Baseline subtraction (TR-SC-1, TR-SC-4 & TR-SC-5): walk base_tree_root
+    let mut base_line_counts: HashMap<String, usize> = HashMap::new();
+    let mut base_line_hashes: HashSet<String> = HashSet::new();
+    let mut base_window_hashes: HashSet<String> = HashSet::new();
+    let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
+    let mut base_binary_tokens: HashSet<String> = HashSet::new();
+
+    if base_tree_root.exists() {
+        for entry in WalkDir::new(base_tree_root)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .flatten()
+        {
+            if entry.file_type().is_file() {
+                // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
+                if let Some(content) = read_text_like_scanner(entry.path()) {
+                    let file_lines: Vec<&str> = content.lines().collect();
+
+                    // Line hashes & counts
+                    for line in &file_lines {
+                        if let Some(norm) = normalize_line(line) {
+                            *base_line_counts.entry(norm.clone()).or_insert(0) += 1;
+                            base_line_hashes.insert(sha256_hex(norm.as_bytes()));
+                        }
+                    }
+
+                    // Window hashes
+                    for i in 0..file_lines.len() {
+                        if i + 1 < file_lines.len() {
+                            let w = [file_lines[i], file_lines[i + 1]];
+                            if !w.iter().all(|l| normalize_line(l).is_none()) {
+                                let norm_w = w
+                                    .iter()
+                                    .map(|l| clean_line(l, false))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                            }
+                        }
+                        if i + 2 < file_lines.len() {
+                            let w = [file_lines[i], file_lines[i + 1], file_lines[i + 2]];
+                            if !w.iter().all(|l| normalize_line(l).is_none()) {
+                                let norm_w = w
+                                    .iter()
+                                    .map(|l| clean_line(l, false))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                            }
+                        }
+                    }
+
+                    // Winnow hashes and binary tokens for base tree
+                    let base_tokens = tokenize(&content);
+                    for tok in &base_tokens {
+                        base_binary_tokens.insert(tok.text.clone());
+                        if let Some(literal_content) =
+                            crate::binary::extract_string_literal_content(&tok.text)
+                        {
+                            base_binary_tokens.insert(literal_content);
+                        }
+                    }
+                    let base_token_texts: Vec<String> =
+                        base_tokens.into_iter().map(|t| t.text).collect();
+                    for hash in kgram_hashes(&base_token_texts) {
+                        base_winnow_hashes.insert(hash);
                     }
                 }
             }
         }
+    }
 
-        let mut subtracted_count = 0;
-        let mut winnow_subtracted_count = 0;
-        let mut binary_subtracted_count = 0;
-        let mut final_hunks = Vec::new();
-        let mut all_diff_shapes = HashSet::new();
-        let mut hash_to_evidence = HashMap::new();
+    let mut subtracted_count = 0;
+    let mut winnow_subtracted_count = 0;
+    let mut binary_subtracted_count = 0;
+    let mut final_hunks = Vec::new();
+    let mut all_diff_shapes = HashSet::new();
+    let mut hash_to_evidence = HashMap::new();
 
-        let mut total_lines = 0;
-        let mut total_windows = 0;
-        let mut total_removed = 0;
-        let mut total_shapes = 0;
-        let mut total_winnow = 0;
-        let mut total_binary_items = 0;
+    let mut total_lines = 0;
+    let mut total_windows = 0;
+    let mut total_removed = 0;
+    let mut total_shapes = 0;
+    let mut total_winnow = 0;
+    let mut total_binary_items = 0;
 
-        for ch in candidate_hunks {
-            let mut surviving_lines = Vec::new();
-            for (hash, norm) in ch.lines {
-                if base_line_hashes.contains(&hash) {
-                    subtracted_count += 1;
-                } else {
-                    hash_to_evidence.insert(hash.clone(), norm.clone());
-                    surviving_lines.push((hash, norm));
-                }
+    for ch in candidate_hunks {
+        let mut surviving_lines = Vec::new();
+        for (hash, norm) in ch.lines {
+            if base_line_hashes.contains(&hash) {
+                subtracted_count += 1;
+            } else {
+                hash_to_evidence.insert(hash.clone(), norm.clone());
+                surviving_lines.push((hash, norm));
             }
+        }
 
-            let mut surviving_windows = Vec::new();
-            for (hash, w_lines) in ch.windows {
-                if base_window_hashes.contains(&hash) {
-                    subtracted_count += 1;
-                } else {
-                    let ev = w_lines
-                        .iter()
-                        .map(|l| clean_line(l, false))
-                        .collect::<Vec<_>>()
-                        .join(" / ");
-                    hash_to_evidence.insert(hash.clone(), ev);
-                    surviving_windows.push((hash, w_lines));
-                }
-            }
-
-            for (hash, marker) in &ch.removed_markers {
-                hash_to_evidence.insert(hash.clone(), marker.clone());
-            }
-
-            for (hash, desc) in &ch.diff_shapes {
-                all_diff_shapes.insert(hash.clone());
-                hash_to_evidence.insert(hash.clone(), desc.clone());
-            }
-
-            // Baseline subtraction for tier 3 winnow fingerprints
-            let mut winnow_fingerprints = HashSet::new();
-            for (hash, ev) in ch.winnow_candidates {
-                if base_winnow_hashes.contains(&hash) {
-                    winnow_subtracted_count += 1;
-                } else {
-                    winnow_fingerprints.insert(hash);
-                    hash_to_evidence.insert(format!("{:016x}", hash), ev);
-                }
-            }
-
-            // Baseline subtraction for binary tier items
-            let mut surviving_binary_items = Vec::new();
-            for item in ch.binary_items {
-                if base_binary_tokens.contains(&item) {
-                    binary_subtracted_count += 1;
-                } else {
-                    surviving_binary_items.push(item);
-                }
-            }
-            total_binary_items += surviving_binary_items.len();
-
-            // Compute raw weights
-            let mut line_fingerprints = HashMap::new();
-            let mut total_line_weight = 0.0;
-            for (hash, norm) in &surviving_lines {
-                let count = base_line_counts.get(norm).copied().unwrap_or(0);
-                // line: 1 / (1 + count)
-                let w = 1.0 / (1.0 + count as f64);
-                line_fingerprints.insert(hash.clone(), w);
-                total_line_weight += w;
-            }
-
-            let mut window_fingerprints = HashMap::new();
-            let mut total_window_weight = 0.0;
-            for (hash, w_lines) in &surviving_windows {
-                // window: minimum raw weight of its lines
-                let min_w = w_lines
+        let mut surviving_windows = Vec::new();
+        for (hash, w_lines) in ch.windows {
+            if base_window_hashes.contains(&hash) {
+                subtracted_count += 1;
+            } else {
+                let ev = w_lines
                     .iter()
-                    .map(|l| {
-                        let cleaned = clean_line(l, false);
-                        let count = base_line_counts.get(&cleaned).copied().unwrap_or(0);
-                        1.0 / (1.0 + count as f64)
-                    })
-                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(1.0);
-                window_fingerprints.insert(hash.clone(), min_w);
-                total_window_weight += min_w;
+                    .map(|l| clean_line(l, false))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                hash_to_evidence.insert(hash.clone(), ev);
+                surviving_windows.push((hash, w_lines));
             }
-
-            let mut removed_map = HashMap::new();
-            let mut total_removed_weight = 0.0;
-            for (hash, marker) in &ch.removed_markers {
-                let cleaned = marker.strip_prefix('-').unwrap_or(marker);
-                let count = base_line_counts.get(cleaned).copied().unwrap_or(0);
-                let w = 1.0 / (1.0 + count as f64);
-                removed_map.insert(hash.clone(), w);
-                total_removed_weight += w;
-            }
-
-            let mut diff_shapes_map = HashMap::new();
-            for (hash, _) in &ch.diff_shapes {
-                diff_shapes_map.insert(hash.clone(), 1.0);
-            }
-
-            total_lines += line_fingerprints.len();
-            total_windows += window_fingerprints.len();
-            total_removed += removed_map.len();
-            total_shapes += diff_shapes_map.len();
-            total_winnow += winnow_fingerprints.len();
-
-            let mut line_u64 = BTreeMap::new();
-            for (hash, &w) in &line_fingerprints {
-                if let Some(u) = hex_to_u64(hash) {
-                    line_u64.insert(u, (w, hash.clone()));
-                }
-            }
-            let mut window_u64 = BTreeMap::new();
-            for (hash, &w) in &window_fingerprints {
-                if let Some(u) = hex_to_u64(hash) {
-                    window_u64.insert(u, (w, hash.clone()));
-                }
-            }
-            let mut removed_u64 = BTreeMap::new();
-            for (hash, &w) in &removed_map {
-                if let Some(u) = hex_to_u64(hash) {
-                    removed_u64.insert(u, (w, hash.clone()));
-                }
-            }
-
-            final_hunks.push(HunkFingerprints {
-                hunk_index: ch.hunk_index,
-                file_path: ch.file_path,
-                line_fingerprints,
-                total_line_weight,
-                window_fingerprints,
-                total_window_weight,
-                removed_markers: removed_map,
-                total_removed_weight,
-                diff_shapes: diff_shapes_map,
-                winnow_fingerprints,
-                binary_items: surviving_binary_items,
-                line_u64,
-                window_u64,
-                removed_u64,
-            });
         }
 
-        let mut diff_shape_u64 = BTreeMap::new();
-        for hash in &all_diff_shapes {
+        for (hash, marker) in &ch.removed_markers {
+            hash_to_evidence.insert(hash.clone(), marker.clone());
+        }
+
+        for (hash, desc) in &ch.diff_shapes {
+            all_diff_shapes.insert(hash.clone());
+            hash_to_evidence.insert(hash.clone(), desc.clone());
+        }
+
+        // Baseline subtraction for tier 3 winnow fingerprints
+        let mut winnow_fingerprints = HashSet::new();
+        for (hash, ev) in ch.winnow_candidates {
+            if base_winnow_hashes.contains(&hash) {
+                winnow_subtracted_count += 1;
+            } else {
+                winnow_fingerprints.insert(hash);
+                hash_to_evidence.insert(format!("{:016x}", hash), ev);
+            }
+        }
+
+        // Baseline subtraction for binary tier items
+        let mut surviving_binary_items = Vec::new();
+        for item in ch.binary_items {
+            if base_binary_tokens.contains(&item) {
+                binary_subtracted_count += 1;
+            } else {
+                surviving_binary_items.push(item);
+            }
+        }
+        total_binary_items += surviving_binary_items.len();
+
+        // Compute raw weights
+        let mut line_fingerprints = HashMap::new();
+        let mut total_line_weight = 0.0;
+        for (hash, norm) in &surviving_lines {
+            let count = base_line_counts.get(norm).copied().unwrap_or(0);
+            // line: 1 / (1 + count)
+            let w = 1.0 / (1.0 + count as f64);
+            line_fingerprints.insert(hash.clone(), w);
+            total_line_weight += w;
+        }
+
+        let mut window_fingerprints = HashMap::new();
+        let mut total_window_weight = 0.0;
+        for (hash, w_lines) in &surviving_windows {
+            // window: minimum raw weight of its lines
+            let min_w = w_lines
+                .iter()
+                .map(|l| {
+                    let cleaned = clean_line(l, false);
+                    let count = base_line_counts.get(&cleaned).copied().unwrap_or(0);
+                    1.0 / (1.0 + count as f64)
+                })
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(1.0);
+            window_fingerprints.insert(hash.clone(), min_w);
+            total_window_weight += min_w;
+        }
+
+        let mut removed_map = HashMap::new();
+        let mut total_removed_weight = 0.0;
+        for (hash, marker) in &ch.removed_markers {
+            let cleaned = marker.strip_prefix('-').unwrap_or(marker);
+            let count = base_line_counts.get(cleaned).copied().unwrap_or(0);
+            let w = 1.0 / (1.0 + count as f64);
+            removed_map.insert(hash.clone(), w);
+            total_removed_weight += w;
+        }
+
+        let mut diff_shapes_map = HashMap::new();
+        for (hash, _) in &ch.diff_shapes {
+            diff_shapes_map.insert(hash.clone(), 1.0);
+        }
+
+        total_lines += line_fingerprints.len();
+        total_windows += window_fingerprints.len();
+        total_removed += removed_map.len();
+        total_shapes += diff_shapes_map.len();
+        total_winnow += winnow_fingerprints.len();
+
+        let mut line_u64 = BTreeMap::new();
+        for (hash, &w) in &line_fingerprints {
             if let Some(u) = hex_to_u64(hash) {
-                diff_shape_u64.insert(u, hash.clone());
+                line_u64.insert(u, (w, hash.clone()));
+            }
+        }
+        let mut window_u64 = BTreeMap::new();
+        for (hash, &w) in &window_fingerprints {
+            if let Some(u) = hex_to_u64(hash) {
+                window_u64.insert(u, (w, hash.clone()));
+            }
+        }
+        let mut removed_u64 = BTreeMap::new();
+        for (hash, &w) in &removed_map {
+            if let Some(u) = hex_to_u64(hash) {
+                removed_u64.insert(u, (w, hash.clone()));
             }
         }
 
-        Ok(FingerprintSet {
-            hunks: final_hunks,
-            diff_shape_hashes: all_diff_shapes,
-            diff_shape_u64,
-            lines_count: total_lines,
-            windows_count: total_windows,
-            removed_markers_count: total_removed,
-            diff_shapes_count: total_shapes,
-            subtracted_count,
-            winnow_count: total_winnow,
-            winnow_subtracted_count,
-            binary_items_count: total_binary_items,
-            binary_subtracted_count,
-            hash_to_evidence,
-        })
+        final_hunks.push(HunkFingerprints {
+            hunk_index: ch.hunk_index,
+            file_path: ch.file_path,
+            line_fingerprints,
+            total_line_weight,
+            window_fingerprints,
+            total_window_weight,
+            removed_markers: removed_map,
+            total_removed_weight,
+            diff_shapes: diff_shapes_map,
+            winnow_fingerprints,
+            binary_items: surviving_binary_items,
+            line_u64,
+            window_u64,
+            removed_u64,
+        });
+    }
+
+    let mut diff_shape_u64 = BTreeMap::new();
+    for hash in &all_diff_shapes {
+        if let Some(u) = hex_to_u64(hash) {
+            diff_shape_u64.insert(u, hash.clone());
+        }
+    }
+
+    FingerprintSet {
+        hunks: final_hunks,
+        diff_shape_hashes: all_diff_shapes,
+        diff_shape_u64,
+        lines_count: total_lines,
+        windows_count: total_windows,
+        removed_markers_count: total_removed,
+        diff_shapes_count: total_shapes,
+        subtracted_count,
+        winnow_count: total_winnow,
+        winnow_subtracted_count,
+        binary_items_count: total_binary_items,
+        binary_subtracted_count,
+        hash_to_evidence,
+        skipped_files_count,
     }
 }

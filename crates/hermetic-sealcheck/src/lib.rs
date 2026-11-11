@@ -15,6 +15,7 @@ pub mod index;
 pub mod normalize;
 pub mod sarif;
 pub mod scan;
+pub mod undated;
 pub mod winnow;
 
 use serde::{Deserialize, Serialize};
@@ -45,12 +46,14 @@ pub use index::{
     merge_continuations, query_index, write_index, write_index_with_threshold, IndexError,
     IndexReader, IndexRecord, IndexStats, MAX_UNIT_BYTES, NOT_COVERED,
 };
+pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};
 pub use scan::{
     compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
     ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
 };
+pub use undated::{load_undated_task, UndatedTask};
 pub use winnow::{
     hash_kgram, kgram_hashes, tokenize, winnow_hashes, winnow_tokens, Token, WinnowFingerprint,
 };
