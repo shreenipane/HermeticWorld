@@ -609,3 +609,222 @@ def test_regression_defect9_secret_bearing_missing_paths_never_leak(tmp_path, ca
     cap2 = capsys.readouterr()
     assert secret_name not in cap2.err
     assert secret_name not in cap2.out
+
+
+def test_regression_defect1_nul_byte_leak_refuses_clean_and_repair(task_world, tmp_path):
+    """Defect 1: unrecognized NUL-containing files must be rejected for both clean and repair paths."""
+    tasks, task, root, initial, binary = task_world
+    nul_file = root / "nul_leak.txt"
+    nul_file.write_bytes(b"\x00" + LEAK.encode("utf-8"))
+    os.utime(nul_file, (STAMP, STAMP))
+
+    # Clean path: clean statement, real sealcheck / dispositions must reject incomplete scan
+    clean_statement = "Clean problem statement without leak.\n"
+    (task / "agent/problem_statement.md").write_text(clean_statement, encoding="utf-8")
+    os.utime(task / "agent/problem_statement.md", (STAMP, STAMP))
+    with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+
+    # Repair path: D0 leak in statement, repair re-scan with NUL file must reject / refuse repair
+    (task / "agent/problem_statement.md").write_text(STATEMENT, encoding="utf-8")
+    os.utime(task / "agent/problem_statement.md", (STAMP, STAMP))
+    with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
+        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_regression_defect2_replace_ancestor_at_subprocess_launch_no_outside_reads(task_world, monkeypatch, tmp_path):
+    """Defect 2: replace root ancestor at subprocess launch and assert no outside reads."""
+    tasks, task, root, initial, binary = task_world
+
+    sub_dir = root / "ancestor" / "target"
+    sub_dir.mkdir(parents=True)
+    target_file = sub_dir / "target.py"
+    target_file.write_text("safe_internal_code = 1\n", encoding="utf-8")
+    backdate(root)
+
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    outside_secret = outside / "secret.txt"
+    outside_secret.write_text("CRITICAL_OUTSIDE_SECRET_LEAK\n", encoding="utf-8")
+    backdate(outside)
+
+    scan_config = {
+        "base_tree": initial["scan_config"]["base_tree"],
+        "roots": [{"path": str(sub_dir), "visibility": "agent_visible"}],
+    }
+
+    original_bounded_process = d.bounded_process
+    replaced = False
+
+    def hook_bounded_process(argv, timeout=d.PROCESS_TIMEOUT_SECONDS, **kwargs):
+        nonlocal replaced
+        if "scan" in argv:
+            shutil.rmtree(root / "ancestor")
+            (root / "ancestor").symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return original_bounded_process(argv, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(d, "bounded_process", hook_bounded_process)
+
+    result = d.run_real_sealcheck(task, binary, scan_config=scan_config)
+    assert replaced
+    result_text = json.dumps(result)
+    assert "CRITICAL_OUTSIDE_SECRET_LEAK" not in result_text
+    assert str(outside) not in result_text
+
+
+def test_regression_defect3_replace_entire_task_dir_during_scan_rejected(task_world, monkeypatch):
+    """Defect 3: replace entire task directory during scanning requires rejection."""
+    tasks, task, _, initial, binary = task_world
+    scan = d.run_real_sealcheck
+
+    def racing_scan(*args, **kwargs):
+        stale_task = tasks / "task_one_stale"
+        task.rename(stale_task)
+        task.mkdir(parents=True, exist_ok=True)
+        (task / "agent").mkdir(parents=True, exist_ok=True)
+        (task / "agent/problem_statement.md").write_text(STATEMENT, encoding="utf-8")
+        (task / "task.json").write_text(json.dumps(complete_task("task_one")), encoding="utf-8")
+        (task / "manifest.json").write_text(json.dumps(complete_manifest("task_one")), encoding="utf-8")
+        return scan(*args, **kwargs)
+
+    monkeypatch.setattr(d, "run_real_sealcheck", racing_scan)
+    with pytest.raises(d.DispositionsError, match="modified or replaced between validation and publication"):
+        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_regression_defect4_cli_whole_statement_and_over_threshold_d0_no_scan_inputs(tmp_path):
+    """Defect 4: CLI with whole-statement and over-threshold D0 findings, no scan inputs -> excluded records."""
+    tasks = tmp_path / "tasks"
+    tasks.mkdir(parents=True)
+
+    tid1 = "task_whole_statement"
+    t1_dir = tasks / tid1
+    (t1_dir / "agent").mkdir(parents=True)
+    text1 = "Short statement to redact fully."
+    (t1_dir / "agent/problem_statement.md").write_text(text1, encoding="utf-8")
+    (t1_dir / "task.json").write_text(json.dumps(complete_task(tid1)), encoding="utf-8")
+    (t1_dir / "manifest.json").write_text(json.dumps(complete_manifest(tid1)), encoding="utf-8")
+    rep1 = {
+        "task_id": tid1,
+        "gate": True,
+        "not_covered": [],
+        "findings": [
+            {
+                "detector": "D0",
+                "channel": "problem_statement",
+                "path": "agent/problem_statement.md",
+                "visibility": "agent_visible",
+                "severity": "gate",
+                "confidence": 1.0,
+                "evidence": [text1],
+                "char_spans": [[0, len(text1)]],
+            }
+        ],
+    }
+
+    tid2 = "task_over_threshold"
+    t2_dir = tasks / tid2
+    (t2_dir / "agent").mkdir(parents=True)
+    text2 = "12345678901234567890123456789012345678901234567890"
+    (t2_dir / "agent/problem_statement.md").write_text(text2, encoding="utf-8")
+    (t2_dir / "task.json").write_text(json.dumps(complete_task(tid2)), encoding="utf-8")
+    (t2_dir / "manifest.json").write_text(json.dumps(complete_manifest(tid2)), encoding="utf-8")
+    leak2 = "12345678901234567890"
+    rep2 = {
+        "task_id": tid2,
+        "gate": True,
+        "not_covered": [],
+        "findings": [
+            {
+                "detector": "D0",
+                "channel": "problem_statement",
+                "path": "agent/problem_statement.md",
+                "visibility": "agent_visible",
+                "severity": "gate",
+                "confidence": 1.0,
+                "evidence": [leak2],
+            }
+        ],
+    }
+
+    source, out = tmp_path / "input.json", tmp_path / "output.json"
+    source.write_text(json.dumps([rep1, rep2]), encoding="utf-8")
+    code = d.dispositions_cli(["--gate-output", str(source), "--out", str(out), "--tasks-dir", str(tasks)])
+    assert code == 0
+
+    records = json.loads(out.read_text(encoding="utf-8"))
+    assert len(records) == 2
+    r1 = next(r for r in records if r["task_id"] == tid1)
+    assert r1["disposition"] == "excluded"
+    assert "D0" in r1["detectors"]
+    assert "reason" in r1 and any("statement" in s.lower() or "threshold" in s.lower() or "issue text" in s.lower() for s in [r1["reason"]])
+
+    r2 = next(r for r in records if r["task_id"] == tid2)
+    assert r2["disposition"] == "excluded"
+    assert "D0" in r2["detectors"]
+    assert "reason" in r2 and any("statement" in s.lower() or "threshold" in s.lower() or "issue text" in s.lower() for s in [r2["reason"]])
+
+
+def test_regression_defect5_previously_repaired_task_receives_d2_exclusion_without_scan_config(task_world, tmp_path):
+    """Defect 5: previously repaired task receives D2 exclusion without scan configuration."""
+    tasks, task, _, initial, binary = task_world
+
+    entries1, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert entries1[0]["disposition"] == "repaired"
+    assert (task / "problem_statement_redacted.json").is_file()
+
+    d2_report = {
+        "task_id": "task_one",
+        "gate": True,
+        "not_covered": [],
+        "findings": [
+            {
+                "detector": "D2",
+                "channel": "file",
+                "path": "leaked.py",
+                "visibility": "agent_visible",
+                "severity": "gate",
+                "confidence": 1.0,
+                "evidence": ["leaked_solution_line()"],
+            }
+        ],
+    }
+
+    out = tmp_path / "d2_out.json"
+    entries2, _ = d.process_dispositions([d2_report], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    assert len(entries2) == 1
+    assert entries2[0]["disposition"] == "excluded"
+    assert "D2" in entries2[0]["detectors"]
+
+    manifest = json.loads((task / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dispositions"][-1]["kind"] == "excluded"
+    assert manifest["dispositions"][-1]["detector"] == "D2"
+
+
+@pytest.mark.parametrize(
+    "artifact_rel",
+    [
+        "manifest.json",
+        "agent/problem_statement.md",
+        "problem_statement_redacted.json",
+        "staging/gold.patch",
+        "staging/test.patch",
+        "task.json",
+    ],
+)
+def test_regression_defect8_output_collisions_with_task_artifacts_rejected(task_world, artifact_rel):
+    """Defect 8: parameterize output collisions with task inputs/artifacts; assert rejection and unchanged files."""
+    tasks, task, _, initial, binary = task_world
+    target_path = task / artifact_rel
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if not target_path.exists():
+        target_path.write_text("initial sentinel content", encoding="utf-8")
+    before_bytes = target_path.read_bytes()
+
+    with pytest.raises(d.DispositionsError, match="Report destination overlaps task artifact"):
+        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary, out_path=target_path)
+
+    after_bytes = target_path.read_bytes()
+    assert before_bytes == after_bytes
+

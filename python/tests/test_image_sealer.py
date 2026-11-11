@@ -728,3 +728,100 @@ def test_cli_seal_images(tmp_path: Path, fake_swebench_image: dict) -> None:
         assert saved_report["status"] == "sealed"
     finally:
         run_docker(["rmi", "-f", sealed_tag], check=False)
+
+
+def test_regression_defect6_tracked_fifo_without_writer_promptly_rejected_and_replacement_during_open(tmp_path: Path) -> None:
+    """Defect 6: replace tracked file with FIFO without writer; assert prompt rejection and replacement during open."""
+    import stat
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Track regular file
+    tracked = repo_dir / "fifo_target.txt"
+    tracked.write_text("regular file\n", encoding="utf-8")
+    run_git(["add", "fifo_target.txt"], cwd=repo_dir)
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "add tracked file"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Part 1: Replace tracked file with a FIFO without a writer
+    tracked.unlink()
+    os.mkfifo(tracked)
+    os.chmod(tracked, 0o666)
+
+    proc = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert proc.returncode == 0
+    assert stat.S_ISFIFO(tracked.stat().st_mode)
+
+    # Part 2: Cover replacement during open
+    race_target = repo_dir / "race_target.txt"
+    race_target.write_text("initial regular\n", encoding="utf-8")
+    dir_fd = os.open(str(repo_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        st_before = os.lstat("race_target.txt", dir_fd=dir_fd)
+        assert stat.S_ISREG(st_before.st_mode)
+        race_target.unlink()
+        os.mkfifo(race_target)
+        fd = os.open("race_target.txt", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=dir_fd)
+        try:
+            st_after = os.fstat(fd)
+            is_valid = stat.S_ISREG(st_after.st_mode) and (st_before.st_dev, st_before.st_ino) == (st_after.st_dev, st_after.st_ino)
+            assert not is_valid
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def test_regression_defect7_ls_tree_lowered_caps_bounded_failure_and_child_cleanup(tmp_path: Path) -> None:
+    """Defect 7: exceed lowered output/entry cap and assert bounded failure and child cleanup."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    for i in range(10):
+        (repo_dir / f"file_{i}.txt").write_text(f"content {i}\n", encoding="utf-8")
+        run_git(["add", f"file_{i}.txt"], cwd=repo_dir)
+
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "10 files"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Test 1: Exceed lowered byte cap
+    env_byte_cap = os.environ.copy()
+    env_byte_cap["HERMETIC_MAX_LS_TREE_BYTES"] = "20"
+    proc_bytes = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        env=env_byte_cap,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_bytes.returncode != 0
+    assert "byte cap exceeded" in proc_bytes.stderr
+
+    # Test 2: Exceed lowered entry cap
+    env_entry_cap = os.environ.copy()
+    env_entry_cap["HERMETIC_MAX_LS_TREE_ENTRIES"] = "2"
+    proc_entries = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        env=env_entry_cap,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_entries.returncode != 0
+    assert "entry count cap exceeded" in proc_entries.stderr
+

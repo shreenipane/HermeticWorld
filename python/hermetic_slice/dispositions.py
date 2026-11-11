@@ -522,11 +522,15 @@ def validate_scan_config(config: Any) -> dict[str, Any]:
         if not isinstance(root, dict) or set(root) != {"path", "visibility"} or not isinstance(root["path"], str) or root["visibility"] not in ("agent_visible", "image_only"):
             raise DispositionsError("Invalid scan root configuration")
         paths.append(root["path"])
-    tree_stats = {}
+    existing_tree_stats = config.get("_tree_stats")
+    tree_stats = dict(existing_tree_stats) if isinstance(existing_tree_stats, dict) else {}
     for path in paths:
         with SafeDirectory(Path(path)) as directory:
             st = os.fstat(directory.fd)
-            tree_stats[path] = (st.st_dev, st.st_ino)
+            if path in tree_stats and (st.st_dev, st.st_ino) != tuple(tree_stats[path]):
+                raise DispositionsError("Scan tree modified or replaced between validation and execution")
+            if path not in tree_stats:
+                tree_stats[path] = (st.st_dev, st.st_ino)
     config["_tree_stats"] = tree_stats
     staged_contents = {}
     file_stats = {}
@@ -550,6 +554,85 @@ def validate_scan_config(config: Any) -> dict[str, Any]:
     return config
 
 
+MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+MAX_SNAPSHOT_ENTRIES = 100000
+
+
+def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
+    """Snapshot a directory tree into dst_path using safe descriptor traversal without check-then-use."""
+    dst_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    total_bytes = 0
+    total_entries = 0
+    dir_times: list[tuple[Path, int, int]] = []
+    with SafeDirectory(src_path) as root_dir:
+        root_stat = os.fstat(root_dir.fd)
+        dir_times.append((dst_path, root_stat.st_atime_ns, root_stat.st_mtime_ns))
+        stack: list[tuple[SafeDirectory, tuple[str, ...]]] = [(root_dir, ())]
+        try:
+            while stack:
+                curr_dir, rel_path = stack.pop()
+                curr_dst = dst_path
+                for part in rel_path:
+                    curr_dst = curr_dst / part
+                curr_dst.mkdir(mode=0o700, exist_ok=True)
+                for name in curr_dir.names():
+                    total_entries += 1
+                    if total_entries > MAX_SNAPSHOT_ENTRIES:
+                        raise DispositionsError("Snapshot entry count cap exceeded")
+                    try:
+                        info = os.stat(name, dir_fd=curr_dir.fd, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(info.st_mode):
+                        try:
+                            target = os.readlink(name, dir_fd=curr_dir.fd)
+                            link_dst = curr_dst / name
+                            os.symlink(target, link_dst)
+                            try:
+                                os.utime(link_dst, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+                            except (OSError, NotImplementedError):
+                                pass
+                        except OSError:
+                            pass
+                    elif stat.S_ISDIR(info.st_mode):
+                        child = curr_dir.child(name)
+                        child_dst = curr_dst / name
+                        dir_times.append((child_dst, info.st_atime_ns, info.st_mtime_ns))
+                        stack.append((child, rel_path + (name,)))
+                    elif stat.S_ISREG(info.st_mode):
+                        if total_bytes + info.st_size > max_bytes:
+                            raise DispositionsError("Snapshot byte cap exceeded")
+                        fd = -1
+                        try:
+                            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=curr_dir.fd)
+                            after = os.fstat(fd)
+                            if not stat.S_ISREG(after.st_mode) or (info.st_dev, info.st_ino) != (after.st_dev, after.st_ino):
+                                raise DispositionsError("File changed during snapshot traversal")
+                            with os.fdopen(fd, "rb") as stream:
+                                content = stream.read(max_bytes - total_bytes + 1)
+                                fd = -1
+                            if len(content) > max_bytes - total_bytes:
+                                raise DispositionsError("Snapshot byte cap exceeded")
+                            total_bytes += len(content)
+                            out_file = curr_dst / name
+                            out_fd = os.open(str(out_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                            with os.fdopen(out_fd, "wb") as out_stream:
+                                out_stream.write(content)
+                            os.utime(out_file, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        finally:
+                            if fd >= 0:
+                                os.close(fd)
+        finally:
+            for d, _ in stack:
+                if d is not root_dir:
+                    d.close()
+    for d_path, atime_ns, mtime_ns in reversed(dir_times):
+        try:
+            os.utime(d_path, ns=(atime_ns, mtime_ns))
+        except OSError:
+            pass
+
+
 def run_real_sealcheck(
     task_dir: Path,
     sealcheck_bin: str | Path,
@@ -564,21 +647,30 @@ def run_real_sealcheck(
         "base_tree": str(base_tree) if base_tree is not None else None,
         "roots": [{"path": str(root), "visibility": "agent_visible"}] if root is not None else [],
     })
-    # Defect 4: Verify scan trees right before subprocess access
     tree_stats = config.get("_tree_stats", {})
     all_trees = [config["base_tree"]] + [entry["path"] for entry in config["roots"]]
     for path in all_trees:
         with SafeDirectory(Path(path)) as directory:
             st = os.fstat(directory.fd)
-            if path in tree_stats and (st.st_dev, st.st_ino) != tree_stats[path]:
+            if path in tree_stats and (st.st_dev, st.st_ino) != tuple(tree_stats[path]):
                 raise DispositionsError("Scan tree modified or replaced between validation and execution")
-    # Verify and stage configuration files in a private bounded directory
+    # Verify and stage configuration files and immutable snapshots in a private bounded directory
     with tempfile.TemporaryDirectory(prefix="disposition_config_") as staging_dir:
         staged_dir = Path(staging_dir)
-        cmd = [str(sealcheck_bin), "scan", "--task", str(task_dir),
-               "--base-tree", config["base_tree"], "--format", "json"]
-        for entry in config["roots"]:
-            cmd.extend(["--root", entry["path"], "--root-visibility", entry["visibility"]])
+        staged_task = staged_dir / Path(task_dir).name
+        snapshot_tree_safely(Path(task_dir), staged_task)
+        staged_base = staged_dir / "base_tree"
+        snapshot_tree_safely(Path(config["base_tree"]), staged_base)
+        staged_roots = []
+        for idx, entry in enumerate(config["roots"]):
+            staged_root = staged_dir / f"root_{idx}"
+            snapshot_tree_safely(Path(entry["path"]), staged_root)
+            staged_roots.append((staged_root, entry["visibility"]))
+
+        cmd = [str(sealcheck_bin), "scan", "--task", str(staged_task),
+               "--base-tree", str(staged_base), "--format", "json"]
+        for staged_root, vis in staged_roots:
+            cmd.extend(["--root", str(staged_root), "--root-visibility", vis])
         staged_contents = config.get("_staged_contents", {})
         file_stats = config.get("_file_stats", {})
         for key in ("signatures", "oci_inspect", "oci_history"):
@@ -586,7 +678,7 @@ def run_real_sealcheck(
                 file_path = Path(config[key])
                 with SafeDirectory(file_path.parent) as directory:
                     info = directory.check_file(file_path.name)
-                    if info is None or (key in file_stats and (info.st_dev, info.st_ino) != file_stats[key]):
+                    if info is None or (key in file_stats and (info.st_dev, info.st_ino) != tuple(file_stats[key])):
                         raise DispositionsError("Configuration file modified or replaced between validation and execution")
                 staged_file = staged_dir / f"{key}.json"
                 staged_file.write_text(staged_contents.get(key, ""), encoding="utf-8")
@@ -676,8 +768,11 @@ def has_incomplete_coverage(report: dict[str, Any]) -> list[str]:
         channel = f.get("channel", "")
         evidence = f.get("evidence", [])
         evidence_str = " ".join(evidence) if isinstance(evidence, list) else str(evidence)
+        severity = f.get("severity", "")
         is_inc = (
             channel in INCOMPLETE_COVERAGE_CHANNELS
+            or "skipped binary file" in evidence_str
+            or "contains NUL byte" in evidence_str
             or "skipped file exceeding max size" in evidence_str
             or "file over 64 MiB skipped" in evidence_str
             or "read error" in evidence_str
@@ -690,6 +785,7 @@ def has_incomplete_coverage(report: dict[str, Any]) -> list[str]:
             or "decompression error" in evidence_str
             or "error reading zip" in evidence_str
             or "error reading tar" in evidence_str
+            or (severity in ("info", "review") and any(w in evidence_str.lower() for w in ("skip", "skipped", "bomb", "incomplete", "unreadable", "decompression error")))
         )
         if is_inc:
             det = f.get("detector")
@@ -1075,18 +1171,57 @@ def verify_repair_metadata(metadata: Any, statement: str, manifest: Any) -> list
     return spans
 
 
-def is_exclusion_only(report: dict[str, Any]) -> bool:
+def is_exclusion_only(report: dict[str, Any], stmt: str | None = None, is_persisted_repair: bool = False) -> bool:
     """Determine if a report is guaranteed to be excluded without re-scan."""
     if report.get("issue_text_is_the_fix"):
         return True
     findings = report.get("findings", [])
-    if isinstance(findings, list):
-        gate_findings = [
-            f for f in findings
-            if isinstance(f, dict) and f.get("severity") == "gate" and f.get("visibility", "agent_visible") == "agent_visible"
-        ]
-        if any(f.get("detector") != "D0" for f in gate_findings):
+    if not isinstance(findings, list):
+        return False
+    gate_findings = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("severity") == "gate" and f.get("visibility", "agent_visible") == "agent_visible"
+    ]
+    if not gate_findings:
+        return False
+    if any(f.get("detector") != "D0" for f in gate_findings):
+        return True
+    if is_persisted_repair:
+        return False
+    problem_text = stmt if stmt is not None else report.get("problem_statement")
+    if problem_text is None:
+        return True
+    stmt_bytes = problem_text.encode("utf-8")
+    stmt_len = len(stmt_bytes)
+    if "explicit_spans" in report:
+        try:
+            spans = validate_and_merge_spans(stmt_len, report["explicit_spans"])
+        except DispositionsError:
             return True
+    else:
+        evidence_list: list[str] = []
+        for f in gate_findings:
+            if f.get("detector") == "D0":
+                ev = f.get("evidence", [])
+                if isinstance(ev, list):
+                    evidence_list.extend(str(item) for item in ev)
+                elif isinstance(ev, str):
+                    evidence_list.append(ev)
+        try:
+            spans = find_spans_in_text(problem_text, evidence_list)
+        except DispositionsError:
+            return True
+    if not spans:
+        return True
+    total_span_bytes = sum(s_end - s_start for s_start, s_end in spans)
+    fraction = total_span_bytes / stmt_len if stmt_len > 0 else 1.0
+    try:
+        redacted_text, _ = redact_problem_statement(problem_text, spans)
+    except DispositionsError:
+        return True
+    non_ws_remaining = len(re.sub(r"\s+", "", redacted_text.replace("[REDACTED]", "")))
+    if fraction > MAX_REDACTION_FRACTION or non_ws_remaining < MIN_REMAINING_CHARS:
+        return True
     return False
 
 
@@ -1116,19 +1251,43 @@ def process_dispositions(
         output = stack.enter_context(SafeDirectory(Path(out_path).parent)) if out_path else None
         if output:
             output.check_file(Path(out_path).name)
+            if tasks:
+                out_resolved = Path(out_path).resolve()
+                for name in tasks.names():
+                    task_base = (Path(tasks_dir) / name).resolve()
+                    forbidden_artifacts = [
+                        task_base / "manifest.json",
+                        task_base / "problem_statement_redacted.json",
+                        task_base / "task.json",
+                        task_base / "agent" / "problem_statement.md",
+                        task_base / "staging" / "gold.patch",
+                        task_base / "staging" / "test.patch",
+                    ]
+                    for artifact in forbidden_artifacts:
+                        if out_resolved == artifact:
+                            raise DispositionsError(f"Report destination overlaps task artifact: {artifact.name}")
+                        try:
+                            if out_resolved.exists() and artifact.exists():
+                                if (out_resolved.stat().st_dev, out_resolved.stat().st_ino) == (artifact.stat().st_dev, artifact.stat().st_ino):
+                                    raise DispositionsError(f"Report destination overlaps task artifact: {artifact.name}")
+                        except OSError:
+                            pass
+                    if out_resolved == task_base or task_base in out_resolved.parents:
+                        raise DispositionsError("Report destination inside task directory")
         prepared = []
         total_task_bytes = 0
         # Retain task and agent descriptors, and validate every destination even with inline text.
         for report in reports:
             tid = report.get("task_id", report.get("instance_id"))
             task_dir = stack.enter_context(tasks.child(tid)) if tasks else None
+            task_dir_stat = os.fstat(task_dir.fd) if task_dir else None
             agent = stack.enter_context(task_dir.child("agent")) if task_dir else None
             stmt = report.get("problem_statement")
             manifest = report.get("manifest")
             task = report.get("task_json")
             gold, test = report.get("gold_patch"), report.get("test_patch")
             metadata = None
-            needs_rescan = rescan_fn is None and not is_exclusion_only(report) and (report["gate"] or metadata is not None)
+            needs_rescan = rescan_fn is None and not is_exclusion_only(report, stmt, is_persisted_repair=(metadata is not None)) and (report["gate"] or metadata is not None)
             if task_dir:
                 for name in ("manifest.json", "problem_statement_redacted.json"):
                     task_dir.check_file(name)
@@ -1151,7 +1310,7 @@ def process_dispositions(
                         raise DispositionsError("Conflicting inline task_json and on-disk task metadata")
                     task = parsed_disk_task if task is None else task
                 # Re-compute needs_rescan now that metadata may be loaded from disk
-                needs_rescan = rescan_fn is None and not is_exclusion_only(report) and (report["gate"] or metadata is not None)
+                needs_rescan = rescan_fn is None and not is_exclusion_only(report, stmt, is_persisted_repair=(metadata is not None)) and (report["gate"] or metadata is not None)
                 if needs_rescan:
                     with task_dir.child("staging") as stage:
                         disk_gold = stage.read("gold.patch", MAX_PATCH_BYTES)
@@ -1192,18 +1351,28 @@ def process_dispositions(
             total_task_bytes += len(retained.encode("utf-8"))
             if total_task_bytes > MAX_TOTAL_TASK_BYTES:
                 raise DispositionsError("Total task input byte cap exceeded")
-            prepared.append((report, task_dir, agent, stmt, manifest, task, gold, test, config, spans))
+            prepared.append((report, task_dir, agent, stmt, manifest, task, gold, test, config, spans, task_dir_stat))
 
         results = []
         updates = []
-        for report, task_dir, agent, stmt, manifest, task, gold, test, config, spans in prepared:
+        for report, task_dir, agent, stmt, manifest, task, gold, test, config, spans, task_dir_stat in prepared:
             tid = report.get("task_id", report.get("instance_id"))
             scan = rescan_fn
             if scan is None and config is not None:
                 binary = find_binary("hermetic-sealcheck", custom_path=sealcheck_bin, env_var="SEALCHECK_BIN")
                 def scan(task_id: str, text: str) -> dict[str, Any]:
                     return staged_rescan(task_id, text, task, gold, test, config, binary)
-            if spans:
+            if is_exclusion_only(report, stmt, is_persisted_repair=(len(spans) > 0)):
+                result = decide_task_disposition(
+                    tid, report["findings"], gate_flag=report["gate"],
+                    not_covered=report["not_covered"], problem_statement=stmt,
+                    explicit_spans=report.get("explicit_spans"),
+                    issue_text_is_the_fix=report.get("issue_text_is_the_fix", False),
+                    rescan_fn=None, manifest=manifest, manifest_bin=manifest_bin,
+                )
+            elif spans:
+                if scan is None:
+                    raise DispositionsError("Re-scan mechanism not configured for verification")
                 current_report = scan(tid, stmt)
                 validate_report(current_report)
                 if current_report["gate"] or any(f["detector"] != "D0" for f in validate_findings(report["findings"])):
@@ -1220,7 +1389,7 @@ def process_dispositions(
             if manifest is not None:
                 result.world_version = compute_real_world_version(manifest, manifest_bin)
             results.append(result)
-            updates.append((task_dir, agent, result, manifest))
+            updates.append((task_dir, agent, result, manifest, task_dir_stat))
         manifest_by_id = {u[2].task_id: u[3] for u in updates}
         results.sort(key=lambda result: result.task_id)
         entries = []
@@ -1241,15 +1410,22 @@ def process_dispositions(
         summary = {"total_tasks": len(results), "dispositions": counts,
                    "detectors": {detector: sum(detector in result.detectors for result in results) for detector in detectors}}
         # All validation and staged scans completed before the first atomic replacement.
-        for task_dir, agent, result, manifest in updates:
+        for task_dir, agent, result, manifest, task_dir_stat in updates:
             if task_dir:
+                tid = result.task_id
+                if tasks:
+                    try:
+                        current_pub_stat = os.stat(tid, dir_fd=tasks.fd, follow_symlinks=False)
+                    except OSError:
+                        raise DispositionsError("Published task directory missing or unavailable")
+                    if not stat.S_ISDIR(current_pub_stat.st_mode) or (current_pub_stat.st_dev, current_pub_stat.st_ino) != (task_dir_stat.st_dev, task_dir_stat.st_ino):
+                        raise DispositionsError("Task directory modified or replaced between validation and publication")
                 if result.disposition == "repaired":
                     agent.write("problem_statement.md", result.redacted_statement)
                     task_dir.write("problem_statement_redacted.json", json.dumps({
                         "spans": [span.to_dict() for span in result.redacted_spans],
                         "statement_sha256": hashlib.sha256(result.redacted_statement.encode("utf-8")).hexdigest(),
                     }, sort_keys=True, indent=2) + "\n")
-                    # Defect 5: Ensure verified repair is at published path task_dir / "agent"
                     agent_stat = os.fstat(agent.fd)
                     try:
                         pub_stat = os.stat("agent", dir_fd=task_dir.fd, follow_symlinks=False)
@@ -1261,10 +1437,15 @@ def process_dispositions(
                             os.mkdir("agent", mode=0o755, dir_fd=task_dir.fd)
                         with task_dir.child("agent") as pub_agent:
                             pub_agent.write("problem_statement.md", result.redacted_statement)
-                    with task_dir.child("agent") as verify_agent:
-                        published_text = verify_agent.read("problem_statement.md", MAX_STATEMENT_BYTES)
-                        if published_text != result.redacted_statement:
-                            raise DispositionsError("Published task path repair verification failed")
+                    verify_dir = tasks.child(tid) if tasks else task_dir
+                    try:
+                        with verify_dir.child("agent") as verify_agent:
+                            published_text = verify_agent.read("problem_statement.md", MAX_STATEMENT_BYTES)
+                            if published_text != result.redacted_statement:
+                                raise DispositionsError("Published task path repair verification failed")
+                    finally:
+                        if verify_dir is not task_dir:
+                            verify_dir.close()
                 if manifest is not None:
                     task_dir.write("manifest.json", json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         if output:

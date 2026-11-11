@@ -431,71 +431,150 @@ import os
 import stat
 import subprocess
 import sys
+import time
 
-target_dir = sys.argv[1]
-proc = subprocess.run(
-    ["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
-    stdout=subprocess.PIPE,
-    check=True,
-    cwd=target_dir,
-)
+def main():
+    max_bytes = int(os.environ.get("HERMETIC_MAX_LS_TREE_BYTES", 64 * 1024 * 1024))
+    max_entries = int(os.environ.get("HERMETIC_MAX_LS_TREE_ENTRIES", 500000))
+    timeout_sec = float(os.environ.get("HERMETIC_LS_TREE_TIMEOUT", 30.0))
 
-root_fd = os.open(target_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-try:
-    for entry in proc.stdout.split(b"\0"):
-        if not entry:
-            continue
-        try:
-            meta, path_bytes = entry.split(b"\t", 1)
-            mode = meta.split(b" ")[0]
-        except ValueError:
-            continue
+    target_dir = sys.argv[1]
+    proc = subprocess.Popen(
+        ["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+        stdout=subprocess.PIPE,
+        cwd=target_dir,
+    )
 
-        if mode == b"100644":
-            target_mode = 0o644
-        elif mode == b"100755":
-            target_mode = 0o755
-        else:
-            continue
+    root_fd = os.open(target_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        total_bytes = 0
+        total_entries = 0
+        buffer = bytearray()
+        deadline = time.monotonic() + timeout_sec
 
-        parts = [p for p in path_bytes.split(b"/") if p and p != b"."]
-        if not parts or any(p == b".." for p in parts):
-            continue
+        def read_more():
+            nonlocal total_bytes
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.wait()
+                raise SystemExit("git ls-tree timeout exceeded")
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                return False
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                proc.kill()
+                proc.wait()
+                raise SystemExit("git ls-tree output byte cap exceeded")
+            buffer.extend(chunk)
+            return True
 
-        curr_fd = root_fd
-        close_curr = False
-        skip = False
+        while True:
+            pos = buffer.find(b"\0")
+            if pos == -1:
+                if not read_more():
+                    if buffer:
+                        entry = bytes(buffer)
+                        buffer.clear()
+                    else:
+                        break
+                else:
+                    continue
+            else:
+                entry = bytes(buffer[:pos])
+                del buffer[:pos + 1]
 
-        for part in parts[:-1]:
+            if not entry:
+                continue
+
+            total_entries += 1
+            if total_entries > max_entries:
+                proc.kill()
+                proc.wait()
+                raise SystemExit("git ls-tree entry count cap exceeded")
+
             try:
-                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=curr_fd)
-            except OSError:
-                skip = True
-                break
+                meta, path_bytes = entry.split(b"\t", 1)
+                mode = meta.split(b" ")[0]
+            except ValueError:
+                continue
+
+            if mode == b"100644":
+                target_mode = 0o644
+            elif mode == b"100755":
+                target_mode = 0o755
+            else:
+                continue
+
+            parts = [p for p in path_bytes.split(b"/") if p and p != b"."]
+            if not parts or any(p == b".." for p in parts):
+                continue
+
+            curr_fd = root_fd
+            close_curr = False
+            skip = False
+
+            for part in parts[:-1]:
+                try:
+                    dir_info = os.stat(part, dir_fd=curr_fd, follow_symlinks=False)
+                except OSError:
+                    skip = True
+                    break
+                if not stat.S_ISDIR(dir_info.st_mode) or stat.S_ISLNK(dir_info.st_mode):
+                    skip = True
+                    break
+                try:
+                    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=curr_fd)
+                    st = os.fstat(next_fd)
+                    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (dir_info.st_dev, dir_info.st_ino):
+                        os.close(next_fd)
+                        skip = True
+                        break
+                except OSError:
+                    skip = True
+                    break
+                if close_curr:
+                    os.close(curr_fd)
+                curr_fd = next_fd
+                close_curr = True
+
+            if not skip:
+                file_name = parts[-1]
+                try:
+                    info = os.stat(file_name, dir_fd=curr_fd, follow_symlinks=False)
+                except OSError:
+                    skip = True
+                if not skip and stat.S_ISREG(info.st_mode):
+                    try:
+                        file_fd = os.open(file_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=curr_fd)
+                        try:
+                            st = os.fstat(file_fd)
+                            if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == (info.st_dev, info.st_ino):
+                                os.fchmod(file_fd, target_mode)
+                        finally:
+                            os.close(file_fd)
+                    except OSError:
+                        pass
+
             if close_curr:
                 os.close(curr_fd)
-            curr_fd = next_fd
-            close_curr = True
 
-        if not skip:
-            file_name = parts[-1]
-            try:
-                file_fd = os.open(file_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=curr_fd)
-                try:
-                    st = os.fstat(file_fd)
-                    if stat.S_ISREG(st.st_mode):
-                        os.fchmod(file_fd, target_mode)
-                finally:
-                    os.close(file_fd)
-            except OSError:
-                pass
+        ret = proc.wait()
+        if ret != 0:
+            raise SystemExit(f"git ls-tree failed with code {ret}")
+    finally:
+        try:
+            proc.kill()
+            proc.wait()
+        except OSError:
+            pass
+        os.close(root_fd)
 
-        if close_curr:
-            os.close(curr_fd)
-finally:
-    os.close(root_fd)
+    subprocess.run(["git", "update-index", "-q", "--refresh"], cwd=target_dir, check=False)
 
-subprocess.run(["git", "update-index", "-q", "--refresh"], cwd=target_dir, check=False)
+if __name__ == "__main__":
+    main()
 PY_EOF
 """
 

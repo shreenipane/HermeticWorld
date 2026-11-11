@@ -368,6 +368,21 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             all_findings.extend(oci_findings);
         }
 
+        let mut not_covered = Vec::new();
+        for f in &all_findings {
+            let is_inc = f.channel == "binary_skipped"
+                || f.channel == "task_file_skipped"
+                || f.channel == "baseline_incomplete"
+                || f.channel == "skipped_symlink"
+                || f.channel == "container_skipped"
+                || f.channel == "scan_error"
+                || (f.severity != Severity::Gate
+                    && f.evidence.iter().any(|e| e.contains("skipped")));
+            if is_inc && !not_covered.contains(&f.detector) {
+                not_covered.push(f.detector.clone());
+            }
+        }
+
         write_report(
             all_findings,
             Some(&fp),
@@ -375,7 +390,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             args.format,
             args.out,
             None,
-            Vec::new(),
+            not_covered,
         )
     }
 }

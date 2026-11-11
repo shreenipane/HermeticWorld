@@ -517,7 +517,7 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
             if bytes[..check_len].contains(&0) {
                 self.push(Finding {
                     detector: "D2".into(),
-                    channel: "file".into(),
+                    channel: "binary_skipped".into(),
                     path: path.to_string(),
                     visibility: self.opts.visibility,
                     severity: Severity::Info,
