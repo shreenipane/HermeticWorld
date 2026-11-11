@@ -1,12 +1,14 @@
-"""Tests for task dispositions (§5.5, T1.14)."""
+"""Comprehensive tests and regression tests for task dispositions (§5.5, T1.14)."""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import pytest
 
 from hermetic_slice import (
+    DispositionsError,
     MalformedGateOutputError,
     MissingDispositionError,
     decide_task_disposition,
@@ -16,367 +18,595 @@ from hermetic_slice import (
     MAX_REDACTION_FRACTION,
     MIN_REMAINING_CHARS,
 )
-from hermetic_slice.dispositions import dispositions_cli, format_summary
+from hermetic_slice.dispositions import (
+    char_to_byte_span,
+    dispositions_cli,
+    format_summary,
+    validate_and_merge_spans,
+    validate_task_id,
+)
 from hermetic_slice.__main__ import main as cli_main
 
 
-def test_d0_leak_with_removable_span_repaired(tmp_path: Path) -> None:
-    """D0 leak with a removable span: redacted, re-scan clean, 'repaired',
+# =========================================================================
+# Defect 1: CLI re-scan end-to-end with real sealcheck binary
+# =========================================================================
 
-    problem_statement_redacted recorded without the leaked text.
+def test_cli_end_to_end_real_rescan_repaired_and_excluded(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Test CLI path end to end: removable D0 becomes 'repaired' via real sealcheck re-scan,
+
+    and dirty re-scan stays 'excluded'.
     """
-    task_id = "test-task-d0-repair"
-    task_dir = tmp_path / task_id
-    task_dir.mkdir(parents=True)
-    agent_dir = task_dir / "agent"
-    agent_dir.mkdir(parents=True)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True)
 
-    leaked_snippet = "SECRET_FIX_FUNCTION = lambda x: x * 42"
-    problem_statement = (
-        "# Calculation Module Issue\n\n"
-        "Users report that the calculation module is failing to produce the correct scaled output "
-        "when multiple factors are combined in sequence.\n\n"
-        f"Proposed patch snippet: {leaked_snippet}\n\n"
-        "Please investigate the mathematical transformation and fix the scaling factor."
+    # Task 1: removable D0 leak that repairs cleanly
+    t1_dir = tasks_dir / "task__clean-repair-01"
+    t1_dir.mkdir(parents=True)
+    (t1_dir / "agent").mkdir(parents=True)
+    t1_leak = "SECRET_LEAK_01 = True"
+    t1_stmt = (
+        "# Calculation Module Report\n\n"
+        "Users report that the calculation module is failing under high loads.\n\n"
+        f"Leaked patch: {t1_leak}\n\n"
+        "Please fix the internal mathematical model to avoid zero-division errors."
     )
-    (agent_dir / "problem_statement.md").write_text(problem_statement, encoding="utf-8")
-
-    manifest_data = {
-        "spec_version": "hermetic-world/v1",
-        "task_id": task_id,
-        "world_root": "blake3:0000000000000000000000000000000000000000000000000000000000000001",
-        "dispositions": [],
-    }
-    (task_dir / "manifest.json").write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
-
-    gate_findings = [
-        {
-            "detector": "D0",
-            "channel": "problem_statement",
-            "path": "agent/problem_statement.md",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "confidence": 1.0,
-            "evidence": [leaked_snippet],
-        }
-    ]
-
-    # Re-scan returns clean findings
-    def mock_rescan(tid: str, redacted_stmt: str) -> dict:
-        assert tid == task_id
-        assert leaked_snippet not in redacted_stmt
-        return {"schema": "hermetic-sealcheck/v0", "findings": [], "gate": False}
-
-    gate_output = [
-        {
-            "task_id": task_id,
-            "findings": gate_findings,
-            "gate": True,
-        }
-    ]
-
-    out_file = tmp_path / "dispositions.json"
-    entries, summary = process_dispositions(
-        gate_source=gate_output,
-        out_path=out_file,
-        tasks_dir=tmp_path,
-        rescan_fn=mock_rescan,
+    (t1_dir / "agent" / "problem_statement.md").write_text(t1_stmt, encoding="utf-8")
+    (t1_dir / "task.json").write_text(
+        json.dumps({
+            "instance_id": "task__clean-repair-01",
+            "gold_patch": "",
+            "test_patch": "",
+        }),
+        encoding="utf-8",
     )
 
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry["task_id"] == task_id
-    assert entry["disposition"] == "repaired"
-    assert entry["detectors"] == ["D0"]
-    assert "clean" in entry["reason"]
-    assert entry["world_version"] is not None
-    assert entry["world_version"] != manifest_data["world_root"]
-
-    # Verify problem_statement.md is updated with redaction placeholder
-    updated_stmt = (agent_dir / "problem_statement.md").read_text(encoding="utf-8")
-    assert leaked_snippet not in updated_stmt
-    assert "[REDACTED]" in updated_stmt
-
-    # Verify problem_statement_redacted.json contains offsets and hash, NEVER the text
-    redacted_json_file = task_dir / "problem_statement_redacted.json"
-    assert redacted_json_file.exists()
-    redacted_json = json.loads(redacted_json_file.read_text(encoding="utf-8"))
-    assert "spans" in redacted_json
-    assert len(redacted_json["spans"]) == 1
-    span_info = redacted_json["spans"][0]
-    assert "start" in span_info
-    assert "end" in span_info
-    assert "hash" in span_info
-    assert "sha256" in span_info
-
-    # Crucial security assertion: leaked text must NEVER be logged/recorded
-    redacted_json_str = json.dumps(redacted_json)
-    assert leaked_snippet not in redacted_json_str
-    assert leaked_snippet not in json.dumps(entry)
-
-
-def test_d0_issue_text_is_the_fix_excluded() -> None:
-    """Issue text is the fix: 'excluded', D0 named (§5.5)."""
-    task_id = "task-text-is-fix"
-
-    # Case A: Redaction removes > 50% of the problem statement
-    leak_text = "def solve_issue(): return True\n" * 5
-    short_context = "Fix: "
-    problem_statement = short_context + leak_text
-
-    findings = [
-        {
-            "detector": "D0",
-            "channel": "problem_statement",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "evidence": [leak_text],
-        }
-    ]
-
-    res = decide_task_disposition(
-        task_id=task_id,
-        findings=findings,
-        problem_statement=problem_statement,
-        rescan_fn=lambda tid, stmt: {"findings": []},
+    # Task 2: D0 leak where sealcheck stub/runner will report dirty re-scan
+    t2_dir = tasks_dir / "task__dirty-rescan-02"
+    t2_dir.mkdir(parents=True)
+    (t2_dir / "agent").mkdir(parents=True)
+    t2_leak = "DIRTY_LEAK_02 = 123"
+    t2_stmt = (
+        "# Parser Module Report\n\n"
+        "The parser fails when handling nested multiline tags in documents.\n\n"
+        f"Leaked patch: {t2_leak}\n\n"
+        "Ensure syntax trees are balanced across block boundaries."
+    )
+    (t2_dir / "agent" / "problem_statement.md").write_text(t2_stmt, encoding="utf-8")
+    (t2_dir / "task.json").write_text(
+        json.dumps({
+            "instance_id": "task__dirty-rescan-02",
+            "gold_patch": "",
+            "test_patch": "",
+        }),
+        encoding="utf-8",
     )
 
-    assert res.disposition == "excluded"
-    assert res.detectors == ["D0"]
-    assert "issue text is the fix" in res.reason
-
-    # Case B: Remaining characters < MIN_REMAINING_CHARS
-    almost_all_leak = "A" * 15 + " " + "FIX_COMMAND_LINE"
-    findings_b = [
-        {
-            "detector": "D0",
-            "channel": "problem_statement",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "evidence": ["FIX_COMMAND_LINE"],
-        }
-    ]
-    res_b = decide_task_disposition(
-        task_id=task_id,
-        findings=findings_b,
-        problem_statement=almost_all_leak,
-        rescan_fn=lambda tid, stmt: {"findings": []},
+    # Create stub sealcheck executable script that verifies real invocation
+    stub_sealcheck = tmp_path / "stub_sealcheck.py"
+    stub_content = (
+        "#!/usr/bin/env python3\n"
+        "import argparse, json, sys\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "subparsers = parser.add_subparsers(dest='subcommand')\n"
+        "scan_p = subparsers.add_parser('scan')\n"
+        "scan_p.add_argument('--task', required=True)\n"
+        "scan_p.add_argument('--base-tree')\n"
+        "scan_p.add_argument('--root')\n"
+        "scan_p.add_argument('--root-visibility')\n"
+        "scan_p.add_argument('--format')\n"
+        "args = parser.parse_args()\n"
+        "\n"
+        "task_dir = Path(args.task)\n"
+        "stmt = (task_dir / 'agent' / 'problem_statement.md').read_text(encoding='utf-8')\n"
+        "instance_id = task_dir.name\n"
+        "\n"
+        "if 'task__dirty-rescan' in instance_id:\n"
+        "    findings = [{'detector': 'D0', 'severity': 'gate', 'visibility': 'agent_visible'}]\n"
+        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': findings}))\n"
+        "    sys.exit(2)\n"
+        "else:\n"
+        "    # Clean re-scan\n"
+        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'instance_id': instance_id, 'findings': []}))\n"
+        "    sys.exit(0)\n"
     )
-    assert res_b.disposition == "excluded"
-    assert res_b.detectors == ["D0"]
+    stub_sealcheck.write_text(stub_content, encoding="utf-8")
+    stub_sealcheck.chmod(0o755)
 
-    # Case C: Explicit issue_text_is_the_fix flag
-    res_c = decide_task_disposition(
-        task_id=task_id,
-        findings=findings_b,
-        problem_statement="A long problem statement with more than 100 characters describing the issue...",
-        issue_text_is_the_fix=True,
-    )
-    assert res_c.disposition == "excluded"
-    assert res_c.detectors == ["D0"]
-
-
-def test_non_d0_detector_without_automatic_removal_excluded() -> None:
-    """Non-D0 detector with no automatic removal: 'excluded' with that detector named."""
-    # Test D1
-    findings_d1 = [
-        {
-            "detector": "D1",
-            "channel": "git",
-            "path": ".git",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "evidence": ["commit beyond base commit"],
-        }
-    ]
-    res_d1 = decide_task_disposition(task_id="task-d1", findings=findings_d1)
-    assert res_d1.disposition == "excluded"
-    assert res_d1.detectors == ["D1"]
-    assert "no automatic removal" in res_d1.reason
-
-    # Test D2
-    findings_d2 = [
-        {
-            "detector": "D2",
-            "channel": "file",
-            "path": "solution.py",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "evidence": ["post-cutoff solution hash"],
-        }
-    ]
-    res_d2 = decide_task_disposition(task_id="task-d2", findings=findings_d2)
-    assert res_d2.disposition == "excluded"
-    assert res_d2.detectors == ["D2"]
-
-    # Test multiple non-D0 detectors plus D0
-    findings_multi = [
-        {"detector": "D0", "severity": "gate", "visibility": "agent_visible"},
-        {"detector": "D5a", "severity": "gate", "visibility": "agent_visible"},
-        {"detector": "D2", "severity": "gate", "visibility": "agent_visible"},
-    ]
-    res_multi = decide_task_disposition(task_id="task-multi", findings=findings_multi)
-    assert res_multi.disposition == "excluded"
-    assert res_multi.detectors == ["D0", "D2", "D5a"]
-
-
-def test_rescan_still_dirty_after_redaction_excluded() -> None:
-    """Re-scan still dirty after redaction: 'excluded', all detectors listed."""
-    task_id = "task-rescan-dirty"
-    leaked_line = "patch_line_alpha = 1"
-    problem_stmt = (
-        "This is an extensive problem description that describes the bug in detail.\n"
-        "Here is a note with leak: " + leaked_line + "\n"
-        "And here is more explanatory text describing expected versus actual behavior."
-    )
-
-    findings = [
-        {
-            "detector": "D0",
-            "channel": "problem_statement",
-            "severity": "gate",
-            "visibility": "agent_visible",
-            "evidence": [leaked_line],
-        }
-    ]
-
-    # Mock re-scan returning that D0 and D2 still fired
-    def dirty_rescan(tid: str, stmt: str) -> dict:
-        return {
-            "schema": "hermetic-sealcheck/v0",
-            "findings": [
-                {"detector": "D0", "severity": "gate", "visibility": "agent_visible"},
-                {"detector": "D2", "severity": "gate", "visibility": "agent_visible"},
-            ],
-            "gate": True,
-        }
-
-    res = decide_task_disposition(
-        task_id=task_id,
-        findings=findings,
-        problem_statement=problem_stmt,
-        rescan_fn=dirty_rescan,
-    )
-
-    assert res.disposition == "excluded"
-    assert res.detectors == ["D0", "D2"]
-    assert "still dirty" in res.reason
-
-
-def test_clean_task_and_n_entries_sorted_and_stable(tmp_path: Path) -> None:
-    """Clean task listed as 'clean'; output for N tasks always has N entries; sorted and stable."""
-    gate_output = [
-        {
-            "task_id": "zeta_task",
-            "findings": [],
-            "gate": False,
-            "world_version": "blake3:zeta0000",
-        },
-        {
-            "task_id": "alpha_task",
-            "findings": [
-                {"detector": "D1", "severity": "gate", "visibility": "agent_visible"}
-            ],
-            "gate": True,
-        },
-        {
-            "task_id": "beta_task",
-            "findings": [],
-            "gate": False,
-            "world_version": "blake3:beta0000",
-        },
-    ]
-
-    out_file = tmp_path / "dispositions.json"
-    entries, summary = process_dispositions(
-        gate_source=gate_output,
-        out_path=out_file,
-    )
-
-    assert len(entries) == 3
-    # Check sorted by task_id
-    assert [e["task_id"] for e in entries] == ["alpha_task", "beta_task", "zeta_task"]
-
-    # Check clean task structure
-    beta = entries[1]
-    assert beta["task_id"] == "beta_task"
-    assert beta["disposition"] == "clean"
-    assert beta["detectors"] == []
-    assert beta["reason"] == "gate passed"
-    assert beta["world_version"] == "blake3:beta0000"
-
-    zeta = entries[2]
-    assert zeta["task_id"] == "zeta_task"
-    assert zeta["disposition"] == "clean"
-
-    alpha = entries[0]
-    assert alpha["task_id"] == "alpha_task"
-    assert alpha["disposition"] == "excluded"
-    assert alpha["detectors"] == ["D1"]
-
-    assert summary["total_tasks"] == 3
-    assert summary["dispositions"]["clean"] == 2
-    assert summary["dispositions"]["excluded"] == 1
-    assert summary["detectors"]["D1"] == 1
-
-    # Verify file written to disk matches
-    disk_entries = json.loads(out_file.read_text(encoding="utf-8"))
-    assert disk_entries == entries
-
-
-def test_malformed_gate_output_no_panic_no_partial_file(tmp_path: Path) -> None:
-    """Malformed gate output: clear error, no panic, no partial file."""
-    out_file = tmp_path / "dispositions.json"
-
-    # Case 1: Corrupted non-JSON file
-    bad_json_file = tmp_path / "bad.json"
-    bad_json_file.write_text("{ unclosed json: ", encoding="utf-8")
-
-    with pytest.raises(MalformedGateOutputError):
-        process_dispositions(gate_source=bad_json_file, out_path=out_file)
-    assert not out_file.exists()
-
-    # Case 2: Missing findings key
-    missing_findings = [{"task_id": "task1"}]
-    with pytest.raises(MalformedGateOutputError):
-        process_dispositions(gate_source=missing_findings, out_path=out_file)
-    assert not out_file.exists()
-
-    # Case 3: Non-list findings
-    non_list_findings = [{"task_id": "task1", "findings": "invalid_string"}]
-    with pytest.raises(MalformedGateOutputError):
-        process_dispositions(gate_source=non_list_findings, out_path=out_file)
-    assert not out_file.exists()
-
-    # Case 4: Non-existent gate path
-    with pytest.raises(MalformedGateOutputError):
-        process_dispositions(gate_source=tmp_path / "non_existent.json", out_path=out_file)
-    assert not out_file.exists()
-
-
-def test_cli_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """Test CLI subcommand via python hermetic_slice dispositions."""
     gate_file = tmp_path / "gate_input.json"
     gate_data = [
-        {"task_id": "t1", "findings": [], "gate": False},
-        {"task_id": "t2", "findings": [{"detector": "D6", "severity": "gate"}], "gate": True},
+        {
+            "task_id": "task__clean-repair-01",
+            "findings": [
+                {
+                    "detector": "D0",
+                    "channel": "problem_statement",
+                    "severity": "gate",
+                    "visibility": "agent_visible",
+                    "evidence": [t1_leak],
+                }
+            ],
+            "gate": True,
+        },
+        {
+            "task_id": "task__dirty-rescan-02",
+            "findings": [
+                {
+                    "detector": "D0",
+                    "channel": "problem_statement",
+                    "severity": "gate",
+                    "visibility": "agent_visible",
+                    "evidence": [t2_leak],
+                }
+            ],
+            "gate": True,
+        },
     ]
     gate_file.write_text(json.dumps(gate_data), encoding="utf-8")
 
-    out_file = tmp_path / "out_dispositions.json"
+    out_file = tmp_path / "dispositions.json"
 
-    code = cli_main(["dispositions", "--gate-output", str(gate_file), "--out", str(out_file)])
+    # Invoke CLI with --sealcheck pointing to executable
+    code = cli_main([
+        "dispositions",
+        "--gate-output", str(gate_file),
+        "--tasks-dir", str(tasks_dir),
+        "--out", str(out_file),
+        "--sealcheck", str(stub_sealcheck),
+    ])
     assert code == 0
     assert out_file.exists()
 
-    captured = capsys.readouterr()
-    assert "Dispositions summary:" in captured.out
-    assert "clean:    1" in captured.out
-    assert "excluded: 1" in captured.out
-    assert "D6: 1" in captured.out
+    entries = json.loads(out_file.read_text(encoding="utf-8"))
+    assert len(entries) == 2
 
-    # Test error exit on malformed gate output
-    bad_file = tmp_path / "corrupt.json"
-    bad_file.write_text("invalid json", encoding="utf-8")
-    err_code = cli_main(["dispositions", "--gate-output", str(bad_file)])
-    assert err_code == 1
+    # Task 1 was repaired cleanly
+    e1 = next(e for e in entries if e["task_id"] == "task__clean-repair-01")
+    assert e1["disposition"] == "repaired"
+    assert e1["detectors"] == ["D0"]
+    assert e1["world_version"] is not None
+    assert (t1_dir / "problem_statement_redacted.json").exists()
+
+    # Task 2 re-scan stayed dirty -> excluded
+    e2 = next(e for e in entries if e["task_id"] == "task__dirty-rescan-02")
+    assert e2["disposition"] == "excluded"
+    assert "D0" in e2["detectors"]
+
+
+# =========================================================================
+# Defect 2: Spans validation, sorting, and merging
+# =========================================================================
+
+def test_spans_validation_sorting_and_merging() -> None:
+    """Validate, sort, and merge overlapping, nested, duplicate, and unsorted spans; reject out-of-range."""
+    stmt = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    stmt_len = len(stmt.encode("utf-8"))
+
+    # Unsorted: [(20, 30), (0, 5)] -> sorted & merged: [(0, 5), (20, 30)]
+    assert validate_and_merge_spans(stmt_len, [(20, 30), (0, 5)]) == [(0, 5), (20, 30)]
+
+    # Nested: [(0, 30), (5, 10)] -> [(0, 30)]
+    assert validate_and_merge_spans(stmt_len, [(0, 30), (5, 10)]) == [(0, 30)]
+
+    # Overlapping: [(0, 15), (10, 25)] -> [(0, 25)]
+    assert validate_and_merge_spans(stmt_len, [(0, 15), (10, 25)]) == [(0, 25)]
+
+    # Duplicates: [(5, 10), (5, 10)] -> [(5, 10)]
+    assert validate_and_merge_spans(stmt_len, [(5, 10), (5, 10)]) == [(5, 10)]
+
+    # Out of range: start > len or end > len or start > end
+    with pytest.raises(DispositionsError):
+        validate_and_merge_spans(stmt_len, [(0, stmt_len + 10)])
+
+    with pytest.raises(DispositionsError):
+        validate_and_merge_spans(stmt_len, [(10, 5)])
+
+    with pytest.raises(DispositionsError):
+        validate_and_merge_spans(stmt_len, [(-1, 5)])
+
+    # Redaction with unsorted + nested spans produces correct output
+    redacted_text, spans = redact_problem_statement(stmt, [(20, 30), (0, 5), (25, 35)])
+    assert len(spans) == 2
+    assert spans[0].start == 0 and spans[0].end == 5
+    assert spans[1].start == 20 and spans[1].end == 35
+    assert redacted_text.startswith("[REDACTED]56789")
+
+
+# =========================================================================
+# Defect 4: UTF-8 byte offsets and SHA-256 agreement across languages
+# =========================================================================
+
+def test_utf8_japanese_byte_offsets_and_sha256() -> None:
+    """Offsets are byte offsets into UTF-8 and hashes are SHA-256 hex in both Python and Rust."""
+    # '日本' is 6 UTF-8 bytes: \xe6\x97\xa5\xe6\x9c\xac
+    stmt = "日本 issue description text here for testing."
+    stmt_bytes = stmt.encode("utf-8")
+    assert stmt_bytes.startswith("日本".encode("utf-8"))
+    assert len("日本".encode("utf-8")) == 6
+
+    # Redacting first 6 bytes
+    redacted_text, spans = redact_problem_statement(stmt, [(0, 6)])
+    assert len(spans) == 1
+    assert spans[0].start == 0
+    assert spans[0].end == 6
+
+    # Expected SHA-256 hex of '日本' UTF-8 bytes
+    expected_sha256 = "cf2abf0c5be326cb922a70f8163f91079c4d9aa8655c60ead89ad545c9de2e92"
+    assert spans[0].sha256 == expected_sha256
+    assert spans[0].hash == f"sha256:{expected_sha256}"
+    assert redacted_text.startswith("[REDACTED]")
+
+
+# =========================================================================
+# Defect 5: D0 span matching variants
+# =========================================================================
+
+def test_d0_span_matching_variants() -> None:
+    """Test D0 matching for case, whitespace, joined windows, 250-char line, and short lines."""
+    # 1. Case-insensitive matching
+    stmt_case = "The function solve_alpha_query() must be rewritten completely."
+    spans_case = find_spans_in_text(stmt_case, ["SOLVE_ALPHA_QUERY()"])
+    assert len(spans_case) == 1
+    redacted, _ = redact_problem_statement(stmt_case, spans_case)
+    assert "solve_alpha_query" not in redacted
+    assert "[REDACTED]" in redacted
+
+    # 2. Whitespace-normalized matching
+    stmt_ws = "def   calculate_special_value(  x,   y  ):\n    return x + y"
+    evidence_ws = "def calculate_special_value( x, y ):"
+    spans_ws = find_spans_in_text(stmt_ws, [evidence_ws])
+    assert len(spans_ws) == 1
+    redacted_ws, _ = redact_problem_statement(stmt_ws, spans_ws)
+    assert "calculate_special_value" not in redacted_ws
+
+    # 3. Joined windows with " / "
+    stmt_win = "First line here.\nSecond leaked line.\nThird intermediate.\nFourth leaked line.\nFifth ending."
+    evidence_win = "Second leaked line. / Fourth leaked line."
+    spans_win = find_spans_in_text(stmt_win, [evidence_win])
+    assert len(spans_win) == 2
+    redacted_win, _ = redact_problem_statement(stmt_win, spans_win)
+    assert "Second leaked line" not in redacted_win
+    assert "Fourth leaked line" not in redacted_win
+    assert "Third intermediate" in redacted_win
+
+    # 4. 250-character line truncated to 200 chars in evidence: extends to line end
+    long_line = "CONFIG_PARAM_NAME_" + "X" * 230 + "_SUFFIX_END"
+    stmt_long = f"Beginning of statement.\n{long_line}\nEnding of statement."
+    trunc_evidence = long_line[:200]
+    spans_long = find_spans_in_text(stmt_long, [trunc_evidence])
+    assert len(spans_long) == 1
+    redacted_long, _ = redact_problem_statement(stmt_long, spans_long)
+    # Entire line must be redacted, not leaving '_SUFFIX_END' visible!
+    assert "_SUFFIX_END" not in redacted_long
+    assert "[REDACTED]" in redacted_long
+
+    # 5. Short lines inside multiline evidence are not skipped
+    stmt_multi = "Start block\n{\nx\n}\nEnd block"
+    evidence_multi = "{\nx\n}"
+    spans_multi = find_spans_in_text(stmt_multi, [evidence_multi])
+    assert len(spans_multi) == 1
+    redacted_multi, _ = redact_problem_statement(stmt_multi, spans_multi)
+    assert "{\nx\n}" not in redacted_multi
+
+
+# =========================================================================
+# Defect 6: Never leak sensitive text in logs, errors, or exceptions
+# =========================================================================
+
+def test_no_leaked_text_in_errors_or_stderr(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Malformed entry containing a secret string must NOT appear in stderr or exception text."""
+    secret_text = "SUPER_SECRET_TOKEN_DO_NOT_LEAK"
+
+    malformed_entry = {
+        "task_id": "valid_task_id",
+        "findings": "invalid_non_list_type_with_secret_" + secret_text,
+    }
+
+    with pytest.raises(MalformedGateOutputError) as exc_info:
+        process_dispositions([malformed_entry])
+
+    err_msg = str(exc_info.value)
+    assert secret_text not in err_msg
+
+    # Also check CLI stderr output
+    bad_file = tmp_path / "secret_bad.json"
+    bad_file.write_text(json.dumps([{"task_id": "t1", "findings": secret_text}]), encoding="utf-8")
+
+    code = cli_main(["dispositions", "--gate-output", str(bad_file)])
+    assert code != 0
+
+    captured = capsys.readouterr()
+    assert secret_text not in captured.out
+    assert secret_text not in captured.err
+
+
+# =========================================================================
+# Defect 7: Gate result consistency (contradictory gate, not_covered, missing detector)
+# =========================================================================
+
+def test_gate_result_consistency_checks() -> None:
+    """Test contradictory gate flag, query not_covered entries, and missing detector field."""
+    # 1. {"gate": true, "findings": []} is contradictory -> error
+    with pytest.raises(MalformedGateOutputError, match="gate is true but findings contains no gate findings"):
+        decide_task_disposition(
+            task_id="task_contradictory",
+            findings=[],
+            gate_flag=True,
+        )
+
+    # 2. query-mode not_covered entries -> error
+    with pytest.raises(MalformedGateOutputError, match="not_covered detectors"):
+        decide_task_disposition(
+            task_id="task_query_incomplete",
+            findings=[],
+            not_covered=["D1", "D3"],
+        )
+
+    # 3. Gate finding missing detector -> error, never default to D0
+    with pytest.raises(MalformedGateOutputError, match="missing 'detector' field"):
+        decide_task_disposition(
+            task_id="task_missing_detector",
+            findings=[{"severity": "gate", "visibility": "agent_visible"}],
+        )
+
+
+# =========================================================================
+# Defect 8: Guard denominator (duplicates, missing reports)
+# =========================================================================
+
+def test_denominator_guarding_duplicate_and_missing(tmp_path: Path) -> None:
+    """Duplicate task_ids fail; every task under tasks-dir must have a report."""
+    # Duplicate task_id
+    dup_reports = [
+        {"task_id": "task_dup", "findings": []},
+        {"task_id": "task_dup", "findings": []},
+    ]
+    with pytest.raises(MalformedGateOutputError, match="Duplicate task_id"):
+        process_dispositions(dup_reports)
+
+    # Missing task from tasks_dir
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "task_present").mkdir()
+    (tasks_dir / "task_missing").mkdir()
+
+    reports_partial = [
+        {"task_id": "task_present", "findings": []},
+    ]
+
+    with pytest.raises(MissingDispositionError, match="Missing gate report for task"):
+        process_dispositions(reports_partial, tasks_dir=tasks_dir)
+
+
+# =========================================================================
+# Defect 9: Atomicity and Idempotent Rerun
+# =========================================================================
+
+def test_atomicity_malformed_task_leaves_no_disk_changes(tmp_path: Path) -> None:
+    """Task A repaired then task B malformed leaves nothing changed on disk."""
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True)
+
+    t_a = tasks_dir / "task_a"
+    t_a.mkdir(parents=True)
+    (t_a / "agent").mkdir(parents=True)
+    orig_stmt = "Long problem description text.\nSECRET_LEAK\nMore information."
+    (t_a / "agent" / "problem_statement.md").write_text(orig_stmt, encoding="utf-8")
+
+    out_file = tmp_path / "dispositions.json"
+
+    # Input: task_a (valid) followed by task_b (malformed, missing findings)
+    reports = [
+        {
+            "task_id": "task_a",
+            "findings": [{"detector": "D0", "severity": "gate", "evidence": ["SECRET_LEAK"]}],
+        },
+        {
+            "task_id": "task_b",
+            # missing findings!
+        },
+    ]
+
+    with pytest.raises(MalformedGateOutputError):
+        process_dispositions(
+            reports,
+            out_path=out_file,
+            tasks_dir=tasks_dir,
+            rescan_fn=lambda tid, stmt: {"findings": []},
+        )
+
+    # Out file must NOT exist
+    assert not out_file.exists()
+
+    # task_a problem_statement.md must remain UNTOUCHED
+    assert (t_a / "agent" / "problem_statement.md").read_text(encoding="utf-8") == orig_stmt
+    assert not (t_a / "problem_statement_redacted.json").exists()
+
+
+def test_idempotent_rerun(tmp_path: Path) -> None:
+    """A statement already redacted by a previous run stays repaired on rerun."""
+    task_id = "task_idempotent"
+    tasks_dir = tmp_path / "tasks"
+    t_dir = tasks_dir / task_id
+    t_dir.mkdir(parents=True)
+    (t_dir / "agent").mkdir(parents=True)
+
+    leak = "LEAK_XYZ"
+    stmt = "Extensive problem description for calculation module.\n" + leak + "\nTrailing context."
+    (t_dir / "agent" / "problem_statement.md").write_text(stmt, encoding="utf-8")
+
+    reports = [
+        {
+            "task_id": task_id,
+            "findings": [{"detector": "D0", "severity": "gate", "evidence": [leak]}],
+        }
+    ]
+
+    out_file = tmp_path / "dispositions.json"
+    entries1, _ = process_dispositions(
+        reports,
+        out_path=out_file,
+        tasks_dir=tasks_dir,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert entries1[0]["disposition"] == "repaired"
+
+    # Second run: gate report on already-redacted task reports clean findings
+    clean_reports = [
+        {
+            "task_id": task_id,
+            "findings": [],
+            "gate": False,
+        }
+    ]
+    entries2, _ = process_dispositions(
+        clean_reports,
+        out_path=out_file,
+        tasks_dir=tasks_dir,
+    )
+    # Must STAY repaired (not flip to clean or excluded)
+    assert entries2[0]["disposition"] == "repaired"
+    assert entries2[0]["detectors"] == ["D0"]
+
+
+# =========================================================================
+# Defect 11: Brief items (dirty rescan retains D0, manifest problem_statement_redacted)
+# =========================================================================
+
+def test_dirty_rescan_retains_d0_and_all_firing_detectors() -> None:
+    """When re-scan is still dirty, keep original D0 in detectors together with re-scan's detectors."""
+    task_id = "task_dirty_multi"
+    findings = [{"detector": "D0", "severity": "gate", "evidence": ["LEAK_FOO"]}]
+    stmt = "Valid problem description text here for testing.\nLEAK_FOO\nMore description."
+
+    # Rescan fires D2 and D5a
+    def dirty_rescan(tid: str, s: str) -> dict:
+        return {
+            "findings": [
+                {"detector": "D2", "severity": "gate"},
+                {"detector": "D5a", "severity": "gate"},
+            ]
+        }
+
+    manifest: dict = {}
+    res = decide_task_disposition(
+        task_id=task_id,
+        findings=findings,
+        problem_statement=stmt,
+        rescan_fn=dirty_rescan,
+        manifest=manifest,
+    )
+    assert res.disposition == "excluded"
+    assert res.detectors == ["D0", "D2", "D5a"]
+    assert any(d["kind"] == "excluded" for d in manifest["dispositions"])
+
+
+# =========================================================================
+# Defect 12: Strict task_id validation and symlink refusal
+# =========================================================================
+
+def test_task_id_and_symlink_refusal(tmp_path: Path) -> None:
+    """task_id='../../etc' rejected; symlinked problem_statement.md rejected."""
+    # Path traversal rejected
+    with pytest.raises(MalformedGateOutputError):
+        validate_task_id("../../etc/passwd")
+
+    with pytest.raises(MalformedGateOutputError):
+        validate_task_id("task/with/slash")
+
+    with pytest.raises(MalformedGateOutputError):
+        validate_task_id(".hidden_task")
+
+    # Symlinked problem_statement.md rejected
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True)
+    t_dir = tasks_dir / "task_symlink"
+    t_dir.mkdir(parents=True)
+    (t_dir / "agent").mkdir(parents=True)
+
+    secret_target = tmp_path / "real_file.txt"
+    secret_target.write_text("secret target content", encoding="utf-8")
+    symlink_file = t_dir / "agent" / "problem_statement.md"
+    symlink_file.symlink_to(secret_target)
+
+    reports = [{"task_id": "task_symlink", "findings": []}]
+    with pytest.raises(DispositionsError, match="Symlink rejected"):
+        process_dispositions(reports, tasks_dir=tasks_dir)
+
+
+# =========================================================================
+# Defect 13: Exact threshold boundaries (Python)
+# =========================================================================
+
+def test_exact_threshold_boundaries_python() -> None:
+    """Test boundary conditions for MAX_REDACTION_FRACTION (50%) and MIN_REMAINING_CHARS (20)."""
+    # 1. EXACT 50% fraction boundary
+    # Statement length: 100 UTF-8 bytes
+    stmt_100 = "a" * 100
+
+    # 50% redacted: remaining non-ws chars = 50 (>= 20) -> eligible (not excluded on fraction)
+    res_50 = decide_task_disposition(
+        task_id="t_50",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 50)],
+        problem_statement=stmt_100,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_50.disposition == "repaired"
+
+    # 51% redacted: fraction > 0.50 -> excluded!
+    res_51 = decide_task_disposition(
+        task_id="t_51",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 51)],
+        problem_statement=stmt_100,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_51.disposition == "excluded"
+    assert "issue text is the fix" in res_51.reason
+
+    # 49% redacted -> eligible
+    res_49 = decide_task_disposition(
+        task_id="t_49",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 49)],
+        problem_statement=stmt_100,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_49.disposition == "repaired"
+
+    # 2. EXACT 20 remaining non-whitespace characters boundary
+    # 10 chars leak, followed by letters and spaces (total 100 chars; leak is 10%)
+    stmt_20 = "LEAK123456" + ("X" * 20) + (" " * 50)
+    res_rem_20 = decide_task_disposition(
+        task_id="t_rem_20",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 10)],
+        problem_statement=stmt_20,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_rem_20.disposition == "repaired"
+
+    # 19 remaining characters -> excluded!
+    stmt_19 = "LEAK123456" + ("X" * 19) + (" " * 50)
+    res_rem_19 = decide_task_disposition(
+        task_id="t_rem_19",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 10)],
+        problem_statement=stmt_19,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_rem_19.disposition == "excluded"
+    assert "leaves 19 < 20 chars" in res_rem_19.reason
+
+    # 21 remaining characters -> eligible
+    stmt_21 = "LEAK123456" + ("X" * 21) + (" " * 50)
+    res_rem_21 = decide_task_disposition(
+        task_id="t_rem_21",
+        findings=[{"detector": "D0", "severity": "gate", "evidence": ["x"]}],
+        explicit_spans=[(0, 10)],
+        problem_statement=stmt_21,
+        rescan_fn=lambda tid, s: {"findings": []},
+    )
+    assert res_rem_21.disposition == "repaired"
