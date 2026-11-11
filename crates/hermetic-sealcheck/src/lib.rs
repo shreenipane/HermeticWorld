@@ -40,8 +40,8 @@ pub use gitstore::{
     ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
 };
 pub use index::{
-    query_index, write_index, write_index_with_threshold, IndexError, IndexReader, IndexRecord,
-    IndexStats, NOT_COVERED,
+    merge_continuations, query_index, write_index, write_index_with_threshold, IndexError,
+    IndexReader, IndexRecord, IndexStats, MAX_UNIT_BYTES, NOT_COVERED,
 };
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};

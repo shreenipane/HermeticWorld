@@ -4,13 +4,13 @@
 //! task-independent facts. `query` matches one task's fingerprints against those records
 //! without reading the tree again.
 //!
-//! # File format (version 1)
+//! # File format (version 2)
 //!
 //! The file is one zstd stream. Decompressed, it holds:
 //!
 //! ```text
 //! magic           6 bytes   "HWIDX1"
-//! version         u32       1
+//! version         u32       2
 //! root            str       the indexed root, as `scan` would display it
 //! canonical_root  str       root canonicalized at index time ("" if failed)
 //! count           u64       number of records
@@ -45,6 +45,22 @@
 //! holding a character outside `[A-Za-z0-9_]` matches only a whole stored string, not a
 //! substring of a printable run, as `scan` would allow.
 //!
+//! # Continuation records and unit limits
+//!
+//! Records exceeding `MAX_RECORD_BYTES` are split into continuation records (`TextCont`,
+//! `BinaryCont`). When reading or querying, continuation records are merged into their
+//! predecessor. The total encoded hash bytes (8 per hash, summed over all sets) of one unit
+//! after merging cannot exceed `MAX_UNIT_BYTES` (1 GiB). Exceeding `MAX_UNIT_BYTES` while
+//! merging is `IndexError::Malformed`, checked before extending the sets.
+//!
+//! The writer never produces a unit exceeding `MAX_UNIT_BYTES`: when a Text or Binary unit's
+//! total hash bytes exceed `MAX_UNIT_BYTES`, its hashes are not written. Instead, a `Fixed`
+//! record (detector "D2", channel "index_skipped", severity Info, confidence 0.0, no hunk,
+//! evidence `["unit too large to index: N hashes"]`) is emitted for that path, so the query
+//! reports the gap instead of hiding it. Note that `scan` and `query` differ for such an
+//! oversized unit: `scan` scans the large unit in memory, whereas `query` reports the
+//! `index_skipped` Info finding.
+//!
 //! # Not covered by a query
 //!
 //! D1 (git stores), D3 (`.pyc` headers against source), D6 (OCI metadata), the D9
@@ -75,9 +91,11 @@ use crate::scan::{
 };
 
 pub const MAGIC: &[u8; 6] = b"HWIDX1";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The largest record payload the reader accepts.
 pub const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+/// The maximum encoded hash bytes of one unit after merging continuations (1 GiB).
+pub const MAX_UNIT_BYTES: u64 = 1024 * 1024 * 1024;
 /// The longest root path the reader accepts.
 pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 
@@ -324,10 +342,34 @@ pub struct IndexStats {
     pub files: u64,
 }
 
+/// Total count of hashes in a UnitHashes set.
+pub fn text_hash_count(hashes: &UnitHashes) -> usize {
+    hashes.line_hashes.len()
+        + hashes.window_hashes.len()
+        + hashes.removed_marker_hashes.len()
+        + hashes.diff_shape_hashes.len()
+        + hashes.winnow_hashes.len()
+}
+
+/// Total encoded hash bytes (8 per hash) in a UnitHashes set.
+pub fn text_hash_bytes(hashes: &UnitHashes) -> u64 {
+    (text_hash_count(hashes) as u64).saturating_mul(8)
+}
+
+/// Total count of hashes in a HashedBinaryStrings set.
+pub fn binary_hash_count(strings: &HashedBinaryStrings) -> usize {
+    strings.exact.len() + strings.tokens.len()
+}
+
+/// Total encoded hash bytes (8 per hash) in a HashedBinaryStrings set.
+pub fn binary_hash_bytes(strings: &HashedBinaryStrings) -> u64 {
+    (binary_hash_count(strings) as u64).saturating_mul(8)
+}
+
 /// Index `root` into the file `out`. The file is written to a temporary name beside `out`
 /// and renamed into place, so a failed run never leaves a partial index.
 pub fn write_index(root: &Path, out: &Path) -> Result<IndexStats, IndexError> {
-    write_index_with_threshold(root, out, MAX_RECORD_BYTES)
+    write_index_with_limits(root, out, MAX_RECORD_BYTES, MAX_UNIT_BYTES)
 }
 
 /// `write_index` with a configurable record split threshold (for testing).
@@ -335,6 +377,16 @@ pub fn write_index_with_threshold(
     root: &Path,
     out: &Path,
     max_record_bytes: u64,
+) -> Result<IndexStats, IndexError> {
+    write_index_with_limits(root, out, max_record_bytes, MAX_UNIT_BYTES)
+}
+
+/// `write_index` with configurable record threshold and unit limit (for testing).
+pub fn write_index_with_limits(
+    root: &Path,
+    out: &Path,
+    max_record_bytes: u64,
+    max_unit_bytes: u64,
 ) -> Result<IndexStats, IndexError> {
     let root_str = root
         .to_str()
@@ -368,6 +420,51 @@ pub fn write_index_with_threshold(
                 if matches!(r, IndexRecord::File { .. }) {
                     stats.files += 1;
                 }
+                let r = match r {
+                    IndexRecord::Text {
+                        ref path,
+                        ref hashes,
+                        ..
+                    } => {
+                        let count = text_hash_count(hashes);
+                        let bytes = (count as u64).saturating_mul(8);
+                        if bytes > max_unit_bytes {
+                            IndexRecord::Fixed(StoredFinding {
+                                detector: "D2".to_string(),
+                                channel: "index_skipped".to_string(),
+                                path: path.clone(),
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec![format!("unit too large to index: {count} hashes")],
+                            })
+                        } else {
+                            r
+                        }
+                    }
+                    IndexRecord::Binary {
+                        ref path,
+                        ref strings,
+                        ..
+                    } => {
+                        let count = binary_hash_count(strings);
+                        let bytes = (count as u64).saturating_mul(8);
+                        if bytes > max_unit_bytes {
+                            IndexRecord::Fixed(StoredFinding {
+                                detector: "D2".to_string(),
+                                channel: "index_skipped".to_string(),
+                                path: path.clone(),
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec![format!("unit too large to index: {count} hashes")],
+                            })
+                        } else {
+                            r
+                        }
+                    }
+                    other => other,
+                };
                 payload.clear();
                 encode_record(&r, &mut payload);
                 if payload.len() as u64 <= max_record_bytes {
@@ -1040,6 +1137,8 @@ impl<R: Read> IndexReader<R> {
 
     /// The next record, `None` after the last one. A count larger than the records present
     /// is `Truncated`; bytes after the last record are `Malformed`.
+    ///
+    /// Continuations are merged only by `query_reader` and `merge_continuations`.
     pub fn next_record(&mut self) -> Result<Option<IndexRecord>, IndexError> {
         if self.finished {
             return Ok(None);
@@ -1083,6 +1182,8 @@ impl<R: Read> IndexReader<R> {
     }
 
     /// Read every remaining record.
+    ///
+    /// Continuations are merged only by `query_reader` and `merge_continuations`.
     pub fn read_all(&mut self) -> Result<Vec<IndexRecord>, IndexError> {
         let mut out = Vec::new();
         while let Some(r) = self.next_record()? {
@@ -1090,6 +1191,156 @@ impl<R: Read> IndexReader<R> {
         }
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Merging continuations
+// ---------------------------------------------------------------------------------------
+
+/// Helper that merges continuation records into their predecessor.
+///
+/// Shared between `query_reader` and `merge_continuations`.
+struct ContinuationMerger<F> {
+    max_unit_bytes: u64,
+    pending: Option<IndexRecord>,
+    pending_unit_bytes: u64,
+    emit: F,
+}
+
+impl<F: FnMut(IndexRecord) -> Result<(), IndexError>> ContinuationMerger<F> {
+    fn new(max_unit_bytes: u64, emit: F) -> Self {
+        Self {
+            max_unit_bytes,
+            pending: None,
+            pending_unit_bytes: 0,
+            emit,
+        }
+    }
+
+    fn push(&mut self, rec: IndexRecord) -> Result<(), IndexError> {
+        match rec {
+            IndexRecord::TextCont { path, hashes } => match self.pending.as_mut() {
+                Some(IndexRecord::Text {
+                    path: prev_path,
+                    hashes: prev_hashes,
+                    ..
+                }) if prev_path == &path => {
+                    let add_bytes = text_hash_bytes(&hashes);
+                    if self.pending_unit_bytes.saturating_add(add_bytes) > self.max_unit_bytes {
+                        return Err(IndexError::Malformed(format!(
+                            "unit hash bytes exceed the {}-byte limit",
+                            self.max_unit_bytes
+                        )));
+                    }
+                    self.pending_unit_bytes += add_bytes;
+                    prev_hashes.line_hashes.extend(hashes.line_hashes);
+                    prev_hashes.window_hashes.extend(hashes.window_hashes);
+                    prev_hashes
+                        .removed_marker_hashes
+                        .extend(hashes.removed_marker_hashes);
+                    prev_hashes
+                        .diff_shape_hashes
+                        .extend(hashes.diff_shape_hashes);
+                    prev_hashes.winnow_hashes.extend(hashes.winnow_hashes);
+                }
+                _ => {
+                    return Err(IndexError::Malformed(
+                        "text continuation without matching predecessor".to_string(),
+                    ));
+                }
+            },
+            IndexRecord::BinaryCont {
+                path,
+                channel,
+                strings,
+            } => match self.pending.as_mut() {
+                Some(IndexRecord::Binary {
+                    path: prev_path,
+                    channel: prev_channel,
+                    strings: prev_strings,
+                    ..
+                }) if prev_path == &path && prev_channel == &channel => {
+                    let add_bytes = binary_hash_bytes(&strings);
+                    if self.pending_unit_bytes.saturating_add(add_bytes) > self.max_unit_bytes {
+                        return Err(IndexError::Malformed(format!(
+                            "unit hash bytes exceed the {}-byte limit",
+                            self.max_unit_bytes
+                        )));
+                    }
+                    self.pending_unit_bytes += add_bytes;
+                    prev_strings.exact.extend(strings.exact);
+                    prev_strings.tokens.extend(strings.tokens);
+                }
+                _ => {
+                    return Err(IndexError::Malformed(
+                        "binary continuation without matching predecessor".to_string(),
+                    ));
+                }
+            },
+            other => {
+                if let Some(prev) = self.pending.take() {
+                    (self.emit)(prev)?;
+                }
+                let unit_bytes = match &other {
+                    IndexRecord::Text { hashes, .. } => {
+                        let b = text_hash_bytes(hashes);
+                        if b > self.max_unit_bytes {
+                            return Err(IndexError::Malformed(format!(
+                                "unit hash bytes exceed the {}-byte limit",
+                                self.max_unit_bytes
+                            )));
+                        }
+                        b
+                    }
+                    IndexRecord::Binary { strings, .. } => {
+                        let b = binary_hash_bytes(strings);
+                        if b > self.max_unit_bytes {
+                            return Err(IndexError::Malformed(format!(
+                                "unit hash bytes exceed the {}-byte limit",
+                                self.max_unit_bytes
+                            )));
+                        }
+                        b
+                    }
+                    _ => 0,
+                };
+                self.pending = Some(other);
+                self.pending_unit_bytes = unit_bytes;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), IndexError> {
+        if let Some(prev) = self.pending.take() {
+            (self.emit)(prev)?;
+        }
+        Ok(())
+    }
+}
+
+/// Merge continuation records into their predecessor.
+///
+/// Continuations are merged only by `query_reader` and `merge_continuations`.
+pub fn merge_continuations(records: Vec<IndexRecord>) -> Result<Vec<IndexRecord>, IndexError> {
+    merge_continuations_with_limit(records, MAX_UNIT_BYTES)
+}
+
+/// `merge_continuations` with a configurable unit limit (for testing).
+pub fn merge_continuations_with_limit(
+    records: Vec<IndexRecord>,
+    max_unit_bytes: u64,
+) -> Result<Vec<IndexRecord>, IndexError> {
+    let mut out = Vec::with_capacity(records.len());
+    let mut merger = ContinuationMerger::new(max_unit_bytes, |rec| {
+        out.push(rec);
+        Ok(())
+    });
+    for rec in records {
+        merger.push(rec)?;
+    }
+    merger.finish()?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1121,7 +1372,7 @@ fn is_excluded(path: &IndexPath, canon_root: &Path, exclude: &[PathBuf]) -> bool
 }
 
 /// Match one record against a task, appending its findings.
-pub fn query_record(
+fn query_record(
     rec: &IndexRecord,
     root: &str,
     fp: &FingerprintSet,
@@ -1196,15 +1447,37 @@ pub fn query_index(
     fp: &FingerprintSet,
     opts: &ScanOptions,
 ) -> Result<Vec<Finding>, IndexError> {
+    query_index_with_limit(index, fp, opts, MAX_UNIT_BYTES)
+}
+
+/// `query_index` with a configurable unit limit (for testing).
+pub fn query_index_with_limit(
+    index: &Path,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+    max_unit_bytes: u64,
+) -> Result<Vec<Finding>, IndexError> {
     let mut reader = IndexReader::open(index)?;
-    query_reader(&mut reader, fp, opts)
+    query_reader_with_limit(&mut reader, fp, opts, max_unit_bytes)
 }
 
 /// `query_index` over an already opened reader.
+///
+/// Continuations are merged only by `query_reader` and `merge_continuations`.
 pub fn query_reader<R: Read>(
     reader: &mut IndexReader<R>,
     fp: &FingerprintSet,
     opts: &ScanOptions,
+) -> Result<Vec<Finding>, IndexError> {
+    query_reader_with_limit(reader, fp, opts, MAX_UNIT_BYTES)
+}
+
+/// `query_reader` with a configurable unit limit (for testing).
+pub fn query_reader_with_limit<R: Read>(
+    reader: &mut IndexReader<R>,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+    max_unit_bytes: u64,
 ) -> Result<Vec<Finding>, IndexError> {
     let root = reader.root().to_string();
     let canon_root = if opts.exclude_dirs.is_empty() {
@@ -1220,76 +1493,24 @@ pub fn query_reader<R: Read>(
         }
     };
     let mut findings = Vec::new();
-    let mut pending: Option<IndexRecord> = None;
-
-    let flush_pending = |pending: Option<IndexRecord>, findings: &mut Vec<Finding>| {
-        if let Some(rec) = pending {
-            let path = match &rec {
-                IndexRecord::File { path, .. }
-                | IndexRecord::Path { path }
-                | IndexRecord::Text { path, .. }
-                | IndexRecord::Binary { path, .. }
-                | IndexRecord::Pkg { path, .. } => path,
-                IndexRecord::Fixed(f) => &f.path,
-                IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
-            };
-            if !is_excluded(path, &canon_root, &opts.exclude_dirs) {
-                query_record(&rec, &root, fp, opts, findings);
-            }
+    let mut merger = ContinuationMerger::new(max_unit_bytes, |rec| {
+        let path = match &rec {
+            IndexRecord::File { path, .. }
+            | IndexRecord::Path { path }
+            | IndexRecord::Text { path, .. }
+            | IndexRecord::Binary { path, .. }
+            | IndexRecord::Pkg { path, .. } => path,
+            IndexRecord::Fixed(f) => &f.path,
+            IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
+        };
+        if !is_excluded(path, &canon_root, &opts.exclude_dirs) {
+            query_record(&rec, &root, fp, opts, &mut findings);
         }
-    };
-
+        Ok(())
+    });
     while let Some(rec) = reader.next_record()? {
-        match rec {
-            IndexRecord::TextCont { path, hashes } => match pending.as_mut() {
-                Some(IndexRecord::Text {
-                    path: prev_path,
-                    hashes: prev_hashes,
-                    ..
-                }) if prev_path == &path => {
-                    prev_hashes.line_hashes.extend(hashes.line_hashes);
-                    prev_hashes.window_hashes.extend(hashes.window_hashes);
-                    prev_hashes
-                        .removed_marker_hashes
-                        .extend(hashes.removed_marker_hashes);
-                    prev_hashes
-                        .diff_shape_hashes
-                        .extend(hashes.diff_shape_hashes);
-                    prev_hashes.winnow_hashes.extend(hashes.winnow_hashes);
-                }
-                _ => {
-                    return Err(IndexError::Malformed(
-                        "text continuation without matching predecessor".to_string(),
-                    ));
-                }
-            },
-            IndexRecord::BinaryCont {
-                path,
-                channel,
-                strings,
-            } => match pending.as_mut() {
-                Some(IndexRecord::Binary {
-                    path: prev_path,
-                    channel: prev_channel,
-                    strings: prev_strings,
-                    ..
-                }) if prev_path == &path && prev_channel == &channel => {
-                    prev_strings.exact.extend(strings.exact);
-                    prev_strings.tokens.extend(strings.tokens);
-                }
-                _ => {
-                    return Err(IndexError::Malformed(
-                        "binary continuation without matching predecessor".to_string(),
-                    ));
-                }
-            },
-            other => {
-                flush_pending(pending.take(), &mut findings);
-                pending = Some(other);
-            }
-        }
+        merger.push(rec)?;
     }
-    flush_pending(pending.take(), &mut findings);
-
+    merger.finish()?;
     Ok(findings)
 }
