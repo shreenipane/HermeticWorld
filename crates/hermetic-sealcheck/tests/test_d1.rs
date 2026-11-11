@@ -987,12 +987,27 @@ fn test_d1_lfs_object_referenced_by_base_passes() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path();
     let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+    // sha256 of the bytes write_lfs_object stores.
+    let oid = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let head = commit_lfs_pointer(repo_dir, oid);
+    write_lfs_object(repo_dir, oid);
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(gates.is_empty(), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_lfs_object_with_wrong_bytes_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+    // Referenced by the pointer, but the stored bytes hash to something else.
     let oid = "a".repeat(64);
     let head = commit_lfs_pointer(repo_dir, &oid);
     write_lfs_object(repo_dir, &oid);
 
     let gates = scan_d1(repo_dir, head, &fp);
-    assert!(gates.is_empty(), "got: {gates:?}");
+    assert!(has_channel(&gates, "git_state_file"), "got: {gates:?}");
 }
 
 #[test]
@@ -1021,6 +1036,19 @@ fn test_d1_split_commit_graph_passes_and_bad_chain_gates() {
     assert!(gates.is_empty(), "got: {gates:?}");
 
     let chain = repo_dir.join(".git/objects/info/commit-graphs/commit-graph-chain");
+    // A graph renamed to a hash its footer doesn't carry is rejected.
+    let hash = fs::read_to_string(&chain).unwrap().trim().to_string();
+    let renamed = "c".repeat(40);
+    fs::rename(
+        chain.with_file_name(format!("graph-{hash}.graph")),
+        chain.with_file_name(format!("graph-{renamed}.graph")),
+    )
+    .unwrap();
+    fs::remove_file(&chain).unwrap();
+    fs::write(&chain, format!("{renamed}\n")).unwrap();
+    let gates = scan_d1(repo_dir, base_commit.clone(), &fp);
+    assert!(has_channel(&gates, "git_commit_graph"), "got: {gates:?}");
+
     fs::remove_file(&chain).unwrap();
     fs::write(&chain, "execute_critical_leak_line()\n").unwrap();
     let gates = scan_d1(repo_dir, base_commit, &fp);

@@ -1,6 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
+use hermetic_common::hash::sha256_hex;
+
 use crate::benchmark::check_d9_content;
 use crate::containers::scan_container_or_unit_with_root_prefix;
 use crate::fingerprint::FingerprintSet;
@@ -772,7 +774,12 @@ fn check_lfs_objects(
     let referenced = lfs_pointer_ids(store, base_commit);
     files
         .iter()
-        .filter(|e| !referenced.contains(&e.file_name().to_string_lossy().to_lowercase()))
+        .filter(|e| {
+            // An LFS object's name is its sha256, so the name alone proves nothing.
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            !referenced.contains(&name)
+                || std::fs::read(e.path()).map_or(true, |bytes| sha256_hex(&bytes) != name)
+        })
         .map(|e| Finding {
             detector: "D1".into(),
             channel: "git_state_file".into(),
@@ -781,7 +788,10 @@ fn check_lfs_objects(
             severity: Severity::Gate,
             confidence: 1.0,
             hunk: None,
-            evidence: vec!["LFS object not referenced by the base tree".into()],
+            evidence: vec![
+                "LFS object not referenced by the base tree, or its bytes don't match its name"
+                    .into(),
+            ],
         })
         .collect()
 }
@@ -1075,10 +1085,18 @@ fn check_commit_graph_chain(path: &Path, opts: &ScanOptions) -> Option<Finding> 
     let bytes = std::fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let dir = path.parent()?;
-    let bad = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !is_hex_oid(line) || !dir.join(format!("graph-{line}.graph")).is_file())?;
+    // A graph file's name is the hash in its 20-byte footer.
+    let bad = text.lines().map(str::trim).find(|line| {
+        if !is_hex_oid(line) {
+            return true;
+        }
+        match std::fs::read(dir.join(format!("graph-{line}.graph"))) {
+            Ok(graph) if graph.len() >= 20 => {
+                !hex::encode(&graph[graph.len() - 20..]).eq_ignore_ascii_case(line)
+            }
+            _ => true,
+        }
+    })?;
     Some(Finding {
         detector: "D1".into(),
         channel: "git_commit_graph".into(),
