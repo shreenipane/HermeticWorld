@@ -15,6 +15,10 @@ pub enum D6Error {
 
 pub fn parse_oci_date(s: &str) -> Result<OffsetDateTime, String> {
     let trimmed = s.trim();
+    // The cleanup below slices by byte index.
+    if !trimmed.is_ascii() {
+        return Err(format!("cannot parse date '{}'", s));
+    }
 
     // 1. Try RFC 3339 directly
     if let Ok(dt) = OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339) {

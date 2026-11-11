@@ -77,6 +77,11 @@ pub enum GitError {
     LimitExceeded(String),
 }
 
+/// Ids come from parsed object text, so check them before slicing by byte index.
+pub fn is_hex_oid(oid: &str) -> bool {
+    oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn compute_git_sha1(obj_type: ObjectType, data: &[u8]) -> String {
     let header = format!("{} {}\0", obj_type.as_str(), data.len());
     let mut hasher = Sha1::new();
@@ -93,7 +98,9 @@ pub struct PackIndex {
     pub offsets: Vec<u64>,
 }
 
-pub type StrayPackResult = (Vec<(u64, Vec<u8>)>, bool);
+/// Blobs decoded (offset, bytes), whether a delta base was missing, and the error that
+/// stopped decoding, if any. Blobs decoded before an error are still returned for scanning.
+pub type StrayPackResult = (Vec<(u64, Vec<u8>)>, bool, Option<GitError>);
 
 impl PackIndex {
     pub fn open(idx_path: &Path) -> Result<Self, GitError> {
@@ -133,7 +140,14 @@ impl PackIndex {
             *entry = count;
         }
 
+        // The count comes from the file: check it against the file's size before allocating.
         let total_objects = fanout[255] as usize;
+        let min_len = 8 + 256 * 4 + (total_objects as u64) * (20 + 4 + 4) + 40;
+        if f.metadata()?.len() < min_len {
+            return Err(GitError::Corrupt(
+                "pack idx shorter than its object count".into(),
+            ));
+        }
         let mut oids = Vec::with_capacity(total_objects);
         let mut oid_buf = [0u8; 20];
         for _ in 0..total_objects {
@@ -387,8 +401,8 @@ impl GitStore {
     }
 
     pub fn read_object(&mut self, oid: &str) -> Result<GitObject, GitError> {
-        if oid.len() != 40 {
-            return Err(GitError::Corrupt(format!("invalid oid length: {}", oid)));
+        if !is_hex_oid(oid) {
+            return Err(GitError::Corrupt(format!("invalid oid: {}", oid)));
         }
 
         if let Some((obj_type, data)) = self.cache.get(oid) {
@@ -623,10 +637,10 @@ impl GitStore {
                     f.read_exact(&mut c)
                         .map_err(|e| GitError::Corrupt(format!("truncated ofs delta: {e}")))?;
                     byte = c[0];
-                    base_offset_delta = (base_offset_delta + 1)
-                        .checked_shl(7)
-                        .ok_or_else(|| GitError::Corrupt("base offset delta overflow".into()))?
-                        .checked_add((byte & 0x7f) as u64)
+                    base_offset_delta = base_offset_delta
+                        .checked_add(1)
+                        .and_then(|d| d.checked_mul(128))
+                        .and_then(|d| d.checked_add((byte & 0x7f) as u64))
                         .ok_or_else(|| GitError::Corrupt("base offset delta overflow".into()))?;
                 }
 
@@ -693,8 +707,8 @@ impl GitStore {
             ));
         }
 
-        if oid.len() != 40 {
-            return Err(GitError::Corrupt(format!("invalid oid length: {}", oid)));
+        if !is_hex_oid(oid) {
+            return Err(GitError::Corrupt(format!("invalid oid: {}", oid)));
         }
 
         if let Some((obj_type, data)) = self.cache.get(oid) {
@@ -1052,7 +1066,32 @@ pub fn scan_stray_pack_slice(
     bytes: &[u8],
     opts: &ScanOptions,
     total_expanded: &mut u64,
-) -> Result<StrayPackResult, GitError> {
+) -> StrayPackResult {
+    let mut objects = Vec::new();
+    let mut has_unresolved = false;
+    let error = decode_stray_objects(
+        bytes,
+        opts,
+        total_expanded,
+        &mut objects,
+        &mut has_unresolved,
+    )
+    .err();
+    let blobs = objects
+        .into_iter()
+        .filter(|(_, obj_type, _)| *obj_type == ObjectType::Blob)
+        .map(|(offset, _, data)| (offset, data))
+        .collect();
+    (blobs, has_unresolved, error)
+}
+
+fn decode_stray_objects(
+    bytes: &[u8],
+    opts: &ScanOptions,
+    total_expanded: &mut u64,
+    objects: &mut Vec<(u64, ObjectType, Vec<u8>)>,
+    has_unresolved: &mut bool,
+) -> Result<(), GitError> {
     if bytes.len() < 12 || &bytes[0..4] != b"PACK" {
         return Err(GitError::Corrupt("invalid pack magic".into()));
     }
@@ -1066,10 +1105,8 @@ pub fn scan_stray_pack_slice(
     }
 
     let num_objects = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    let mut objects: Vec<(u64, ObjectType, Vec<u8>)> = Vec::new();
     let mut by_offset: HashMap<u64, usize> = HashMap::new();
     let mut by_oid: HashMap<String, usize> = HashMap::new();
-    let mut has_unresolved = false;
     let mut cursor = 12;
     let end = bytes.len().saturating_sub(20);
 
@@ -1181,14 +1218,9 @@ pub fn scan_stray_pack_slice(
                 by_oid.insert(compute_git_sha1(obj_type, &data), idx);
                 objects.push((obj_offset, obj_type, data));
             }
-            None => has_unresolved = true,
+            None => *has_unresolved = true,
         }
     }
 
-    let blobs = objects
-        .into_iter()
-        .filter(|(_, obj_type, _)| *obj_type == ObjectType::Blob)
-        .map(|(offset, _, data)| (offset, data))
-        .collect();
-    Ok((blobs, has_unresolved))
+    Ok(())
 }
