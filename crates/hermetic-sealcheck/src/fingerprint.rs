@@ -7,6 +7,7 @@ use hermetic_common::hash::sha256_hex;
 
 use crate::diff::{parse_patch, DiffLineType, DiffParseError, FilePatch};
 use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
+use crate::winnow::{kgram_hashes, tokenize, winnow_tokens};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
@@ -31,6 +32,8 @@ pub struct HunkFingerprints {
     pub total_removed_weight: f64,
     /// Diff shape hashes and their raw weights
     pub diff_shapes: HashMap<String, f64>,
+    /// Tier 3 winnow fingerprints
+    pub winnow_fingerprints: HashSet<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +45,8 @@ pub struct FingerprintSet {
     pub removed_markers_count: usize,
     pub diff_shapes_count: usize,
     pub subtracted_count: usize,
+    pub winnow_count: usize,
+    pub winnow_subtracted_count: usize,
     /// Maps fingerprint hash to representative evidence text
     pub hash_to_evidence: HashMap<String, String>,
 }
@@ -53,6 +58,7 @@ struct CandidateHunk {
     windows: Vec<(String, Vec<String>)>,    // (hash, window_lines)
     removed_markers: Vec<(String, String)>, // (hash, norm)
     diff_shapes: Vec<(String, String)>,     // (hash, description)
+    winnow_candidates: Vec<(u64, String)>,  // (hash, evidence)
 }
 
 fn apply_patch_to_base(
@@ -167,7 +173,7 @@ fn read_text_like_scanner(path: &Path) -> Option<String> {
 }
 
 impl FingerprintSet {
-    /// Build tier 1 fingerprints from gold patch, test patch, and base tree.
+    /// Build tier 1 and tier 3 fingerprints from gold patch, test patch, and base tree.
     pub fn from_task(
         gold_patch_str: &str,
         test_patch_str: &str,
@@ -190,6 +196,9 @@ impl FingerprintSet {
 
             let (post_fix_lines, hunk_changed_positions) =
                 apply_patch_to_base(file, base_tree_root);
+
+            let post_fix_text = post_fix_lines.join("\n");
+            let all_tokens = tokenize(&post_fix_text);
 
             // File-level diff shapes
             let headers = file
@@ -222,6 +231,7 @@ impl FingerprintSet {
                 let mut removed_markers = Vec::new();
                 let mut windows = Vec::new();
                 let mut diff_shapes = Vec::new();
+                let mut winnow_candidates = Vec::new();
 
                 // Diff shapes attached to first hunk
                 if hunk_idx == 0 {
@@ -348,6 +358,33 @@ impl FingerprintSet {
                             }
                         }
                     }
+
+                    // Tier 3 winnowing: restricted to token range overlapping changed lines plus 15 tokens
+                    let changed_line_set: HashSet<usize> = changed_pos.iter().copied().collect();
+                    let matching_token_indices: Vec<usize> = all_tokens
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, tok)| changed_line_set.contains(&tok.line))
+                        .map(|(idx, _)| idx)
+                        .collect();
+
+                    if !matching_token_indices.is_empty() {
+                        let t_min = *matching_token_indices.iter().min().unwrap_or(&0);
+                        let t_max = *matching_token_indices.iter().max().unwrap_or(&0);
+                        let t_start = t_min.saturating_sub(15);
+                        let t_end = (t_max + 15 + 1).min(all_tokens.len());
+
+                        let slice = &all_tokens[t_start..t_end];
+                        let token_texts: Vec<String> =
+                            slice.iter().map(|t| t.text.clone()).collect();
+                        let fps = winnow_tokens(&token_texts);
+
+                        for fp in fps {
+                            let ev_end = (fp.token_pos + 8).min(token_texts.len());
+                            let ev = token_texts[fp.token_pos..ev_end].join(" ");
+                            winnow_candidates.push((fp.hash, ev));
+                        }
+                    }
                 }
 
                 candidate_hunks.push(CandidateHunk {
@@ -357,6 +394,7 @@ impl FingerprintSet {
                     windows,
                     removed_markers,
                     diff_shapes,
+                    winnow_candidates,
                 });
                 global_hunk_counter += 1;
             }
@@ -389,16 +427,18 @@ impl FingerprintSet {
                         windows: Vec::new(),
                         removed_markers: Vec::new(),
                         diff_shapes: Vec::new(),
+                        winnow_candidates: Vec::new(),
                     });
                     global_hunk_counter += 1;
                 }
             }
         }
 
-        // 3. Baseline subtraction (TR-SC-1): walk base_tree_root
+        // 3. Baseline subtraction (TR-SC-1 & TR-SC-4): walk base_tree_root
         let mut base_line_counts: HashMap<String, usize> = HashMap::new();
         let mut base_line_hashes: HashSet<String> = HashSet::new();
         let mut base_window_hashes: HashSet<String> = HashSet::new();
+        let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
 
         if base_tree_root.exists() {
             for entry in WalkDir::new(base_tree_root)
@@ -407,8 +447,7 @@ impl FingerprintSet {
                 .flatten()
             {
                 if entry.file_type().is_file() {
-                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every
-                    // text unit the scanner can see at the base is also subtracted here.
+                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
                     if let Some(content) = read_text_like_scanner(entry.path()) {
                         let file_lines: Vec<&str> = content.lines().collect();
 
@@ -445,12 +484,21 @@ impl FingerprintSet {
                                 }
                             }
                         }
+
+                        // Winnow hashes for base tree
+                        let base_tokens = tokenize(&content);
+                        let base_token_texts: Vec<String> =
+                            base_tokens.into_iter().map(|t| t.text).collect();
+                        for hash in kgram_hashes(&base_token_texts) {
+                            base_winnow_hashes.insert(hash);
+                        }
                     }
                 }
             }
         }
 
         let mut subtracted_count = 0;
+        let mut winnow_subtracted_count = 0;
         let mut final_hunks = Vec::new();
         let mut all_diff_shapes = HashSet::new();
         let mut hash_to_evidence = HashMap::new();
@@ -459,6 +507,7 @@ impl FingerprintSet {
         let mut total_windows = 0;
         let mut total_removed = 0;
         let mut total_shapes = 0;
+        let mut total_winnow = 0;
 
         for ch in candidate_hunks {
             let mut surviving_lines = Vec::new();
@@ -495,13 +544,23 @@ impl FingerprintSet {
                 hash_to_evidence.insert(hash.clone(), desc.clone());
             }
 
+            // Baseline subtraction for tier 3 winnow fingerprints
+            let mut winnow_fingerprints = HashSet::new();
+            for (hash, ev) in ch.winnow_candidates {
+                if base_winnow_hashes.contains(&hash) {
+                    winnow_subtracted_count += 1;
+                } else {
+                    winnow_fingerprints.insert(hash);
+                    hash_to_evidence.insert(format!("{:016x}", hash), ev);
+                }
+            }
+
             // Compute raw weights
-            // line: 1 / (1 + count)
-            // window: minimum raw weight of its lines
             let mut line_fingerprints = HashMap::new();
             let mut total_line_weight = 0.0;
             for (hash, norm) in &surviving_lines {
                 let count = base_line_counts.get(norm).copied().unwrap_or(0);
+                // line: 1 / (1 + count)
                 let w = 1.0 / (1.0 + count as f64);
                 line_fingerprints.insert(hash.clone(), w);
                 total_line_weight += w;
@@ -510,6 +569,7 @@ impl FingerprintSet {
             let mut window_fingerprints = HashMap::new();
             let mut total_window_weight = 0.0;
             for (hash, w_lines) in &surviving_windows {
+                // window: minimum raw weight of its lines
                 let min_w = w_lines
                     .iter()
                     .map(|l| {
@@ -542,6 +602,7 @@ impl FingerprintSet {
             total_windows += window_fingerprints.len();
             total_removed += removed_map.len();
             total_shapes += diff_shapes_map.len();
+            total_winnow += winnow_fingerprints.len();
 
             final_hunks.push(HunkFingerprints {
                 hunk_index: ch.hunk_index,
@@ -553,6 +614,7 @@ impl FingerprintSet {
                 removed_markers: removed_map,
                 total_removed_weight,
                 diff_shapes: diff_shapes_map,
+                winnow_fingerprints,
             });
         }
 
@@ -564,6 +626,8 @@ impl FingerprintSet {
             removed_markers_count: total_removed,
             diff_shapes_count: total_shapes,
             subtracted_count,
+            winnow_count: total_winnow,
+            winnow_subtracted_count,
             hash_to_evidence,
         })
     }

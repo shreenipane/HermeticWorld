@@ -22,3 +22,10 @@ clap = { version = "4.5", features = ["derive"] }
 walkdir = "2.5"
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
 tempfile = "3.10"
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+bzip2 = "0.4"
+xz2 = "0.1"
+zstd = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }

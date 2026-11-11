@@ -18,6 +18,13 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 walkdir = { workspace = true }
 time = { workspace = true }
+tempfile = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+bzip2 = { workspace = true }
+xz2 = { workspace = true }
+zstd = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }

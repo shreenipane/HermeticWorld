@@ -2,14 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use hermetic_common::hash::sha256_hex;
 
+use crate::benchmark::BenchmarkSignatures;
+use crate::bytecode::check_pyc_bytecode;
+use crate::containers::{
+    detect_container_type, scan_container_or_unit_with_root_prefix, ContainerType,
+};
 use crate::diff::parse_patch;
 use crate::fingerprint::FingerprintSet;
 use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
+use crate::winnow::{tokenize, winnow_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,7 +49,15 @@ pub struct Finding {
 pub struct ScanOptions {
     pub max_file_bytes: u64,
     pub hunk_threshold: f64,
+    pub winnow_threshold: f64,
     pub visibility: Visibility,
+    pub max_depth: usize,
+    pub max_member_bytes: u64,
+    pub max_total_expanded_bytes: u64,
+    pub max_ratio: f64,
+    pub signatures: BenchmarkSignatures,
+    /// Canonical directories never entered by `scan_tree`
+    pub exclude_dirs: Vec<PathBuf>,
 }
 
 impl Default for ScanOptions {
@@ -51,7 +65,14 @@ impl Default for ScanOptions {
         Self {
             max_file_bytes: 64 * 1024 * 1024, // 64 MiB
             hunk_threshold: 0.60,
+            winnow_threshold: 0.60,
             visibility: Visibility::AgentVisible,
+            max_depth: 4,
+            max_member_bytes: 256 * 1024 * 1024, // 256 MiB
+            max_total_expanded_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
+            max_ratio: 200.0,
+            signatures: BenchmarkSignatures::new(None),
+            exclude_dirs: Vec::new(),
         }
     }
 }
@@ -62,6 +83,7 @@ struct UnitHashes {
     window_hashes: HashSet<String>,
     removed_marker_hashes: HashSet<String>,
     diff_shape_hashes: HashSet<String>,
+    winnow_hashes: HashSet<u64>,
 }
 
 fn compute_unit_hashes(text: &str) -> UnitHashes {
@@ -109,7 +131,6 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
         .iter()
         .any(|l| l.starts_with('+') || l.starts_with('-'));
     if has_diff_lines {
-        // Also add diff-mode normalised lines for lines starting with '+'
         for line in &lines {
             if line.starts_with('+') {
                 if let Some(norm) = normalize_diff_line(line) {
@@ -118,7 +139,6 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
             }
         }
 
-        // Removed markers for lines starting with '-'
         for line in &lines {
             if line.starts_with('-') {
                 if let Some(norm) = normalize_diff_line(line) {
@@ -128,7 +148,6 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
             }
         }
 
-        // After-change-view windows: filter out '-' lines, strip '+' from '+' lines
         let after_change: Vec<String> = lines
             .iter()
             .filter(|l| !l.starts_with('-'))
@@ -168,7 +187,6 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
             }
         }
 
-        // Check if text is a patch: extract diff shapes
         if let Ok(patch) = parse_patch(text) {
             for file in &patch.files {
                 let file_path = file
@@ -207,22 +225,30 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
         }
     }
 
+    // 3. Tier 3 winnow hashes
+    let tokens = tokenize(text);
+    let token_texts: Vec<String> = tokens.into_iter().map(|t| t.text).collect();
+    let winnow_fps = winnow_tokens(&token_texts);
+    let winnow_hashes = winnow_fps.into_iter().map(|f| f.hash).collect();
+
     UnitHashes {
         line_hashes,
         window_hashes,
         removed_marker_hashes,
         diff_shape_hashes,
+        winnow_hashes,
     }
 }
 
-fn match_unit(
-    unit: &UnitHashes,
+pub fn match_unit(
+    text: &str,
     fp: &FingerprintSet,
     opts: &ScanOptions,
     detector: &str,
     channel: &str,
     path: &str,
 ) -> Vec<Finding> {
+    let unit = compute_unit_hashes(text);
     let mut findings = Vec::new();
 
     // 1. Check diff shapes
@@ -247,7 +273,7 @@ fn match_unit(
         }
     }
 
-    // 2. Check each hunk's fingerprints
+    // 2. Check each hunk's tier 1 fingerprints
     for hunk in &fp.hunks {
         let mut matched_line_weight = 0.0;
         let mut matched_window_weight = 0.0;
@@ -330,21 +356,55 @@ fn match_unit(
                 evidence: matched_evidence,
             });
         }
+
+        // 3. Tier 3 winnowing check
+        // "Hunks with fewer than 3 tier 3 fingerprints after subtraction are skipped on tier 3"
+        if hunk.winnow_fingerprints.len() >= 3 {
+            let mut winnow_matched_count = 0;
+            let mut winnow_evidence = Vec::new();
+
+            for &whash in &hunk.winnow_fingerprints {
+                if unit.winnow_hashes.contains(&whash) {
+                    winnow_matched_count += 1;
+                    if winnow_evidence.len() < 5 {
+                        let hex_key = format!("{:016x}", whash);
+                        if let Some(ev) = fp.hash_to_evidence.get(&hex_key) {
+                            let truncated: String = ev.chars().take(200).collect();
+                            if !winnow_evidence.contains(&truncated) {
+                                winnow_evidence.push(truncated);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let winnow_confidence =
+                winnow_matched_count as f64 / hunk.winnow_fingerprints.len() as f64;
+            if winnow_confidence >= opts.winnow_threshold {
+                findings.push(Finding {
+                    detector: "D2".to_string(),
+                    channel: "winnow".to_string(),
+                    path: path.to_string(),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: (winnow_confidence * 100.0).round() / 100.0,
+                    hunk: Some(hunk.hunk_index),
+                    evidence: winnow_evidence,
+                });
+            }
+        }
     }
 
     findings
 }
 
 /// Scan a problem statement for leaks (D0).
-/// Checks the entire statement as one unit, then checks each fenced code block as a unit.
 pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
     let problem_path = "agent/problem_statement.md";
 
-    // Whole statement as one unit
-    let whole_unit = compute_unit_hashes(text);
     findings.extend(match_unit(
-        &whole_unit,
+        text,
         fp,
         opts,
         "D0",
@@ -360,9 +420,8 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
         if line.trim_start().starts_with("```") {
             if in_code_block {
                 let block_text = current_block.join("\n");
-                let block_unit = compute_unit_hashes(&block_text);
                 findings.extend(match_unit(
-                    &block_unit,
+                    &block_text,
                     fp,
                     opts,
                     "D0",
@@ -383,23 +442,28 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
     findings
 }
 
-/// Scan a filesystem tree for leaks (D2).
+/// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let root_str = root.display().to_string();
+    let root_prefix_len = root_str.len();
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         let path = e.path();
-        // Skip system directories if root is /
         if root == Path::new("/") {
             let path_str = path.to_string_lossy();
             if path_str == "/proc" || path_str == "/sys" || path_str == "/dev" {
                 return false;
             }
         }
+        if e.file_type().is_dir() && !opts.exclude_dirs.is_empty() {
+            if let Ok(canon) = path.canonicalize() {
+                return !opts.exclude_dirs.iter().any(|d| canon.starts_with(d));
+            }
+        }
         true
     });
 
-    // Nothing is skipped silently: unreadable entries become info findings.
     let error_finding = |path: String, what: String| Finding {
         detector: "D2".into(),
         channel: "scan_error".into(),
@@ -426,9 +490,6 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
-        // The agent reads through symlinks, so a link to a file is scanned as that file
-        // (std::fs follows links). Links to directories are not followed (cycles) and,
-        // like broken links, are reported.
         let metadata = if entry.path_is_symlink() {
             match std::fs::metadata(file_path) {
                 Ok(m) if m.is_file() => m,
@@ -456,68 +517,84 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             continue;
         };
 
-        // Size check
+        // Size check for loose file
         if metadata.len() > opts.max_file_bytes {
-            findings.push(Finding {
-                detector: "D2".into(),
-                channel: "file".into(),
-                path: display_path,
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec![format!(
-                    "skipped file exceeding max size ({} bytes > {} bytes)",
-                    metadata.len(),
-                    opts.max_file_bytes
-                )],
-            });
-            continue;
-        }
+            let is_large_archive = if metadata.len() <= opts.max_member_bytes {
+                if let Ok(mut f) = File::open(file_path) {
+                    let mut head = [0u8; 512];
+                    if let Ok(n) = f.read(&mut head) {
+                        matches!(
+                            detect_container_type(&head[..n], &display_path),
+                            Some(
+                                ContainerType::Zip
+                                    | ContainerType::Tar
+                                    | ContainerType::Gzip
+                                    | ContainerType::Bzip2
+                                    | ContainerType::Xz
+                                    | ContainerType::Zstd
+                            )
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
-        // Binary check (NUL byte in first 8 KiB)
-        let mut file = match File::open(file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                findings.push(error_finding(display_path, format!("open error: {e}")));
+            if !is_large_archive {
+                findings.push(Finding {
+                    detector: "D2".into(),
+                    channel: "file".into(),
+                    path: display_path,
+                    visibility: opts.visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec![format!(
+                        "skipped file exceeding max size ({} bytes > {} bytes)",
+                        metadata.len(),
+                        opts.max_file_bytes
+                    )],
+                });
                 continue;
             }
-        };
+        }
 
-        let mut buffer = [0u8; 8192];
-        let bytes_read = match file.read(&mut buffer) {
-            Ok(n) => n,
+        // Loose .pyc check: PEP 552 bytecode check (D3)
+        let is_pyc = file_path.extension().is_some_and(|ext| ext == "pyc");
+        if is_pyc {
+            match check_pyc_bytecode(file_path, opts.visibility) {
+                Ok(d3_findings) => findings.extend(d3_findings),
+                Err(e) => {
+                    findings.push(error_finding(
+                        display_path.clone(),
+                        format!("pyc check error: {e}"),
+                    ));
+                }
+            }
+        }
+
+        // Read file bytes
+        let bytes = match std::fs::read(file_path) {
+            Ok(b) => b,
             Err(e) => {
                 findings.push(error_finding(display_path, format!("read error: {e}")));
                 continue;
             }
         };
 
-        if buffer[..bytes_read].contains(&0) {
-            findings.push(Finding {
-                detector: "D2".into(),
-                channel: "file".into(),
-                path: display_path,
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec!["skipped binary file (contains NUL byte)".into()],
-            });
-            continue;
-        }
-
-        // Read full file text; invalid UTF-8 is decoded lossily, exactly as the baseline does.
-        let content = match std::fs::read(file_path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                findings.push(error_finding(display_path, format!("read error: {e}")));
-                continue;
-            }
-        };
-
-        let unit = compute_unit_hashes(&content);
-        findings.extend(match_unit(&unit, fp, opts, "D2", "file", &display_path));
+        let unit_findings = scan_container_or_unit_with_root_prefix(
+            &display_path,
+            &bytes,
+            fp,
+            &opts.signatures,
+            opts,
+            root_prefix_len,
+        );
+        findings.extend(unit_findings);
     }
 
     findings

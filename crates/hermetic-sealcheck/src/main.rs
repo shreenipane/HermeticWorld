@@ -7,8 +7,8 @@ use std::process::ExitCode;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    generate_sarif, scan_problem_statement, scan_tree, FingerprintSet, FingerprintSummary,
-    ScanOptions, SealcheckReport, Severity, Visibility,
+    generate_sarif, scan_problem_statement, scan_tree, BenchmarkSignatures, FingerprintSet,
+    FingerprintSummary, ScanOptions, SealcheckReport, Severity, Visibility,
 };
 
 #[derive(Parser, Debug)]
@@ -53,7 +53,7 @@ impl From<CliVisibility> for Visibility {
 
 #[derive(Parser, Debug)]
 struct ScanArgs {
-    /// Path to task directory containing task.json, staging/, agent/
+    /// Path to task directory containing task.json, staging/, agent/ (paths under --task are never scanned)
     #[arg(long)]
     task: PathBuf,
 
@@ -68,6 +68,10 @@ struct ScanArgs {
     /// Visibility for root (repeatable)
     #[arg(long = "root-visibility")]
     root_visibilities: Vec<CliVisibility>,
+
+    /// Path to optional external signatures JSON file
+    #[arg(long)]
+    signatures: Option<PathBuf>,
 
     /// Output format: json or sarif
     #[arg(long, default_value = "json")]
@@ -92,11 +96,20 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let task = TaskInput::load(&args.task)?;
     let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
 
+    let signatures = if let Some(ref sig_file) = args.signatures {
+        BenchmarkSignatures::load_from_file(Some(task.instance_id.clone()), sig_file)?
+    } else {
+        BenchmarkSignatures::new(Some(task.instance_id.clone()))
+    };
+
     let d0_opts = ScanOptions {
         visibility: Visibility::AgentVisible,
+        signatures: signatures.clone(),
         ..Default::default()
     };
     let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
+
+    let canonical_task_dir = args.task.canonicalize().ok();
 
     for (idx, root) in args.roots.iter().enumerate() {
         let vis = args
@@ -105,8 +118,11 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             .copied()
             .unwrap_or(CliVisibility::AgentVisible);
 
+        // Paths under the sealcheck's own --task dir are never scanned, wherever the root is
         let opts = ScanOptions {
             visibility: vis.into(),
+            signatures: signatures.clone(),
+            exclude_dirs: canonical_task_dir.iter().cloned().collect(),
             ..Default::default()
         };
         let tree_findings = scan_tree(root, &fp, &opts);
@@ -129,6 +145,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 removed_markers: fp.removed_markers_count,
                 diff_shapes: fp.diff_shapes_count,
                 subtracted: fp.subtracted_count,
+                winnow: fp.winnow_count,
+                winnow_subtracted: fp.winnow_subtracted_count,
             };
             let report = SealcheckReport {
                 schema: "hermetic-sealcheck/v0".to_string(),

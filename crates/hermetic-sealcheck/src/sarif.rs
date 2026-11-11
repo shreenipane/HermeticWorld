@@ -121,6 +121,18 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
                 text: "Files and archives leak".to_string(),
             },
         },
+        SarifRule {
+            id: "D3".to_string(),
+            short_description: SarifMessage {
+                text: "Stale bytecode".to_string(),
+            },
+        },
+        SarifRule {
+            id: "D9".to_string(),
+            short_description: SarifMessage {
+                text: "Benchmark presence".to_string(),
+            },
+        },
     ];
 
     SarifLog {
