@@ -381,6 +381,11 @@ fn test_d6_cli_run_both_files() {
 
     let scan_root = temp.path().join("root");
     fs::create_dir_all(&scan_root).unwrap();
+    let old_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+    if let Ok(f) = fs::File::open(&scan_root) {
+        let _ = f.set_modified(old_time);
+    }
 
     let exe = env!("CARGO_BIN_EXE_hermetic-sealcheck");
 

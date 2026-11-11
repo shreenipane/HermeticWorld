@@ -41,6 +41,28 @@ enum Commands {
     /// Scan files for real-date, host-name, and host-path sentinels (D12 advisory)
     #[command(name = "d12")]
     D12(D12Args),
+    /// Check an ext4 filesystem image for times later than T_clock (D4)
+    #[command(name = "d4-image")]
+    D4Image(D4ImageArgs),
+}
+
+#[derive(Parser, Debug)]
+struct D4ImageArgs {
+    /// Path to ext4 filesystem image
+    #[arg(long)]
+    image: PathBuf,
+
+    /// Target clock time (RFC 3339 format)
+    #[arg(long = "t-clock")]
+    t_clock: String,
+
+    /// Output format: json or sarif
+    #[arg(long, default_value = "json")]
+    format: OutputFormat,
+
+    /// Output file path (defaults to stdout)
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -226,7 +248,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     write_report(
         all_findings,
-        &fp,
+        Some(&fp),
         task.instance_id,
         args.format,
         args.out,
@@ -236,7 +258,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
 fn write_report(
     all_findings: Vec<Finding>,
-    fp: &FingerprintSet,
+    fp: Option<&FingerprintSet>,
     instance_id: String,
     format: OutputFormat,
     out: Option<PathBuf>,
@@ -261,16 +283,29 @@ fn write_report(
             serde_json::to_string_pretty(&sarif)?
         }
         OutputFormat::Json => {
-            let summary = FingerprintSummary {
-                lines: fp.lines_count,
-                windows: fp.windows_count,
-                removed_markers: fp.removed_markers_count,
-                diff_shapes: fp.diff_shapes_count,
-                subtracted: fp.subtracted_count,
-                winnow: fp.winnow_count,
-                winnow_subtracted: fp.winnow_subtracted_count,
-                binary_items: fp.binary_items_count,
-                binary_subtracted: fp.binary_subtracted_count,
+            let summary = match fp {
+                Some(fp) => FingerprintSummary {
+                    lines: fp.lines_count,
+                    windows: fp.windows_count,
+                    removed_markers: fp.removed_markers_count,
+                    diff_shapes: fp.diff_shapes_count,
+                    subtracted: fp.subtracted_count,
+                    winnow: fp.winnow_count,
+                    winnow_subtracted: fp.winnow_subtracted_count,
+                    binary_items: fp.binary_items_count,
+                    binary_subtracted: fp.binary_subtracted_count,
+                },
+                None => FingerprintSummary {
+                    lines: 0,
+                    windows: 0,
+                    removed_markers: 0,
+                    diff_shapes: 0,
+                    subtracted: 0,
+                    winnow: 0,
+                    winnow_subtracted: 0,
+                    binary_items: 0,
+                    binary_subtracted: 0,
+                },
             };
             let report = SealcheckReport {
                 schema: "hermetic-sealcheck/v0".to_string(),
@@ -341,7 +376,16 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut target_packages = vec![repo_pkg.to_string()];
     target_packages.extend(args.target_package);
 
+    let mut not_covered_set: Vec<String> = NOT_COVERED.iter().map(|s| s.to_string()).collect();
     for (idx, index) in args.indexes.iter().enumerate() {
+        let reader = hermetic_sealcheck::IndexReader::open(index)?;
+        let v = reader.version();
+        for item in hermetic_sealcheck::index::not_covered_for_version(v) {
+            let s = item.to_string();
+            if !not_covered_set.contains(&s) {
+                not_covered_set.push(s);
+            }
+        }
         let vis = args
             .root_visibilities
             .get(idx)
@@ -359,13 +403,28 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         all_findings.extend(query_index(index, &fp, &opts)?);
     }
 
+    let not_covered_refs: Vec<&str> = not_covered_set.iter().map(|s| s.as_str()).collect();
     write_report(
         all_findings,
-        &fp,
+        Some(&fp),
         task.instance_id,
         args.format,
         args.out,
-        Some(NOT_COVERED),
+        Some(&not_covered_refs),
+    )
+}
+
+fn run_d4_image(args: D4ImageArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let t_clock = hermetic_common::cutoff::parse_utc_datetime(&args.t_clock)
+        .map_err(|e| format!("invalid --t-clock: {e}"))?;
+    let findings = hermetic_sealcheck::scan_ext4_image(&args.image, t_clock)?;
+    write_report(
+        findings,
+        None,
+        args.image.display().to_string(),
+        args.format,
+        args.out,
+        None,
     )
 }
 
@@ -712,6 +771,7 @@ fn main() -> ExitCode {
         Commands::D8(args) => run_d8(args),
         Commands::D11(args) => run_d11(args),
         Commands::D12(args) => run_d12(args),
+        Commands::D4Image(args) => run_d4_image(args),
     };
     match result {
         Ok(code) => code,

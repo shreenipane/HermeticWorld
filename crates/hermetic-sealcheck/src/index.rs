@@ -4,13 +4,13 @@
 //! task-independent facts. `query` matches one task's fingerprints against those records
 //! without reading the tree again.
 //!
-//! # File format (version 2)
+//! # File format (version 4)
 //!
 //! The file is one zstd stream. Decompressed, it holds:
 //!
 //! ```text
 //! magic           6 bytes   "HWIDX1"
-//! version         u32       2
+//! version         u32       4
 //! root            str       the indexed root, as `scan` would display it
 //! canonical_root  str       root canonicalized at index time ("" if failed)
 //! count           u64       number of records
@@ -24,16 +24,24 @@
 //! `set` is a u64 count then that many u64s, sorted ascending. `opt<T>` is a u8 (0 or 1)
 //! then `T` when 1.
 //!
-//! | tag | record    | fields |
-//! |-----|-----------|--------|
-//! | 1   | file      | path, size u64, mtime seconds i64, mtime nanos u32, mode u32 |
-//! | 2   | fixed     | path, detector str, channel str, severity u8, confidence f64, hunk opt<u64>, evidence (u32 count, str*) |
-//! | 3   | path      | path |
-//! | 4   | text      | path, D9 flags u8, line set, window set, removed-marker set, diff-shape set, winnow set |
-//! | 5   | binary    | path, channel str, exact set, token set |
-//! | 6   | pkg       | path, name str, version opt<str> |
-//! | 7   | text cont | path, line set, window set, removed-marker set, diff-shape set, winnow set |
-//! | 8   | bin cont  | path, channel str, exact set, token set |
+//! | tag | record      | fields |
+//! |-----|-------------|--------|
+//! | 1   | file        | path, size u64, mtime seconds i64, mtime nanos u32, mode u32 |
+//! | 2   | fixed       | path, detector str, channel str, severity u8, confidence f64, hunk opt<u64>, evidence (u32 count, str*) |
+//! | 3   | path        | path |
+//! | 4   | text        | path, D9 flags u8, line set, window set, removed-marker set, diff-shape set, winnow set |
+//! | 5   | binary      | path, channel str, exact set, token set |
+//! | 6   | pkg         | path, name str, version opt<str> |
+//! | 7   | text cont   | path, line set, window set, removed-marker set, diff-shape set, winnow set |
+//! | 8   | bin cont    | path, channel str, exact set, token set |
+//! | 9   | member time | path, mtime seconds i64 |
+//! | 10  | dir         | path, mtime seconds i64, mtime nanos u32 |
+//! | 11  | symlink     | path, mtime seconds i64, mtime nanos u32 |
+//!
+//! The reader accepts versions 2, 3 and 4 (a version-2 index has no member-time records,
+//! directory records, or symlink records; a version-3 index has member-time records but lacks
+//! directory and symlink records). Older versions report their uncovered aspects via `not_covered`.
+//! Version 1 and anything else stay `UnsupportedVersion`.
 //!
 //! `fixed` holds a finding that depends on the unit alone (errors, bombs, skipped
 //! binaries); its visibility comes from the query. Text hashes are the first 8 bytes of
@@ -93,7 +101,7 @@ use crate::scan::{
 };
 
 pub const MAGIC: &[u8; 6] = b"HWIDX1";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 4;
 /// The largest record payload the reader accepts.
 pub const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 /// The maximum encoded hash bytes of one unit after merging continuations (1 GiB).
@@ -104,6 +112,17 @@ pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 /// Detectors a query can't answer from an index.
 pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external"];
 
+/// Detectors not covered when querying an index of a given format version.
+pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
+    let mut list = NOT_COVERED.to_vec();
+    if version == 2 {
+        list.push("D4:directories_symlinks_members");
+    } else if version == 3 {
+        list.push("D4:directories_symlinks");
+    }
+    list
+}
+
 const TAG_FILE: u8 = 1;
 const TAG_FIXED: u8 = 2;
 const TAG_PATH: u8 = 3;
@@ -112,6 +131,9 @@ const TAG_BINARY: u8 = 5;
 const TAG_PKG: u8 = 6;
 const TAG_TEXT_CONT: u8 = 7;
 const TAG_BINARY_CONT: u8 = 8;
+const TAG_MEMBER_TIME: u8 = 9;
+const TAG_DIR: u8 = 10;
+const TAG_SYMLINK: u8 = 11;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -202,6 +224,20 @@ pub enum IndexRecord {
         channel: String,
         strings: HashedBinaryStrings,
     },
+    MemberTime {
+        path: IndexPath,
+        mtime_secs: i64,
+    },
+    Dir {
+        path: IndexPath,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+    },
+    Symlink {
+        path: IndexPath,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------------------
@@ -275,6 +311,35 @@ impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
             (self.emit)(record);
         }
     }
+
+    fn member_time(&mut self, path: &str, unix_secs: i64) {
+        let record = IndexRecord::MemberTime {
+            path: self.ipath(path),
+            mtime_secs: unix_secs,
+        };
+        (self.emit)(record);
+    }
+}
+
+fn extract_mtime(metadata: &std::fs::Metadata) -> (i64, u32) {
+    match metadata.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (
+                i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            ),
+            Err(e) => {
+                let d = e.duration();
+                let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+                if d.subsec_nanos() == 0 {
+                    (-secs, 0)
+                } else {
+                    (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+                }
+            }
+        },
+        Err(_) => (0, 0),
+    }
 }
 
 impl<F: FnMut(IndexRecord)> TreeSink for IndexSink<F> {
@@ -283,30 +348,33 @@ impl<F: FnMut(IndexRecord)> TreeSink for IndexSink<F> {
     fn pyc_file(&mut self, _path: &Path, _display_path: &str) {}
 
     fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
-        let (mtime_secs, mtime_nanos) = match metadata.modified() {
-            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => (
-                    i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-                    d.subsec_nanos(),
-                ),
-                Err(e) => {
-                    let d = e.duration();
-                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-                    if d.subsec_nanos() == 0 {
-                        (-secs, 0)
-                    } else {
-                        (-secs - 1, 1_000_000_000 - d.subsec_nanos())
-                    }
-                }
-            },
-            Err(_) => (0, 0),
-        };
+        let (mtime_secs, mtime_nanos) = extract_mtime(metadata);
         let record = IndexRecord::File {
             path: self.ipath(display_path),
             size: metadata.len(),
             mtime_secs,
             mtime_nanos,
             mode: file_mode(metadata),
+        };
+        (self.emit)(record);
+    }
+
+    fn directory(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        let (mtime_secs, mtime_nanos) = extract_mtime(metadata);
+        let record = IndexRecord::Dir {
+            path: self.ipath(display_path),
+            mtime_secs,
+            mtime_nanos,
+        };
+        (self.emit)(record);
+    }
+
+    fn symlink(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        let (mtime_secs, mtime_nanos) = extract_mtime(metadata);
+        let record = IndexRecord::Symlink {
+            path: self.ipath(display_path),
+            mtime_secs,
+            mtime_nanos,
         };
         (self.emit)(record);
     }
@@ -856,6 +924,31 @@ pub fn encode_record(r: &IndexRecord, b: &mut Vec<u8>) {
             put_set(b, &strings.exact);
             put_set(b, &strings.tokens);
         }
+        IndexRecord::MemberTime { path, mtime_secs } => {
+            put_u8(b, TAG_MEMBER_TIME);
+            put_path(b, path);
+            b.extend_from_slice(&mtime_secs.to_le_bytes());
+        }
+        IndexRecord::Dir {
+            path,
+            mtime_secs,
+            mtime_nanos,
+        } => {
+            put_u8(b, TAG_DIR);
+            put_path(b, path);
+            b.extend_from_slice(&mtime_secs.to_le_bytes());
+            put_u32(b, *mtime_nanos);
+        }
+        IndexRecord::Symlink {
+            path,
+            mtime_secs,
+            mtime_nanos,
+        } => {
+            put_u8(b, TAG_SYMLINK);
+            put_path(b, path);
+            b.extend_from_slice(&mtime_secs.to_le_bytes());
+            put_u32(b, *mtime_nanos);
+        }
     }
 }
 
@@ -1055,6 +1148,36 @@ pub fn decode_record(payload: &[u8]) -> Result<IndexRecord, IndexError> {
                 tokens: c.set("run tokens")?,
             },
         },
+        TAG_MEMBER_TIME => IndexRecord::MemberTime {
+            path: c.path()?,
+            mtime_secs: c.i64("member mtime")?,
+        },
+        TAG_DIR => IndexRecord::Dir {
+            path: c.path()?,
+            mtime_secs: c.i64("dir mtime")?,
+            mtime_nanos: {
+                let n = c.u32("dir mtime nanos")?;
+                if n >= 1_000_000_000 {
+                    return Err(IndexError::Malformed(format!(
+                        "mtime nanos {n} out of range"
+                    )));
+                }
+                n
+            },
+        },
+        TAG_SYMLINK => IndexRecord::Symlink {
+            path: c.path()?,
+            mtime_secs: c.i64("symlink mtime")?,
+            mtime_nanos: {
+                let n = c.u32("symlink mtime nanos")?;
+                if n >= 1_000_000_000 {
+                    return Err(IndexError::Malformed(format!(
+                        "mtime nanos {n} out of range"
+                    )));
+                }
+                n
+            },
+        },
         t => return Err(IndexError::Malformed(format!("unknown record tag {t}"))),
     };
     if c.remaining() != 0 {
@@ -1081,6 +1204,7 @@ fn read_exact_or_truncated<R: Read>(
 /// Streams the records of one index file.
 pub struct IndexReader<R: Read> {
     inner: R,
+    version: u32,
     root: String,
     canonical_root: String,
     count: u64,
@@ -1107,7 +1231,7 @@ impl<R: Read> IndexReader<R> {
         let mut b4 = [0u8; 4];
         read_exact_or_truncated(&mut inner, &mut b4, "version")?;
         let version = u32::from_le_bytes(b4);
-        if version != FORMAT_VERSION {
+        if version != 2 && version != 3 && version != 4 {
             return Err(IndexError::UnsupportedVersion(version));
         }
         read_exact_or_truncated(&mut inner, &mut b4, "root length")?;
@@ -1139,12 +1263,17 @@ impl<R: Read> IndexReader<R> {
         let count = u64::from_le_bytes(b8);
         Ok(Self {
             inner,
+            version,
             root,
             canonical_root,
             count,
             read: 0,
             finished: false,
         })
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     pub fn root(&self) -> &str {
@@ -1409,9 +1538,68 @@ fn query_record(
     findings: &mut Vec<Finding>,
 ) {
     match rec {
-        IndexRecord::File { .. }
-        | IndexRecord::TextCont { .. }
-        | IndexRecord::BinaryCont { .. } => {}
+        IndexRecord::File {
+            path,
+            mtime_secs,
+            mtime_nanos,
+            ..
+        }
+        | IndexRecord::Dir {
+            path,
+            mtime_secs,
+            mtime_nanos,
+        }
+        | IndexRecord::Symlink {
+            path,
+            mtime_secs,
+            mtime_nanos,
+        } => {
+            if let Some(t_clock) = opts.t_clock {
+                let t_clock_secs = t_clock.unix_timestamp();
+                let t_clock_nanos = t_clock.nanosecond();
+                let is_later = (*mtime_secs > t_clock_secs)
+                    || (*mtime_secs == t_clock_secs && *mtime_nanos > t_clock_nanos);
+                if is_later {
+                    let display = path.display(root);
+                    let mtime_str = crate::scan::format_mtime(*mtime_secs, *mtime_nanos);
+                    let t_clock_str = crate::scan::format_rfc3339(t_clock);
+                    findings.push(Finding {
+                        detector: "D4".into(),
+                        channel: "mtime".into(),
+                        path: display,
+                        visibility: opts.visibility,
+                        severity: Severity::Gate,
+                        confidence: 1.0,
+                        hunk: None,
+                        evidence: vec![format!("mtime {mtime_str} > T_clock {t_clock_str}")],
+                    });
+                }
+            }
+        }
+        IndexRecord::MemberTime { path, mtime_secs } => {
+            if let Some(t_clock) = opts.t_clock {
+                let t_clock_secs = t_clock.unix_timestamp();
+                if *mtime_secs > t_clock_secs {
+                    let display = path.display(root);
+                    let mtime_str = match time::OffsetDateTime::from_unix_timestamp(*mtime_secs) {
+                        Ok(dt) => crate::scan::format_rfc3339(dt),
+                        Err(_) => format!("{mtime_secs}s"),
+                    };
+                    let t_clock_str = crate::scan::format_rfc3339(t_clock);
+                    findings.push(Finding {
+                        detector: "D4".into(),
+                        channel: "member_mtime".into(),
+                        path: display,
+                        visibility: opts.visibility,
+                        severity: Severity::Gate,
+                        confidence: 1.0,
+                        hunk: None,
+                        evidence: vec![format!("mtime {mtime_str} > T_clock {t_clock_str}")],
+                    });
+                }
+            }
+        }
+        IndexRecord::TextCont { .. } | IndexRecord::BinaryCont { .. } => {}
         IndexRecord::Fixed(f) => findings.push(Finding {
             detector: f.detector.clone(),
             channel: f.channel.clone(),
@@ -1528,7 +1716,10 @@ pub fn query_reader_with_limit<R: Read>(
             | IndexRecord::Path { path }
             | IndexRecord::Text { path, .. }
             | IndexRecord::Binary { path, .. }
-            | IndexRecord::Pkg { path, .. } => path,
+            | IndexRecord::Pkg { path, .. }
+            | IndexRecord::MemberTime { path, .. }
+            | IndexRecord::Dir { path, .. }
+            | IndexRecord::Symlink { path, .. } => path,
             IndexRecord::Fixed(f) => &f.path,
             IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
         };

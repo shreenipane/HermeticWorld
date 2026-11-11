@@ -11,6 +11,7 @@ pub mod d5a;
 pub mod d6;
 pub mod d8;
 pub mod diff;
+pub mod ext4;
 pub mod fingerprint;
 pub mod gitstore;
 pub mod index;
@@ -40,6 +41,7 @@ pub use d8::check_d8;
 pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
 };
+pub use ext4::{scan_ext4_image, scan_ext4_slice, Ext4Error};
 pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
 pub use gitstore::{
     apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,

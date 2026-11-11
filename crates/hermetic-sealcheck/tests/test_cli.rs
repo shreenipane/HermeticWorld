@@ -1,7 +1,27 @@
 use serde_json::Value;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
+
+fn backdate_tree(root: &Path) {
+    let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_704_067_200); // 2024-01-01T00:00:00Z
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                backdate_tree(&path);
+            }
+            if let Ok(f) = fs::File::open(&path) {
+                let _ = f.set_modified(t);
+            }
+        }
+    }
+    if let Ok(f) = fs::File::open(root) {
+        let _ = f.set_modified(t);
+    }
+}
 
 #[test]
 fn test_cli_task_dir_inside_root_is_not_scanned() {
@@ -40,6 +60,8 @@ fn test_cli_task_dir_inside_root_is_not_scanned() {
     )
     .expect("write problem_statement.md");
 
+    backdate_tree(parent);
+
     let scan = || {
         Command::new(bin_path)
             .arg("scan")
@@ -61,10 +83,32 @@ fn test_cli_task_dir_inside_root_is_not_scanned() {
         "def main():\n    execute_critical_leak_line()\n    do_base_work_initial()\n",
     )
     .expect("write leak");
+    backdate_tree(parent);
+
+    let output = Command::new(bin_path)
+        .arg("scan")
+        .arg("--task")
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base_tree)
+        .arg("--root")
+        .arg(parent)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("executed scan");
     assert_eq!(
-        scan(),
+        output.status.code(),
         Some(2),
         "a leak beside the task dir must still gate"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let findings = report["findings"].as_array().expect("findings array");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["detector"] == "D2" && f["severity"] == "gate"),
+        "gate must come from D2, got: {findings:#?}"
     );
 }
 
@@ -109,6 +153,8 @@ fn test_cli_execution() {
     )
     .expect("write problem_statement.md");
 
+    backdate_tree(base_tree);
+
     // 3. Clean root scan: exit 0
     let status_clean = Command::new(bin_path)
         .arg("scan")
@@ -136,6 +182,7 @@ fn test_cli_execution() {
         "def main():\n    execute_critical_leak_line()\n    do_base_work_initial()\n",
     )
     .expect("write leak");
+    backdate_tree(leak_root);
 
     // 5. Agent-visible leak: exit 2
     let status_leaked = Command::new(bin_path)
@@ -150,12 +197,22 @@ fn test_cli_execution() {
         .arg("agent_visible")
         .arg("--format")
         .arg("json")
-        .status()
+        .output()
         .expect("executed leak scan");
     assert_eq!(
-        status_leaked.code(),
+        status_leaked.status.code(),
         Some(2),
         "agent-visible leak must exit with code 2"
+    );
+    let report_leaked: Value = serde_json::from_slice(&status_leaked.stdout).expect("parse json");
+    let findings_leaked = report_leaked["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(
+        findings_leaked
+            .iter()
+            .any(|f| f["detector"] == "D2" && f["severity"] == "gate"),
+        "agent-visible leak gate must come from D2, got: {findings_leaked:#?}"
     );
 
     // 6. Image-only leak: exit 0 (gate requires agent_visible)
