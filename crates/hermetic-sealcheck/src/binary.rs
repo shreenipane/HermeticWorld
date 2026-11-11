@@ -270,8 +270,14 @@ pub fn parse_elf(bytes: &[u8]) -> Result<BinaryStrings, BinaryMalformed> {
     }
 
     let shstrtab_sec = &sections[e_shstrndx];
-    let shstrtab_bytes = bytes
-        .get(shstrtab_sec.offset..shstrtab_sec.offset + shstrtab_sec.size)
+    // A NOBITS section has no file bytes, and its offset and size were never checked.
+    if shstrtab_sec.sh_type == 8 {
+        return Err(BinaryMalformed("shstrtab is a NOBITS section".into()));
+    }
+    let shstrtab_bytes = shstrtab_sec
+        .offset
+        .checked_add(shstrtab_sec.size)
+        .and_then(|end| bytes.get(shstrtab_sec.offset..end))
         .ok_or_else(|| BinaryMalformed("shstrtab out of bounds".into()))?;
 
     let mut exact_strings = HashSet::new();
@@ -685,15 +691,45 @@ pub fn is_minified_bundle(path: &str, text: &str) -> bool {
     text.lines().any(|l| l.len() >= 5000)
 }
 
-/// Extract tokens from minified text.
+/// Extract tokens from minified text: runs of `[A-Za-z0-9_$]` and quoted-string contents.
+/// `winnow::tokenize` can't be used here: it treats `#` as a comment to the end of the
+/// line, and a minified bundle is one line, so CSS `#fff` or JS `this.#x` would hide the rest.
 pub fn parse_minified(text: &str) -> BinaryStrings {
-    let tokens = tokenize(text);
     let mut exact_strings = HashSet::new();
-    for tok in tokens {
-        if let Some(content) = extract_string_literal_content(&tok.text) {
+    let mut word = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            exact_strings.insert(std::mem::take(&mut word));
+        }
+        if c == '"' || c == '\'' || c == '`' {
+            let mut content = String::new();
+            while let Some(d) = chars.next() {
+                if d == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        content.push(escaped);
+                    }
+                } else if d == c {
+                    break;
+                } else {
+                    content.push(d);
+                }
+            }
+            for part in content.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+            {
+                if !part.is_empty() {
+                    exact_strings.insert(part.to_string());
+                }
+            }
             exact_strings.insert(content);
         }
-        exact_strings.insert(tok.text);
+    }
+    if !word.is_empty() {
+        exact_strings.insert(word);
     }
     BinaryStrings {
         exact_strings,
@@ -789,6 +825,12 @@ pub fn match_binary_items(
     findings
 }
 
+/// `0xCAFEBABE` starts both class files and Mach-O universal binaries. A class file's major
+/// version (bytes 6-7) is 45 or more; a universal binary has a small architecture count there.
+fn is_java_class(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && u16::from_be_bytes([bytes[6], bytes[7]]) >= 45
+}
+
 /// If `bytes` is a recognised binary (ELF, Class, wasm), parse and scan it for D3b.
 /// Returns `Some(findings)` if recognised, or `None` if not a recognised binary format.
 pub fn scan_binary_if_recognized(
@@ -799,8 +841,17 @@ pub fn scan_binary_if_recognized(
 ) -> Option<Vec<Finding>> {
     let (channel, res) = if bytes.starts_with(b"\x7fELF") {
         ("binary_elf", parse_elf(bytes))
-    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) {
+    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) && is_java_class(bytes) {
         ("binary_class", parse_class(bytes))
+    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) {
+        // Same magic as a class file: a Mach-O universal binary. Search its strings.
+        (
+            "binary_macho",
+            Ok(BinaryStrings {
+                exact_strings: HashSet::new(),
+                printable_runs: extract_printable_runs(bytes, 6),
+            }),
+        )
     } else if bytes.starts_with(b"\0asm") {
         ("binary_wasm", parse_wasm(bytes))
     } else {

@@ -830,3 +830,52 @@ fn test_multiline_literal_is_not_an_item() {
     );
     assert!(items.is_empty(), "{items:?}");
 }
+
+#[test]
+fn test_minified_bundle_after_a_hash_is_still_searched() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let dir = tempdir().expect("tempdir");
+    let bundle = ".a{color:#fff}.b{x:1}function f(){elf_leaked_func_one();elf_leaked_func_two()}";
+    fs::write(dir.path().join("app.min.js"), bundle).expect("write");
+    let gates = d3b_gates(dir.path(), &fp);
+    assert!(
+        gates.iter().any(|g| g.channel == "binary_minified"),
+        "{gates:?}"
+    );
+}
+
+#[test]
+fn test_macho_universal_binary_is_not_a_malformed_class() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2];
+    fat.extend_from_slice(&[0u8; 40]);
+    fat.extend_from_slice(b"\0elf_leaked_func_one\0elf_leaked_func_two\0");
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("libfat.dylib"), &fat).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    assert!(
+        findings.iter().all(|f| f.channel != "binary_malformed"),
+        "{findings:?}"
+    );
+    assert!(findings
+        .iter()
+        .any(|f| f.channel == "binary_macho" && f.severity == Severity::Gate));
+}
+
+#[test]
+fn test_hostile_nobits_shstrtab_is_not_a_panic() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut elf = build_elf64_le(&["elf_leaked_func_one"]);
+    let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+    let sec1 = shoff + 64;
+    elf[sec1 + 4..sec1 + 8].copy_from_slice(&8u32.to_le_bytes()); // SHT_NOBITS
+    elf[sec1 + 24..sec1 + 32].copy_from_slice(&u64::MAX.to_le_bytes()); // sh_offset
+    elf[sec1 + 32..sec1 + 40].copy_from_slice(&u64::MAX.to_le_bytes()); // sh_size
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("evil.so"), &elf).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    assert!(findings.iter().any(|f| f.channel == "binary_malformed"));
+}
