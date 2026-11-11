@@ -141,7 +141,8 @@ def write_eval_spec(task_dir: Path, row: dict) -> dict:
     gold_patch_path = task_dir / "staging" / "gold.patch"
     if not gold_patch_path.exists():
         raise EvalSpecError(f"staging/gold.patch not found in {task_dir}")
-    gold_patch_text = gold_patch_path.read_text(encoding="utf-8")
+    # Bytes, not read_text: universal newlines would turn a CRLF file's \r\n into \n.
+    gold_patch_text = gold_patch_path.read_bytes().decode("utf-8")
     if row.get("patch", "") != gold_patch_text:
         raise EvalSpecError("patch mismatch with staging/gold.patch")
 

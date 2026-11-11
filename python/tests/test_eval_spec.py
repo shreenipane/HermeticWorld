@@ -108,6 +108,16 @@ def _setup_task_dir(tmp_path: Path, row: dict) -> Path:
     return task_dir
 
 
+def test_write_eval_spec_keeps_crlf_in_gold_patch(tmp_path: Path) -> None:
+    """A gold patch touching a CRLF file must still match the row byte for byte."""
+    row = _read_row_fixture("pytest-dev__pytest-6202")
+    row = {**row, "patch": row["patch"].replace("\n", "\r\n", 3)}
+    task_dir = _setup_task_dir(tmp_path, row)
+
+    spec = write_eval_spec(task_dir, row)
+    assert spec["instance_id"] == row["instance_id"]
+
+
 def test_write_eval_spec_success(tmp_path: Path) -> None:
     """Verify write_eval_spec cross-checks and outputs grader-only spec and eval.sh."""
     row = _read_row_fixture("pytest-dev__pytest-6202")
