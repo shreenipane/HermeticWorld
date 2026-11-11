@@ -847,41 +847,72 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
                     if mentions_pytest11 && depth == 0 && !waiting_for_open {
                         if let Some(pos) = line.content.find("pytest11") {
                             let after = &line.content[pos + "pytest11".len()..];
-                            let mut open_offset = None;
-                            for (byte_idx, ch) in after.char_indices() {
-                                if ch == '[' || ch == '(' || ch == '{' {
-                                    open_offset = Some(byte_idx + ch.len_utf8());
-                                    break;
-                                }
+                            let mut rest = after.trim_start();
+                            if let Some(stripped) = rest.strip_prefix("\"\"\"") {
+                                rest = stripped;
+                            } else if let Some(stripped) = rest.strip_prefix("'''") {
+                                rest = stripped;
+                            } else if let Some(stripped) =
+                                rest.strip_prefix(|c| c == '\'' || c == '"')
+                            {
+                                rest = stripped;
                             }
+                            rest = rest.trim_start();
+                            let had_separator = if let Some(stripped) =
+                                rest.strip_prefix(|c| c == ':' || c == '=')
+                            {
+                                rest = stripped;
+                                true
+                            } else {
+                                false
+                            };
+                            rest = rest.trim_start();
 
-                            if let Some(start_offset) = open_offset {
-                                depth = 1;
-                                in_pytest11_group = true;
-                                waiting_for_open = false;
+                            let mut chars = rest.chars();
+                            match chars.next() {
+                                Some('[' | '(' | '{') => {
+                                    depth = 1;
+                                    in_pytest11_group = true;
+                                    waiting_for_open = false;
 
-                                for ch in after[start_offset..].chars() {
-                                    match ch {
-                                        '[' | '(' | '{' => depth += 1,
-                                        ']' | ')' | '}' => {
-                                            depth = depth.saturating_sub(1);
-                                            if depth == 0 {
-                                                in_pytest11_group = false;
-                                                break;
+                                    let after_open = chars.as_str();
+                                    let stripped_after =
+                                        strip_python_comments_and_strings(after_open);
+                                    for ch in stripped_after.chars() {
+                                        match ch {
+                                            '[' | '(' | '{' => depth += 1,
+                                            ']' | ')' | '}' => {
+                                                depth = depth.saturating_sub(1);
+                                                if depth == 0 {
+                                                    in_pytest11_group = false;
+                                                    break;
+                                                }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
-                            } else {
-                                waiting_for_open = true;
-                                in_pytest11_group = false;
-                                depth = 0;
+                                None if had_separator => {
+                                    waiting_for_open = true;
+                                    in_pytest11_group = false;
+                                    depth = 0;
+                                }
+                                Some('#') if had_separator => {
+                                    waiting_for_open = true;
+                                    in_pytest11_group = false;
+                                    depth = 0;
+                                }
+                                _ => {
+                                    waiting_for_open = false;
+                                    in_pytest11_group = false;
+                                    depth = 0;
+                                }
                             }
                         }
                     } else if waiting_for_open {
+                        let stripped = strip_python_comments_and_strings(&line.content);
                         let mut open_offset = None;
-                        for (byte_idx, ch) in line.content.char_indices() {
+                        for (byte_idx, ch) in stripped.char_indices() {
                             if ch == '[' || ch == '(' || ch == '{' {
                                 open_offset = Some(byte_idx + ch.len_utf8());
                                 break;
@@ -893,7 +924,7 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
                             in_pytest11_group = true;
                             waiting_for_open = false;
 
-                            for ch in line.content[start_offset..].chars() {
+                            for ch in stripped[start_offset..].chars() {
                                 match ch {
                                     '[' | '(' | '{' => depth += 1,
                                     ']' | ')' | '}' => {
@@ -908,7 +939,8 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
                             }
                         }
                     } else if in_pytest11_group {
-                        for ch in line.content.chars() {
+                        let stripped = strip_python_comments_and_strings(&line.content);
+                        for ch in stripped.chars() {
                             match ch {
                                 '[' | '(' | '{' => depth += 1,
                                 ']' | ')' | '}' => {

@@ -710,3 +710,87 @@ diff --git a/setup.py b/setup.py
         .iter()
         .any(|e| e.contains("entry_points={'pytest11': ['plugin = pkg.plugin']}")));
 }
+
+#[test]
+fn test_d11_setup_py_entry_points_variable_followed_by_changed_version_gives_no_finding() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,4 +10,4 @@
+     entry_points={'pytest11': plugins},
+-    version=\"1.0.0\",
++    version=\"2.0.0\",
+     description=\"pkg\",
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert!(
+        findings.is_empty(),
+        "Unchanged entry_points with variable followed by changed version= must give no finding"
+    );
+}
+
+#[test]
+fn test_d11_setup_py_multiline_pytest11_comment_bracket_does_not_close_group() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,6 +10,7 @@
+ entry_points={
+     'pytest11': [
+         # ]
++        'plugin = pkg.plugin',
+     ],
+ }
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "runner_config_section");
+    assert_eq!(findings[0].path, "setup.py");
+    assert!(findings[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("plugin = pkg.plugin")));
+}
+
+#[test]
+fn test_d11_setup_py_string_element_with_bracket_does_not_close_group() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,6 +10,7 @@
+ entry_points={
+     'pytest11': [
+         'p = pkg:x]',
++        'q = pkg:y',
+     ],
+ }
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "runner_config_section");
+    assert_eq!(findings[0].path, "setup.py");
+    assert!(findings[0].evidence.iter().any(|e| e.contains("q = pkg:y")));
+}
+
+#[test]
+fn test_d11_setup_py_inline_string_element_with_bracket_followed_by_changed_version_gives_no_finding(
+) {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,4 +10,4 @@
+     entry_points={'pytest11': ['p = pkg:x]']},
+-    version=\"1.0.0\",
++    version=\"2.0.0\",
+     description=\"pkg\",
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert!(
+        findings.is_empty(),
+        "Inline string element containing ']' followed by changed version= must give no finding"
+    );
+}
