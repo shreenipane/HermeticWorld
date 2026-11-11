@@ -28,19 +28,22 @@ class ModelError(Exception):
             super().__init__(str(message_or_status))
 
 
-def load_api_key(env: Mapping[str, str] = os.environ) -> str:
-    """Read the Gemini API key from the file named by HERMETIC_GEMINI_KEY_FILE.
+def load_api_key(
+    env: Mapping[str, str] = os.environ,
+    var: str = "HERMETIC_GEMINI_KEY_FILE",
+) -> str:
+    """Read an API key from the file named by the environment variable `var`.
 
     Raises ModelError on missing variable, missing file, or read failure,
     without echoing the key's contents.
     """
-    path_str = env.get("HERMETIC_GEMINI_KEY_FILE")
+    path_str = env.get(var)
     if not path_str:
-        raise ModelError("HERMETIC_GEMINI_KEY_FILE environment variable is not set")
+        raise ModelError(f"{var} environment variable is not set")
 
     key_file = Path(path_str)
     if not key_file.is_file():
-        raise ModelError(f"HERMETIC_GEMINI_KEY_FILE points to nonexistent file: {key_file}")
+        raise ModelError(f"{var} points to nonexistent file: {key_file}")
 
     try:
         key = key_file.read_text(encoding="utf-8").strip()
@@ -124,8 +127,10 @@ class GeminiClient:
             text = text.replace(self.api_key, "[REDACTED]")
         return text
 
-    def generate(self, system: str, messages: list[dict[str, str]]) -> ModelReply:
-        """Call generateContent and return ModelReply."""
+    def _build_request(
+        self, system: str, messages: list[dict[str, str]]
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """Return the URL, headers and JSON body of a generateContent call."""
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         headers = {
             "x-goog-api-key": self.api_key,
@@ -150,7 +155,31 @@ class GeminiClient:
             body_dict["systemInstruction"] = {
                 "parts": [{"text": system}],
             }
+        return url, headers, body_dict
 
+    def _embedded_error(self, data: dict[str, Any]) -> tuple[int, str] | None:
+        """Return (status, body) when a 200 response actually carries an error."""
+        return None
+
+    def _parse_reply(self, data: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+        """Return the text, finish reason and usage of a successful response."""
+        candidates = data.get("candidates", [])
+        text_parts = []
+        finish_reason = ""
+        if candidates:
+            cand = candidates[0]
+            finish_reason = cand.get("finishReason", "")
+            content = cand.get("content", {})
+            parts = content.get("parts", [])
+            for part in parts:
+                if not part.get("thought", False):
+                    text_parts.append(part.get("text", ""))
+
+        return "".join(text_parts), finish_reason, data.get("usageMetadata", {})
+
+    def generate(self, system: str, messages: list[dict[str, str]]) -> ModelReply:
+        """Call the model API and return ModelReply."""
+        url, headers, body_dict = self._build_request(system, messages)
         body_bytes = json.dumps(body_dict).encode("utf-8")
 
         t0 = time.monotonic()
@@ -170,31 +199,22 @@ class GeminiClient:
                     scrubbed = self._scrub(str(exc))
                     raise ModelError(200, f"Failed to parse JSON response: {scrubbed[:500]}")
 
-                candidates = data.get("candidates", [])
-                text_parts = []
-                finish_reason = ""
-                if candidates:
-                    cand = candidates[0]
-                    finish_reason = cand.get("finishReason", "")
-                    content = cand.get("content", {})
-                    parts = content.get("parts", [])
-                    for part in parts:
-                        if not part.get("thought", False):
-                            text_parts.append(part.get("text", ""))
+                embedded = self._embedded_error(data)
+                if embedded is None:
+                    text, finish_reason, usage = self._parse_reply(data)
+                    return ModelReply(
+                        text=text,
+                        finish_reason=finish_reason,
+                        usage=usage,
+                        latency_s=latency_s,
+                        attempts=attempt,
+                    )
+                status, raw_body_str = embedded
+            else:
+                raw_body_str = body_bytes_out.decode("utf-8", errors="replace")
 
-                text = "".join(text_parts)
-                usage = data.get("usageMetadata", {})
-                return ModelReply(
-                    text=text,
-                    finish_reason=finish_reason,
-                    usage=usage,
-                    latency_s=latency_s,
-                    attempts=attempt,
-                )
-
-            # Non-200 status
+            # Failed call
             last_status = status
-            raw_body_str = body_bytes_out.decode("utf-8", errors="replace")
             last_body = self._scrub(raw_body_str)
 
             if status in RETRYABLE_STATUSES and attempt < self.max_attempts:
@@ -216,3 +236,60 @@ class GeminiClient:
                 raise ModelError(status, last_body[:500])
 
         raise ModelError(last_status, last_body[:500])
+
+
+class OpenRouterClient(GeminiClient):
+    """Client for OpenRouter's free models, through its chat completions API."""
+
+    def __init__(self, model: str, api_key: str, **kwargs: Any) -> None:
+        # Fail closed: a free-tier run must never reach a priced model.
+        if not model.endswith(":free"):
+            raise ModelError(f"OpenRouter model must be a ':free' model, got: {model}")
+        super().__init__(model, api_key, **kwargs)
+
+    def _build_request(
+        self, system: str, messages: list[dict[str, str]]
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        chat = [{"role": "system", "content": system}] if system else []
+        for msg in messages:
+            role = "assistant" if msg["role"] == "model" else msg["role"]
+            chat.append({"role": role, "content": msg["text"]})
+
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        return url, headers, {
+            "model": self.model,
+            "messages": chat,
+            "temperature": 0,
+            "max_tokens": 16384,
+        }
+
+    def _embedded_error(self, data: dict[str, Any]) -> tuple[int, str] | None:
+        # OpenRouter can answer 200 with an upstream provider's error in the body.
+        error = data.get("error")
+        if not error:
+            return None
+        code = error.get("code") if isinstance(error, dict) else None
+        return (code if isinstance(code, int) else 502), json.dumps(error)
+
+    def _parse_reply(self, data: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+        text = ""
+        finish_reason = ""
+        choices = data.get("choices", [])
+        if choices:
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason") or ""
+            text = (choice.get("message") or {}).get("content") or ""
+
+        # The agent loop totals usage under Gemini's field names.
+        raw = data.get("usage") or {}
+        usage = {
+            "promptTokenCount": raw.get("prompt_tokens", 0),
+            "candidatesTokenCount": raw.get("completion_tokens", 0),
+            "totalTokenCount": raw.get("total_tokens", 0),
+            "thoughtsTokenCount": (raw.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+        }
+        return text, finish_reason, usage

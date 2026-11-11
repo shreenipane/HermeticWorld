@@ -10,11 +10,88 @@ from hermetic_slice.model_client import (
     GeminiClient,
     ModelError,
     ModelReply,
+    OpenRouterClient,
     PostResult,
     load_api_key,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "model"
+FREE_MODEL = "vendor/some-model:free"
+
+
+def test_openrouter_request_and_reply() -> None:
+    captured: dict = {}
+    response = {
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done", "reasoning": "hidden"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "completion_tokens_details": {"reasoning_tokens": 2}},
+    }
+
+    def fake_post(url: str, headers: dict[str, str], body: bytes, timeout: float = 300):
+        captured.update(url=url, headers=headers, body=json.loads(body.decode("utf-8")))
+        return PostResult(200, json.dumps(response).encode("utf-8"))
+
+    client = OpenRouterClient(FREE_MODEL, "or-key", http_post=fake_post)
+    reply = client.generate("sys", [{"role": "user", "text": "a"}, {"role": "model", "text": "b"}])
+
+    assert reply.text == "done"
+    assert reply.finish_reason == "stop"
+    assert reply.usage == {"promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10, "thoughtsTokenCount": 2}
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer or-key"
+    assert captured["body"]["model"] == FREE_MODEL
+    assert [m["role"] for m in captured["body"]["messages"]] == ["system", "user", "assistant"]
+
+
+@pytest.mark.parametrize("model", ["vendor/paid-model", "openrouter/free", "vendor/x:freebie"])
+def test_openrouter_refuses_non_free_models(model: str) -> None:
+    with pytest.raises(ModelError, match="':free'"):
+        OpenRouterClient(model, "or-key")
+
+
+def test_openrouter_retries_error_inside_200_response() -> None:
+    bodies = [
+        {"error": {"code": 429, "message": "upstream rate limited"}},
+        {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+    ]
+    sleeps: list[float] = []
+
+    def fake_post(url: str, headers: dict[str, str], body: bytes, timeout: float = 300):
+        return PostResult(200, json.dumps(bodies.pop(0)).encode("utf-8"))
+
+    client = OpenRouterClient(FREE_MODEL, "or-key", http_post=fake_post, sleep=sleeps.append)
+    reply = client.generate("", [{"role": "user", "text": "a"}])
+
+    assert reply.text == "ok"
+    assert reply.attempts == 2
+    assert sleeps == [5.0]
+
+
+def test_openrouter_null_content_is_empty_text() -> None:
+    response = {"choices": [{"finish_reason": "length", "message": {"content": None}}]}
+
+    def fake_post(url: str, headers: dict[str, str], body: bytes, timeout: float = 300):
+        return PostResult(200, json.dumps(response).encode("utf-8"))
+
+    reply = OpenRouterClient(FREE_MODEL, "or-key", http_post=fake_post).generate("", [{"role": "user", "text": "a"}])
+    assert reply.text == ""
+    assert reply.finish_reason == "length"
+
+
+def test_openrouter_error_body_scrubs_key() -> None:
+    def fake_post(url: str, headers: dict[str, str], body: bytes, timeout: float = 300):
+        return PostResult(401, b'{"error": "bad key or-key"}')
+
+    with pytest.raises(ModelError) as exc_info:
+        OpenRouterClient(FREE_MODEL, "or-key", http_post=fake_post).generate("", [{"role": "user", "text": "a"}])
+    assert "or-key" not in str(exc_info.value)
+
+
+def test_load_api_key_named_variable(tmp_path: Path) -> None:
+    key_file = tmp_path / "or.key"
+    key_file.write_text("or-key\n", encoding="utf-8")
+    assert load_api_key({"HERMETIC_OPENROUTER_KEY_FILE": str(key_file)}, var="HERMETIC_OPENROUTER_KEY_FILE") == "or-key"
+    with pytest.raises(ModelError, match="HERMETIC_OPENROUTER_KEY_FILE"):
+        load_api_key({}, var="HERMETIC_OPENROUTER_KEY_FILE")
 
 
 def test_model_client_parses_real_fixture() -> None:
