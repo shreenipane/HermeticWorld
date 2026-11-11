@@ -41,7 +41,7 @@ pub const MAX_REQUEST_FRAME_SIZE: usize = 16 * 1024;
 pub const REQUEST_HEADER_SIZE: usize = 4 + 1 + 1 + 1 + 1 + 8 + 2 + 2 + 8 + 8; // = 36
 
 /// Maximum authority length.
-pub const MAX_AUTHORITY_LEN: usize = 255;
+pub const MAX_AUTHORITY_LEN: usize = 259;
 
 /// Maximum path_and_query length.
 pub const MAX_PATH_LEN: usize = 8 * 1024;
@@ -118,7 +118,7 @@ pub struct ResponseFrame {
 
 // ── Validation helpers ──
 
-fn validate_authority(auth: &[u8]) -> Result<(), WireError> {
+pub fn validate_authority(auth: &[u8]) -> Result<(), WireError> {
     if auth.is_empty() {
         return Err(WireError::Malformed("authority is empty".into()));
     }
@@ -129,40 +129,63 @@ fn validate_authority(auth: &[u8]) -> Result<(), WireError> {
             MAX_AUTHORITY_LEN
         )));
     }
-    // Must match [a-z0-9.-]+(:[0-9]{1,5})?
     let s = std::str::from_utf8(auth)
         .map_err(|_| WireError::Malformed("authority is not valid UTF-8".into()))?;
 
-    let parts: Vec<&str> = s.split(':').collect();
-    match parts.len() {
-        1 => {
-            let host = parts[0];
-            if host.is_empty()
-                || !host
-                    .bytes()
-                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
-            {
-                return Err(WireError::Malformed("invalid host in authority".into()));
-            }
+    let (host, port_opt) = match s.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (s, None),
+    };
+
+    if host.is_empty() || host.len() > 253 {
+        return Err(WireError::Malformed(
+            "host length must be 1..=253 chars".into(),
+        ));
+    }
+
+    if host.starts_with('.') || host.ends_with('.') {
+        return Err(WireError::Malformed(
+            "host cannot start or end with a dot".into(),
+        ));
+    }
+
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(WireError::Malformed(
+                "label length must be 1..=63 chars".into(),
+            ));
         }
-        2 => {
-            let host = parts[0];
-            let port = parts[1];
-            if host.is_empty()
-                || !host
-                    .bytes()
-                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
-            {
-                return Err(WireError::Malformed("invalid host in authority".into()));
-            }
-            if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(WireError::Malformed("invalid port in authority".into()));
-            }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(WireError::Malformed(
+                "label cannot start or end with '-'".into(),
+            ));
         }
-        _ => {
-            return Err(WireError::Malformed("too many colons in authority".into()));
+        if !label
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        {
+            return Err(WireError::Malformed(
+                "invalid character in authority label".into(),
+            ));
         }
     }
+
+    if let Some(port) = port_opt {
+        if port.is_empty()
+            || port.len() > 5
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.starts_with('0')
+        {
+            return Err(WireError::Malformed("invalid port in authority".into()));
+        }
+        let port_num = port
+            .parse::<u32>()
+            .map_err(|_| WireError::Malformed("invalid port number".into()))?;
+        if !(1..=65535).contains(&port_num) {
+            return Err(WireError::Malformed("port out of range 1..=65535".into()));
+        }
+    }
+
     Ok(())
 }
 
@@ -192,7 +215,7 @@ fn validate_path_and_query(pq: &[u8]) -> Result<(), WireError> {
     Ok(())
 }
 
-fn validate_header_name(name: &[u8]) -> Result<(), WireError> {
+pub fn validate_header_name(name: &[u8]) -> Result<(), WireError> {
     // HTTP token characters: any VCHAR except delimiters
     // RFC 7230 token = 1*tchar
     // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
@@ -222,7 +245,7 @@ fn is_token_char(b: u8) -> bool {
     )
 }
 
-fn validate_header_value(value: &[u8]) -> Result<(), WireError> {
+pub fn validate_header_value(value: &[u8]) -> Result<(), WireError> {
     // Printable ASCII (0x20..=0x7E) plus HTAB (0x09)
     for &b in value {
         if !(b == 0x09 || (0x20..=0x7E).contains(&b)) {
@@ -604,7 +627,11 @@ impl ResponseFrame {
         }
 
         let body_start = pos;
-        let body_end = body_start + body_len as usize;
+        let body_len_usize = usize::try_from(body_len)
+            .map_err(|_| WireError::Malformed("body length overflow".into()))?;
+        let body_end = body_start
+            .checked_add(body_len_usize)
+            .ok_or_else(|| WireError::Malformed("body length overflow".into()))?;
         if body_end != data.len() {
             return Err(WireError::Malformed(format!(
                 "frame length mismatch: body ends at {body_end} but frame is {} bytes",
@@ -1017,6 +1044,37 @@ mod tests {
         assert!(validate_authority(b"example.com/path").is_err());
         // Invalid: spaces
         assert!(validate_authority(b"example .com").is_err());
+
+        // FIX 1 required test authorities
+        assert!(validate_authority(b"..").is_err());
+        assert!(validate_authority(b".").is_err());
+        assert!(validate_authority(b"a..b").is_err());
+        assert!(validate_authority(b".a").is_err());
+        assert!(validate_authority(b"a.").is_err());
+        assert!(validate_authority(b"-a.com").is_err());
+        assert!(validate_authority(b"a-.com").is_err());
+        assert!(validate_authority(b"../etc").is_err());
+        assert!(validate_authority(b"example.com:0").is_err());
+    }
+
+    #[test]
+    fn test_response_decode_body_len_overflow() {
+        // FIX 10: decode with limit u64::MAX and a header claiming body_len near u64::MAX returns an error, no panic
+        let mut data = vec![0u8; RESPONSE_HEADER_SIZE];
+        data[0..4].copy_from_slice(RESPONSE_MAGIC);
+        data[4] = WIRE_VERSION;
+        // status = 200
+        data[16..18].copy_from_slice(&200u16.to_le_bytes());
+        // header_count = 0
+        data[18..20].copy_from_slice(&0u16.to_le_bytes());
+        // body_len near u64::MAX
+        data[20..28].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+
+        let res = ResponseFrame::decode(&data, u64::MAX);
+        assert!(
+            res.is_err(),
+            "Overflowing body_end must return error, not panic"
+        );
     }
 
     #[test]

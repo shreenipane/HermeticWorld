@@ -14,10 +14,26 @@ use crate::store::{DirStore, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerExit {
-    Normal,
+    Normal = 0,
+    StartupFailed = 1,
     Tampered = 3,
     LimitExceeded = 4,
+    LogFailed = 5,
 }
+
+impl std::fmt::Display for ServerExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerExit::Normal => write!(f, "Normal exit"),
+            ServerExit::StartupFailed => write!(f, "Startup failed"),
+            ServerExit::Tampered => write!(f, "Tampered"),
+            ServerExit::LimitExceeded => write!(f, "Limit exceeded"),
+            ServerExit::LogFailed => write!(f, "Log failed"),
+        }
+    }
+}
+
+impl std::error::Error for ServerExit {}
 
 pub struct ServerConfig {
     pub store_dir: PathBuf,
@@ -30,6 +46,7 @@ pub struct ServerConfig {
     pub max_bytes: Option<u64>,
     pub allow_no_landlock: bool,
     pub no_sandbox: bool, // For in-process unit testing without restricting cargo test runner
+    pub resume_log: bool,
 }
 
 /// Format an OffsetDateTime in IMF-fixdate format (RFC 7231 / RFC 9110), e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
@@ -71,6 +88,7 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
 }
 
 /// Strip forbidden headers: memento-*, x-archive-*, server containing pywb.
+/// Drop invalid headers: not a lowercase token, not printable ASCII/HTAB, or exceeding caps.
 pub fn filter_headers(
     extra_headers: Vec<(String, String)>,
     content_type: Option<&str>,
@@ -79,36 +97,79 @@ pub fn filter_headers(
     content_range: Option<&str>,
 ) -> Vec<ResponseHeader> {
     let mut out = Vec::new();
+    let mut total_bytes = 0;
+
+    let try_push =
+        |name: String, value: String, out: &mut Vec<ResponseHeader>, total: &mut usize| -> bool {
+            if out.len() >= hermetic_common::MAX_RESPONSE_HEADERS {
+                eprintln!("Dropping header '{name}': MAX_RESPONSE_HEADERS reached");
+                return false;
+            }
+            if name.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
+                eprintln!("Dropping header '{name}': per-header limit exceeded");
+                return false;
+            }
+            let h_bytes = name.len() + value.len();
+            if *total + h_bytes > hermetic_common::MAX_RESPONSE_HEADERS_BYTES {
+                eprintln!("Dropping header '{name}': MAX_RESPONSE_HEADERS_BYTES exceeded");
+                return false;
+            }
+            if hermetic_common::validate_header_name(name.as_bytes()).is_err() {
+                eprintln!("Dropping header '{name}': invalid name (not a lowercase token)");
+                return false;
+            }
+            if hermetic_common::validate_header_value(value.as_bytes()).is_err() {
+                eprintln!("Dropping header '{name}': invalid value (not printable ASCII/HTAB)");
+                return false;
+            }
+            *total += h_bytes;
+            out.push(ResponseHeader { name, value });
+            true
+        };
 
     // Standard headers
-    out.push(ResponseHeader {
-        name: "date".into(),
-        value: date_str.into(),
-    });
-    out.push(ResponseHeader {
-        name: "content-length".into(),
-        value: content_length.to_string(),
-    });
-    out.push(ResponseHeader {
-        name: "accept-ranges".into(),
-        value: "bytes".into(),
-    });
+    try_push("date".into(), date_str.into(), &mut out, &mut total_bytes);
+    try_push(
+        "content-length".into(),
+        content_length.to_string(),
+        &mut out,
+        &mut total_bytes,
+    );
+    try_push(
+        "accept-ranges".into(),
+        "bytes".into(),
+        &mut out,
+        &mut total_bytes,
+    );
 
     if let Some(ct) = content_type {
-        out.push(ResponseHeader {
-            name: "content-type".into(),
-            value: ct.into(),
-        });
+        let valid_ct = if hermetic_common::validate_header_value(ct.as_bytes()).is_ok()
+            && ct.len() <= hermetic_common::MAX_RESPONSE_HEADERS_BYTES
+            && ct.len() <= u16::MAX as usize
+        {
+            ct
+        } else {
+            eprintln!("Sidecar content_type is invalid, falling back to application/octet-stream");
+            "application/octet-stream"
+        };
+        try_push(
+            "content-type".into(),
+            valid_ct.into(),
+            &mut out,
+            &mut total_bytes,
+        );
     }
 
     if let Some(cr) = content_range {
-        out.push(ResponseHeader {
-            name: "content-range".into(),
-            value: cr.into(),
-        });
+        try_push(
+            "content-range".into(),
+            cr.into(),
+            &mut out,
+            &mut total_bytes,
+        );
     }
 
-    // Extra headers with security stripping
+    // Extra headers with security stripping & validation
     for (name, val) in extra_headers {
         let lower = name.to_ascii_lowercase();
         if lower.starts_with("memento-") || lower.starts_with("x-archive-") {
@@ -117,7 +178,7 @@ pub fn filter_headers(
         if lower == "server" && val.to_ascii_lowercase().contains("pywb") {
             continue;
         }
-        // Don't overwrite the ones we already set
+        // Don't overwrite standard headers
         if lower == "date"
             || lower == "content-length"
             || lower == "content-type"
@@ -126,10 +187,13 @@ pub fn filter_headers(
         {
             continue;
         }
-        out.push(ResponseHeader {
-            name: lower,
-            value: val,
-        });
+        // Name must be a lowercase token
+        if name != lower {
+            eprintln!("Dropping header '{name}': name is not lowercase");
+            continue;
+        }
+
+        try_push(name, val, &mut out, &mut total_bytes);
     }
 
     out
@@ -144,10 +208,16 @@ pub struct WorldServer {
 }
 
 impl WorldServer {
-    pub fn new(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: ServerConfig) -> Result<Self, ServerExit> {
         // Step 1: Open store directory and create log files
         let store = DirStore::new(&config.store_dir);
-        let log = LogManager::new(&config.log_dir)?;
+        let log = match LogManager::new_opts(&config.log_dir, config.resume_log) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                return Err(ServerExit::StartupFailed);
+            }
+        };
         let limits = Limits::new(
             config.rate_rps,
             config.burst,
@@ -172,7 +242,7 @@ impl WorldServer {
         }
         let listener = UnixListener::bind(&self.config.socket_path).map_err(|e| {
             eprintln!("Failed to bind socket: {e}");
-            ServerExit::Normal
+            ServerExit::StartupFailed
         })?;
 
         // Step 3: Apply Landlock and Seccomp (TR-WS-1)
@@ -183,7 +253,7 @@ impl WorldServer {
                 self.config.allow_no_landlock,
             ) {
                 eprintln!("Failed to apply sandbox: {e}");
-                return Err(ServerExit::Normal);
+                return Err(ServerExit::StartupFailed);
             }
         }
 
@@ -222,7 +292,7 @@ impl WorldServer {
                     // Malformed frame: log tampered, exit code 3
                     let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
                     eprintln!("Malformed frame received: {reason}");
-                    let _ = self.log.log_event(&LogEventParams {
+                    if let Err(e) = self.log.log_event(&LogEventParams {
                         elapsed_ms,
                         request_id: 0,
                         method: "",
@@ -231,7 +301,11 @@ impl WorldServer {
                         range: None,
                         status: "tampered",
                         bytes: 0,
-                    });
+                    }) {
+                        eprintln!("log_failed: {e}");
+                        let _ = self.log.finish();
+                        return ServerExit::LogFailed;
+                    }
                     let _ = self.log.finish();
                     return ServerExit::Tampered;
                 }
@@ -244,7 +318,7 @@ impl WorldServer {
             // 1. Check request cap
             if self.limits.check_request_cap().is_err() {
                 let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-                let _ = self.log.log_event(&LogEventParams {
+                if let Err(e) = self.log.log_event(&LogEventParams {
                     elapsed_ms,
                     request_id: frame.request_id,
                     method: match frame.method {
@@ -256,7 +330,11 @@ impl WorldServer {
                     range: frame.range,
                     status: "limit_exceeded",
                     bytes: 0,
-                });
+                }) {
+                    eprintln!("log_failed: {e}");
+                    let _ = self.log.finish();
+                    return ServerExit::LogFailed;
+                }
                 let _ = self.log.finish();
                 return ServerExit::LimitExceeded;
             }
@@ -351,7 +429,7 @@ impl WorldServer {
 
             // 4. Check byte cap
             if self.limits.check_bytes_cap(response_bytes).is_err() {
-                let _ = self.log.log_event(&LogEventParams {
+                if let Err(e) = self.log.log_event(&LogEventParams {
                     elapsed_ms,
                     request_id: frame.request_id,
                     method: method_str,
@@ -360,7 +438,11 @@ impl WorldServer {
                     range: frame.range,
                     status: "limit_exceeded",
                     bytes: 0,
-                });
+                }) {
+                    eprintln!("log_failed: {e}");
+                    let _ = self.log.finish();
+                    return ServerExit::LogFailed;
+                }
                 let _ = self.log.finish();
                 return ServerExit::LimitExceeded;
             }
@@ -376,6 +458,23 @@ impl WorldServer {
             let max_body = self.config.max_bytes.unwrap_or(u64::MAX);
             if let Err(e) = response.write_to(stream, max_body) {
                 eprintln!("Error writing response frame: {e}");
+                self.limits.record_request();
+                self.limits.record_bytes(response_bytes);
+                if let Err(log_err) = self.log.log_event(&LogEventParams {
+                    elapsed_ms,
+                    request_id: frame.request_id,
+                    method: method_str,
+                    authority: &frame.authority,
+                    path_and_query: &frame.path_and_query,
+                    range: frame.range,
+                    status: "write_error",
+                    bytes: response_bytes,
+                }) {
+                    eprintln!("log_failed: {log_err}");
+                    let _ = self.log.finish();
+                    return ServerExit::LogFailed;
+                }
+                let _ = self.log.finish();
                 return ServerExit::Normal;
             }
 
@@ -384,7 +483,7 @@ impl WorldServer {
             self.limits.record_bytes(response_bytes);
 
             let status_str = status.to_string();
-            let _ = self.log.log_event(&LogEventParams {
+            if let Err(e) = self.log.log_event(&LogEventParams {
                 elapsed_ms,
                 request_id: frame.request_id,
                 method: method_str,
@@ -393,7 +492,11 @@ impl WorldServer {
                 range: frame.range,
                 status: &status_str,
                 bytes: response_bytes,
-            });
+            }) {
+                eprintln!("log_failed: {e}");
+                let _ = self.log.finish();
+                return ServerExit::LogFailed;
+            }
         }
     }
 }

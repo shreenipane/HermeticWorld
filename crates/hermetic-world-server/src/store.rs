@@ -1,8 +1,61 @@
 #![forbid(unsafe_code)]
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Helper to normalize path components lexically.
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Prefix(p) => out.push(p.as_os_str()),
+            std::path::Component::RootDir => out.push(comp.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::Normal(c) => out.push(c),
+        }
+    }
+    out
+}
+
+/// Verify component-wise that path stays inside root (never string prefix).
+pub fn is_inside_root(root: &Path, path: &Path) -> bool {
+    let norm_root = normalize_components(root);
+    let norm_path = normalize_components(path);
+
+    let mut root_comps = norm_root.components();
+    let mut path_comps = norm_path.components();
+
+    for r in &mut root_comps {
+        match path_comps.next() {
+            Some(p) if p == r => {}
+            _ => return false,
+        }
+    }
+
+    if path_comps.next().is_none() {
+        return false;
+    }
+
+    if let (Ok(canon_root), Ok(canon_path)) = (root.canonicalize(), path.canonicalize()) {
+        let mut c_root_comps = canon_root.components();
+        let mut c_path_comps = canon_path.components();
+        for r in &mut c_root_comps {
+            match c_path_comps.next() {
+                Some(p) if p == r => {}
+                _ => return false,
+            }
+        }
+        if c_path_comps.next().is_none() {
+            return false;
+        }
+    }
+
+    true
+}
 
 /// An object retrieved from a store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +81,7 @@ struct SidecarHeaders {
     content_type: Option<String>,
     #[serde(rename = "content-type")]
     content_type_dash: Option<String>,
-    headers: Option<HashMap<String, String>>,
+    headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,14 +96,22 @@ struct Custom404 {
 impl DirStore {
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         Self {
-            root: root.as_ref().to_path_buf(),
+            root: normalize_components(root.as_ref()),
         }
     }
 
     /// Return custom or default 404 response for the given authority: (status, content_type, body).
     pub fn get_404(&self, authority: &str) -> (u16, Option<String>, Vec<u8>) {
+        if hermetic_common::validate_authority(authority.as_bytes()).is_err() {
+            return (
+                404,
+                Some("text/html".to_string()),
+                b"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>".to_vec(),
+            );
+        }
+
         let sidecar_path = self.root.join(authority).join(".404.json");
-        if sidecar_path.is_file() {
+        if is_inside_root(&self.root, &sidecar_path) && sidecar_path.is_file() {
             if let Ok(data) = std::fs::read_to_string(&sidecar_path) {
                 if let Ok(c404) = serde_json::from_str::<Custom404>(&data) {
                     let status = c404.status.unwrap_or(404);
@@ -105,6 +166,10 @@ impl DirStore {
 
     /// Resolve authority and path_and_query to an on-disk file path, rejecting traversal attacks.
     fn resolve_path(&self, authority: &str, path_and_query: &str) -> Option<PathBuf> {
+        if hermetic_common::validate_authority(authority.as_bytes()).is_err() {
+            return None;
+        }
+
         // Must start with '/'
         if !path_and_query.starts_with('/') {
             return None;
@@ -152,13 +217,13 @@ impl DirStore {
             if raw_segs.is_empty() {
                 // Root with query: %3F<query>
                 candidate.push(format!("%3F{q}"));
-                if candidate.is_file() {
+                if is_inside_root(&self.root, &candidate) && candidate.is_file() {
                     return Some(candidate);
                 }
                 // Or index.html%3F<query>
                 let mut alt = auth_dir.clone();
                 alt.push(format!("index.html%3F{q}"));
-                if alt.is_file() {
+                if is_inside_root(&self.root, &alt) && alt.is_file() {
                     return Some(alt);
                 }
             } else {
@@ -168,14 +233,14 @@ impl DirStore {
                 let last = raw_segs[raw_segs.len() - 1];
                 let mut with_q = candidate.clone();
                 with_q.push(format!("{last}%3F{q}"));
-                if with_q.is_file() {
+                if is_inside_root(&self.root, &with_q) && with_q.is_file() {
                     return Some(with_q);
                 }
                 // If trailing slash was requested, might be `<last>/index.html%3F<q>`
                 let mut index_with_q = candidate.clone();
                 index_with_q.push(last);
                 index_with_q.push(format!("index.html%3F{q}"));
-                if index_with_q.is_file() {
+                if is_inside_root(&self.root, &index_with_q) && index_with_q.is_file() {
                     return Some(index_with_q);
                 }
             }
@@ -188,13 +253,13 @@ impl DirStore {
             candidate.push(seg);
         }
 
-        if candidate.is_file() {
+        if is_inside_root(&self.root, &candidate) && candidate.is_file() {
             return Some(candidate);
         }
 
         // If directory or trailing slash, look for index.html
         let index_candidate = candidate.join("index.html");
-        if index_candidate.is_file() {
+        if is_inside_root(&self.root, &index_candidate) && index_candidate.is_file() {
             return Some(index_candidate);
         }
 
@@ -202,9 +267,9 @@ impl DirStore {
     }
 
     /// Read optional sidecar `<file>.headers.json`.
-    fn read_sidecar(file_path: &Path) -> (Option<String>, Vec<(String, String)>) {
+    fn read_sidecar(&self, file_path: &Path) -> (Option<String>, Vec<(String, String)>) {
         let sidecar_path = PathBuf::from(format!("{}.headers.json", file_path.display()));
-        if sidecar_path.is_file() {
+        if is_inside_root(&self.root, &sidecar_path) && sidecar_path.is_file() {
             if let Ok(data) = std::fs::read_to_string(&sidecar_path) {
                 if let Ok(sc) = serde_json::from_str::<SidecarHeaders>(&data) {
                     let ct = sc.content_type.or(sc.content_type_dash);
@@ -237,8 +302,11 @@ impl DirStore {
 impl Store for DirStore {
     fn get(&self, authority: &str, path_and_query: &str) -> Option<StoredObject> {
         let file_path = self.resolve_path(authority, path_and_query)?;
+        if !is_inside_root(&self.root, &file_path) {
+            return None;
+        }
         let body = std::fs::read(&file_path).ok()?;
-        let (content_type, extra_headers) = Self::read_sidecar(&file_path);
+        let (content_type, extra_headers) = self.read_sidecar(&file_path);
 
         Some(StoredObject {
             body,

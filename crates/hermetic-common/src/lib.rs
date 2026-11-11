@@ -11,6 +11,7 @@ pub use cutoff::{
 pub use hash::{sha256_hex, ChainError, HashChain};
 pub use manifest::{CutoffsRecord, ManifestError, TaskInput, TaskJson};
 pub use wire::{
-    Method, RequestFrame, ResponseFrame, ResponseHeader, WireError, MAX_REQUEST_FRAME_SIZE,
+    validate_authority, validate_header_name, validate_header_value, Method, RequestFrame,
+    ResponseFrame, ResponseHeader, WireError, MAX_AUTHORITY_LEN, MAX_REQUEST_FRAME_SIZE,
     MAX_RESPONSE_HEADERS, MAX_RESPONSE_HEADERS_BYTES, REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE,
 };

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use hermetic_world_server::{verify_log, ServerConfig, ServerExit, WorldServer};
+use hermetic_world_server::{verify_log_ext, ServerConfig, ServerExit, WorldServer};
 use std::path::PathBuf;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -44,6 +44,9 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     no_sandbox: bool,
+
+    #[arg(long, default_value_t = false)]
+    resume_log: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -55,6 +58,9 @@ enum Commands {
 
         #[arg(long)]
         log: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        allow_unanchored: bool,
     },
 }
 
@@ -71,6 +77,10 @@ fn run_sandbox_child_test() {
     let store_file = store_path.join("test.txt");
     let _ = std::fs::write(&store_file, b"read only content");
 
+    // FIX 9: Create the outside file BEFORE applying the sandbox
+    let outside = std::env::temp_dir().join("hw_test_outside.txt");
+    let _ = std::fs::write(&outside, b"secret");
+
     let status = match hermetic_world_server::apply_sandbox(&store_path, &log_path, true) {
         Ok(s) => s,
         Err(e) => {
@@ -82,12 +92,18 @@ fn run_sandbox_child_test() {
     if status == hermetic_world_server::SandboxLandlockStatus::NotEnforced {
         println!("Note: Landlock not supported by running kernel, checking only seccomp");
     } else {
-        // 1. Opening a file outside allowed paths fails
-        let outside = std::env::temp_dir().join("hw_test_outside.txt");
-        let _ = std::fs::write(&outside, b"secret");
-        if std::fs::File::open(&outside).is_ok() {
-            eprintln!("Opening file outside allowed paths unexpectedly succeeded");
-            std::process::exit(10);
+        // 1. Opening a file outside allowed paths fails with PermissionDenied
+        match std::fs::File::open(&outside) {
+            Ok(_) => {
+                eprintln!("Opening file outside allowed paths unexpectedly succeeded");
+                std::process::exit(10);
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::PermissionDenied {
+                    eprintln!("Expected PermissionDenied opening outside file, got: {e}");
+                    std::process::exit(10);
+                }
+            }
         }
 
         // 2. Writing into the store fails
@@ -129,7 +145,12 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::VerifyLog { path, log }) = cli.cmd {
+    if let Some(Commands::VerifyLog {
+        path,
+        log,
+        allow_unanchored,
+    }) = cli.cmd
+    {
         let target_path = path
             .or(log)
             .unwrap_or_else(|| PathBuf::from("requests.log"));
@@ -140,7 +161,7 @@ fn main() {
             target_path
         };
 
-        match verify_log(&log_file) {
+        match verify_log_ext(&log_file, allow_unanchored) {
             Ok(count) => {
                 println!("Log verified: {count} records in {}", log_file.display());
                 std::process::exit(0);
@@ -186,10 +207,12 @@ fn main() {
         max_bytes: cli.max_bytes,
         allow_no_landlock: cli.allow_no_landlock,
         no_sandbox: cli.no_sandbox,
+        resume_log: cli.resume_log,
     };
 
     let server = match WorldServer::new(config) {
         Ok(s) => s,
+        Err(ServerExit::StartupFailed) => std::process::exit(1),
         Err(e) => {
             eprintln!("Server initialization error: {e}");
             std::process::exit(1);
@@ -199,7 +222,9 @@ fn main() {
     match server.run() {
         Ok(()) => std::process::exit(0),
         Err(ServerExit::Normal) => std::process::exit(0),
+        Err(ServerExit::StartupFailed) => std::process::exit(1),
         Err(ServerExit::Tampered) => std::process::exit(3),
         Err(ServerExit::LimitExceeded) => std::process::exit(4),
+        Err(ServerExit::LogFailed) => std::process::exit(5),
     }
 }

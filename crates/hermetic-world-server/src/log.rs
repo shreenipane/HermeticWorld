@@ -9,12 +9,28 @@ use std::path::{Path, PathBuf};
 pub const INITIAL_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+pub trait LogWriter: Write + Send {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogWriter for File {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("requests.log already exists and is non-empty; pass --resume-log to resume")]
+    ExistingLogNonEmpty,
+    #[error("Failed to verify existing log for resume: {0}")]
+    ResumeVerification(String),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -23,6 +39,21 @@ pub enum VerifyError {
     BadLine { line: usize, reason: String },
     #[error("I/O error on {path}: {message}")]
     Io { path: String, message: String },
+    #[error("unanchored (no head file)")]
+    Unanchored,
+    #[error("Head mismatch: expected seq {expected_seq} hash {expected_hash}, got seq {actual_seq} hash {actual_hash}")]
+    HeadMismatch {
+        expected_seq: u64,
+        expected_hash: String,
+        actual_seq: u64,
+        actual_hash: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogHead {
+    pub seq: u64,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,7 +80,7 @@ pub struct LogEventParams<'a> {
 
 pub struct LogManager {
     log_dir: PathBuf,
-    log_file: File,
+    log_file: Box<dyn LogWriter>,
     seq: u64,
     prev_hash: String,
     dedupe: BTreeMap<(String, String, String), DedupeEntry>,
@@ -57,10 +88,57 @@ pub struct LogManager {
 
 impl LogManager {
     pub fn new<P: AsRef<Path>>(log_dir: P) -> Result<Self, LogError> {
+        Self::new_opts(log_dir, false)
+    }
+
+    pub fn new_opts<P: AsRef<Path>>(log_dir: P, resume_log: bool) -> Result<Self, LogError> {
         let log_dir = log_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&log_dir)?;
 
         let log_path = log_dir.join("requests.log");
+        let exists = log_path.exists();
+        let non_empty = if exists {
+            let meta = std::fs::metadata(&log_path)?;
+            meta.len() > 0
+        } else {
+            false
+        };
+
+        if non_empty && !resume_log {
+            return Err(LogError::ExistingLogNonEmpty);
+        }
+
+        let mut seq = 0;
+        let mut prev_hash = INITIAL_PREV_HASH.to_string();
+        let mut dedupe = BTreeMap::new();
+
+        if non_empty && resume_log {
+            // Verify existing log including head file
+            verify_log(&log_path).map_err(|e| LogError::ResumeVerification(e.to_string()))?;
+
+            let head_path = PathBuf::from(format!("{}.head", log_path.display()));
+            let head_data = std::fs::read_to_string(&head_path)?;
+            let head: LogHead = serde_json::from_str(&head_data)?;
+            seq = head.seq;
+            prev_hash = head.hash;
+
+            let dedupe_path = log_dir.join("dedupe.json");
+            if dedupe_path.is_file() {
+                let dedupe_data = std::fs::read_to_string(&dedupe_path)?;
+                let raw_map: BTreeMap<String, DedupeEntry> = serde_json::from_str(&dedupe_data)?;
+                for entry in raw_map.into_values() {
+                    dedupe.insert(
+                        (
+                            entry.authority.clone(),
+                            entry.path_and_query.clone(),
+                            entry.status.clone(),
+                        ),
+                        entry,
+                    );
+                }
+            }
+        }
+
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -68,11 +146,21 @@ impl LogManager {
 
         Ok(Self {
             log_dir,
-            log_file,
+            log_file: Box::new(log_file),
+            seq,
+            prev_hash,
+            dedupe,
+        })
+    }
+
+    pub fn new_with_writer<P: AsRef<Path>, W: LogWriter + 'static>(log_dir: P, writer: W) -> Self {
+        Self {
+            log_dir: log_dir.as_ref().to_path_buf(),
+            log_file: Box::new(writer),
             seq: 0,
             prev_hash: INITIAL_PREV_HASH.to_string(),
             dedupe: BTreeMap::new(),
-        })
+        }
     }
 
     /// Compute canonical JSON without hash and hash = BLAKE3(prev_hash_hex || canonical_json_without_hash)
@@ -117,12 +205,15 @@ impl LogManager {
 
     /// Append a log record to requests.log and update dedupe index.
     pub fn log_event(&mut self, params: &LogEventParams<'_>) -> Result<(), LogError> {
-        self.seq += 1;
-        let (hash, line) = Self::compute_hash(&self.prev_hash, self.seq, params)?;
+        let next_seq = self.seq + 1;
+        let (hash, line) = Self::compute_hash(&self.prev_hash, next_seq, params)?;
 
-        self.prev_hash = hash;
         writeln!(self.log_file, "{line}")?;
         self.log_file.flush()?;
+
+        // Commit only after write and flush succeed
+        self.seq = next_seq;
+        self.prev_hash = hash;
 
         // Update dedupe map
         let key = (
@@ -188,21 +279,50 @@ impl LogManager {
         Ok(())
     }
 
-    /// Flush and fsync the log file and dedupe index at server shutdown.
+    /// Flush and fsync the log file and dedupe index, and write requests.log.head fsynced.
     pub fn finish(&mut self) -> Result<(), LogError> {
-        self.write_dedupe_atomic()?;
-        self.log_file.flush()?;
-        self.log_file.sync_all()?;
+        let _ = self.write_dedupe_atomic();
+        let _ = self.log_file.flush();
+        let _ = self.log_file.sync_all();
+
+        let head_path = self.log_dir.join("requests.log.head");
+        let head = LogHead {
+            seq: self.seq,
+            hash: self.prev_hash.clone(),
+        };
+        let head_json = serde_json::to_string_pretty(&head)?;
+        let mut head_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&head_path)?;
+        head_file.write_all(head_json.as_bytes())?;
+        head_file.write_all(b"\n")?;
+        head_file.flush()?;
+        head_file.sync_all()?;
+
         Ok(())
     }
 
     pub fn current_seq(&self) -> u64 {
         self.seq
     }
+
+    pub fn prev_hash(&self) -> &str {
+        &self.prev_hash
+    }
 }
 
-/// Verify hash chain of requests.log. Returns total records verified or error on first bad line.
+/// Verify hash chain of requests.log with default anchored requirement.
 pub fn verify_log<P: AsRef<Path>>(path: P) -> Result<usize, VerifyError> {
+    verify_log_ext(path, false)
+}
+
+/// Verify hash chain of requests.log, optionally allowing unanchored log (no head file).
+pub fn verify_log_ext<P: AsRef<Path>>(
+    path: P,
+    allow_unanchored: bool,
+) -> Result<usize, VerifyError> {
     let p = path.as_ref();
     let file = File::open(p).map_err(|e| VerifyError::Io {
         path: p.display().to_string(),
@@ -289,6 +409,29 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> Result<usize, VerifyError> {
         }
 
         expected_prev = recorded_hash;
+    }
+
+    // FIX 7: check head file
+    let head_path = PathBuf::from(format!("{}.head", p.display()));
+    if head_path.is_file() {
+        let head_data = std::fs::read_to_string(&head_path).map_err(|e| VerifyError::Io {
+            path: head_path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        let head: LogHead = serde_json::from_str(&head_data).map_err(|e| VerifyError::Io {
+            path: head_path.display().to_string(),
+            message: format!("invalid head JSON: {e}"),
+        })?;
+        if head.seq != line_num as u64 || head.hash != expected_prev {
+            return Err(VerifyError::HeadMismatch {
+                expected_seq: head.seq,
+                expected_hash: head.hash,
+                actual_seq: line_num as u64,
+                actual_hash: expected_prev,
+            });
+        }
+    } else if !allow_unanchored {
+        return Err(VerifyError::Unanchored);
     }
 
     Ok(line_num)

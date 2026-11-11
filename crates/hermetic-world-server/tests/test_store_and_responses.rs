@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use hermetic_common::{Method, RequestFrame, ResponseFrame};
-use hermetic_world_server::{format_imf_fixdate, ServerConfig, WorldServer};
+use hermetic_world_server::{format_imf_fixdate, DirStore, ServerConfig, Store, WorldServer};
 use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -30,6 +30,7 @@ fn start_test_server(
         max_bytes: None,
         allow_no_landlock: true,
         no_sandbox: true,
+        resume_log: false,
     };
 
     let server = WorldServer::new(config).expect("create server");
@@ -287,4 +288,242 @@ fn test_date_header_advances() {
     let t_plus = t_start + Duration::from_secs(3665);
     let s2 = format_imf_fixdate(t_plus);
     assert_eq!(s2, "Wed, 01 Jan 2025 01:01:05 GMT");
+}
+
+#[test]
+fn test_fix1_authority_traversal_and_sibling_protection() {
+    let temp = tempdir().expect("tempdir");
+    let parent = temp.path();
+    let store_dir = parent.join("store");
+    fs::create_dir_all(&store_dir).expect("create store dir");
+
+    // Sibling secret file next to store dir
+    let sibling_secret = parent.join("secret.txt");
+    fs::write(&sibling_secret, b"super-secret-sibling-data").expect("write secret");
+
+    // Sibling .404.json next to store dir
+    let sibling_404 = parent.join(".404.json");
+    fs::write(
+        &sibling_404,
+        r#"{"status": 404, "body": "sibling custom 404 leaked"}"#,
+    )
+    .expect("write sibling 404");
+
+    let store = DirStore::new(&store_dir);
+
+    // FIX 1: authorities "..", ".", "a..b", ".a", "a.", "-a.com", "a-.com", "../etc", and "example.com:0"
+    // are rejected at lookup
+    let bad_authorities = [
+        "..",
+        ".",
+        "a..b",
+        ".a",
+        "a.",
+        "-a.com",
+        "a-.com",
+        "../etc",
+        "example.com:0",
+    ];
+    for bad_auth in bad_authorities {
+        assert!(
+            store.get(bad_auth, "/secret.txt").is_none(),
+            "lookup with bad authority {bad_auth} must return None"
+        );
+        let (_st, _ct, body) = store.get_404(bad_auth);
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            !body_str.contains("sibling custom 404 leaked"),
+            "get_404 with bad authority {bad_auth} must not read sibling .404.json"
+        );
+    }
+
+    // Verify crafting to reach a sibling never returns it
+    let res = store.get("..", "/secret.txt");
+    assert!(res.is_none(), "store.get must never reach sibling");
+
+    let (_status, _ct, body404) = store.get_404("..");
+    assert!(
+        !String::from_utf8_lossy(&body404).contains("sibling custom 404 leaked"),
+        "store.get_404 must never reach sibling"
+    );
+
+    // Also verify via server
+    let log_dir = parent.join("log");
+    let socket_path = parent.join("server.sock");
+    let sock = start_test_server(
+        &store_dir,
+        &log_dir,
+        &socket_path,
+        datetime!(2024-03-01 12:00:00 UTC),
+    );
+
+    let req_sibling = RequestFrame {
+        method: Method::Get,
+        request_id: 1,
+        authority: "example.com".into(),
+        path_and_query: "/../secret.txt".into(),
+        range: None,
+    };
+    let resp = send_req(&sock, &req_sibling);
+    assert_eq!(resp.status, 404);
+    assert!(
+        !String::from_utf8_lossy(&resp.body).contains("super-secret-sibling-data"),
+        "Server must never serve sibling secret"
+    );
+}
+
+#[test]
+fn test_fix4_deterministic_headers() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let obj_dir = store_dir.join("example.com").join("files");
+    fs::create_dir_all(&obj_dir).expect("create obj dir");
+
+    let file_path = obj_dir.join("data.txt");
+    fs::write(&file_path, b"determinism test content").expect("write data.txt");
+
+    // Sidecar with 20 headers in non-alphabetical order
+    let sidecar_path = obj_dir.join("data.txt.headers.json");
+    let mut header_pairs = Vec::new();
+    for i in (1..=20).rev() {
+        header_pairs.push(format!("\"x-header-{i:02}\": \"val-{i}\""));
+    }
+    let sidecar_content = format!(
+        "{{\n\"content_type\": \"text/plain\",\n\"headers\": {{\n{}\n}}\n}}",
+        header_pairs.join(",\n")
+    );
+    fs::write(&sidecar_path, sidecar_content).expect("write sidecar");
+
+    // Server instance 1
+    let log_dir1 = temp.path().join("log1");
+    let sock_path1 = temp.path().join("s1.sock");
+    let t_clock = datetime!(2024-01-01 00:00:00 UTC);
+    let sock1 = start_test_server(&store_dir, &log_dir1, &sock_path1, t_clock);
+
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 10,
+        authority: "example.com".into(),
+        path_and_query: "/files/data.txt".into(),
+        range: None,
+    };
+    let resp1 = send_req(&sock1, &req);
+    let bytes1 = resp1.encode(1024 * 1024).expect("encode resp1");
+
+    // Server instance 2
+    let log_dir2 = temp.path().join("log2");
+    let sock_path2 = temp.path().join("s2.sock");
+    let sock2 = start_test_server(&store_dir, &log_dir2, &sock_path2, t_clock);
+
+    let resp2 = send_req(&sock2, &req);
+    let bytes2 = resp2.encode(1024 * 1024).expect("encode resp2");
+
+    // FIX 4: the same object served twice by two server instances yields byte-identical response frames
+    assert_eq!(
+        bytes1, bytes2,
+        "Two server instances must yield byte-identical response frames"
+    );
+
+    // Extra headers must appear in alphabetical order
+    let x_headers: Vec<&str> = resp1
+        .headers
+        .iter()
+        .map(|h| h.name.as_str())
+        .filter(|n| n.starts_with("x-header-"))
+        .collect();
+    let mut sorted_x_headers = x_headers.clone();
+    sorted_x_headers.sort();
+    assert_eq!(
+        x_headers, sorted_x_headers,
+        "Headers must be sorted by name"
+    );
+}
+
+#[test]
+fn test_fix6_filter_headers_sidecar_validation() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let obj_dir = store_dir.join("example.com").join("fix6");
+    fs::create_dir_all(&obj_dir).expect("create obj dir");
+
+    let file_path = obj_dir.join("index.html");
+    fs::write(&file_path, b"valid body content").expect("write file");
+
+    // FIX 6: sidecar with an obs-text value, a 20 KiB value, 100 headers and a bad content_type
+    let sidecar_path = obj_dir.join("index.html.headers.json");
+
+    let huge_value = "A".repeat(20 * 1024);
+    let mut extra_headers = Vec::new();
+    // 1. obs-text value (0x80)
+    extra_headers.push(r#""x-bad-obs": "bad\u0080val""#.to_string());
+    // 2. 20 KiB value
+    extra_headers.push(format!("\"x-bad-huge\": \"{huge_value}\""));
+    // 3. 98 other headers -> total 100 headers in sidecar
+    for i in 0..98 {
+        extra_headers.push(format!("\"x-hdr-{i:03}\": \"val-{i}\""));
+    }
+
+    let sidecar_json = format!(
+        "{{\n\"content_type\": \"text/html\\u0080bad\",\n\"headers\": {{\n{}\n}}\n}}",
+        extra_headers.join(",\n")
+    );
+    fs::write(&sidecar_path, sidecar_json).expect("write sidecar");
+
+    let log_dir = temp.path().join("log");
+    let sock_path = temp.path().join("server.sock");
+    let sock = start_test_server(
+        &store_dir,
+        &log_dir,
+        &sock_path,
+        datetime!(2024-03-01 12:00:00 UTC),
+    );
+
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 1,
+        authority: "example.com".into(),
+        path_and_query: "/fix6/index.html".into(),
+        range: None,
+    };
+    let resp = send_req(&sock, &req);
+
+    // Serves the object with valid headers only
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"valid body content");
+
+    let hdrs: std::collections::HashMap<_, _> = resp
+        .headers
+        .iter()
+        .map(|h| (h.name.as_str(), h.value.as_str()))
+        .collect();
+
+    // Bad content_type fell back to application/octet-stream
+    assert_eq!(
+        hdrs.get("content-type"),
+        Some(&"application/octet-stream"),
+        "Bad content-type must fall back to application/octet-stream"
+    );
+
+    // Obs-text and 20 KiB headers are dropped
+    assert!(!hdrs.contains_key("x-bad-obs"));
+    assert!(!hdrs.contains_key("x-bad-huge"));
+
+    // Caps are respected: header_count <= 64, header_bytes <= 8192
+    assert_eq!(
+        resp.headers.len(),
+        hermetic_common::MAX_RESPONSE_HEADERS,
+        "Header count should be capped at MAX_RESPONSE_HEADERS"
+    );
+    let total_header_bytes: usize = resp
+        .headers
+        .iter()
+        .map(|h| h.name.len() + h.value.len())
+        .sum();
+    assert!(
+        total_header_bytes <= hermetic_common::MAX_RESPONSE_HEADERS_BYTES,
+        "Header bytes {total_header_bytes} exceeds MAX_RESPONSE_HEADERS_BYTES"
+    );
+
+    // Valid headers are present
+    assert_eq!(hdrs.get("x-hdr-000"), Some(&"val-0"));
 }

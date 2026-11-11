@@ -41,6 +41,7 @@ fn test_token_bucket_delays_requests() {
         max_bytes: None,
         allow_no_landlock: true,
         no_sandbox: true,
+        resume_log: false,
     };
 
     let server = WorldServer::new(config).expect("create server");
@@ -282,5 +283,118 @@ fn test_malformed_frame_exit_code_3() {
     assert!(
         log_content.contains("\"tampered\""),
         "Log must record status tampered"
+    );
+}
+
+#[test]
+fn test_fix2_startup_failed_socket_nonexistent_dir() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let log_dir = temp.path().join("log");
+    fs::create_dir_all(&store_dir).expect("create store");
+    fs::create_dir_all(&log_dir).expect("create log");
+
+    let bad_socket = temp.path().join("nonexistent_subdir").join("server.sock");
+    let bin = bin_path();
+    let status = Command::new(&bin)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--socket")
+        .arg(&bad_socket)
+        .arg("--log")
+        .arg(&log_dir)
+        .arg("--t-clock")
+        .arg("2024-03-01T12:00:00Z")
+        .arg("--no-sandbox")
+        .status()
+        .expect("run binary");
+
+    // FIX 2: bind failure exits code 1 (ServerExit::StartupFailed)
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "Server startup failure (bind error) must exit with code 1"
+    );
+}
+
+#[test]
+fn test_fix5_client_early_close_logs_write_error_and_chain_verifies() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let log_dir = temp.path().join("log");
+    let socket_path = temp.path().join("server.sock");
+
+    let auth_dir = store_dir.join("example.com");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    // Write 500 KB file so server writing to dropped client will encounter broken pipe
+    let big_body = vec![b'w'; 500 * 1024];
+    fs::write(auth_dir.join("large.dat"), &big_body).expect("write large file");
+
+    let bin = bin_path();
+    let mut child = Command::new(&bin)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--socket")
+        .arg(&socket_path)
+        .arg("--log")
+        .arg(&log_dir)
+        .arg("--t-clock")
+        .arg("2024-03-01T12:00:00Z")
+        .arg("--max-requests")
+        .arg("1")
+        .arg("--no-sandbox")
+        .spawn()
+        .expect("spawn server");
+
+    for _ in 0..100 {
+        if socket_path.exists() {
+            thread::sleep(Duration::from_millis(20));
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 1,
+        authority: "example.com".into(),
+        path_and_query: "/large.dat".into(),
+        range: None,
+    };
+    let encoded = req.encode().expect("encode");
+
+    // Connect, send frame, immediately drop stream
+    let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    stream.write_all(&encoded).expect("write request");
+    drop(stream);
+
+    thread::sleep(Duration::from_millis(50));
+
+    // Send a 2nd request to cleanly trigger max-requests (limit_exceeded) exit
+    let req2 = RequestFrame {
+        method: Method::Get,
+        request_id: 2,
+        authority: "example.com".into(),
+        path_and_query: "/large.dat".into(),
+        range: None,
+    };
+    if let Ok(mut s2) = UnixStream::connect(&socket_path) {
+        let _ = s2.write_all(&req2.encode().expect("encode req2"));
+    }
+
+    let status = child.wait().expect("child wait");
+    assert_eq!(status.code(), Some(4));
+
+    let log_file = log_dir.join("requests.log");
+    assert!(log_file.exists(), "requests.log must exist");
+
+    // FIX 5: chain still verifies
+    let count = hermetic_world_server::verify_log(&log_file).expect("chain must verify");
+    assert!(count >= 1, "at least one record must be verified");
+
+    let log_content = fs::read_to_string(&log_file).expect("read log");
+    assert!(
+        log_content.contains("\"status\":\"write_error\""),
+        "Log must contain write_error record: {log_content}"
     );
 }

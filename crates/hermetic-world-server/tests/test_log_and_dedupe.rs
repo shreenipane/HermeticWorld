@@ -159,3 +159,270 @@ fn test_dedupe_index_counts_repeated_requests() {
     assert_eq!(notfound_entry.first_seen_seq, 6);
     assert_eq!(notfound_entry.last_seen_seq, 6);
 }
+
+struct FailingWriter;
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("disk write failure"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk flush failure"))
+    }
+}
+impl hermetic_world_server::LogWriter for FailingWriter {}
+
+#[test]
+fn test_fix3_log_write_failure_chain_integrity() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+    fs::create_dir_all(&log_dir).expect("create log dir");
+
+    let mut lm = LogManager::new_with_writer(&log_dir, FailingWriter);
+    assert_eq!(lm.current_seq(), 0);
+    assert_eq!(lm.prev_hash(), hermetic_world_server::INITIAL_PREV_HASH);
+
+    let res = lm.log_event(&LogEventParams {
+        elapsed_ms: 10,
+        request_id: 1,
+        method: "GET",
+        authority: "example.com",
+        path_and_query: "/",
+        range: None,
+        status: "200",
+        bytes: 100,
+    });
+
+    // Error propagates
+    assert!(res.is_err(), "Write failure must propagate error");
+
+    // Chain state did not advance
+    assert_eq!(lm.current_seq(), 0, "seq must not advance on write failure");
+    assert_eq!(
+        lm.prev_hash(),
+        hermetic_world_server::INITIAL_PREV_HASH,
+        "prev_hash must not advance on write failure"
+    );
+}
+
+#[test]
+fn test_fix7_tail_truncation_detection() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+    let mut lm = LogManager::new(&log_dir).expect("create log manager");
+
+    for i in 1..=5 {
+        lm.log_event(&LogEventParams {
+            elapsed_ms: i * 10,
+            request_id: i,
+            method: "GET",
+            authority: "example.com",
+            path_and_query: &format!("/{i}"),
+            range: None,
+            status: "200",
+            bytes: 100 * i,
+        })
+        .expect("log event");
+    }
+    lm.finish().expect("finish");
+
+    let log_path = log_dir.join("requests.log");
+    let head_path = log_dir.join("requests.log.head");
+    assert!(
+        head_path.is_file(),
+        "requests.log.head must be created at finish"
+    );
+
+    // Baseline: valid log verifies
+    let count = verify_log(&log_path).expect("valid anchored log should verify");
+    assert_eq!(count, 5);
+
+    let original_content = fs::read_to_string(&log_path).expect("read log");
+    let lines: Vec<&str> = original_content.lines().collect();
+    assert_eq!(lines.len(), 5);
+
+    // 1. Deleting the last line is detected
+    let last_1_deleted = lines[..4].join("\n") + "\n";
+    let log_dir_del1 = temp.path().join("log_del1");
+    fs::create_dir_all(&log_dir_del1).expect("create dir");
+    fs::write(log_dir_del1.join("requests.log"), &last_1_deleted).expect("write log");
+    fs::copy(&head_path, log_dir_del1.join("requests.log.head")).expect("copy head");
+
+    let del1_res = verify_log(log_dir_del1.join("requests.log"));
+    assert!(
+        del1_res.is_err(),
+        "Deleting last line must fail verification"
+    );
+    let err = del1_res.unwrap_err();
+    assert!(
+        matches!(err, hermetic_world_server::VerifyError::HeadMismatch { .. }),
+        "Expected HeadMismatch on deleting last line, got: {err:?}"
+    );
+
+    // 2. Deleting the last 3 lines is detected
+    let last_3_deleted = lines[..2].join("\n") + "\n";
+    let log_dir_del3 = temp.path().join("log_del3");
+    fs::create_dir_all(&log_dir_del3).expect("create dir");
+    fs::write(log_dir_del3.join("requests.log"), &last_3_deleted).expect("write log");
+    fs::copy(&head_path, log_dir_del3.join("requests.log.head")).expect("copy head");
+
+    let del3_res = verify_log(log_dir_del3.join("requests.log"));
+    assert!(
+        del3_res.is_err(),
+        "Deleting last 3 lines must fail verification"
+    );
+    let err3 = del3_res.unwrap_err();
+    assert!(
+        matches!(
+            err3,
+            hermetic_world_server::VerifyError::HeadMismatch { .. }
+        ),
+        "Expected HeadMismatch on deleting last 3 lines, got: {err3:?}"
+    );
+
+    // 3. Missing head file is reported as unanchored
+    let log_dir_nohead = temp.path().join("log_nohead");
+    fs::create_dir_all(&log_dir_nohead).expect("create dir");
+    fs::write(log_dir_nohead.join("requests.log"), &original_content).expect("write log");
+
+    let nohead_res = verify_log(log_dir_nohead.join("requests.log"));
+    assert!(
+        nohead_res.is_err(),
+        "Missing head file must fail anchored verify"
+    );
+    let err_nohead = nohead_res.unwrap_err();
+    assert_eq!(
+        err_nohead,
+        hermetic_world_server::VerifyError::Unanchored,
+        "Expected Unanchored error"
+    );
+    assert_eq!(err_nohead.to_string(), "unanchored (no head file)");
+
+    // With allow_unanchored: true, it succeeds
+    let unanchored_ok =
+        hermetic_world_server::verify_log_ext(log_dir_nohead.join("requests.log"), true)
+            .expect("allow_unanchored must succeed");
+    assert_eq!(unanchored_ok, 5);
+}
+
+#[test]
+fn test_fix8_resume_log_and_dedupe_accumulation() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+
+    // First run: log 3 events
+    {
+        let mut lm1 = LogManager::new(&log_dir).expect("create log manager");
+        lm1.log_event(&LogEventParams {
+            elapsed_ms: 10,
+            request_id: 1,
+            method: "GET",
+            authority: "pypi.org",
+            path_and_query: "/item1",
+            range: None,
+            status: "200",
+            bytes: 50,
+        })
+        .expect("log event");
+
+        lm1.log_event(&LogEventParams {
+            elapsed_ms: 20,
+            request_id: 2,
+            method: "GET",
+            authority: "pypi.org",
+            path_and_query: "/item1",
+            range: None,
+            status: "200",
+            bytes: 50,
+        })
+        .expect("log event");
+
+        lm1.log_event(&LogEventParams {
+            elapsed_ms: 30,
+            request_id: 3,
+            method: "GET",
+            authority: "pypi.org",
+            path_and_query: "/item2",
+            range: None,
+            status: "200",
+            bytes: 60,
+        })
+        .expect("log event");
+
+        lm1.finish().expect("finish");
+    }
+
+    let log_path = log_dir.join("requests.log");
+    let original_log = fs::read_to_string(&log_path).expect("read original log");
+
+    // Second run without --resume-log: refuses to start (StartupFailed), leaves log untouched
+    let second_run_no_resume = LogManager::new_opts(&log_dir, false);
+    assert!(
+        second_run_no_resume.is_err(),
+        "Second run without resume_log must fail to start"
+    );
+    let log_after_failed_second_run = fs::read_to_string(&log_path).expect("read log");
+    assert_eq!(
+        original_log, log_after_failed_second_run,
+        "requests.log must remain untouched when startup fails"
+    );
+
+    // Third run with --resume-log: continues and accumulates dedupe
+    {
+        let mut lm_resume = LogManager::new_opts(&log_dir, true).expect("resume log manager");
+        assert_eq!(lm_resume.current_seq(), 3, "Resumed seq must be 3");
+
+        // Log 1 more for /item1 (now total 3), and 1 for /item3
+        lm_resume
+            .log_event(&LogEventParams {
+                elapsed_ms: 40,
+                request_id: 4,
+                method: "GET",
+                authority: "pypi.org",
+                path_and_query: "/item1",
+                range: None,
+                status: "200",
+                bytes: 50,
+            })
+            .expect("log event");
+
+        lm_resume
+            .log_event(&LogEventParams {
+                elapsed_ms: 50,
+                request_id: 5,
+                method: "GET",
+                authority: "pypi.org",
+                path_and_query: "/item3",
+                range: None,
+                status: "200",
+                bytes: 70,
+            })
+            .expect("log event");
+
+        lm_resume.finish().expect("finish");
+    }
+
+    // Verify combined log: all 5 records verify
+    let count = verify_log(&log_path).expect("combined log must verify");
+    assert_eq!(count, 5);
+
+    // Verify dedupe counts accumulated
+    let dedupe_path = log_dir.join("dedupe.json");
+    let dedupe_content = fs::read_to_string(&dedupe_path).expect("read dedupe.json");
+    let map: BTreeMap<String, DedupeEntry> =
+        serde_json::from_str(&dedupe_content).expect("parse dedupe.json");
+
+    let item1_entry = map.get("pypi.org /item1 200").expect("item1 entry");
+    assert_eq!(item1_entry.count, 3, "item1 count must accumulate to 3");
+    assert_eq!(item1_entry.first_seen_seq, 1);
+    assert_eq!(item1_entry.last_seen_seq, 4);
+
+    let item2_entry = map.get("pypi.org /item2 200").expect("item2 entry");
+    assert_eq!(item2_entry.count, 1);
+    assert_eq!(item2_entry.first_seen_seq, 3);
+    assert_eq!(item2_entry.last_seen_seq, 3);
+
+    let item3_entry = map.get("pypi.org /item3 200").expect("item3 entry");
+    assert_eq!(item3_entry.count, 1);
+    assert_eq!(item3_entry.first_seen_seq, 5);
+    assert_eq!(item3_entry.last_seen_seq, 5);
+}
