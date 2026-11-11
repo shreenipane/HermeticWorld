@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::benchmark::check_d9_content;
 use crate::containers::scan_container_or_unit_with_root_prefix;
 use crate::fingerprint::FingerprintSet;
-use crate::gitstore::{compute_git_sha1, GitError, GitStore, ObjectType};
+use crate::gitstore::{compute_git_sha1, GitError, GitStore, ObjectType, Tag};
 use crate::scan::{match_unit, Finding, ScanOptions, Severity};
 
 pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
@@ -52,16 +52,7 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     let mut store = match GitStore::open(git_dir, opts) {
         Ok(s) => s,
         Err(GitError::Unsupported(msg)) => {
-            findings.push(Finding {
-                detector: "D1".into(),
-                channel: "git_unsupported".into(),
-                path: git_dir_str.clone(),
-                visibility: opts.visibility,
-                severity: Severity::Review,
-                confidence: 1.0,
-                hunk: None,
-                evidence: vec![msg],
-            });
+            findings.push(gate_finding("git_unsupported", git_dir_str.clone(), msg));
             return findings;
         }
         Err(GitError::Corrupt(msg)) => {
@@ -69,16 +60,11 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
             return findings;
         }
         Err(e) => {
-            findings.push(Finding {
-                detector: "D1".into(),
-                channel: "git_store_error".into(),
-                path: git_dir_str.clone(),
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec![format!("failed to open git store: {e}")],
-            });
+            findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("failed to open git store: {e}"),
+            ));
             return findings;
         }
     };
@@ -99,16 +85,11 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     let all_object_ids = match store.enumerate_object_ids() {
         Ok(ids) => ids,
         Err(e) => {
-            findings.push(Finding {
-                detector: "D1".into(),
-                channel: "git_store_error".into(),
-                path: git_dir_str.clone(),
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec![format!("failed to enumerate object ids: {e}")],
-            });
+            findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("failed to enumerate object ids: {e}"),
+            ));
             return findings;
         }
     };
@@ -123,7 +104,10 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     }
 
     // 7. Read refs (loose and packed)
-    let (all_refs, packed_ref_names) = read_all_refs(git_dir);
+    let (all_refs, invalid_refs) = read_all_refs(git_dir);
+    for (ref_name, why) in invalid_refs {
+        findings.push(gate_finding("git_ref", ref_name, why));
+    }
 
     // 8. Resolve HEAD and check git_head
     let head_path = git_dir.join("HEAD");
@@ -212,9 +196,6 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
         }
     }
 
-    // Ensure packed-refs only refs are also validated (already in all_refs, but verify packed-refs presence)
-    let _ = packed_ref_names;
-
     // 11. Reachability walk from base_commit and allowed tags
     let mut reachable = HashSet::new();
     let mut commit_queue = VecDeque::new();
@@ -262,11 +243,18 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
             ));
         }
 
-        if let Ok(commit) = store.parse_commit(&obj.data) {
-            tree_queue.push_back(commit.tree.to_lowercase());
-            for parent in commit.parents {
-                commit_queue.push_back(parent.to_lowercase());
+        match store.parse_commit(&obj.data) {
+            Ok(commit) => {
+                tree_queue.push_back(commit.tree.to_lowercase());
+                for parent in commit.parents {
+                    commit_queue.push_back(parent.to_lowercase());
+                }
             }
+            Err(e) => findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("failed to parse commit {}: {}", c_oid, e),
+            )),
         }
     }
 
@@ -296,18 +284,25 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
             ));
         }
 
-        if let Ok(tree) = store.parse_tree(&obj.data) {
-            for entry in tree.entries {
-                let entry_oid = entry.oid.to_lowercase();
-                if entry.mode == 0o160000 {
-                    // Gitlink mode 160000: recorded and not followed
-                    reachable.insert(entry_oid);
-                } else if entry.mode & 0o170000 == 0o040000 {
-                    tree_queue.push_back(entry_oid);
-                } else {
-                    reachable.insert(entry_oid);
+        match store.parse_tree(&obj.data) {
+            Ok(tree) => {
+                for entry in tree.entries {
+                    let entry_oid = entry.oid.to_lowercase();
+                    if entry.mode == 0o160000 {
+                        // Gitlink mode 160000: recorded and not followed
+                        reachable.insert(entry_oid);
+                    } else if entry.mode & 0o170000 == 0o040000 {
+                        tree_queue.push_back(entry_oid);
+                    } else {
+                        reachable.insert(entry_oid);
+                    }
                 }
             }
+            Err(e) => findings.push(gate_finding(
+                "git_corrupt",
+                git_dir_str.clone(),
+                format!("failed to parse tree {}: {}", t_oid, e),
+            )),
         }
     }
 
@@ -467,34 +462,28 @@ fn check_tag(
                 Err(e) => return Err(gate_finding(format!("failed to parse tag object: {e}"))),
             };
 
-            // Check tagger date
-            match (tag.tagger_time, t_clock) {
-                (None, _) => {
-                    return Err(gate_finding("annotated tag has no tagger date".into()));
+            // Every annotated tag in a chain must pass the date and message rules
+            let tag_problem = |t: &Tag| -> Option<String> {
+                match (t.tagger_time, t_clock) {
+                    (None, _) => return Some("annotated tag has no tagger date".into()),
+                    (Some(ts), Some(tc)) if ts > tc.unix_timestamp() => {
+                        return Some(format!(
+                            "annotated tagger date {} is after T_clock {}",
+                            ts,
+                            tc.unix_timestamp()
+                        ));
+                    }
+                    _ => {}
                 }
-                (Some(ts), Some(tc)) if ts > tc.unix_timestamp() => {
-                    return Err(gate_finding(format!(
-                        "annotated tagger date {} is after T_clock {}",
-                        ts,
-                        tc.unix_timestamp()
-                    )));
+                let path = format!("refs/tags/{}", tag_name);
+                if match_unit(&t.message, fp, opts, "D1", "git_tag", &path).is_empty() {
+                    None
+                } else {
+                    Some("tag message matches leaked fingerprint".into())
                 }
-                _ => {}
-            }
-
-            // Check tag message matching fingerprint tier
-            let msg_findings = match_unit(
-                &tag.message,
-                fp,
-                opts,
-                "D1",
-                "git_tag",
-                &format!("refs/tags/{}", tag_name),
-            );
-            if !msg_findings.is_empty() {
-                return Err(gate_finding(
-                    "tag message matches leaked fingerprint".into(),
-                ));
+            };
+            if let Some(problem) = tag_problem(&tag) {
+                return Err(gate_finding(problem));
             }
 
             // Peel target to verify ancestor
@@ -525,6 +514,9 @@ fn check_tag(
                             }));
                         }
                         if let Ok(next_tag) = store.parse_tag(&next_obj.data) {
+                            if let Some(problem) = tag_problem(&next_tag) {
+                                return Err(gate_finding(problem));
+                            }
                             current_target = next_tag.target_oid.to_lowercase();
                             current_type = next_tag.target_type;
                         } else {
@@ -587,10 +579,10 @@ fn check_git_config(config_path: &Path, gitdir: &str, opts: &ScanOptions) -> Vec
                 in_remote_section = false;
             }
 
-            in_extensions_section = section == "extensions";
+            in_extensions_section = section.eq_ignore_ascii_case("extensions");
         }
 
-        if in_extensions_section && trimmed.starts_with("objectformat") {
+        if in_extensions_section && trimmed.to_ascii_lowercase().starts_with("objectformat") {
             if let Some((_, val)) = trimmed.split_once('=') {
                 if val.trim().eq_ignore_ascii_case("sha256") {
                     findings.push(Finding {
@@ -741,7 +733,7 @@ fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec
     }
 
     for entry in walkdir::WalkDir::new(objects_dir).into_iter().flatten() {
-        if !entry.file_type().is_file() {
+        if entry.file_type().is_dir() {
             continue;
         }
 
@@ -754,17 +746,13 @@ fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let parts: Vec<&str> = rel_str.split('/').collect();
 
-        let is_allowed = (parts.len() == 2
+        let is_allowed = (entry.file_type().is_file()
+            && parts.len() == 2
             && parts[0].len() == 2
             && parts[1].len() == 38
             && parts[0].chars().all(|c| c.is_ascii_hexdigit())
             && parts[1].chars().all(|c| c.is_ascii_hexdigit()))
-            || (parts.len() == 2
-                && parts[0] == "pack"
-                && (parts[1].ends_with(".pack")
-                    || parts[1].ends_with(".idx")
-                    || parts[1].ends_with(".rev")
-                    || parts[1].ends_with(".mtimes")))
+            || (parts.len() == 2 && parts[0] == "pack" && is_valid_pack_file(path))
             || rel_str == "info/packs"
             || rel_str == "info/commit-graph"
             || rel_str.starts_with("info/commit-graphs/")
@@ -788,9 +776,49 @@ fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec
     findings
 }
 
-fn read_all_refs(git_dir: &Path) -> (Vec<(String, String)>, HashSet<String>) {
+/// A pack-directory file is valid when it's named `pack-<40 hex>.<ext>`, has the magic of
+/// its format, and its `.pack` and `.idx` both exist. Anything else could hide content,
+/// because the ordinary walk skips `objects/`.
+fn is_valid_pack_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let magic: &[u8; 4] = match ext {
+        "pack" => b"PACK",
+        "idx" => b"\xfftOc",
+        "rev" => b"RIDX",
+        "mtimes" => b"MTME",
+        _ => return false,
+    };
+    let Some(hash) = stem.strip_prefix("pack-") else {
+        return false;
+    };
+    if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if !path.with_extension("pack").is_file() || !path.with_extension("idx").is_file() {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok()
+        && &head == magic
+}
+
+fn is_hex_oid(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+type NamedRefs = Vec<(String, String)>;
+
+/// Returns the valid refs, and the name and reason for each malformed or symbolic one.
+fn read_all_refs(git_dir: &Path) -> (NamedRefs, NamedRefs) {
     let mut all_refs = Vec::new();
-    let mut packed_ref_names = HashSet::new();
+    let mut invalid = Vec::new();
 
     // 1. Loose refs
     let refs_dir = git_dir.join("refs");
@@ -800,11 +828,13 @@ fn read_all_refs(git_dir: &Path) -> (Vec<(String, String)>, HashSet<String>) {
                 let path = entry.path();
                 if let Ok(rel) = path.strip_prefix(git_dir) {
                     let ref_name = rel.to_string_lossy().replace('\\', "/");
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        let trimmed = content.trim();
-                        if !trimmed.starts_with("ref: ") && trimmed.len() == 40 {
-                            all_refs.push((ref_name, trimmed.to_lowercase()));
-                        }
+                    let content = std::fs::read(path).unwrap_or_default();
+                    let text = String::from_utf8_lossy(&content);
+                    let trimmed = text.trim();
+                    if is_hex_oid(trimmed) {
+                        all_refs.push((ref_name, trimmed.to_lowercase()));
+                    } else {
+                        invalid.push((ref_name, "ref is symbolic or malformed".to_string()));
                     }
                 }
             }
@@ -820,20 +850,28 @@ fn read_all_refs(git_dir: &Path) -> (Vec<(String, String)>, HashSet<String>) {
                 if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('^') {
                     continue;
                 }
-                if let Some((oid, ref_name)) = trimmed.split_once(' ') {
-                    let oid_clean = oid.trim().to_lowercase();
-                    let ref_clean = ref_name.trim().to_string();
-                    packed_ref_names.insert(ref_clean.clone());
-                    // Only add if not already present from loose
-                    if !all_refs.iter().any(|(r, _)| r == &ref_clean) {
-                        all_refs.push((ref_clean, oid_clean));
+                match trimmed.split_once(' ') {
+                    Some((oid, ref_name)) if is_hex_oid(oid.trim()) => {
+                        let oid_clean = oid.trim().to_lowercase();
+                        let ref_clean = ref_name.trim().to_string();
+                        // Only add if not already present from loose
+                        if !all_refs.iter().any(|(r, _)| r == &ref_clean) {
+                            all_refs.push((ref_clean, oid_clean));
+                        }
                     }
+                    _ => invalid.push((
+                        "packed-refs".to_string(),
+                        format!(
+                            "malformed line: {}",
+                            trimmed.chars().take(80).collect::<String>()
+                        ),
+                    )),
                 }
             }
         }
     }
 
-    (all_refs, packed_ref_names)
+    (all_refs, invalid)
 }
 
 fn resolve_head(head_path: &Path, all_refs: &[(String, String)]) -> Option<String> {

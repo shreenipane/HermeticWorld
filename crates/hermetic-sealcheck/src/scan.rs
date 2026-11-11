@@ -509,6 +509,19 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
+        if entry.path_is_symlink() && entry.file_name() == ".git" {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_pointer".into(),
+                path: display_path.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec!["symlink named .git".into()],
+            });
+        }
+
         let metadata = if entry.path_is_symlink() {
             match std::fs::metadata(file_path) {
                 Ok(m) if m.is_file() => m,

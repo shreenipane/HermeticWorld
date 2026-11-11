@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+use hermetic_sealcheck::gitstore::scan_stray_pack_slice;
 use hermetic_sealcheck::{
     apply_delta, compute_git_sha1, GitError, GitStore, PackIndex, ScanOptions,
 };
@@ -387,6 +388,93 @@ fn test_hostile_ref_delta_cycle() {
         "cycle detection expected, got {:?}",
         res
     );
+}
+
+fn stray_pack(count: u32, body: &[u8]) -> Vec<u8> {
+    let mut pack = b"PACK\0\0\0\x02".to_vec();
+    pack.extend_from_slice(&count.to_be_bytes());
+    pack.extend_from_slice(body);
+    pack.extend_from_slice(&[0u8; 20]); // trailer
+    pack
+}
+
+#[test]
+fn test_hostile_delta_copy_cannot_exceed_declared_result() {
+    // base 4 bytes, declared result 4 bytes, then two copies of the whole base.
+    let delta = vec![4, 4, 0x90, 4, 0x90, 4];
+    let res = apply_delta(b"abcd", &delta, 1024 * 1024);
+    assert!(matches!(res, Err(GitError::Corrupt(msg)) if msg.contains("result size mismatch")));
+}
+
+#[test]
+fn test_hostile_delta_insert_cannot_exceed_declared_result() {
+    // base 4 bytes, declared result 1 byte, then a 3-byte insert.
+    let delta = vec![4, 1, 3, b'x', b'y', b'z'];
+    let res = apply_delta(b"abcd", &delta, 1024 * 1024);
+    assert!(matches!(res, Err(GitError::Corrupt(msg)) if msg.contains("result size mismatch")));
+}
+
+#[test]
+fn test_hostile_stray_pack_huge_declared_size() {
+    // A blob whose header declares 2^56 bytes: must be refused before allocating.
+    let mut body = vec![0xb0u8];
+    body.extend_from_slice(&[0x80; 7]);
+    body.push(0x01);
+    let opts = ScanOptions::default();
+    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(res, Err(GitError::LimitExceeded(_))));
+}
+
+#[test]
+fn test_hostile_stray_pack_size_varint_overflow() {
+    let body = vec![0xffu8; 16];
+    let opts = ScanOptions::default();
+    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(res, Err(GitError::Corrupt(_))));
+}
+
+#[test]
+fn test_hostile_stray_pack_zlib_bomb_stops_at_the_limit() {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&vec![0u8; 5 * 1024 * 1024]).unwrap();
+    let mut body = vec![0x35u8]; // blob, declared size 5
+    body.extend_from_slice(&encoder.finish().unwrap());
+
+    let opts = ScanOptions {
+        max_member_bytes: 1024 * 1024,
+        ..Default::default()
+    };
+    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(res, Err(GitError::LimitExceeded(_))));
+}
+
+#[test]
+fn test_hostile_stray_pack_shorter_than_its_count() {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(b"hello").unwrap();
+    let mut body = vec![0x35u8];
+    body.extend_from_slice(&encoder.finish().unwrap());
+
+    let opts = ScanOptions::default();
+    let res = scan_stray_pack_slice(&stray_pack(2, &body), &opts, &mut 0);
+    assert!(matches!(res, Err(GitError::Corrupt(msg)) if msg.contains("last object")));
+}
+
+#[test]
+fn test_stray_pack_counts_against_container_total() {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(b"hello").unwrap();
+    let mut body = vec![0x35u8];
+    body.extend_from_slice(&encoder.finish().unwrap());
+
+    let opts = ScanOptions::default();
+    let mut total = 0u64;
+    let (blobs, unresolved) =
+        scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut total).unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].1, b"hello");
+    assert!(!unresolved);
+    assert_eq!(total, 5);
 }
 
 #[test]

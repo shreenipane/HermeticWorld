@@ -381,7 +381,7 @@ impl<'a> ContainerScanner<'a> {
     }
 
     fn scan_stray_pack(&mut self, path: &str, bytes: &[u8], depth: usize) {
-        match crate::gitstore::scan_stray_pack_slice(bytes, self.opts.max_member_bytes) {
+        match crate::gitstore::scan_stray_pack_slice(bytes, self.opts, &mut self.total_expanded) {
             Ok((blobs, has_unresolved_ref_delta)) => {
                 for (offset, blob_bytes) in blobs {
                     let blob_path = format!("{}#{}", path, offset);
@@ -399,6 +399,18 @@ impl<'a> ContainerScanner<'a> {
                         evidence: vec!["unresolved REF_DELTA in stray pack".into()],
                     });
                 }
+            }
+            Err(crate::gitstore::GitError::LimitExceeded(msg)) => {
+                self.findings.push(Finding {
+                    detector: "D2".into(),
+                    channel: "container_bomb".into(),
+                    path: path.to_string(),
+                    visibility: self.opts.visibility,
+                    severity: Severity::Review,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec![msg],
+                });
             }
             Err(e) => {
                 self.findings.push(Finding {

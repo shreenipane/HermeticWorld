@@ -60,6 +60,195 @@ fn t_clock() -> OffsetDateTime {
     time::macros::datetime!(2026-01-01 00:00:00 UTC)
 }
 
+fn scan_d1(
+    repo_dir: &Path,
+    base_commit: String,
+    fp: &FingerprintSet,
+) -> Vec<hermetic_sealcheck::Finding> {
+    let opts = ScanOptions {
+        base_commit: Some(base_commit),
+        t_clock: Some(t_clock()),
+        ..Default::default()
+    };
+    scan_tree(repo_dir, fp, &opts)
+        .into_iter()
+        .filter(|f| f.detector == "D1" && f.severity == Severity::Gate)
+        .collect()
+}
+
+fn has_channel(findings: &[hermetic_sealcheck::Finding], channel: &str) -> bool {
+    findings.iter().any(|f| f.channel == channel)
+}
+
+#[test]
+fn test_d1_non_utf8_commit_keeps_history_reachable() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    // A Latin-1 commit in the middle of the history must not cut the walk off.
+    fs::write(repo_dir.join("second.py"), "print('second')\n").unwrap();
+    fs::write(repo_dir.join("msg.txt"), b"caf\xe9 commit\n").unwrap();
+    run_git(repo_dir, &["add", "second.py"]);
+    run_git(
+        repo_dir,
+        &[
+            "-c",
+            "i18n.commitEncoding=ISO-8859-1",
+            "commit",
+            "-F",
+            "msg.txt",
+        ],
+    );
+    fs::write(repo_dir.join("third.py"), "print('third')\n").unwrap();
+    run_git(repo_dir, &["add", "third.py"]);
+    run_git(repo_dir, &["commit", "-m", "top commit"]);
+    let head = run_git(repo_dir, &["rev-parse", "HEAD"]);
+    let _ = fs::remove_dir_all(repo_dir.join(".git/logs"));
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(gates.is_empty(), "expected no D1 gates, got: {gates:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_d1_non_utf8_file_name_keeps_tree_reachable() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    fs::write(repo_dir.join(OsStr::from_bytes(b"caf\xe9.txt")), "x\n").unwrap();
+    run_git(repo_dir, &["add", "-A"]);
+    run_git(repo_dir, &["commit", "-m", "odd name"]);
+    let head = run_git(repo_dir, &["rev-parse", "HEAD"]);
+    let _ = fs::remove_dir_all(repo_dir.join(".git/logs"));
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(gates.is_empty(), "expected no D1 gates, got: {gates:?}");
+}
+
+#[test]
+fn test_d1_text_named_idx_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let pack_dir = repo_dir.join(".git/objects/pack");
+    fs::create_dir_all(&pack_dir).unwrap();
+    fs::write(
+        pack_dir.join("notes.idx"),
+        "def run():\n    execute_critical_leak_line()\n",
+    )
+    .unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+    assert!(has_channel(&gates, "git_unsupported"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_pack_without_idx_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let pack_dir = repo_dir.join(".git/objects/pack");
+    fs::create_dir_all(&pack_dir).unwrap();
+    let name = format!("pack-{}.pack", "a".repeat(40));
+    fs::write(pack_dir.join(name), b"PACK\0\0\0\x02\0\0\0\0").unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_oddly_named_pack_file_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let pack_dir = repo_dir.join(".git/objects/pack");
+    fs::create_dir_all(&pack_dir).unwrap();
+    fs::write(pack_dir.join("leak.rev"), "execute_critical_leak_line()\n").unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_pack_count_differing_from_idx_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+    run_git(repo_dir, &["repack", "-adq"]);
+
+    let pack_dir = repo_dir.join(".git/objects/pack");
+    let pack = fs::read_dir(&pack_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "pack"))
+        .unwrap();
+    let mut bytes = fs::read(&pack).unwrap();
+    bytes[11] = bytes[11].wrapping_add(1);
+    let mut perms = fs::metadata(&pack).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&pack, perms).unwrap();
+    fs::write(&pack, bytes).unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_corrupt"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_symbolic_ref_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let dir = repo_dir.join(".git/refs/remotes/origin");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("HEAD"), "ref: refs/remotes/origin/main\n").unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_ref"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_inner_tag_of_a_chain_is_checked() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let leak = "def run():\n    execute_critical_leak_line()\n    pass\n";
+    run_git(repo_dir, &["tag", "-a", "inner", "-m", leak, &base_commit]);
+    run_git(repo_dir, &["tag", "-a", "outer", "-m", "harmless", "inner"]);
+    run_git(repo_dir, &["tag", "-d", "inner"]);
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_tag"), "got: {gates:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_d1_symlinks_can_not_hide() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    std::os::unix::fs::symlink("/etc/hostname", repo_dir.join(".git/objects/stash")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink("/somewhere/else", repo_dir.join("sub/.git")).unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+    assert!(has_channel(&gates, "git_pointer"), "got: {gates:?}");
+}
+
 #[test]
 fn test_d1_pass() {
     let temp = tempfile::tempdir().unwrap();
