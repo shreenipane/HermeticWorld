@@ -35,14 +35,36 @@ class SealReport:
 
 def _make_writable_and_retry(func, path, _exc):
     try:
-        os.chmod(path, stat.S_IRWXU)  # S_IWRITE alone would strip r/x from directories on POSIX
-        func(path)
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            parent = os.path.dirname(path) or "."
+            pst = os.lstat(parent)
+            if not stat.S_ISLNK(pst.st_mode):
+                os.chmod(parent, pst.st_mode | stat.S_IRWXU)
+                os.unlink(path)
+        else:
+            os.chmod(path, stat.S_IRWXU)  # S_IWRITE alone would strip r/x from directories on POSIX
+            try:
+                func(path)
+            except OSError:
+                parent = os.path.dirname(path) or "."
+                pst = os.lstat(parent)
+                if not stat.S_ISLNK(pst.st_mode):
+                    os.chmod(parent, pst.st_mode | stat.S_IRWXU)
+                    func(path)
     except OSError:
         pass
 
 
 def rmtree_force(path: Path) -> None:
     """Remove a directory tree, clearing read-only flags and retrying on failure."""
+    path = Path(path)
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError as exc:
+            _make_writable_and_retry(os.unlink, path, exc)
+        return
     if not path.exists():
         return
     if sys.version_info >= (3, 12):
@@ -53,17 +75,31 @@ def rmtree_force(path: Path) -> None:
 
 def _clean_directory(path: Path) -> None:
     """Remove all contents within a directory, handling read-only files."""
-    if not path.exists():
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
         return
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISLNK(st.st_mode) and (st.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
+            os.chmod(path, st.st_mode | stat.S_IRWXU)
+    except OSError:
+        pass
     for item in list(path.iterdir()):
-        if item.is_dir():
+        if item.is_symlink():
+            try:
+                item.unlink()
+            except OSError as exc:
+                _make_writable_and_retry(os.unlink, item, exc)
+        elif item.is_dir():
             rmtree_force(item)
         else:
             try:
-                os.chmod(item, stat.S_IRWXU)
+                st = os.lstat(item)
+                if not stat.S_ISLNK(st.st_mode):
+                    os.chmod(item, stat.S_IRWXU)
                 item.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                _make_writable_and_retry(os.unlink, item, exc)
 
 
 def seal_repo(

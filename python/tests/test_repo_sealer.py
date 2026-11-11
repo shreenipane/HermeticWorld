@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 from unittest.mock import patch
@@ -19,6 +20,8 @@ from hermetic_slice.gitutil import GitError, run_git
 from hermetic_slice.repo_sealer import (
     UnsupportedRepoError,
     VerificationError,
+    _clean_directory,
+    rmtree_force,
     seal_repo,
     verify_sealed_repo,
 )
@@ -444,3 +447,93 @@ def test_cli_error_exit_codes(synthetic_repo: SyntheticRepo, tmp_path: Path) -> 
             synthetic_repo.t_clock.isoformat(),
         ])
         assert code == 2, f"Expected exit code 2 on verification failure, got {code}"
+
+
+def test_rmtree_force_symlink_to_host_file_in_readonly_dir(tmp_path: Path) -> None:
+    """(a) a directory containing a symlink to a 'host' file outside the tree,
+    with the directory made read-only (chmod 0o555): rmtree_force removes the tree
+    and the host file's mode is unchanged."""
+    if os.geteuid() == 0:
+        pytest.skip("Read-only directory test requires non-root user")
+
+    host_file = tmp_path / "host_file.txt"
+    host_file.write_text("host content\n")
+    os.chmod(host_file, 0o644)
+    orig_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
+
+    tree = tmp_path / "dir_to_remove"
+    tree.mkdir()
+    link = tree / "symlink_to_host"
+    link.symlink_to(host_file)
+
+    os.chmod(tree, 0o555)
+    try:
+        rmtree_force(tree)
+    finally:
+        if tree.exists():
+            os.chmod(tree, 0o755)
+
+    assert not tree.exists(), "Tree must be completely removed"
+    assert host_file.exists(), "Host file must still exist"
+    assert host_file.read_text() == "host content\n"
+    current_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
+    assert current_mode == orig_mode, f"Host file mode changed from {oct(orig_mode)} to {oct(current_mode)}"
+
+
+def test_clean_directory_symlink_to_host_directory(tmp_path: Path) -> None:
+    """(b) _clean_directory on a directory containing a symlink to a host directory:
+    the host directory and its contents are untouched and the link is gone."""
+    host_dir = tmp_path / "host_dir"
+    host_dir.mkdir()
+    (host_dir / "file1.txt").write_text("precious file 1")
+    (host_dir / "subdir").mkdir()
+    (host_dir / "subdir" / "file2.txt").write_text("precious file 2")
+
+    clean_dir = tmp_path / "dest_to_clean"
+    clean_dir.mkdir()
+    link = clean_dir / "link_to_host_dir"
+    link.symlink_to(host_dir)
+
+    _clean_directory(clean_dir)
+
+    assert clean_dir.exists(), "clean_dir itself should remain existing"
+    assert list(clean_dir.iterdir()) == [], "clean_dir should be empty"
+    assert host_dir.exists(), "host directory must remain untouched"
+    assert (host_dir / "file1.txt").read_text() == "precious file 1"
+    assert (host_dir / "subdir" / "file2.txt").read_text() == "precious file 2"
+
+
+def test_rootfs_clean_staging_readonly_dir_symlinked_history(tmp_path: Path) -> None:
+    """(c) the rootfs builder test with a read-only staging directory holding a
+    symlinked history file leaves the host target's mode unchanged."""
+    if os.geteuid() == 0:
+        pytest.skip("Read-only directory test requires non-root user")
+
+    from hermetic_slice.rootfs import clean_rootfs_staging
+
+    host_file = tmp_path / "host_bash_history"
+    host_file.write_text("secret host commands\n")
+    os.chmod(host_file, 0o600)
+    orig_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
+
+    staging = tmp_path / "staging_ro"
+    staging.mkdir()
+    user_dir = staging / "home" / "user"
+    user_dir.mkdir(parents=True)
+    symlink_hist = user_dir / ".bash_history"
+    symlink_hist.symlink_to(host_file.resolve())
+
+    os.chmod(user_dir, 0o555)
+    try:
+        removed = clean_rootfs_staging(staging)
+    finally:
+        if user_dir.exists():
+            os.chmod(user_dir, 0o755)
+
+    assert "home/user/.bash_history" in removed
+    assert not symlink_hist.exists()
+    assert not symlink_hist.is_symlink()
+    assert host_file.exists()
+    assert host_file.read_text() == "secret host commands\n"
+    current_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
+    assert current_mode == orig_mode, f"Host file mode changed from {oct(orig_mode)} to {oct(current_mode)}"

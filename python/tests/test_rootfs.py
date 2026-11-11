@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -22,9 +23,11 @@ from hermetic_slice.rootfs import (
     RootfsGateError,
     build_rootfs,
     calculate_image_size_mib,
+    calculate_inode_count,
     check_e2fsprogs_version,
     clean_rootfs_staging,
     compute_tree_size_bytes,
+    compute_tree_stats,
     copy_to_staging,
     find_sealcheck_bin,
     parse_mke2fs_version,
@@ -501,3 +504,372 @@ def test_measured_build_time_20mib(tmp_path: Path) -> None:
     assert res["d4"] == "pass"
     assert out_image.exists()
     print(f"\n[MEASURED_BUILD_TIME_20MIB] Elapsed: {elapsed:.3f} s, image sha256: {res['sha256']}, size_bytes: {res['size_bytes']}")
+
+
+# -----------------------------------------------------------------------------
+# Regression Tests for Security Review Fixes 1-6
+# -----------------------------------------------------------------------------
+
+
+def test_fix1_symlinks_in_cleanup_a_staging_var_log_absolute_host_dir(tmp_path: Path) -> None:
+    """FIX 1 (a): staging var/log -> absolute path of a tmp host directory containing files:
+    after the build those host files still exist."""
+    host_dir = tmp_path / "host_log"
+    host_dir.mkdir()
+    host_file = host_dir / "syslog.host"
+    host_file.write_text("critical host log content")
+
+    src = tmp_path / "src_a"
+    src.mkdir()
+    (src / "var").mkdir()
+    (src / "var" / "log").symlink_to(host_dir.resolve())
+
+    staging = tmp_path / "staging_a"
+    copy_to_staging(src, staging)
+    removed = clean_rootfs_staging(staging)
+
+    assert host_file.exists(), "Host file was deleted by clean-up following symlink!"
+    assert host_file.read_text() == "critical host log content"
+    assert "var/log/syslog.host" not in removed
+
+
+def test_fix1_symlinks_in_cleanup_b_home_u_host_dir_with_history(tmp_path: Path) -> None:
+    """FIX 1 (b): home/u -> a host dir containing .bash_history: the host file still exists."""
+    host_dir = tmp_path / "host_user"
+    host_dir.mkdir()
+    host_hist = host_dir / ".bash_history"
+    host_hist.write_text("secret host history")
+
+    src = tmp_path / "src_b"
+    src.mkdir()
+    (src / "home").mkdir()
+    (src / "home" / "u").symlink_to(host_dir.resolve())
+
+    staging = tmp_path / "staging_b"
+    copy_to_staging(src, staging)
+    removed = clean_rootfs_staging(staging)
+
+    assert host_hist.exists(), "Host history was deleted by clean-up following symlink!"
+    assert host_hist.read_text() == "secret host history"
+    assert "home/u/.bash_history" not in removed
+
+
+def test_fix1_symlinks_in_cleanup_c_var_points_outside(tmp_path: Path) -> None:
+    """FIX 1 (c): var -> ../outside: nothing outside staging is touched."""
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "untouchable.txt"
+    outside_file.write_text("outside data")
+    outside_log = outside_dir / "log"
+    outside_log.mkdir()
+    outside_log_file = outside_log / "app.log"
+    outside_log_file.write_text("outside log")
+
+    src = tmp_path / "src_c"
+    src.mkdir()
+    (src / "var").symlink_to(Path("..") / "outside")
+
+    staging = tmp_path / "staging_c"
+    copy_to_staging(src, staging)
+    removed = clean_rootfs_staging(staging)
+
+    assert outside_file.exists()
+    assert outside_file.read_text() == "outside data"
+    assert outside_log_file.exists()
+    assert outside_log_file.read_text() == "outside log"
+    assert not any(r.startswith("var/") for r in removed)
+
+
+def test_fix1_symlinks_in_cleanup_d_history_symlink_to_host_file(tmp_path: Path) -> None:
+    """FIX 1 (d): a .bash_history that is itself a symlink to a host file:
+    the link is removed, the host file stays."""
+    host_file = tmp_path / "host_bash_history"
+    host_file.write_text("precious history")
+
+    src = tmp_path / "src_d"
+    src.mkdir()
+    (src / "home" / "user").mkdir(parents=True)
+    (src / "home" / "user" / ".bash_history").symlink_to(host_file.resolve())
+
+    staging = tmp_path / "staging_d"
+    copy_to_staging(src, staging)
+    removed = clean_rootfs_staging(staging)
+
+    # Host file stays!
+    assert host_file.exists()
+    assert host_file.read_text() == "precious history"
+    # The symlink in staging was unlinked!
+    assert not (staging / "home" / "user" / ".bash_history").exists()
+    assert not (staging / "home" / "user" / ".bash_history").is_symlink()
+    assert "home/user/.bash_history" in removed
+
+
+def test_fix2_readonly_parent_made_writable_in_staging_never_in_src(tmp_path: Path) -> None:
+    """FIX 2: A history file in a read-only directory inside source is still removed
+    (parent made writable in staging, never in src)."""
+    src = tmp_path / "src_ro"
+    src.mkdir()
+    user_dir = src / "home" / "user"
+    user_dir.mkdir(parents=True)
+    hist = user_dir / ".bash_history"
+    hist.write_text("history")
+
+    # Make parent directory in src read-only (no user write: 0o555)
+    os.chmod(user_dir, 0o555)
+    try:
+        staging = tmp_path / "staging_ro"
+        copy_to_staging(src, staging)
+
+        staging_user = staging / "home" / "user"
+        # Verify staging started read-only like src
+        assert (staging_user.stat().st_mode & stat.S_IWUSR) == 0
+
+        removed = clean_rootfs_staging(staging)
+
+        # Removed from staging
+        assert "home/user/.bash_history" in removed
+        assert not (staging / "home" / "user" / ".bash_history").exists()
+
+        # Parent in staging made writable
+        assert (staging_user.stat().st_mode & stat.S_IWUSR) != 0
+
+        # Parent in src NEVER made writable!
+        assert (user_dir.stat().st_mode & stat.S_IWUSR) == 0
+    finally:
+        # Restore src permissions for clean tmp_path teardown
+        os.chmod(user_dir, 0o755)
+
+
+def test_readonly_staging_dir_with_symlinked_history_leaves_host_mode_unchanged(tmp_path: Path) -> None:
+    """The rootfs builder test with a read-only staging directory holding a
+    symlinked history file leaves the host target's mode unchanged."""
+    if os.geteuid() == 0:
+        pytest.skip("Read-only directory test requires non-root user")
+
+    host_file = tmp_path / "host_bash_history"
+    host_file.write_text("precious history")
+    os.chmod(host_file, 0o644)
+    orig_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
+
+    src = tmp_path / "src_ro_symlink"
+    src.mkdir()
+    user_dir = src / "home" / "user"
+    user_dir.mkdir(parents=True)
+    (user_dir / ".bash_history").symlink_to(host_file.resolve())
+
+    os.chmod(user_dir, 0o555)
+    try:
+        staging = tmp_path / "staging_ro_symlink"
+        copy_to_staging(src, staging)
+
+        staging_user = staging / "home" / "user"
+        assert (staging_user.stat().st_mode & stat.S_IWUSR) == 0
+
+        removed = clean_rootfs_staging(staging)
+
+        assert "home/user/.bash_history" in removed
+        assert not (staging / "home" / "user" / ".bash_history").exists()
+        assert not (staging / "home" / "user" / ".bash_history").is_symlink()
+
+        assert host_file.exists()
+        assert host_file.read_text() == "precious history"
+        assert stat.S_IMODE(os.lstat(host_file).st_mode) == orig_mode
+        assert (user_dir.stat().st_mode & stat.S_IWUSR) == 0
+    finally:
+        os.chmod(user_dir, 0o755)
+
+
+def test_fix2_unremovable_file_raises_error_naming_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FIX 2: A case that cannot be removed (monkeypatch on os.unlink raising PermissionError twice) raises."""
+    src = tmp_path / "src_fail"
+    src.mkdir()
+    (src / "home" / "user").mkdir(parents=True)
+    (src / "home" / "user" / ".bash_history").write_text("history")
+
+    staging = tmp_path / "staging_fail"
+    copy_to_staging(src, staging)
+
+    unlink_calls = 0
+
+    def mock_unlink(path, *args, **kwargs):
+        nonlocal unlink_calls
+        unlink_calls += 1
+        raise PermissionError(f"Permission denied on {path}")
+
+    monkeypatch.setattr(os, "unlink", mock_unlink)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        clean_rootfs_staging(staging)
+
+    assert ".bash_history" in str(excinfo.value)
+    assert unlink_calls >= 2
+
+
+def test_fix3_existing_out_image_survives_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FIX 3: An existing good out_image survives a gate failure (exit 2), a gate error (exit 1),
+    and a missing sealcheck binary."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.txt").write_text("app data")
+
+    out_image = tmp_path / "existing.img"
+    original_data = b"PRE-EXISTING-GOOD-IMAGE-DATA\x00\x01\x02\x03"
+    out_image.write_bytes(original_data)
+
+    t_clock = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Missing sealcheck binary fails BEFORE building and leaves existing image untouched
+    monkeypatch.setattr(
+        "hermetic_slice.rootfs.resolve_mke2fs_bin",
+        lambda: "/bin/mke2fs",
+    )
+    monkeypatch.setattr(
+        "hermetic_slice.rootfs.find_sealcheck_bin",
+        lambda _bin=None: (_ for _ in ()).throw(FileNotFoundError("no hermetic-sealcheck")),
+    )
+    with pytest.raises(FileNotFoundError, match="no hermetic-sealcheck"):
+        build_rootfs(src=src, out_image=out_image, t_clock=t_clock, world_id="test-world")
+
+    assert out_image.exists()
+    assert out_image.read_bytes() == original_data
+
+    # Setup mock subprocess for exit 2 and exit 1
+    monkeypatch.setattr(
+        "hermetic_slice.rootfs.find_sealcheck_bin",
+        lambda _bin=None: Path("/bin/hermetic-sealcheck"),
+    )
+
+    sc_exit = 2
+
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        if "-V" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="mke2fs 1.47.2\n", stderr="")
+        if "-t" in cmd and "ext4" in cmd:
+            out_idx = cmd.index("-F") + 1
+            Path(cmd[out_idx]).write_bytes(b"temporary ext4 data")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "d4-image" in cmd:
+            if sc_exit == 2:
+                findings = [{"rule": "D4", "severity": "gate", "message": "bad timestamp"}]
+                return subprocess.CompletedProcess(
+                    cmd, 2, stdout=json.dumps({"findings": findings}), stderr=""
+                )
+            elif sc_exit == 1:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Corrupted ext4")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+    # 2. Gate failure (exit 2) leaves existing out_image untouched
+    sc_exit = 2
+    with pytest.raises(RootfsGateError):
+        build_rootfs(src=src, out_image=out_image, t_clock=t_clock, world_id="test-world")
+
+    assert out_image.exists()
+    assert out_image.read_bytes() == original_data
+
+    # 3. Gate error (exit 1) leaves existing out_image untouched
+    sc_exit = 1
+    with pytest.raises(RuntimeError, match="sealcheck d4-image failed"):
+        build_rootfs(src=src, out_image=out_image, t_clock=t_clock, world_id="test-world")
+
+    assert out_image.exists()
+    assert out_image.read_bytes() == original_data
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_fix4_concurrent_builds_to_same_out_image(tmp_path: Path) -> None:
+    """FIX 4: Two builds to the same out_image run in threads both succeed,
+    the result is one valid image, and no .tmp files remain."""
+    import concurrent.futures
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "hello.txt").write_text("concurrent content")
+
+    out_image = tmp_path / "concurrent.ext4"
+    t_clock = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def run_worker(wid: str):
+        return build_rootfs(
+            src=src,
+            out_image=out_image,
+            t_clock=t_clock,
+            world_id=wid,
+            size_mib=64,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(run_worker, "w1")
+        f2 = pool.submit(run_worker, "w2")
+        r1 = f1.result()
+        r2 = f2.result()
+
+    assert r1["d4"] == "pass"
+    assert r2["d4"] == "pass"
+    assert out_image.exists()
+    assert out_image.stat().st_size > 0
+    # No .tmp files remain
+    tmp_files = list(out_image.parent.glob("*.tmp"))
+    assert tmp_files == [], f"Found leftover .tmp files: {tmp_files}"
+
+
+def test_fix5_out_inside_src_exits_with_error_and_creates_nothing(tmp_path: Path) -> None:
+    """FIX 5: --out inside --src exits with error and creates nothing."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "data.txt").write_text("important")
+
+    nested_out = src / "nested" / "out.img"
+    rc = main([
+        "build-rootfs",
+        "--src", str(src),
+        "--out", str(nested_out),
+        "--t-clock", "2024-01-01T00:00:00Z",
+        "--world-id", "test-inside",
+    ])
+    assert rc != 0
+    # Creates nothing!
+    assert not (src / "nested").exists()
+    assert not nested_out.exists()
+    assert list(src.iterdir()) == [src / "data.txt"]
+
+    # Direct build_rootfs call also raises ValueError
+    with pytest.raises(ValueError, match="cannot be inside source directory"):
+        build_rootfs(
+            src=src,
+            out_image=src / "out.img",
+            t_clock=datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            world_id="test-inside",
+        )
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_fix6_many_empty_files_automatic_sizing(tmp_path: Path) -> None:
+    """FIX 6: A tree of 20,000 empty files builds successfully with automatic sizing."""
+    src = tmp_path / "src_20000"
+    src.mkdir()
+    # Create 20,000 empty files
+    for i in range(20000):
+        (src / f"f_{i:05d}").touch()
+
+    out_image = tmp_path / "rootfs_20000.ext4"
+    t_clock = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    t0 = time.perf_counter()
+    res = build_rootfs(
+        src=src,
+        out_image=out_image,
+        t_clock=t_clock,
+        world_id="world-20000",
+        size_mib=None,  # automatic sizing!
+    )
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+
+    assert res["d4"] == "pass"
+    assert out_image.exists()
+    assert out_image.stat().st_size > 0
+    print(f"\n[20000_FILES_BUILD_TIME] Elapsed: {elapsed:.3f} s")

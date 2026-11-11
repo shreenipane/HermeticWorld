@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import uuid
 
 from hermetic_slice.cutoffs import ensure_utc
@@ -168,19 +169,100 @@ def copy_to_staging(src: Path, staging_dir: Path) -> list[str]:
     return sorted(skipped_special)
 
 
-def _remove_entry(path: Path) -> None:
-    """Remove a file, symlink, or directory tree forcefully."""
-    if path.is_symlink() or not path.is_dir():
+def _safe_real_dir(staging_dir: Path, rel_path: Path | str) -> Path | None:
+    """Resolve rel_path component by component from staging_dir using os.lstat.
+
+    If any component (including ancestors) is a symlink, does not exist,
+    or is not a directory, returns None (never descend through symlinks).
+    Otherwise returns the Path.
+    """
+    rel = Path(rel_path)
+    current = staging_dir
+    try:
+        st = os.lstat(current)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return None
+    except OSError:
+        return None
+
+    for part in rel.parts:
+        if part in (".", ""):
+            continue
+        if part == "..":
+            return None
+        current = current / part
         try:
-            path.unlink()
+            st = os.lstat(current)
         except OSError:
-            try:
-                os.chmod(path, 0o700)
-                path.unlink()
-            except OSError:
-                pass
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return None
+
+    return current
+
+
+def _safe_walk(dir_path: Path):
+    """Walk directory tree yielding (dirpath, dirnames, filenames), NEVER following symlinks."""
+    try:
+        with os.scandir(dir_path) as it:
+            dirs = []
+            files = []
+            for entry in it:
+                try:
+                    if entry.is_symlink():
+                        files.append(entry.name)
+                    elif entry.is_dir(follow_symlinks=False):
+                        dirs.append(entry.name)
+                    else:
+                        files.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+    yield dir_path, dirs, files
+
+    for d in list(dirs):
+        yield from _safe_walk(dir_path / d)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        os.unlink(path)
     else:
         rmtree_force(path)
+        if path.exists() or path.is_symlink():
+            raise OSError(f"Directory {path} could not be completely removed")
+
+
+def _remove_entry(path: Path, staging_dir: Path | None = None) -> None:
+    """Remove a file, symlink, or directory tree forcefully, failing if it cannot be removed."""
+    try:
+        _remove_path(path)
+    except OSError:
+        # First try making the parent directory writable (chmod u+w on the parent, inside staging only)
+        parent = path.parent
+        try:
+            can_chmod = True
+            if staging_dir is not None:
+                resolved_staging = staging_dir.resolve()
+                resolved_parent = parent.resolve()
+                can_chmod = (
+                    resolved_parent == resolved_staging
+                    or resolved_parent.is_relative_to(resolved_staging)
+                )
+            if can_chmod:
+                st = os.lstat(parent)
+                if not stat.S_ISLNK(st.st_mode):
+                    os.chmod(parent, st.st_mode | stat.S_IWUSR)
+        except OSError:
+            pass
+
+        # Retry once
+        try:
+            _remove_path(path)
+        except OSError as exc:
+            raise RuntimeError(f"Failed to remove clean-up target {path}: {exc}") from exc
 
 
 def clean_rootfs_staging(staging_dir: Path) -> list[str]:
@@ -200,98 +282,138 @@ def clean_rootfs_staging(staging_dir: Path) -> list[str]:
     removed: set[str] = set()
 
     # 1. var/log/* (keep var/log itself)
-    log_dir = staging_dir / "var" / "log"
-    if log_dir.is_dir():
-        for entry in log_dir.iterdir():
-            rel = entry.relative_to(staging_dir).as_posix()
-            _remove_entry(entry)
-            removed.add(rel)
+    log_dir = _safe_real_dir(staging_dir, "var/log")
+    if log_dir is not None:
+        with os.scandir(log_dir) as it:
+            for entry in it:
+                entry_path = Path(entry.path)
+                rel = entry_path.relative_to(staging_dir).as_posix()
+                _remove_entry(entry_path, staging_dir)
+                removed.add(rel)
 
     # 2. var/cache/* (keep var/cache itself)
-    cache_dir = staging_dir / "var" / "cache"
-    if cache_dir.is_dir():
-        for entry in cache_dir.iterdir():
-            rel = entry.relative_to(staging_dir).as_posix()
-            _remove_entry(entry)
-            removed.add(rel)
+    cache_dir = _safe_real_dir(staging_dir, "var/cache")
+    if cache_dir is not None:
+        with os.scandir(cache_dir) as it:
+            for entry in it:
+                entry_path = Path(entry.path)
+                rel = entry_path.relative_to(staging_dir).as_posix()
+                _remove_entry(entry_path, staging_dir)
+                removed.add(rel)
 
     # 3. var/lib/apt/lists/*
-    apt_lists = staging_dir / "var" / "lib" / "apt" / "lists"
-    if apt_lists.is_dir():
-        for entry in apt_lists.iterdir():
-            rel = entry.relative_to(staging_dir).as_posix()
-            _remove_entry(entry)
-            removed.add(rel)
+    apt_lists = _safe_real_dir(staging_dir, "var/lib/apt/lists")
+    if apt_lists is not None:
+        with os.scandir(apt_lists) as it:
+            for entry in it:
+                entry_path = Path(entry.path)
+                rel = entry_path.relative_to(staging_dir).as_posix()
+                _remove_entry(entry_path, staging_dir)
+                removed.add(rel)
 
     # 4. root/.cache/pip, every .cache/pip and .cache/uv under home/* and root
-    user_caches: list[Path] = [
-        staging_dir / "root" / ".cache" / "pip",
-        staging_dir / "root" / ".cache" / "uv",
-    ]
-    home_dir = staging_dir / "home"
-    if home_dir.is_dir():
-        for child in home_dir.iterdir():
-            if child.is_dir():
-                user_caches.append(child / ".cache" / "pip")
-                user_caches.append(child / ".cache" / "uv")
-    for cache_target in user_caches:
-        if cache_target.exists() or cache_target.is_symlink():
-            rel = cache_target.relative_to(staging_dir).as_posix()
-            _remove_entry(cache_target)
-            removed.add(rel)
+    root_cache_dir = _safe_real_dir(staging_dir, "root/.cache")
+    if root_cache_dir is not None:
+        for cname in ("pip", "uv"):
+            target = root_cache_dir / cname
+            try:
+                os.lstat(target)
+                target_exists = True
+            except OSError:
+                target_exists = False
+            if target_exists:
+                rel = target.relative_to(staging_dir).as_posix()
+                _remove_entry(target, staging_dir)
+                removed.add(rel)
+
+    home_dir = _safe_real_dir(staging_dir, "home")
+    if home_dir is not None:
+        with os.scandir(home_dir) as it:
+            for u_entry in it:
+                if u_entry.is_dir(follow_symlinks=False):
+                    user_cache_dir = _safe_real_dir(staging_dir, f"home/{u_entry.name}/.cache")
+                    if user_cache_dir is not None:
+                        for cname in ("pip", "uv"):
+                            target = user_cache_dir / cname
+                            try:
+                                os.lstat(target)
+                                target_exists = True
+                            except OSError:
+                                target_exists = False
+                            if target_exists:
+                                rel = target.relative_to(staging_dir).as_posix()
+                                _remove_entry(target, staging_dir)
+                                removed.add(rel)
 
     # 5. conda pkgs caches (opt/conda/pkgs/* and */miniconda3/pkgs/*, keeping urls.txt if present)
     pkgs_dirs: list[Path] = []
-    opt_conda_pkgs = staging_dir / "opt" / "conda" / "pkgs"
-    if opt_conda_pkgs.is_dir():
+    opt_conda_pkgs = _safe_real_dir(staging_dir, "opt/conda/pkgs")
+    if opt_conda_pkgs is not None:
         pkgs_dirs.append(opt_conda_pkgs)
 
-    for p in staging_dir.rglob("miniconda3/pkgs"):
-        if p.is_dir() and p not in pkgs_dirs:
-            pkgs_dirs.append(p)
+    for dirpath, dirs, files in _safe_walk(staging_dir):
+        if dirpath.name == "pkgs" and dirpath.parent.name == "miniconda3":
+            if dirpath not in pkgs_dirs:
+                pkgs_dirs.append(dirpath)
 
     for pkgs_dir in pkgs_dirs:
-        for entry in pkgs_dir.iterdir():
-            if entry.name == "urls.txt":
-                continue
-            rel = entry.relative_to(staging_dir).as_posix()
-            _remove_entry(entry)
-            removed.add(rel)
+        with os.scandir(pkgs_dir) as it:
+            for entry in it:
+                if entry.name == "urls.txt":
+                    continue
+                entry_path = Path(entry.path)
+                rel = entry_path.relative_to(staging_dir).as_posix()
+                _remove_entry(entry_path, staging_dir)
+                removed.add(rel)
 
     # 6. shell histories anywhere under root/ and home/
-    for base in (staging_dir / "root", staging_dir / "home"):
-        if base.is_dir():
-            for dirpath, dirnames, filenames in os.walk(base, topdown=True):
+    for base_name in ("root", "home"):
+        base_dir = _safe_real_dir(staging_dir, base_name)
+        if base_dir is not None:
+            for dirpath, dirnames, filenames in _safe_walk(base_dir):
                 for f in filenames:
                     if f in SHELL_HISTORY_NAMES:
-                        p = Path(dirpath) / f
-                        if p.exists() or p.is_symlink():
-                            rel = p.relative_to(staging_dir).as_posix()
-                            _remove_entry(p)
-                            removed.add(rel)
-                dirs_to_remove = [d for d in dirnames if d in SHELL_HISTORY_NAMES]
-                for d in dirs_to_remove:
-                    p = Path(dirpath) / d
-                    if p.exists() or p.is_symlink():
+                        p = dirpath / f
                         rel = p.relative_to(staging_dir).as_posix()
-                        _remove_entry(p)
+                        _remove_entry(p, staging_dir)
                         removed.add(rel)
-                    dirnames.remove(d)
+                for d in list(dirnames):
+                    if d in SHELL_HISTORY_NAMES:
+                        p = dirpath / d
+                        rel = p.relative_to(staging_dir).as_posix()
+                        _remove_entry(p, staging_dir)
+                        removed.add(rel)
+                        dirnames.remove(d)
 
     return sorted(removed)
 
 
-def compute_tree_size_bytes(root: Path) -> int:
-    """Sum file sizes in directory tree."""
-    total = 0
-    for dirpath, _, filenames in os.walk(root):
+def compute_tree_stats(root: Path) -> tuple[int, int]:
+    """Sum file sizes and count entries (files, dirs, symlinks) in directory tree."""
+    total_bytes = 0
+    entry_count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        entry_count += len(dirnames)
         for name in filenames:
+            entry_count += 1
             p = Path(dirpath) / name
             try:
-                total += p.lstat().st_size
+                st = p.lstat()
+                total_bytes += st.st_size
             except OSError:
                 pass
-    return total
+    return total_bytes, entry_count
+
+
+def compute_tree_size_bytes(root: Path) -> int:
+    """Sum file sizes in directory tree."""
+    total_bytes, _ = compute_tree_stats(root)
+    return total_bytes
+
+
+def calculate_inode_count(entry_count: int) -> int:
+    """Calculate requested inode count: entries * 1.25 + 1024."""
+    return math.ceil(entry_count * 1.25 + 1024)
 
 
 def calculate_image_size_mib(staging_dir: Path, size_mib: int | None = None) -> int:
@@ -300,9 +422,15 @@ def calculate_image_size_mib(staging_dir: Path, size_mib: int | None = None) -> 
         if size_mib <= 0:
             raise ValueError(f"size_mib must be positive: {size_mib}")
         return size_mib
-    staging_bytes = compute_tree_size_bytes(staging_dir)
+    staging_bytes, entry_count = compute_tree_stats(staging_dir)
     staging_mib = staging_bytes / (1024 * 1024)
-    return math.ceil(staging_mib * 1.3 + 64)
+    base_mib = math.ceil(staging_mib * 1.3 + 64)
+
+    requested_inodes = calculate_inode_count(entry_count)
+    min_bytes = requested_inodes * 256 + staging_bytes
+    min_mib = math.ceil(min_bytes / (1024 * 1024))
+
+    return max(base_mib, min_mib)
 
 
 def build_rootfs(
@@ -332,6 +460,19 @@ def build_rootfs(
         raise FileNotFoundError(f"Source directory does not exist or is not a directory: {src}")
 
     out_image = Path(out_image)
+    resolved_src = src.resolve()
+    resolved_out = out_image.resolve()
+
+    # FIX 5: Reject before creating anything if out_image or staging would be inside src
+    if resolved_out.is_relative_to(resolved_src) or resolved_out.parent.is_relative_to(resolved_src):
+        raise ValueError(
+            f"Output image and staging directory cannot be inside source directory: "
+            f"out_image={out_image} (resolved: {resolved_out}), src={src} (resolved: {resolved_src})"
+        )
+
+    # FIX 3: Find sealcheck binary BEFORE building (fail early if missing)
+    resolved_sealcheck = find_sealcheck_bin(sealcheck_bin)
+
     t_clock_utc = ensure_utc(t_clock, "t_clock")
     t_clock_str = iso_utc(t_clock_utc)
     source_date_epoch = int(t_clock_utc.timestamp())
@@ -350,28 +491,39 @@ def build_rootfs(
     parsed_ver = check_e2fsprogs_version(combined_ver_out)
     e2fsprogs_version_str = f"{parsed_ver[0]}.{parsed_ver[1]}.{parsed_ver[2]}"
 
-    out_image.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = out_image.parent / f".staging-{out_image.name}-{uuid.uuid4().hex}"
-    tmp_image = out_image.parent / f"{out_image.name}.tmp"
+    staging_dir: Path | None = None
+    tmp_image: Path | None = None
 
     try:
+        out_image.parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = out_image.parent / f".staging-{out_image.name}-{uuid.uuid4().hex}"
+
+        # FIX 4: Unique temporary file in the same directory
+        fd, tmp_path_str = tempfile.mkstemp(
+            dir=out_image.parent,
+            prefix=f"{out_image.name}.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        tmp_image = Path(tmp_path_str)
+
         # 1. Staging copy (skipping special files)
         skipped_special = copy_to_staging(src, staging_dir)
 
         # 2. Clean-up (TR-SEAL-8)
         removed = clean_rootfs_staging(staging_dir)
 
-        # 3. Size calculation
+        # 3. Size calculation and inode demand (FIX 6)
+        staging_bytes, entry_count = compute_tree_stats(staging_dir)
+        inode_count = calculate_inode_count(entry_count)
         final_size_mib = calculate_image_size_mib(staging_dir, size_mib)
 
         # 4. Build ext4 image (TR-SEAL-7)
-        if tmp_image.exists():
-            tmp_image.unlink()
-
         cmd = [
             mke2fs_bin,
             "-q",
             "-t", "ext4",
+            "-N", str(inode_count),
             "-d", str(staging_dir),
             "-U", rootfs_uuid,
             "-E", f"hash_seed={hash_seed}",
@@ -405,14 +557,11 @@ def build_rootfs(
                 f"mke2fs failed with exit code {build_proc.returncode}: {build_proc.stderr.strip()}"
             )
 
-        tmp_image.replace(out_image)
-
-        # 5. Guard (D4)
-        resolved_sealcheck = find_sealcheck_bin(sealcheck_bin)
+        # 5. Guard (D4) - run against temporary image BEFORE replacing out_image (FIX 3)
         sc_cmd = [
             str(resolved_sealcheck),
             "d4-image",
-            "--image", str(out_image),
+            "--image", str(tmp_image),
             "--t-clock", t_clock_str,
             "--format", "json",
         ]
@@ -426,8 +575,8 @@ def build_rootfs(
         if sc_proc.returncode == 0:
             pass
         elif sc_proc.returncode == 2:
-            if out_image.exists():
-                out_image.unlink()
+            if tmp_image.exists():
+                tmp_image.unlink()
             findings = []
             try:
                 parsed_json = json.loads(sc_proc.stdout)
@@ -439,10 +588,13 @@ def build_rootfs(
                 findings=findings,
             )
         else:
-            if out_image.exists():
-                out_image.unlink()
+            if tmp_image.exists():
+                tmp_image.unlink()
             err_msg = sc_proc.stderr.strip() or sc_proc.stdout.strip() or f"exit code {sc_proc.returncode}"
             raise RuntimeError(f"sealcheck d4-image failed ({sc_proc.returncode}): {err_msg}")
+
+        # Gate passed! Publish temporary image to out_image (FIX 3, FIX 4)
+        os.replace(tmp_image, out_image)
 
         # 6. Result
         h = hashlib.sha256()
@@ -465,10 +617,10 @@ def build_rootfs(
             "d4": "pass",
         }
     finally:
-        if tmp_image.exists():
+        if tmp_image is not None and tmp_image.exists():
             try:
                 tmp_image.unlink()
             except OSError:
                 pass
-        if staging_dir.exists():
+        if staging_dir is not None and staging_dir.exists():
             rmtree_force(staging_dir)
