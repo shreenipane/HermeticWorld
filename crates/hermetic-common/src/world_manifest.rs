@@ -3,10 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, UtcOffset};
+use time::{Date, Month, OffsetDateTime, UtcOffset};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub struct ValidationErrors {
@@ -39,6 +42,8 @@ pub enum WorldManifestError {
     InvalidProof(String),
     #[error("Invalid digest format: {0}")]
     InvalidDigest(String),
+    #[error("Non-UTF-8 path encountered: '{0}'")]
+    NonUtf8Path(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,14 +284,18 @@ fn collect_leaves_from_value(
     Ok(())
 }
 
-pub fn compute_leaf_hash(domain_tag: &[u8], path: &str, value: &str) -> [u8; 32] {
+pub fn compute_leaf_hash_raw(domain_tag: &[u8], path: &[u8], value: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(domain_tag);
     hasher.update(&(path.len() as u32).to_le_bytes());
-    hasher.update(path.as_bytes());
+    hasher.update(path);
     hasher.update(&(value.len() as u32).to_le_bytes());
-    hasher.update(value.as_bytes());
+    hasher.update(value);
     hasher.finalize().into()
+}
+
+pub fn compute_leaf_hash(domain_tag: &[u8], path: &str, value: &str) -> [u8; 32] {
+    compute_leaf_hash_raw(domain_tag, path.as_bytes(), value.as_bytes())
 }
 
 pub fn compute_merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
@@ -399,6 +408,24 @@ fn validate_month(name: &str, s: &str, errors: &mut Vec<String>) {
     }
 }
 
+fn parse_ymd_date(s: &str) -> Option<Date> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        return None;
+    }
+    if !parts[0].chars().all(|c| c.is_ascii_digit())
+        || !parts[1].chars().all(|c| c.is_ascii_digit())
+        || !parts[2].chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = parts[0].parse::<i32>().ok()?;
+    let month_u8 = parts[1].parse::<u8>().ok()?;
+    let day = parts[2].parse::<u8>().ok()?;
+    let month = Month::try_from(month_u8).ok()?;
+    Date::from_calendar_date(year, month, day).ok()
+}
+
 fn parse_rfc3339_utc(name: &str, s: &str, errors: &mut Vec<String>) -> Option<OffsetDateTime> {
     match OffsetDateTime::parse(s, &Rfc3339) {
         Ok(dt) => {
@@ -498,19 +525,12 @@ impl WorldManifest {
                 &entry.digest,
                 &mut errors,
             );
-            // Verify date format: RFC3339 or YYYY-MM-DD
+            // Verify date format: RFC3339 or YYYY-MM-DD (valid calendar date)
             let is_rfc3339 = OffsetDateTime::parse(&entry.date, &Rfc3339).is_ok();
-            let is_ymd = entry.date.len() == 10
-                && entry.date.chars().enumerate().all(|(idx, ch)| {
-                    if idx == 4 || idx == 7 {
-                        ch == '-'
-                    } else {
-                        ch.is_ascii_digit()
-                    }
-                });
+            let is_ymd = parse_ymd_date(&entry.date).is_some();
             if !is_rfc3339 && !is_ymd {
                 errors.push(format!(
-                    "Substrate date at index {i} must be RFC 3339 or YYYY-MM-DD, got '{}'",
+                    "Field 'substrate[{i}].date' must be a valid RFC 3339 timestamp or YYYY-MM-DD calendar date, got '{}'",
                     entry.date
                 ));
             }
@@ -695,8 +715,93 @@ struct TreeEntryValue<'a> {
 }
 
 struct TreeEntry {
-    rel_path: String,
-    value: String,
+    rel_path: Vec<u8>,
+    value: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn is_owner_executable(meta: &std::fs::Metadata) -> bool {
+    (meta.permissions().mode() & 0o100) != 0
+}
+
+#[cfg(not(unix))]
+fn is_owner_executable(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_special_file(ft: &std::fs::FileType) -> bool {
+    ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device()
+}
+
+#[cfg(not(unix))]
+fn is_special_file(_ft: &std::fs::FileType) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn path_to_rel_bytes(base_dir: &Path, path: &Path) -> Result<Vec<u8>, WorldManifestError> {
+    let rel = path
+        .strip_prefix(base_dir)
+        .map_err(|e| WorldManifestError::Io(std::io::Error::other(e)))?;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for comp in rel.components() {
+        parts.push(comp.as_os_str().as_bytes());
+    }
+    Ok(parts.join(&b'/'))
+}
+
+#[cfg(not(unix))]
+fn path_to_rel_bytes(base_dir: &Path, path: &Path) -> Result<Vec<u8>, WorldManifestError> {
+    let rel = path
+        .strip_prefix(base_dir)
+        .map_err(|e| WorldManifestError::Io(std::io::Error::other(e)))?;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for comp in rel.components() {
+        let s = comp.as_os_str().to_str().ok_or_else(|| {
+            WorldManifestError::NonUtf8Path(comp.as_os_str().to_string_lossy().to_string())
+        })?;
+        parts.push(s.as_bytes());
+    }
+    Ok(parts.join(&b'/'))
+}
+
+#[cfg(unix)]
+fn read_symlink_target_bytes(path: &Path) -> Result<Vec<u8>, WorldManifestError> {
+    let target = std::fs::read_link(path)?;
+    Ok(target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn read_symlink_target_bytes(path: &Path) -> Result<Vec<u8>, WorldManifestError> {
+    let target = std::fs::read_link(path)?;
+    let s = target
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| WorldManifestError::NonUtf8Path(target.to_string_lossy().to_string()))?;
+    Ok(s.as_bytes().to_vec())
+}
+
+fn serialize_json_byte_string(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.push(b'"');
+    for &b in bytes {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            c if c < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c).as_bytes());
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(b'"');
+    out
 }
 
 /// Compute the `blake3:` digest of a file's contents, streamed in chunks.
@@ -738,55 +843,56 @@ fn walk_dir_entries(
         let symlink_meta = std::fs::symlink_metadata(&path)?;
         let ft = symlink_meta.file_type();
 
-        if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
+        if is_special_file(&ft) {
             return Err(WorldManifestError::SpecialFile(path.display().to_string()));
         }
 
-        let rel_path_buf = path
-            .strip_prefix(base_dir)
-            .map_err(|e| WorldManifestError::Io(std::io::Error::other(e)))?;
-        let rel_path_str = rel_path_buf
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
+        let rel_path_bytes = path_to_rel_bytes(base_dir, &path)?;
 
         if ft.is_symlink() {
-            let target = std::fs::read_link(&path)?;
-            let target_str = target.to_string_lossy().to_string();
-            let val = serde_json::to_string(&TreeEntryValue {
-                executable: false,
-                kind: "symlink",
-                digest: None,
-                target: Some(&target_str),
-            })?;
+            let target_bytes = read_symlink_target_bytes(&path)?;
+            let val = if let Ok(target_str) = std::str::from_utf8(&target_bytes) {
+                serde_json::to_vec(&TreeEntryValue {
+                    executable: false,
+                    kind: "symlink",
+                    digest: None,
+                    target: Some(target_str),
+                })?
+            } else {
+                let mut v = Vec::new();
+                v.extend_from_slice(b"{\"executable\":false,\"kind\":\"symlink\",\"target\":");
+                v.extend_from_slice(&serialize_json_byte_string(&target_bytes));
+                v.extend_from_slice(b"}");
+                v
+            };
             entries.push(TreeEntry {
-                rel_path: rel_path_str,
+                rel_path: rel_path_bytes,
                 value: val,
             });
         } else if ft.is_dir() {
-            let val = serde_json::to_string(&TreeEntryValue {
-                executable: false,
+            let is_exec = is_owner_executable(&symlink_meta);
+            let val = serde_json::to_vec(&TreeEntryValue {
+                executable: is_exec,
                 kind: "dir",
                 digest: None,
                 target: None,
             })?;
             entries.push(TreeEntry {
-                rel_path: rel_path_str,
+                rel_path: rel_path_bytes,
                 value: val,
             });
             walk_dir_entries(base_dir, &path, entries)?;
         } else if ft.is_file() {
-            let is_exec = (symlink_meta.permissions().mode() & 0o111) != 0;
+            let is_exec = is_owner_executable(&symlink_meta);
             let file_digest = digest_file(&path)?;
-            let val = serde_json::to_string(&TreeEntryValue {
+            let val = serde_json::to_vec(&TreeEntryValue {
                 executable: is_exec,
                 kind: "file",
                 digest: Some(&file_digest),
                 target: None,
             })?;
             entries.push(TreeEntry {
-                rel_path: rel_path_str,
+                rel_path: rel_path_bytes,
                 value: val,
             });
         }
@@ -797,16 +903,17 @@ fn walk_dir_entries(
 /// Compute the Merkle tree digest of a directory tree with domain tag `"hw-tree\0"`.
 ///
 /// Walks the directory sorted by byte path, never follows symlinks (a symlink contributes its
-/// target string), includes each entry's relative path, kind (file, dir, symlink), executable bit,
+/// target bytes), includes each entry's relative path, kind (file, dir, symlink), executable bit
+/// (only the owner-executable bit 0o100 is recorded, for files and directories alike),
 /// and file content digests (streamed). Special files (FIFOs, sockets, devices) return an error naming the path.
 pub fn digest_tree(dir: &Path) -> Result<String, WorldManifestError> {
     let mut entries = Vec::new();
     walk_dir_entries(dir, dir, &mut entries)?;
-    entries.sort_by(|a, b| a.rel_path.as_bytes().cmp(b.rel_path.as_bytes()));
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     let leaf_hashes: Vec<[u8; 32]> = entries
         .iter()
-        .map(|e| compute_leaf_hash(b"hw-tree\0", &e.rel_path, &e.value))
+        .map(|e| compute_leaf_hash_raw(b"hw-tree\0", &e.rel_path, &e.value))
         .collect();
     let root = compute_merkle_root(&leaf_hashes);
     Ok(format!("blake3:{}", hex::encode(root)))

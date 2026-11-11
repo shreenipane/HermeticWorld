@@ -551,3 +551,126 @@ fn test_cli_execution_and_exit_codes() {
         digest_tree(temp_dir.path()).expect("digest_tree direct")
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn test_regression_fix1_invalid_utf8_file_names_and_symlink_targets() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Two trees whose only difference is a file named b"\xff" versus b"\xfe" digest differently
+    let dir_a = tempdir().expect("tempdir a");
+    let dir_b = tempdir().expect("tempdir b");
+
+    let file_a = dir_a.path().join(OsStr::from_bytes(b"\xff"));
+    fs::write(&file_a, b"identical content").expect("write file a");
+
+    let file_b = dir_b.path().join(OsStr::from_bytes(b"\xfe"));
+    fs::write(&file_b, b"identical content").expect("write file b");
+
+    let digest_a = digest_tree(dir_a.path()).expect("digest tree a");
+    let digest_b = digest_tree(dir_b.path()).expect("digest tree b");
+    assert_ne!(
+        digest_a, digest_b,
+        "Distinct invalid-UTF-8 file names b'\\xff' vs b'\\xfe' must not collide"
+    );
+
+    // A symlink target differing only in an invalid byte changes the digest
+    let link_dir_a = tempdir().expect("link tempdir a");
+    let link_dir_b = tempdir().expect("link tempdir b");
+
+    let link_a = link_dir_a.path().join("symlink_entry");
+    symlink(OsStr::from_bytes(b"target_\xff"), &link_a).expect("symlink a");
+
+    let link_b = link_dir_b.path().join("symlink_entry");
+    symlink(OsStr::from_bytes(b"target_\xfe"), &link_b).expect("symlink b");
+
+    let link_digest_a = digest_tree(link_dir_a.path()).expect("digest link tree a");
+    let link_digest_b = digest_tree(link_dir_b.path()).expect("digest link tree b");
+    assert_ne!(
+        link_digest_a, link_digest_b,
+        "Symlink targets differing only in an invalid byte must change the digest"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_regression_fix2_directory_mode_owner_exec() {
+    let dir1 = tempdir().expect("tempdir 1");
+    let dir2 = tempdir().expect("tempdir 2");
+
+    let sub1 = dir1.path().join("empty_subdir");
+    fs::create_dir(&sub1).expect("create sub1");
+    let mut perms1 = fs::metadata(&sub1).expect("metadata sub1").permissions();
+    perms1.set_mode(0o755);
+    fs::set_permissions(&sub1, perms1).expect("set perms 0755");
+
+    let sub2 = dir2.path().join("empty_subdir");
+    fs::create_dir(&sub2).expect("create sub2");
+    let mut perms2 = fs::metadata(&sub2).expect("metadata sub2").permissions();
+    perms2.set_mode(0o644);
+    fs::set_permissions(&sub2, perms2).expect("set perms 0644");
+
+    let d1 = digest_tree(dir1.path()).expect("digest tree 1 (0755)");
+    let d2 = digest_tree(dir2.path()).expect("digest tree 2 (0644)");
+    assert_ne!(
+        d1, d2,
+        "Two otherwise identical trees with an empty subdirectory at 0755 vs 0644 must digest differently"
+    );
+
+    // Restore permissions so tempdir cleanup is uninhibited
+    let mut restore_perms = fs::metadata(&sub2).expect("metadata sub2").permissions();
+    restore_perms.set_mode(0o755);
+    let _ = fs::set_permissions(&sub2, restore_perms);
+}
+
+#[test]
+fn test_regression_fix3_calendar_date_validation() {
+    let mut manifest = sample_manifest();
+
+    // 2024-02-29 is accepted (leap year)
+    manifest.substrate[0].date = "2024-02-29".to_string();
+    assert!(
+        manifest.validate().is_ok(),
+        "2024-02-29 must be accepted as a valid leap year date"
+    );
+
+    // 2026-02-29 is rejected (2026 is not a leap year)
+    manifest.substrate[0].date = "2026-02-29".to_string();
+    let err1 = manifest
+        .validate()
+        .expect_err("2026-02-29 must be rejected");
+    assert!(
+        err1.errors
+            .iter()
+            .any(|e| e.contains("substrate[0].date") && e.contains("2026-02-29")),
+        "Expected validation error naming substrate[0].date for 2026-02-29, got: {:?}",
+        err1.errors
+    );
+
+    // 2026-13-01 is rejected (month 13 does not exist)
+    manifest.substrate[0].date = "2026-13-01".to_string();
+    let err2 = manifest
+        .validate()
+        .expect_err("2026-13-01 must be rejected");
+    assert!(
+        err2.errors
+            .iter()
+            .any(|e| e.contains("substrate[0].date") && e.contains("2026-13-01")),
+        "Expected validation error naming substrate[0].date for 2026-13-01, got: {:?}",
+        err2.errors
+    );
+
+    // 2026-04-31 is rejected (April only has 30 days)
+    manifest.substrate[0].date = "2026-04-31".to_string();
+    let err3 = manifest
+        .validate()
+        .expect_err("2026-04-31 must be rejected");
+    assert!(
+        err3.errors
+            .iter()
+            .any(|e| e.contains("substrate[0].date") && e.contains("2026-04-31")),
+        "Expected validation error naming substrate[0].date for 2026-04-31, got: {:?}",
+        err3.errors
+    );
+}
