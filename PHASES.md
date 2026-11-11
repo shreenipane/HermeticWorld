@@ -1,7 +1,7 @@
 # Hermetic World: Phases
 
 - **Status:** derived from §15 of [HERMETIC_WORLD_ARCHITECTURE.md](HERMETIC_WORLD_ARCHITECTURE.md). Requirement IDs refer to [TRD.md](TRD.md).
-- **Last updated:** 2026-11-10
+- **Last updated:** 2026-11-11
 
 Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -9,8 +9,8 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 
 | Phase | Name | Runs on | Exit criterion | Status |
 |---|---|---|---|---|
-| 0 | Vertical slice | WSL2 Ubuntu + Docker | Oracle passes on every slice task; one agent run graded | In progress |
-| 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | Not started |
+| 0 | Vertical slice | WSL2 Ubuntu + Docker | Oracle passes on every slice task; one agent run graded | **Done** 2026-11-11 |
+| 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | In progress |
 | 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
 | 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
 | 3b | Clock hiding | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Not started |
@@ -38,12 +38,12 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 - [x] Image sealer (T0.3/T0.3a): all 10 real images sealed and verified. It removes the extra SWE-bench commit, the reflog and future history, and restores file modes.
 - [x] Minimal cutoff computation (`T_world`, base commit, `T_clock`): done; T0.2 intake feeds it real GitHub, Trac and git dates for all 10 tasks
 - [x] Repo sealer: reachable-objects copy, tag filter, strip refs and reflog (TR-SEAL-1 to TR-SEAL-3, TR-SEAL-6), done in T0.1, 25 tests
-- [ ] Local frozen pip index, built with `uv --exclude-newer` at the cutoff
-- [ ] Docker network with no outside route; the agent container reaches only the index
-- [ ] Clean container as grader: apply the extracted diff, run `FAIL_TO_PASS` and `PASS_TO_PASS`
-- [ ] Unsigned JSON run record
-- [ ] Oracle run: the gold patch passes in the sealed world for every slice task
-- [ ] One real agent run, graded
+- [x] Local frozen pip index at the cutoff (T0.4; PEP 503 index of PyPI files uploaded at or before `T_world`, up to 5 versions per installed package, target project excluded; all 10 tasks, 25 MB to 1.5 GB each, 4.4 GB total)
+- [x] Docker network with no outside route; the agent container reaches only the index (T0.4; `world-probe` all_ok: positive install, newer version blocked, target blocked, egress blocked)
+- [x] Clean container as grader: apply the extracted diff, run `FAIL_TO_PASS` and `PASS_TO_PASS` (T0.5; official SWE-bench eval scripts minus the pip line, swebench 5.0.2 grading rules)
+- [x] Unsigned JSON run record (T0.6; `hermetic-slice-run/v0-unsigned`)
+- [x] Oracle run: the gold patch passes in the sealed world for every slice task (10/10 on 2026-11-11; django-11099 lists one FAIL_TO_PASS test that already passes without the fix, recorded as `f2p_pass_without_fix`)
+- [x] One real agent run, graded: django-11099 on Gemma 4 31B, `RESOLVED_FULL`
 
 ### Exit
 The oracle passes on every slice task, and one agent run is graded.
@@ -62,18 +62,18 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** A laptop.
 
 ### Deliverables
-- [ ] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain
+- [x] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain (T1.1)
 - [ ] Both modes: dated and undated (TR-SC-9)
 - [ ] Fingerprints with baseline subtraction (TR-SC-1)
-  - [ ] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2)
+  - [x] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2) (T1.1)
   - [ ] Tier 2: tree-sitter IDF symbols, as review (TR-SC-3)
-  - [ ] Tier 3: winnowing, k=8, w=8 (TR-SC-4)
+  - [x] Tier 3: winnowing, k=8, w=8 (TR-SC-4) (T1.2)
   - [ ] Binary tier (TR-SC-5)
-- [ ] Container recursion with bomb limits (TR-SC-6)
-- [ ] Detectors D0–D12 (TR-SC-7)
+- [x] Container recursion with bomb limits, including git packs (TR-SC-6) (T1.2, T1.3)
+- [ ] Detectors D0–D12 (TR-SC-7): done D0, D1, D2, D3, D6, D9. In T1.4: D3b, D5a. Remaining, in order: D4, D5b, D7, D8, D10, D11, D12
 - [ ] Thread scrub and mutable-content revision rule (TR-SEAL-9)
 - [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
-- [ ] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8)
+- [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [ ] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks, blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
 - [ ] Calibrate the tier-1 and tier-2 thresholds against E3

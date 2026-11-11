@@ -1,10 +1,12 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
+use hermetic_common::hash::sha256_hex;
+
 use crate::benchmark::check_d9_content;
 use crate::containers::scan_container_or_unit_with_root_prefix;
 use crate::fingerprint::FingerprintSet;
-use crate::gitstore::{compute_git_sha1, GitError, GitStore, ObjectType, Tag};
+use crate::gitstore::{compute_git_sha1, is_hex_oid, GitError, GitStore, ObjectType, Tag};
 use crate::scan::{match_unit, Finding, ScanOptions, Severity};
 
 pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
@@ -387,7 +389,10 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
         }
     }
 
-    // 13. Check commit-graph
+    // 13. LFS objects must be referenced by the base tree
+    findings.extend(check_lfs_objects(git_dir, &mut store, &base_commit, opts));
+
+    // 14. Check commit-graph
     findings.extend(check_commit_graphs(git_dir, &reachable, opts));
 
     findings
@@ -563,7 +568,7 @@ fn check_git_config(config_path: &Path, gitdir: &str, opts: &ScanOptions) -> Vec
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             let section = trimmed[1..trimmed.len() - 1].trim();
-            if section.starts_with("remote") {
+            if section.to_ascii_lowercase().starts_with("remote") {
                 in_remote_section = true;
                 findings.push(Finding {
                     detector: "D1".into(),
@@ -708,22 +713,87 @@ fn check_git_state_files(git_dir: &Path, opts: &ScanOptions) -> Vec<Finding> {
         ));
     }
 
-    // 6. lfs/objects/
-    let lfs_dir = git_dir.join("lfs").join("objects");
-    if lfs_dir.is_dir() {
-        let has_lfs = walkdir::WalkDir::new(&lfs_dir)
-            .into_iter()
-            .flatten()
-            .any(|e| e.file_type().is_file());
-        if has_lfs {
-            findings.push(gate_finding(
-                lfs_dir.display().to_string(),
-                "unreferenced LFS objects in lfs/objects/".into(),
-            ));
+    findings
+}
+
+/// Collect the sha256 ids named by LFS pointer files in the tree at `base_commit`.
+fn lfs_pointer_ids(store: &mut GitStore, base_commit: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let root = store
+        .read_object(base_commit)
+        .ok()
+        .and_then(|o| store.parse_commit(&o.data).ok())
+        .map(|c| c.tree.to_lowercase());
+    let mut queue: VecDeque<String> = root.into_iter().collect();
+    let mut seen = HashSet::new();
+    while let Some(oid) = queue.pop_front() {
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        let Ok(obj) = store.read_object(&oid) else {
+            continue;
+        };
+        match obj.obj_type {
+            ObjectType::Tree => {
+                if let Ok(tree) = store.parse_tree(&obj.data) {
+                    for entry in tree.entries {
+                        if entry.mode != 0o160000 {
+                            queue.push_back(entry.oid.to_lowercase());
+                        }
+                    }
+                }
+            }
+            ObjectType::Blob if obj.data.starts_with(b"version https://git-lfs") => {
+                let text = String::from_utf8_lossy(&obj.data);
+                if let Some(id) = text.lines().find_map(|l| l.strip_prefix("oid sha256:")) {
+                    ids.insert(id.trim().to_lowercase());
+                }
+            }
+            _ => {}
         }
     }
+    ids
+}
 
-    findings
+fn check_lfs_objects(
+    git_dir: &Path,
+    store: &mut GitStore,
+    base_commit: &str,
+    opts: &ScanOptions,
+) -> Vec<Finding> {
+    let lfs_dir = git_dir.join("lfs").join("objects");
+    let files: Vec<_> = walkdir::WalkDir::new(&lfs_dir)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .collect();
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let referenced = lfs_pointer_ids(store, base_commit);
+    files
+        .iter()
+        .filter(|e| {
+            // An LFS object's name is its sha256, so the name alone proves nothing.
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            !referenced.contains(&name)
+                || std::fs::read(e.path()).map_or(true, |bytes| sha256_hex(&bytes) != name)
+        })
+        .map(|e| Finding {
+            detector: "D1".into(),
+            channel: "git_state_file".into(),
+            path: e.path().display().to_string(),
+            visibility: opts.visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec![
+                "LFS object not referenced by the base tree, or its bytes don't match its name"
+                    .into(),
+            ],
+        })
+        .collect()
 }
 
 fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec<Finding> {
@@ -753,7 +823,7 @@ fn check_unknown_files_in_objects(objects_dir: &Path, opts: &ScanOptions) -> Vec
             && parts[0].chars().all(|c| c.is_ascii_hexdigit())
             && parts[1].chars().all(|c| c.is_ascii_hexdigit()))
             || (parts.len() == 2 && parts[0] == "pack" && is_valid_pack_file(path))
-            || rel_str == "info/packs"
+            || (rel_str == "info/packs" && is_valid_info_packs(path))
             || rel_str == "info/commit-graph"
             || rel_str.starts_with("info/commit-graphs/")
             || rel_str == "commit-graph"
@@ -803,14 +873,47 @@ fn is_valid_pack_file(path: &Path) -> bool {
         return false;
     }
     let mut head = [0u8; 4];
-    std::fs::File::open(path)
+    let magic_ok = std::fs::File::open(path)
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
         .is_ok()
-        && &head == magic
+        && &head == magic;
+    if !magic_ok {
+        return false;
+    }
+
+    // .rev and .mtimes have a fixed size, so nothing can be appended to them unnoticed.
+    if ext == "rev" || ext == "mtimes" {
+        let Some(count) = pack_object_count(&path.with_extension("pack")) else {
+            return false;
+        };
+        return path
+            .metadata()
+            .is_ok_and(|m| m.len() == 12 + 4 * count + 40);
+    }
+    true
 }
 
-fn is_hex_oid(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+fn pack_object_count(pack: &Path) -> Option<u64> {
+    let mut header = [0u8; 12];
+    std::fs::File::open(pack)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+        .ok()?;
+    Some(u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as u64)
+}
+
+/// `objects/info/packs` is either empty or lines of `P pack-<hex>.pack`.
+fn is_valid_info_packs(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    String::from_utf8_lossy(&bytes).lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line
+                .strip_prefix("P pack-")
+                .and_then(|l| l.strip_suffix(".pack"))
+                .is_some_and(is_hex_oid)
+    })
 }
 
 type NamedRefs = Vec<(String, String)>;
@@ -920,7 +1023,11 @@ fn check_commit_graphs(
         if dir.is_dir() {
             for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
                 if entry.file_type().is_file() {
-                    candidates.push(entry.into_path());
+                    if entry.file_name() == "commit-graph-chain" {
+                        findings.extend(check_commit_graph_chain(entry.path(), opts));
+                    } else {
+                        candidates.push(entry.into_path());
+                    }
                 }
             }
         }
@@ -971,6 +1078,38 @@ fn check_commit_graphs(
     }
 
     findings
+}
+
+/// The chain file of a split commit-graph is a list of graph hashes, one per line.
+fn check_commit_graph_chain(path: &Path, opts: &ScanOptions) -> Option<Finding> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let dir = path.parent()?;
+    // A graph file's name is the hash in its 20-byte footer.
+    let bad = text.lines().map(str::trim).find(|line| {
+        if !is_hex_oid(line) {
+            return true;
+        }
+        match std::fs::read(dir.join(format!("graph-{line}.graph"))) {
+            Ok(graph) if graph.len() >= 20 => {
+                !hex::encode(&graph[graph.len() - 20..]).eq_ignore_ascii_case(line)
+            }
+            _ => true,
+        }
+    })?;
+    Some(Finding {
+        detector: "D1".into(),
+        channel: "git_commit_graph".into(),
+        path: path.display().to_string(),
+        visibility: opts.visibility,
+        severity: Severity::Gate,
+        confidence: 1.0,
+        hunk: None,
+        evidence: vec![format!(
+            "invalid commit-graph chain line: {}",
+            bad.chars().take(80).collect::<String>()
+        )],
+    })
 }
 
 fn parse_commit_graph_oidl(bytes: &[u8]) -> Result<Vec<String>, GitError> {

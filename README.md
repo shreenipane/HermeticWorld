@@ -4,7 +4,7 @@ A time-sealed evaluation environment for AI agents. Each task runs in a world fr
 
 The first component, **sealcheck**, proves before a run that nothing created after that moment is reachable.
 
-> **Status:** design specification only. Nothing has been built or run yet. See [BUILD_LOG.md](BUILD_LOG.md).
+> **Status:** Phase 0 (vertical slice) is complete and Phase 1 (sealcheck) is in progress. See [PHASES.md](PHASES.md) and [BUILD_LOG.md](BUILD_LOG.md).
 
 ## Why
 

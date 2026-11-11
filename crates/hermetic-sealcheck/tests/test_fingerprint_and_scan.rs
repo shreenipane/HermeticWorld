@@ -64,6 +64,42 @@ fn test_no_false_positive_at_base_and_planted_findings() {
 }
 
 #[test]
+fn test_removed_markdown_bullet_does_not_gate_the_base_tree() {
+    // Parsed diff content has already lost its marker; stripping again would turn the
+    // removed bullet `- Fixed ...` into a marker that the unchanged base file also yields.
+    let base_dir = tempdir().expect("tempdir");
+    let base_tree = base_dir.path();
+    let base_content = "# Changes\n\n- Fixed issue in the configuration parser\n- Added a retry to the downloader\n";
+    fs::write(base_tree.join("CHANGES.md"), base_content).expect("write base");
+
+    let gold_patch = "diff --git a/CHANGES.md b/CHANGES.md\n--- a/CHANGES.md\n+++ b/CHANGES.md\n@@ -1,4 +1,3 @@\n # Changes\n \n-- Fixed issue in the configuration parser\n - Added a retry to the downloader\n";
+    let fp = FingerprintSet::from_task(gold_patch, "", base_tree).expect("fingerprints built");
+    let opts = ScanOptions {
+        visibility: Visibility::AgentVisible,
+        ..Default::default()
+    };
+
+    let base_gates: Vec<_> = scan_tree(base_tree, &fp, &opts)
+        .into_iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .collect();
+    assert!(
+        base_gates.is_empty(),
+        "base tree must not gate: {base_gates:?}"
+    );
+
+    // The leaked diff itself is still caught.
+    let leaked_dir = tempdir().expect("tempdir");
+    fs::write(leaked_dir.path().join("fix.diff"), gold_patch).expect("write leak");
+    assert!(
+        scan_tree(leaked_dir.path(), &fp, &opts)
+            .iter()
+            .any(|f| f.severity == Severity::Gate),
+        "leaked diff must gate"
+    );
+}
+
+#[test]
 fn test_deletion_only_fix() {
     let base_dir = tempdir().expect("tempdir");
     let base_tree = base_dir.path();

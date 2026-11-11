@@ -421,16 +421,16 @@ fn test_hostile_stray_pack_huge_declared_size() {
     body.extend_from_slice(&[0x80; 7]);
     body.push(0x01);
     let opts = ScanOptions::default();
-    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
-    assert!(matches!(res, Err(GitError::LimitExceeded(_))));
+    let (_, _, err) = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(err, Some(GitError::LimitExceeded(_))));
 }
 
 #[test]
 fn test_hostile_stray_pack_size_varint_overflow() {
     let body = vec![0xffu8; 16];
     let opts = ScanOptions::default();
-    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
-    assert!(matches!(res, Err(GitError::Corrupt(_))));
+    let (_, _, err) = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(err, Some(GitError::Corrupt(_))));
 }
 
 #[test]
@@ -444,8 +444,8 @@ fn test_hostile_stray_pack_zlib_bomb_stops_at_the_limit() {
         max_member_bytes: 1024 * 1024,
         ..Default::default()
     };
-    let res = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
-    assert!(matches!(res, Err(GitError::LimitExceeded(_))));
+    let (_, _, err) = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut 0);
+    assert!(matches!(err, Some(GitError::LimitExceeded(_))));
 }
 
 #[test]
@@ -456,8 +456,11 @@ fn test_hostile_stray_pack_shorter_than_its_count() {
     body.extend_from_slice(&encoder.finish().unwrap());
 
     let opts = ScanOptions::default();
-    let res = scan_stray_pack_slice(&stray_pack(2, &body), &opts, &mut 0);
-    assert!(matches!(res, Err(GitError::Corrupt(msg)) if msg.contains("last object")));
+    let (blobs, _, err) = scan_stray_pack_slice(&stray_pack(2, &body), &opts, &mut 0);
+    assert!(matches!(err, Some(GitError::Corrupt(msg)) if msg.contains("last object")));
+    // What was decoded before the error is still handed back for scanning.
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].1, b"hello");
 }
 
 #[test]
@@ -469,8 +472,8 @@ fn test_stray_pack_counts_against_container_total() {
 
     let opts = ScanOptions::default();
     let mut total = 0u64;
-    let (blobs, unresolved) =
-        scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut total).unwrap();
+    let (blobs, unresolved, err) = scan_stray_pack_slice(&stray_pack(1, &body), &opts, &mut total);
+    assert!(err.is_none());
     assert_eq!(blobs.len(), 1);
     assert_eq!(blobs[0].1, b"hello");
     assert!(!unresolved);
@@ -486,4 +489,30 @@ fn test_hostile_declared_object_size_over_limit() {
     // Limit is 100 bytes
     let res = apply_delta(base, &delta, 100);
     assert!(matches!(res, Err(GitError::LimitExceeded(msg)) if msg.contains("over the limit")));
+}
+
+#[test]
+fn test_hostile_non_hex_oid_is_an_error_not_a_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("objects")).unwrap();
+    let mut store = GitStore::open(temp.path(), &ScanOptions::default()).unwrap();
+    // 40 bytes long, with a multi-byte character across byte 2.
+    let oid = format!("a\u{FFFD}{}", "b".repeat(36));
+    assert_eq!(oid.len(), 40);
+    assert!(matches!(store.read_object(&oid), Err(GitError::Corrupt(_))));
+}
+
+#[test]
+fn test_hostile_idx_count_larger_than_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let idx = temp.path().join("pack-x.idx");
+    let mut bytes = b"\xfftOc\0\0\0\x02".to_vec();
+    // Fanout claims u32::MAX objects, in a file with none.
+    for _ in 0..256 {
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+    }
+    std::fs::write(&idx, bytes).unwrap();
+    assert!(
+        matches!(PackIndex::open(&idx), Err(GitError::Corrupt(msg)) if msg.contains("shorter"))
+    );
 }

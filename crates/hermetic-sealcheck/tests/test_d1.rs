@@ -945,3 +945,165 @@ fn test_d1_visibility_image_only_exits_0() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_d1_remote_section_case_insensitive() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+
+    let cfg = repo_dir.join(".git/config");
+    let mut text = fs::read_to_string(&cfg).unwrap();
+    text.push_str("[REMOTE \"origin\"]\n\turl = https://example.com/x.git\n");
+    fs::write(&cfg, text).unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_config"), "got: {gates:?}");
+}
+
+fn commit_lfs_pointer(repo_dir: &Path, oid: &str) -> String {
+    fs::write(
+        repo_dir.join("model.bin"),
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 3\n"),
+    )
+    .unwrap();
+    run_git(repo_dir, &["add", "model.bin"]);
+    run_git(repo_dir, &["commit", "-m", "lfs pointer"]);
+    let _ = fs::remove_dir_all(repo_dir.join(".git/logs"));
+    run_git(repo_dir, &["rev-parse", "HEAD"])
+}
+
+fn write_lfs_object(repo_dir: &Path, oid: &str) {
+    let dir = repo_dir
+        .join(".git/lfs/objects")
+        .join(&oid[..2])
+        .join(&oid[2..4]);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(oid), "abc").unwrap();
+}
+
+#[test]
+fn test_d1_lfs_object_referenced_by_base_passes() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+    // sha256 of the bytes write_lfs_object stores.
+    let oid = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let head = commit_lfs_pointer(repo_dir, oid);
+    write_lfs_object(repo_dir, oid);
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(gates.is_empty(), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_lfs_object_with_wrong_bytes_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+    // Referenced by the pointer, but the stored bytes hash to something else.
+    let oid = "a".repeat(64);
+    let head = commit_lfs_pointer(repo_dir, &oid);
+    write_lfs_object(repo_dir, &oid);
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(has_channel(&gates, "git_state_file"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_lfs_object_not_referenced_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (_, fp, _base_tree) = setup_base_repo(repo_dir);
+    let head = commit_lfs_pointer(repo_dir, &"a".repeat(64));
+    write_lfs_object(repo_dir, &"b".repeat(64));
+
+    let gates = scan_d1(repo_dir, head, &fp);
+    assert!(has_channel(&gates, "git_state_file"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_split_commit_graph_passes_and_bad_chain_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+    run_git(
+        repo_dir,
+        &["commit-graph", "write", "--split", "--reachable"],
+    );
+
+    let gates = scan_d1(repo_dir, base_commit.clone(), &fp);
+    assert!(gates.is_empty(), "got: {gates:?}");
+
+    let chain = repo_dir.join(".git/objects/info/commit-graphs/commit-graph-chain");
+    // A graph renamed to a hash its footer doesn't carry is rejected.
+    let hash = fs::read_to_string(&chain).unwrap().trim().to_string();
+    let renamed = "c".repeat(40);
+    fs::rename(
+        chain.with_file_name(format!("graph-{hash}.graph")),
+        chain.with_file_name(format!("graph-{renamed}.graph")),
+    )
+    .unwrap();
+    fs::remove_file(&chain).unwrap();
+    fs::write(&chain, format!("{renamed}\n")).unwrap();
+    let gates = scan_d1(repo_dir, base_commit.clone(), &fp);
+    assert!(has_channel(&gates, "git_commit_graph"), "got: {gates:?}");
+
+    fs::remove_file(&chain).unwrap();
+    fs::write(&chain, "execute_critical_leak_line()\n").unwrap();
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_commit_graph"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_info_packs_must_have_git_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+    let info = repo_dir.join(".git/objects/info");
+    fs::create_dir_all(&info).unwrap();
+
+    fs::write(
+        info.join("packs"),
+        format!("P pack-{}.pack\n\n", "a".repeat(40)),
+    )
+    .unwrap();
+    let gates = scan_d1(repo_dir, base_commit.clone(), &fp);
+    assert!(!has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+
+    fs::write(info.join("packs"), "execute_critical_leak_line()\n").unwrap();
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+}
+
+#[test]
+fn test_d1_rev_file_with_appended_bytes_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path();
+    let (base_commit, fp, _base_tree) = setup_base_repo(repo_dir);
+    run_git(
+        repo_dir,
+        &["-c", "pack.writeReverseIndex=true", "repack", "-adq"],
+    );
+
+    let gates = scan_d1(repo_dir, base_commit.clone(), &fp);
+    assert!(gates.is_empty(), "got: {gates:?}");
+
+    let pack_dir = repo_dir.join(".git/objects/pack");
+    let rev = fs::read_dir(&pack_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "rev"))
+        .unwrap();
+    let mut bytes = fs::read(&rev).unwrap();
+    bytes.extend_from_slice(b"execute_critical_leak_line()");
+    let mut perms = fs::metadata(&rev).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&rev, perms).unwrap();
+    fs::write(&rev, bytes).unwrap();
+
+    let gates = scan_d1(repo_dir, base_commit, &fp);
+    assert!(has_channel(&gates, "git_unknown_file"), "got: {gates:?}");
+}

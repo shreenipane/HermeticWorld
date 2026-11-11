@@ -432,3 +432,10 @@ fn test_d6_cli_run_both_files() {
         bad_output.status.code()
     );
 }
+
+#[test]
+fn test_d6_non_ascii_date_is_an_error_not_a_panic() {
+    for bad in ["2026-08-1é 06:04:51 +0000 UTC", "2026-08-15 06:04:51 +aé1"] {
+        assert!(hermetic_sealcheck::d6::parse_oci_date(bad).is_err());
+    }
+}
