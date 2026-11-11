@@ -1,13 +1,34 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
 use hermetic_common::hash::sha256_hex;
+use sha2::{Digest, Sha256};
 
 use crate::diff::{parse_patch, DiffLineType, DiffParseError, FilePatch};
 use crate::normalize::{clean_line, normalize_line};
 use crate::winnow::{kgram_hashes, tokenize, winnow_tokens};
+
+/// Convert the first 8 bytes of a byte slice's SHA-256 hash to a u64 in little-endian.
+pub fn sha256_u64(bytes: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    u64::from_le_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ])
+}
+
+/// Convert a 64-char sha256 hex string's first 8 bytes to a u64 in little-endian.
+pub fn hex_to_u64(hex_str: &str) -> Option<u64> {
+    if hex_str.len() < 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    hex::decode_to_slice(&hex_str[..16], &mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
@@ -36,12 +57,20 @@ pub struct HunkFingerprints {
     pub winnow_fingerprints: HashSet<u64>,
     /// Binary tier items (identifiers and string literals)
     pub binary_items: Vec<String>,
+    /// Preconverted 64-bit line fingerprints: hash -> (weight, orig_hex_hash). Ordered, so
+    /// matching (and so the evidence a finding keeps) is the same on every run.
+    pub line_u64: BTreeMap<u64, (f64, String)>,
+    /// Preconverted 64-bit window fingerprints: hash -> (weight, orig_hex_hash)
+    pub window_u64: BTreeMap<u64, (f64, String)>,
+    /// Preconverted 64-bit removed marker fingerprints: hash -> (weight, orig_hex_hash)
+    pub removed_u64: BTreeMap<u64, (f64, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FingerprintSet {
     pub hunks: Vec<HunkFingerprints>,
     pub diff_shape_hashes: HashSet<String>,
+    pub diff_shape_u64: BTreeMap<u64, String>,
     pub lines_count: usize,
     pub windows_count: usize,
     pub removed_markers_count: usize,
@@ -649,6 +678,25 @@ impl FingerprintSet {
             total_shapes += diff_shapes_map.len();
             total_winnow += winnow_fingerprints.len();
 
+            let mut line_u64 = BTreeMap::new();
+            for (hash, &w) in &line_fingerprints {
+                if let Some(u) = hex_to_u64(hash) {
+                    line_u64.insert(u, (w, hash.clone()));
+                }
+            }
+            let mut window_u64 = BTreeMap::new();
+            for (hash, &w) in &window_fingerprints {
+                if let Some(u) = hex_to_u64(hash) {
+                    window_u64.insert(u, (w, hash.clone()));
+                }
+            }
+            let mut removed_u64 = BTreeMap::new();
+            for (hash, &w) in &removed_map {
+                if let Some(u) = hex_to_u64(hash) {
+                    removed_u64.insert(u, (w, hash.clone()));
+                }
+            }
+
             final_hunks.push(HunkFingerprints {
                 hunk_index: ch.hunk_index,
                 file_path: ch.file_path,
@@ -661,12 +709,23 @@ impl FingerprintSet {
                 diff_shapes: diff_shapes_map,
                 winnow_fingerprints,
                 binary_items: surviving_binary_items,
+                line_u64,
+                window_u64,
+                removed_u64,
             });
+        }
+
+        let mut diff_shape_u64 = BTreeMap::new();
+        for hash in &all_diff_shapes {
+            if let Some(u) = hex_to_u64(hash) {
+                diff_shape_u64.insert(u, hash.clone());
+            }
         }
 
         Ok(FingerprintSet {
             hunks: final_hunks,
             diff_shape_hashes: all_diff_shapes,
+            diff_shape_u64,
             lines_count: total_lines,
             windows_count: total_windows,
             removed_markers_count: total_removed,

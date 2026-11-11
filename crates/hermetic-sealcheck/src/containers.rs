@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::benchmark::{check_d9_content, check_d9_path_with_display, BenchmarkSignatures};
+use crate::binary::{BinaryMalformed, BinaryStrings};
 use crate::bytecode::{pyc_header_len, pyc_magic};
 use crate::fingerprint::FingerprintSet;
 use crate::scan::{match_unit, Finding, ScanOptions, Severity};
@@ -246,38 +247,104 @@ fn strip_compression_suffix(name: &str) -> String {
     }
 }
 
-pub struct ContainerScanner<'a> {
+/// Receives every unit the container walk reaches. The walk itself (container detection,
+/// recursion, bomb limits, member paths) is the same whether the units are matched against
+/// a task now (`MatchSink`) or recorded into a layer index (`crate::index::IndexSink`).
+pub trait UnitSink {
+    /// A finding that depends on the unit alone: errors, bombs, skipped members.
+    fn fixed(&mut self, finding: Finding);
+    /// Every unit path, for the D9 path checks. `match_path` is relative to the scan root.
+    fn path(&mut self, match_path: &str, display_path: &str);
+    /// A text unit, for D9 content and tiers 1 and 3.
+    fn text(&mut self, path: &str, text: &str);
+    /// The extracted strings of a binary unit, for the D3b binary tier.
+    fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings);
+    /// A loose text unit, before its `text` call, for D5a package metadata.
+    fn pkg_metadata(&mut self, path: &str, bytes: &[u8]);
+}
+
+/// The sink `scan` uses: matches every unit against one task's fingerprints at once.
+pub struct MatchSink<'a> {
     pub fp: &'a FingerprintSet,
     pub signatures: &'a BenchmarkSignatures,
     pub opts: &'a ScanOptions,
-    pub total_expanded: u64,
     pub findings: Vec<Finding>,
-    pub root_prefix_len: usize,
 }
 
-impl<'a> ContainerScanner<'a> {
+impl<'a> MatchSink<'a> {
     pub fn new(
         fp: &'a FingerprintSet,
         signatures: &'a BenchmarkSignatures,
         opts: &'a ScanOptions,
     ) -> Self {
-        Self::new_with_root_prefix(fp, signatures, opts, 0)
-    }
-
-    pub fn new_with_root_prefix(
-        fp: &'a FingerprintSet,
-        signatures: &'a BenchmarkSignatures,
-        opts: &'a ScanOptions,
-        root_prefix_len: usize,
-    ) -> Self {
         Self {
             fp,
             signatures,
             opts,
-            total_expanded: 0,
             findings: Vec::new(),
+        }
+    }
+}
+
+impl UnitSink for MatchSink<'_> {
+    fn fixed(&mut self, finding: Finding) {
+        self.findings.push(finding);
+    }
+
+    fn path(&mut self, match_path: &str, display_path: &str) {
+        self.findings.extend(check_d9_path_with_display(
+            match_path,
+            display_path,
+            self.signatures,
+            self.opts.visibility,
+        ));
+    }
+
+    fn text(&mut self, path: &str, text: &str) {
+        self.findings.extend(check_d9_content(
+            path,
+            text,
+            self.signatures,
+            self.opts.visibility,
+        ));
+        self.findings
+            .extend(match_unit(text, self.fp, self.opts, "D2", "file", path));
+    }
+
+    fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
+        self.findings.extend(crate::binary::match_binary_items(
+            &strings, self.fp, self.opts, channel, path,
+        ));
+    }
+
+    fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
+        self.findings.extend(crate::d5a::check_d5a_metadata(
+            Path::new(path),
+            bytes,
+            self.opts,
+        ));
+    }
+}
+
+pub struct ContainerScanner<'a, S: UnitSink> {
+    pub opts: &'a ScanOptions,
+    pub sink: S,
+    pub total_expanded: u64,
+    pub root_prefix_len: usize,
+}
+
+impl<'a, S: UnitSink> ContainerScanner<'a, S> {
+    pub fn new(opts: &'a ScanOptions, sink: S, root_prefix_len: usize) -> Self {
+        Self {
+            opts,
+            sink,
+            total_expanded: 0,
             root_prefix_len,
         }
+    }
+
+    fn push(&mut self, finding: Finding) {
+        self.sink.fixed(finding);
     }
 
     pub fn scan(&mut self, path: &str, bytes: &[u8], depth: usize) {
@@ -286,19 +353,14 @@ impl<'a> ContainerScanner<'a> {
             Some(rel) if !rel.is_empty() => rel.trim_start_matches(['/', '\\']),
             _ => path,
         };
-        self.findings.extend(check_d9_path_with_display(
-            match_path,
-            path,
-            self.signatures,
-            self.opts.visibility,
-        ));
+        self.sink.path(match_path, path);
 
         // 2. Check container type
         let container_type = detect_container_type(bytes, path);
 
         if let Some(ctype) = container_type {
             if depth > self.opts.max_depth {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_depth".into(),
                     path: path.to_string(),
@@ -321,12 +383,11 @@ impl<'a> ContainerScanner<'a> {
                 ContainerType::Pyc => {
                     let constants_text = extract_pyc_constants(bytes);
                     if !constants_text.is_empty() {
-                        self.scan_text(path, &constants_text);
+                        self.sink.text(path, &constants_text);
                     }
                     // Names and constants, matched exactly by the binary tier
-                    self.findings.extend(crate::binary::scan_pyc_strings(
-                        path, bytes, self.fp, self.opts,
-                    ));
+                    self.sink
+                        .binary(path, "binary_pyc", crate::binary::pyc_binary_strings(bytes));
                 }
                 ContainerType::Sqlite => {
                     self.scan_sqlite(path, bytes);
@@ -353,17 +414,27 @@ impl<'a> ContainerScanner<'a> {
         } else {
             // Plain file unit
             // Part B: Recognised binaries (ELF, Java .class, wasm) are scanned for D3b
-            if let Some(findings) =
-                crate::binary::scan_binary_if_recognized(path, bytes, self.fp, self.opts)
-            {
-                self.findings.extend(findings);
+            if let Some((channel, res)) = crate::binary::recognize_binary(bytes) {
+                match res {
+                    Ok(strings) => self.sink.binary(path, channel, strings),
+                    Err(BinaryMalformed(err)) => {
+                        let f =
+                            crate::binary::malformed_binary_finding(path, channel, &err, self.opts);
+                        self.push(f);
+                        self.sink.binary(
+                            path,
+                            channel,
+                            crate::binary::malformed_fallback_strings(bytes),
+                        );
+                    }
+                }
                 return;
             }
 
             // Check binary (NUL byte in first 8 KiB)
             let check_len = bytes.len().min(8192);
             if bytes[..check_len].contains(&0) {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "file".into(),
                     path: path.to_string(),
@@ -377,32 +448,19 @@ impl<'a> ContainerScanner<'a> {
             }
 
             // D5a runs on every unit, so metadata inside wheels and eggs is checked too
-            self.findings.extend(crate::d5a::check_d5a_metadata(
-                Path::new(path),
-                bytes,
-                self.opts,
-            ));
+            self.sink.pkg_metadata(path, bytes);
 
             let text = String::from_utf8_lossy(bytes);
             // Minified text gets D3b in addition to tiers 1 and 3
             if crate::binary::is_minified_bundle(path, &text) {
-                self.findings.extend(crate::binary::scan_minified_bundle(
-                    path, &text, self.fp, self.opts,
-                ));
+                self.sink.binary(
+                    path,
+                    "binary_minified",
+                    crate::binary::parse_minified(&text),
+                );
             }
-            self.scan_text(path, &text);
+            self.sink.text(path, &text);
         }
-    }
-
-    pub fn scan_text(&mut self, path: &str, text: &str) {
-        self.findings.extend(check_d9_content(
-            path,
-            text,
-            self.signatures,
-            self.opts.visibility,
-        ));
-        self.findings
-            .extend(match_unit(text, self.fp, self.opts, "D2", "file", path));
     }
 
     fn scan_stray_pack(&mut self, path: &str, bytes: &[u8], depth: usize) {
@@ -413,7 +471,7 @@ impl<'a> ContainerScanner<'a> {
             self.scan(&blob_path, &blob_bytes, depth + 1);
         }
         if has_unresolved_ref_delta {
-            self.findings.push(Finding {
+            self.push(Finding {
                 detector: "D2".into(),
                 channel: "container_skipped".into(),
                 path: path.to_string(),
@@ -427,7 +485,7 @@ impl<'a> ContainerScanner<'a> {
         match error {
             None => {}
             Some(crate::gitstore::GitError::LimitExceeded(msg)) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_bomb".into(),
                     path: path.to_string(),
@@ -439,7 +497,7 @@ impl<'a> ContainerScanner<'a> {
                 });
             }
             Some(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -457,7 +515,7 @@ impl<'a> ContainerScanner<'a> {
         let temp_file = match tempfile::NamedTempFile::new() {
             Ok(t) => t,
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -472,7 +530,7 @@ impl<'a> ContainerScanner<'a> {
         };
 
         if let Err(e) = std::fs::write(temp_file.path(), bytes) {
-            self.findings.push(Finding {
+            self.push(Finding {
                 detector: "D2".into(),
                 channel: "container_error".into(),
                 path: path.to_string(),
@@ -491,7 +549,7 @@ impl<'a> ContainerScanner<'a> {
         ) {
             Ok(c) => c,
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -510,7 +568,7 @@ impl<'a> ContainerScanner<'a> {
         ) {
             Ok(s) => s,
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -527,7 +585,7 @@ impl<'a> ContainerScanner<'a> {
         let table_names: Vec<String> = match stmt.query_map([], |row| row.get(0)) {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -555,7 +613,7 @@ impl<'a> ContainerScanner<'a> {
             let mut row_stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: format!("{}::{}", path, table),
@@ -576,7 +634,7 @@ impl<'a> ContainerScanner<'a> {
             let mut rows = match row_stmt.query([]) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: format!("{}::{}", path, table),
@@ -596,7 +654,7 @@ impl<'a> ContainerScanner<'a> {
                     Ok(Some(r)) => r,
                     Ok(None) => break,
                     Err(e) => {
-                        self.findings.push(Finding {
+                        self.push(Finding {
                             detector: "D2".into(),
                             channel: "container_error".into(),
                             path: format!("{}::{}", path, table),
@@ -644,7 +702,7 @@ impl<'a> ContainerScanner<'a> {
                 if !row_text_parts.is_empty() {
                     let row_text = row_text_parts.join("\n");
                     let row_path = format!("{}::{}#{}", path, table, rowid_str);
-                    self.scan_text(&row_path, &row_text);
+                    self.sink.text(&row_path, &row_text);
                 }
             }
         }
@@ -655,7 +713,7 @@ impl<'a> ContainerScanner<'a> {
         let mut archive = match zip::ZipArchive::new(reader) {
             Ok(a) => a,
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -673,7 +731,7 @@ impl<'a> ContainerScanner<'a> {
             let mut file = match archive.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: path.to_string(),
@@ -706,7 +764,7 @@ impl<'a> ContainerScanner<'a> {
             if let Err(e) = counting.read_to_end(&mut member_bytes) {
                 let msg = e.to_string();
                 if msg.starts_with("bomb limit exceeded") {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_bomb".into(),
                         path: path.to_string(),
@@ -718,7 +776,7 @@ impl<'a> ContainerScanner<'a> {
                     });
                     return;
                 } else {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: member_path,
@@ -743,7 +801,7 @@ impl<'a> ContainerScanner<'a> {
         let entries = match archive.entries() {
             Ok(e) => e,
             Err(e) => {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -761,7 +819,7 @@ impl<'a> ContainerScanner<'a> {
             let mut entry = match entry_res {
                 Ok(e) => e,
                 Err(e) => {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: path.to_string(),
@@ -789,7 +847,7 @@ impl<'a> ContainerScanner<'a> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| "unknown".into());
                     let member_path = format!("{}!/{}", path, entry_path);
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_skipped".into(),
                         path: member_path,
@@ -806,7 +864,7 @@ impl<'a> ContainerScanner<'a> {
             let entry_path = match entry.path() {
                 Ok(p) => p.display().to_string(),
                 Err(e) => {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: path.to_string(),
@@ -830,7 +888,7 @@ impl<'a> ContainerScanner<'a> {
             if let Err(e) = counting.read_to_end(&mut member_bytes) {
                 let msg = e.to_string();
                 if msg.starts_with("bomb limit exceeded") {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_bomb".into(),
                         path: path.to_string(),
@@ -842,7 +900,7 @@ impl<'a> ContainerScanner<'a> {
                     });
                     return;
                 } else {
-                    self.findings.push(Finding {
+                    self.push(Finding {
                         detector: "D2".into(),
                         channel: "container_error".into(),
                         path: member_path,
@@ -909,7 +967,7 @@ impl<'a> ContainerScanner<'a> {
         if let Err(e) = res {
             let msg = e.to_string();
             if msg.starts_with("bomb limit exceeded") {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_bomb".into(),
                     path: path.to_string(),
@@ -921,7 +979,7 @@ impl<'a> ContainerScanner<'a> {
                 });
                 return;
             } else {
-                self.findings.push(Finding {
+                self.push(Finding {
                     detector: "D2".into(),
                     channel: "container_error".into(),
                     path: path.to_string(),
@@ -969,7 +1027,8 @@ pub fn scan_container_or_unit_with_root_prefix(
     opts: &ScanOptions,
     root_prefix_len: usize,
 ) -> Vec<Finding> {
-    let mut scanner = ContainerScanner::new_with_root_prefix(fp, signatures, opts, root_prefix_len);
+    let mut scanner =
+        ContainerScanner::new(opts, MatchSink::new(fp, signatures, opts), root_prefix_len);
     scanner.scan(path, bytes, 0);
-    scanner.findings
+    scanner.sink.findings
 }

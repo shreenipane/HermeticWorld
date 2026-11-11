@@ -183,6 +183,25 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
         return Vec::new();
     }
 
+    let text = String::from_utf8_lossy(bytes);
+    let (found_name, found_version) = parse_pkg_metadata(&text);
+
+    let found_name = match found_name {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+
+    let display_path = file_path.display().to_string();
+    check_d5a_name_and_version(&found_name, found_version.as_deref(), &display_path, opts)
+}
+
+/// Check found package name and version against target_packages and task_version for D5a.
+pub fn check_d5a_name_and_version(
+    found_name: &str,
+    found_version: Option<&str>,
+    display_path: &str,
+    opts: &ScanOptions,
+) -> Vec<Finding> {
     if opts.target_packages.is_empty() {
         return Vec::new();
     }
@@ -193,27 +212,18 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
         .map(|n| pep503_normalize(n))
         .collect();
 
-    let text = String::from_utf8_lossy(bytes);
-    let (found_name, found_version) = parse_pkg_metadata(&text);
-
-    let found_name = match found_name {
-        Some(n) => n,
-        None => return Vec::new(),
-    };
-
-    let norm_found = pep503_normalize(&found_name);
+    let norm_found = pep503_normalize(found_name);
     if !target_names.contains(&norm_found) {
         return Vec::new();
     }
 
-    let display_path = file_path.display().to_string();
     let found_v_str = match found_version {
-        Some(v) => v,
+        Some(v) => v.to_string(),
         None => {
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -234,7 +244,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -253,7 +263,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -272,7 +282,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -302,7 +312,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
         return vec![Finding {
             detector: "D5a".into(),
             channel: "target_version".into(),
-            path: display_path.clone(),
+            path: display_path.to_string(),
             visibility: opts.visibility,
             severity: Severity::Gate,
             confidence: 1.0,
@@ -323,7 +333,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
                         return vec![Finding {
                             detector: "D5a".into(),
                             channel: "target_dev_date".into(),
-                            path: display_path.clone(),
+                            path: display_path.to_string(),
                             visibility: opts.visibility,
                             severity: Severity::Gate,
                             confidence: 1.0,
@@ -341,7 +351,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
                         return vec![Finding {
                             detector: "D5a".into(),
                             channel: "target_dev_date".into(),
-                            path: display_path.clone(),
+                            path: display_path.to_string(),
                             visibility: opts.visibility,
                             severity: Severity::Gate,
                             confidence: 1.0,

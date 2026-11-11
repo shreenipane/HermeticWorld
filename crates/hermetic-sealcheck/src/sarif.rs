@@ -51,10 +51,18 @@ pub struct SarifTool {
     pub driver: SarifDriver,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SarifRunProperties {
+    pub mode: String,
+    pub not_covered: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SarifRun {
     pub tool: SarifTool,
     pub results: Vec<SarifResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<SarifRunProperties>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +178,19 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
                 },
             },
             results,
+            properties: None,
         }],
     }
+}
+
+/// Convert findings to a valid SARIF 2.1.0 log with optional run properties (e.g. query mode).
+pub fn generate_sarif_with_properties(
+    findings: &[Finding],
+    properties: Option<SarifRunProperties>,
+) -> SarifLog {
+    let mut log = generate_sarif(findings);
+    if let Some(run) = log.runs.first_mut() {
+        run.properties = properties;
+    }
+    log
 }

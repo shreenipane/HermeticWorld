@@ -7,8 +7,9 @@ use std::process::ExitCode;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    generate_sarif, scan_problem_statement, scan_tree, BenchmarkSignatures, FingerprintSet,
-    FingerprintSummary, ScanOptions, SealcheckReport, Severity, Visibility,
+    generate_sarif, generate_sarif_with_properties, query_index, scan_problem_statement, scan_tree,
+    write_index, BenchmarkSignatures, Finding, FingerprintSet, FingerprintSummary,
+    SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility, NOT_COVERED,
 };
 
 #[derive(Parser, Debug)]
@@ -26,6 +27,52 @@ struct Cli {
 enum Commands {
     /// Scan directories and problem statement for post-cutoff leaks
     Scan(ScanArgs),
+    /// Index a tree once: record each unit's task-independent facts (TR-SC-10)
+    Index(IndexArgs),
+    /// Match one task against layer indexes instead of scanning the trees again
+    Query(QueryArgs),
+}
+
+#[derive(Parser, Debug)]
+struct IndexArgs {
+    /// Root directory to index
+    #[arg(long)]
+    root: PathBuf,
+
+    /// Index file to write
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct QueryArgs {
+    /// Path to task directory containing task.json, staging/, agent/
+    #[arg(long)]
+    task: PathBuf,
+
+    /// Path to base tree root
+    #[arg(long)]
+    base_tree: PathBuf,
+
+    /// Index file to query (repeatable)
+    #[arg(long = "index", required = true)]
+    indexes: Vec<PathBuf>,
+
+    /// Visibility for each index's root (repeatable, one per --index)
+    #[arg(long = "root-visibility")]
+    root_visibilities: Vec<CliVisibility>,
+
+    /// Output format: json or sarif
+    #[arg(long, default_value = "json")]
+    format: OutputFormat,
+
+    /// Output file path (defaults to stdout)
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Target package names for D5a target version check (repeatable)
+    #[arg(long = "target-package")]
+    target_package: Vec<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,13 +214,40 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         all_findings.extend(oci_findings);
     }
 
+    write_report(
+        all_findings,
+        &fp,
+        task.instance_id,
+        args.format,
+        args.out,
+        None,
+    )
+}
+
+fn write_report(
+    all_findings: Vec<Finding>,
+    fp: &FingerprintSet,
+    instance_id: String,
+    format: OutputFormat,
+    out: Option<PathBuf>,
+    query_mode: Option<&[&str]>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let gate = all_findings
         .iter()
         .any(|f| f.severity == Severity::Gate && f.visibility == Visibility::AgentVisible);
 
-    let output_str = match args.format {
+    let output_str = match format {
         OutputFormat::Sarif => {
-            let sarif = generate_sarif(&all_findings);
+            let sarif = match query_mode {
+                Some(not_covered) => generate_sarif_with_properties(
+                    &all_findings,
+                    Some(SarifRunProperties {
+                        mode: "query".to_string(),
+                        not_covered: not_covered.iter().map(|s| s.to_string()).collect(),
+                    }),
+                ),
+                None => generate_sarif(&all_findings),
+            };
             serde_json::to_string_pretty(&sarif)?
         }
         OutputFormat::Json => {
@@ -190,16 +264,22 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             };
             let report = SealcheckReport {
                 schema: "hermetic-sealcheck/v0".to_string(),
-                instance_id: task.instance_id,
+                instance_id,
                 fingerprints: summary,
                 findings: all_findings,
                 gate,
+                mode: query_mode.map(|_| "query".to_string()),
+                not_covered: query_mode
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             };
             serde_json::to_string_pretty(&report)?
         }
     };
 
-    if let Some(out_path) = args.out {
+    if let Some(out_path) = out {
         fs::write(out_path, format!("{}\n", output_str))?;
     } else {
         println!("{}", output_str);
@@ -210,6 +290,73 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn run_index(args: IndexArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let stats = write_index(&args.root, &args.out)?;
+    eprintln!(
+        "indexed {} files into {} records: {}",
+        stats.files,
+        stats.records,
+        args.out.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if !args.root_visibilities.is_empty() && args.root_visibilities.len() != args.indexes.len() {
+        return Err(format!(
+            "got {} --root-visibility values for {} --index values; give one per index or none",
+            args.root_visibilities.len(),
+            args.indexes.len()
+        )
+        .into());
+    }
+
+    let task = TaskInput::load(&args.task)?;
+    let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+
+    // The instance id is not matched in the trees (D9:instance_id is not covered),
+    // but D0 on the problem statement runs exactly as in `scan`.
+    let signatures = BenchmarkSignatures::new(Some(task.instance_id.clone()));
+    let d0_opts = ScanOptions {
+        visibility: Visibility::AgentVisible,
+        signatures,
+        ..Default::default()
+    };
+    let mut all_findings = scan_problem_statement(&task.problem_statement, &fp, &d0_opts);
+
+    let canonical_task_dir = args.task.canonicalize().ok();
+    let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
+    let mut target_packages = vec![repo_pkg.to_string()];
+    target_packages.extend(args.target_package);
+
+    for (idx, index) in args.indexes.iter().enumerate() {
+        let vis = args
+            .root_visibilities
+            .get(idx)
+            .copied()
+            .unwrap_or(CliVisibility::AgentVisible);
+        let opts = ScanOptions {
+            visibility: vis.into(),
+            exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+            base_commit: Some(task.base_commit.clone()),
+            t_clock: Some(task.cutoffs.t_clock),
+            target_packages: target_packages.clone(),
+            task_version: task.version.clone(),
+            ..Default::default()
+        };
+        all_findings.extend(query_index(index, &fp, &opts)?);
+    }
+
+    write_report(
+        all_findings,
+        &fp,
+        task.instance_id,
+        args.format,
+        args.out,
+        Some(NOT_COVERED),
+    )
 }
 
 fn main() -> ExitCode {
@@ -223,13 +370,16 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     };
-    match cli.command {
-        Commands::Scan(args) => match run_scan(args) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("hermetic-sealcheck error: {}", e);
-                ExitCode::from(1)
-            }
-        },
+    let result = match cli.command {
+        Commands::Scan(args) => run_scan(args),
+        Commands::Index(args) => run_index(args),
+        Commands::Query(args) => run_query(args),
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("hermetic-sealcheck error: {}", e);
+            ExitCode::from(1)
+        }
     }
 }
