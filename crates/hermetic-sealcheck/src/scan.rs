@@ -214,11 +214,11 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                 for h in &file.hunks {
                     for l in &h.lines {
                         if l.line_type == crate::diff::DiffLineType::Added {
-                            if let Some(norm) = normalize_diff_line(&l.content) {
+                            if let Some(norm) = normalize_line(&l.content) {
                                 diff_seq.push(format!("+{}", norm));
                             }
                         } else if l.line_type == crate::diff::DiffLineType::Removed {
-                            if let Some(norm) = normalize_diff_line(&l.content) {
+                            if let Some(norm) = normalize_line(&l.content) {
                                 diff_seq.push(format!("-{}", norm));
                             }
                         }
