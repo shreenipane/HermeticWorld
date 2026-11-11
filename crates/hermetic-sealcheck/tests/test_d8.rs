@@ -1,11 +1,12 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 use time::macros::datetime;
 
 use hermetic_sealcheck::d8::{
-    check_d8, parse_kernel_version, parse_python_version, CPYTHON_RELEASES, KERNEL_RELEASES,
-    TZDATA_RELEASES, UBUNTU_RELEASES,
+    check_d8, parse_kernel_version, parse_python_version, resolve_in_root, CPYTHON_RELEASES,
+    KERNEL_RELEASES, TZDATA_RELEASES, UBUNTU_RELEASES,
 };
 use hermetic_sealcheck::{SealcheckReport, Visibility};
 
@@ -307,7 +308,7 @@ fn test_syslog_with_year_flagged() {
     let log_dir = root.join("var/log");
     fs::create_dir_all(&log_dir).expect("mkdir");
 
-    let syslog_with_year = "Nov 11 12:00:00 myhost app [2026]: service started\n";
+    let syslog_with_year = "Nov 11 12:00:00 2026 myhost app: service started\n";
     fs::write(log_dir.join("app.log"), syslog_with_year).expect("write");
 
     let t_clock = datetime!(2025-01-01 00:00:00 UTC);
@@ -357,7 +358,7 @@ fn test_missing_files_give_no_findings() {
 #[test]
 fn test_version_tables_structure() {
     // Ubuntu
-    assert!(UBUNTU_RELEASES.len() >= 22);
+    assert!(UBUNTU_RELEASES.len() >= 24);
     assert_eq!(UBUNTU_RELEASES.first().unwrap().0, "14.04");
     assert_eq!(UBUNTU_RELEASES.last().unwrap().0, "26.04");
 
@@ -369,7 +370,7 @@ fn test_version_tables_structure() {
     // Kernel
     assert!(KERNEL_RELEASES.len() >= 40);
     assert_eq!(KERNEL_RELEASES.first().unwrap().0, (4, 0));
-    assert_eq!(KERNEL_RELEASES.last().unwrap().0, (6, 13));
+    assert_eq!(KERNEL_RELEASES.last().unwrap().0, (6, 16));
 
     // Python
     assert!(CPYTHON_RELEASES.len() >= 9);
@@ -390,10 +391,12 @@ fn test_fuzz_style_random_bytes_never_panic() {
     let zi = root.join("usr/share/zoneinfo");
     let certs = root.join("etc/ssl/certs");
     let logs = root.join("var/log");
+    let boot = root.join("boot");
     fs::create_dir_all(&etc).expect("mkdir");
     fs::create_dir_all(&zi).expect("mkdir");
     fs::create_dir_all(&certs).expect("mkdir");
     fs::create_dir_all(&logs).expect("mkdir");
+    fs::create_dir_all(&boot).expect("mkdir");
 
     // Pseudorandom generator (deterministic LCG)
     let mut state: u64 = 0xDEADBEEFCAFEBABE;
@@ -412,12 +415,347 @@ fn test_fuzz_style_random_bytes_never_panic() {
         let len = (i * 257) % 5000 + 1;
         fs::write(etc.join("os-release"), rand_bytes(len)).expect("write");
         fs::write(zi.join("tzdata.zi"), rand_bytes(len)).expect("write");
+        fs::write(zi.join("+VERSION"), rand_bytes(len)).expect("write");
         fs::write(certs.join("ca-certificates.crt"), rand_bytes(len)).expect("write");
+        fs::write(certs.join("cert.pem"), rand_bytes(len)).expect("write");
         fs::write(logs.join("fuzz.log"), rand_bytes(len)).expect("write");
+        fs::write(boot.join("config-fuzz"), rand_bytes(len)).expect("write");
 
         // Must never panic
         let _ = check_d8(root, t_clock, Visibility::AgentVisible);
     }
+}
+
+#[test]
+fn test_tzdata_multibyte_never_panics() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let zi_dir = root.join("usr/share/zoneinfo");
+    fs::create_dir_all(&zi_dir).expect("mkdir");
+
+    // +VERSION containing multibyte character €€
+    fs::write(zi_dir.join("+VERSION"), "€€\n").expect("write");
+    // tzdata.zi containing multibyte characters
+    fs::write(zi_dir.join("tzdata.zi"), "# version €€\n").expect("write");
+
+    let t_clock = datetime!(2024-01-01 00:00:00 UTC);
+    // Must not panic on string slicing
+    let findings = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(findings.is_empty());
+
+    // Also test with other multibyte sequences
+    fs::write(zi_dir.join("+VERSION"), "2024€\n").expect("write");
+    fs::write(zi_dir.join("tzdata.zi"), "# version 2024€\n").expect("write");
+    let findings2 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(findings2.is_empty());
+}
+
+#[test]
+fn test_syslog_adjacent_year_and_false_positives() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let log_dir = root.join("var/log");
+    fs::create_dir_all(&log_dir).expect("mkdir");
+
+    let t_clock = datetime!(2025-01-01 00:00:00 UTC);
+
+    // Negative tests: false positive patterns must NOT produce findings
+    // 1. PIDs in brackets (sshd[2099]:)
+    let pids = "Nov 11 12:00:00 host sshd[2099]: x\n";
+    fs::write(log_dir.join("pids.log"), pids).expect("write");
+
+    // 2. Sizes (... 2048 MB)
+    let sizes = "Nov 11 12:00:00 host kernel: Total Memory: 2048 MB available\n";
+    fs::write(log_dir.join("sizes.log"), sizes).expect("write");
+
+    // 3. Ports (... port 2049)
+    let ports = "Nov 11 12:00:00 host daemon: listening on port 2049 for nfs\n";
+    fs::write(log_dir.join("ports.log"), ports).expect("write");
+
+    let findings_neg = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(
+        findings_neg.is_empty(),
+        "Expected no findings for false positive patterns, but got {:?}",
+        findings_neg
+    );
+
+    // Clean up negative logs
+    fs::remove_file(log_dir.join("pids.log")).expect("remove");
+    fs::remove_file(log_dir.join("sizes.log")).expect("remove");
+    fs::remove_file(log_dir.join("ports.log")).expect("remove");
+
+    // Positive tests: each of the three recognised layouts is dated correctly
+    // Layout 1: "Mon DD YYYY HH:MM:SS"
+    let l1 = "Nov 11 2026 12:00:00 host service: started\n";
+    fs::write(log_dir.join("layout1.log"), l1).expect("write");
+    let f1 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f1.len(), 1);
+    assert_eq!(f1[0].channel, "dated_log");
+    assert!(f1[0].evidence[0].contains("2026-11-11 12:00:00 UTC"));
+    fs::remove_file(log_dir.join("layout1.log")).expect("remove");
+
+    // Layout 2: "Mon DD HH:MM:SS YYYY"
+    let l2 = "Nov 11 12:00:00 2026 host service: started\n";
+    fs::write(log_dir.join("layout2.log"), l2).expect("write");
+    let f2 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f2.len(), 1);
+    assert_eq!(f2[0].channel, "dated_log");
+    assert!(f2[0].evidence[0].contains("2026-11-11 12:00:00 UTC"));
+    fs::remove_file(log_dir.join("layout2.log")).expect("remove");
+
+    // Layout 3: "Www Mon DD HH:MM:SS YYYY" (ctime)
+    let l3 = "Wed Nov 11 12:00:00 2026 host service: started\n";
+    fs::write(log_dir.join("layout3.log"), l3).expect("write");
+    let f3 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f3.len(), 1);
+    assert_eq!(f3[0].channel, "dated_log");
+    assert!(f3[0].evidence[0].contains("2026-11-11 12:00:00 UTC"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_symlink_root_isolation() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let cert_dir = root.join("etc/ssl/certs");
+    let share_certs = root.join("usr/share/ca-certificates");
+    fs::create_dir_all(&cert_dir).expect("mkdir");
+    fs::create_dir_all(&share_certs).expect("mkdir");
+
+    // Case 1: Absolute symlink inside rootfs
+    // etc/ssl/certs/test.pem -> /usr/share/ca-certificates/x.crt
+    let pem_content = make_test_cert_pem(Some("260101000000Z"), None, Some("Rootfs Test CA"));
+    fs::write(share_certs.join("x.crt"), &pem_content).expect("write");
+    symlink(
+        "/usr/share/ca-certificates/x.crt",
+        cert_dir.join("test.pem"),
+    )
+    .expect("symlink");
+
+    let t_clock = datetime!(2025-01-01 00:00:00 UTC);
+    let findings = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "ca_bundle");
+    assert!(findings[0].evidence[0].contains("Rootfs Test CA"));
+
+    // Case 2: When rootfs copy is missing, host path is never read!
+    let missing_link = cert_dir.join("host_leak.pem");
+    symlink("/etc/hostname", &missing_link).expect("symlink");
+    fs::remove_file(cert_dir.join("test.pem")).expect("remove");
+    fs::remove_file(share_certs.join("x.crt")).expect("remove");
+
+    let findings_host = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(
+        findings_host.is_empty(),
+        "Host file /etc/hostname must not be read: got {:?}",
+        findings_host
+    );
+    fs::remove_file(&missing_link).expect("remove");
+
+    // Case 3: Link loop gives d8_error and no hang
+    let loop_a = cert_dir.join("loop_a.pem");
+    let loop_b = cert_dir.join("loop_b.pem");
+    symlink("/etc/ssl/certs/loop_b.pem", &loop_a).expect("symlink");
+    symlink("/etc/ssl/certs/loop_a.pem", &loop_b).expect("symlink");
+
+    let findings_loop = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(
+        findings_loop.iter().any(|f| f.channel == "d8_error"),
+        "Expected d8_error for symlink loop"
+    );
+    fs::remove_file(&loop_a).expect("remove");
+    fs::remove_file(&loop_b).expect("remove");
+
+    // Case 4: ../../../ escape stays inside root
+    let sub = root.join("a/b/c");
+    fs::create_dir_all(&sub).expect("mkdir");
+    let escape_link = sub.join("escaped.pem");
+    symlink(
+        "../../../../../../../../usr/share/ca-certificates/x.crt",
+        &escape_link,
+    )
+    .expect("symlink");
+    let resolved = resolve_in_root(root, Path::new("a/b/c/escaped.pem"));
+    assert_eq!(resolved, Some(share_certs.join("x.crt")));
+}
+
+#[test]
+fn test_cli_d8_invalid_root_error_and_exit_1() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+
+    // 1. Nonexistent directory
+    let output_nonexistent = Command::new(bin_path)
+        .arg("d8")
+        .arg("--root")
+        .arg("/nonexistent/directory/that/does/not/exist/d8_test")
+        .arg("--t-clock")
+        .arg("2023-01-01T00:00:00Z")
+        .output()
+        .expect("run d8");
+
+    assert_eq!(output_nonexistent.status.code(), Some(1));
+    let stderr_str = String::from_utf8_lossy(&output_nonexistent.stderr);
+    assert!(
+        stderr_str.contains("does not exist or is not a directory"),
+        "Expected error message on stderr, got: {}",
+        stderr_str
+    );
+
+    // 2. Path is a regular file, not a directory
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("regular_file.txt");
+    fs::write(&file_path, "not a directory").expect("write");
+
+    let output_file = Command::new(bin_path)
+        .arg("d8")
+        .arg("--root")
+        .arg(&file_path)
+        .arg("--t-clock")
+        .arg("2023-01-01T00:00:00Z")
+        .output()
+        .expect("run d8 on file");
+
+    assert_eq!(output_file.status.code(), Some(1));
+    let stderr_file = String::from_utf8_lossy(&output_file.stderr);
+    assert!(
+        stderr_file.contains("does not exist or is not a directory"),
+        "Expected error message on stderr, got: {}",
+        stderr_file
+    );
+}
+
+#[test]
+fn test_large_log_reads_tail_post_t_clock() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let log_dir = root.join("var/log");
+    fs::create_dir_all(&log_dir).expect("mkdir");
+
+    let file_path = log_dir.join("large.log");
+    let mut file = fs::File::create(&file_path).expect("create file");
+    use std::io::Write;
+
+    // Write ~4 MiB + 200 bytes
+    // Early lines before T_clock (2024-01-01)
+    let early_line = b"2024-01-01 10:00:00 past event line padding data to fill buffer\n";
+    let target_size = 4 * 1024 * 1024 + 200;
+    let mut written = 0;
+    while written + early_line.len() + 100 < target_size {
+        file.write_all(early_line).expect("write");
+        written += early_line.len();
+    }
+
+    // Only post-T_clock line is at the end of the file
+    let late_line = b"2026-11-11 12:00:00 post-cutoff event at log tail\n";
+    file.write_all(late_line).expect("write");
+    file.flush().expect("flush");
+
+    let t_clock = datetime!(2025-01-01 00:00:00 UTC);
+    let findings = check_d8(root, t_clock, Visibility::AgentVisible);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "dated_log");
+    assert!(findings[0].evidence[0].contains("2026-11-11 12:00:00 UTC"));
+    assert!(findings[0].evidence[1].contains("post-cutoff event at log tail"));
+}
+
+#[test]
+fn test_format_dt_utc_conversion_with_nonzero_offset() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let etc = root.join("etc");
+    fs::create_dir_all(&etc).expect("mkdir");
+
+    // Ubuntu 24.04 released 2024-04-25
+    fs::write(
+        etc.join("os-release"),
+        "NAME=Ubuntu\nID=ubuntu\nVERSION_ID=24.04\n",
+    )
+    .expect("write");
+
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+
+    // --t-clock 2023-01-01T00:00:00+05:00
+    // UTC time is 2022-12-31 19:00:00 UTC
+    let out_file = dir.path().join("report.json");
+    let status = Command::new(bin_path)
+        .arg("d8")
+        .arg("--root")
+        .arg(root)
+        .arg("--t-clock")
+        .arg("2023-01-01T00:00:00+05:00")
+        .arg("--out")
+        .arg(&out_file)
+        .status()
+        .expect("run d8");
+
+    assert_eq!(status.code(), Some(0));
+    let content = fs::read_to_string(&out_file).expect("read report");
+    let report: SealcheckReport = serde_json::from_str(&content).expect("parse report");
+    assert_eq!(report.findings.len(), 1);
+    let t_clock_evidence = &report.findings[0].evidence[2];
+    assert!(
+        t_clock_evidence.contains("2022-12-31 19:00:00 UTC"),
+        "Expected '2022-12-31 19:00:00 UTC' in evidence, got: {}",
+        t_clock_evidence
+    );
+}
+
+#[test]
+fn test_newer_than_table_distro_kernel_python() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let t_clock = datetime!(2025-01-01 00:00:00 UTC);
+
+    // 1. Ubuntu 30.04 (newer than Ubuntu table ending at 26.04) -> finding!
+    let etc = root.join("etc");
+    fs::create_dir_all(&etc).expect("mkdir");
+    fs::write(
+        etc.join("os-release"),
+        "NAME=Ubuntu\nID=ubuntu\nVERSION_ID=30.04\n",
+    )
+    .expect("write");
+
+    let f_u30 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f_u30.len(), 1);
+    assert_eq!(f_u30[0].channel, "os_release");
+    assert_eq!(f_u30[0].confidence, 0.5);
+    assert!(f_u30[0].evidence[1].contains("newer than the built-in table (release date unknown)"));
+
+    // 2. Older unknown version: Ubuntu 5.04 (not in table, older than 26.04) -> gives NONE
+    fs::write(
+        etc.join("os-release"),
+        "NAME=Ubuntu\nID=ubuntu\nVERSION_ID=5.04\n",
+    )
+    .expect("write");
+    let f_u5 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert!(
+        f_u5.is_empty(),
+        "Older unknown version must give no finding"
+    );
+    fs::remove_file(etc.join("os-release")).expect("remove");
+
+    // 3. Kernel 9.1 (newer than Kernel table ending at 6.16) -> finding!
+    let mod_dir = root.join("lib/modules/9.1.0-custom");
+    fs::create_dir_all(&mod_dir).expect("mkdir");
+    let f_k9 = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f_k9.len(), 1);
+    assert_eq!(f_k9[0].channel, "kernel");
+    assert_eq!(f_k9[0].confidence, 0.5);
+    assert!(f_k9[0].evidence[1].contains("newer than the built-in table (release date unknown)"));
+    fs::remove_dir_all(root.join("lib")).expect("rmdir");
+
+    // 4. CPython 3.99 (newer than CPython table ending at 3.14) -> finding!
+    let py_dir = root.join("usr/lib/python3.99");
+    fs::create_dir_all(&py_dir).expect("mkdir");
+    let f_py = check_d8(root, t_clock, Visibility::AgentVisible);
+    assert_eq!(f_py.len(), 1);
+    assert_eq!(f_py[0].channel, "python_build");
+    assert_eq!(f_py[0].confidence, 0.5);
+    assert!(f_py[0].evidence[1].contains("newer than the built-in table (release date unknown)"));
 }
 
 #[test]

@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::scan::{Finding, Severity, Visibility};
@@ -32,6 +34,8 @@ pub const UBUNTU_RELEASES: &[(&str, (i32, u8, u8))] = &[
     ("23.10", (2023, 10, 12)),
     ("24.04", (2024, 4, 25)),
     ("24.10", (2024, 10, 10)),
+    ("25.04", (2025, 4, 17)),
+    ("25.10", (2025, 10, 9)),
     ("26.04", (2026, 4, 23)),
 ];
 
@@ -57,6 +61,7 @@ pub const ALPINE_RELEASES: &[(&str, (i32, u8, u8))] = &[
     ("3.19", (2023, 12, 7)),
     ("3.20", (2024, 5, 22)),
     ("3.21", (2024, 12, 5)),
+    ("3.22", (2025, 5, 30)),
 ];
 
 pub const FEDORA_RELEASES: &[(&str, (i32, u8, u8))] = &[
@@ -72,6 +77,7 @@ pub const FEDORA_RELEASES: &[(&str, (i32, u8, u8))] = &[
     ("39", (2023, 11, 7)),
     ("40", (2024, 4, 23)),
     ("41", (2024, 10, 29)),
+    ("42", (2025, 4, 15)),
 ];
 
 pub const RHEL_FAMILY_RELEASES: &[(&str, (i32, u8, u8))] = &[
@@ -218,6 +224,9 @@ pub const KERNEL_RELEASES: &[(VersionPair, ReleaseDate)] = &[
     ((6, 11), (2024, 9, 15)),
     ((6, 12), (2024, 11, 17)),
     ((6, 13), (2025, 1, 19)),
+    ((6, 14), (2025, 3, 24)),
+    ((6, 15), (2025, 5, 25)),
+    ((6, 16), (2025, 7, 27)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -233,7 +242,7 @@ pub const CPYTHON_RELEASES: &[(VersionPair, ReleaseDate)] = &[
     ((3, 11), (2022, 10, 24)),
     ((3, 12), (2023, 10, 2)),
     ((3, 13), (2024, 10, 7)),
-    ((3, 14), (2025, 10, 1)),
+    ((3, 14), (2025, 10, 7)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -247,6 +256,10 @@ fn make_date(y: i32, m: u8, d: u8) -> Option<OffsetDateTime> {
 }
 
 fn format_dt(dt: OffsetDateTime) -> String {
+    let dt = match dt.checked_to_offset(time::UtcOffset::UTC) {
+        Some(utc) => utc,
+        None => dt,
+    };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
         dt.year(),
@@ -271,6 +284,113 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Err
     let mut buf = Vec::new();
     Read::take(&mut file, max_bytes).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn read_log_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len <= max_bytes {
+        let mut buf = Vec::with_capacity(file_len as usize);
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        file.seek(SeekFrom::Start(file_len - max_bytes))?;
+        let mut buf = Vec::with_capacity(max_bytes as usize);
+        file.read_to_end(&mut buf)?;
+        if let Some(first_nl) = buf.iter().position(|&b| b == b'\n') {
+            Ok(buf[first_nl + 1..].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PathStep {
+    Root,
+    Parent,
+    Normal(OsString),
+}
+
+pub fn resolve_in_root(root: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut hops = 0usize;
+    let rel_stripped = rel.strip_prefix(root).unwrap_or(rel);
+
+    let mut resolved: Vec<OsString> = Vec::new();
+    let mut remaining: VecDeque<PathStep> = VecDeque::new();
+
+    for comp in rel_stripped.components() {
+        match comp {
+            Component::Prefix(_) => {}
+            Component::RootDir => remaining.push_back(PathStep::Root),
+            Component::CurDir => {}
+            Component::ParentDir => remaining.push_back(PathStep::Parent),
+            Component::Normal(n) => remaining.push_back(PathStep::Normal(n.to_os_string())),
+        }
+    }
+
+    while let Some(step) = remaining.pop_front() {
+        match step {
+            PathStep::Root => {
+                resolved.clear();
+            }
+            PathStep::Parent => {
+                resolved.pop();
+            }
+            PathStep::Normal(name) => {
+                let mut candidate = root.to_path_buf();
+                for seg in &resolved {
+                    candidate.push(seg);
+                }
+                candidate.push(&name);
+
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            hops += 1;
+                            if hops > 40 {
+                                return None;
+                            }
+                            let target = match std::fs::read_link(&candidate) {
+                                Ok(t) => t,
+                                Err(_) => return None,
+                            };
+                            let mut target_steps = Vec::new();
+                            for c in target.components() {
+                                match c {
+                                    Component::Prefix(_) => {}
+                                    Component::RootDir => target_steps.push(PathStep::Root),
+                                    Component::CurDir => {}
+                                    Component::ParentDir => target_steps.push(PathStep::Parent),
+                                    Component::Normal(n) => {
+                                        target_steps.push(PathStep::Normal(n.to_os_string()))
+                                    }
+                                }
+                            }
+                            for s in target_steps.into_iter().rev() {
+                                remaining.push_front(s);
+                            }
+                        } else {
+                            resolved.push(name);
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            resolved.push(name);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut final_path = root.to_path_buf();
+    for seg in resolved {
+        final_path.push(seg);
+    }
+    Some(final_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +442,72 @@ pub fn lookup_distro_date(id: &str, version_id: &str) -> Option<OffsetDateTime> 
     None
 }
 
+fn parse_version_pair(v: &str) -> Option<(u32, u32)> {
+    let mut parts = v.split('.');
+    let maj = parts.next()?.parse::<u32>().ok()?;
+    let min = parts.next()?.parse::<u32>().ok()?;
+    Some((maj, min))
+}
+
+fn parse_single_version(v: &str) -> Option<u32> {
+    v.split('.').next()?.parse::<u32>().ok()
+}
+
+pub fn is_newer_than_distro_table(id: &str, version_id: &str) -> bool {
+    let id_norm = id.trim().to_ascii_lowercase();
+    let v_norm = version_id.trim();
+
+    match id_norm.as_str() {
+        "ubuntu" => {
+            if let Some((maj, min)) = parse_version_pair(v_norm) {
+                if let Some((last_ver, _)) = UBUNTU_RELEASES.last() {
+                    if let Some((max_maj, max_min)) = parse_version_pair(last_ver) {
+                        return maj > max_maj || (maj == max_maj && min > max_min);
+                    }
+                }
+            }
+        }
+        "debian" => {
+            if let Some(maj) = parse_single_version(v_norm) {
+                if let Some((last_ver, _)) = DEBIAN_RELEASES.last() {
+                    if let Some(max_maj) = parse_single_version(last_ver) {
+                        return maj > max_maj;
+                    }
+                }
+            }
+        }
+        "alpine" => {
+            if let Some((maj, min)) = parse_version_pair(v_norm) {
+                if let Some((last_ver, _)) = ALPINE_RELEASES.last() {
+                    if let Some((max_maj, max_min)) = parse_version_pair(last_ver) {
+                        return maj > max_maj || (maj == max_maj && min > max_min);
+                    }
+                }
+            }
+        }
+        "fedora" => {
+            if let Some(maj) = parse_single_version(v_norm) {
+                if let Some((last_ver, _)) = FEDORA_RELEASES.last() {
+                    if let Some(max_maj) = parse_single_version(last_ver) {
+                        return maj > max_maj;
+                    }
+                }
+            }
+        }
+        "centos" | "rhel" | "rocky" | "almalinux" | "alma" => {
+            if let Some(maj) = parse_single_version(v_norm) {
+                if let Some((last_ver, _)) = RHEL_FAMILY_RELEASES.last() {
+                    if let Some(max_maj) = parse_single_version(last_ver) {
+                        return maj > max_maj;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn check_os_release(
     root: &Path,
     t_clock: OffsetDateTime,
@@ -330,7 +516,22 @@ fn check_os_release(
 ) {
     let targets = ["etc/os-release", "usr/lib/os-release"];
     for rel_path in targets {
-        let full_path = root.join(rel_path);
+        let full_path = match resolve_in_root(root, Path::new(rel_path)) {
+            Some(p) => p,
+            None => {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "d8_error".into(),
+                    path: root.join(rel_path).display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec!["symlink loop or resolution failure".into()],
+                });
+                continue;
+            }
+        };
         let bytes = match read_file_capped(&full_path, 1024 * 1024) {
             Ok(b) => b,
             Err(e) => {
@@ -360,13 +561,14 @@ fn check_os_release(
                 continue;
             }
             if let Some(eq_pos) = trimmed.find('=') {
-                let key = trimmed[..eq_pos].trim();
-                let mut val = trimmed[eq_pos + 1..].trim();
-                if val.len() >= 2
-                    && ((val.starts_with('"') && val.ends_with('"'))
-                        || (val.starts_with('\'') && val.ends_with('\'')))
+                let key = trimmed.get(..eq_pos).unwrap_or("").trim();
+                let mut val = trimmed.get(eq_pos + 1..).unwrap_or("").trim();
+                if let Some(stripped) = val.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    val = stripped;
+                } else if let Some(stripped) =
+                    val.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
                 {
-                    val = &val[1..val.len() - 1];
+                    val = stripped;
                 }
                 if key == "ID" {
                     id = Some(val.to_string());
@@ -394,6 +596,21 @@ fn check_os_release(
                         ],
                     });
                 }
+            } else if is_newer_than_distro_table(&id_str, &v_str) {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "os_release".into(),
+                    path: full_path.display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.5,
+                    hunk: None,
+                    evidence: vec![
+                        format!("os-release: ID=\"{}\", VERSION_ID=\"{}\"", id_str, v_str),
+                        "newer than the built-in table (release date unknown)".to_string(),
+                        format!("T_clock: {}", format_dt(t_clock)),
+                    ],
+                });
             }
         }
     }
@@ -405,10 +622,8 @@ fn check_os_release(
 
 fn parse_tzdata_version(s: &str) -> Option<(u32, &str)> {
     let trimmed = s.trim();
-    if trimmed.len() < 5 {
-        return None;
-    }
-    let (year_str, suffix) = trimmed.split_at(4);
+    let year_str = trimmed.get(..4)?;
+    let suffix = trimmed.get(4..)?;
     let year: u32 = year_str.parse().ok()?;
     if !suffix.chars().all(|c| c.is_ascii_lowercase()) || suffix.is_empty() {
         return None;
@@ -422,12 +637,28 @@ fn check_tzdata(
     visibility: Visibility,
     findings: &mut Vec<Finding>,
 ) {
-    let zi_path = root.join("usr/share/zoneinfo/tzdata.zi");
-    let version_path = root.join("usr/share/zoneinfo/+VERSION");
+    let targets = [
+        ("usr/share/zoneinfo/tzdata.zi", true),
+        ("usr/share/zoneinfo/+VERSION", false),
+    ];
 
-    let targets = [(zi_path, true), (version_path, false)];
-
-    for (full_path, is_zi) in targets {
+    for (rel_path, is_zi) in targets {
+        let full_path = match resolve_in_root(root, Path::new(rel_path)) {
+            Some(p) => p,
+            None => {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "d8_error".into(),
+                    path: root.join(rel_path).display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec!["symlink loop or resolution failure".into()],
+                });
+                continue;
+            }
+        };
         let bytes = match read_file_capped(&full_path, 64 * 1024) {
             Ok(b) => b,
             Err(e) => {
@@ -492,7 +723,7 @@ fn check_tzdata(
                 // Newest entry in TZDATA_RELEASES is 2025a
                 let newest = TZDATA_RELEASES.last();
                 if let Some((newest_ver, (ny, _, _))) = newest {
-                    let newest_suffix = &newest_ver[4..];
+                    let newest_suffix = newest_ver.get(4..).unwrap_or("");
                     let is_newer =
                         year > (*ny as u32) || (year == (*ny as u32) && suffix > newest_suffix);
                     if is_newer {
@@ -506,7 +737,7 @@ fn check_tzdata(
                             hunk: None,
                             evidence: vec![
                                 format!("tzdata version {}", ver_str),
-                                "newer than the built-in table".to_string(),
+                                "newer than the built-in table (release date unknown)".to_string(),
                                 format!("T_clock: {}", format_dt(t_clock)),
                             ],
                         });
@@ -765,28 +996,76 @@ fn check_ca_bundle(
 ) {
     let mut cert_files: Vec<PathBuf> = Vec::new();
 
-    let p1 = root.join("etc/ssl/certs/ca-certificates.crt");
-    if p1.is_file() {
-        cert_files.push(p1);
-    }
-    let p2 = root.join("etc/pki/tls/certs/ca-bundle.crt");
-    if p2.is_file() {
-        cert_files.push(p2);
+    for bundle_rel in [
+        "etc/ssl/certs/ca-certificates.crt",
+        "etc/pki/tls/certs/ca-bundle.crt",
+    ] {
+        match resolve_in_root(root, Path::new(bundle_rel)) {
+            Some(resolved) => {
+                if resolved.is_file() && !cert_files.contains(&resolved) {
+                    cert_files.push(resolved);
+                }
+            }
+            None => {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "d8_error".into(),
+                    path: root.join(bundle_rel).display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec!["symlink loop or resolution failure".into()],
+                });
+            }
+        }
     }
 
-    let cert_dir = root.join("etc/ssl/certs");
+    let cert_dir = match resolve_in_root(root, Path::new("etc/ssl/certs")) {
+        Some(d) => d,
+        None => {
+            findings.push(Finding {
+                detector: "D8".into(),
+                channel: "d8_error".into(),
+                path: root.join("etc/ssl/certs").display().to_string(),
+                visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec!["symlink loop or resolution failure".into()],
+            });
+            return;
+        }
+    };
+
     if cert_dir.is_dir() {
         match std::fs::read_dir(&cert_dir) {
             Ok(entries) => {
                 let mut dir_files = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
-                        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                            if ext == "pem" || ext == "crt" {
-                                dir_files.push(path);
-                            }
+                    let resolved = match resolve_in_root(root, &path) {
+                        Some(p) => p,
+                        None => {
+                            findings.push(Finding {
+                                detector: "D8".into(),
+                                channel: "d8_error".into(),
+                                path: path.display().to_string(),
+                                visibility,
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec!["symlink loop or resolution failure".into()],
+                            });
+                            continue;
                         }
+                    };
+                    let ext_match = path.extension().is_some_and(|e| e == "pem" || e == "crt")
+                        || resolved
+                            .extension()
+                            .is_some_and(|e| e == "pem" || e == "crt");
+                    if resolved.is_file() && ext_match {
+                        dir_files.push(resolved);
                     }
                 }
                 dir_files.sort();
@@ -910,16 +1189,22 @@ pub fn parse_kernel_version(s: &str) -> Option<(u32, u32)> {
     for token in s.split_whitespace() {
         let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
         if let Some(start) = trimmed.find(|c: char| c.is_ascii_digit()) {
-            let rem = &trimmed[start..];
-            if let Some(dot_idx) = rem.find('.') {
-                if let Ok(major) = rem[..dot_idx].parse::<u32>() {
-                    let rem2 = &rem[dot_idx + 1..];
-                    let end_minor = rem2
-                        .find(|c: char| !c.is_ascii_digit())
-                        .unwrap_or(rem2.len());
-                    if end_minor > 0 {
-                        if let Ok(minor) = rem2[..end_minor].parse::<u32>() {
-                            return Some((major, minor));
+            if let Some(rem) = trimmed.get(start..) {
+                if let Some(dot_idx) = rem.find('.') {
+                    if let Some(major_str) = rem.get(..dot_idx) {
+                        if let Ok(major) = major_str.parse::<u32>() {
+                            if let Some(rem2) = rem.get(dot_idx + 1..) {
+                                let end_minor = rem2
+                                    .find(|c: char| !c.is_ascii_digit())
+                                    .unwrap_or(rem2.len());
+                                if end_minor > 0 {
+                                    if let Some(minor_str) = rem2.get(..end_minor) {
+                                        if let Ok(minor) = minor_str.parse::<u32>() {
+                                            return Some((major, minor));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -938,6 +1223,14 @@ pub fn lookup_kernel_date(major: u32, minor: u32) -> Option<OffsetDateTime> {
     None
 }
 
+pub fn is_newer_than_kernel_table(maj: u32, min: u32) -> bool {
+    if let Some(((max_maj, max_min), _)) = KERNEL_RELEASES.last() {
+        maj > *max_maj || (maj == *max_maj && min > *max_min)
+    } else {
+        false
+    }
+}
+
 fn check_kernel(
     root: &Path,
     t_clock: OffsetDateTime,
@@ -946,13 +1239,44 @@ fn check_kernel(
 ) {
     let module_dirs = ["lib/modules", "usr/lib/modules"];
     for m_dir_rel in module_dirs {
-        let m_dir = root.join(m_dir_rel);
+        let m_dir = match resolve_in_root(root, Path::new(m_dir_rel)) {
+            Some(d) => d,
+            None => {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "d8_error".into(),
+                    path: root.join(m_dir_rel).display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec!["symlink loop or resolution failure".into()],
+                });
+                continue;
+            }
+        };
         if m_dir.is_dir() {
             match std::fs::read_dir(&m_dir) {
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_dir() {
+                        let resolved = match resolve_in_root(root, &path) {
+                            Some(p) => p,
+                            None => {
+                                findings.push(Finding {
+                                    detector: "D8".into(),
+                                    channel: "d8_error".into(),
+                                    path: path.display().to_string(),
+                                    visibility,
+                                    severity: Severity::Info,
+                                    confidence: 0.0,
+                                    hunk: None,
+                                    evidence: vec!["symlink loop or resolution failure".into()],
+                                });
+                                continue;
+                            }
+                        };
+                        if resolved.is_dir() {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 if let Some((maj, min)) = parse_kernel_version(name) {
                                     if let Some(rel_dt) = lookup_kernel_date(maj, min) {
@@ -975,6 +1299,21 @@ fn check_kernel(
                                                 ],
                                             });
                                         }
+                                    } else if is_newer_than_kernel_table(maj, min) {
+                                        findings.push(Finding {
+                                            detector: "D8".into(),
+                                            channel: "kernel".into(),
+                                            path: path.display().to_string(),
+                                            visibility,
+                                            severity: Severity::Info,
+                                            confidence: 0.5,
+                                            hunk: None,
+                                            evidence: vec![
+                                                format!("kernel version {}.{}", maj, min),
+                                                "newer than the built-in table (release date unknown)".to_string(),
+                                                format!("T_clock: {}", format_dt(t_clock)),
+                                            ],
+                                        });
                                     }
                                 }
                             }
@@ -999,16 +1338,47 @@ fn check_kernel(
         }
     }
 
-    let boot_dir = root.join("boot");
+    let boot_dir = match resolve_in_root(root, Path::new("boot")) {
+        Some(d) => d,
+        None => {
+            findings.push(Finding {
+                detector: "D8".into(),
+                channel: "d8_error".into(),
+                path: root.join("boot").display().to_string(),
+                visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec!["symlink loop or resolution failure".into()],
+            });
+            return;
+        }
+    };
     if boot_dir.is_dir() {
         match std::fs::read_dir(&boot_dir) {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
+                    let resolved = match resolve_in_root(root, &path) {
+                        Some(p) => p,
+                        None => {
+                            findings.push(Finding {
+                                detector: "D8".into(),
+                                channel: "d8_error".into(),
+                                path: path.display().to_string(),
+                                visibility,
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec!["symlink loop or resolution failure".into()],
+                            });
+                            continue;
+                        }
+                    };
+                    if resolved.is_file() {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if fname.starts_with("config-") {
-                                match read_file_capped(&path, 4 * 1024 * 1024) {
+                                match read_file_capped(&resolved, 4 * 1024 * 1024) {
                                     Ok(bytes) => {
                                         let content = String::from_utf8_lossy(&bytes);
                                         let mut flagged_version = false;
@@ -1051,6 +1421,28 @@ fn check_kernel(
                                                                 ],
                                                             });
                                                         }
+                                                    } else if is_newer_than_kernel_table(maj, min) {
+                                                        flagged_version = true;
+                                                        findings.push(Finding {
+                                                            detector: "D8".into(),
+                                                            channel: "kernel".into(),
+                                                            path: path.display().to_string(),
+                                                            visibility,
+                                                            severity: Severity::Info,
+                                                            confidence: 0.5,
+                                                            hunk: None,
+                                                            evidence: vec![
+                                                                format!(
+                                                                    "kernel version {}.{}",
+                                                                    maj, min
+                                                                ),
+                                                                "newer than the built-in table (release date unknown)".to_string(),
+                                                                format!(
+                                                                    "T_clock: {}",
+                                                                    format_dt(t_clock)
+                                                                ),
+                                                            ],
+                                                        });
                                                     }
                                                 }
                                             }
@@ -1157,25 +1549,14 @@ fn match_syslog_month(bytes: &[u8]) -> Option<(Month, usize)> {
     Some((m, 3))
 }
 
-fn find_4digit_year_on_line(bytes: &[u8], exclude_start: usize, exclude_end: usize) -> Option<i32> {
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if i >= exclude_start && i < exclude_end {
-            i += 1;
-            continue;
-        }
-        let prev_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
-        let next_ok = i + 4 == bytes.len() || !bytes[i + 4].is_ascii_digit();
-        if prev_ok && next_ok {
-            if let Some(y) = parse_4digits(&bytes[i..i + 4]) {
-                if (1970..=2100).contains(&y) {
-                    return Some(y);
-                }
-            }
-        }
-        i += 1;
+fn match_weekday(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 3 {
+        return None;
     }
-    None
+    match &bytes[..3] {
+        b"Sun" | b"Mon" | b"Tue" | b"Wed" | b"Thu" | b"Fri" | b"Sat" => Some(3),
+        _ => None,
+    }
 }
 
 pub fn find_timestamp_in_line(bytes: &[u8]) -> Option<OffsetDateTime> {
@@ -1245,8 +1626,7 @@ pub fn find_timestamp_in_line(bytes: &[u8]) -> Option<OffsetDateTime> {
                                                                                 PrimitiveDateTime::new(
                                                                                     d, t,
                                                                                 )
-                                                                                .assume_utc(
-                                                                                );
+                                                                                .assume_utc();
                                                                             update(
                                                                                 &mut best_ts,
                                                                                 dt,
@@ -1271,47 +1651,135 @@ pub fn find_timestamp_in_line(bytes: &[u8]) -> Option<OffsetDateTime> {
             }
         }
 
-        // 2. Try Syslog format: "Nov 11 12:00:00" or "Nov  5 12:00:00"
+        // 2. Try Syslog/ctime formats with adjacent year:
+        // Layout 1: "Mon DD YYYY HH:MM:SS"
+        // Layout 2: "Mon DD HH:MM:SS YYYY"
+        // Layout 3: "Www Mon DD HH:MM:SS YYYY" (ctime)
         let word_start = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
         if word_start {
-            if let Some((month, 3)) = match_syslog_month(&bytes[i..]) {
-                if i + 3 < len && bytes[i + 3] == b' ' {
-                    let mut day_idx = i + 4;
-                    if day_idx < len && bytes[day_idx] == b' ' {
-                        day_idx += 1;
+            // Check optional weekday prefix ("Www ")
+            let mut month_pos = i;
+            if let Some(w_len) = match_weekday(&bytes[i..]) {
+                if i + w_len < len && bytes[i + w_len] == b' ' {
+                    let mut p = i + w_len + 1;
+                    while p < len && bytes[p] == b' ' {
+                        p += 1;
                     }
-                    if day_idx + 1 < len {
-                        let day_opt = if day_idx + 2 <= len
-                            && bytes[day_idx].is_ascii_digit()
-                            && bytes[day_idx + 1].is_ascii_digit()
+                    if p < len && match_syslog_month(&bytes[p..]).is_some() {
+                        month_pos = p;
+                    }
+                }
+            }
+
+            if let Some((month, m_len)) = match_syslog_month(&bytes[month_pos..]) {
+                let after_month = month_pos + m_len;
+                if after_month < len && bytes[after_month] == b' ' {
+                    let mut d_pos = after_month + 1;
+                    while d_pos < len && bytes[d_pos] == b' ' {
+                        d_pos += 1;
+                    }
+                    if d_pos < len {
+                        let day_opt = if d_pos + 2 <= len
+                            && bytes[d_pos].is_ascii_digit()
+                            && bytes[d_pos + 1].is_ascii_digit()
                         {
-                            parse_2digits(&bytes[day_idx..day_idx + 2]).map(|d| (d, day_idx + 2))
-                        } else if bytes[day_idx].is_ascii_digit() {
-                            Some((bytes[day_idx] - b'0', day_idx + 1))
+                            parse_2digits(&bytes[d_pos..d_pos + 2]).map(|d| (d, d_pos + 2))
+                        } else if bytes[d_pos].is_ascii_digit() {
+                            Some((bytes[d_pos] - b'0', d_pos + 1))
                         } else {
                             None
                         };
 
                         if let Some((day, after_day)) = day_opt {
                             if after_day < len && bytes[after_day] == b' ' {
-                                let time_idx = after_day + 1;
-                                if time_idx + 8 <= len {
-                                    if let Some(hour) =
-                                        parse_2digits(&bytes[time_idx..time_idx + 2])
+                                let mut post_day = after_day + 1;
+                                while post_day < len && bytes[post_day] == b' ' {
+                                    post_day += 1;
+                                }
+
+                                // Check Layout 1: Mon DD YYYY HH:MM:SS
+                                let mut matched = false;
+                                if post_day + 4 <= len {
+                                    if let Some(year) =
+                                        parse_4digits(&bytes[post_day..post_day + 4])
                                     {
-                                        if bytes[time_idx + 2] == b':' {
-                                            if let Some(min) =
-                                                parse_2digits(&bytes[time_idx + 3..time_idx + 5])
-                                            {
-                                                if bytes[time_idx + 5] == b':' {
-                                                    if let Some(sec) = parse_2digits(
-                                                        &bytes[time_idx + 6..time_idx + 8],
-                                                    ) {
-                                                        let syslog_end = time_idx + 8;
-                                                        // Require 4-digit year on the same line
-                                                        if let Some(year) = find_4digit_year_on_line(
-                                                            bytes, i, syslog_end,
+                                        if (1970..=2100).contains(&year)
+                                            && post_day + 4 < len
+                                            && bytes[post_day + 4] == b' '
+                                        {
+                                            let mut t_pos = post_day + 5;
+                                            while t_pos < len && bytes[t_pos] == b' ' {
+                                                t_pos += 1;
+                                            }
+                                            if t_pos + 8 <= len {
+                                                if let (Some(hour), Some(min), Some(sec)) = (
+                                                    parse_2digits(&bytes[t_pos..t_pos + 2]),
+                                                    if bytes[t_pos + 2] == b':' {
+                                                        parse_2digits(&bytes[t_pos + 3..t_pos + 5])
+                                                    } else {
+                                                        None
+                                                    },
+                                                    if bytes[t_pos + 5] == b':' {
+                                                        parse_2digits(&bytes[t_pos + 6..t_pos + 8])
+                                                    } else {
+                                                        None
+                                                    },
+                                                ) {
+                                                    let end_idx = t_pos + 8;
+                                                    if end_idx == len
+                                                        || !bytes[end_idx].is_ascii_digit()
+                                                    {
+                                                        if let Ok(d) = Date::from_calendar_date(
+                                                            year, month, day,
                                                         ) {
+                                                            if let Ok(t) =
+                                                                Time::from_hms(hour, min, sec)
+                                                            {
+                                                                let dt =
+                                                                    PrimitiveDateTime::new(d, t)
+                                                                        .assume_utc();
+                                                                update(&mut best_ts, dt);
+                                                                i = end_idx;
+                                                                matched = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check Layout 2 & 3: [Www ]Mon DD HH:MM:SS YYYY
+                                if !matched && post_day + 8 <= len {
+                                    if let (Some(hour), Some(min), Some(sec)) = (
+                                        parse_2digits(&bytes[post_day..post_day + 2]),
+                                        if bytes[post_day + 2] == b':' {
+                                            parse_2digits(&bytes[post_day + 3..post_day + 5])
+                                        } else {
+                                            None
+                                        },
+                                        if bytes[post_day + 5] == b':' {
+                                            parse_2digits(&bytes[post_day + 6..post_day + 8])
+                                        } else {
+                                            None
+                                        },
+                                    ) {
+                                        let time_end = post_day + 8;
+                                        if time_end < len && bytes[time_end] == b' ' {
+                                            let mut y_pos = time_end + 1;
+                                            while y_pos < len && bytes[y_pos] == b' ' {
+                                                y_pos += 1;
+                                            }
+                                            if y_pos + 4 <= len {
+                                                if let Some(year) =
+                                                    parse_4digits(&bytes[y_pos..y_pos + 4])
+                                                {
+                                                    if (1970..=2100).contains(&year) {
+                                                        let end_idx = y_pos + 4;
+                                                        if end_idx == len
+                                                            || !bytes[end_idx].is_ascii_digit()
+                                                        {
                                                             if let Ok(d) = Date::from_calendar_date(
                                                                 year, month, day,
                                                             ) {
@@ -1324,8 +1792,8 @@ pub fn find_timestamp_in_line(bytes: &[u8]) -> Option<OffsetDateTime> {
                                                                         )
                                                                         .assume_utc();
                                                                     update(&mut best_ts, dt);
-                                                                    i = syslog_end;
-                                                                    continue;
+                                                                    i = end_idx;
+                                                                    matched = true;
                                                                 }
                                                             }
                                                         }
@@ -1334,6 +1802,10 @@ pub fn find_timestamp_in_line(bytes: &[u8]) -> Option<OffsetDateTime> {
                                             }
                                         }
                                     }
+                                }
+
+                                if matched {
+                                    continue;
                                 }
                             }
                         }
@@ -1354,7 +1826,22 @@ fn check_dated_logs(
     visibility: Visibility,
     findings: &mut Vec<Finding>,
 ) {
-    let log_dir = root.join("var/log");
+    let log_dir = match resolve_in_root(root, Path::new("var/log")) {
+        Some(d) => d,
+        None => {
+            findings.push(Finding {
+                detector: "D8".into(),
+                channel: "d8_error".into(),
+                path: root.join("var/log").display().to_string(),
+                visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec!["symlink loop or resolution failure".into()],
+            });
+            return;
+        }
+    };
     if !log_dir.is_dir() {
         return;
     }
@@ -1373,10 +1860,26 @@ fn check_dated_logs(
                 if log_files.len() >= 500 {
                     break;
                 }
-                if path.is_file() {
-                    log_files.push(path);
-                } else if path.is_dir() {
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                let resolved = match resolve_in_root(root, &path) {
+                    Some(p) => p,
+                    None => {
+                        findings.push(Finding {
+                            detector: "D8".into(),
+                            channel: "d8_error".into(),
+                            path: path.display().to_string(),
+                            visibility,
+                            severity: Severity::Info,
+                            confidence: 0.0,
+                            hunk: None,
+                            evidence: vec!["symlink loop or resolution failure".into()],
+                        });
+                        continue;
+                    }
+                };
+                if resolved.is_file() {
+                    log_files.push(resolved);
+                } else if resolved.is_dir() {
+                    if let Ok(sub_entries) = std::fs::read_dir(&resolved) {
                         let mut sub_list = Vec::new();
                         for sub_entry in sub_entries.flatten() {
                             sub_list.push(sub_entry.path());
@@ -1386,8 +1889,24 @@ fn check_dated_logs(
                             if log_files.len() >= 500 {
                                 break;
                             }
-                            if sub_path.is_file() {
-                                log_files.push(sub_path);
+                            let sub_resolved = match resolve_in_root(root, &sub_path) {
+                                Some(p) => p,
+                                None => {
+                                    findings.push(Finding {
+                                        detector: "D8".into(),
+                                        channel: "d8_error".into(),
+                                        path: sub_path.display().to_string(),
+                                        visibility,
+                                        severity: Severity::Info,
+                                        confidence: 0.0,
+                                        hunk: None,
+                                        evidence: vec!["symlink loop or resolution failure".into()],
+                                    });
+                                    continue;
+                                }
+                            };
+                            if sub_resolved.is_file() {
+                                log_files.push(sub_resolved);
                             }
                         }
                     }
@@ -1412,7 +1931,7 @@ fn check_dated_logs(
     }
 
     for file_path in log_files {
-        let bytes = match read_file_capped(&file_path, 4 * 1024 * 1024) {
+        let bytes = match read_log_capped(&file_path, 4 * 1024 * 1024) {
             Ok(b) => b,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -1474,15 +1993,15 @@ fn check_dated_logs(
 pub fn parse_python_version(dir_name: &str) -> Option<(u32, u32)> {
     let rest = dir_name.strip_prefix("python")?;
     let dot_idx = rest.find('.')?;
-    let major: u32 = rest[..dot_idx].parse().ok()?;
-    let rest2 = &rest[dot_idx + 1..];
+    let major: u32 = rest.get(..dot_idx)?.parse().ok()?;
+    let rest2 = rest.get(dot_idx + 1..)?;
     let end_minor = rest2
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest2.len());
     if end_minor == 0 {
         return None;
     }
-    let minor: u32 = rest2[..end_minor].parse().ok()?;
+    let minor: u32 = rest2.get(..end_minor)?.parse().ok()?;
     Some((major, minor))
 }
 
@@ -1495,6 +2014,14 @@ pub fn lookup_cpython_date(major: u32, minor: u32) -> Option<OffsetDateTime> {
     None
 }
 
+pub fn is_newer_than_cpython_table(maj: u32, min: u32) -> bool {
+    if let Some(((max_maj, max_min), _)) = CPYTHON_RELEASES.last() {
+        maj > *max_maj || (maj == *max_maj && min > *max_min)
+    } else {
+        false
+    }
+}
+
 fn check_python_build(
     root: &Path,
     t_clock: OffsetDateTime,
@@ -1503,13 +2030,44 @@ fn check_python_build(
 ) {
     let py_dirs = ["usr/lib", "usr/local/lib"];
     for py_dir_rel in py_dirs {
-        let py_dir = root.join(py_dir_rel);
+        let py_dir = match resolve_in_root(root, Path::new(py_dir_rel)) {
+            Some(d) => d,
+            None => {
+                findings.push(Finding {
+                    detector: "D8".into(),
+                    channel: "d8_error".into(),
+                    path: root.join(py_dir_rel).display().to_string(),
+                    visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec!["symlink loop or resolution failure".into()],
+                });
+                continue;
+            }
+        };
         if py_dir.is_dir() {
             match std::fs::read_dir(&py_dir) {
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_dir() {
+                        let resolved = match resolve_in_root(root, &path) {
+                            Some(p) => p,
+                            None => {
+                                findings.push(Finding {
+                                    detector: "D8".into(),
+                                    channel: "d8_error".into(),
+                                    path: path.display().to_string(),
+                                    visibility,
+                                    severity: Severity::Info,
+                                    confidence: 0.0,
+                                    hunk: None,
+                                    evidence: vec!["symlink loop or resolution failure".into()],
+                                });
+                                continue;
+                            }
+                        };
+                        if resolved.is_dir() {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 if name.starts_with("python3") {
                                     if let Some((maj, min)) = parse_python_version(name) {
@@ -1533,6 +2091,21 @@ fn check_python_build(
                                                     ],
                                                 });
                                             }
+                                        } else if is_newer_than_cpython_table(maj, min) {
+                                            findings.push(Finding {
+                                                detector: "D8".into(),
+                                                channel: "python_build".into(),
+                                                path: path.display().to_string(),
+                                                visibility,
+                                                severity: Severity::Info,
+                                                confidence: 0.5,
+                                                hunk: None,
+                                                evidence: vec![
+                                                    format!("CPython directory: {}", name),
+                                                    "newer than the built-in table (release date unknown)".to_string(),
+                                                    format!("T_clock: {}", format_dt(t_clock)),
+                                                ],
+                                            });
                                         }
                                     }
                                 }

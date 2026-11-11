@@ -385,6 +385,14 @@ struct D8Args {
 }
 
 fn run_d8(args: D8Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if !args.root.is_dir() {
+        return Err(format!(
+            "--root '{}' does not exist or is not a directory",
+            args.root.display()
+        )
+        .into());
+    }
+
     let t_clock = match time::OffsetDateTime::parse(
         &args.t_clock,
         &time::format_description::well_known::Rfc3339,
