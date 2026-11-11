@@ -99,6 +99,18 @@ pub fn parse_pep440(version_str: &str) -> Option<Pep440Version> {
     Some(Pep440Version { release, dev })
 }
 
+/// The commit a setuptools_scm version names in its local part, as in
+/// `3.7.0.dev342+gaf39f1edf.d20260815`. The `.devN` there counts commits *towards* the
+/// next release, so the release segment alone would look newer than the task version.
+pub fn local_git_hash(version: &str) -> Option<String> {
+    let (_, local) = version.split_once('+')?;
+    local.split('.').find_map(|part| {
+        let hex = part.strip_prefix('g')?;
+        (hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hex.to_ascii_lowercase())
+    })
+}
+
 fn parse_dev_date(dev: &str) -> Option<Date> {
     if dev.len() == 8 || dev.len() == 14 {
         let year: i32 = dev.get(0..4)?.parse().ok()?;
@@ -160,7 +172,8 @@ pub fn is_pkg_metadata_file(path: &Path) -> bool {
             .and_then(|n| n.to_str())
             .is_some_and(|parent| parent.ends_with(".dist-info"))
     } else {
-        file_name == "PKG-INFO"
+        // An old distutils install writes its metadata as a single `<name>.egg-info` file.
+        file_name == "PKG-INFO" || file_name.ends_with(".egg-info")
     }
 }
 
@@ -271,6 +284,13 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
             }];
         }
     };
+
+    // A copy built from the base commit itself is the base, whatever version it reports.
+    if let (Some(hash), Some(base)) = (local_git_hash(&found_v_str), &opts.base_commit) {
+        if base.to_ascii_lowercase().starts_with(&hash) {
+            return Vec::new();
+        }
+    }
 
     let k = task_pep.release.len();
     let mut found_prefix = found_pep.release[..k.min(found_pep.release.len())].to_vec();

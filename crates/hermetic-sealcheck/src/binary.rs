@@ -67,7 +67,7 @@ pub fn extract_binary_items(text: &str) -> Vec<String> {
     let mut items = Vec::new();
     for tok in tokens {
         if let Some(content) = extract_string_literal_content(&tok.text) {
-            if content.len() >= 8 {
+            if content.len() >= 8 && !content.chars().any(char::is_control) {
                 items.push(content);
             }
         } else if is_identifier(&tok.text) && tok.text.len() >= 8 {
@@ -115,8 +115,9 @@ pub fn extract_null_terminated_strings(bytes: &[u8]) -> Vec<String> {
 }
 
 fn read_u16(bytes: &[u8], offset: usize, is_le: bool) -> Result<u16, BinaryMalformed> {
-    let slice = bytes
-        .get(offset..offset + 2)
+    let slice = offset
+        .checked_add(2)
+        .and_then(|end| bytes.get(offset..end))
         .ok_or_else(|| BinaryMalformed("offset out of bounds reading u16".into()))?;
     Ok(if is_le {
         u16::from_le_bytes([slice[0], slice[1]])
@@ -126,8 +127,9 @@ fn read_u16(bytes: &[u8], offset: usize, is_le: bool) -> Result<u16, BinaryMalfo
 }
 
 fn read_u32(bytes: &[u8], offset: usize, is_le: bool) -> Result<u32, BinaryMalformed> {
-    let slice = bytes
-        .get(offset..offset + 4)
+    let slice = offset
+        .checked_add(4)
+        .and_then(|end| bytes.get(offset..end))
         .ok_or_else(|| BinaryMalformed("offset out of bounds reading u32".into()))?;
     Ok(if is_le {
         u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])
@@ -137,8 +139,9 @@ fn read_u32(bytes: &[u8], offset: usize, is_le: bool) -> Result<u32, BinaryMalfo
 }
 
 fn read_u64(bytes: &[u8], offset: usize, is_le: bool) -> Result<u64, BinaryMalformed> {
-    let slice = bytes
-        .get(offset..offset + 8)
+    let slice = offset
+        .checked_add(8)
+        .and_then(|end| bytes.get(offset..end))
         .ok_or_else(|| BinaryMalformed("offset out of bounds reading u64".into()))?;
     let mut b = [0u8; 8];
     b.copy_from_slice(slice);
@@ -200,6 +203,9 @@ pub fn parse_elf(bytes: &[u8]) -> Result<BinaryStrings, BinaryMalformed> {
         (shoff, shentsize, shnum, shstrndx)
     };
 
+    let (e_shnum, e_shstrndx) =
+        extended_section_counts(bytes, is_64, is_le, e_shoff, e_shnum, e_shstrndx)?;
+
     let min_shentsize = if is_64 { 64 } else { 40 };
     if e_shnum > 0 && e_shentsize < min_shentsize {
         return Err(BinaryMalformed("e_shentsize too small".into()));
@@ -218,9 +224,10 @@ pub fn parse_elf(bytes: &[u8]) -> Result<BinaryStrings, BinaryMalformed> {
     }
 
     if e_shnum == 0 {
+        // No section table (stripped of section headers): fall back to the whole file.
         return Ok(BinaryStrings {
             exact_strings: HashSet::new(),
-            printable_runs: Vec::new(),
+            printable_runs: extract_printable_runs(bytes, 6),
         });
     }
 
@@ -290,7 +297,10 @@ pub fn parse_elf(bytes: &[u8]) -> Result<BinaryStrings, BinaryMalformed> {
             for s in extract_null_terminated_strings(sec_bytes) {
                 exact_strings.insert(s);
             }
-        } else if sec_name == ".rodata" || sec_name == ".data" || sec_name == ".comment" {
+        } else if sec_name.starts_with(".rodata")
+            || sec_name.starts_with(".data")
+            || sec_name == ".comment"
+        {
             printable_runs.extend(extract_printable_runs(sec_bytes, 6));
         }
     }
@@ -299,6 +309,41 @@ pub fn parse_elf(bytes: &[u8]) -> Result<BinaryStrings, BinaryMalformed> {
         exact_strings,
         printable_runs,
     })
+}
+
+/// ELF stores a section count of 0xff00 or more in section 0's `sh_size`, and an
+/// overflowing string-table index (`SHN_XINDEX`) in section 0's `sh_link`.
+fn extended_section_counts(
+    bytes: &[u8],
+    is_64: bool,
+    is_le: bool,
+    e_shoff: usize,
+    e_shnum: usize,
+    e_shstrndx: usize,
+) -> Result<(usize, usize), BinaryMalformed> {
+    const SHN_XINDEX: usize = 0xffff;
+    if e_shoff == 0 || (e_shnum != 0 && e_shstrndx != SHN_XINDEX) {
+        return Ok((e_shnum, e_shstrndx));
+    }
+    let (size_off, link_off) = if is_64 { (32, 40) } else { (20, 24) };
+    let at = |field: usize| {
+        e_shoff
+            .checked_add(field)
+            .ok_or_else(|| BinaryMalformed("section 0 offset overflow".into()))
+    };
+    let shnum = if e_shnum != 0 {
+        e_shnum
+    } else if is_64 {
+        read_u64(bytes, at(size_off)?, is_le)? as usize
+    } else {
+        read_u32(bytes, at(size_off)?, is_le)? as usize
+    };
+    let shstrndx = if e_shstrndx == SHN_XINDEX {
+        read_u32(bytes, at(link_off)?, is_le)? as usize
+    } else {
+        e_shstrndx
+    };
+    Ok((shnum, shstrndx))
 }
 
 /// Parse Java .class file (magic 0xCAFEBABE).
@@ -414,7 +459,7 @@ fn read_varuint(bytes: &[u8], offset: &mut usize) -> Result<u32, BinaryMalformed
             break;
         }
         shift += 7;
-        if shift > 35 {
+        if shift >= 32 {
             return Err(BinaryMalformed("LEB128 varuint overflow".into()));
         }
     }
@@ -764,16 +809,25 @@ pub fn scan_binary_if_recognized(
 
     match res {
         Ok(extracted) => Some(match_binary_items(&extracted, fp, opts, channel, path)),
-        Err(BinaryMalformed(err)) => Some(vec![Finding {
-            detector: "D3b".into(),
-            channel: "binary_malformed".into(),
-            path: path.to_string(),
-            visibility: opts.visibility,
-            severity: Severity::Info,
-            confidence: 0.0,
-            hunk: None,
-            evidence: vec![format!("malformed {}: {}", channel, err)],
-        }]),
+        Err(BinaryMalformed(err)) => {
+            let mut findings = vec![Finding {
+                detector: "D3b".into(),
+                channel: "binary_malformed".into(),
+                path: path.to_string(),
+                visibility: opts.visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!("malformed {}: {}", channel, err)],
+            }];
+            // A corrupted header must not hide the file's strings.
+            let fallback = BinaryStrings {
+                exact_strings: HashSet::new(),
+                printable_runs: extract_printable_runs(bytes, 6),
+            };
+            findings.extend(match_binary_items(&fallback, fp, opts, channel, path));
+            Some(findings)
+        }
     }
 }
 

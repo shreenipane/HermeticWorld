@@ -641,9 +641,6 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             }
         };
 
-        // D5a target project version check on metadata files
-        findings.extend(crate::d5a::check_d5a_metadata(file_path, &bytes, opts));
-
         let unit_findings = scan_container_or_unit_with_root_prefix(
             &display_path,
             &bytes,

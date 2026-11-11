@@ -731,3 +731,102 @@ fn test_visibility_image_only_d3b_gate_exits_0() {
         "an agent_visible D3b gate must exit 2"
     );
 }
+
+fn leak_fp(base: &std::path::Path) -> FingerprintSet {
+    let gold_patch = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,3 @@\n def foo():\n+    elf_leaked_func_one()\n+    elf_leaked_func_two()\n";
+    FingerprintSet::from_task(gold_patch, "", base).expect("fp")
+}
+
+fn d3b_gates(dir: &std::path::Path, fp: &FingerprintSet) -> Vec<hermetic_sealcheck::Finding> {
+    scan_tree(dir, fp, &ScanOptions::default())
+        .into_iter()
+        .filter(|f| f.detector == "D3b" && f.severity == Severity::Gate)
+        .collect()
+}
+
+#[test]
+fn test_elf_without_section_table_is_searched_whole() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut elf = build_elf64_le(&["elf_leaked_func_one", "elf_leaked_func_two"]);
+    elf[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf[62..64].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("stripped.so"), &elf).expect("write");
+    assert!(!d3b_gates(dir.path(), &fp).is_empty());
+}
+
+#[test]
+fn test_malformed_elf_still_gates_on_its_strings() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut elf = build_elf64_le(&["elf_leaked_func_one", "elf_leaked_func_two"]);
+    // Point section 1's name past the end of .shstrtab.
+    let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+    elf[shoff + 64..shoff + 68].copy_from_slice(&0xffffu32.to_le_bytes());
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("bad.so"), &elf).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    assert!(findings.iter().any(|f| f.channel == "binary_malformed"));
+    assert!(findings
+        .iter()
+        .any(|f| f.detector == "D3b" && f.severity == Severity::Gate));
+}
+
+#[test]
+fn test_elf_rodata_str_section_is_read() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut elf = build_elf64_le(&["elf_leaked_func_one", "elf_leaked_func_two"]);
+    // Rename .strtab (8 bytes with its NUL) to .rodata.s, so only the run search sees it.
+    let pos = elf.windows(8).position(|w| w == b".strtab\0").unwrap();
+    elf[pos..pos + 8].copy_from_slice(b".rodata.");
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("lit.so"), &elf).expect("write");
+    let gates = d3b_gates(dir.path(), &fp);
+    assert!(!gates.is_empty(), "literals in .rodata.* must be searched");
+}
+
+#[test]
+fn test_elf_extended_section_count() {
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let mut elf = build_elf64_le(&["elf_leaked_func_one", "elf_leaked_func_two"]);
+    let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+    elf[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum = 0: real count in section 0
+    elf[62..64].copy_from_slice(&0xffffu16.to_le_bytes()); // SHN_XINDEX
+    elf[shoff + 32..shoff + 40].copy_from_slice(&3u64.to_le_bytes()); // sh_size = 3
+    elf[shoff + 40..shoff + 44].copy_from_slice(&1u32.to_le_bytes()); // sh_link = 1
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("big.so"), &elf).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    assert!(
+        findings.iter().all(|f| f.channel != "binary_malformed"),
+        "{findings:?}"
+    );
+    assert!(findings
+        .iter()
+        .any(|f| f.channel == "binary_elf" && f.severity == Severity::Gate));
+}
+
+#[test]
+fn test_hostile_wasm_leb128_overflow_is_not_a_panic() {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.push(1); // type section
+    wasm.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01]);
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("x.wasm"), &wasm).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    assert!(findings.iter().any(|f| f.channel == "binary_malformed"));
+}
+
+#[test]
+fn test_multiline_literal_is_not_an_item() {
+    let items = hermetic_sealcheck::binary::extract_binary_items(
+        "x = \"\"\"first line\nsecond line\"\"\"\n",
+    );
+    assert!(items.is_empty(), "{items:?}");
+}

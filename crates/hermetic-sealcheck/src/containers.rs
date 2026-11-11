@@ -372,6 +372,13 @@ impl<'a> ContainerScanner<'a> {
                 return;
             }
 
+            // D5a runs on every unit, so metadata inside wheels and eggs is checked too
+            self.findings.extend(crate::d5a::check_d5a_metadata(
+                Path::new(path),
+                bytes,
+                self.opts,
+            ));
+
             let text = String::from_utf8_lossy(bytes);
             // Minified text gets D3b in addition to tiers 1 and 3
             if crate::binary::is_minified_bundle(path, &text) {

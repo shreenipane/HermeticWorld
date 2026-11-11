@@ -325,3 +325,82 @@ fn test_d5a_task_json_without_version_loads_and_gives_info() {
         "must emit info finding with channel target_version_unknown"
     );
 }
+
+fn d5a_gates(dir: &std::path::Path) -> Vec<hermetic_sealcheck::Finding> {
+    let fp = FingerprintSet::from_task("", "", &dir.join("nonexistent")).expect("fp");
+    let opts = ScanOptions {
+        target_packages: vec!["requests".to_string()],
+        task_version: Some("3.0".to_string()),
+        ..Default::default()
+    };
+    scan_tree(dir, &fp, &opts)
+        .into_iter()
+        .filter(|f| f.detector == "D5a" && f.severity == Severity::Gate)
+        .collect()
+}
+
+#[test]
+fn test_d5a_newer_copy_inside_a_wheel_gates() {
+    use std::io::Write;
+    let dir = tempdir().expect("tempdir");
+    let file = fs::File::create(dir.path().join("requests-3.1.0-py3-none-any.whl")).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file(
+        "requests-3.1.0.dist-info/METADATA",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(b"Metadata-Version: 2.1\nName: requests\nVersion: 3.1.0\n\n")
+        .unwrap();
+    zip.finish().unwrap();
+
+    let gates = d5a_gates(dir.path());
+    assert_eq!(gates.len(), 1, "{gates:?}");
+    assert!(gates[0]
+        .path
+        .contains("!/requests-3.1.0.dist-info/METADATA"));
+}
+
+#[test]
+fn test_d5a_single_file_egg_info_gates() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("requests-3.1.0-py3.6.egg-info"),
+        "Metadata-Version: 1.1\nName: requests\nVersion: 3.1.0\n\n",
+    )
+    .unwrap();
+    assert_eq!(d5a_gates(dir.path()).len(), 1);
+}
+
+fn scm_gates(version: &str) -> Vec<hermetic_sealcheck::Finding> {
+    let dir = tempdir().expect("tempdir");
+    let info = dir.path().join("matplotlib.egg-info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(
+        info.join("PKG-INFO"),
+        format!("Metadata-Version: 2.1\nName: matplotlib\nVersion: {version}\n\n"),
+    )
+    .unwrap();
+    let fp = FingerprintSet::from_task("", "", &dir.path().join("nonexistent")).expect("fp");
+    let opts = ScanOptions {
+        target_packages: vec!["matplotlib".to_string()],
+        task_version: Some("3.6".to_string()),
+        base_commit: Some("af39f1edffcd828f05cfdd04f2e59506bb4a27bc".to_string()),
+        ..Default::default()
+    };
+    scan_tree(dir.path(), &fp, &opts)
+        .into_iter()
+        .filter(|f| f.detector == "D5a" && f.severity == Severity::Gate)
+        .collect()
+}
+
+#[test]
+fn test_d5a_scm_dev_version_of_the_base_commit_passes() {
+    // Real shape from the matplotlib-24149 image: the next release's dev version, at the base.
+    assert!(scm_gates("3.7.0.dev342+gaf39f1edf.d20260815").is_empty());
+}
+
+#[test]
+fn test_d5a_scm_dev_version_of_another_commit_gates() {
+    assert_eq!(scm_gates("3.7.0.dev342+g0123456789.d20260815").len(), 1);
+}
