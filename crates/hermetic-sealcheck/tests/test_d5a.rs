@@ -1,7 +1,27 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 use time::macros::datetime;
+
+fn backdate_tree(root: &Path) {
+    let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_704_067_200); // 2024-01-01T00:00:00Z
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                backdate_tree(&path);
+            }
+            if let Ok(f) = fs::File::open(&path) {
+                let _ = f.set_modified(t);
+            }
+        }
+    }
+    if let Ok(f) = fs::File::open(root) {
+        let _ = f.set_modified(t);
+    }
+}
 
 use hermetic_sealcheck::{scan_tree, FingerprintSet, ScanOptions, Severity};
 
@@ -301,6 +321,8 @@ fn test_d5a_task_json_without_version_loads_and_gives_info() {
         "Metadata-Version: 2.1\nName: requests\nVersion: 2.31.0\n",
     )
     .expect("write METADATA");
+
+    backdate_tree(&scan_root);
 
     let output = Command::new(bin_path)
         .arg("scan")

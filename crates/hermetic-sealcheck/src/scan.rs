@@ -484,11 +484,16 @@ pub trait TreeSink: UnitSink {
     fn pyc_file(&mut self, path: &Path, display_path: &str);
     /// A loose file the walk is about to read, with its metadata.
     fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata);
+    /// A directory reached by the walk, with its metadata.
+    fn directory(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
+    /// A symlink reached by the walk, with its metadata (via symlink_metadata).
+    fn symlink(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
 }
 
 /// The sink `scan_tree` uses: `MatchSink` plus the D1 and D3 checks.
 struct TreeMatchSink<'a> {
     inner: MatchSink<'a>,
+    d4_paths: HashSet<String>,
 }
 
 impl UnitSink for TreeMatchSink<'_> {
@@ -506,6 +511,9 @@ impl UnitSink for TreeMatchSink<'_> {
     }
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
         self.inner.pkg_metadata(path, bytes);
+    }
+    fn member_time(&mut self, path: &str, unix_secs: i64) {
+        self.inner.member_time(path, unix_secs);
     }
 }
 
@@ -532,13 +540,111 @@ impl TreeSink for TreeMatchSink<'_> {
             }),
         }
     }
-    fn loose_file(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
+    fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+    fn directory(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+    fn symlink(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+}
+
+pub fn format_rfc3339(dt: time::OffsetDateTime) -> String {
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| dt.to_string())
+}
+
+pub fn format_mtime(secs: i64, nanos: u32) -> String {
+    let total_nanos = (secs as i128) * 1_000_000_000 + (nanos as i128);
+    match time::OffsetDateTime::from_unix_timestamp_nanos(total_nanos) {
+        Ok(dt) => format_rfc3339(dt),
+        Err(_) => format!("{secs}s"),
+    }
+}
+
+/// Check loose file, directory, or symlink mtime against `T_clock` (D4).
+///
+/// Note: On a live tree, we do NOT check ctime or atime because the host sets
+/// them on extraction or archive unpacking, so they always appear new.
+fn check_live_mtime(
+    display_path: &str,
+    metadata: &std::fs::Metadata,
+    t_clock: Option<time::OffsetDateTime>,
+    visibility: Visibility,
+    d4_paths: &mut HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(tc) = t_clock else { return };
+    if d4_paths.contains(display_path) {
+        return;
+    }
+    let mtime = match metadata.modified() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let (mtime_secs, mtime_nanos) = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            if d.subsec_nanos() == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
+    };
+    let t_secs = tc.unix_timestamp();
+    let t_nanos = tc.nanosecond();
+    let is_later = (mtime_secs > t_secs) || (mtime_secs == t_secs && mtime_nanos > t_nanos);
+    if is_later {
+        let mtime_str = format_mtime(mtime_secs, mtime_nanos);
+        let t_clock_str = format_rfc3339(tc);
+        findings.push(Finding {
+            detector: "D4".into(),
+            channel: "mtime".into(),
+            path: display_path.to_string(),
+            visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec![format!("mtime {mtime_str} > T_clock {t_clock_str}")],
+        });
+        d4_paths.insert(display_path.to_string());
+    }
 }
 
 /// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
     let sink = TreeMatchSink {
         inner: MatchSink::new(fp, &opts.signatures, opts),
+        d4_paths: HashSet::new(),
     };
     walk_tree(root, opts, sink).inner.findings
 }
@@ -604,17 +710,22 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
-        if entry.path_is_symlink() && entry.file_name() == ".git" {
-            sink.d1_finding(Finding {
-                detector: "D1".into(),
-                channel: "git_pointer".into(),
-                path: display_path.clone(),
-                visibility: opts.visibility,
-                severity: Severity::Gate,
-                confidence: 1.0,
-                hunk: None,
-                evidence: vec!["symlink named .git".into()],
-            });
+        if entry.path_is_symlink() {
+            if let Ok(sym_meta) = std::fs::symlink_metadata(file_path) {
+                sink.symlink(&display_path, &sym_meta);
+            }
+            if entry.file_name() == ".git" {
+                sink.d1_finding(Finding {
+                    detector: "D1".into(),
+                    channel: "git_pointer".into(),
+                    path: display_path.clone(),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec!["symlink named .git".into()],
+                });
+            }
         }
 
         let metadata = if entry.path_is_symlink() {
@@ -653,6 +764,9 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
                 }
             }
         } else if entry.file_type().is_dir() {
+            if let Ok(dir_meta) = entry.metadata() {
+                sink.directory(&display_path, &dir_meta);
+            }
             if file_path != root && is_git_dir(file_path) {
                 sink.git_repo(file_path);
             }
@@ -660,6 +774,8 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         } else {
             continue;
         };
+
+        sink.loose_file(&display_path, &metadata);
 
         // Size check for loose file
         if metadata.len() > opts.max_file_bytes {
@@ -722,7 +838,6 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
             }
         };
 
-        sink.loose_file(&display_path, &metadata);
         let mut scanner = ContainerScanner::new(opts, sink, root_prefix_len);
         scanner.scan(&display_path, &bytes, 0);
         sink = scanner.sink;

@@ -1,7 +1,27 @@
 use serde_json::Value;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
+
+fn backdate_tree(root: &Path) {
+    let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_704_067_200); // 2024-01-01T00:00:00Z
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                backdate_tree(&path);
+            }
+            if let Ok(f) = fs::File::open(&path) {
+                let _ = f.set_modified(t);
+            }
+        }
+    }
+    if let Ok(f) = fs::File::open(root) {
+        let _ = f.set_modified(t);
+    }
+}
 
 #[test]
 fn test_cli_task_dir_inside_root_is_not_scanned() {
@@ -39,6 +59,8 @@ fn test_cli_task_dir_inside_root_is_not_scanned() {
         "Please fix the bug.\n",
     )
     .expect("write problem_statement.md");
+
+    backdate_tree(parent);
 
     let scan = || {
         Command::new(bin_path)
@@ -108,6 +130,8 @@ fn test_cli_execution() {
         "Please fix the bug.\n",
     )
     .expect("write problem_statement.md");
+
+    backdate_tree(base_tree);
 
     // 3. Clean root scan: exit 0
     let status_clean = Command::new(bin_path)

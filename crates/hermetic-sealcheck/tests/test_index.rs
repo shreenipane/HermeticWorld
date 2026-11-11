@@ -64,6 +64,9 @@ fn covered_sorted(findings: Vec<Finding>) -> Vec<String> {
         .into_iter()
         .filter(|f| !matches!(f.detector.as_str(), "D1" | "D3" | "D6"))
         .filter(|f| !(f.detector == "D9" && f.channel == "instance_id"))
+        .filter(|f| {
+            !(f.detector == "D4" && f.channel == "mtime" && std::path::Path::new(&f.path).is_dir())
+        })
         .map(|f| serde_json::to_string(&f).expect("serialize finding"))
         .collect();
     v.sort();
@@ -258,6 +261,65 @@ fn equivalence_zip_targz_and_nested_archives() {
         gates_with(&f, "c.tar.gz!/inner.zip!/deep/service.py") > 0,
         "{f:#?}"
     );
+}
+
+#[test]
+fn equivalence_d4_times() {
+    let t = task();
+    let root = tempdir().expect("tempdir");
+    let t_clock = time::macros::datetime!(2024-01-02 00:00:00 UTC);
+    let early_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_153_600 - 100);
+    let late_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_153_600 + 10);
+
+    // Clean file
+    let clean_path = root.path().join("clean.txt");
+    fs::write(&clean_path, "clean\n").expect("write");
+    fs::File::open(&clean_path)
+        .expect("open")
+        .set_modified(early_time)
+        .expect("set modified");
+
+    // Late file
+    let late_path = root.path().join("late.txt");
+    fs::write(&late_path, "late\n").expect("write");
+    fs::File::open(&late_path)
+        .expect("open")
+        .set_modified(late_time)
+        .expect("set modified");
+
+    // Tar with late member
+    let tar_path = root.path().join("arch.tar");
+    {
+        let file = fs::File::create(&tar_path).expect("create tar");
+        let mut tar = tar::Builder::new(file);
+        let mut h = tar::Header::new_gnu();
+        h.set_path("late_member.txt").expect("path");
+        h.set_size(4);
+        h.set_mode(0o644);
+        h.set_mtime(1_704_153_600 + 10);
+        h.set_cksum();
+        tar.append(&h, b"late".as_slice()).expect("append");
+        tar.finish().expect("finish");
+    }
+    fs::File::open(&tar_path)
+        .expect("open")
+        .set_modified(early_time)
+        .expect("set modified");
+
+    // Backdate root directory so directory does not gate
+    if let Ok(f) = fs::File::open(root.path()) {
+        let _ = f.set_modified(early_time);
+    }
+
+    let o = ScanOptions {
+        t_clock: Some(t_clock),
+        ..opts()
+    };
+    let f = assert_equivalent(root.path(), &t, &o);
+    assert!(gates_with(&f, "late.txt") > 0, "{f:#?}");
+    assert!(gates_with(&f, "arch.tar!/late_member.txt") > 0, "{f:#?}");
 }
 
 #[test]
@@ -546,7 +608,7 @@ fn hostile_bad_magic() {
     raw[0..6].copy_from_slice(b"NOTIDX");
     assert!(matches!(read_raw(&raw), Err(IndexError::BadMagic)));
     assert_eq!(&MAGIC[..], b"HWIDX1");
-    assert_eq!(FORMAT_VERSION, 2);
+    assert_eq!(FORMAT_VERSION, 3);
     assert_eq!(MAX_UNIT_BYTES, 1024 * 1024 * 1024);
 }
 
@@ -1023,6 +1085,11 @@ fn cli_index_and_query_match_scan() {
     .expect("write");
     let task = root.join("task");
     write_task(&task);
+    let old_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+    if let Ok(f) = fs::File::open(&root) {
+        let _ = f.set_modified(old_time);
+    }
     let idx = parent.path().join("image.hwidx");
 
     let st = Command::new(bin)
@@ -1120,6 +1187,11 @@ fn cli_query_relative_root_from_different_cwd() {
     fs::write(image.join("leak.py"), POST_FIX).expect("write leak");
     let task = image.join("task");
     write_task(&task);
+    let old_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+    if let Ok(f) = fs::File::open(&image) {
+        let _ = f.set_modified(old_time);
+    }
 
     let idx = parent.path().join("image.hwidx");
 
