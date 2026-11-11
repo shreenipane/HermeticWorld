@@ -623,12 +623,6 @@ impl FingerprintSet {
             all_tier2_symbols.extend(ch.tier2_candidate_symbols.iter().cloned());
         }
 
-        let mut tier2_py_count = 0usize;
-        let mut tier2_py_bytes = 0u64;
-        let mut tier2_capped = false;
-        let mut tier2_chosen_files = Vec::new();
-        let mut tier2_df_counts: HashMap<String, usize> = HashMap::new();
-
         if base_tree_root.exists() {
             for entry in WalkDir::new(base_tree_root)
                 .sort_by_file_name()
@@ -690,63 +684,18 @@ impl FingerprintSet {
                         for hash in kgram_hashes(&base_token_texts) {
                             base_winnow_hashes.insert(hash);
                         }
-
-                        // Tier 2 IDF counting on .py files
-                        if entry.path().extension().is_some_and(|e| e == "py") {
-                            let file_size = entry.metadata().map_or(0, |m| m.len());
-                            if !tier2_capped {
-                                if tier2_py_count >= tier2_max_files
-                                    || tier2_py_bytes + file_size > tier2_max_bytes
-                                {
-                                    tier2_capped = true;
-                                } else {
-                                    tier2_py_count += 1;
-                                    tier2_py_bytes += file_size;
-                                    tier2_chosen_files.push(entry.path().to_path_buf());
-                                    if !all_tier2_symbols.is_empty() {
-                                        let mut found_in_file = HashSet::new();
-                                        for tok in &base_tokens {
-                                            if all_tier2_symbols.contains(&tok.text) {
-                                                found_in_file.insert(tok.text.clone());
-                                            } else if let Some(lit) =
-                                                crate::binary::extract_string_literal_content(
-                                                    &tok.text,
-                                                )
-                                            {
-                                                if all_tier2_symbols.contains(&lit) {
-                                                    found_in_file.insert(lit);
-                                                }
-                                            }
-                                        }
-
-                                        let mut i = 0;
-                                        while i < base_tokens.len() {
-                                            let mut chain = base_tokens[i].text.clone();
-                                            let mut j = i + 1;
-                                            while j + 1 < base_tokens.len()
-                                                && base_tokens[j].text == "."
-                                            {
-                                                chain.push('.');
-                                                chain.push_str(&base_tokens[j + 1].text);
-                                                if all_tier2_symbols.contains(&chain) {
-                                                    found_in_file.insert(chain.clone());
-                                                }
-                                                j += 2;
-                                            }
-                                            i += 1;
-                                        }
-
-                                        for sym in found_in_file {
-                                            *tier2_df_counts.entry(sym).or_insert(0) += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
         }
+
+        let (tier2_df_counts, tier2_py_count, tier2_capped, tier2_chosen_files) =
+            sample_base_tree_for_idf(
+                base_tree_root,
+                &all_tier2_symbols,
+                tier2_max_files,
+                tier2_max_bytes,
+            );
 
         let mut subtracted_count = 0;
         let mut winnow_subtracted_count = 0;
@@ -972,9 +921,12 @@ pub fn sample_base_tree_for_idf(
             .filter_entry(|e| e.file_name() != ".git")
             .flatten()
         {
-            if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "py") {
-                let file_size = entry.metadata().map_or(0, |m| m.len());
-                if !capped {
+            if entry.file_type().is_file()
+                && entry.path().extension().is_some_and(|e| e == "py")
+                && !capped
+            {
+                if let Some(content) = read_text_like_scanner(entry.path()) {
+                    let file_size = entry.metadata().map_or(0, |m| m.len());
                     if py_count >= max_files || py_bytes + file_size > max_bytes {
                         capped = true;
                     } else {
@@ -982,39 +934,37 @@ pub fn sample_base_tree_for_idf(
                         py_bytes += file_size;
                         chosen_files.push(entry.path().to_path_buf());
                         if !symbols.is_empty() {
-                            if let Some(content) = read_text_like_scanner(entry.path()) {
-                                let base_tokens = tokenize(&content);
-                                let mut found_in_file = HashSet::new();
-                                for tok in &base_tokens {
-                                    if symbols.contains(&tok.text) {
-                                        found_in_file.insert(tok.text.clone());
-                                    } else if let Some(lit) =
-                                        crate::binary::extract_string_literal_content(&tok.text)
-                                    {
-                                        if symbols.contains(&lit) {
-                                            found_in_file.insert(lit);
-                                        }
+                            let base_tokens = tokenize(&content);
+                            let mut found_in_file = HashSet::new();
+                            for tok in &base_tokens {
+                                if symbols.contains(&tok.text) {
+                                    found_in_file.insert(tok.text.clone());
+                                } else if let Some(lit) =
+                                    crate::binary::extract_string_literal_content(&tok.text)
+                                {
+                                    if symbols.contains(&lit) {
+                                        found_in_file.insert(lit);
                                     }
                                 }
+                            }
 
-                                let mut i = 0;
-                                while i < base_tokens.len() {
-                                    let mut chain = base_tokens[i].text.clone();
-                                    let mut j = i + 1;
-                                    while j + 1 < base_tokens.len() && base_tokens[j].text == "." {
-                                        chain.push('.');
-                                        chain.push_str(&base_tokens[j + 1].text);
-                                        if symbols.contains(&chain) {
-                                            found_in_file.insert(chain.clone());
-                                        }
-                                        j += 2;
+                            let mut i = 0;
+                            while i < base_tokens.len() {
+                                let mut chain = base_tokens[i].text.clone();
+                                let mut j = i + 1;
+                                while j + 1 < base_tokens.len() && base_tokens[j].text == "." {
+                                    chain.push('.');
+                                    chain.push_str(&base_tokens[j + 1].text);
+                                    if symbols.contains(&chain) {
+                                        found_in_file.insert(chain.clone());
                                     }
-                                    i += 1;
+                                    j += 2;
                                 }
+                                i += 1;
+                            }
 
-                                for sym in found_in_file {
-                                    *df_counts.entry(sym).or_insert(0) += 1;
-                                }
+                            for sym in found_in_file {
+                                *df_counts.entry(sym).or_insert(0) += 1;
                             }
                         }
                     }

@@ -602,3 +602,219 @@ fn test_fuzz_anchor_and_unit_matching_never_panics() {
         let _ = extract_unit_symbols_and_anchors(&text);
     }
 }
+
+// =========================================================================
+// REVIEW 2 - FIX 1: Prose-Aware Anchor and Symbol Scanning
+// =========================================================================
+#[test]
+fn test_markdown_heading_file_anchor_service_py() {
+    let base_dir = tempdir().expect("tempdir");
+
+    for i in 0..10 {
+        let f = base_dir.path().join(format!("common_{}.py", i));
+        fs::write(
+            &f,
+            "def worker():\n    common_sym = 1\n    return common_sym\n",
+        )
+        .expect("write common");
+    }
+
+    let gold_patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,4 @@\n def run():\n+    rare_alpha = compute_rare()\n+    rare_beta = format_rare(rare_alpha)\n     pass\n";
+
+    let fp = FingerprintSet::from_task(gold_patch, "", base_dir.path()).expect("fp");
+    let opts = ScanOptions::default();
+
+    // Problem statement whose only mention of the file is the heading "# service.py"
+    // and whose body names the rare symbols
+    let problem_statement = "# service.py\n\nPlease fix the bug by implementing rare_alpha and rare_beta in the service.";
+    let findings = scan_problem_statement(problem_statement, &fp, &opts);
+    let t2_findings: Vec<_> = findings.iter().filter(|f| f.channel == "tier2").collect();
+
+    assert_eq!(
+        t2_findings.len(),
+        1,
+        "Expected 1 tier2 finding for markdown heading '# service.py', got: {findings:?}"
+    );
+    let f = t2_findings[0];
+    assert_eq!(f.detector, "D0");
+    assert_eq!(f.severity, Severity::Review);
+    assert_eq!(f.hunk, Some(0));
+    assert!(
+        f.evidence.contains(&"service.py".to_string())
+            || f.evidence.contains(&"service".to_string()),
+        "Evidence must contain file anchor 'service.py': {:?}",
+        f.evidence
+    );
+    assert!(
+        f.evidence.contains(&"rare_alpha".to_string())
+            || f.evidence.contains(&"rare_beta".to_string()),
+        "Evidence must contain rare symbols: {:?}",
+        f.evidence
+    );
+}
+
+#[test]
+fn test_markdown_heading_function_anchor_parse_cookie() {
+    let base_dir = tempdir().expect("tempdir");
+    let base_file = base_dir.path().join("cookies.py");
+    fs::write(&base_file, "def parse_cookie(value):\n    return value\n").expect("write base");
+
+    for i in 0..10 {
+        let f = base_dir.path().join(format!("common_{}.py", i));
+        fs::write(
+            &f,
+            "def worker():\n    common_sym = 1\n    return common_sym\n",
+        )
+        .expect("write common");
+    }
+
+    let gold_patch = "diff --git a/cookies.py b/cookies.py\n--- a/cookies.py\n+++ b/cookies.py\n@@ -1,2 +1,4 @@\n def parse_cookie(value):\n+    rare_cookie_attr = compute_cookie_attr(value)\n+    validate_cookie_strict(rare_cookie_attr)\n     return value\n";
+
+    let fp = FingerprintSet::from_task(gold_patch, "", base_dir.path()).expect("fp");
+    let opts = ScanOptions::default();
+
+    // 1. "## parse_cookie" works as a function anchor
+    let problem_statement =
+        "## parse_cookie\n\nFix with rare_cookie_attr and validate_cookie_strict.";
+    let findings = scan_problem_statement(problem_statement, &fp, &opts);
+    let t2_findings: Vec<_> = findings.iter().filter(|f| f.channel == "tier2").collect();
+
+    assert_eq!(
+        t2_findings.len(),
+        1,
+        "Expected 1 tier2 finding for markdown heading '## parse_cookie', got: {findings:?}"
+    );
+    let f = t2_findings[0];
+    assert_eq!(f.detector, "D0");
+    assert_eq!(f.severity, Severity::Review);
+    assert!(
+        f.evidence.contains(&"parse_cookie".to_string()),
+        "Evidence must contain function anchor 'parse_cookie': {:?}",
+        f.evidence
+    );
+
+    // 2. "## Fix in parse_cookie" also works as a function anchor
+    let heading_with_prose =
+        "## Fix in parse_cookie\n\nEnsure rare_cookie_attr and validate_cookie_strict are handled.";
+    let findings_prose = scan_problem_statement(heading_with_prose, &fp, &opts);
+    let t2_prose: Vec<_> = findings_prose
+        .iter()
+        .filter(|f| f.channel == "tier2")
+        .collect();
+    assert_eq!(
+        t2_prose.len(),
+        1,
+        "Expected 1 tier2 finding for '## Fix in parse_cookie', got: {findings_prose:?}"
+    );
+    assert!(
+        t2_prose[0].evidence.contains(&"parse_cookie".to_string()),
+        "Evidence must contain function anchor 'parse_cookie': {:?}",
+        t2_prose[0].evidence
+    );
+}
+
+// =========================================================================
+// REVIEW 2 - FIX 2: IDF Sample Excludes Binary and Unreadable Files
+// =========================================================================
+#[test]
+fn test_idf_sample_excludes_binary_and_unreadable_files_and_both_paths_match() {
+    let base_dir = tempdir().expect("tempdir");
+
+    // 1. A valid readable .py file
+    let valid_file = base_dir.path().join("valid.py");
+    fs::write(
+        &valid_file,
+        "def valid_func():\n    rare_symbol = 123\n    return rare_symbol\n",
+    )
+    .expect("write valid");
+
+    // 2. A binary .py file (contains NUL byte in first 8 KiB)
+    let binary_file = base_dir.path().join("binary.py");
+    fs::write(&binary_file, b"def broken():\x00\x01\x02pass\n").expect("write binary");
+
+    // 3. An unreadable .py file (cfg(unix), chmod 000; skip if running as root)
+    let mut has_unreadable = false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let unreadable_file = base_dir.path().join("unreadable.py");
+        fs::write(&unreadable_file, "def secret(): pass\n").expect("write unreadable");
+        let mut perms = fs::metadata(&unreadable_file)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&unreadable_file, perms.clone()).expect("set perms");
+
+        // Skip the unreadable part when running as root (root ignores 000 permissions)
+        if fs::read(&unreadable_file).is_ok() {
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(&unreadable_file, perms);
+            let _ = fs::remove_file(&unreadable_file);
+        } else {
+            has_unreadable = true;
+        }
+    }
+
+    let gold_patch = "diff --git a/valid.py b/valid.py\n--- a/valid.py\n+++ b/valid.py\n@@ -1,3 +1,4 @@\n def valid_func():\n+    rare_symbol = 123\n     return rare_symbol\n";
+
+    // Path 1: FingerprintSet::from_task
+    let fp = FingerprintSet::from_task(gold_patch, "", base_dir.path()).expect("fp");
+
+    // Path 2: build_tier2_idf
+    let mut symbols = HashSet::new();
+    symbols.insert("valid_func".to_string());
+    symbols.insert("rare_symbol".to_string());
+    let (weights, chosen_files) = build_tier2_idf(
+        base_dir.path(),
+        &symbols,
+        FingerprintSet::DEFAULT_TIER2_MAX_FILES,
+        FingerprintSet::DEFAULT_TIER2_MAX_BYTES,
+    );
+
+    // Both paths must exclude binary.py and unreadable.py
+    assert_eq!(
+        fp.tier2_chosen_files,
+        vec![valid_file.clone()],
+        "Path 1 (from_task) should only contain valid.py"
+    );
+    assert_eq!(
+        chosen_files,
+        vec![valid_file.clone()],
+        "Path 2 (build_tier2_idf) should only contain valid.py"
+    );
+
+    let n_path1 = fp.tier2_chosen_files.len();
+    let n_path2 = chosen_files.len();
+    assert_eq!(
+        n_path1, 1,
+        "N should be 1 (excluding binary and unreadable files)"
+    );
+    assert_eq!(
+        n_path2, 1,
+        "N should be 1 (excluding binary and unreadable files)"
+    );
+
+    // Weights via both paths must be identical
+    for (sym, w1) in &fp.hunks[0].tier2_symbols {
+        if let Some(w2) = weights.get(sym) {
+            assert!(
+                (w1 - w2).abs() < 1e-6,
+                "Weights for symbol {sym} must match across both paths: {w1} vs {w2}"
+            );
+        }
+    }
+
+    // Clean up permissions on unix so tempdir can be deleted cleanly
+    #[cfg(unix)]
+    if has_unreadable {
+        use std::os::unix::fs::PermissionsExt;
+        let unreadable_file = base_dir.path().join("unreadable.py");
+        if unreadable_file.exists() {
+            let mut perms = fs::metadata(&unreadable_file)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(&unreadable_file, perms);
+        }
+    }
+}

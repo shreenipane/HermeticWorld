@@ -4,7 +4,6 @@ use std::path::Path;
 use crate::binary::extract_string_literal_content;
 use crate::fingerprint::HunkFingerprints;
 use crate::scan::{Finding, ScanOptions, Severity};
-use crate::winnow::tokenize;
 
 /// Supported language for AST parsing in Tier 2.
 /// Structured to allow additional language grammars to be added in the future.
@@ -456,52 +455,62 @@ pub fn find_first_anchor<'a>(text: &str, anchors: &'a [String]) -> Option<&'a st
     None
 }
 
-fn is_ident_token(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
+fn process_prose_token(
+    raw_tok: &str,
+    symbols: &mut HashSet<String>,
+    anchor_tokens: &mut HashSet<String>,
+) {
+    let trimmed = raw_tok.trim_matches('.');
+    if trimmed.is_empty() {
+        return;
     }
-    let first = s.chars().next().unwrap_or(' ');
-    (first.is_alphabetic() || first == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+
+    symbols.insert(trimmed.to_string());
+    anchor_tokens.insert(trimmed.to_string());
+
+    let parts: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.len() > 1 {
+        for part in &parts {
+            symbols.insert((*part).to_string());
+            anchor_tokens.insert((*part).to_string());
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let mut chain = (*part).to_string();
+            for next_part in parts.iter().skip(i + 1) {
+                chain.push('.');
+                chain.push_str(next_part);
+                symbols.insert(chain.clone());
+                anchor_tokens.insert(chain.clone());
+            }
+        }
+    }
 }
 
-fn is_number_token(s: &str) -> bool {
-    s.chars().next().is_some_and(|c| c.is_ascii_digit())
+fn extract_prose_tokens_into(
+    text: &str,
+    symbols: &mut HashSet<String>,
+    anchor_tokens: &mut HashSet<String>,
+) {
+    let mut start_opt = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+            if start_opt.is_none() {
+                start_opt = Some(idx);
+            }
+        } else if let Some(start) = start_opt.take() {
+            process_prose_token(&text[start..idx], symbols, anchor_tokens);
+        }
+    }
+    if let Some(start) = start_opt {
+        process_prose_token(&text[start..], symbols, anchor_tokens);
+    }
 }
 
 pub fn extract_unit_symbols_and_anchors(text: &str) -> (HashSet<String>, HashSet<String>) {
     let mut symbols = HashSet::new();
     let mut anchor_tokens = HashSet::new();
 
-    let tokens = tokenize(text);
-    for tok in &tokens {
-        if is_ident_token(&tok.text) {
-            symbols.insert(tok.text.clone());
-            anchor_tokens.insert(tok.text.clone());
-        } else if is_number_token(&tok.text) {
-            symbols.insert(tok.text.clone());
-        } else if let Some(lit) = extract_string_literal_content(&tok.text) {
-            symbols.insert(lit);
-        }
-    }
-
-    let mut i = 0;
-    while i < tokens.len() {
-        if is_ident_token(&tokens[i].text) {
-            let mut chain = tokens[i].text.clone();
-            let mut j = i + 1;
-            while j + 1 < tokens.len()
-                && tokens[j].text == "."
-                && is_ident_token(&tokens[j + 1].text)
-            {
-                chain.push('.');
-                chain.push_str(&tokens[j + 1].text);
-                symbols.insert(chain.clone());
-                anchor_tokens.insert(chain.clone());
-                j += 2;
-            }
-        }
-        i += 1;
-    }
+    extract_prose_tokens_into(text, &mut symbols, &mut anchor_tokens);
 
     extract_delimited_spans_into(text, '`', '`', &mut symbols, &mut anchor_tokens);
     extract_delimited_spans_into(text, '\'', '\'', &mut symbols, &mut anchor_tokens);
@@ -530,35 +539,7 @@ fn extract_delimited_spans_into(
             if !span.is_empty() && span.len() <= 500 && !span.contains('\n') {
                 symbols.insert(span.to_string());
                 anchor_tokens.insert(span.to_string());
-                let span_tokens = tokenize(span);
-                for tok in &span_tokens {
-                    if is_ident_token(&tok.text) {
-                        symbols.insert(tok.text.clone());
-                        anchor_tokens.insert(tok.text.clone());
-                    } else if is_number_token(&tok.text) {
-                        symbols.insert(tok.text.clone());
-                    } else if let Some(lit) = extract_string_literal_content(&tok.text) {
-                        symbols.insert(lit);
-                    }
-                }
-                let mut k = 0;
-                while k < span_tokens.len() {
-                    if is_ident_token(&span_tokens[k].text) {
-                        let mut chain = span_tokens[k].text.clone();
-                        let mut l = k + 1;
-                        while l + 1 < span_tokens.len()
-                            && span_tokens[l].text == "."
-                            && is_ident_token(&span_tokens[l + 1].text)
-                        {
-                            chain.push('.');
-                            chain.push_str(&span_tokens[l + 1].text);
-                            symbols.insert(chain.clone());
-                            anchor_tokens.insert(chain.clone());
-                            l += 2;
-                        }
-                    }
-                    k += 1;
-                }
+                extract_prose_tokens_into(span, symbols, anchor_tokens);
             }
             start_idx = abs_open + open.len_utf8() + c_idx + close.len_utf8();
         } else {
