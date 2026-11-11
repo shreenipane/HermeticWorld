@@ -40,7 +40,7 @@ pub fn apply_landlock(
     log_dir: &Path,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
-    let abi = ABI::V1;
+    let abi = ABI::V3;
     let ruleset_res = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .and_then(|r| r.create())
@@ -50,10 +50,8 @@ pub fn apply_landlock(
 
     match ruleset_res {
         Ok(status) => match status.ruleset {
-            RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => {
-                Ok(SandboxLandlockStatus::Enforced)
-            }
-            RulesetStatus::NotEnforced => {
+            RulesetStatus::FullyEnforced => Ok(SandboxLandlockStatus::Enforced),
+            RulesetStatus::NotEnforced | RulesetStatus::PartiallyEnforced => {
                 if allow_no_landlock {
                     Ok(SandboxLandlockStatus::NotEnforced)
                 } else {
@@ -106,7 +104,6 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_rt_sigaction,
         libc::SYS_rt_sigprocmask,
         libc::SYS_rt_sigreturn,
-        libc::SYS_ioctl,
         libc::SYS_pread64,
         libc::SYS_pwrite64,
         libc::SYS_readv,
@@ -146,8 +143,6 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_flock,
         libc::SYS_fsync,
         libc::SYS_fdatasync,
-        libc::SYS_truncate,
-        libc::SYS_ftruncate,
         libc::SYS_getdents,
         libc::SYS_getdents64,
         libc::SYS_getcwd,
@@ -156,15 +151,9 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_rename,
         libc::SYS_mkdir,
         libc::SYS_rmdir,
-        libc::SYS_creat,
         libc::SYS_link,
         libc::SYS_unlink,
         libc::SYS_readlink,
-        libc::SYS_chmod,
-        libc::SYS_fchmod,
-        libc::SYS_chown,
-        libc::SYS_fchown,
-        libc::SYS_lchown,
         libc::SYS_umask,
         libc::SYS_gettimeofday,
         libc::SYS_getrlimit,
@@ -222,29 +211,23 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_clock_nanosleep,
         libc::SYS_exit_group,
         libc::SYS_tgkill,
-        libc::SYS_openat,
         libc::SYS_mkdirat,
         libc::SYS_mknodat,
-        libc::SYS_fchownat,
-        libc::SYS_futimesat,
         libc::SYS_newfstatat,
         libc::SYS_unlinkat,
         libc::SYS_renameat,
         libc::SYS_linkat,
         libc::SYS_symlinkat,
         libc::SYS_readlinkat,
-        libc::SYS_fchmodat,
         libc::SYS_faccessat,
         libc::SYS_pselect6,
         libc::SYS_ppoll,
         libc::SYS_set_robust_list,
         libc::SYS_get_robust_list,
         libc::SYS_epoll_pwait,
-        libc::SYS_utimensat,
         libc::SYS_signalfd,
         libc::SYS_timerfd_create,
         libc::SYS_eventfd,
-        libc::SYS_fallocate,
         libc::SYS_timerfd_settime,
         libc::SYS_timerfd_gettime,
         libc::SYS_accept4,
@@ -257,8 +240,8 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_statx,
         libc::SYS_rseq,
         libc::SYS_clone3,
-        libc::SYS_openat2,
         libc::SYS_renameat2,
+        libc::SYS_openat,
     ];
 
     for sys in allowed_syscalls {
@@ -286,4 +269,66 @@ pub fn apply_sandbox(
     let landlock_status = apply_landlock(store_dir, log_dir, allow_no_landlock)?;
     apply_seccomp()?;
     Ok(landlock_status)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+
+    #[test]
+    fn sandbox_denies_store_and_outside_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let log = temp.path().join("log");
+        fs::create_dir(&store).unwrap();
+        fs::create_dir(&log).unwrap();
+        let targets = [store.join("body"), temp.path().join("outside")];
+        for target in targets {
+            for operation in ["open_truncate", "ftruncate"] {
+                fs::write(&target, b"unchanged").unwrap();
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sandbox::review_tests::truncation_child",
+                        "--nocapture",
+                    ])
+                    .env("HERMETIC_TRUNCATE_TARGET", &target)
+                    .env("HERMETIC_TRUNCATE_STORE", &store)
+                    .env("HERMETIC_TRUNCATE_LOG", &log)
+                    .env("HERMETIC_TRUNCATE_OP", operation)
+                    .status()
+                    .unwrap();
+                assert!(
+                    status.success() || status.signal() == Some(libc::SIGSYS),
+                    "{status}"
+                );
+                assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+            }
+        }
+    }
+    #[test]
+    fn truncation_child() {
+        let Some(target) = std::env::var_os("HERMETIC_TRUNCATE_TARGET") else {
+            return;
+        };
+        let store = std::env::var_os("HERMETIC_TRUNCATE_STORE").unwrap();
+        let log = std::env::var_os("HERMETIC_TRUNCATE_LOG").unwrap();
+        let operation = std::env::var("HERMETIC_TRUNCATE_OP").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        apply_sandbox(Path::new(&store), Path::new(&log), true).unwrap();
+        let error = if operation == "ftruncate" {
+            file.set_len(0).unwrap_err()
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(target)
+                .unwrap_err()
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        std::process::exit(0);
+    }
 }

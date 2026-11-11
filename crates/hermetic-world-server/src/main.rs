@@ -190,13 +190,6 @@ fn main() {
         eprintln!("Error: --store DIR is required");
         std::process::exit(1);
     });
-    let store_dir = match store_dir.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: store root does not exist: {e}");
-            std::process::exit(1);
-        }
-    };
     let socket_path = cli.socket.unwrap_or_else(|| {
         eprintln!("Error: --socket PATH is required");
         std::process::exit(1);

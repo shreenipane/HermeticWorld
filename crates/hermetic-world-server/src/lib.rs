@@ -2,6 +2,7 @@
 
 pub mod limits;
 pub mod log;
+mod safe_fs;
 pub mod sandbox;
 pub mod server;
 pub mod store;

@@ -1,6 +1,13 @@
 #![forbid(unsafe_code)]
 
+use crate::safe_fs::Directory;
 use serde::Deserialize;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+
+pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_STORE_PATH_BYTES: usize = 8192;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +91,7 @@ pub trait Store: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct DirStore {
     root: PathBuf,
+    directory: Option<Directory>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,9 +113,23 @@ struct Custom404 {
 
 impl DirStore {
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
-        let p = root.as_ref();
-        let canon = p.canonicalize().unwrap_or_else(|_| normalize_components(p));
-        Self { root: canon }
+        let root = crate::safe_fs::normalize_path(root.as_ref());
+        Self {
+            directory: Directory::open(&root).ok(),
+            root,
+        }
+    }
+
+    pub(crate) fn try_new(root: &Path) -> std::io::Result<Self> {
+        let root = crate::safe_fs::normalize_path(root);
+        Ok(Self {
+            directory: Some(Directory::open(&root)?),
+            root,
+        })
+    }
+
+    pub(crate) fn descriptor_path(&self) -> Option<PathBuf> {
+        Some(self.directory.as_ref()?.descriptor_path())
     }
 
     /// Return custom or default 404 response for the given authority: (status, content_type, body).
@@ -121,20 +143,18 @@ impl DirStore {
         }
 
         let sidecar_path = self.root.join(authority).join(".404.json");
-        if is_inside_root(&self.root, &sidecar_path) && sidecar_path.is_file() {
-            if let Ok(data) = std::fs::read_to_string(&sidecar_path) {
-                if let Ok(c404) = serde_json::from_str::<Custom404>(&data) {
-                    let status = c404.status.unwrap_or(404);
-                    let ct = c404
-                        .content_type
-                        .or(c404.content_type_dash)
-                        .or_else(|| Some("text/html".to_string()));
-                    let body = c404
-                        .body
-                        .map(|s| s.into_bytes())
-                        .unwrap_or_else(|| b"<h1>404 Not Found</h1>".to_vec());
-                    return (status, ct, body);
-                }
+        if let Some(data) = self.read_metadata(&sidecar_path) {
+            if let Ok(c404) = serde_json::from_slice::<Custom404>(&data) {
+                let status = c404.status.unwrap_or(404);
+                let ct = c404
+                    .content_type
+                    .or(c404.content_type_dash)
+                    .or_else(|| Some("text/html".to_string()));
+                let body = c404
+                    .body
+                    .map(|s| s.into_bytes())
+                    .unwrap_or_else(|| b"<h1>404 Not Found</h1>".to_vec());
+                return (status, ct, body);
             }
         }
 
@@ -147,36 +167,29 @@ impl DirStore {
 
     /// Percent-decode an ASCII path string, rejecting invalid escapes and NUL characters.
     fn percent_decode(input: &str) -> Option<String> {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' {
-                if i + 2 >= bytes.len() {
-                    return None;
-                }
-                let h1 = char::from(bytes[i + 1]).to_digit(16)?;
-                let h2 = char::from(bytes[i + 2]).to_digit(16)?;
-                let byte = ((h1 << 4) | h2) as u8;
-                if byte == 0 {
-                    return None; // NUL byte rejected
-                }
-                out.push(byte);
-                i += 3;
+        let mut bytes = input.as_bytes().iter();
+        let mut out = Vec::with_capacity(input.len());
+        while let Some(&byte) = bytes.next() {
+            let decoded = if byte == b'%' {
+                let high = char::from(*bytes.next()?).to_digit(16)?;
+                let low = char::from(*bytes.next()?).to_digit(16)?;
+                ((high << 4) | low) as u8
             } else {
-                if bytes[i] == 0 {
-                    return None; // Literal NUL rejected
-                }
-                out.push(bytes[i]);
-                i += 1;
+                byte
+            };
+            if decoded == 0 {
+                return None;
             }
+            out.push(decoded);
         }
         String::from_utf8(out).ok()
     }
 
     /// Resolve authority and path_and_query to an on-disk file path, rejecting traversal attacks.
     fn resolve_path(&self, authority: &str, path_and_query: &str) -> Option<PathBuf> {
-        if hermetic_common::validate_authority(authority.as_bytes()).is_err() {
+        if path_and_query.len() > MAX_STORE_PATH_BYTES
+            || hermetic_common::validate_authority(authority.as_bytes()).is_err()
+        {
             return None;
         }
 
@@ -186,8 +199,8 @@ impl DirStore {
         }
 
         // Split into path and optional query
-        let (path_part, query_part) = match path_and_query.find('?') {
-            Some(idx) => (&path_and_query[..idx], Some(&path_and_query[idx + 1..])),
+        let (path_part, query_part) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
             None => (path_and_query, None),
         };
 
@@ -227,30 +240,30 @@ impl DirStore {
             if raw_segs.is_empty() {
                 // Root with query: %3F<query>
                 candidate.push(format!("%3F{q}"));
-                if is_inside_root(&self.root, &candidate) && candidate.is_file() {
+                if self.open_path(&candidate).is_some() {
                     return Some(candidate);
                 }
                 // Or index.html%3F<query>
                 let mut alt = auth_dir.clone();
                 alt.push(format!("index.html%3F{q}"));
-                if is_inside_root(&self.root, &alt) && alt.is_file() {
+                if self.open_path(&alt).is_some() {
                     return Some(alt);
                 }
             } else {
-                for seg in &raw_segs[..raw_segs.len() - 1] {
+                let (last, parents) = raw_segs.split_last()?;
+                for seg in parents {
                     candidate.push(seg);
                 }
-                let last = raw_segs[raw_segs.len() - 1];
                 let mut with_q = candidate.clone();
                 with_q.push(format!("{last}%3F{q}"));
-                if is_inside_root(&self.root, &with_q) && with_q.is_file() {
+                if self.open_path(&with_q).is_some() {
                     return Some(with_q);
                 }
                 // If trailing slash was requested, might be `<last>/index.html%3F<q>`
                 let mut index_with_q = candidate.clone();
                 index_with_q.push(last);
                 index_with_q.push(format!("index.html%3F{q}"));
-                if is_inside_root(&self.root, &index_with_q) && index_with_q.is_file() {
+                if self.open_path(&index_with_q).is_some() {
                     return Some(index_with_q);
                 }
             }
@@ -263,13 +276,13 @@ impl DirStore {
             candidate.push(seg);
         }
 
-        if is_inside_root(&self.root, &candidate) && candidate.is_file() {
+        if self.open_path(&candidate).is_some() {
             return Some(candidate);
         }
 
         // If directory or trailing slash, look for index.html
         let index_candidate = candidate.join("index.html");
-        if is_inside_root(&self.root, &index_candidate) && index_candidate.is_file() {
+        if self.open_path(&index_candidate).is_some() {
             return Some(index_candidate);
         }
 
@@ -278,19 +291,19 @@ impl DirStore {
 
     /// Read optional sidecar `<file>.headers.json`.
     fn read_sidecar(&self, file_path: &Path) -> (Option<String>, Vec<(String, String)>) {
-        let sidecar_path = PathBuf::from(format!("{}.headers.json", file_path.display()));
-        if is_inside_root(&self.root, &sidecar_path) && sidecar_path.is_file() {
-            if let Ok(data) = std::fs::read_to_string(&sidecar_path) {
-                if let Ok(sc) = serde_json::from_str::<SidecarHeaders>(&data) {
-                    let ct = sc.content_type.or(sc.content_type_dash);
-                    let mut extra = Vec::new();
-                    if let Some(map) = sc.headers {
-                        for (k, v) in map {
-                            extra.push((k, v));
-                        }
+        let mut name = file_path.as_os_str().to_os_string();
+        name.push(".headers.json");
+        let sidecar_path = PathBuf::from(name);
+        if let Some(data) = self.read_metadata(&sidecar_path) {
+            if let Ok(sc) = serde_json::from_slice::<SidecarHeaders>(&data) {
+                let ct = sc.content_type.or(sc.content_type_dash);
+                let mut extra = Vec::new();
+                if let Some(map) = sc.headers {
+                    for (k, v) in map {
+                        extra.push((k, v));
                     }
-                    return (ct, extra);
                 }
+                return (ct, extra);
             }
         }
 
@@ -309,19 +322,70 @@ impl DirStore {
     }
 }
 
-impl Store for DirStore {
-    fn get(&self, authority: &str, path_and_query: &str) -> Option<StoredObject> {
-        let file_path = self.resolve_path(authority, path_and_query)?;
-        if !is_inside_root(&self.root, &file_path) {
-            return None;
-        }
-        let body = std::fs::read(&file_path).ok()?;
-        let (content_type, extra_headers) = self.read_sidecar(&file_path);
+impl DirStore {
+    fn open_path(&self, path: &Path) -> Option<File> {
+        self.directory
+            .as_ref()?
+            .open_file(path.strip_prefix(&self.root).ok()?, false, false)
+            .ok()
+    }
 
-        Some(StoredObject {
-            body,
+    fn read_metadata(&self, path: &Path) -> Option<Vec<u8>> {
+        self.directory
+            .as_ref()?
+            .read(path.strip_prefix(&self.root).ok()?, MAX_SIDECAR_BYTES)
+            .ok()
+    }
+
+    pub fn open(&self, authority: &str, path: &str) -> Option<OpenedObject> {
+        let path = self.resolve_path(authority, path)?;
+        let file = self.open_path(&path)?;
+        let len = file.metadata().ok()?.len();
+        let (content_type, extra_headers) = self.read_sidecar(&path);
+        Some(OpenedObject {
+            file,
+            len,
             content_type,
             extra_headers,
+        })
+    }
+}
+
+pub struct OpenedObject {
+    file: File,
+    pub len: u64,
+    pub content_type: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
+}
+
+impl OpenedObject {
+    pub fn read_range(&mut self, start: u64, length: u64, cap: u64) -> std::io::Result<Vec<u8>> {
+        if length > cap.min(MAX_BODY_BYTES)
+            || start.checked_add(length).is_none_or(|end| end > self.len)
+        {
+            return Err(crate::safe_fs::invalid());
+        }
+        self.file.seek(SeekFrom::Start(start))?;
+        let size = usize::try_from(length).map_err(|_| crate::safe_fs::invalid())?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(size)
+            .map_err(|_| crate::safe_fs::invalid())?;
+        self.file.by_ref().take(length).read_to_end(&mut body)?;
+        if body.len() != size {
+            return Err(crate::safe_fs::invalid());
+        }
+        Ok(body)
+    }
+}
+
+impl Store for DirStore {
+    fn get(&self, authority: &str, path_and_query: &str) -> Option<StoredObject> {
+        let mut object = self.open(authority, path_and_query)?;
+        let body = object.read_range(0, object.len, MAX_BODY_BYTES).ok()?;
+        Some(StoredObject {
+            body,
+            content_type: object.content_type,
+            extra_headers: object.extra_headers,
         })
     }
 }

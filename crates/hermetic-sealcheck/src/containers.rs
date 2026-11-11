@@ -261,6 +261,8 @@ pub trait UnitSink {
     fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings);
     /// A loose text unit, before its `text` call, for D5a package metadata.
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]);
+    /// An archive member's modification time (tar mtime or zip DOS date-time), for D4.
+    fn member_time(&mut self, path: &str, unix_secs: i64);
 }
 
 /// The sink `scan` uses: matches every unit against one task's fingerprints at once.
@@ -307,8 +309,43 @@ impl UnitSink for MatchSink<'_> {
             self.signatures,
             self.opts.visibility,
         ));
+        let before_unit = self.findings.len();
         self.findings
             .extend(match_unit(text, self.fp, self.opts, "D2", "file", path));
+
+        // Tier 2 matching for D2 text units (TR-SC-3)
+        // A unit that already has a tier-1 or tier-3 Gate finding for the same hunk gets no tier-2 finding.
+        let unit_gate_hunks: std::collections::HashSet<usize> = self.findings[before_unit..]
+            .iter()
+            .filter(|f| f.severity == Severity::Gate)
+            .filter_map(|f| f.hunk)
+            .collect();
+
+        let has_tier2_candidates = self.fp.hunks.iter().any(|h| {
+            !unit_gate_hunks.contains(&h.hunk_index)
+                && h.tier2_total_weight > 0.0
+                && h.tier2_symbols.len() >= 2
+                && !h.tier2_anchors.is_empty()
+        });
+
+        if has_tier2_candidates {
+            let (unit_symbols, unit_anchor_tokens) =
+                crate::tier2::extract_unit_symbols_and_anchors(text);
+            for hunk in &self.fp.hunks {
+                if unit_gate_hunks.contains(&hunk.hunk_index) {
+                    continue;
+                }
+                if let Some(t2_finding) = hunk.match_tier2_with_context(
+                    &unit_symbols,
+                    &unit_anchor_tokens,
+                    self.opts,
+                    "D2",
+                    path,
+                ) {
+                    self.findings.push(t2_finding);
+                }
+            }
+        }
     }
 
     fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
@@ -318,12 +355,56 @@ impl UnitSink for MatchSink<'_> {
     }
 
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
+        if self.opts.undated {
+            return;
+        }
         self.findings.extend(crate::d5a::check_d5a_metadata(
             Path::new(path),
             bytes,
             self.opts,
         ));
     }
+
+    fn member_time(&mut self, path: &str, unix_secs: i64) {
+        if let Some(t_clock) = self.opts.t_clock {
+            if unix_secs > t_clock.unix_timestamp() {
+                let mtime_str = match time::OffsetDateTime::from_unix_timestamp(unix_secs) {
+                    Ok(dt) => dt
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| dt.to_string()),
+                    Err(_) => format!("{unix_secs}s"),
+                };
+                let t_clock_str = t_clock
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| t_clock.to_string());
+                self.findings.push(Finding {
+                    detector: "D4".into(),
+                    channel: "member_mtime".into(),
+                    path: path.to_string(),
+                    visibility: self.opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec![format!("mtime {mtime_str} > T_clock {t_clock_str}")],
+                });
+            }
+        }
+    }
+}
+
+/// Convert a zip entry DOS date-time to Unix seconds.
+///
+/// Note: Zip entries carry a DOS date-time without timezone information
+/// (representing local time). By specification, sealcheck treats DOS date-times
+/// as UTC.
+pub fn zip_datetime_to_unix_secs(dt: zip::DateTime) -> Option<i64> {
+    let year = dt.year() as i32;
+    let month = time::Month::try_from(dt.month()).ok()?;
+    let day = dt.day();
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let time = time::Time::from_hms(dt.hour(), dt.minute(), dt.second()).ok()?;
+    let primitive = time::PrimitiveDateTime::new(date, time);
+    Some(primitive.assume_utc().unix_timestamp())
 }
 
 pub struct ContainerScanner<'a, S: UnitSink> {
@@ -751,6 +832,11 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
 
             let member_name = file.name().to_string();
             let member_path = format!("{}!/{}", path, member_name);
+            if let Some(dt) = file.last_modified() {
+                if let Some(unix_secs) = zip_datetime_to_unix_secs(dt) {
+                    self.sink.member_time(&member_path, unix_secs);
+                }
+            }
             let compressed_size = file.compressed_size();
 
             let mut member_bytes = Vec::new();
@@ -879,6 +965,10 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
             };
 
             let member_path = format!("{}!/{}", path, entry_path);
+            if let Ok(mtime) = entry.header().mtime() {
+                let unix_secs = i64::try_from(mtime).unwrap_or(i64::MAX);
+                self.sink.member_time(&member_path, unix_secs);
+            }
             let size = entry.header().size().unwrap_or(0);
 
             let mut member_bytes = Vec::new();

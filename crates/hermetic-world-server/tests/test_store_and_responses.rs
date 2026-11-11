@@ -79,7 +79,7 @@ fn test_get_head_range_miss_and_headers() {
     let sidecar_json = r#"{
         "content_type": "text/html; charset=utf-8",
         "headers": {
-            "x-custom-foo": "bar",
+            "etag": "bar",
             "memento-datetime": "Thu, 01 Jan 1970 00:00:00 GMT",
             "x-archive-orig-date": "1999-01-01",
             "server": "pywb/2.6.7"
@@ -132,7 +132,7 @@ fn test_get_head_range_miss_and_headers() {
         get_headers.get("content-length"),
         Some(&html_body.len().to_string().as_str())
     );
-    assert_eq!(get_headers.get("x-custom-foo"), Some(&"bar"));
+    assert_eq!(get_headers.get("etag"), Some(&"bar"));
     assert!(get_headers.contains_key("date"));
     // Ensure stripped headers are absent
     assert!(!get_headers.contains_key("memento-datetime"));
@@ -466,8 +466,16 @@ fn test_fix6_filter_headers_sidecar_validation() {
     // 2. 20 KiB value
     extra_headers.push(format!("\"x-bad-huge\": \"{huge_value}\""));
     // 3. 98 other headers -> total 100 headers in sidecar
-    for i in 0..98 {
-        extra_headers.push(format!("\"x-hdr-{i:03}\": \"val-{i}\""));
+    for (i, name) in std::iter::once(&"cache-control")
+        .chain(
+            hermetic_world_server::server::ALLOWED_SIDECAR_HEADERS
+                .iter()
+                .filter(|&&h| h != "cache-control"),
+        )
+        .take(98)
+        .enumerate()
+    {
+        extra_headers.push(format!("\"{name}\": \"val-{i}\""));
     }
 
     let sidecar_json = format!(
@@ -532,7 +540,7 @@ fn test_fix6_filter_headers_sidecar_validation() {
     );
 
     // Valid headers are present
-    assert_eq!(hdrs.get("x-hdr-000"), Some(&"val-0"));
+    assert_eq!(hdrs.get("cache-control"), Some(&"val-0"));
 }
 
 #[test]
@@ -599,7 +607,7 @@ fn test_fix2_mixed_case_sidecar_headers() {
         "headers": {
             "ETag": "\"abcdef123456\"",
             "Cache-Control": "public, max-age=86400",
-            "X-Mixed-Case-Custom": "custom-val"
+            "Content-Language": "custom-val"
         }
     }"#;
     fs::write(&sidecar_path, sidecar_content).expect("write sidecar");
@@ -640,7 +648,7 @@ fn test_fix2_mixed_case_sidecar_headers() {
         "Cache-Control sidecar header must be lowercased to cache-control"
     );
     assert_eq!(
-        hdrs.get("x-mixed-case-custom"),
+        hdrs.get("content-language"),
         Some(&"custom-val"),
         "Mixed-case headers must be lowercased and retained"
     );

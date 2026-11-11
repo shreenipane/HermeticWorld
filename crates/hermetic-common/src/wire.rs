@@ -31,6 +31,8 @@
 //! | headers          | ...    | each: name_len u16, name, value_len u16, value|
 //! | body             | bytes  | `body_len` bytes                              |
 
+pub const MAX_RESPONSE_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
 use std::io::{self, Read, Write};
 
 /// Maximum total size of a request frame (header + payload).
@@ -492,7 +494,7 @@ impl ResponseFrame {
         }
 
         let body_len = self.body.len() as u64;
-        if body_len > max_body_len {
+        if body_len > max_body_len || body_len > MAX_RESPONSE_BODY_BYTES {
             return Err(WireError::Malformed(format!(
                 "body too large: {body_len} > {max_body_len}"
             )));
@@ -574,7 +576,7 @@ impl ResponseFrame {
                 "too many headers: {header_count} > {MAX_RESPONSE_HEADERS}"
             )));
         }
-        if body_len > max_body_len {
+        if body_len > max_body_len || body_len > MAX_RESPONSE_BODY_BYTES {
             return Err(WireError::Malformed(format!(
                 "body too large: {body_len} > {max_body_len}"
             )));
@@ -710,7 +712,7 @@ impl ResponseFrame {
                 .try_into()
                 .map_err(|_| WireError::Malformed("failed to read body_len".into()))?,
         );
-        if body_len > max_body_len {
+        if body_len > max_body_len || body_len > MAX_RESPONSE_BODY_BYTES {
             return Err(WireError::Malformed(format!(
                 "body too large: {body_len} > {max_body_len}"
             )));
@@ -789,7 +791,12 @@ impl ResponseFrame {
         }
 
         // Read body
-        let mut body = vec![0u8; body_len as usize];
+        let body_size = usize::try_from(body_len)
+            .map_err(|_| WireError::Malformed("body allocation limit".into()))?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(body_size)
+            .map_err(|_| WireError::Malformed("body allocation limit".into()))?;
+        body.resize(body_size, 0);
         reader.read_exact(&mut body).map_err(|e| match e.kind() {
             io::ErrorKind::UnexpectedEof => WireError::Malformed("truncated response body".into()),
             _ => WireError::Io(e),
@@ -1110,5 +1117,25 @@ mod tests {
         let mut encoded = frame.encode(max_body).unwrap();
         encoded[5] = 1;
         assert!(ResponseFrame::decode(&encoded, max_body).is_err());
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    #[test]
+    fn streaming_maximum_and_oversized_bodies_return_errors() {
+        let response = ResponseFrame {
+            request_id: 1,
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        };
+        let base = response.encode(u64::MAX).unwrap();
+        for length in [u64::MAX, i64::MAX as u64, MAX_RESPONSE_BODY_BYTES + 1] {
+            let mut header = base.clone();
+            header[20..28].copy_from_slice(&length.to_le_bytes());
+            assert!(ResponseFrame::read_from(&mut std::io::Cursor::new(header), u64::MAX).is_err());
+        }
     }
 }
