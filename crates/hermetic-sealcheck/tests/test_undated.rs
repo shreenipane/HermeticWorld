@@ -5,8 +5,8 @@ use std::process::Command;
 use tempfile::{tempdir, TempDir};
 
 use hermetic_sealcheck::{
-    load_undated_task, query_index, scan_tree, write_index, Finding, FingerprintSet, ScanOptions,
-    Visibility,
+    load_undated_task, match_unit, query_index, scan_tree, write_index, Finding, FingerprintSet,
+    ScanOptions, Severity, Visibility,
 };
 
 const DISTINCTIVE_SCRIPT: &str = r#"#!/usr/bin/env bash
@@ -450,7 +450,8 @@ fn test_oversized_and_binary_solution_files_empty_and_missing() {
     fs::write(task_ov.join("solution/big_solution.bin"), &big_content).expect("write big file");
 
     let undated_ov = load_undated_task(task_ov).expect("load task");
-    let fp_ov = FingerprintSet::from_files(&undated_ov.files, base).expect("fp");
+    let mut fp_ov = FingerprintSet::from_files(&undated_ov.files, base).expect("fp");
+    fp_ov.skipped_files_count += undated_ov.skipped_files_count;
     assert_eq!(
         fp_ov.skipped_files_count, 1,
         "17 MiB file must be skipped by 16 MiB cap"
@@ -617,11 +618,11 @@ fn test_total_size_cap_64mb() {
     let base = base_dir.path();
 
     // 5 files of 15 MiB each. Total = 75 MiB > 64 MiB cap.
-    let files: Vec<(String, String)> = (0..5)
+    let files: Vec<(String, Vec<u8>)> = (0..5)
         .map(|i| {
             (
                 format!("solution/chunk_{i}.txt"),
-                "A".repeat(15 * 1024 * 1024),
+                vec![b'A'; 15 * 1024 * 1024],
             )
         })
         .collect();
@@ -761,4 +762,373 @@ fn test_undated_mode_sarif_output_has_properties() {
         props["not_covered"],
         serde_json::json!(["D1", "D3", "D4", "D5a"])
     );
+}
+
+#[test]
+fn test_fix1_yaml_block_scalar_headers_with_and_without_comments() {
+    let headers = ["|", "|-", ">", ">+", "|2"];
+    for header in headers {
+        // Without comment
+        let yaml_no_comment = format!("id: test-task\ninstruction: {header}\n  the block instruction line 1\n  the block instruction line 2\n");
+        let dir_no_comment = tempdir().expect("tempdir");
+        fs::write(dir_no_comment.path().join("task.yaml"), &yaml_no_comment).expect("write yaml");
+        let task = load_undated_task(dir_no_comment.path()).expect("load task");
+        assert_eq!(
+            task.instruction, "the block instruction line 1\nthe block instruction line 2",
+            "failed for header without comment: {header}"
+        );
+
+        // With trailing comment
+        let yaml_with_comment = format!("id: test-task\ninstruction: {header} # inline header comment\n  the block instruction line 1\n  the block instruction line 2\n");
+        let dir_with_comment = tempdir().expect("tempdir");
+        fs::write(
+            dir_with_comment.path().join("task.yaml"),
+            &yaml_with_comment,
+        )
+        .expect("write yaml");
+        let task = load_undated_task(dir_with_comment.path()).expect("load task");
+        assert_eq!(
+            task.instruction, "the block instruction line 1\nthe block instruction line 2",
+            "failed for header with comment: {header}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_fix2_unreadable_subtree_in_solution_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let task_dir = tempdir().expect("task dir");
+    let unreadable = task_dir.path().join("solution").join("forbidden_subdir");
+    fs::create_dir_all(&unreadable).expect("mkdir");
+    fs::write(unreadable.join("subfile.sh"), "echo hello\n").expect("write subfile");
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+    if fs::read_dir(&unreadable).is_ok() {
+        // Running as root: permissions ignored, skip assertion
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
+        return;
+    }
+
+    let res = load_undated_task(task_dir.path());
+
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let base_dir = tempdir().expect("base dir");
+    let scan_root = tempdir().expect("scan root");
+    let cli_out = Command::new(bin_path)
+        .arg("scan")
+        .arg("--undated")
+        .arg("--task")
+        .arg(task_dir.path())
+        .arg("--base-tree")
+        .arg(base_dir.path())
+        .arg("--root")
+        .arg(scan_root.path())
+        .output();
+
+    let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
+
+    assert!(
+        res.is_err(),
+        "loading task with unreadable subtree must fail"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("forbidden_subdir") || err.contains(&unreadable.display().to_string()),
+        "error must name unreadable path: {err}"
+    );
+
+    let cli_out = cli_out.expect("run scan");
+    assert_eq!(
+        cli_out.status.code(),
+        Some(1),
+        "CLI must exit 1 when traversal fails"
+    );
+}
+
+#[test]
+fn test_fix3_duplicate_line_weights_undated_and_dated() {
+    // 1. Undated mode
+    let task_dir = tempdir().expect("task dir");
+    fs::create_dir_all(task_dir.path().join("solution")).expect("mkdir solution");
+    fs::write(
+        task_dir.path().join("solution/dup.py"),
+        "unique_repeated_test_line_alpha = 1\nunique_repeated_test_line_alpha = 1\n",
+    )
+    .expect("write dup.py");
+    let base_dir = tempdir().expect("base dir");
+    let task = load_undated_task(task_dir.path()).expect("load task");
+    let fp_undated = FingerprintSet::from_files(&task.files, base_dir.path()).expect("from_files");
+
+    let unit_text = "unique_repeated_test_line_alpha = 1\n";
+    let findings_undated = match_unit(
+        unit_text,
+        &fp_undated,
+        &ScanOptions::default(),
+        "D2",
+        "file",
+        "dup.py",
+    );
+    let f_undated = findings_undated
+        .iter()
+        .find(|f| f.detector == "D2" && f.channel == "file")
+        .expect("finding for undated");
+    assert_eq!(
+        f_undated.confidence, 1.0,
+        "undated confidence must be 1.0 when hunk's only distinctive line repeated twice appears once in unit"
+    );
+
+    // 2. Dated gold-patch path (from_task)
+    let dated_base_dir = tempdir().expect("dated base dir");
+    fs::write(
+        dated_base_dir.path().join("dated.py"),
+        "initial_context_line = 0\n",
+    )
+    .expect("write dated base");
+    let gold_patch = "diff --git a/dated.py b/dated.py\n--- a/dated.py\n+++ b/dated.py\n@@ -1,1 +1,3 @@\n initial_context_line = 0\n+unique_repeated_test_line_beta = 2\n+unique_repeated_test_line_beta = 2\n";
+    let fp_dated =
+        FingerprintSet::from_task(gold_patch, "", dated_base_dir.path()).expect("from_task");
+
+    let dated_unit_text = "unique_repeated_test_line_beta = 2\n";
+    let findings_dated = match_unit(
+        dated_unit_text,
+        &fp_dated,
+        &ScanOptions::default(),
+        "D2",
+        "file",
+        "dated.py",
+    );
+    let f_dated = findings_dated
+        .iter()
+        .find(|f| f.detector == "D2" && f.channel == "file")
+        .expect("finding for dated");
+    assert_eq!(
+        f_dated.confidence, 1.0,
+        "dated confidence must be 1.0 when hunk's only distinctive line repeated twice appears once in unit"
+    );
+
+    // 3. Dated test-patch path (from_task)
+    let test_patch = "diff --git a/test_dated.py b/test_dated.py\n--- /dev/null\n+++ b/test_dated.py\n@@ -0,0 +1,2 @@\n+unique_repeated_test_line_gamma = 3\n+unique_repeated_test_line_gamma = 3\n";
+    let fp_test_patch =
+        FingerprintSet::from_task("", test_patch, dated_base_dir.path()).expect("from_task");
+    let test_unit_text = "unique_repeated_test_line_gamma = 3\n";
+    let findings_tp = match_unit(
+        test_unit_text,
+        &fp_test_patch,
+        &ScanOptions::default(),
+        "D2",
+        "file",
+        "test_dated.py",
+    );
+    let f_tp = findings_tp
+        .iter()
+        .find(|f| f.detector == "D2" && f.channel == "file")
+        .expect("finding for test patch");
+    assert_eq!(
+        f_tp.confidence, 1.0,
+        "test patch confidence must be 1.0 when hunk's only distinctive line repeated twice appears once in unit"
+    );
+}
+
+#[test]
+fn test_fix4_sparse_large_file_and_budget_enforcement() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+
+    // Part 1: Sparse / large file over 16 MiB per-file cap is skipped without being read
+    let task_dir_sparse = tempdir().expect("task dir sparse");
+    fs::create_dir_all(task_dir_sparse.path().join("solution")).expect("mkdir solution");
+    fs::write(
+        task_dir_sparse.path().join("task.yaml"),
+        "id: sparse-task\ninstruction: Do work.\n",
+    )
+    .expect("write yaml");
+
+    let sparse_file_path = task_dir_sparse.path().join("solution/sparse_oversized.bin");
+    let file = fs::File::create(&sparse_file_path).expect("create sparse file");
+    file.set_len(20 * 1024 * 1024).expect("set_len to 20 MiB");
+    drop(file);
+
+    let task_sparse = load_undated_task(task_dir_sparse.path()).expect("load task sparse");
+    assert_eq!(
+        task_sparse.skipped_files_count, 1,
+        "sparse 20 MiB file must be skipped during loading"
+    );
+    assert!(
+        task_sparse.files.is_empty(),
+        "sparse oversized file must not be loaded into memory"
+    );
+
+    let base_dir = tempdir().expect("base dir");
+    let clean_root = tempdir().expect("clean root");
+    let out_sparse = Command::new(bin_path)
+        .arg("scan")
+        .arg("--undated")
+        .arg("--task")
+        .arg(task_dir_sparse.path())
+        .arg("--base-tree")
+        .arg(base_dir.path())
+        .arg("--root")
+        .arg(clean_root.path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("scan sparse");
+    assert_eq!(out_sparse.status.code(), Some(0));
+    let json_sparse: serde_json::Value =
+        serde_json::from_slice(&out_sparse.stdout).expect("parse json");
+    let findings_sparse = json_sparse["findings"].as_array().expect("findings");
+    let info_finding = findings_sparse
+        .iter()
+        .find(|f| f["channel"] == "task_file_skipped" && f["severity"] == "info")
+        .expect("must produce task_file_skipped info finding");
+    assert!(
+        info_finding["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("skipped 1 task files"),
+        "evidence must indicate 1 skipped file: {info_finding:?}"
+    );
+
+    // Part 2: A set of files totalling over 64 MiB loads only up to it in sorted path order
+    let task_dir_budget = tempdir().expect("task dir budget");
+    fs::create_dir_all(task_dir_budget.path().join("solution")).expect("mkdir solution");
+    let chunk_data = vec![b'B'; 15 * 1024 * 1024];
+    fs::write(
+        task_dir_budget.path().join("solution/file_a.bin"),
+        &chunk_data,
+    )
+    .expect("write a");
+    fs::write(
+        task_dir_budget.path().join("solution/file_b.bin"),
+        &chunk_data,
+    )
+    .expect("write b");
+    fs::write(
+        task_dir_budget.path().join("solution/file_c.bin"),
+        &chunk_data,
+    )
+    .expect("write c");
+    fs::write(
+        task_dir_budget.path().join("solution/file_d.bin"),
+        &chunk_data,
+    )
+    .expect("write d");
+    fs::write(
+        task_dir_budget.path().join("solution/file_e.bin"),
+        &chunk_data,
+    )
+    .expect("write e");
+
+    let task_budget = load_undated_task(task_dir_budget.path()).expect("load task budget");
+    assert_eq!(
+        task_budget.skipped_files_count, 1,
+        "5th file must be skipped when 64 MiB budget is reached"
+    );
+    assert_eq!(
+        task_budget.files.len(),
+        4,
+        "only first 4 files up to 64 MiB should be loaded"
+    );
+    assert_eq!(task_budget.files[0].0, "solution/file_a.bin");
+    assert_eq!(task_budget.files[1].0, "solution/file_b.bin");
+    assert_eq!(task_budget.files[2].0, "solution/file_c.bin");
+    assert_eq!(task_budget.files[3].0, "solution/file_d.bin");
+}
+
+#[test]
+fn test_fix5_nul_plus_6mib_ff_classified_binary_not_skipped_for_size() {
+    let mut exact_input = Vec::with_capacity(1 + 6 * 1024 * 1024);
+    exact_input.push(0x00);
+    exact_input.resize(1 + 6 * 1024 * 1024, 0xFF);
+
+    let task_dir = tempdir().expect("task dir");
+    fs::create_dir_all(task_dir.path().join("solution")).expect("mkdir solution");
+    fs::write(task_dir.path().join("solution/nul_ff.bin"), &exact_input).expect("write binary");
+
+    let task = load_undated_task(task_dir.path()).expect("load task");
+    assert_eq!(
+        task.skipped_files_count, 0,
+        "NUL + 6 MiB of 0xFF must not be skipped during loading (actual bytes <= 16 MiB)"
+    );
+    assert_eq!(task.files.len(), 1);
+
+    let base_dir = tempdir().expect("base dir");
+    let fp = FingerprintSet::from_files(&task.files, base_dir.path()).expect("from_files");
+    assert_eq!(
+        fp.skipped_files_count, 0,
+        "from_files must not skip NUL + 6 MiB of 0xFF for size"
+    );
+    // Classified as binary, so tier 1 text lines/windows must be 0
+    assert_eq!(fp.lines_count, 0, "binary file must have 0 lines");
+    assert_eq!(fp.windows_count, 0, "binary file must have 0 windows");
+    assert_eq!(fp.winnow_count, 0, "binary file must have 0 winnow");
+}
+
+#[test]
+fn test_fix6_identical_base_and_solution_binary_subtracted_no_gate() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+
+    // Identical binary with NUL in first 8 KiB and printable runs of 8+ characters
+    let mut binary_bytes = Vec::new();
+    binary_bytes.extend_from_slice(b"\x7fELF\x00\x00\x00\x00header_padding_data_here\n");
+    binary_bytes.extend_from_slice(b"identical_binary_symbol_token_one\x00");
+    binary_bytes.extend_from_slice(b"identical_binary_symbol_token_two\x00");
+
+    let base_dir = tempdir().expect("base dir");
+    fs::write(base_dir.path().join("libcommon.so"), &binary_bytes).expect("write base binary");
+
+    let task_dir = tempdir().expect("task dir");
+    fs::create_dir_all(task_dir.path().join("solution")).expect("mkdir solution");
+    fs::write(task_dir.path().join("solution/libcommon.so"), &binary_bytes)
+        .expect("write solution binary");
+
+    let task = load_undated_task(task_dir.path()).expect("load task");
+    let fp = FingerprintSet::from_files(&task.files, base_dir.path()).expect("from_files");
+
+    assert_eq!(
+        fp.binary_items_count, 0,
+        "identical solution binary to base-tree must yield 0 surviving binary items after subtraction"
+    );
+    assert!(
+        fp.binary_subtracted_count >= 2,
+        "binary items from identical base binary must be subtracted, got {}",
+        fp.binary_subtracted_count
+    );
+
+    // Scan a root containing the same binary: must not gate!
+    let scan_root = tempdir().expect("scan root");
+    fs::write(scan_root.path().join("libcommon.so"), &binary_bytes).expect("write scan binary");
+
+    let findings = scan_tree(
+        scan_root.path(),
+        &fp,
+        &ScanOptions {
+            undated: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        findings.iter().all(|f| f.severity != Severity::Gate),
+        "scanning root with unchanged base binary must not gate: {findings:?}"
+    );
+
+    // CLI test
+    let out = Command::new(bin_path)
+        .arg("scan")
+        .arg("--undated")
+        .arg("--task")
+        .arg(task_dir.path())
+        .arg("--base-tree")
+        .arg(base_dir.path())
+        .arg("--root")
+        .arg(scan_root.path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("scan");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse json");
+    assert_eq!(json["gate"], false);
+    assert_eq!(json["fingerprints"]["binary_items"], 0);
+    assert!(json["fingerprints"]["binary_subtracted"].as_u64().unwrap() >= 2);
 }

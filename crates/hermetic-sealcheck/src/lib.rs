@@ -50,8 +50,8 @@ pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};
 pub use scan::{
-    compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
-    ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
+    compute_unit_hashes, match_unit, match_unit_hashes, scan_problem_statement, scan_tree,
+    walk_tree, Finding, ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
 };
 pub use undated::{load_undated_task, UndatedTask};
 pub use winnow::{

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -281,19 +282,25 @@ impl FingerprintSet {
                 }
 
                 // Added and removed lines
+                let mut seen_lines = HashSet::new();
+                let mut seen_removed = HashSet::new();
                 for diff_line in &hunk.lines {
                     match diff_line.line_type {
                         DiffLineType::Added => {
                             if let Some(norm) = normalize_line(&diff_line.content) {
                                 let hash = sha256_hex(norm.as_bytes());
-                                lines.push((hash, norm));
+                                if seen_lines.insert(hash.clone()) {
+                                    lines.push((hash, norm));
+                                }
                             }
                         }
                         DiffLineType::Removed => {
                             if let Some(norm) = normalize_line(&diff_line.content) {
                                 let marker = format!("-{}", norm);
                                 let hash = sha256_hex(marker.as_bytes());
-                                removed_markers.push((hash, marker));
+                                if seen_removed.insert(hash.clone()) {
+                                    removed_markers.push((hash, marker));
+                                }
                             }
                         }
                         DiffLineType::Context => {}
@@ -463,11 +470,14 @@ impl FingerprintSet {
 
             for hunk in &file.hunks {
                 let mut lines = Vec::new();
+                let mut seen_lines = HashSet::new();
                 for diff_line in &hunk.lines {
                     if diff_line.line_type == DiffLineType::Added {
                         if let Some(norm) = normalize_line(&diff_line.content) {
                             let hash = sha256_hex(norm.as_bytes());
-                            lines.push((hash, norm));
+                            if seen_lines.insert(hash.clone()) {
+                                lines.push((hash, norm));
+                            }
                         }
                     }
                 }
@@ -492,7 +502,7 @@ impl FingerprintSet {
 
     /// Build tier 1, tier 3, and binary tier fingerprints from task files in undated mode (TR-SC-9).
     pub fn from_files(
-        files: &[(String, String)],
+        files: &[(String, Vec<u8>)],
         base_tree: &Path,
     ) -> Result<Self, FingerprintError> {
         const MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
@@ -503,8 +513,8 @@ impl FingerprintSet {
         let mut candidate_hunks: Vec<CandidateHunk> = Vec::new();
         let mut global_hunk_counter = 0;
 
-        for (file_path, text) in files {
-            let file_bytes = text.len();
+        for (file_path, bytes) in files {
+            let file_bytes = bytes.len();
             if file_bytes > MAX_FILE_BYTES
                 || total_bytes.saturating_add(file_bytes) > MAX_TOTAL_BYTES
             {
@@ -513,7 +523,6 @@ impl FingerprintSet {
             }
             total_bytes += file_bytes;
 
-            let bytes = text.as_bytes();
             let head = &bytes[..bytes.len().min(8192)];
             let is_binary = head.contains(&0);
 
@@ -548,13 +557,17 @@ impl FingerprintSet {
                 });
                 global_hunk_counter += 1;
             } else {
+                let text = String::from_utf8_lossy(bytes);
                 let file_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
                 let mut lines = Vec::new();
+                let mut seen_lines = HashSet::new();
                 for line in &file_lines {
                     if let Some(norm) = normalize_line(line) {
                         let hash = sha256_hex(norm.as_bytes());
-                        lines.push((hash, norm));
+                        if seen_lines.insert(hash.clone()) {
+                            lines.push((hash, norm));
+                        }
                     }
                 }
 
@@ -622,7 +635,7 @@ impl FingerprintSet {
                     diff_shapes.push((diff_shape_seq, format!("diff-shape:seq:{}", file_path)));
                 }
 
-                let all_tokens = tokenize(text);
+                let all_tokens = tokenize(&text);
                 let token_texts: Vec<String> = all_tokens.iter().map(|t| t.text.clone()).collect();
                 let fps = winnow_tokens(&token_texts);
                 let mut winnow_candidates = Vec::new();
@@ -632,7 +645,7 @@ impl FingerprintSet {
                     winnow_candidates.push((fp.hash, ev));
                 }
 
-                let raw_items = crate::binary::extract_binary_items(text);
+                let raw_items = crate::binary::extract_binary_items(&text);
                 let mut seen_items = HashSet::new();
                 let mut binary_items = Vec::new();
                 for it in raw_items {
@@ -682,8 +695,44 @@ fn finish_fingerprint_set(
             .flatten()
         {
             if entry.file_type().is_file() {
-                // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
-                if let Some(content) = read_text_like_scanner(entry.path()) {
+                const MAX_BASELINE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() > MAX_BASELINE_FILE_BYTES {
+                        continue;
+                    }
+                }
+                let mut bytes = Vec::new();
+                if let Ok(file) = fs::File::open(entry.path()) {
+                    if file
+                        .take(MAX_BASELINE_FILE_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .is_err()
+                        || bytes.len() as u64 > MAX_BASELINE_FILE_BYTES
+                    {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                let head = &bytes[..bytes.len().min(8192)];
+                let is_binary = head.contains(&0);
+
+                if is_binary {
+                    let runs = crate::binary::extract_printable_runs(&bytes, 8);
+                    for run in runs {
+                        if !run.chars().any(char::is_control) {
+                            base_binary_tokens.insert(run.clone());
+                        }
+                        for token in crate::binary::word_tokens(&run) {
+                            if token.len() >= 8 && !token.chars().any(char::is_control) {
+                                base_binary_tokens.insert(token.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
+                    let content = String::from_utf8_lossy(&bytes);
                     let file_lines: Vec<&str> = content.lines().collect();
 
                     // Line hashes & counts
@@ -756,20 +805,22 @@ fn finish_fingerprint_set(
 
     for ch in candidate_hunks {
         let mut surviving_lines = Vec::new();
+        let mut seen_surviving_lines = HashSet::new();
         for (hash, norm) in ch.lines {
             if base_line_hashes.contains(&hash) {
                 subtracted_count += 1;
-            } else {
+            } else if seen_surviving_lines.insert(hash.clone()) {
                 hash_to_evidence.insert(hash.clone(), norm.clone());
                 surviving_lines.push((hash, norm));
             }
         }
 
         let mut surviving_windows = Vec::new();
+        let mut seen_surviving_windows = HashSet::new();
         for (hash, w_lines) in ch.windows {
             if base_window_hashes.contains(&hash) {
                 subtracted_count += 1;
-            } else {
+            } else if seen_surviving_windows.insert(hash.clone()) {
                 let ev = w_lines
                     .iter()
                     .map(|l| clean_line(l, false))
@@ -780,8 +831,13 @@ fn finish_fingerprint_set(
             }
         }
 
-        for (hash, marker) in &ch.removed_markers {
-            hash_to_evidence.insert(hash.clone(), marker.clone());
+        let mut surviving_removed_markers = Vec::new();
+        let mut seen_surviving_removed = HashSet::new();
+        for (hash, marker) in ch.removed_markers {
+            if seen_surviving_removed.insert(hash.clone()) {
+                hash_to_evidence.insert(hash.clone(), marker.clone());
+                surviving_removed_markers.push((hash, marker));
+            }
         }
 
         for (hash, desc) in &ch.diff_shapes {
@@ -815,6 +871,9 @@ fn finish_fingerprint_set(
         let mut line_fingerprints = HashMap::new();
         let mut total_line_weight = 0.0;
         for (hash, norm) in &surviving_lines {
+            if line_fingerprints.contains_key(hash) {
+                continue;
+            }
             let count = base_line_counts.get(norm).copied().unwrap_or(0);
             // line: 1 / (1 + count)
             let w = 1.0 / (1.0 + count as f64);
@@ -825,6 +884,9 @@ fn finish_fingerprint_set(
         let mut window_fingerprints = HashMap::new();
         let mut total_window_weight = 0.0;
         for (hash, w_lines) in &surviving_windows {
+            if window_fingerprints.contains_key(hash) {
+                continue;
+            }
             // window: minimum raw weight of its lines
             let min_w = w_lines
                 .iter()
@@ -841,7 +903,10 @@ fn finish_fingerprint_set(
 
         let mut removed_map = HashMap::new();
         let mut total_removed_weight = 0.0;
-        for (hash, marker) in &ch.removed_markers {
+        for (hash, marker) in &surviving_removed_markers {
+            if removed_map.contains_key(hash) {
+                continue;
+            }
             let cleaned = marker.strip_prefix('-').unwrap_or(marker);
             let count = base_line_counts.get(cleaned).copied().unwrap_or(0);
             let w = 1.0 / (1.0 + count as f64);

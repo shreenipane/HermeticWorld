@@ -165,7 +165,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
-        let fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        let mut fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        fp.skipped_files_count += undated_task.skipped_files_count;
 
         let signatures = if let Some(ref sig_file) = args.signatures {
             BenchmarkSignatures::load_from_file(Some(undated_task.instance_id.clone()), sig_file)?
@@ -409,7 +410,8 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
-        let fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        let mut fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        fp.skipped_files_count += undated_task.skipped_files_count;
 
         let signatures = BenchmarkSignatures::new(Some(undated_task.instance_id.clone()));
         let d0_opts = ScanOptions {

@@ -1,12 +1,14 @@
 use std::fs;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndatedTask {
     pub instance_id: String,
     pub instruction: String,
-    pub files: Vec<(String, String)>,
+    pub files: Vec<(String, Vec<u8>)>,
+    pub skipped_files_count: usize,
 }
 
 fn strip_quotes(s: &str) -> &str {
@@ -111,6 +113,37 @@ fn get_directory_name(task_dir: &Path) -> String {
         .to_string()
 }
 
+fn is_block_scalar_indicator(s: &str) -> bool {
+    if !s.starts_with('|') && !s.starts_with('>') {
+        return false;
+    }
+    let rest = &s[1..];
+    if rest.is_empty() {
+        return true;
+    }
+    if rest.len() > 3 {
+        return false;
+    }
+    let mut has_chomp = false;
+    let mut has_indent = false;
+    for ch in rest.chars() {
+        if ch == '+' || ch == '-' {
+            if has_chomp {
+                return false;
+            }
+            has_chomp = true;
+        } else if ch.is_ascii_digit() && ch != '0' {
+            if has_indent {
+                return false;
+            }
+            has_indent = true;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 fn extract_yaml_instruction(content: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
@@ -119,14 +152,8 @@ fn extract_yaml_instruction(content: &str) -> Option<String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("instruction:") {
-            let after_colon = rest.trim();
-            if after_colon == "|"
-                || after_colon == "|-"
-                || after_colon == "|+"
-                || after_colon == ">"
-                || after_colon == ">-"
-                || after_colon == ">+"
-            {
+            let after_colon = strip_inline_comment(rest).trim();
+            if is_block_scalar_indicator(after_colon) {
                 let mut block_lines = Vec::new();
                 let mut block_indent = None;
                 for next_line in &lines[i + 1..] {
@@ -156,7 +183,7 @@ fn extract_yaml_instruction(content: &str) -> Option<String> {
                     return Some(block_lines.join("\n"));
                 }
             } else if !after_colon.is_empty() {
-                let unquoted = strip_quotes(strip_inline_comment(after_colon));
+                let unquoted = strip_quotes(after_colon);
                 return Some(unquoted.to_string());
             }
         }
@@ -180,32 +207,103 @@ fn extract_instruction(task_dir: &Path) -> String {
     String::new()
 }
 
-fn gather_undated_files(task_dir: &Path) -> Result<Vec<(String, String)>, std::io::Error> {
-    let mut files = Vec::new();
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+type GatheredFiles = (Vec<(String, Vec<u8>)>, usize);
+
+fn gather_undated_files(task_dir: &Path) -> Result<GatheredFiles, std::io::Error> {
+    let mut collected_paths: Vec<(PathBuf, String)> = Vec::new();
     for sub in &["solution", "tests"] {
         let sub_dir = task_dir.join(sub);
         if sub_dir.is_dir() {
-            for entry in WalkDir::new(&sub_dir)
+            for entry_res in WalkDir::new(&sub_dir)
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| !e.path_is_symlink())
-                .flatten()
             {
+                let entry = entry_res.map_err(|e| {
+                    let p = e.path().unwrap_or(&sub_dir);
+                    std::io::Error::new(
+                        e.io_error()
+                            .map(|io_err| io_err.kind())
+                            .unwrap_or(std::io::ErrorKind::Other),
+                        format!("failed to traverse '{}': {}", p.display(), e),
+                    )
+                })?;
                 if entry.file_type().is_file() {
-                    let path = entry.path();
+                    let path = entry.into_path();
                     let rel_path = match path.strip_prefix(task_dir) {
                         Ok(p) => p.to_string_lossy().replace('\\', "/"),
                         Err(_) => path.to_string_lossy().replace('\\', "/"),
                     };
-                    let bytes = fs::read(path)?;
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    files.push((rel_path, text));
+                    collected_paths.push((path, rel_path));
                 }
             }
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
+
+    // Collect and sort the file paths first
+    collected_paths.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut total_bytes = 0usize;
+    let mut skipped_files_count = 0usize;
+    let mut files = Vec::new();
+
+    for (path, rel_path) in collected_paths {
+        if total_bytes >= MAX_TOTAL_BYTES {
+            skipped_files_count += 1;
+            continue;
+        }
+
+        let metadata = fs::metadata(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read metadata for '{}': {}", path.display(), e),
+            )
+        })?;
+        let file_len = metadata.len();
+
+        if file_len > MAX_FILE_BYTES {
+            skipped_files_count += 1;
+            continue;
+        }
+
+        if total_bytes.saturating_add(file_len as usize) > MAX_TOTAL_BYTES {
+            skipped_files_count += 1;
+            continue;
+        }
+
+        let file = fs::File::open(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to open file '{}': {}", path.display(), e),
+            )
+        })?;
+        let mut handle = file.take(MAX_FILE_BYTES + 1);
+        let mut bytes = Vec::with_capacity(file_len.min(MAX_FILE_BYTES) as usize);
+        handle.read_to_end(&mut bytes).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read file '{}': {}", path.display(), e),
+            )
+        })?;
+
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            skipped_files_count += 1;
+            continue;
+        }
+
+        if total_bytes.saturating_add(bytes.len()) > MAX_TOTAL_BYTES {
+            skipped_files_count += 1;
+            continue;
+        }
+
+        total_bytes += bytes.len();
+        files.push((rel_path, bytes));
+    }
+
+    Ok((files, skipped_files_count))
 }
 
 pub fn load_undated_task(task_dir: &Path) -> Result<UndatedTask, std::io::Error> {
@@ -222,11 +320,12 @@ pub fn load_undated_task(task_dir: &Path) -> Result<UndatedTask, std::io::Error>
     let instance_id =
         extract_id_from_metadata(task_dir).unwrap_or_else(|| get_directory_name(task_dir));
     let instruction = extract_instruction(task_dir);
-    let files = gather_undated_files(task_dir)?;
+    let (files, skipped_files_count) = gather_undated_files(task_dir)?;
 
     Ok(UndatedTask {
         instance_id,
         instruction,
         files,
+        skipped_files_count,
     })
 }
