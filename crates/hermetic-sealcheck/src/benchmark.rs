@@ -71,15 +71,25 @@ pub fn check_d9_path(
     signatures: &BenchmarkSignatures,
     visibility: Visibility,
 ) -> Vec<Finding> {
+    check_d9_path_with_display(path, path, signatures, visibility)
+}
+
+/// Check relative path against D9 path signatures, while reporting finding under display_path.
+pub fn check_d9_path_with_display(
+    match_path: &str,
+    display_path: &str,
+    signatures: &BenchmarkSignatures,
+    visibility: Visibility,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let lower_path = path.to_ascii_lowercase();
+    let lower_path = match_path.to_ascii_lowercase();
 
     for &name in BUILTIN_DATASET_PATHS {
         if lower_path.contains(name) {
             findings.push(Finding {
                 detector: "D9".into(),
                 channel: "dataset_path".into(),
-                path: path.to_string(),
+                path: display_path.to_string(),
                 visibility,
                 severity: Severity::Gate,
                 confidence: 1.0,
@@ -92,11 +102,11 @@ pub fn check_d9_path(
 
     // External path signatures
     for sig in &signatures.external {
-        if sig.kind == "path" && path.contains(&sig.pattern) {
+        if sig.kind == "path" && match_path.contains(&sig.pattern) {
             findings.push(Finding {
                 detector: "D9".into(),
                 channel: sig.id.clone(),
-                path: path.to_string(),
+                path: display_path.to_string(),
                 visibility,
                 severity: sig.severity,
                 confidence: 1.0,

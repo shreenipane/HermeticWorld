@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::tempdir;
 
@@ -184,5 +184,132 @@ fn test_d3_pyc_hash_based() {
     assert!(
         !hash_findings.is_empty(),
         "hash-based pyc must produce pyc_hash_unchecked info finding"
+    );
+}
+
+#[test]
+fn test_h8_pyc_headers_old_and_invalid() {
+    let root_dir = tempdir().expect("tempdir");
+    let pycache = root_dir.path().join("__pycache__");
+    fs::create_dir_all(&pycache).expect("mkdir pycache");
+
+    let source_path = root_dir.path().join("old_mod.py");
+    fs::write(&source_path, "def run():\n    return 42\n").expect("write source");
+    let src_size = fs::metadata(&source_path).expect("meta").len() as u32;
+    set_file_mtime(&source_path, 4000);
+
+    let fp = FingerprintSet::from_task("", "", root_dir.path()).expect("fp");
+    let opts = ScanOptions {
+        visibility: Visibility::AgentVisible,
+        ..Default::default()
+    };
+
+    // 1. Fresh 12-byte pyc (magic 3379)
+    let fresh_12_path = pycache.join("old_mod.cpython-36.pyc");
+    let mut header_12 = [0u8; 12];
+    header_12[0..2].copy_from_slice(&3379u16.to_le_bytes());
+    header_12[2..4].copy_from_slice(&[0x0d, 0x0a]);
+    header_12[4..8].copy_from_slice(&4000u32.to_le_bytes()); // mtime
+    header_12[8..12].copy_from_slice(&src_size.to_le_bytes()); // size
+    fs::write(&fresh_12_path, header_12).expect("write 12-byte pyc");
+
+    let findings_fresh = scan_tree(root_dir.path(), &fp, &opts);
+    let d3_fresh: Vec<_> = findings_fresh
+        .iter()
+        .filter(|f| f.detector == "D3" && f.path.contains("old_mod.cpython-36.pyc"))
+        .collect();
+    assert!(
+        d3_fresh.is_empty(),
+        "fresh 12-byte pyc (magic 3379) must have 0 findings, got: {:?}",
+        d3_fresh
+    );
+
+    // 2. Stale 12-byte pyc (mtime mismatch)
+    let stale_12_path = pycache.join("stale_mod.cpython-36.pyc");
+    let stale_source = root_dir.path().join("stale_mod.py");
+    fs::write(&stale_source, "def stale(): pass\n").expect("write source");
+    set_file_mtime(&stale_source, 4000);
+    let stale_src_size = fs::metadata(&stale_source).expect("meta").len() as u32;
+    let mut stale_hdr_12 = [0u8; 12];
+    stale_hdr_12[0..2].copy_from_slice(&3379u16.to_le_bytes());
+    stale_hdr_12[2..4].copy_from_slice(&[0x0d, 0x0a]);
+    stale_hdr_12[4..8].copy_from_slice(&1000u32.to_le_bytes()); // mismatch mtime
+    stale_hdr_12[8..12].copy_from_slice(&stale_src_size.to_le_bytes());
+    fs::write(&stale_12_path, stale_hdr_12).expect("write stale pyc");
+
+    let findings_stale = scan_tree(root_dir.path(), &fp, &opts);
+    let d3_stale: Vec<_> = findings_stale
+        .iter()
+        .filter(|f| {
+            f.detector == "D3"
+                && f.channel == "pyc_stale"
+                && f.severity == Severity::Gate
+                && f.path.contains("stale_mod.cpython-36.pyc")
+        })
+        .collect();
+    assert!(
+        !d3_stale.is_empty(),
+        "stale 12-byte pyc must give D3 pyc_stale gate"
+    );
+
+    // 3. Fresh 8-byte pyc (magic 62211, Python 2.7) with different source size
+    let py27_source = root_dir.path().join("py27.py");
+    fs::write(&py27_source, "print 'hello world'\n").expect("write source");
+    set_file_mtime(&py27_source, 5000);
+    let py27_path = root_dir.path().join("py27.pyc");
+    let mut header_8 = [0u8; 8];
+    header_8[0..2].copy_from_slice(&62211u16.to_le_bytes());
+    header_8[2..4].copy_from_slice(&[0x0d, 0x0a]);
+    header_8[4..8].copy_from_slice(&5000u32.to_le_bytes()); // mtime matches
+    fs::write(&py27_path, header_8).expect("write 8-byte pyc");
+
+    let findings_8 = scan_tree(root_dir.path(), &fp, &opts);
+    let d3_py27: Vec<_> = findings_8
+        .iter()
+        .filter(|f| f.detector == "D3" && f.path.contains("py27.pyc"))
+        .collect();
+    assert!(
+        d3_py27.is_empty(),
+        "fresh 8-byte pyc (62211) must stay fresh even without size, got: {:?}",
+        d3_py27
+    );
+
+    // 4. Too-short file gives pyc_invalid
+    let short_path = root_dir.path().join("short.pyc");
+    let short_bytes = [0x33, 0x0d, 0x0d, 0x0a, 0x00, 0x00];
+    fs::write(&short_path, short_bytes).expect("write short");
+
+    let findings_short = scan_tree(root_dir.path(), &fp, &opts);
+    let d3_invalid: Vec<_> = findings_short
+        .iter()
+        .filter(|f| {
+            f.detector == "D3"
+                && f.channel == "pyc_invalid"
+                && f.severity == Severity::Info
+                && f.path.contains("short.pyc")
+        })
+        .collect();
+    assert!(
+        !d3_invalid.is_empty(),
+        "too-short pyc file must give pyc_invalid info finding"
+    );
+}
+
+#[test]
+fn test_h9_dotted_and_opt_pyc_source_location() {
+    let p1 = Path::new("/workspace/__pycache__/a.b.cpython-36.pyc");
+    let src1 = hermetic_sealcheck::locate_pyc_source(p1);
+    assert_eq!(
+        src1,
+        Some(PathBuf::from("/workspace/a.b.py")),
+        "a.b.cpython-36.pyc must locate to a.b.py"
+    );
+
+    let p2 = Path::new("/workspace/__pycache__/a.cpython-36.opt-1.pyc");
+    let src2 = hermetic_sealcheck::locate_pyc_source(p2);
+    assert_eq!(
+        src2,
+        Some(PathBuf::from("/workspace/a.py")),
+        "a.cpython-36.opt-1.pyc must locate to a.py"
     );
 }

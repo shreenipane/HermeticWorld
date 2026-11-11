@@ -53,6 +53,13 @@ pub fn tokenize(text: &str) -> Vec<Token> {
                         line += 1;
                     }
                     if bytes[i] == b'\\' {
+                        if i + 1 < len && bytes[i + 1] == b'\n' {
+                            line += 1;
+                        } else if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                            line += 1;
+                            i += 3;
+                            continue;
+                        }
                         i += 2;
                         continue;
                     }
@@ -231,17 +238,23 @@ pub struct WinnowFingerprint {
     pub token_pos: usize,
 }
 
-/// Compute winnow fingerprints for a token sequence.
-pub fn winnow_tokens(tokens: &[String]) -> Vec<WinnowFingerprint> {
+/// Compute k-gram hashes for a token sequence.
+pub fn kgram_hashes(tokens: &[String]) -> Vec<u64> {
     if tokens.len() < K_GRAM_SIZE {
         return Vec::new();
     }
     let num_kgrams = tokens.len() - K_GRAM_SIZE + 1;
-    let mut kgram_hashes = Vec::with_capacity(num_kgrams);
+    let mut hashes = Vec::with_capacity(num_kgrams);
     for i in 0..num_kgrams {
-        kgram_hashes.push(hash_kgram(&tokens[i..i + K_GRAM_SIZE]));
+        hashes.push(hash_kgram(&tokens[i..i + K_GRAM_SIZE]));
     }
-    winnow_hashes(&kgram_hashes)
+    hashes
+}
+
+/// Compute winnow fingerprints for a token sequence.
+pub fn winnow_tokens(tokens: &[String]) -> Vec<WinnowFingerprint> {
+    let hashes = kgram_hashes(tokens);
+    winnow_hashes(&hashes)
 }
 
 /// Winnow a sequence of k-gram hashes with window w = 8, robust winnowing

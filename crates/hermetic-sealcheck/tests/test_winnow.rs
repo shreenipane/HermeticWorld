@@ -182,3 +182,71 @@ fn test_winnow_planted_reformatted_copy_gives_tier3_gate() {
         "Reformatted copy must produce a tier 3 winnow gate finding"
     );
 }
+
+#[test]
+fn test_h10_triple_quoted_string_backslash_newline_line_counting() {
+    let text = "'''first line\\\nsecond line\n'''\nx = 1\n";
+    let tokens = hermetic_sealcheck::tokenize(text);
+    // Line 0: '''first line\ (escaped newline)
+    // Line 1: second line
+    // Line 2: ''' (closing quote)
+    // Line 3: x = 1
+    let x_token = tokens.iter().find(|t| t.text == "x").expect("find x token");
+    assert_eq!(
+        x_token.line, 3,
+        "token 'x' after triple-quoted string with backslash-newline must have line 3, got {}",
+        x_token.line
+    );
+}
+
+#[test]
+fn test_h11_baseline_subtraction_unselected_base_kgram() {
+    use hermetic_sealcheck::winnow_hashes;
+    use std::collections::HashSet;
+
+    // 1. Build a deterministic base k-gram hash sequence:
+    // Seven of hash 100, then one of hash 10.
+    let base_kgram_hashes = vec![100u64, 100, 100, 100, 100, 100, 100, 10];
+    let base_winnow_selected = winnow_hashes(&base_kgram_hashes);
+    // Base winnowing selected ONLY hash 10, because 10 is the minimum of window [100..10]
+    assert_eq!(base_winnow_selected.len(), 1);
+    assert_eq!(base_winnow_selected[0].hash, 10);
+    let base_selected_set: HashSet<u64> = base_winnow_selected.iter().map(|f| f.hash).collect();
+    assert!(!base_selected_set.contains(&100));
+
+    // 2. Build a post-fix slice whose selected k-gram exists at base (hash 100)
+    // but was not selected by base's winnowing:
+    // Hash 100, followed by seven of hash 200.
+    let postfix_kgram_hashes = vec![100u64, 200, 200, 200, 200, 200, 200, 200];
+    let postfix_selected = winnow_hashes(&postfix_kgram_hashes);
+    // Post-fix winnowing selects hash 100 at pos 0!
+    assert_eq!(postfix_selected.len(), 1);
+    assert_eq!(postfix_selected[0].hash, 100);
+
+    // Old T1.2 behavior:
+    // Base subtraction only subtracted hashes selected by base's own winnowing:
+    let old_surviving: Vec<_> = postfix_selected
+        .iter()
+        .filter(|f| !base_selected_set.contains(&f.hash))
+        .collect();
+    assert_eq!(
+        old_surviving.len(),
+        1,
+        "under old T1.2 behavior, unselected base k-gram survived"
+    );
+
+    // New H11 behavior:
+    // Base subtraction collects all k-gram hashes occurring in the base:
+    let base_all_kgrams_set: HashSet<u64> = base_kgram_hashes.into_iter().collect();
+    assert!(base_all_kgrams_set.contains(&100));
+
+    // Subtracting against all base k-grams:
+    let new_surviving: Vec<_> = postfix_selected
+        .iter()
+        .filter(|f| !base_all_kgrams_set.contains(&f.hash))
+        .collect();
+    assert!(
+        new_surviving.is_empty(),
+        "under H11, selected k-gram in post-fix that exists in base must be subtracted"
+    );
+}

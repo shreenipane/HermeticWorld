@@ -7,7 +7,7 @@ use hermetic_common::hash::sha256_hex;
 
 use crate::diff::{parse_patch, DiffLineType, DiffParseError, FilePatch};
 use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
-use crate::winnow::{tokenize, winnow_tokens};
+use crate::winnow::{kgram_hashes, tokenize, winnow_tokens};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
@@ -447,6 +447,7 @@ impl FingerprintSet {
                 .flatten()
             {
                 if entry.file_type().is_file() {
+                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
                     if let Some(content) = read_text_like_scanner(entry.path()) {
                         let file_lines: Vec<&str> = content.lines().collect();
 
@@ -488,9 +489,8 @@ impl FingerprintSet {
                         let base_tokens = tokenize(&content);
                         let base_token_texts: Vec<String> =
                             base_tokens.into_iter().map(|t| t.text).collect();
-                        let base_fps = winnow_tokens(&base_token_texts);
-                        for fp in base_fps {
-                            base_winnow_hashes.insert(fp.hash);
+                        for hash in kgram_hashes(&base_token_texts) {
+                            base_winnow_hashes.insert(hash);
                         }
                     }
                 }
@@ -560,6 +560,7 @@ impl FingerprintSet {
             let mut total_line_weight = 0.0;
             for (hash, norm) in &surviving_lines {
                 let count = base_line_counts.get(norm).copied().unwrap_or(0);
+                // line: 1 / (1 + count)
                 let w = 1.0 / (1.0 + count as f64);
                 line_fingerprints.insert(hash.clone(), w);
                 total_line_weight += w;
@@ -568,6 +569,7 @@ impl FingerprintSet {
             let mut window_fingerprints = HashMap::new();
             let mut total_window_weight = 0.0;
             for (hash, w_lines) in &surviving_windows {
+                // window: minimum raw weight of its lines
                 let min_w = w_lines
                     .iter()
                     .map(|l| {

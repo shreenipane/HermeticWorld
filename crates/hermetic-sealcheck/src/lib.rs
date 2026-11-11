@@ -13,8 +13,11 @@ pub mod winnow;
 use serde::{Deserialize, Serialize};
 
 pub use benchmark::{BenchmarkSignatures, ExternalSignature};
-pub use bytecode::{check_pyc_bytecode, locate_pyc_source};
-pub use containers::{detect_container_type, scan_container_or_unit, CountingReader};
+pub use bytecode::{check_pyc_bytecode, locate_pyc_source, pyc_header_len, pyc_magic};
+pub use containers::{
+    detect_container_type, extract_pyc_constants, is_tar, scan_container_or_unit,
+    scan_container_or_unit_with_root_prefix, CountingReader,
+};
 pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
 };
@@ -22,7 +25,9 @@ pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, SarifLog};
 pub use scan::{scan_problem_statement, scan_tree, Finding, ScanOptions, Severity, Visibility};
-pub use winnow::{hash_kgram, tokenize, winnow_hashes, winnow_tokens, Token, WinnowFingerprint};
+pub use winnow::{
+    hash_kgram, kgram_hashes, tokenize, winnow_hashes, winnow_tokens, Token, WinnowFingerprint,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FingerprintSummary {

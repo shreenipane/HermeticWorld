@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -7,7 +9,9 @@ use hermetic_common::hash::sha256_hex;
 
 use crate::benchmark::BenchmarkSignatures;
 use crate::bytecode::check_pyc_bytecode;
-use crate::containers::scan_container_or_unit;
+use crate::containers::{
+    detect_container_type, scan_container_or_unit_with_root_prefix, ContainerType,
+};
 use crate::diff::parse_patch;
 use crate::fingerprint::FingerprintSet;
 use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
@@ -438,6 +442,8 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
 /// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let root_str = root.display().to_string();
+    let root_prefix_len = root_str.len();
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         let path = e.path();
@@ -505,21 +511,48 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
 
         // Size check for loose file
         if metadata.len() > opts.max_file_bytes {
-            findings.push(Finding {
-                detector: "D2".into(),
-                channel: "file".into(),
-                path: display_path,
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec![format!(
-                    "skipped file exceeding max size ({} bytes > {} bytes)",
-                    metadata.len(),
-                    opts.max_file_bytes
-                )],
-            });
-            continue;
+            let is_large_archive = if metadata.len() <= opts.max_member_bytes {
+                if let Ok(mut f) = File::open(file_path) {
+                    let mut head = [0u8; 512];
+                    if let Ok(n) = f.read(&mut head) {
+                        matches!(
+                            detect_container_type(&head[..n], &display_path),
+                            Some(
+                                ContainerType::Zip
+                                    | ContainerType::Tar
+                                    | ContainerType::Gzip
+                                    | ContainerType::Bzip2
+                                    | ContainerType::Xz
+                                    | ContainerType::Zstd
+                            )
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !is_large_archive {
+                findings.push(Finding {
+                    detector: "D2".into(),
+                    channel: "file".into(),
+                    path: display_path,
+                    visibility: opts.visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec![format!(
+                        "skipped file exceeding max size ({} bytes > {} bytes)",
+                        metadata.len(),
+                        opts.max_file_bytes
+                    )],
+                });
+                continue;
+            }
         }
 
         // Loose .pyc check: PEP 552 bytecode check (D3)
@@ -545,8 +578,14 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             }
         };
 
-        let unit_findings =
-            scan_container_or_unit(&display_path, &bytes, fp, &opts.signatures, opts);
+        let unit_findings = scan_container_or_unit_with_root_prefix(
+            &display_path,
+            &bytes,
+            fp,
+            &opts.signatures,
+            opts,
+            root_prefix_len,
+        );
         findings.extend(unit_findings);
     }
 

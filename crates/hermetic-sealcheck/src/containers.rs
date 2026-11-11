@@ -3,7 +3,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::benchmark::{check_d9_content, check_d9_path, BenchmarkSignatures};
+use crate::benchmark::{check_d9_content, check_d9_path_with_display, BenchmarkSignatures};
+use crate::bytecode::{pyc_header_len, pyc_magic};
 use crate::fingerprint::FingerprintSet;
 use crate::scan::{match_unit, Finding, ScanOptions, Severity};
 
@@ -21,8 +22,11 @@ pub enum ContainerType {
 }
 
 pub fn detect_container_type(bytes: &[u8], path: &str) -> Option<ContainerType> {
-    if bytes.starts_with(b"PACK") || path.ends_with(".pack") {
-        return Some(ContainerType::GitPack);
+    if bytes.len() >= 8 && bytes.starts_with(b"PACK") {
+        let ver = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if ver == 2 || ver == 3 {
+            return Some(ContainerType::GitPack);
+        }
     }
     if bytes.starts_with(b"SQLite format 3\0") {
         return Some(ContainerType::Sqlite);
@@ -45,32 +49,60 @@ pub fn detect_container_type(bytes: &[u8], path: &str) -> Option<ContainerType> 
     if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         return Some(ContainerType::Zstd);
     }
-    if (bytes.len() >= 16 && bytes[2] == 0x0d && bytes[3] == 0x0a) || path.ends_with(".pyc") {
+    if pyc_magic(bytes).is_some() || path.ends_with(".pyc") {
         return Some(ContainerType::Pyc);
     }
-    if is_tar(bytes, path) {
+    if is_tar(bytes) {
         return Some(ContainerType::Tar);
     }
     None
 }
 
-fn is_tar(bytes: &[u8], path: &str) -> bool {
+pub fn is_tar(bytes: &[u8]) -> bool {
+    if bytes.len() < 512 {
+        return false;
+    }
     if bytes.len() >= 262 && &bytes[257..262] == b"ustar" {
         return true;
     }
-    let p = path.to_ascii_lowercase();
-    if p.ends_with(".tar")
-        || p.ends_with(".tar.gz")
-        || p.ends_with(".tgz")
-        || p.ends_with(".tar.bz2")
-        || p.ends_with(".tbz2")
-        || p.ends_with(".tar.xz")
-        || p.ends_with(".txz")
-        || p.ends_with(".tar.zst")
-    {
-        return bytes.len() >= 512;
+    tar_header_checksum_valid(&bytes[..512])
+}
+
+fn tar_header_checksum_valid(header: &[u8]) -> bool {
+    if header.len() < 512 {
+        return false;
     }
-    false
+    let cksum_slice = &header[148..156];
+    let mut start = 0;
+    while start < cksum_slice.len() && (cksum_slice[start] == 0 || cksum_slice[start] == b' ') {
+        start += 1;
+    }
+    let mut end = cksum_slice.len();
+    while end > start && (cksum_slice[end - 1] == 0 || cksum_slice[end - 1] == b' ') {
+        end -= 1;
+    }
+    if start == end {
+        return false;
+    }
+    let digits = &cksum_slice[start..end];
+    if digits.iter().any(|&b| !b.is_ascii_digit() || b > b'7') {
+        return false;
+    }
+    let Ok(octal_str) = std::str::from_utf8(digits) else {
+        return false;
+    };
+    let Ok(stored_val) = u32::from_str_radix(octal_str, 8) else {
+        return false;
+    };
+    let mut sum: u32 = 0;
+    for (i, &b) in header[..512].iter().enumerate() {
+        if (148..156).contains(&i) {
+            sum += b' ' as u32;
+        } else {
+            sum += b as u32;
+        }
+    }
+    stored_val == sum
 }
 
 /// Counting read wrapper enforcing member size, total expanded size, and expansion ratio limits.
@@ -141,10 +173,14 @@ impl<'a, R: Read> Read for CountingReader<'a, R> {
 }
 
 pub fn extract_pyc_constants(bytes: &[u8]) -> String {
-    if bytes.len() <= 16 {
+    let header_len = match pyc_magic(bytes) {
+        Some(magic) => pyc_header_len(magic),
+        None => 0,
+    };
+    if bytes.len() <= header_len {
         return String::new();
     }
-    let body = &bytes[16..];
+    let body = &bytes[header_len..];
     let mut runs = Vec::new();
     let mut current_run = Vec::new();
 
@@ -216,6 +252,7 @@ pub struct ContainerScanner<'a> {
     pub opts: &'a ScanOptions,
     pub total_expanded: u64,
     pub findings: Vec<Finding>,
+    pub root_prefix_len: usize,
 }
 
 impl<'a> ContainerScanner<'a> {
@@ -224,19 +261,37 @@ impl<'a> ContainerScanner<'a> {
         signatures: &'a BenchmarkSignatures,
         opts: &'a ScanOptions,
     ) -> Self {
+        Self::new_with_root_prefix(fp, signatures, opts, 0)
+    }
+
+    pub fn new_with_root_prefix(
+        fp: &'a FingerprintSet,
+        signatures: &'a BenchmarkSignatures,
+        opts: &'a ScanOptions,
+        root_prefix_len: usize,
+    ) -> Self {
         Self {
             fp,
             signatures,
             opts,
             total_expanded: 0,
             findings: Vec::new(),
+            root_prefix_len,
         }
     }
 
     pub fn scan(&mut self, path: &str, bytes: &[u8], depth: usize) {
-        // 1. Path check for D9 on every path
-        self.findings
-            .extend(check_d9_path(path, self.signatures, self.opts.visibility));
+        // 1. Path check for D9 on every path (relative to scan root)
+        let match_path = match path.get(self.root_prefix_len..) {
+            Some(rel) if !rel.is_empty() => rel.trim_start_matches(['/', '\\']),
+            _ => path,
+        };
+        self.findings.extend(check_d9_path_with_display(
+            match_path,
+            path,
+            self.signatures,
+            self.opts.visibility,
+        ));
 
         // 2. Check container type
         let container_type = detect_container_type(bytes, path);
@@ -387,7 +442,7 @@ impl<'a> ContainerScanner<'a> {
         };
 
         let mut stmt = match conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -423,28 +478,76 @@ impl<'a> ContainerScanner<'a> {
         };
 
         for table in table_names {
-            let query = format!("SELECT rowid, * FROM \"{}\"", table);
+            let escaped_table = table.replace('"', "\"\"");
+            let query = format!("SELECT rowid, * FROM \"{}\"", escaped_table);
             let has_rowid = conn.prepare(&query).is_ok();
 
             let (sql, has_explicit_rowid) = if has_rowid {
                 (query, true)
             } else {
-                (format!("SELECT * FROM \"{}\"", table), false)
+                (format!("SELECT * FROM \"{}\"", escaped_table), false)
             };
 
             let mut row_stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    self.findings.push(Finding {
+                        detector: "D2".into(),
+                        channel: "container_error".into(),
+                        path: format!("{}::{}", path, table),
+                        visibility: self.opts.visibility,
+                        severity: Severity::Info,
+                        confidence: 0.0,
+                        hunk: None,
+                        evidence: vec![format!(
+                            "failed to prepare statement for table '{}': {e}",
+                            table
+                        )],
+                    });
+                    continue;
+                }
             };
 
             let col_count = row_stmt.column_count();
             let mut rows = match row_stmt.query([]) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    self.findings.push(Finding {
+                        detector: "D2".into(),
+                        channel: "container_error".into(),
+                        path: format!("{}::{}", path, table),
+                        visibility: self.opts.visibility,
+                        severity: Severity::Info,
+                        confidence: 0.0,
+                        hunk: None,
+                        evidence: vec![format!("failed to query rows for table '{}': {e}", table)],
+                    });
+                    continue;
+                }
             };
 
             let mut row_idx: i64 = 0;
-            while let Ok(Some(row)) = rows.next() {
+            loop {
+                let row = match rows.next() {
+                    Ok(Some(r)) => r,
+                    Ok(None) => break,
+                    Err(e) => {
+                        self.findings.push(Finding {
+                            detector: "D2".into(),
+                            channel: "container_error".into(),
+                            path: format!("{}::{}", path, table),
+                            visibility: self.opts.visibility,
+                            severity: Severity::Info,
+                            confidence: 0.0,
+                            hunk: None,
+                            evidence: vec![format!(
+                                "failed to fetch row for table '{}': {e}",
+                                table
+                            )],
+                        });
+                        break;
+                    }
+                };
                 row_idx += 1;
                 let rowid_str = if has_explicit_rowid {
                     let id: i64 = row.get(0).unwrap_or(row_idx);
@@ -475,7 +578,7 @@ impl<'a> ContainerScanner<'a> {
                 }
 
                 if !row_text_parts.is_empty() {
-                    let row_text = row_text_parts.join(" ");
+                    let row_text = row_text_parts.join("\n");
                     let row_path = format!("{}::{}#{}", path, table, rowid_str);
                     self.scan_text(&row_path, &row_text);
                 }
@@ -608,8 +711,32 @@ impl<'a> ContainerScanner<'a> {
                 }
             };
 
-            if !entry.header().entry_type().is_file() {
-                continue;
+            let entry_type = entry.header().entry_type();
+            match entry_type {
+                tar::EntryType::Regular
+                | tar::EntryType::GNUSparse
+                | tar::EntryType::Continuous => {}
+                tar::EntryType::Directory | tar::EntryType::Symlink | tar::EntryType::Link => {
+                    continue
+                }
+                _ => {
+                    let entry_path = entry
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "unknown".into());
+                    let member_path = format!("{}!/{}", path, entry_path);
+                    self.findings.push(Finding {
+                        detector: "D2".into(),
+                        channel: "container_skipped".into(),
+                        path: member_path,
+                        visibility: self.opts.visibility,
+                        severity: Severity::Info,
+                        confidence: 0.0,
+                        hunk: None,
+                        evidence: vec![format!("tar member type '{:?}' skipped", entry_type)],
+                    });
+                    continue;
+                }
             }
 
             let entry_path = match entry.path() {
@@ -744,7 +871,7 @@ impl<'a> ContainerScanner<'a> {
             }
         }
 
-        let is_tar_content = is_tar(&decompressed_bytes, path);
+        let is_tar_content = is_tar(&decompressed_bytes);
         if is_tar_content {
             self.scan_tar(path, &decompressed_bytes, depth);
         } else {
@@ -767,7 +894,18 @@ pub fn scan_container_or_unit(
     signatures: &BenchmarkSignatures,
     opts: &ScanOptions,
 ) -> Vec<Finding> {
-    let mut scanner = ContainerScanner::new(fp, signatures, opts);
+    scan_container_or_unit_with_root_prefix(path, bytes, fp, signatures, opts, 0)
+}
+
+pub fn scan_container_or_unit_with_root_prefix(
+    path: &str,
+    bytes: &[u8],
+    fp: &FingerprintSet,
+    signatures: &BenchmarkSignatures,
+    opts: &ScanOptions,
+    root_prefix_len: usize,
+) -> Vec<Finding> {
+    let mut scanner = ContainerScanner::new_with_root_prefix(fp, signatures, opts, root_prefix_len);
     scanner.scan(path, bytes, 0);
     scanner.findings
 }
