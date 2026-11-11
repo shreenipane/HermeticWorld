@@ -57,9 +57,11 @@
 //! total hash bytes exceed `MAX_UNIT_BYTES`, its hashes are not written. Instead, a `Fixed`
 //! record (detector "D2", channel "index_skipped", severity Info, confidence 0.0, no hunk,
 //! evidence `["unit too large to index: N hashes"]`) is emitted for that path, so the query
-//! reports the gap instead of hiding it. Note that `scan` and `query` differ for such an
-//! oversized unit: `scan` scans the large unit in memory, whereas `query` reports the
-//! `index_skipped` Info finding.
+//! reports the gap instead of hiding it. D9 content flags are kept: for an oversized Text
+//! unit with non-zero D9 flags, a Text record with empty hash sets is also written, so
+//! canary, dataset host, and dataset dump findings are still reported. Note that `scan` and
+//! `query` differ for such an oversized unit: `scan` scans the large unit in memory, whereas
+//! `query` reports the `index_skipped` Info finding alongside any D9 content findings.
 //!
 //! # Not covered by a query
 //!
@@ -381,6 +383,33 @@ pub fn write_index_with_threshold(
     write_index_with_limits(root, out, max_record_bytes, MAX_UNIT_BYTES)
 }
 
+fn write_record_to<W: Write>(
+    w: &mut W,
+    rec: &IndexRecord,
+    payload: &mut Vec<u8>,
+    stats: &mut IndexStats,
+    max_record_bytes: u64,
+) -> io::Result<()> {
+    payload.clear();
+    encode_record(rec, payload);
+    if payload.len() as u64 <= max_record_bytes {
+        w.write_all(&(payload.len() as u64).to_le_bytes())?;
+        w.write_all(payload)?;
+        stats.records += 1;
+    } else if let Some(chunks) = split_record(rec, max_record_bytes) {
+        for chunk in chunks {
+            w.write_all(&(chunk.len() as u64).to_le_bytes())?;
+            w.write_all(&chunk)?;
+            stats.records += 1;
+        }
+    } else {
+        w.write_all(&(payload.len() as u64).to_le_bytes())?;
+        w.write_all(payload)?;
+        stats.records += 1;
+    }
+    Ok(())
+}
+
 /// `write_index` with configurable record threshold and unit limit (for testing).
 pub fn write_index_with_limits(
     root: &Path,
@@ -420,16 +449,25 @@ pub fn write_index_with_limits(
                 if matches!(r, IndexRecord::File { .. }) {
                     stats.files += 1;
                 }
-                let r = match r {
+                let mut write_one = |rec: &IndexRecord| {
+                    if write_err.is_none() {
+                        if let Err(e) =
+                            write_record_to(&mut w, rec, &mut payload, &mut stats, max_record_bytes)
+                        {
+                            write_err = Some(e);
+                        }
+                    }
+                };
+                match r {
                     IndexRecord::Text {
-                        ref path,
-                        ref hashes,
-                        ..
+                        path,
+                        d9_flags,
+                        hashes,
                     } => {
-                        let count = text_hash_count(hashes);
+                        let count = text_hash_count(&hashes);
                         let bytes = (count as u64).saturating_mul(8);
                         if bytes > max_unit_bytes {
-                            IndexRecord::Fixed(StoredFinding {
+                            let skipped = IndexRecord::Fixed(StoredFinding {
                                 detector: "D2".to_string(),
                                 channel: "index_skipped".to_string(),
                                 path: path.clone(),
@@ -437,65 +475,51 @@ pub fn write_index_with_limits(
                                 confidence: 0.0,
                                 hunk: None,
                                 evidence: vec![format!("unit too large to index: {count} hashes")],
-                            })
+                            });
+                            write_one(&skipped);
+                            if d9_flags != 0 {
+                                let d9_rec = IndexRecord::Text {
+                                    path,
+                                    d9_flags,
+                                    hashes: UnitHashes::default(),
+                                };
+                                write_one(&d9_rec);
+                            }
                         } else {
-                            r
+                            write_one(&IndexRecord::Text {
+                                path,
+                                d9_flags,
+                                hashes,
+                            });
                         }
                     }
                     IndexRecord::Binary {
-                        ref path,
-                        ref strings,
-                        ..
+                        path,
+                        channel,
+                        strings,
                     } => {
-                        let count = binary_hash_count(strings);
+                        let count = binary_hash_count(&strings);
                         let bytes = (count as u64).saturating_mul(8);
                         if bytes > max_unit_bytes {
-                            IndexRecord::Fixed(StoredFinding {
+                            let skipped = IndexRecord::Fixed(StoredFinding {
                                 detector: "D2".to_string(),
                                 channel: "index_skipped".to_string(),
-                                path: path.clone(),
+                                path,
                                 severity: Severity::Info,
                                 confidence: 0.0,
                                 hunk: None,
                                 evidence: vec![format!("unit too large to index: {count} hashes")],
-                            })
+                            });
+                            write_one(&skipped);
                         } else {
-                            r
+                            write_one(&IndexRecord::Binary {
+                                path,
+                                channel,
+                                strings,
+                            });
                         }
                     }
-                    other => other,
-                };
-                payload.clear();
-                encode_record(&r, &mut payload);
-                if payload.len() as u64 <= max_record_bytes {
-                    let res = w
-                        .write_all(&(payload.len() as u64).to_le_bytes())
-                        .and_then(|_| w.write_all(&payload));
-                    match res {
-                        Ok(()) => stats.records += 1,
-                        Err(e) => write_err = Some(e),
-                    }
-                } else if let Some(chunks) = split_record(&r, max_record_bytes) {
-                    for chunk in chunks {
-                        let res = w
-                            .write_all(&(chunk.len() as u64).to_le_bytes())
-                            .and_then(|_| w.write_all(&chunk));
-                        match res {
-                            Ok(()) => stats.records += 1,
-                            Err(e) => {
-                                write_err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    let res = w
-                        .write_all(&(payload.len() as u64).to_le_bytes())
-                        .and_then(|_| w.write_all(&payload));
-                    match res {
-                        Ok(()) => stats.records += 1,
-                        Err(e) => write_err = Some(e),
-                    }
+                    other => write_one(&other),
                 }
             }),
         );
@@ -1200,6 +1224,11 @@ impl<R: Read> IndexReader<R> {
 /// Helper that merges continuation records into their predecessor.
 ///
 /// Shared between `query_reader` and `merge_continuations`.
+///
+/// The unit size bound counts every hash received, including duplicates of hashes already
+/// merged, on purpose: it bounds the bytes a hostile index can make the reader process,
+/// and the writer never repeats a hash across the records of one unit, so valid indexes
+/// are unaffected.
 struct ContinuationMerger<F> {
     max_unit_bytes: u64,
     pending: Option<IndexRecord>,
