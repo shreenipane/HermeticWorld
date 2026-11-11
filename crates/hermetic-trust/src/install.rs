@@ -364,6 +364,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     ];
 
     let mut first_existing_system_bundle: Option<String> = None;
+    let mut successful_bundle_targets: HashSet<PathBuf> = HashSet::new();
 
     for rel_str in &known_system_bundles {
         let bundle_path = rootfs.join(rel_str);
@@ -402,6 +403,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der)
                         {
                             Ok(modified) => {
+                                successful_bundle_targets.insert(target.clone());
                                 if modified {
                                     modified_paths.insert(make_rel(&target));
                                 }
@@ -416,7 +418,9 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 });
                             }
                         }
-                    } else if first_existing_system_bundle.is_none() {
+                    } else if successful_bundle_targets.contains(&target)
+                        && first_existing_system_bundle.is_none()
+                    {
                         first_existing_system_bundle = Some(format!("/{}", rel_str));
                     }
                 }
@@ -723,12 +727,56 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             let fallback_path = rootfs.join(fallback_rel);
             let target = resolve_in_rootfs(rootfs, &fallback_path)?;
 
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            match fs::symlink_metadata(&target) {
+                Ok(meta) => {
+                    let rel_target = make_rel(&target);
+                    if meta.is_dir() {
+                        if !skipped_paths.iter().any(|s| s.path == rel_target) {
+                            skipped_paths.push(SkippedPath {
+                                path: rel_target,
+                                reason: "bundle_is_directory".to_string(),
+                            });
+                        }
+                    } else if !meta.file_type().is_file() {
+                        if !skipped_paths.iter().any(|s| s.path == rel_target) {
+                            skipped_paths.push(SkippedPath {
+                                path: rel_target,
+                                reason: "not a regular file".to_string(),
+                            });
+                        }
+                    } else {
+                        match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der)
+                        {
+                            Ok(modified) => {
+                                if modified {
+                                    modified_paths.insert(rel_target);
+                                }
+                            }
+                            Err(e) => {
+                                skipped_paths.push(SkippedPath {
+                                    path: rel_target,
+                                    reason: e.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
 
-            atomic_write_preserving(&target, canonical_ca_pem.as_bytes(), Some(0o644))?;
-            modified_paths.insert(make_rel(&target));
+                    atomic_write_preserving(&target, canonical_ca_pem.as_bytes(), Some(0o644))?;
+                    modified_paths.insert(make_rel(&target));
+                }
+                Err(e) => {
+                    let rel_target = make_rel(&target);
+                    skipped_paths.push(SkippedPath {
+                        path: rel_target,
+                        reason: format!("cannot stat target: {}", e),
+                    });
+                }
+            }
 
             "/etc/ssl/certs/ca-certificates.crt".to_string()
         }

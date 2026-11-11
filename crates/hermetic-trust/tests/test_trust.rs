@@ -1007,3 +1007,138 @@ fn test_fix10_key_file_exposure_prevented() {
         "Key file content must match"
     );
 }
+
+#[test]
+fn test_failed_bundle_not_selected_by_repeated_alias() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+
+    // Target 1: etc/ssl/certs/ca-certificates.crt in an unwritable directory
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    let bundle_file = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_file, b"INITIAL_CANDIDATE_1\n").expect("write bundle");
+    // Make directory non-writable so NamedTempFile::new_in fails during append
+    fs::set_permissions(&certs_dir, fs::Permissions::from_mode(0o555)).expect("chmod certs dir");
+
+    // Candidate 2: etc/pki/tls/certs/ca-bundle.crt is a symlink to candidate 1
+    let rhel_dir = rootfs.join("etc/pki/tls/certs");
+    fs::create_dir_all(&rhel_dir).expect("create rhel dir");
+    let rhel_symlink = rhel_dir.join("ca-bundle.crt");
+    std::os::unix::fs::symlink("../../ssl/certs/ca-certificates.crt", &rhel_symlink)
+        .expect("symlink candidate 2 to candidate 1");
+
+    // Candidate 3: etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem is a valid writable bundle
+    let fedora_dir = rootfs.join("etc/pki/ca-trust/extracted/pem");
+    fs::create_dir_all(&fedora_dir).expect("create fedora dir");
+    let fedora_bundle = fedora_dir.join("tls-ca-bundle.pem");
+    fs::write(&fedora_bundle, b"INITIAL_FEDORA_BUNDLE\n").expect("write fedora bundle");
+
+    let seed: [u8; 32] = [111u8; 32];
+    let ca = mint_ca("finding1-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+
+    // Environment defaults must NOT select candidate 2 (alias of failed candidate 1).
+    // Candidate 3 must be selected!
+    assert_eq!(
+        report.env_defaults.get("SSL_CERT_FILE").map(|s| s.as_str()),
+        Some("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+    );
+
+    // Target 1 must be recorded in skipped_paths
+    assert!(
+        report
+            .skipped_paths
+            .iter()
+            .any(|s| s.path.ends_with("ca-certificates.crt")),
+        "Failed target 1 must be in skipped_paths"
+    );
+
+    // Candidate 3 must have received the CA cert
+    let fedora_content = fs::read_to_string(&fedora_bundle).expect("read fedora bundle");
+    assert!(fedora_content.contains("INITIAL_FEDORA_BUNDLE"));
+    assert!(fedora_content.contains(&ca.cert_pem));
+
+    // Restore permissions for clean temp_dir cleanup
+    let _ = fs::set_permissions(&certs_dir, fs::Permissions::from_mode(0o755));
+}
+
+#[test]
+fn test_preserve_existing_resolved_fallback_bundle() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+
+    // rootfs/etc/ssl exists
+    fs::create_dir_all(rootfs.join("etc/ssl")).expect("create etc/ssl");
+
+    // rootfs/etc/ssl/certs is a symlink to /guest-certs (which does NOT exist on the host)
+    std::os::unix::fs::symlink("/guest-certs", rootfs.join("etc/ssl/certs"))
+        .expect("symlink to /guest-certs");
+
+    // rootfs/guest-certs/ca-certificates.crt exists with existing trust anchors
+    let guest_dir = rootfs.join("guest-certs");
+    fs::create_dir_all(&guest_dir).expect("create guest-certs");
+    let existing_bundle = guest_dir.join("ca-certificates.crt");
+    let existing_content =
+        "-----BEGIN CERTIFICATE-----\nEXISTING_TRUST_ANCHOR\n-----END CERTIFICATE-----\n";
+    fs::write(&existing_bundle, existing_content).expect("write existing bundle");
+
+    let seed: [u8; 32] = [112u8; 32];
+    let ca = mint_ca("finding2-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+
+    // The existing trust anchor MUST be preserved, and the new CA appended
+    let updated_content = fs::read_to_string(&existing_bundle).expect("read updated bundle");
+    assert!(
+        updated_content.contains("EXISTING_TRUST_ANCHOR"),
+        "Existing trust anchors must not be wiped out by fallback!"
+    );
+    assert!(
+        updated_content.contains(&ca.cert_pem),
+        "New CA must be present in the bundle!"
+    );
+
+    // The modified path must be recorded in report
+    assert!(
+        report
+            .modified_paths
+            .contains(&"guest-certs/ca-certificates.crt".to_string()),
+        "Modified path must be recorded"
+    );
+
+    // Default env spec should point to standard guest path
+    assert_eq!(
+        report.env_defaults.get("SSL_CERT_FILE").map(|s| s.as_str()),
+        Some("/etc/ssl/certs/ca-certificates.crt")
+    );
+
+    // Idempotency: second run should not re-modify the bundle
+    let report2 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca second run");
+    assert!(
+        !report2
+            .modified_paths
+            .contains(&"guest-certs/ca-certificates.crt".to_string()),
+        "Second run must be idempotent (not re-modified)"
+    );
+
+    // Test non-regular file skip preservation in fallback
+    let temp_dir2 = tempfile::tempdir().expect("tempdir2");
+    let rootfs2 = temp_dir2.path().join("rootfs");
+    fs::create_dir_all(rootfs2.join("etc/ssl")).expect("create etc/ssl 2");
+    std::os::unix::fs::symlink("/guest-certs", rootfs2.join("etc/ssl/certs"))
+        .expect("symlink to /guest-certs 2");
+    // Target is a directory instead of a regular file
+    fs::create_dir_all(rootfs2.join("guest-certs/ca-certificates.crt")).expect("create dir target");
+
+    let report3 = install_ca(&rootfs2, &ca.cert_pem).expect("install_ca with dir fallback");
+    assert!(
+        report3
+            .skipped_paths
+            .iter()
+            .any(|s| s.path == "guest-certs/ca-certificates.crt"
+                && s.reason == "bundle_is_directory"),
+        "Directory bundle in fallback must be skipped with bundle_is_directory"
+    );
+}
