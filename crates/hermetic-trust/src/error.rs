@@ -26,4 +26,8 @@ pub enum TrustError {
     Json(#[from] serde_json::Error),
     #[error("Certificate error: {0}")]
     Cert(String),
+    #[error("alias collision with private key")]
+    AliasCollisionWithPrivateKey,
+    #[error("unknown keystore password")]
+    UnknownKeystorePassword,
 }

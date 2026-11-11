@@ -304,8 +304,8 @@ pub fn mint_leaf(
     let leaf_ski: [u8; 20] = sha1_hasher.finalize().into();
 
     // 6. Extensions:
-    // basicConstraints CA:false (non-critical)
-    let bc_value = encode_sequence(&[&encode_boolean(false)]);
+    // basicConstraints CA:false (non-critical): DER requires omitting DEFAULT false, so empty SEQUENCE (30 00)
+    let bc_value = encode_sequence(&[]);
     let bc_extn = encode_sequence(&[
         &encode_oid(OID_BASIC_CONSTRAINTS),
         &encode_octet_string(&bc_value),
@@ -387,15 +387,55 @@ pub fn mint_leaf(
     })
 }
 
-/// Read and validate seed file: exactly 32 bytes and not group/world readable.
+#[cfg(unix)]
+fn get_current_uid() -> Result<u32, TrustError> {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(euid) = parts[1].parse::<u32>() {
+                        return Ok(euid);
+                    }
+                }
+            }
+        }
+    }
+    use std::os::unix::fs::MetadataExt;
+    let temp = tempfile::NamedTempFile::new()
+        .map_err(|e| TrustError::Cert(format!("cannot determine current process uid: {}", e)))?;
+    let meta = temp
+        .path()
+        .metadata()
+        .map_err(|e| TrustError::Cert(format!("cannot determine current process uid: {}", e)))?;
+    Ok(meta.uid())
+}
+
+/// Read and validate seed file: regular file owned by current user, mode & 0o077 == 0, exactly 32 bytes.
 pub fn read_seed_file(path: &Path) -> Result<[u8; 32], TrustError> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(TrustError::Cert(format!(
+                "seed file '{}' is not a regular file",
+                path.display()
+            )));
+        }
         let mode = metadata.permissions().mode();
-        if (mode & 0o044) != 0 {
+        if (mode & 0o077) != 0 {
             return Err(TrustError::InsecureSeedFilePermissions(mode));
+        }
+        let current_uid = get_current_uid()?;
+        if metadata.uid() != current_uid {
+            return Err(TrustError::Cert(format!(
+                "seed file '{}' is not owned by current user (file uid: {}, current uid: {})",
+                path.display(),
+                metadata.uid(),
+                current_uid
+            )));
         }
     }
 
@@ -409,29 +449,58 @@ pub fn read_seed_file(path: &Path) -> Result<[u8; 32], TrustError> {
     Ok(seed)
 }
 
-/// Write private key to key_out with mode 0600.
+/// Write private key to key_out with mode 0600 atomically via a temp file.
 pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), TrustError> {
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
     }
 
-    let mut file = options.open(path)?;
-    file.write_all(pem_contents.as_bytes())?;
-    file.flush()?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let tmp_name = format!(
+            ".tmp-key-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            attempt
+        );
+        let tmp_path = parent.join(tmp_name);
 
-    // Explicitly enforce permissions on existing files if already created
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(&tmp_path) {
+            Ok(mut file) => {
+                let write_res = (|| -> Result<(), TrustError> {
+                    file.write_all(pem_contents.as_bytes())?;
+                    file.sync_all()?;
+                    drop(file);
+                    std::fs::rename(&tmp_path, path)?;
+                    Ok(())
+                })();
+                if write_res.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                return write_res;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt > 1000 {
+                    return Err(TrustError::Io(e));
+                }
+                continue;
+            }
+            Err(e) => return Err(TrustError::Io(e)),
+        }
     }
-
-    Ok(())
 }

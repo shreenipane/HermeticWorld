@@ -60,45 +60,113 @@ pub fn safe_join_rootfs_from(rootfs: &Path, base_dir: &Path, target: &Path) -> P
 /// Absolute symlink targets are interpreted relative to rootfs.
 /// Detects symlink loops and limits hop depth to 40.
 pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustError> {
-    let mut current = path.to_path_buf();
+    use std::collections::VecDeque;
+
+    let rootfs_canon = rootfs
+        .canonicalize()
+        .unwrap_or_else(|_| rootfs.to_path_buf());
+
+    let rel = if let Ok(r) = path.strip_prefix(rootfs) {
+        r.to_path_buf()
+    } else if let Ok(r) = path.strip_prefix(&rootfs_canon) {
+        r.to_path_buf()
+    } else if path.is_absolute() {
+        path.strip_prefix("/").unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut queue = VecDeque::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => queue.push_back(PathBuf::from(c)),
+            Component::ParentDir => queue.push_back(PathBuf::from("..")),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    let mut current = rootfs.to_path_buf();
     let mut hops = 0;
     const MAX_HOPS: usize = 40;
 
-    while hops < MAX_HOPS {
-        let meta = match fs::symlink_metadata(&current) {
+    while let Some(comp) = queue.pop_front() {
+        if comp == Path::new("..") {
+            let at_root = current == rootfs
+                || current == rootfs_canon
+                || match current.strip_prefix(rootfs) {
+                    Ok(p) => p.as_os_str().is_empty(),
+                    Err(_) => match current.strip_prefix(&rootfs_canon) {
+                        Ok(p) => p.as_os_str().is_empty(),
+                        Err(_) => false,
+                    },
+                };
+            if !at_root {
+                current.pop();
+            }
+            continue;
+        }
+
+        let candidate = current.join(&comp);
+        let meta = match fs::symlink_metadata(&candidate) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(current);
+                current = candidate;
+                continue;
             }
             Err(e) => {
                 return Err(TrustError::Symlink(format!(
                     "metadata {}: {}",
-                    current.display(),
+                    candidate.display(),
                     e
                 )));
             }
         };
 
-        if !meta.is_symlink() {
-            return Ok(current);
-        }
+        if meta.is_symlink() {
+            hops += 1;
+            if hops > MAX_HOPS {
+                return Err(TrustError::Symlink("symlink loop detected".to_string()));
+            }
 
-        hops += 1;
-        let target = fs::read_link(&current)
-            .map_err(|e| TrustError::Symlink(format!("read_link {}: {}", current.display(), e)))?;
+            let target = fs::read_link(&candidate).map_err(|e| {
+                TrustError::Symlink(format!("read_link {}: {}", candidate.display(), e))
+            })?;
 
-        let next = if target.is_absolute() {
-            let rel = target.strip_prefix("/").unwrap_or(&target);
-            safe_join_rootfs(rootfs, rel)
+            if target.is_absolute() {
+                current = rootfs.to_path_buf();
+                let rel_target = target.strip_prefix("/").unwrap_or(&target);
+                let target_comps: Vec<PathBuf> = rel_target
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(n) => Some(PathBuf::from(n)),
+                        Component::ParentDir => Some(PathBuf::from("..")),
+                        Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+                    })
+                    .collect();
+
+                for c in target_comps.into_iter().rev() {
+                    queue.push_front(c);
+                }
+            } else {
+                let target_comps: Vec<PathBuf> = target
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(n) => Some(PathBuf::from(n)),
+                        Component::ParentDir => Some(PathBuf::from("..")),
+                        Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+                    })
+                    .collect();
+
+                for c in target_comps.into_iter().rev() {
+                    queue.push_front(c);
+                }
+            }
         } else {
-            let parent = current.parent().unwrap_or(rootfs);
-            safe_join_rootfs_from(rootfs, parent, &target)
-        };
-
-        current = next;
+            current = candidate;
+        }
     }
 
-    Err(TrustError::Symlink("symlink loop detected".to_string()))
+    Ok(current)
 }
 
 /// Write data atomically into target_path: writes to a temporary file in the same directory,
@@ -221,10 +289,50 @@ pub fn append_pem_bundle_idempotent(
 
 /// Install the CA certificate into every trust store found under rootfs.
 pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, TrustError> {
-    // Decode CA DER from PEM
-    let parsed_pem =
-        pem::parse(ca_cert_pem).map_err(|e| TrustError::Cert(format!("invalid CA PEM: {}", e)))?;
-    let ca_cert_der = parsed_pem.contents();
+    // FIX 1: Parse --ca-cert, require exactly one CERTIFICATE block and reject any
+    // file containing a PRIVATE KEY (any "PRIVATE KEY" label) or other block types with a clear error;
+    // re-encode the single parsed certificate as canonical PEM and write only that everywhere.
+    if ca_cert_pem.contains("PRIVATE KEY") {
+        return Err(TrustError::Cert(
+            "ca-cert contains a private key".to_string(),
+        ));
+    }
+
+    let parsed_blocks = pem::parse_many(ca_cert_pem.as_bytes())
+        .map_err(|e| TrustError::Cert(format!("invalid PEM in ca-cert: {}", e)))?;
+
+    if parsed_blocks.is_empty() {
+        return Err(TrustError::Cert(
+            "ca-cert contains no PEM blocks".to_string(),
+        ));
+    }
+
+    for block in &parsed_blocks {
+        if block.tag().contains("PRIVATE KEY") {
+            return Err(TrustError::Cert(
+                "ca-cert contains a private key".to_string(),
+            ));
+        }
+        if block.tag() != "CERTIFICATE" {
+            return Err(TrustError::Cert(format!(
+                "unexpected block type '{}' in ca-cert; expected only CERTIFICATE",
+                block.tag()
+            )));
+        }
+    }
+
+    if parsed_blocks.len() != 1 {
+        return Err(TrustError::Cert(format!(
+            "expected exactly one CERTIFICATE block in ca-cert, found {}",
+            parsed_blocks.len()
+        )));
+    }
+
+    let ca_cert_der = parsed_blocks[0].contents();
+    let mut canonical_ca_pem = pem::encode(&pem::Pem::new("CERTIFICATE", ca_cert_der.to_vec()));
+    if !canonical_ca_pem.ends_with('\n') {
+        canonical_ca_pem.push('\n');
+    }
 
     // Compute SHA-256 hex digest of the CA certificate DER
     let mut hasher = Sha256::new();
@@ -263,7 +371,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             // Found a bundle candidate
             match resolve_in_rootfs(rootfs, &bundle_path) {
                 Ok(target) => {
-                    let target_meta = match fs::metadata(&target) {
+                    let target_meta = match fs::symlink_metadata(&target) {
                         Ok(m) => m,
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
@@ -282,16 +390,25 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         continue;
                     }
 
-                    if first_existing_system_bundle.is_none() {
-                        first_existing_system_bundle = Some(format!("/{}", rel_str));
+                    if !target_meta.file_type().is_file() {
+                        skipped_paths.push(SkippedPath {
+                            path: make_rel(&bundle_path),
+                            reason: "not a regular file".to_string(),
+                        });
+                        continue;
                     }
 
                     if processed_targets.insert(target.clone()) {
-                        match append_pem_bundle_idempotent(&target, ca_cert_pem, ca_cert_der) {
-                            Ok(true) => {
-                                modified_paths.insert(make_rel(&target));
+                        match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der)
+                        {
+                            Ok(modified) => {
+                                if modified {
+                                    modified_paths.insert(make_rel(&target));
+                                }
+                                if first_existing_system_bundle.is_none() {
+                                    first_existing_system_bundle = Some(format!("/{}", rel_str));
+                                }
                             }
-                            Ok(false) => {} // already present
                             Err(e) => {
                                 skipped_paths.push(SkippedPath {
                                     path: make_rel(&target),
@@ -299,6 +416,8 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 });
                             }
                         }
+                    } else if first_existing_system_bundle.is_none() {
+                        first_existing_system_bundle = Some(format!("/{}", rel_str));
                     }
                 }
                 Err(e) => {
@@ -329,8 +448,21 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             let file_path = rootfs.join(file_rel);
             match resolve_in_rootfs(rootfs, &file_path) {
                 Ok(target) => {
+                    if let Ok(m) = fs::symlink_metadata(&target) {
+                        if !m.file_type().is_file() {
+                            skipped_paths.push(SkippedPath {
+                                path: make_rel(&target),
+                                reason: if m.is_dir() {
+                                    "bundle_is_directory".to_string()
+                                } else {
+                                    "not a regular file".to_string()
+                                },
+                            });
+                            continue;
+                        }
+                    }
                     if processed_targets.insert(target.clone()) {
-                        let content = ca_cert_pem.as_bytes();
+                        let content = canonical_ca_pem.as_bytes();
                         let existing = fs::read(&target).ok();
                         if existing.as_deref() != Some(content) {
                             match atomic_write_preserving(&target, content, Some(0o644)) {
@@ -437,7 +569,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 if parent_name == "certifi" || parent_name == "ssl" {
                     match resolve_in_rootfs(rootfs, &entry_path) {
                         Ok(target) => {
-                            let target_meta = match fs::metadata(&target) {
+                            let target_meta = match fs::symlink_metadata(&target) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     skipped_paths.push(SkippedPath {
@@ -456,10 +588,18 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 continue;
                             }
 
+                            if !target_meta.file_type().is_file() {
+                                skipped_paths.push(SkippedPath {
+                                    path: make_rel(&entry_path),
+                                    reason: "not a regular file".to_string(),
+                                });
+                                continue;
+                            }
+
                             if processed_targets.insert(target.clone()) {
                                 match append_pem_bundle_idempotent(
                                     &target,
-                                    ca_cert_pem,
+                                    &canonical_ca_pem,
                                     ca_cert_der,
                                 ) {
                                     Ok(true) => {
@@ -487,7 +627,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 // Java keystore named cacerts
                 match resolve_in_rootfs(rootfs, &entry_path) {
                     Ok(target) => {
-                        let target_meta = match fs::metadata(&target) {
+                        let target_meta = match fs::symlink_metadata(&target) {
                             Ok(m) => m,
                             Err(e) => {
                                 skipped_paths.push(SkippedPath {
@@ -502,6 +642,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             skipped_paths.push(SkippedPath {
                                 path: make_rel(&entry_path),
                                 reason: "bundle_is_directory".to_string(),
+                            });
+                            continue;
+                        }
+
+                        if !target_meta.file_type().is_file() {
+                            skipped_paths.push(SkippedPath {
+                                path: make_rel(&entry_path),
+                                reason: "not a regular file".to_string(),
                             });
                             continue;
                         }
@@ -565,8 +713,26 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     }
 
     // Default system bundle path for env spec
-    let chosen_bundle = first_existing_system_bundle
-        .unwrap_or_else(|| "/etc/ssl/certs/ca-certificates.crt".to_string());
+    let chosen_bundle = match first_existing_system_bundle {
+        Some(b) => b,
+        None => {
+            // FIX 7: if no system bundle exists in the rootfs, create one at etc/ssl/certs/ca-certificates.crt
+            // containing only the CA (creating parent directories inside the rootfs, checked as in FIX 9),
+            // and point the defaults at it; record the creation in the report.
+            let fallback_rel = "etc/ssl/certs/ca-certificates.crt";
+            let fallback_path = rootfs.join(fallback_rel);
+            let target = resolve_in_rootfs(rootfs, &fallback_path)?;
+
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            atomic_write_preserving(&target, canonical_ca_pem.as_bytes(), Some(0o644))?;
+            modified_paths.insert(make_rel(&target));
+
+            "/etc/ssl/certs/ca-certificates.crt".to_string()
+        }
+    };
 
     let mut env_defaults = BTreeMap::new();
     env_defaults.insert("SSL_CERT_FILE".to_string(), chosen_bundle.clone());

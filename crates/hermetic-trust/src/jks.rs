@@ -291,14 +291,25 @@ pub fn inject_ca_into_jks(
     ca_cert_der: &[u8],
     timestamp_ms: i64,
 ) -> Result<Option<Vec<u8>>, TrustError> {
-    let (_version, entries, _old_hash) = parse_jks(data)?;
+    let (_version, entries, existing_hash) = parse_jks(data)?;
 
-    // Check if hermetic-world-ca already exists
+    // FIX 4: Verify existing integrity digest with "changeit" first
+    let expected_hash = compute_jks_integrity_hash(JKS_DEFAULT_PASSWORD, &data[..data.len() - 20]);
+    if existing_hash != expected_hash {
+        return Err(TrustError::UnknownKeystorePassword);
+    }
+
+    // FIX 3: Check if hermetic-world-ca already exists
     for entry in &entries {
         if entry.alias() == "hermetic-world-ca" {
-            if let JksEntry::TrustedCert { cert_der, .. } = entry {
-                if cert_der.as_slice() == ca_cert_der {
-                    return Ok(None); // Exact cert already present: idempotent!
+            match entry {
+                JksEntry::PrivateKey { .. } => {
+                    return Err(TrustError::AliasCollisionWithPrivateKey);
+                }
+                JksEntry::TrustedCert { cert_der, .. } => {
+                    if cert_der.as_slice() == ca_cert_der {
+                        return Ok(None); // Exact cert already present: idempotent!
+                    }
                 }
             }
         }
@@ -309,10 +320,12 @@ pub fn inject_ca_into_jks(
     new_data.extend_from_slice(&JKS_MAGIC.to_be_bytes());
     new_data.extend_from_slice(&JKS_VERSION_2.to_be_bytes());
 
-    // Filter out any existing entry with alias "hermetic-world-ca" to overwrite cleanly
+    // Filter out only existing TrustedCert entry with alias "hermetic-world-ca"
     let filtered_entries: Vec<&JksEntry> = entries
         .iter()
-        .filter(|e| e.alias() != "hermetic-world-ca")
+        .filter(|e| {
+            !(e.alias() == "hermetic-world-ca" && matches!(e, JksEntry::TrustedCert { .. }))
+        })
         .collect();
 
     let new_count = (filtered_entries.len() + 1) as u32;

@@ -615,3 +615,395 @@ fn test_cli_mint_ca_and_install() {
     // Verify key never appears under rootfs
     assert_no_key_files(&rootfs);
 }
+
+fn create_jks_with_private_key(alias: &str, password: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&hermetic_trust::JKS_MAGIC.to_be_bytes());
+    data.extend_from_slice(&hermetic_trust::JKS_VERSION_2.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes()); // 1 entry
+
+    // KeyEntry tag = 1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    let alias_bytes = alias.as_bytes();
+    data.extend_from_slice(&(alias_bytes.len() as u16).to_be_bytes());
+    data.extend_from_slice(alias_bytes);
+    data.extend_from_slice(&0i64.to_be_bytes()); // date_ms
+    data.extend_from_slice(&4u32.to_be_bytes()); // key_len
+    data.extend_from_slice(&[1, 2, 3, 4]); // dummy key bytes
+    data.extend_from_slice(&0u32.to_be_bytes()); // chain_len = 0
+
+    let hash = hermetic_trust::compute_jks_integrity_hash(password, &data);
+    data.extend_from_slice(&hash);
+    data
+}
+
+#[test]
+fn test_fix1_private_key_leak_and_multiple_certs_rejected() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    let bundle_file = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_file, b"INITIAL_CONTENT\n").expect("write bundle");
+
+    let seed: [u8; 32] = [101u8; 32];
+    let ca = mint_ca("fix1-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // 1. Combined cert+key must be rejected and nothing in rootfs modified
+    let combined_cert_key = format!("{}\n{}", ca.cert_pem, ca.key_pem);
+    let res1 = install_ca(&rootfs, &combined_cert_key);
+    assert!(res1.is_err(), "combined cert+key must return error");
+    assert_eq!(
+        fs::read(&bundle_file).expect("read bundle"),
+        b"INITIAL_CONTENT\n"
+    );
+
+    // 2. Key first, then cert must also be rejected
+    let key_first = format!("{}\n{}", ca.key_pem, ca.cert_pem);
+    let res2 = install_ca(&rootfs, &key_first);
+    assert!(res2.is_err(), "key-first must return error");
+    assert_eq!(
+        fs::read(&bundle_file).expect("read bundle"),
+        b"INITIAL_CONTENT\n"
+    );
+
+    // 3. Two certificates must be rejected
+    let two_certs = format!("{}\n{}", ca.cert_pem, ca.cert_pem);
+    let res3 = install_ca(&rootfs, &two_certs);
+    assert!(res3.is_err(), "two certs must return error");
+    assert_eq!(
+        fs::read(&bundle_file).expect("read bundle"),
+        b"INITIAL_CONTENT\n"
+    );
+}
+
+#[test]
+fn test_fix2_leaf_basic_constraints_der_default() {
+    let seed: [u8; 32] = [102u8; 32];
+    let t_clock = datetime!(2024-06-01 12:00:00 UTC);
+    let ca = mint_ca("fix2-world", t_clock, &seed).expect("mint ca");
+    let leaf = mint_leaf(&ca, &["api.hermetic.local"], t_clock).expect("mint leaf");
+
+    // BasicConstraints OID: 2.5.29.19 -> 06 03 55 1D 13
+    // In DER: SEQUENCE containing OID and OCTET STRING
+    // The OCTET STRING wrapping the empty SEQUENCE has length 2 and bytes 30 00: 04 02 30 00
+    let target_seq = [0x06, 0x03, 0x55, 0x1D, 0x13, 0x04, 0x02, 0x30, 0x00];
+    let found = leaf
+        .cert_der
+        .windows(target_seq.len())
+        .any(|w| w == target_seq);
+    assert!(
+        found,
+        "Leaf BasicConstraints extension value bytes must be exactly 30 00 (empty SEQUENCE)"
+    );
+}
+
+#[test]
+fn test_fix3_jks_private_key_alias_collision_and_replace() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let jks_dir = rootfs.join("usr/lib/jvm/lib/security");
+    fs::create_dir_all(&jks_dir).expect("create jks dir");
+    let jks_path = jks_dir.join("cacerts");
+
+    let seed: [u8; 32] = [103u8; 32];
+    let ca = mint_ca("fix3-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // Case 1: PrivateKey entry with alias hermetic-world-ca -> skip without modifying
+    let jks_with_pk = create_jks_with_private_key("hermetic-world-ca", "changeit");
+    fs::write(&jks_path, &jks_with_pk).expect("write jks");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+    assert_eq!(
+        fs::read(&jks_path).expect("read jks"),
+        jks_with_pk,
+        "Keystore must be untouched on private key alias collision"
+    );
+    let skipped = report
+        .skipped_paths
+        .iter()
+        .find(|s| s.reason == "alias collision with private key");
+    assert!(
+        skipped.is_some(),
+        "Report must contain skipped reason 'alias collision with private key'"
+    );
+
+    // Case 2: TrustedCert entry with alias hermetic-world-ca -> replace cleanly
+    let dummy_old_cert_der = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+    let initial_jks = create_empty_jks("changeit");
+    let jks_with_old_cert =
+        hermetic_trust::inject_ca_into_jks(&initial_jks, &dummy_old_cert_der, 0)
+            .expect("inject old")
+            .expect("modified");
+    fs::write(&jks_path, &jks_with_old_cert).expect("write old cert jks");
+
+    let report2 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca second");
+    assert!(
+        report2
+            .modified_paths
+            .iter()
+            .any(|p| p.ends_with("cacerts")),
+        "Keystore must be modified when replacing TrustedCert"
+    );
+
+    let updated_bytes = fs::read(&jks_path).expect("read updated");
+    let (_, entries, _) = parse_jks(&updated_bytes).expect("parse updated");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].alias(), "hermetic-world-ca");
+    if let JksEntry::TrustedCert { cert_der, .. } = &entries[0] {
+        assert_eq!(
+            cert_der, &ca.cert_der,
+            "TrustedCert must be updated to new CA cert"
+        );
+    } else {
+        panic!("Entry should be a TrustedCert");
+    }
+}
+
+#[test]
+fn test_fix4_jks_unknown_keystore_password() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let jks_dir = rootfs.join("opt/java/lib/security");
+    fs::create_dir_all(&jks_dir).expect("create jks dir");
+    let jks_path = jks_dir.join("cacerts");
+
+    let other_jks = create_empty_jks("other");
+    fs::write(&jks_path, &other_jks).expect("write other jks");
+
+    let seed: [u8; 32] = [104u8; 32];
+    let ca = mint_ca("fix4-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+    assert_eq!(
+        fs::read(&jks_path).expect("read jks"),
+        other_jks,
+        "Keystore with other password must be left byte-identical"
+    );
+
+    let skipped = report
+        .skipped_paths
+        .iter()
+        .find(|s| s.reason == "unknown keystore password");
+    assert!(
+        skipped.is_some(),
+        "Must report skipped with reason 'unknown keystore password'"
+    );
+}
+
+#[test]
+fn test_fix5_fifo_hang_prevention() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    let fifo_path = certs_dir.join("ca-certificates.crt");
+
+    let status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo command");
+    assert!(status.success());
+
+    let seed: [u8; 32] = [105u8; 32];
+    let ca = mint_ca("fix5-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca on fifo");
+    let skipped = report
+        .skipped_paths
+        .iter()
+        .find(|s| s.path.ends_with("ca-certificates.crt") && s.reason == "not a regular file");
+    assert!(
+        skipped.is_some(),
+        "FIFO must be skipped with reason 'not a regular file'"
+    );
+}
+
+#[test]
+fn test_fix6_env_defaults_chosen_after_successful_append() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+
+    // Candidate 1: etc/ssl/certs/ca-certificates.crt is a symlink loop (fails install)
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    let loop_path = certs_dir.join("ca-certificates.crt");
+    std::os::unix::fs::symlink("ca-certificates.crt", &loop_path).expect("create loop");
+
+    // Candidate 2: etc/pki/tls/certs/ca-bundle.crt is a normal bundle (succeeds)
+    let rhel_dir = rootfs.join("etc/pki/tls/certs");
+    fs::create_dir_all(&rhel_dir).expect("create rhel dir");
+    let rhel_bundle = rhel_dir.join("ca-bundle.crt");
+    fs::write(&rhel_bundle, b"INITIAL_RHEL\n").expect("write rhel");
+
+    let seed: [u8; 32] = [106u8; 32];
+    let ca = mint_ca("fix6-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+
+    // Default must NOT be candidate 1 (which failed); it must be candidate 2!
+    assert_eq!(
+        report.env_defaults.get("SSL_CERT_FILE").map(|s| s.as_str()),
+        Some("/etc/pki/tls/certs/ca-bundle.crt")
+    );
+}
+
+#[test]
+fn test_fix7_system_bundle_created_when_missing() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+
+    // Rootfs has NO system bundle, only a certifi bundle
+    let certifi_dir = rootfs.join("usr/local/lib/python3.10/site-packages/certifi");
+    fs::create_dir_all(&certifi_dir).expect("create certifi dir");
+    let certifi_bundle = certifi_dir.join("cacert.pem");
+    fs::write(&certifi_bundle, b"INITIAL_CERTIFI\n").expect("write certifi");
+
+    let seed: [u8; 32] = [107u8; 32];
+    let ca = mint_ca("fix7-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+
+    let created_bundle = rootfs.join("etc/ssl/certs/ca-certificates.crt");
+    assert!(
+        created_bundle.exists(),
+        "System bundle etc/ssl/certs/ca-certificates.crt must be created"
+    );
+    let created_content = fs::read_to_string(&created_bundle).expect("read created bundle");
+    assert_eq!(
+        created_content.trim(),
+        ca.cert_pem.trim(),
+        "Created system bundle must contain only the CA"
+    );
+
+    assert!(
+        report
+            .modified_paths
+            .contains(&"etc/ssl/certs/ca-certificates.crt".to_string()),
+        "Report modified_paths must record the created system bundle"
+    );
+
+    assert_eq!(
+        report.env_defaults.get("SSL_CERT_FILE").map(|s| s.as_str()),
+        Some("/etc/ssl/certs/ca-certificates.crt")
+    );
+}
+
+#[test]
+fn test_fix8_seed_permissions_validation() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // 0600 passes
+    let seed_0600 = temp_dir.path().join("seed_0600.bin");
+    fs::write(&seed_0600, [42u8; 32]).expect("write");
+    fs::set_permissions(&seed_0600, fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(read_seed_file(&seed_0600).is_ok());
+
+    // 0640 fails
+    let seed_0640 = temp_dir.path().join("seed_0640.bin");
+    fs::write(&seed_0640, [42u8; 32]).expect("write");
+    fs::set_permissions(&seed_0640, fs::Permissions::from_mode(0o640)).expect("chmod");
+    assert!(matches!(
+        read_seed_file(&seed_0640),
+        Err(TrustError::InsecureSeedFilePermissions(_))
+    ));
+
+    // 0622 fails
+    let seed_0622 = temp_dir.path().join("seed_0622.bin");
+    fs::write(&seed_0622, [42u8; 32]).expect("write");
+    fs::set_permissions(&seed_0622, fs::Permissions::from_mode(0o622)).expect("chmod");
+    assert!(matches!(
+        read_seed_file(&seed_0622),
+        Err(TrustError::InsecureSeedFilePermissions(_))
+    ));
+
+    // 0604 fails
+    let seed_0604 = temp_dir.path().join("seed_0604.bin");
+    fs::write(&seed_0604, [42u8; 32]).expect("write");
+    fs::set_permissions(&seed_0604, fs::Permissions::from_mode(0o604)).expect("chmod");
+    assert!(matches!(
+        read_seed_file(&seed_0604),
+        Err(TrustError::InsecureSeedFilePermissions(_))
+    ));
+}
+
+#[test]
+fn test_fix9_host_modification_via_parent_symlinks_prevented() {
+    let host_temp = tempfile::tempdir().expect("host tempdir");
+    let host_dir = host_temp.path().join("host_ssl_certs");
+    fs::create_dir_all(&host_dir).expect("create host dir");
+    let host_bundle = host_dir.join("ca-certificates.crt");
+    fs::write(&host_bundle, b"HOST_ORIGINAL_BUNDLE\n").expect("write host bundle");
+
+    let rootfs_temp = tempfile::tempdir().expect("rootfs tempdir");
+    let rootfs = rootfs_temp.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("etc/ssl")).expect("create etc/ssl");
+
+    // rootfs etc/ssl/certs is a symlink to absolute path of tmp host dir
+    std::os::unix::fs::symlink(&host_dir, rootfs.join("etc/ssl/certs")).expect("symlink to host");
+
+    let seed: [u8; 32] = [109u8; 32];
+    let ca = mint_ca("fix9-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // Case A: target absent in rootfs -> host bundle remains unchanged
+    let _report1 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca absent target");
+    assert_eq!(
+        fs::read(&host_bundle).expect("read host"),
+        b"HOST_ORIGINAL_BUNDLE\n",
+        "Host bundle must be completely untouched!"
+    );
+
+    // Case B: target created inside rootfs under rootfs/<host_dir_path> -> updated inside rootfs
+    let rootfs_target = rootfs
+        .join(host_dir.strip_prefix("/").expect("strip"))
+        .join("ca-certificates.crt");
+    fs::create_dir_all(rootfs_target.parent().expect("parent")).expect("create dir in rootfs");
+    fs::write(&rootfs_target, b"ROOTFS_INITIAL\n").expect("write rootfs initial");
+
+    let _report2 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca present target");
+    assert_eq!(
+        fs::read(&host_bundle).expect("read host"),
+        b"HOST_ORIGINAL_BUNDLE\n",
+        "Host bundle must still be completely untouched!"
+    );
+    let rootfs_updated = fs::read_to_string(&rootfs_target).expect("read rootfs target");
+    assert!(
+        rootfs_updated.contains(&ca.cert_pem),
+        "Rootfs-resolved target must be updated"
+    );
+}
+
+#[test]
+fn test_fix10_key_file_exposure_prevented() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let key_out = temp_dir.path().join("ca.key");
+
+    // Create an existing key file with mode 0644
+    fs::write(&key_out, b"old_unsecret_content").expect("write existing");
+    fs::set_permissions(&key_out, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+    assert_eq!(
+        fs::metadata(&key_out)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+
+    let seed: [u8; 32] = [110u8; 32];
+    let ca = mint_ca("fix10-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    write_private_key_file(&key_out, &ca.key_pem).expect("write_private_key_file");
+
+    let final_mode = fs::metadata(&key_out)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(final_mode, 0o600, "Final mode must be 0600");
+    assert_eq!(
+        fs::read_to_string(&key_out).expect("read key"),
+        ca.key_pem,
+        "Key file content must match"
+    );
+}
