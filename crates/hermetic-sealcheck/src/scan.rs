@@ -13,7 +13,7 @@ use crate::containers::{
     detect_container_type, scan_container_or_unit_with_root_prefix, ContainerType,
 };
 use crate::diff::parse_patch;
-use crate::fingerprint::FingerprintSet;
+use crate::fingerprint::{sha256_u64, FingerprintSet};
 use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
 use crate::winnow::{tokenize, winnow_tokens};
 
@@ -90,15 +90,16 @@ impl Default for ScanOptions {
 }
 
 /// Hashes extracted from a single scanned text unit.
-struct UnitHashes {
-    line_hashes: HashSet<String>,
-    window_hashes: HashSet<String>,
-    removed_marker_hashes: HashSet<String>,
-    diff_shape_hashes: HashSet<String>,
-    winnow_hashes: HashSet<u64>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UnitHashes {
+    pub line_hashes: HashSet<u64>,
+    pub window_hashes: HashSet<u64>,
+    pub removed_marker_hashes: HashSet<u64>,
+    pub diff_shape_hashes: HashSet<u64>,
+    pub winnow_hashes: HashSet<u64>,
 }
 
-fn compute_unit_hashes(text: &str) -> UnitHashes {
+pub fn compute_unit_hashes(text: &str) -> UnitHashes {
     let mut line_hashes = HashSet::new();
     let mut window_hashes = HashSet::new();
     let mut removed_marker_hashes = HashSet::new();
@@ -109,7 +110,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
     // 1. Regular lines and 2/3-line windows
     for line in &lines {
         if let Some(norm) = normalize_line(line) {
-            line_hashes.insert(sha256_hex(norm.as_bytes()));
+            line_hashes.insert(sha256_u64(norm.as_bytes()));
         }
     }
 
@@ -122,7 +123,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                     .map(|l| clean_line(l, false))
                     .collect::<Vec<_>>()
                     .join("\n");
-                window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                window_hashes.insert(sha256_u64(norm_w.as_bytes()));
             }
         }
         if i + 2 < lines.len() {
@@ -133,7 +134,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                     .map(|l| clean_line(l, false))
                     .collect::<Vec<_>>()
                     .join("\n");
-                window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                window_hashes.insert(sha256_u64(norm_w.as_bytes()));
             }
         }
     }
@@ -146,7 +147,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
         for line in &lines {
             if line.starts_with('+') {
                 if let Some(norm) = normalize_diff_line(line) {
-                    line_hashes.insert(sha256_hex(norm.as_bytes()));
+                    line_hashes.insert(sha256_u64(norm.as_bytes()));
                 }
             }
         }
@@ -155,7 +156,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
             if line.starts_with('-') {
                 if let Some(norm) = normalize_diff_line(line) {
                     let marker = format!("-{}", norm);
-                    removed_marker_hashes.insert(sha256_hex(marker.as_bytes()));
+                    removed_marker_hashes.insert(sha256_u64(marker.as_bytes()));
                 }
             }
         }
@@ -183,7 +184,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                         .map(|l| clean_line(l, false))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                    window_hashes.insert(sha256_u64(norm_w.as_bytes()));
                 }
             }
             if i + 2 < after_change.len() {
@@ -194,7 +195,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                         .map(|l| clean_line(l, false))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                    window_hashes.insert(sha256_u64(norm_w.as_bytes()));
                 }
             }
         }
@@ -213,7 +214,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                     .map(|h| h.raw_header.trim())
                     .collect::<Vec<_>>()
                     .join("\n");
-                let shape_h = sha256_hex(format!("{}\n{}", file_path, headers).as_bytes());
+                let shape_h = sha256_u64(format!("{}\n{}", file_path, headers).as_bytes());
                 diff_shape_hashes.insert(shape_h);
 
                 let mut diff_seq = Vec::new();
@@ -231,7 +232,7 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
                     }
                 }
                 let shape_s =
-                    sha256_hex(format!("{}\n{}", file_path, diff_seq.join("\n")).as_bytes());
+                    sha256_u64(format!("{}\n{}", file_path, diff_seq.join("\n")).as_bytes());
                 diff_shape_hashes.insert(shape_s);
             }
         }
@@ -252,23 +253,22 @@ fn compute_unit_hashes(text: &str) -> UnitHashes {
     }
 }
 
-pub fn match_unit(
-    text: &str,
+pub fn match_unit_hashes(
+    unit: &UnitHashes,
     fp: &FingerprintSet,
     opts: &ScanOptions,
     detector: &str,
     channel: &str,
     path: &str,
 ) -> Vec<Finding> {
-    let unit = compute_unit_hashes(text);
     let mut findings = Vec::new();
 
     // 1. Check diff shapes
-    for shape in &unit.diff_shape_hashes {
-        if fp.diff_shape_hashes.contains(shape) {
+    for (shape_u64, orig_hex) in &fp.diff_shape_u64 {
+        if unit.diff_shape_hashes.contains(shape_u64) {
             let evidence_str = fp
                 .hash_to_evidence
-                .get(shape)
+                .get(orig_hex)
                 .cloned()
                 .unwrap_or_else(|| "diff_shape".into());
             findings.push(Finding {
@@ -292,11 +292,11 @@ pub fn match_unit(
         let mut matched_removed_weight = 0.0;
         let mut matched_evidence = Vec::new();
 
-        for (hash, &weight) in &hunk.line_fingerprints {
-            if unit.line_hashes.contains(hash) {
+        for (&hash_u64, (weight, orig_hex)) in &hunk.line_u64 {
+            if unit.line_hashes.contains(&hash_u64) {
                 matched_line_weight += weight;
                 if matched_evidence.len() < 5 {
-                    if let Some(ev) = fp.hash_to_evidence.get(hash) {
+                    if let Some(ev) = fp.hash_to_evidence.get(orig_hex) {
                         let truncated: String = ev.chars().take(200).collect();
                         if !matched_evidence.contains(&truncated) {
                             matched_evidence.push(truncated);
@@ -306,11 +306,11 @@ pub fn match_unit(
             }
         }
 
-        for (hash, &weight) in &hunk.window_fingerprints {
-            if unit.window_hashes.contains(hash) {
+        for (&hash_u64, (weight, orig_hex)) in &hunk.window_u64 {
+            if unit.window_hashes.contains(&hash_u64) {
                 matched_window_weight += weight;
                 if matched_evidence.len() < 5 {
-                    if let Some(ev) = fp.hash_to_evidence.get(hash) {
+                    if let Some(ev) = fp.hash_to_evidence.get(orig_hex) {
                         let truncated: String = ev.chars().take(200).collect();
                         if !matched_evidence.contains(&truncated) {
                             matched_evidence.push(truncated);
@@ -320,11 +320,11 @@ pub fn match_unit(
             }
         }
 
-        for (hash, &weight) in &hunk.removed_markers {
-            if unit.removed_marker_hashes.contains(hash) {
+        for (&hash_u64, (weight, orig_hex)) in &hunk.removed_u64 {
+            if unit.removed_marker_hashes.contains(&hash_u64) {
                 matched_removed_weight += weight;
                 if matched_evidence.len() < 5 {
-                    if let Some(ev) = fp.hash_to_evidence.get(hash) {
+                    if let Some(ev) = fp.hash_to_evidence.get(orig_hex) {
                         let truncated: String = ev.chars().take(200).collect();
                         if !matched_evidence.contains(&truncated) {
                             matched_evidence.push(truncated);
@@ -408,6 +408,17 @@ pub fn match_unit(
     }
 
     findings
+}
+
+pub fn match_unit(
+    text: &str,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+    detector: &str,
+    channel: &str,
+    path: &str,
+) -> Vec<Finding> {
+    match_unit_hashes(&compute_unit_hashes(text), fp, opts, detector, channel, path)
 }
 
 /// Scan a problem statement for leaks (D0).
