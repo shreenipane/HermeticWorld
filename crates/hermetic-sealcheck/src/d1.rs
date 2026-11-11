@@ -607,12 +607,12 @@ fn check_git_config(config_path: &Path, gitdir: &str, opts: &ScanOptions) -> Vec
             }
         }
 
-        // Check for embedded credentials in URLs: ://[^/@\s]+:[^/@\s]+@
+        // Check for embedded credentials in URLs: ://[^/@\s]+@
         if let Some(pos) = trimmed.find("://") {
             let rest = &trimmed[pos + 3..];
             if let Some(at_pos) = rest.find('@') {
                 let user_info = &rest[..at_pos];
-                if !user_info.contains('/') && user_info.contains(':') {
+                if !user_info.is_empty() && !user_info.contains('/') && !user_info.contains(' ') {
                     findings.push(Finding {
                         detector: "D1".into(),
                         channel: "git_config".into(),

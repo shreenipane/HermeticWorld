@@ -60,6 +60,7 @@ pub struct ScanOptions {
     pub exclude_dirs: Vec<PathBuf>,
     pub base_commit: Option<String>,
     pub t_clock: Option<time::OffsetDateTime>,
+    pub max_delta_depth: usize,
 }
 
 impl Default for ScanOptions {
@@ -77,6 +78,7 @@ impl Default for ScanOptions {
             exclude_dirs: Vec::new(),
             base_commit: None,
             t_clock: None,
+            max_delta_depth: 4096,
         }
     }
 }

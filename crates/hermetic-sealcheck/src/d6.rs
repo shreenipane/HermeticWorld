@@ -47,6 +47,13 @@ pub fn parse_oci_date(s: &str) -> Result<OffsetDateTime, String> {
         cleaned = cleaned.replace(" +", "+").replace(" -", "-");
     }
 
+    if !cleaned.ends_with('Z')
+        && !cleaned.contains('+')
+        && (cleaned.len() <= 10 || cleaned[10..].find('-').is_none())
+    {
+        cleaned.push('Z');
+    }
+
     if let Ok(dt) = OffsetDateTime::parse(&cleaned, &time::format_description::well_known::Rfc3339)
     {
         return Ok(dt);

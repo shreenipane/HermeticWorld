@@ -4,7 +4,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::read::ZlibDecoder;
-use flate2::Decompress;
 use sha1::{Digest, Sha1};
 
 use crate::containers::CountingReader;
@@ -341,7 +340,7 @@ impl GitStore {
             packs,
             cache: DeltaBaseCache::new(64 * 1024 * 1024), // 64 MiB
             max_member_bytes: opts.max_member_bytes,
-            max_depth: 4096,
+            max_depth: opts.max_delta_depth,
         })
     }
 
@@ -441,11 +440,12 @@ impl GitStore {
         };
 
         let compressed_bytes = path.metadata()?.len();
-        let counting = CountingReader::new(f, &mut total_expanded, compressed_bytes, &opts);
-        let mut decoder = ZlibDecoder::new(counting);
+        let decoder = ZlibDecoder::new(f);
+        let mut counting =
+            CountingReader::new(decoder, &mut total_expanded, compressed_bytes, &opts);
 
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).map_err(|e| {
+        counting.read_to_end(&mut decompressed).map_err(|e| {
             let msg = e.to_string();
             if msg.starts_with("bomb limit exceeded") {
                 GitError::LimitExceeded(msg)
@@ -567,10 +567,10 @@ impl GitStore {
                     ..Default::default()
                 };
 
-                let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
-                let mut decoder = ZlibDecoder::new(counting);
+                let decoder = ZlibDecoder::new(f);
+                let mut counting = CountingReader::new(decoder, &mut total_expanded, size, &opts);
                 let mut data = Vec::with_capacity(size as usize);
-                decoder.read_to_end(&mut data).map_err(|e| {
+                counting.read_to_end(&mut data).map_err(|e| {
                     let msg = e.to_string();
                     if msg.starts_with("bomb limit exceeded") {
                         GitError::LimitExceeded(msg)
@@ -614,10 +614,10 @@ impl GitStore {
                     ..Default::default()
                 };
 
-                let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
-                let mut decoder = ZlibDecoder::new(counting);
+                let decoder = ZlibDecoder::new(f);
+                let mut counting = CountingReader::new(decoder, &mut total_expanded, size, &opts);
                 let mut delta_data = Vec::new();
-                decoder.read_to_end(&mut delta_data).map_err(|e| {
+                counting.read_to_end(&mut delta_data).map_err(|e| {
                     let msg = e.to_string();
                     if msg.starts_with("bomb limit exceeded") {
                         GitError::LimitExceeded(msg)
@@ -657,10 +657,10 @@ impl GitStore {
                     ..Default::default()
                 };
 
-                let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
-                let mut decoder = ZlibDecoder::new(counting);
+                let decoder = ZlibDecoder::new(f);
+                let mut counting = CountingReader::new(decoder, &mut total_expanded, size, &opts);
                 let mut delta_data = Vec::new();
-                decoder.read_to_end(&mut delta_data).map_err(|e| {
+                counting.read_to_end(&mut delta_data).map_err(|e| {
                     let msg = e.to_string();
                     if msg.starts_with("bomb limit exceeded") {
                         GitError::LimitExceeded(msg)
@@ -697,6 +697,10 @@ impl GitStore {
             return Err(GitError::LimitExceeded(
                 "delta chain depth limit exceeded".into(),
             ));
+        }
+
+        if oid.len() != 40 {
+            return Err(GitError::Corrupt(format!("invalid oid length: {}", oid)));
         }
 
         if let Some((obj_type, data)) = self.cache.get(oid) {
@@ -877,17 +881,22 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max_member_bytes: u64) -> Result<V
     // 1. Base size
     let mut base_size = 0u64;
     let mut shift = 0;
+    let mut terminated = false;
     while pos < delta.len() {
         let b = delta[pos];
         pos += 1;
         base_size |= ((b & 0x7f) as u64) << shift;
         shift += 7;
         if (b & 0x80) == 0 {
+            terminated = true;
             break;
         }
         if shift > 64 {
             return Err(GitError::Corrupt("delta base size overflow".into()));
         }
+    }
+    if !terminated {
+        return Err(GitError::Corrupt("truncated delta base size".into()));
     }
 
     if base_size != base.len() as u64 {
@@ -897,17 +906,22 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max_member_bytes: u64) -> Result<V
     // 2. Result size
     let mut result_size = 0u64;
     let mut shift = 0;
+    let mut terminated = false;
     while pos < delta.len() {
         let b = delta[pos];
         pos += 1;
         result_size |= ((b & 0x7f) as u64) << shift;
         shift += 7;
         if (b & 0x80) == 0 {
+            terminated = true;
             break;
         }
         if shift > 64 {
             return Err(GitError::Corrupt("delta result size overflow".into()));
         }
+    }
+    if !terminated {
+        return Err(GitError::Corrupt("truncated delta result size".into()));
     }
 
     if result_size > max_member_bytes {
@@ -1029,6 +1043,7 @@ pub fn scan_stray_pack_slice(
 
     let num_objects = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let mut resolved_by_offset: HashMap<u64, (ObjectType, Vec<u8>)> = HashMap::new();
+    let mut resolved_by_oid: HashMap<String, (ObjectType, Vec<u8>)> = HashMap::new();
     let mut blobs = Vec::new();
     let mut has_unresolved_ref_delta = false;
     let mut cursor = 12;
@@ -1077,6 +1092,8 @@ pub fn scan_stray_pack_slice(
                 if obj_type == ObjectType::Blob {
                     blobs.push((obj_offset, data.clone()));
                 }
+                let oid = compute_git_sha1(obj_type, &data);
+                resolved_by_oid.insert(oid, (obj_type, data.clone()));
                 resolved_by_offset.insert(obj_offset, (obj_type, data));
             }
             6 => {
@@ -1119,6 +1136,8 @@ pub fn scan_stray_pack_slice(
                     if base_type == ObjectType::Blob {
                         blobs.push((obj_offset, result_data.clone()));
                     }
+                    let oid = compute_git_sha1(base_type, &result_data);
+                    resolved_by_oid.insert(oid, (base_type, result_data.clone()));
                     resolved_by_offset.insert(obj_offset, (base_type, result_data));
                 }
             }
@@ -1139,21 +1158,16 @@ pub fn scan_stray_pack_slice(
 
                 cursor += decoder.total_in() as usize;
 
-                // Check if base_oid is among already resolved objects
                 let base_oid_hex = hex::encode(base_oid_arr);
-                let mut found_base = None;
-                for (b_type, b_data) in resolved_by_offset.values() {
-                    if compute_git_sha1(*b_type, b_data) == base_oid_hex {
-                        found_base = Some((*b_type, b_data.clone()));
-                        break;
-                    }
-                }
+                let found_base = resolved_by_oid.get(&base_oid_hex).cloned();
 
                 if let Some((base_type, base_data)) = found_base {
                     let result_data = apply_delta(&base_data, &delta_data, max_member_bytes)?;
                     if base_type == ObjectType::Blob {
                         blobs.push((obj_offset, result_data.clone()));
                     }
+                    let oid = compute_git_sha1(base_type, &result_data);
+                    resolved_by_oid.insert(oid, (base_type, result_data.clone()));
                     resolved_by_offset.insert(obj_offset, (base_type, result_data));
                 } else {
                     has_unresolved_ref_delta = true;
