@@ -49,6 +49,8 @@ pub struct ScanOptions {
     pub hunk_threshold: f64,
     pub winnow_threshold: f64,
     pub binary_threshold: f64,
+    /// Tier 2 symbol weight fraction threshold (TR-SC-3, TRD.md §4.2; default 0.35, to be calibrated in E3)
+    pub tier2_threshold: f64,
     pub visibility: Visibility,
     pub max_depth: usize,
     pub max_member_bytes: u64,
@@ -71,6 +73,7 @@ impl Default for ScanOptions {
             hunk_threshold: 0.60,
             winnow_threshold: 0.60,
             binary_threshold: 0.60,
+            tier2_threshold: 0.35,
             visibility: Visibility::AgentVisible,
             max_depth: 4,
             max_member_bytes: 256 * 1024 * 1024, // 256 MiB
@@ -467,6 +470,39 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
             }
         } else if in_code_block {
             current_block.push(line);
+        }
+    }
+
+    // Tier 2 problem statement matching (D0 review flag, TR-SC-3)
+    let gate_hunks: HashSet<usize> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .filter_map(|f| f.hunk)
+        .collect();
+
+    let has_tier2_candidates = fp.hunks.iter().any(|h| {
+        !gate_hunks.contains(&h.hunk_index)
+            && h.tier2_total_weight > 0.0
+            && h.tier2_symbols.len() >= 2
+            && !h.tier2_anchors.is_empty()
+    });
+
+    if has_tier2_candidates {
+        let (unit_symbols, unit_anchor_tokens) =
+            crate::tier2::extract_unit_symbols_and_anchors(text);
+        for hunk in &fp.hunks {
+            if gate_hunks.contains(&hunk.hunk_index) {
+                continue;
+            }
+            if let Some(t2_finding) = hunk.match_tier2_with_context(
+                &unit_symbols,
+                &unit_anchor_tokens,
+                opts,
+                "D0",
+                problem_path,
+            ) {
+                findings.push(t2_finding);
+            }
         }
     }
 

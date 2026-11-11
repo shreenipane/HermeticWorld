@@ -27,5 +27,7 @@ bzip2 = { workspace = true }
 xz2 = { workspace = true }
 zstd = { workspace = true }
 rusqlite = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }
 
 [dev-dependencies]

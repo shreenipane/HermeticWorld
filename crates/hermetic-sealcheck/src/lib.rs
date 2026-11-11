@@ -18,6 +18,7 @@ pub mod index;
 pub mod normalize;
 pub mod sarif;
 pub mod scan;
+pub mod tier2;
 pub mod winnow;
 
 use serde::{Deserialize, Serialize};

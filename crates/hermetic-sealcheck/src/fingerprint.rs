@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use hermetic_common::hash::sha256_hex;
@@ -64,6 +64,42 @@ pub struct HunkFingerprints {
     pub window_u64: BTreeMap<u64, (f64, String)>,
     /// Preconverted 64-bit removed marker fingerprints: hash -> (weight, orig_hex_hash)
     pub removed_u64: BTreeMap<u64, (f64, String)>,
+    /// Tier 2 anchors (file names, module path, enclosing functions/classes)
+    pub tier2_anchors: Vec<String>,
+    /// Tier 2 symbols and their IDF weights
+    pub tier2_symbols: Vec<(String, f64)>,
+    /// Tier 2 total symbol weight
+    pub tier2_total_weight: f64,
+}
+
+impl HunkFingerprints {
+    pub fn match_tier2(
+        &self,
+        text: &str,
+        opts: &crate::scan::ScanOptions,
+        detector: &str,
+        path: &str,
+    ) -> Option<crate::scan::Finding> {
+        crate::tier2::match_tier2_for_unit(text, self, opts, detector, path)
+    }
+
+    pub fn match_tier2_with_context(
+        &self,
+        unit_symbols: &HashSet<String>,
+        unit_anchor_tokens: &HashSet<String>,
+        opts: &crate::scan::ScanOptions,
+        detector: &str,
+        path: &str,
+    ) -> Option<crate::scan::Finding> {
+        crate::tier2::match_tier2_with_context(
+            unit_symbols,
+            unit_anchor_tokens,
+            self,
+            opts,
+            detector,
+            path,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +118,10 @@ pub struct FingerprintSet {
     pub binary_subtracted_count: usize,
     /// Maps fingerprint hash to representative evidence text
     pub hash_to_evidence: HashMap<String, String>,
+    /// Whether base-tree scan was capped at 20,000 files or 200 MiB
+    pub tier2_capped: bool,
+    /// The base-tree Python files sampled for Tier 2 IDF
+    pub tier2_chosen_files: Vec<PathBuf>,
 }
 
 struct CandidateHunk {
@@ -93,6 +133,8 @@ struct CandidateHunk {
     diff_shapes: Vec<(String, String)>,     // (hash, description)
     winnow_candidates: Vec<(u64, String)>,  // (hash, evidence)
     binary_items: Vec<String>,
+    tier2_anchors: Vec<String>,
+    tier2_candidate_symbols: HashSet<String>,
 }
 
 fn apply_patch_to_base(
@@ -207,11 +249,30 @@ fn read_text_like_scanner(path: &Path) -> Option<String> {
 }
 
 impl FingerprintSet {
+    pub const DEFAULT_TIER2_MAX_FILES: usize = 20_000;
+    pub const DEFAULT_TIER2_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
     /// Build tier 1 and tier 3 fingerprints from gold patch, test patch, and base tree.
     pub fn from_task(
         gold_patch_str: &str,
         test_patch_str: &str,
         base_tree_root: &Path,
+    ) -> Result<Self, FingerprintError> {
+        Self::from_task_with_caps(
+            gold_patch_str,
+            test_patch_str,
+            base_tree_root,
+            Self::DEFAULT_TIER2_MAX_FILES,
+            Self::DEFAULT_TIER2_MAX_BYTES,
+        )
+    }
+
+    pub fn from_task_with_caps(
+        gold_patch_str: &str,
+        test_patch_str: &str,
+        base_tree_root: &Path,
+        tier2_max_files: usize,
+        tier2_max_bytes: u64,
     ) -> Result<Self, FingerprintError> {
         let gold_patch = parse_patch(gold_patch_str)?;
         let test_patch = parse_patch(test_patch_str)?;
@@ -260,12 +321,72 @@ impl FingerprintSet {
             let diff_shape_seq =
                 sha256_hex(format!("{}\n{}", file_path, diff_lines_seq.join("\n")).as_bytes());
 
+            // FIX 4: For renames, base file is at old_path
+            let old_file_path = file.old_path.as_deref().unwrap_or(&file_path);
+            let base_file_path = base_tree_root.join(old_file_path);
+            let base_src = if base_file_path.exists() {
+                read_text_like_scanner(&base_file_path)
+            } else {
+                None
+            };
+
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 let mut lines = Vec::new();
                 let mut removed_markers = Vec::new();
                 let mut windows = Vec::new();
                 let mut diff_shapes = Vec::new();
                 let mut winnow_candidates = Vec::new();
+
+                let mut removed_lines = Vec::new();
+                let mut cur_old = hunk.header.old_range.start;
+                for diff_line in &hunk.lines {
+                    match diff_line.line_type {
+                        DiffLineType::Context => {
+                            cur_old += 1;
+                        }
+                        DiffLineType::Removed => {
+                            if cur_old > 0 {
+                                removed_lines.push(cur_old - 1);
+                            }
+                            cur_old += 1;
+                        }
+                        DiffLineType::Added => {}
+                    }
+                }
+
+                // FIX 3: If hunk adds no lines, pass empty added-line list to Tier 2
+                let hunk_has_added = hunk
+                    .lines
+                    .iter()
+                    .any(|l| l.line_type == DiffLineType::Added);
+                let added_lines = if hunk_has_added {
+                    hunk_changed_positions
+                        .get(hunk_idx)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                let (tier2_candidate_symbols, mut tier2_anchors) =
+                    crate::tier2::extract_hunk_symbols_and_anchors(
+                        &file_path,
+                        base_src.as_deref(),
+                        &removed_lines,
+                        &post_fix_text,
+                        &added_lines,
+                    );
+
+                // FIX 4: Add old file's base name and module as additional anchors
+                if let Some(old_p) = file.old_path.as_deref() {
+                    if old_p != file_path {
+                        for a in crate::tier2::extract_file_anchors(old_p) {
+                            if !tier2_anchors.contains(&a) {
+                                tier2_anchors.push(a);
+                            }
+                        }
+                    }
+                }
 
                 // Diff shapes attached to first hunk
                 if hunk_idx == 0 {
@@ -446,6 +567,8 @@ impl FingerprintSet {
                     diff_shapes,
                     winnow_candidates,
                     binary_items,
+                    tier2_anchors,
+                    tier2_candidate_symbols,
                 });
                 global_hunk_counter += 1;
             }
@@ -480,6 +603,8 @@ impl FingerprintSet {
                         diff_shapes: Vec::new(),
                         winnow_candidates: Vec::new(),
                         binary_items: Vec::new(),
+                        tier2_anchors: Vec::new(),
+                        tier2_candidate_symbols: HashSet::new(),
                     });
                     global_hunk_counter += 1;
                 }
@@ -493,8 +618,14 @@ impl FingerprintSet {
         let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
         let mut base_binary_tokens: HashSet<String> = HashSet::new();
 
+        let mut all_tier2_symbols = HashSet::new();
+        for ch in &candidate_hunks {
+            all_tier2_symbols.extend(ch.tier2_candidate_symbols.iter().cloned());
+        }
+
         if base_tree_root.exists() {
             for entry in WalkDir::new(base_tree_root)
+                .sort_by_file_name()
                 .into_iter()
                 .filter_entry(|e| e.file_name() != ".git")
                 .flatten()
@@ -549,7 +680,7 @@ impl FingerprintSet {
                             }
                         }
                         let base_token_texts: Vec<String> =
-                            base_tokens.into_iter().map(|t| t.text).collect();
+                            base_tokens.iter().map(|t| t.text.clone()).collect();
                         for hash in kgram_hashes(&base_token_texts) {
                             base_winnow_hashes.insert(hash);
                         }
@@ -557,6 +688,14 @@ impl FingerprintSet {
                 }
             }
         }
+
+        let (tier2_df_counts, tier2_py_count, tier2_capped, tier2_chosen_files) =
+            sample_base_tree_for_idf(
+                base_tree_root,
+                &all_tier2_symbols,
+                tier2_max_files,
+                tier2_max_bytes,
+            );
 
         let mut subtracted_count = 0;
         let mut winnow_subtracted_count = 0;
@@ -697,6 +836,22 @@ impl FingerprintSet {
                 }
             }
 
+            let n_py_files = tier2_py_count;
+            let mut tier2_symbols = Vec::new();
+            let mut tier2_total_weight = 0.0;
+            for sym in &ch.tier2_candidate_symbols {
+                let df = tier2_df_counts.get(sym).copied().unwrap_or(0);
+                let weight = ((n_py_files as f64 + 1.0) / (df as f64 + 1.0)).ln() + 1.0;
+                tier2_total_weight += weight;
+                tier2_symbols.push((sym.clone(), weight));
+            }
+
+            tier2_symbols.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+
             final_hunks.push(HunkFingerprints {
                 hunk_index: ch.hunk_index,
                 file_path: ch.file_path,
@@ -712,6 +867,9 @@ impl FingerprintSet {
                 line_u64,
                 window_u64,
                 removed_u64,
+                tier2_anchors: ch.tier2_anchors,
+                tier2_symbols,
+                tier2_total_weight,
             });
         }
 
@@ -736,6 +894,103 @@ impl FingerprintSet {
             binary_items_count: total_binary_items,
             binary_subtracted_count,
             hash_to_evidence,
+            tier2_capped,
+            tier2_chosen_files,
         })
     }
+}
+
+/// Sample up to `max_files` (and `max_bytes`) Python files from `base_tree_root` in deterministic
+/// lexicographical order to compute symbol document frequencies.
+pub fn sample_base_tree_for_idf(
+    base_tree_root: &Path,
+    symbols: &HashSet<String>,
+    max_files: usize,
+    max_bytes: u64,
+) -> (HashMap<String, usize>, usize, bool, Vec<PathBuf>) {
+    let mut py_count = 0usize;
+    let mut py_bytes = 0u64;
+    let mut capped = false;
+    let mut df_counts = HashMap::new();
+    let mut chosen_files = Vec::new();
+
+    if base_tree_root.exists() {
+        for entry in WalkDir::new(base_tree_root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .flatten()
+        {
+            if entry.file_type().is_file()
+                && entry.path().extension().is_some_and(|e| e == "py")
+                && !capped
+            {
+                if let Some(content) = read_text_like_scanner(entry.path()) {
+                    let file_size = entry.metadata().map_or(0, |m| m.len());
+                    if py_count >= max_files || py_bytes + file_size > max_bytes {
+                        capped = true;
+                    } else {
+                        py_count += 1;
+                        py_bytes += file_size;
+                        chosen_files.push(entry.path().to_path_buf());
+                        if !symbols.is_empty() {
+                            let base_tokens = tokenize(&content);
+                            let mut found_in_file = HashSet::new();
+                            for tok in &base_tokens {
+                                if symbols.contains(&tok.text) {
+                                    found_in_file.insert(tok.text.clone());
+                                } else if let Some(lit) =
+                                    crate::binary::extract_string_literal_content(&tok.text)
+                                {
+                                    if symbols.contains(&lit) {
+                                        found_in_file.insert(lit);
+                                    }
+                                }
+                            }
+
+                            let mut i = 0;
+                            while i < base_tokens.len() {
+                                let mut chain = base_tokens[i].text.clone();
+                                let mut j = i + 1;
+                                while j + 1 < base_tokens.len() && base_tokens[j].text == "." {
+                                    chain.push('.');
+                                    chain.push_str(&base_tokens[j + 1].text);
+                                    if symbols.contains(&chain) {
+                                        found_in_file.insert(chain.clone());
+                                    }
+                                    j += 2;
+                                }
+                                i += 1;
+                            }
+
+                            for sym in found_in_file {
+                                *df_counts.entry(sym).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (df_counts, py_count, capped, chosen_files)
+}
+
+/// Compute IDF weights for `symbols` sampled from `base_tree_root` with caps on files and bytes.
+/// Returns the symbol weights and the chosen files in sorted order.
+pub fn build_tier2_idf(
+    base_tree_root: &Path,
+    symbols: &HashSet<String>,
+    max_files: usize,
+    max_bytes: u64,
+) -> (HashMap<String, f64>, Vec<PathBuf>) {
+    let (df_counts, py_count, _capped, chosen_files) =
+        sample_base_tree_for_idf(base_tree_root, symbols, max_files, max_bytes);
+    let mut weights = HashMap::new();
+    for sym in symbols {
+        let df = df_counts.get(sym).copied().unwrap_or(0);
+        let weight = ((py_count as f64 + 1.0) / (df as f64 + 1.0)).ln() + 1.0;
+        weights.insert(sym.clone(), weight);
+    }
+    (weights, chosen_files)
 }

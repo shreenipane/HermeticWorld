@@ -309,8 +309,43 @@ impl UnitSink for MatchSink<'_> {
             self.signatures,
             self.opts.visibility,
         ));
+        let before_unit = self.findings.len();
         self.findings
             .extend(match_unit(text, self.fp, self.opts, "D2", "file", path));
+
+        // Tier 2 matching for D2 text units (TR-SC-3)
+        // A unit that already has a tier-1 or tier-3 Gate finding for the same hunk gets no tier-2 finding.
+        let unit_gate_hunks: std::collections::HashSet<usize> = self.findings[before_unit..]
+            .iter()
+            .filter(|f| f.severity == Severity::Gate)
+            .filter_map(|f| f.hunk)
+            .collect();
+
+        let has_tier2_candidates = self.fp.hunks.iter().any(|h| {
+            !unit_gate_hunks.contains(&h.hunk_index)
+                && h.tier2_total_weight > 0.0
+                && h.tier2_symbols.len() >= 2
+                && !h.tier2_anchors.is_empty()
+        });
+
+        if has_tier2_candidates {
+            let (unit_symbols, unit_anchor_tokens) =
+                crate::tier2::extract_unit_symbols_and_anchors(text);
+            for hunk in &self.fp.hunks {
+                if unit_gate_hunks.contains(&hunk.hunk_index) {
+                    continue;
+                }
+                if let Some(t2_finding) = hunk.match_tier2_with_context(
+                    &unit_symbols,
+                    &unit_anchor_tokens,
+                    self.opts,
+                    "D2",
+                    path,
+                ) {
+                    self.findings.push(t2_finding);
+                }
+            }
+        }
     }
 
     fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
