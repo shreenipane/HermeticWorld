@@ -1066,13 +1066,13 @@ pub fn scan_stray_pack_slice(
                     _ => unreachable!(),
                 };
 
-                let mut decompressor = Decompress::new(true);
+                let mut decoder = ZlibDecoder::new(&bytes[cursor..]);
                 let mut data = Vec::with_capacity(size as usize);
-                decompressor
-                    .decompress_vec(&bytes[cursor..], &mut data, flate2::FlushDecompress::Finish)
+                decoder
+                    .read_to_end(&mut data)
                     .map_err(|e| GitError::Corrupt(format!("zlib decompress error: {e}")))?;
 
-                cursor += decompressor.total_in() as usize;
+                cursor += decoder.total_in() as usize;
 
                 if obj_type == ObjectType::Blob {
                     blobs.push((obj_offset, data.clone()));
@@ -1105,17 +1105,13 @@ pub fn scan_stray_pack_slice(
                     .checked_sub(base_offset_delta)
                     .ok_or_else(|| GitError::Corrupt("base offset underflow".into()))?;
 
-                let mut decompressor = Decompress::new(true);
+                let mut decoder = ZlibDecoder::new(&bytes[cursor..]);
                 let mut delta_data = Vec::new();
-                decompressor
-                    .decompress_vec(
-                        &bytes[cursor..],
-                        &mut delta_data,
-                        flate2::FlushDecompress::Finish,
-                    )
+                decoder
+                    .read_to_end(&mut delta_data)
                     .map_err(|e| GitError::Corrupt(format!("zlib delta decompress error: {e}")))?;
 
-                cursor += decompressor.total_in() as usize;
+                cursor += decoder.total_in() as usize;
 
                 if let Some((base_type, base_data)) = resolved_by_offset.get(&base_offset).cloned()
                 {
@@ -1135,17 +1131,13 @@ pub fn scan_stray_pack_slice(
                 base_oid_arr.copy_from_slice(&bytes[cursor..cursor + 20]);
                 cursor += 20;
 
-                let mut decompressor = Decompress::new(true);
+                let mut decoder = ZlibDecoder::new(&bytes[cursor..]);
                 let mut delta_data = Vec::new();
-                decompressor
-                    .decompress_vec(
-                        &bytes[cursor..],
-                        &mut delta_data,
-                        flate2::FlushDecompress::Finish,
-                    )
+                decoder
+                    .read_to_end(&mut delta_data)
                     .map_err(|e| GitError::Corrupt(format!("zlib delta decompress error: {e}")))?;
 
-                cursor += decompressor.total_in() as usize;
+                cursor += decoder.total_in() as usize;
 
                 // Check if base_oid is among already resolved objects
                 let base_oid_hex = hex::encode(base_oid_arr);
