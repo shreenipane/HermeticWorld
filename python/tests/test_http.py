@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import urllib.error
 import pytest
 
-from hermetic_slice.http import HttpError, atomic_write_bytes, make_http_get
+from hermetic_slice.http import HttpError, atomic_write_bytes, make_http_get, make_http_post_json
 
 
 def test_make_http_get_retry_and_backoff(tmp_path: Path) -> None:
@@ -130,3 +130,122 @@ def test_atomic_write_bytes_failure_leaves_no_file(tmp_path: Path) -> None:
     assert not cache_path.exists()
     # Ensure no partial or temporary files left in parent directory
     assert list(cache_path.parent.glob("*.tmp")) == []
+
+
+def test_make_http_post_json_retry_and_backoff(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    sleep_calls: list[float] = []
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = b'{"data": {"status": "ok"}}'
+    mock_resp.__enter__.return_value = mock_resp
+
+    err502 = urllib.error.HTTPError("http://example.com/graphql", 502, "Bad Gateway", {}, None)  # type: ignore
+
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=[err502, err502, mock_resp],
+    ) as mock_urlopen:
+        http_post = make_http_post_json(cache_dir, sleep=sleep_calls.append)
+        res = http_post("http://example.com/graphql", {"query": "test"})
+
+        assert res == {"data": {"status": "ok"}}
+        assert sleep_calls == [2, 4]
+        assert mock_urlopen.call_count == 3
+
+
+def test_make_http_post_json_404_no_retry(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    sleep_calls: list[float] = []
+
+    err404 = urllib.error.HTTPError("http://example.com/missing", 404, "Not Found", {}, None)  # type: ignore
+
+    with patch("urllib.request.urlopen", side_effect=err404) as mock_urlopen:
+        http_post = make_http_post_json(cache_dir, sleep=sleep_calls.append)
+        with pytest.raises(HttpError) as exc_info:
+            http_post("http://example.com/missing", {"query": "test"})
+
+        assert exc_info.value.status == 404
+        assert exc_info.value.url == "http://example.com/missing"
+        assert sleep_calls == []
+        assert mock_urlopen.call_count == 1
+
+
+def test_make_http_post_json_cache_hit(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    sleep_calls: list[float] = []
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = b'{"data": {"item": 1}}'
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        http_post = make_http_post_json(cache_dir, sleep=sleep_calls.append)
+        res1 = http_post("http://example.com/graphql", {"query": "q1"})
+        assert res1 == {"data": {"item": 1}}
+        assert mock_urlopen.call_count == 1
+
+        # Second call is a cache hit
+        res2 = http_post("http://example.com/graphql", {"query": "q1"})
+        assert res2 == {"data": {"item": 1}}
+        assert mock_urlopen.call_count == 1, "Cache hit must make zero network calls"
+
+
+def test_make_http_post_json_token_handling(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    secret_token = "ghp_POST_SECRET_TOKEN_123"
+
+    captured_requests: list[urllib.request.Request] = []
+
+    def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MagicMock:
+        captured_requests.append(req)
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"data": "ok"}'
+        mock_resp.__enter__.return_value = mock_resp
+        return mock_resp
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        http_post = make_http_post_json(cache_dir, token=secret_token)
+
+        # 1. GitHub API URL -> token is sent
+        http_post("https://api.github.com/graphql", {"query": "test"})
+        assert len(captured_requests) == 1
+        assert captured_requests[0].get_header("Authorization") == f"Bearer {secret_token}"
+        assert captured_requests[0].get_header("Content-type") == "application/json"
+
+        # 2. Non-GitHub API URL -> token is NOT sent
+        http_post("https://other.com/graphql", {"query": "test"})
+        assert len(captured_requests) == 2
+        assert captured_requests[1].get_header("Authorization") is None
+
+    # Verify token never appears in any cache file
+    for cache_file in (cache_dir / "http").iterdir():
+        file_bytes = cache_file.read_bytes()
+        assert secret_token.encode("utf-8") not in file_bytes
+
+
+def test_make_http_post_json_errors_not_cached(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = b'{"data": null, "errors": [{"message": "Field not found"}]}'
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        http_post = make_http_post_json(cache_dir)
+        res1 = http_post("https://api.github.com/graphql", {"query": "bad_query"})
+        assert res1 == {"data": None, "errors": [{"message": "Field not found"}]}
+        assert mock_urlopen.call_count == 1
+
+        # Because response contained errors, no cache file should be written!
+        http_cache = cache_dir / "http"
+        assert not http_cache.exists() or list(http_cache.iterdir()) == []
+
+        # Calling again triggers another network call because errors were not cached
+        res2 = http_post("https://api.github.com/graphql", {"query": "bad_query"})
+        assert res2 == res1
+        assert mock_urlopen.call_count == 2

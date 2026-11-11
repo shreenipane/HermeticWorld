@@ -13,7 +13,8 @@ import urllib.parse
 
 from hermetic_slice.cutoffs import Cutoffs, FixCommit, compute_cutoffs, ensure_utc
 from hermetic_slice.gitutil import GitError, run_git
-from hermetic_slice.http import HttpError, HttpGet, atomic_write_bytes
+from hermetic_slice.http import HttpError, HttpGet, HttpPostJson, atomic_write_bytes
+from hermetic_slice.thread_scrub import process_thread_scrub_and_revision
 
 
 class IntakeError(Exception):
@@ -276,6 +277,9 @@ def intake_task(
     cache_dir: Path,
     out_dir: Path,
     clone_url: str | None = None,
+    *,
+    token: str | None = None,
+    http_post_json: HttpPostJson | None = None,
 ) -> Path:
     """Ingest a SWE-bench task, computing cutoffs and creating isolated staging/agent files."""
     if instance_id not in rows:
@@ -336,8 +340,6 @@ def intake_task(
     elif not resolved_issue_refs:
         warnings_list.append(f"No valid issue reference resolved for PR {pr_number}")
 
-    warnings_list.append("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)")
-
     base_commit_time, repo_first_commit_time = repo_dates(
         repo,
         row["base_commit"],
@@ -351,6 +353,21 @@ def intake_task(
         fix_commits=fix_commits,
         base_commit_time=base_commit_time,
         repo_first_commit_time=repo_first_commit_time,
+    )
+
+    target_issue_number = earliest_ref.number if (resolved_issue_refs and earliest_ref.kind == "github") else None
+    scrub_result = process_thread_scrub_and_revision(
+        repo=repo,
+        pr_number=pr_number,
+        target_issue_number=target_issue_number,
+        target_issue_created=earliest_issue_created,
+        t_world=cutoffs.t_world,
+        scraped_problem_statement=row.get("problem_statement", ""),
+        scraped_hints=row.get("hints_text", ""),
+        token=token,
+        http_post_json=http_post_json,
+        cache_dir=cache_dir,
+        warnings_list=warnings_list,
     )
 
     image = "swebench/sweb.eval.x86_64." + instance_id.lower().replace("__", "_1776_") + ":latest"
@@ -385,10 +402,14 @@ def intake_task(
             "repo_first_commit_time": iso_utc(repo_first_commit_time),
         },
         "environment_setup_commit": row.get("environment_setup_commit", ""),
+        "hints_revisioned": scrub_result.hints_revisioned,
         "image": image,
         "instance_id": instance_id,
         "issue_source": issue_source,
         "pr_number": pr_number,
+        "problem_statement_revision": scrub_result.problem_statement_revision,
+        "chosen_revision_edited_at": scrub_result.chosen_revision_edited_at,
+        "edits_ignored": scrub_result.edits_ignored,
         "repo": repo,
         "schema": "hermetic-slice-task/v1",
         "sources": {
@@ -414,9 +435,14 @@ def intake_task(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     (task_dir / "task.json").write_text(json.dumps(task_json_data, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
-    (agent_dir / "problem_statement.md").write_text(row.get("problem_statement", ""), encoding="utf-8", newline="")
+    (agent_dir / "problem_statement.md").write_text(scrub_result.problem_statement, encoding="utf-8", newline="")
     (staging_dir / "gold.patch").write_text(row.get("patch", ""), encoding="utf-8", newline="")
     (staging_dir / "test.patch").write_text(row.get("test_patch", ""), encoding="utf-8", newline="")
-    (staging_dir / "hints.txt").write_text(row.get("hints_text", ""), encoding="utf-8", newline="")
+    (staging_dir / "hints.txt").write_text(scrub_result.hints_text, encoding="utf-8", newline="")
+    (staging_dir / "thread_scrub.json").write_text(
+        json.dumps(scrub_result.scrub_entries, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     return task_dir

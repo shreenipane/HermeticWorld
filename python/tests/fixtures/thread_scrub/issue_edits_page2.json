@@ -1,0 +1,26 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-03T10:00:00Z",
+              "editedAt": "2020-01-03T10:00:00Z",
+              "diff": "Page 2 Edit: pre-cutoff valid revision"
+            },
+            {
+              "createdAt": "2020-01-01T10:00:00Z",
+              "editedAt": "2020-01-01T10:00:00Z",
+              "diff": "Page 2 Edit: initial revision"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import hashlib
+import json
 import os
 from pathlib import Path
 import socket
 import tempfile
 import time
+from typing import Any
 import urllib.error
 import urllib.request
 
@@ -23,6 +25,7 @@ class HttpError(Exception):
 
 
 HttpGet = Callable[[str], bytes]
+HttpPostJson = Callable[[str, Any], Any]
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -97,3 +100,96 @@ def make_http_get(
         raise HttpError(url, last_status) from None
 
     return http_get
+
+
+def make_http_post_json(
+    cache_dir: Path,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    token: str | None = None,
+) -> HttpPostJson:
+    """Create an HttpPostJson callable backed by a disk cache, token handling, and retry logic."""
+    http_cache_dir = cache_dir / "http"
+
+    def http_post_json_fn(url: str, payload: Any) -> Any:
+        if isinstance(payload, str):
+            body_str = payload
+        else:
+            body_str = json.dumps(payload, sort_keys=True)
+
+        cache_key = hashlib.sha256((url + body_str).encode("utf-8")).hexdigest()
+        cache_file = http_cache_dir / f"{cache_key}.body"
+        if cache_file.exists():
+            return json.loads(cache_file.read_bytes().decode("utf-8"))
+
+        data = body_str.encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("User-Agent", "hermetic-world-intake/0.1")
+        req.add_header("Content-Type", "application/json")
+        if token and url.startswith("https://api.github.com/"):
+            req.add_header("Authorization", f"Bearer {token}")
+
+        retry_delays = [2, 4, 8, 16]
+        max_attempts = 5
+        last_status = 0
+
+        for attempt in range(max_attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    status = resp.status
+                    body = resp.read()
+                    data_obj = json.loads(body.decode("utf-8"))
+                    # Never cache responses containing GraphQL errors
+                    has_errors = isinstance(data_obj, dict) and bool(data_obj.get("errors"))
+                    if status == 200 and not has_errors:
+                        atomic_write_bytes(cache_file, body)
+                    return data_obj
+            except urllib.error.HTTPError as exc:
+                last_status = exc.code
+                if exc.code == 429 or (500 <= exc.code < 600):
+                    if attempt < len(retry_delays):
+                        sleep(retry_delays[attempt])
+                        continue
+                elif 400 <= exc.code < 500:
+                    raise HttpError(url, exc.code) from None
+                if attempt < len(retry_delays):
+                    sleep(retry_delays[attempt])
+                    continue
+            except (urllib.error.URLError, TimeoutError, socket.timeout):
+                last_status = 0
+                if attempt < len(retry_delays):
+                    sleep(retry_delays[attempt])
+                    continue
+
+        raise HttpError(url, last_status) from None
+
+    return http_post_json_fn
+
+
+def http_post_json(
+    url: str,
+    payload: Any,
+    *,
+    cache_dir: Path | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    token: str | None = None,
+) -> Any:
+    """Execute an HTTP POST request sending JSON, optionally cached."""
+    if cache_dir is not None:
+        caller = make_http_post_json(cache_dir, sleep=sleep, token=token)
+        return caller(url, payload)
+
+    if isinstance(payload, str):
+        body_str = payload
+    else:
+        body_str = json.dumps(payload, sort_keys=True)
+
+    data = body_str.encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("User-Agent", "hermetic-world-intake/0.1")
+    req.add_header("Content-Type", "application/json")
+    if token and url.startswith("https://api.github.com/"):
+        req.add_header("Authorization", f"Bearer {token}")
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
