@@ -348,6 +348,14 @@ impl<'a> ContainerScanner<'a> {
             }
         } else {
             // Plain file unit
+            // Part B: Recognised binaries (ELF, Java .class, wasm) are scanned for D3b
+            if let Some(findings) =
+                crate::binary::scan_binary_if_recognized(path, bytes, self.fp, self.opts)
+            {
+                self.findings.extend(findings);
+                return;
+            }
+
             // Check binary (NUL byte in first 8 KiB)
             let check_len = bytes.len().min(8192);
             if bytes[..check_len].contains(&0) {
@@ -365,6 +373,12 @@ impl<'a> ContainerScanner<'a> {
             }
 
             let text = String::from_utf8_lossy(bytes);
+            // Minified text gets D3b in addition to tiers 1 and 3
+            if crate::binary::is_minified_bundle(path, &text) {
+                self.findings.extend(crate::binary::scan_minified_bundle(
+                    path, &text, self.fp, self.opts,
+                ));
+            }
             self.scan_text(path, &text);
         }
     }

@@ -50,6 +50,7 @@ pub struct ScanOptions {
     pub max_file_bytes: u64,
     pub hunk_threshold: f64,
     pub winnow_threshold: f64,
+    pub binary_threshold: f64,
     pub visibility: Visibility,
     pub max_depth: usize,
     pub max_member_bytes: u64,
@@ -61,6 +62,8 @@ pub struct ScanOptions {
     pub base_commit: Option<String>,
     pub t_clock: Option<time::OffsetDateTime>,
     pub max_delta_depth: usize,
+    pub target_packages: Vec<String>,
+    pub task_version: Option<String>,
 }
 
 impl Default for ScanOptions {
@@ -69,6 +72,7 @@ impl Default for ScanOptions {
             max_file_bytes: 64 * 1024 * 1024, // 64 MiB
             hunk_threshold: 0.60,
             winnow_threshold: 0.60,
+            binary_threshold: 0.60,
             visibility: Visibility::AgentVisible,
             max_depth: 4,
             max_member_bytes: 256 * 1024 * 1024, // 256 MiB
@@ -79,6 +83,8 @@ impl Default for ScanOptions {
             base_commit: None,
             t_clock: None,
             max_delta_depth: 4096,
+            target_packages: Vec::new(),
+            task_version: None,
         }
     }
 }
@@ -634,6 +640,9 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                 continue;
             }
         };
+
+        // D5a target project version check on metadata files
+        findings.extend(crate::d5a::check_d5a_metadata(file_path, &bytes, opts));
 
         let unit_findings = scan_container_or_unit_with_root_prefix(
             &display_path,

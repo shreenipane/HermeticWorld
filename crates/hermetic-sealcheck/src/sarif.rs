@@ -134,6 +134,18 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
             },
         },
         SarifRule {
+            id: "D3b".to_string(),
+            short_description: SarifMessage {
+                text: "Compiled and derived artifacts".to_string(),
+            },
+        },
+        SarifRule {
+            id: "D5a".to_string(),
+            short_description: SarifMessage {
+                text: "Target project at a post-fix version".to_string(),
+            },
+        },
+        SarifRule {
             id: "D6".to_string(),
             short_description: SarifMessage {
                 text: "OCI and VM metadata leak".to_string(),

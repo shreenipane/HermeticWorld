@@ -34,6 +34,8 @@ pub struct HunkFingerprints {
     pub diff_shapes: HashMap<String, f64>,
     /// Tier 3 winnow fingerprints
     pub winnow_fingerprints: HashSet<u64>,
+    /// Binary tier items (identifiers and string literals)
+    pub binary_items: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,8 @@ pub struct FingerprintSet {
     pub subtracted_count: usize,
     pub winnow_count: usize,
     pub winnow_subtracted_count: usize,
+    pub binary_items_count: usize,
+    pub binary_subtracted_count: usize,
     /// Maps fingerprint hash to representative evidence text
     pub hash_to_evidence: HashMap<String, String>,
 }
@@ -59,6 +63,7 @@ struct CandidateHunk {
     removed_markers: Vec<(String, String)>, // (hash, norm)
     diff_shapes: Vec<(String, String)>,     // (hash, description)
     winnow_candidates: Vec<(u64, String)>,  // (hash, evidence)
+    binary_items: Vec<String>,
 }
 
 fn apply_patch_to_base(
@@ -387,6 +392,22 @@ impl FingerprintSet {
                     }
                 }
 
+                // Binary tier items from added lines only
+                let mut added_lines = Vec::new();
+                for diff_line in &hunk.lines {
+                    if diff_line.line_type == DiffLineType::Added {
+                        added_lines.push(diff_line.content.as_str());
+                    }
+                }
+                let raw_items = crate::binary::extract_binary_items(&added_lines.join("\n"));
+                let mut seen_items = HashSet::new();
+                let mut binary_items = Vec::new();
+                for it in raw_items {
+                    if seen_items.insert(it.clone()) {
+                        binary_items.push(it);
+                    }
+                }
+
                 candidate_hunks.push(CandidateHunk {
                     hunk_index: global_hunk_counter,
                     file_path: file_path.clone(),
@@ -395,6 +416,7 @@ impl FingerprintSet {
                     removed_markers,
                     diff_shapes,
                     winnow_candidates,
+                    binary_items,
                 });
                 global_hunk_counter += 1;
             }
@@ -428,17 +450,19 @@ impl FingerprintSet {
                         removed_markers: Vec::new(),
                         diff_shapes: Vec::new(),
                         winnow_candidates: Vec::new(),
+                        binary_items: Vec::new(),
                     });
                     global_hunk_counter += 1;
                 }
             }
         }
 
-        // 3. Baseline subtraction (TR-SC-1 & TR-SC-4): walk base_tree_root
+        // 3. Baseline subtraction (TR-SC-1, TR-SC-4 & TR-SC-5): walk base_tree_root
         let mut base_line_counts: HashMap<String, usize> = HashMap::new();
         let mut base_line_hashes: HashSet<String> = HashSet::new();
         let mut base_window_hashes: HashSet<String> = HashSet::new();
         let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
+        let mut base_binary_tokens: HashSet<String> = HashSet::new();
 
         if base_tree_root.exists() {
             for entry in WalkDir::new(base_tree_root)
@@ -485,8 +509,16 @@ impl FingerprintSet {
                             }
                         }
 
-                        // Winnow hashes for base tree
+                        // Winnow hashes and binary tokens for base tree
                         let base_tokens = tokenize(&content);
+                        for tok in &base_tokens {
+                            base_binary_tokens.insert(tok.text.clone());
+                            if let Some(literal_content) =
+                                crate::binary::extract_string_literal_content(&tok.text)
+                            {
+                                base_binary_tokens.insert(literal_content);
+                            }
+                        }
                         let base_token_texts: Vec<String> =
                             base_tokens.into_iter().map(|t| t.text).collect();
                         for hash in kgram_hashes(&base_token_texts) {
@@ -499,6 +531,7 @@ impl FingerprintSet {
 
         let mut subtracted_count = 0;
         let mut winnow_subtracted_count = 0;
+        let mut binary_subtracted_count = 0;
         let mut final_hunks = Vec::new();
         let mut all_diff_shapes = HashSet::new();
         let mut hash_to_evidence = HashMap::new();
@@ -508,6 +541,7 @@ impl FingerprintSet {
         let mut total_removed = 0;
         let mut total_shapes = 0;
         let mut total_winnow = 0;
+        let mut total_binary_items = 0;
 
         for ch in candidate_hunks {
             let mut surviving_lines = Vec::new();
@@ -554,6 +588,17 @@ impl FingerprintSet {
                     hash_to_evidence.insert(format!("{:016x}", hash), ev);
                 }
             }
+
+            // Baseline subtraction for binary tier items
+            let mut surviving_binary_items = Vec::new();
+            for item in ch.binary_items {
+                if base_binary_tokens.contains(&item) {
+                    binary_subtracted_count += 1;
+                } else {
+                    surviving_binary_items.push(item);
+                }
+            }
+            total_binary_items += surviving_binary_items.len();
 
             // Compute raw weights
             let mut line_fingerprints = HashMap::new();
@@ -615,6 +660,7 @@ impl FingerprintSet {
                 total_removed_weight,
                 diff_shapes: diff_shapes_map,
                 winnow_fingerprints,
+                binary_items: surviving_binary_items,
             });
         }
 
@@ -628,6 +674,8 @@ impl FingerprintSet {
             subtracted_count,
             winnow_count: total_winnow,
             winnow_subtracted_count,
+            binary_items_count: total_binary_items,
+            binary_subtracted_count,
             hash_to_evidence,
         })
     }

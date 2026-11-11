@@ -88,6 +88,10 @@ struct ScanArgs {
     /// Path to docker history JSON lines file
     #[arg(long)]
     oci_history: Option<PathBuf>,
+
+    /// Target package names for D5a target version check (repeatable)
+    #[arg(long = "target-package")]
+    target_package: Vec<String>,
 }
 
 fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -119,6 +123,10 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let canonical_task_dir = args.task.canonicalize().ok();
 
+    let repo_pkg = task.repo.rsplit('/').next().unwrap_or(&task.repo);
+    let mut target_packages = vec![repo_pkg.to_string()];
+    target_packages.extend(args.target_package);
+
     for (idx, root) in args.roots.iter().enumerate() {
         let vis = args
             .root_visibilities
@@ -133,6 +141,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             exclude_dirs: canonical_task_dir.iter().cloned().collect(),
             base_commit: Some(task.base_commit.clone()),
             t_clock: Some(task.cutoffs.t_clock),
+            target_packages: target_packages.clone(),
+            task_version: task.version.clone(),
             ..Default::default()
         };
         let tree_findings = scan_tree(root, &fp, &opts);
@@ -175,6 +185,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 subtracted: fp.subtracted_count,
                 winnow: fp.winnow_count,
                 winnow_subtracted: fp.winnow_subtracted_count,
+                binary_items: fp.binary_items_count,
+                binary_subtracted: fp.binary_subtracted_count,
             };
             let report = SealcheckReport {
                 schema: "hermetic-sealcheck/v0".to_string(),
