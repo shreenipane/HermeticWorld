@@ -170,7 +170,7 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     }
 
     // 10. Validate refs and identify allowed tags
-    let mut allowed_tags = HashSet::new(); // set of tag oids or peeled target oids
+    let mut allowed_tags: Vec<AllowedTag> = Vec::new();
 
     for (ref_name, ref_oid) in &all_refs {
         if ref_name.starts_with("refs/heads/") {
@@ -195,11 +195,8 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
                 fp,
                 opts,
             ) {
-                Ok(allowed_oid) => {
-                    allowed_tags.insert(ref_oid.clone());
-                    if let Some(target) = allowed_oid {
-                        allowed_tags.insert(target);
-                    }
+                Ok(allowed_tag) => {
+                    allowed_tags.push(allowed_tag);
                 }
                 Err(tag_finding) => {
                     findings.push(*tag_finding);
@@ -223,32 +220,21 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     let mut commit_queue = VecDeque::new();
     let mut tree_queue = VecDeque::new();
 
-    commit_queue.push_back(base_commit.clone());
-    for tag_oid in &allowed_tags {
-        reachable.insert(tag_oid.clone());
-        if let Ok(obj) = store.read_object(tag_oid) {
-            match obj.obj_type {
-                ObjectType::Commit => commit_queue.push_back(tag_oid.clone()),
-                ObjectType::Tree => tree_queue.push_back(tag_oid.clone()),
-                ObjectType::Blob => {
-                    reachable.insert(tag_oid.clone());
-                }
-                ObjectType::Tag => {
-                    if let Ok(tag) = store.parse_tag(&obj.data) {
-                        match tag.target_type {
-                            ObjectType::Commit => {
-                                commit_queue.push_back(tag.target_oid.to_lowercase())
-                            }
-                            ObjectType::Tree => tree_queue.push_back(tag.target_oid.to_lowercase()),
-                            ObjectType::Blob | ObjectType::Tag => {
-                                reachable.insert(tag.target_oid.to_lowercase());
-                            }
-                        }
-                    }
-                }
+    // Mark tag objects as reachable, and queue their targets
+    for tag in &allowed_tags {
+        for tag_obj in &tag.tag_objects {
+            reachable.insert(tag_obj.clone());
+        }
+        match tag.target_type {
+            ObjectType::Commit => commit_queue.push_back(tag.target_oid.clone()),
+            ObjectType::Tree => tree_queue.push_back(tag.target_oid.clone()),
+            ObjectType::Blob | ObjectType::Tag => {
+                reachable.insert(tag.target_oid.clone());
             }
         }
     }
+
+    commit_queue.push_back(base_commit.clone());
 
     // Walk commits
     while let Some(c_oid) = commit_queue.pop_front() {
@@ -347,6 +333,13 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
             if let Ok(obj) = store.read_object(oid) {
                 match obj.obj_type {
                     ObjectType::Blob => {
+                        if compute_git_sha1(ObjectType::Blob, &obj.data) != *oid {
+                            findings.push(gate_finding(
+                                "git_corrupt",
+                                git_dir_str.clone(),
+                                format!("hash mismatch for unreachable blob {}", oid),
+                            ));
+                        }
                         let unit_findings = scan_container_or_unit_with_root_prefix(
                             &item_path,
                             &obj.data,
@@ -405,20 +398,26 @@ pub fn scan_git_repo(git_dir: &Path, fp: &FingerprintSet, opts: &ScanOptions) ->
     findings
 }
 
+struct AllowedTag {
+    tag_objects: Vec<String>,
+    target_oid: String,
+    target_type: ObjectType,
+}
+
 fn check_tag(
     store: &mut GitStore,
     tag_oid: &str,
-    _tag_name: &str,
+    tag_name: &str,
     ancestors: &HashSet<String>,
     t_clock: Option<time::OffsetDateTime>,
     fp: &FingerprintSet,
     opts: &ScanOptions,
-) -> Result<Option<String>, Box<Finding>> {
+) -> Result<AllowedTag, Box<Finding>> {
     let gate_finding = |ev: String| {
         Box::new(Finding {
             detector: "D1".into(),
             channel: "git_tag".into(),
-            path: format!("refs/tags/{}", _tag_name),
+            path: format!("refs/tags/{}", tag_name),
             visibility: opts.visibility,
             severity: Severity::Gate,
             confidence: 1.0,
@@ -441,9 +440,27 @@ fn check_tag(
                     tag_oid
                 )));
             }
-            Ok(None)
+            Ok(AllowedTag {
+                tag_objects: Vec::new(),
+                target_oid: tag_oid.to_string(),
+                target_type: ObjectType::Commit,
+            })
         }
         ObjectType::Tag => {
+            // Recompute tag id
+            if compute_git_sha1(obj.obj_type, &obj.data) != tag_oid {
+                return Err(Box::new(Finding {
+                    detector: "D1".into(),
+                    channel: "git_corrupt".into(),
+                    path: format!("refs/tags/{}", tag_name),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec![format!("hash mismatch for tag {}", tag_oid)],
+                }));
+            }
+
             // Annotated tag object
             let tag = match store.parse_tag(&obj.data) {
                 Ok(t) => t,
@@ -472,7 +489,7 @@ fn check_tag(
                 opts,
                 "D1",
                 "git_tag",
-                &format!("refs/tags/{}", _tag_name),
+                &format!("refs/tags/{}", tag_name),
             );
             if !msg_findings.is_empty() {
                 return Err(gate_finding(
@@ -481,17 +498,35 @@ fn check_tag(
             }
 
             // Peel target to verify ancestor
-            let target_oid = tag.target_oid.to_lowercase();
-            let mut current_target = target_oid.clone();
+            let mut tag_objects = vec![tag_oid.to_string()];
+            let mut current_target = tag.target_oid.to_lowercase();
+            let mut current_type = tag.target_type;
 
             loop {
-                if ancestors.contains(&current_target) {
+                if current_type == ObjectType::Commit && ancestors.contains(&current_target) {
                     break;
                 }
                 match store.read_object(&current_target) {
                     Ok(next_obj) if next_obj.obj_type == ObjectType::Tag => {
+                        tag_objects.push(current_target.clone());
+                        if compute_git_sha1(next_obj.obj_type, &next_obj.data) != current_target {
+                            return Err(Box::new(Finding {
+                                detector: "D1".into(),
+                                channel: "git_corrupt".into(),
+                                path: format!("refs/tags/{}", tag_name),
+                                visibility: opts.visibility,
+                                severity: Severity::Gate,
+                                confidence: 1.0,
+                                hunk: None,
+                                evidence: vec![format!(
+                                    "hash mismatch for intermediate tag {}",
+                                    current_target
+                                )],
+                            }));
+                        }
                         if let Ok(next_tag) = store.parse_tag(&next_obj.data) {
                             current_target = next_tag.target_oid.to_lowercase();
+                            current_type = next_tag.target_type;
                         } else {
                             return Err(gate_finding(format!(
                                 "peeled tag points to non-ancestor {}",
@@ -508,7 +543,11 @@ fn check_tag(
                 }
             }
 
-            Ok(Some(target_oid))
+            Ok(AllowedTag {
+                tag_objects,
+                target_oid: current_target,
+                target_type: current_type,
+            })
         }
         _ => Err(gate_finding("tag points to unsupported object type".into())),
     }
@@ -822,10 +861,32 @@ fn check_commit_graphs(
     opts: &ScanOptions,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let candidates = [
-        git_dir.join("objects").join("info").join("commit-graph"),
-        git_dir.join("objects").join("commit-graph"),
-    ];
+    let mut candidates = Vec::new();
+    let p1 = git_dir.join("objects").join("info").join("commit-graph");
+    if p1.is_file() {
+        candidates.push(p1);
+    }
+    let p2 = git_dir.join("objects").join("commit-graph");
+    if p2.is_file() {
+        candidates.push(p2);
+    }
+    let p3 = git_dir.join("commit-graph");
+    if p3.is_file() {
+        candidates.push(p3);
+    }
+    for dir in &[
+        git_dir.join("objects").join("info").join("commit-graphs"),
+        git_dir.join("objects").join("commit-graphs"),
+        git_dir.join("commit-graphs"),
+    ] {
+        if dir.is_dir() {
+            for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+                if entry.file_type().is_file() {
+                    candidates.push(entry.into_path());
+                }
+            }
+        }
+    }
 
     for path in &candidates {
         if path.is_file() {

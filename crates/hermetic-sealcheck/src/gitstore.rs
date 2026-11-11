@@ -94,16 +94,23 @@ pub struct PackIndex {
     pub offsets: Vec<u64>,
 }
 
+pub type StrayPackResult = (Vec<(u64, Vec<u8>)>, bool);
+
 impl PackIndex {
     pub fn open(idx_path: &Path) -> Result<Self, GitError> {
         let mut f = File::open(idx_path)?;
         let mut magic = [0u8; 4];
-        if f.read_exact(&mut magic).is_err() || &magic != b"\xfftOc" {
-            return Err(GitError::Unsupported("pack idx v1 or invalid magic".into()));
+        if f.read_exact(&mut magic).is_err() {
+            return Err(GitError::Corrupt("truncated pack idx".into()));
+        }
+        if &magic != b"\xfftOc" {
+            return Err(GitError::Unsupported("pack idx v1".into()));
         }
 
         let mut ver_buf = [0u8; 4];
-        f.read_exact(&mut ver_buf)?;
+        if f.read_exact(&mut ver_buf).is_err() {
+            return Err(GitError::Corrupt("truncated pack idx version".into()));
+        }
         let version = u32::from_be_bytes(ver_buf);
         if version != 2 {
             return Err(GitError::Unsupported(format!(
@@ -116,7 +123,9 @@ impl PackIndex {
         let mut buf4 = [0u8; 4];
         let mut prev = 0u32;
         for (i, entry) in fanout.iter_mut().enumerate() {
-            f.read_exact(&mut buf4)?;
+            if f.read_exact(&mut buf4).is_err() {
+                return Err(GitError::Corrupt("truncated pack idx fanout".into()));
+            }
             let count = u32::from_be_bytes(buf4);
             if i > 0 && count < prev {
                 return Err(GitError::Corrupt("idx fanout not monotonic".into()));
@@ -129,7 +138,9 @@ impl PackIndex {
         let mut oids = Vec::with_capacity(total_objects);
         let mut oid_buf = [0u8; 20];
         for _ in 0..total_objects {
-            f.read_exact(&mut oid_buf)?;
+            if f.read_exact(&mut oid_buf).is_err() {
+                return Err(GitError::Corrupt("truncated pack idx oids".into()));
+            }
             oids.push(oid_buf);
         }
 
@@ -139,7 +150,9 @@ impl PackIndex {
         // 32-bit offsets table
         let mut raw_offsets = Vec::with_capacity(total_objects);
         for _ in 0..total_objects {
-            f.read_exact(&mut buf4)?;
+            if f.read_exact(&mut buf4).is_err() {
+                return Err(GitError::Corrupt("truncated pack idx offsets".into()));
+            }
             raw_offsets.push(u32::from_be_bytes(buf4));
         }
 
@@ -157,7 +170,9 @@ impl PackIndex {
             let max_idx = large_indices.iter().map(|(_, idx)| *idx).max().unwrap_or(0);
             let mut buf8 = [0u8; 8];
             for _ in 0..=max_idx {
-                f.read_exact(&mut buf8)?;
+                if f.read_exact(&mut buf8).is_err() {
+                    return Err(GitError::Corrupt("truncated pack idx large offsets".into()));
+                }
                 large_offsets.push(u64::from_be_bytes(buf8));
             }
         }
@@ -179,13 +194,36 @@ impl PackIndex {
 
         let pack_path = idx_path.with_extension("pack");
         if !pack_path.exists() {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::Corrupt(format!(
                 "missing pack file for {}",
                 idx_path.display()
             )));
         }
 
         let pack_len = pack_path.metadata()?.len();
+        if pack_len < 32 {
+            return Err(GitError::Corrupt("truncated pack".into()));
+        }
+
+        let mut pack_f = File::open(&pack_path)?;
+        let mut pack_magic = [0u8; 4];
+        if pack_f.read_exact(&mut pack_magic).is_err() || &pack_magic != b"PACK" {
+            return Err(GitError::Corrupt(
+                "truncated pack or invalid pack magic".into(),
+            ));
+        }
+        let mut ver_bytes = [0u8; 4];
+        if pack_f.read_exact(&mut ver_bytes).is_err() {
+            return Err(GitError::Corrupt("truncated pack".into()));
+        }
+        let pack_ver = u32::from_be_bytes(ver_bytes);
+        if pack_ver != 2 && pack_ver != 3 {
+            return Err(GitError::Unsupported(format!(
+                "unsupported pack version {}",
+                pack_ver
+            )));
+        }
+
         for &offset in &offsets {
             if offset >= pack_len {
                 return Err(GitError::Corrupt("idx offset beyond the pack".into()));
@@ -407,7 +445,14 @@ impl GitStore {
         let mut decoder = ZlibDecoder::new(counting);
 
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
+        decoder.read_to_end(&mut decompressed).map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("bomb limit exceeded") {
+                GitError::LimitExceeded(msg)
+            } else {
+                GitError::Corrupt(format!("loose object decompress error: {e}"))
+            }
+        })?;
 
         let null_pos = decompressed
             .iter()
@@ -480,7 +525,8 @@ impl GitStore {
 
         // Read object header
         let mut b = [0u8; 1];
-        f.read_exact(&mut b)?;
+        f.read_exact(&mut b)
+            .map_err(|e| GitError::Corrupt(format!("truncated pack object header: {e}")))?;
         let first_byte = b[0];
         let type_num = (first_byte >> 4) & 0x07;
         let mut size = (first_byte & 0x0f) as u64;
@@ -488,7 +534,8 @@ impl GitStore {
         let mut more = (first_byte & 0x80) != 0;
 
         while more {
-            f.read_exact(&mut b)?;
+            f.read_exact(&mut b)
+                .map_err(|e| GitError::Corrupt(format!("truncated pack object header: {e}")))?;
             let byte = b[0];
             size |= ((byte & 0x7f) as u64) << shift;
             shift += 7;
@@ -523,7 +570,14 @@ impl GitStore {
                 let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
                 let mut decoder = ZlibDecoder::new(counting);
                 let mut data = Vec::with_capacity(size as usize);
-                decoder.read_to_end(&mut data)?;
+                decoder.read_to_end(&mut data).map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.starts_with("bomb limit exceeded") {
+                        GitError::LimitExceeded(msg)
+                    } else {
+                        GitError::Corrupt(format!("pack decompression error: {e}"))
+                    }
+                })?;
 
                 if data.len() as u64 != size {
                     return Err(GitError::Corrupt("inflated size mismatch in pack".into()));
@@ -534,12 +588,14 @@ impl GitStore {
             6 => {
                 // OFS_DELTA
                 let mut c = [0u8; 1];
-                f.read_exact(&mut c)?;
+                f.read_exact(&mut c)
+                    .map_err(|e| GitError::Corrupt(format!("truncated ofs delta: {e}")))?;
                 let mut byte = c[0];
                 let mut base_offset_delta = (byte & 0x7f) as u64;
 
                 while (byte & 0x80) != 0 {
-                    f.read_exact(&mut c)?;
+                    f.read_exact(&mut c)
+                        .map_err(|e| GitError::Corrupt(format!("truncated ofs delta: {e}")))?;
                     byte = c[0];
                     base_offset_delta = (base_offset_delta + 1)
                         .checked_shl(7)
@@ -561,7 +617,14 @@ impl GitStore {
                 let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
                 let mut decoder = ZlibDecoder::new(counting);
                 let mut delta_data = Vec::new();
-                decoder.read_to_end(&mut delta_data)?;
+                decoder.read_to_end(&mut delta_data).map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.starts_with("bomb limit exceeded") {
+                        GitError::LimitExceeded(msg)
+                    } else {
+                        GitError::Corrupt(format!("pack delta decompression error: {e}"))
+                    }
+                })?;
 
                 let base_obj = self.read_packed_object(
                     pack_idx,
@@ -580,7 +643,8 @@ impl GitStore {
             7 => {
                 // REF_DELTA
                 let mut base_oid_bytes = [0u8; 20];
-                f.read_exact(&mut base_oid_bytes)?;
+                f.read_exact(&mut base_oid_bytes)
+                    .map_err(|e| GitError::Corrupt(format!("truncated ref delta oid: {e}")))?;
                 let base_oid = hex::encode(base_oid_bytes);
 
                 if !visited_oids.insert(base_oid.clone()) {
@@ -596,7 +660,14 @@ impl GitStore {
                 let counting = CountingReader::new(f, &mut total_expanded, size, &opts);
                 let mut decoder = ZlibDecoder::new(counting);
                 let mut delta_data = Vec::new();
-                decoder.read_to_end(&mut delta_data)?;
+                decoder.read_to_end(&mut delta_data).map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.starts_with("bomb limit exceeded") {
+                        GitError::LimitExceeded(msg)
+                    } else {
+                        GitError::Corrupt(format!("pack delta decompression error: {e}"))
+                    }
+                })?;
 
                 // Base object could be loose or in any pack
                 let base_obj =
@@ -841,7 +912,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max_member_bytes: u64) -> Result<V
 
     if result_size > max_member_bytes {
         return Err(GitError::LimitExceeded(
-            "delta result size exceeds limit".into(),
+            "a declared object size over the limit".into(),
         ));
     }
 
@@ -943,7 +1014,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max_member_bytes: u64) -> Result<V
 pub fn scan_stray_pack_slice(
     bytes: &[u8],
     max_member_bytes: u64,
-) -> Result<(Vec<(u64, Vec<u8>)>, bool), GitError> {
+) -> Result<StrayPackResult, GitError> {
     if bytes.len() < 12 || &bytes[0..4] != b"PACK" {
         return Err(GitError::Corrupt("invalid pack magic".into()));
     }
@@ -986,7 +1057,7 @@ pub fn scan_stray_pack_slice(
         }
 
         match type_num {
-            1 | 2 | 3 | 4 => {
+            1..=4 => {
                 let obj_type = match type_num {
                     1 => ObjectType::Commit,
                     2 => ObjectType::Tree,

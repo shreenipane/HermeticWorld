@@ -28,8 +28,8 @@ pub use diff::{
 };
 pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
 pub use gitstore::{
-    apply_delta, compute_git_sha1, Commit, GitError, GitObject, GitStore, ObjectType, PackIndex,
-    Tag, Tree, TreeEntry,
+    apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,
+    ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
 };
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, SarifLog};
