@@ -447,3 +447,158 @@ def test_output_directory_failure_has_no_host_path(tmp_path):
     assert str(exc.value) == "task_publication_failed"
     assert SECRET not in repr(exc.value)
     assert not (tmp_path / "out/test-org__test-repo-50/task.json").exists()
+
+
+@pytest.mark.parametrize("unidentified_case", ["late_comment", "pr_comment", "null_source"])
+def test_defect1_unidentified_resources_require_scope_denial(tmp_path, unidentified_case):
+    """Regression Defect 1: Unidentified late comments, PR comments, and null reference sources either fail publication or include scope denial."""
+    target_node = issue()
+    pr_node = pr()
+
+    if unidentified_case == "late_comment":
+        target_node["comments"] = connection([{
+            "id": "c_unidentified",
+            "databaseId": None,
+            "url": None,
+            "body": LATE,
+            "createdAt": "2020-01-10T00:00:00Z",
+            "lastEditedAt": None,
+        }])
+    elif unidentified_case == "pr_comment":
+        pr_node["comments"] = connection([{
+            "id": "pr_c_unidentified",
+            "databaseId": None,
+            "url": None,
+        }])
+    elif unidentified_case == "null_source":
+        target_node["timelineItems"] = connection([{
+            "__typename": "CrossReferencedEvent",
+            "url": None,
+            "source": None,
+        }])
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr_node)
+        if op == "TargetIssueData":
+            return response("issue", target_node)
+        raise OSError("unexpected op")
+
+    try:
+        task = publish(tmp_path, post=post, refs="Fixes #1")
+        scrub = json.loads((task / "staging/thread_scrub.json").read_text())
+        assert_denied(scrub)
+        assert (task / "agent/problem_statement.md").read_bytes() == b""
+        assert (task / "staging/hints.txt").read_bytes() == b""
+    except IntakeError:
+        pass
+
+
+def test_defect2_unresolved_reference_lookup_denies_scope(tmp_path):
+    """Regression Defect 2: 404/410 for one issue ref preserves unresolved target reference and emits scope denial despite GraphQL success on remaining issue."""
+    def get(url):
+        if "/commits?" in url:
+            return b"[]"
+        if "/issues/1" in url:
+            return b'{"created_at":"2020-01-01T00:00:00Z"}'
+        if "/issues/2" in url:
+            raise http.HttpError(url, 404)
+        return json.dumps({"created_at": "2020-02-01T00:00:00Z", "body": "Fixes #1 and fixes #2"}).encode()
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
+        if op == "TargetIssueData":
+            assert payload["variables"]["number"] == 1
+            return response("issue", issue())
+        raise OSError(f"Unexpected op: {op}")
+
+    row = {
+        "repo": REPO,
+        "base_commit": "abc",
+        "problem_statement": "Statement",
+        "hints_text": "Hints",
+        "patch": "gold",
+        "test_patch": "tests",
+    }
+    with patch("hermetic_slice.intake.repo_dates", return_value=(WORLD, WORLD)):
+        task = intake_task(
+            "test-org__test-repo-50",
+            {"test-org__test-repo-50": row},
+            get,
+            tmp_path / "cache",
+            tmp_path / "out",
+            http_post_json=post,
+        )
+
+    scrub = json.loads((task / "staging/thread_scrub.json").read_text())
+    assert_denied(scrub)
+    assert (task / "agent/problem_statement.md").read_bytes() == b""
+    assert (task / "staging/hints.txt").read_bytes() == b""
+    urls = [e["url"] for e in scrub]
+    assert f"https://github.com/{REPO}/issues/2" in urls
+
+
+@pytest.mark.parametrize("location", ["issue_body", "comment_body"])
+def test_defect4_oversized_numeric_reference_handled_gracefully(tmp_path, location):
+    """Regression Defect 4: Hostile discussion text with 5,000-digit reference causes no uncaught exception and denies scope."""
+    hostile_ref = "Fixes #" + "9" * 5000
+    target_node = issue()
+
+    if location == "issue_body":
+        target_node["body"] = hostile_ref
+    else:
+        comm = comment()
+        comm["body"] = hostile_ref
+        target_node["comments"] = connection([comm])
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
+        if op == "TargetIssueData":
+            return response("issue", target_node)
+        raise OSError("unexpected op")
+
+    warnings: list[str] = []
+    res = run_scrub(tmp_path, node=target_node, post=post, warnings=warnings)
+    assert_denied(res.scrub_entries)
+
+
+def test_defect5_ancestor_symlink_swap_leaves_sentinel_untouched(tmp_path):
+    """Regression Defect 5: Swapping task directory ancestor after validation leaves outside sentinels untouched and publishes no task.json."""
+    outside_dir = tmp_path / "outside_dir"
+    (outside_dir / "agent").mkdir(parents=True)
+    (outside_dir / "staging").mkdir(parents=True)
+    agent_sentinel = outside_dir / "agent" / "sentinel.txt"
+    staging_sentinel = outside_dir / "staging" / "sentinel.txt"
+    agent_sentinel.write_text("agent_sentinel_data", encoding="utf-8")
+    staging_sentinel.write_text("staging_sentinel_data", encoding="utf-8")
+
+    from hermetic_slice import intake
+    real_open = intake.open_secure_directory
+    swapped = False
+
+    task_target = tmp_path / "out" / "test-org__test-repo-50"
+
+    def hook_open_secure(p):
+        nonlocal swapped
+        fd = real_open(p)
+        if Path(p) == task_target and not swapped:
+            swapped = True
+            backup = tmp_path / "out" / "temp_backup"
+            os.rename(task_target, backup)
+            os.symlink(outside_dir, task_target)
+        return fd
+
+    with patch("hermetic_slice.intake.open_secure_directory", side_effect=hook_open_secure):
+        with pytest.raises(IntakeError):
+            publish(tmp_path, refs="Fixes #1")
+
+    assert agent_sentinel.exists()
+    assert agent_sentinel.read_text(encoding="utf-8") == "agent_sentinel_data"
+    assert staging_sentinel.exists()
+    assert staging_sentinel.read_text(encoding="utf-8") == "staging_sentinel_data"
+    assert not (outside_dir / "task.json").exists()

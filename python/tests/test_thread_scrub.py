@@ -19,6 +19,8 @@ from hermetic_slice.thread_scrub import (
     ScrubResult,
     dedupe_and_sort_entries,
     get_solution_pr_scrub_entries,
+    match_scrub_entry,
+    matches_any_scrub_entry,
     process_thread_scrub_and_revision,
     select_revision,
     split_title_and_body,
@@ -1869,4 +1871,58 @@ def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> 
     )
     assert res_p3.problem_statement_revision == "excluded"
     assert expected_warning in warn_p3
+
+
+def test_defect3_query_bearing_resource_matching() -> None:
+    """Regression Defect 3: Evaluate generated entries against query-bearing PR, comment, and referencing-resource URLs; assert PR 50 does not block PR 500."""
+    from hermetic_slice.thread_scrub import get_referencing_pr_scrub_entries
+
+    repo = "test-org/test-repo"
+    pr_entries = get_solution_pr_scrub_entries(repo, 50, commit_shas=["sha123"])
+
+    # Add standalone comment entry
+    pr_entries.append(ScrubEntry(
+        kind="comment",
+        match="exact",
+        url=f"https://api.github.com/repos/{repo}/issues/comments/777",
+        reason="late comment",
+    ))
+    pr_entries.append(ScrubEntry(
+        kind="comment",
+        match="exact",
+        url=f"https://github.com/{repo}/issues/100#issuecomment-777",
+        reason="late comment HTML",
+    ))
+
+    # Add referencing resource entries
+    pr_entries.extend(get_referencing_pr_scrub_entries("other-org/other-repo", 80, base_reason="referencing PR"))
+
+    # 1. Query-bearing solution PR URLs are blocked
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/50?x=1")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/50/?x=1")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/50?diff=split")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/50/files?x=1&y=2")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/50.diff?raw=true")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/50/commits?per_page=100")
+
+    # 2. Query-bearing comment URLs are blocked
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/issues/comments/777?view=simple")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/issues/100?x=1#issuecomment-777")
+    # Different comment id is not blocked
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/issues/comments/7770?view=simple")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/issues/100?x=1#issuecomment-999")
+
+    # 3. Query-bearing referencing resource URLs are blocked
+    assert matches_any_scrub_entry(pr_entries, "https://github.com/other-org/other-repo/pull/80?x=1")
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/other-org/other-repo/pulls/80?page=2")
+    assert matches_any_scrub_entry(pr_entries, "https://github.com/other-org/other-repo/pull/80/files?utf8=1")
+
+    # 4. Strict numeric path boundary: PR 50 does NOT block PR 500
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/500")
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/500?x=1")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500?x=1")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500/files")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500/files?x=1")
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/500/commits")
 

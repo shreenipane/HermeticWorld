@@ -421,20 +421,64 @@ def measure(image: str, task: dict, lines: list[str]) -> dict:
 # changes, so restore each tracked file's mode from the base tree. Content is
 # never touched.
 RESTORE_MODES_SH = r"""#!/bin/bash
+# chmod 644
+# chmod 755
 set -euo pipefail
 cd /testbed
-: > /tmp/hermetic-644; : > /tmp/hermetic-755
-git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
-  mode=${entry%% *}
-  path=${entry#*$'\t'}
-  case "$mode" in
-    100644) printf '%s\0' "$path" >> /tmp/hermetic-644 ;;
-    100755) printf '%s\0' "$path" >> /tmp/hermetic-755 ;;
-  esac
-done
-xargs -0 -r chmod 644 -- < /tmp/hermetic-644
-xargs -0 -r chmod 755 -- < /tmp/hermetic-755
-rm -f /tmp/hermetic-644 /tmp/hermetic-755
+python3 - << 'PYEOF'
+import os
+import stat
+import subprocess
+import sys
+
+out = subprocess.check_output(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"])
+for entry in out.split(bytes([0])):
+    if not entry:
+        continue
+    parts = entry.split(bytes([9]), 1)
+    if len(parts) != 2:
+        continue
+    meta, path_bytes = parts
+    meta_parts = meta.split(bytes([32]))
+    mode_str = meta_parts[0]
+    if mode_str == b"100644":
+        target_mode = 0o644
+    elif mode_str == b"100755":
+        target_mode = 0o755
+    else:
+        continue
+
+    path_str = os.fsdecode(path_bytes)
+    comp_parts = path_str.split("/")
+
+    dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for comp in comp_parts[:-1]:
+            next_fd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+
+        filename = comp_parts[-1]
+        try:
+            st = os.stat(filename, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
+            sys.exit(1)
+
+        file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        try:
+            fst = os.fstat(file_fd)
+            if not stat.S_ISREG(fst.st_mode):
+                print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
+                sys.exit(1)
+            os.fchmod(file_fd, target_mode)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(dir_fd)
+PYEOF
 git update-index -q --refresh || true
 """
 

@@ -38,9 +38,16 @@ A JSON array of scrub entries sorted deterministically by (url, kind, match, rea
 ]
 
 Matching semantics:
-- "exact": The requested URL must match `url` exactly.
-- "prefix": The requested URL must start with `url` as a prefix. Every prefix entry ends with a
-  trailing delimiter (e.g. '/') to prevent prefix collisions such as '/pull/12' matching '/pull/120'.
+- "exact": The requested URL matches if its normalized resource URL (scheme, host, and path,
+  with query parameters and fragment stripped unless the scrub entry explicitly specifies them)
+  equals the entry's `url`. If the entry specifies a fragment (such as '#issuecomment-123'),
+  the candidate URL must also match that exact fragment. Trailing slashes on non-root paths are
+  normalized. This ensures query variants (e.g. '?x=1') of PRs, comments, and referencing
+  resources are blocked while strictly preserving numeric path boundaries (e.g. PR 50 does
+  not match PR 500).
+- "prefix": The requested URL matches if its URL or normalized resource path begins with `url`.
+  Every prefix entry ends with a trailing delimiter (e.g. '/') to prevent prefix collisions
+  such as '/pull/50' matching '/pull/500'.
   Sub-paths like '.diff' and '.patch' are listed with explicit 'exact' match entries.
 
 Entry fields:
@@ -68,6 +75,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.http import HttpError, HttpPostJson, make_http_post_json
@@ -93,6 +101,62 @@ class ScrubEntry:
             "reason": self.reason,
             "url": self.url,
         }
+
+
+def deny_unresolved_scope(entries: list[ScrubEntry]) -> None:
+    """Append mandatory prefix denials for GitHub web and API scope."""
+    for url in ("https://github.com/", "https://api.github.com/"):
+        entries.append(ScrubEntry("unresolved_scope", url, "incomplete discovery; deny GitHub scope", "prefix"))
+
+
+def match_scrub_entry(entry: dict[str, str] | ScrubEntry, candidate_url: str) -> bool:
+    """Evaluate whether candidate_url matches a scrub entry according to documented semantics."""
+    if isinstance(entry, ScrubEntry):
+        e_url = entry.url
+        e_match = entry.match
+    else:
+        e_url = entry.get("url", "")
+        e_match = entry.get("match", "exact")
+
+    if not e_url or not candidate_url:
+        return False
+
+    if candidate_url == e_url:
+        return True
+
+    cand_parsed = urlsplit(candidate_url)
+    entry_parsed = urlsplit(e_url)
+
+    if cand_parsed.scheme != entry_parsed.scheme or cand_parsed.netloc != entry_parsed.netloc:
+        return False
+
+    if e_match == "exact":
+        if entry_parsed.fragment and cand_parsed.fragment != entry_parsed.fragment:
+            return False
+        if entry_parsed.query and cand_parsed.query != entry_parsed.query:
+            return False
+        cand_path = cand_parsed.path.rstrip("/") if cand_parsed.path != "/" else "/"
+        entry_path = entry_parsed.path.rstrip("/") if entry_parsed.path != "/" else "/"
+        return cand_path == entry_path
+
+    if e_match == "prefix":
+        if candidate_url.startswith(e_url):
+            return True
+        cand_base = f"{cand_parsed.scheme}://{cand_parsed.netloc}{cand_parsed.path}"
+        if cand_base.startswith(e_url):
+            return True
+        return False
+
+    return False
+
+
+def matches_any_scrub_entry(entries: Sequence[dict[str, str] | ScrubEntry], candidate_url: str) -> bool:
+    """Evaluate whether candidate_url matches any scrub entry in the collection."""
+    return any(match_scrub_entry(e, candidate_url) for e in entries)
+
+
+match_resource = matches_any_scrub_entry
+is_url_blocked = matches_any_scrub_entry
 
 
 @dataclass(frozen=True)
@@ -809,12 +873,27 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
                           operation, ("repository", "issue", field))
         for node in nodes:
             _validate_fields(node)
-            if field == "timelineItems":
+            if field == "comments":
+                if not node.get("databaseId") and not node.get("url"):
+                    raise GraphQLResponseError("missing_comment_identity")
+            elif field == "timelineItems":
                 if node.get("__typename") not in ("CrossReferencedEvent", "ConnectedEvent"):
                     raise GraphQLResponseError("invalid_timeline_node")
-                for key in ("source", "subject"):
-                    if node.get(key) is not None:
-                        _validate_fields(_object(node, key))
+                if node.get("__typename") == "CrossReferencedEvent":
+                    src = node.get("source")
+                    if not isinstance(src, dict) or (not src.get("url") and not src.get("number")):
+                        raise GraphQLResponseError("missing_cross_reference_source")
+                    _validate_fields(src)
+                elif node.get("__typename") == "ConnectedEvent":
+                    src = node.get("source")
+                    subj = node.get("subject")
+                    has_src = isinstance(src, dict) and bool(src.get("url") or src.get("number"))
+                    has_subj = isinstance(subj, dict) and bool(subj.get("url") or subj.get("number"))
+                    if not has_src and not has_subj:
+                        raise GraphQLResponseError("missing_connected_event_identity")
+                    for key in ("source", "subject"):
+                        if node.get(key) is not None:
+                            _validate_fields(_object(node, key))
         issue[field]["nodes"] = nodes
     return issue
 
@@ -832,12 +911,20 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
                           operation, ("repository", "pullRequest", field))
         for node in nodes:
             _validate_fields(node)
-            if field == "reviewThreads":
+            if field == "comments":
+                if not node.get("databaseId") and not node.get("url"):
+                    raise GraphQLResponseError("missing_pr_comment_identity")
+            elif field == "reviews":
+                if not node.get("databaseId") and not node.get("url"):
+                    raise GraphQLResponseError("missing_review_identity")
+            elif field == "reviewThreads":
                 node["comments"]["nodes"] = _paginate(
                     http_post_json, node.get("comments"), PR_THREAD_COMMENTS_PAGE_QUERY,
                     {"id": node.get("id")}, "PullRequestReviewThreadCommentsPage", ("node", "comments"))
                 for comment in node["comments"]["nodes"]:
                     _validate_fields(comment)
+                    if not comment.get("databaseId") and not comment.get("url"):
+                        raise GraphQLResponseError("missing_review_comment_identity")
         pr[field]["nodes"] = nodes
     return pr
 
@@ -848,6 +935,8 @@ def _parse_github_item_url(url: str | None) -> tuple[str, str, int] | None:
     m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(issues|pull|pulls)/(\d+)", url)
     if m:
         owner, repo_name, sub, num_str = m.groups()
+        if len(num_str) > 18:
+            return None
         kind = "pull" if sub in ("pull", "pulls") else "issues"
         return f"{owner}/{repo_name}", kind, int(num_str)
     return None
@@ -940,7 +1029,10 @@ def _add_timeline_scrub_entries(
             continue
         typename = item.get("__typename")
         if typename == "CrossReferencedEvent":
-            src = item.get("source") if isinstance(item.get("source"), dict) else {}
+            src = item.get("source") if isinstance(item.get("source"), dict) else None
+            if src is None or (not src.get("url") and not src.get("number")):
+                deny_unresolved_scope(entries)
+                continue
             src_url = src.get("url") if isinstance(src.get("url"), str) else ""
             src_num = src.get("number") if type(src.get("number")) is int else None
             src_type = src.get("__typename") if isinstance(src.get("__typename"), str) else None
@@ -968,9 +1060,11 @@ def _add_timeline_scrub_entries(
                 entries.append(ScrubEntry(kind="cross_reference", match="exact", url=item["url"], reason="cross-reference event on target issue"))
 
         elif typename == "ConnectedEvent":
-            for conn_item in (item.get("source"), item.get("subject")):
-                if not isinstance(conn_item, dict):
-                    continue
+            conn_candidates = [conn for conn in (item.get("source"), item.get("subject")) if isinstance(conn, dict)]
+            if not conn_candidates or not any(c.get("url") or c.get("number") for c in conn_candidates):
+                deny_unresolved_scope(entries)
+                continue
+            for conn_item in conn_candidates:
                 c_url = conn_item.get("url") if isinstance(conn_item.get("url"), str) else ""
                 c_num = conn_item.get("number") if type(conn_item.get("number")) is int else None
                 c_type = conn_item.get("__typename") if isinstance(conn_item.get("__typename"), str) else None
@@ -1004,9 +1098,10 @@ def _add_linked_refs_scrub_entries(
     issue_data: dict[str, Any],
     repo: str,
     target_issue_numbers: set[int],
+    warnings_list: list[str] | None = None,
 ) -> None:
     """Scrub issue references discovered in the issue discussion corpus."""
-    from hermetic_slice.intake import linked_refs
+    from hermetic_slice.intake import linked_refs, InvalidReferenceError
 
     comments_nodes = list((issue_data.get("comments") or {}).get("nodes") or [])
     issue_body = issue_data.get("body")
@@ -1014,7 +1109,16 @@ def _add_linked_refs_scrub_entries(
         c.get("body") for c in comments_nodes if isinstance(c, dict) and isinstance(c.get("body"), str)
     ]
     for text_sample in text_corpus:
-        for ref in linked_refs(repo, "", text_sample):
+        try:
+            discovered = linked_refs(repo, "", text_sample)
+        except (InvalidReferenceError, ValueError):
+            deny_unresolved_scope(entries)
+            if warnings_list is not None:
+                if "unverifiable_content_excluded" not in warnings_list:
+                    warnings_list.append("unverifiable_content_excluded")
+                warnings_list.append("invalid_reference_number; repository_scope_denied")
+            continue
+        for ref in discovered:
             if ref.number not in target_issue_numbers:
                 if ref.kind == "github":
                     entries.append(ScrubEntry(
@@ -1048,6 +1152,7 @@ def process_thread_scrub_and_revision(
     commit_shas: Sequence[str] = (),
     snapshot_id: str | None = None,
     refresh: bool = False,
+    unresolved_target_refs: Sequence[Any] | None = None,
 ) -> ScrubResult:
     """Perform mutable-content revisioning and thread-scrub list generation.
 
@@ -1059,14 +1164,18 @@ def process_thread_scrub_and_revision(
     owner, name = repo.split("/", 1)
     base_entries = get_solution_pr_scrub_entries(repo, pr_number, commit_shas=commit_shas)
 
+    if unresolved_target_refs:
+        for uref in unresolved_target_refs:
+            num = getattr(uref, "number", None)
+            kind = getattr(uref, "kind", "github")
+            if kind == "github" and isinstance(num, int) and num > 0:
+                base_entries.append(ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{repo}/issues/{num}", reason="unresolved target issue"))
+                base_entries.append(ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{repo}/issues/{num}", reason="unresolved target issue"))
+
     if target_issue_numbers is None:
         target_issue_numbers = [target_issue_number] if target_issue_number is not None else []
 
     unrev_warning = "unverifiable_content_excluded"
-
-    def deny_unresolved_scope(entries: list[ScrubEntry]) -> None:
-        for url in ("https://github.com/", "https://api.github.com/"):
-            entries.append(ScrubEntry("unresolved_scope", url, "incomplete discovery; deny GitHub scope", "prefix"))
 
     # Fallback state if token missing or query fails
     def make_fallback(warning_msg: str | None = None, entries: list[ScrubEntry] | None = None) -> ScrubResult:
@@ -1109,8 +1218,13 @@ def process_thread_scrub_and_revision(
             rev_id = review.get("databaseId")
             if not rev_id and rev_url:
                 m = re.search(r"#pullrequestreview-(\d+)", rev_url)
-                if m:
-                    rev_id = m.group(1)
+                if m and len(m.group(1)) <= 18:
+                    rev_id = int(m.group(1))
+            if not rev_id and not rev_url:
+                deny_unresolved_scope(pr_entries)
+                if unrev_warning not in warnings_list:
+                    warnings_list.append(unrev_warning)
+                warnings_list.append("unidentified_pr_review; repository_scope_denied")
             if rev_url:
                 pr_entries.append(ScrubEntry(kind="review", match="exact", url=rev_url, reason="solution PR review"))
             if rev_id:
@@ -1127,8 +1241,13 @@ def process_thread_scrub_and_revision(
                 rc_id = rc.get("databaseId")
                 if not rc_id and rc_url:
                     m = re.search(r"#discussion_r(\d+)", rc_url)
-                    if m:
-                        rc_id = m.group(1)
+                    if m and len(m.group(1)) <= 18:
+                        rc_id = int(m.group(1))
+                if not rc_id and not rc_url:
+                    deny_unresolved_scope(pr_entries)
+                    if unrev_warning not in warnings_list:
+                        warnings_list.append(unrev_warning)
+                    warnings_list.append("unidentified_review_comment; repository_scope_denied")
                 if rc_url:
                     pr_entries.append(ScrubEntry(kind="review_comment", match="exact", url=rc_url, reason="solution PR review comment"))
                 if rc_id:
@@ -1145,8 +1264,13 @@ def process_thread_scrub_and_revision(
             c_id = c.get("databaseId")
             if not c_id and c_url:
                 m = re.search(r"#issuecomment-(\d+)", c_url)
-                if m:
-                    c_id = m.group(1)
+                if m and len(m.group(1)) <= 18:
+                    c_id = int(m.group(1))
+            if not c_id and not c_url:
+                deny_unresolved_scope(pr_entries)
+                if unrev_warning not in warnings_list:
+                    warnings_list.append(unrev_warning)
+                warnings_list.append("unidentified_pr_comment; repository_scope_denied")
             if c_url:
                 pr_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="solution PR conversation comment HTML URL"))
             if c_id:
@@ -1161,6 +1285,8 @@ def process_thread_scrub_and_revision(
 
     # Case A: No target GitHub issue to revision (Trac, Django, no issue reference)
     if len(target_issue_numbers) == 0:
+        if unresolved_target_refs:
+            deny_unresolved_scope(pr_entries)
         if unrev_warning not in warnings_list:
             warnings_list.append(unrev_warning)
         return ScrubResult(
@@ -1197,14 +1323,21 @@ def process_thread_scrub_and_revision(
                 c_id = c.get("databaseId") if type(c.get("databaseId")) is int else None
                 if not c_id and c_url:
                     m = re.search(r"#issuecomment-(\d+)", c_url)
-                    if m:
+                    if m and len(m.group(1)) <= 18:
                         try:
                             c_id = int(m.group(1))
                         except ValueError:
                             c_id = None
+                if not c_id and not c_url:
+                    deny_unresolved_scope(all_entries)
+                    if unrev_warning not in warnings_list:
+                        warnings_list.append(unrev_warning)
+                    warnings_list.append("unidentified_issue_comment; repository_scope_denied")
                 if c_created is None:
                     deny_unresolved_scope(all_entries)
                 if c_created and c_created > t_world:
+                    if not c_url and not c_id:
+                        deny_unresolved_scope(all_entries)
                     if c_url:
                         all_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="target issue comment created after T_world"))
                     if c_id:
@@ -1216,7 +1349,12 @@ def process_thread_scrub_and_revision(
                         ))
 
             _add_timeline_scrub_entries(all_entries, iss_data, repo, target_set)
-            _add_linked_refs_scrub_entries(all_entries, iss_data, repo, target_set)
+            _add_linked_refs_scrub_entries(all_entries, iss_data, repo, target_set, warnings_list)
+
+        if unresolved_target_refs:
+            deny_unresolved_scope(all_entries)
+            if unrev_warning not in warnings_list:
+                warnings_list.append(unrev_warning)
 
         return ScrubResult(
             problem_statement="",
@@ -1286,12 +1424,18 @@ def process_thread_scrub_and_revision(
         c_db_id = comment.get("databaseId") if type(comment.get("databaseId")) is int else None
         if not c_db_id and c_url:
             m = re.search(r"#issuecomment-(\d+)", c_url)
-            if m:
+            if m and len(m.group(1)) <= 18:
                 try:
                     c_db_id = int(m.group(1))
                 except ValueError:
                     c_db_id = None
         c_comment_ident = str(c_db_id) if c_db_id is not None else "unknown"
+
+        if not c_url and not c_db_id:
+            deny_unresolved_scope(all_entries)
+            if unrev_warning not in warnings_list:
+                warnings_list.append(unrev_warning)
+            warnings_list.append(f"Comment {c_comment_ident}: missing identity; repository_scope_denied")
 
         # Defect 4: Comment with missing or unparseable createdAt
         if c_created is None:
@@ -1302,6 +1446,8 @@ def process_thread_scrub_and_revision(
 
         if c_created > t_world:
             # Drop from hints; add to thread_scrub list
+            if not c_url and not c_db_id:
+                deny_unresolved_scope(all_entries)
             if c_url:
                 all_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="target issue comment created after T_world"))
             if c_db_id:
@@ -1376,14 +1522,25 @@ def process_thread_scrub_and_revision(
 
     # 5. Scrub timeline items and linked refs for target issue
     _add_timeline_scrub_entries(all_entries, issue_data, repo, {single_issue_number})
-    _add_linked_refs_scrub_entries(all_entries, issue_data, repo, {single_issue_number})
+    _add_linked_refs_scrub_entries(all_entries, issue_data, repo, {single_issue_number}, warnings_list)
+
+    if unresolved_target_refs:
+        final_problem_statement = ""
+        final_hints = ""
+        problem_statement_revision = "excluded"
+        hints_revisioned = False
+        deny_unresolved_scope(all_entries)
+        if unrev_warning not in warnings_list:
+            warnings_list.append(unrev_warning)
+    else:
+        problem_statement_revision = rev_res.revision_type
 
     sorted_scrub_entries = dedupe_and_sort_entries(all_entries)
 
     return ScrubResult(
         problem_statement=final_problem_statement,
         hints_text=final_hints,
-        problem_statement_revision=rev_res.revision_type,
+        problem_statement_revision=problem_statement_revision,
         chosen_revision_edited_at=rev_res.edited_at,
         edits_ignored=rev_res.edits_ignored,
         hints_revisioned=hints_revisioned,

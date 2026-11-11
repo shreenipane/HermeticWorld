@@ -96,6 +96,49 @@ def test_restore_modes_exact_modes_offline(tmp_path: Path) -> None:
     assert mode_755 == "0o755"
 
 
+def test_restore_modes_symlink_to_private_sentinel_rejected(tmp_path: Path) -> None:
+    """Regression Defect 6: tracked regular file replaced by symlink to private sentinel is rejected and sentinel remains 0600."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file in git
+    f_tracked = repo_dir / "tracked.txt"
+    f_tracked.write_text("tracked content\n", encoding="utf-8")
+    run_git(["add", "tracked.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Outside private sentinel file
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Replace tracked file with symlink to sentinel
+    f_tracked.unlink()
+    f_tracked.symlink_to(sentinel)
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode != 0, f"Expected rejection, but script succeeded: {res.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+
 def test_verification_problems() -> None:
     """Test verification_problems returns [] for clean after and identifies each flaw."""
     clean_after = {

@@ -9,7 +9,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import urllib.parse
+import uuid
 
 from hermetic_slice.cutoffs import Cutoffs, FixCommit, compute_cutoffs, ensure_utc
 from hermetic_slice.gitutil import GitError, run_git
@@ -18,10 +20,16 @@ from hermetic_slice.thread_scrub import process_thread_scrub_and_revision
 
 
 MAX_TASK_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_REFERENCE_DIGITS = 18
+MAX_REFERENCE_NUMBER = (1 << 63) - 1
 
 
 class IntakeError(Exception):
     """Raised when task intake fails verification or fetching."""
+
+
+class InvalidReferenceError(ValueError):
+    """Raised when an issue/ticket reference number exceeds bounds or parsing limits."""
 
 
 @dataclass(frozen=True)
@@ -137,14 +145,26 @@ def linked_refs(repo: str, title: str, body: str) -> list[IssueRef]:
         if repo == "django/django":
             trac_url_pattern = re.compile(r"https://code\.djangoproject\.com/ticket/(\d+)\b")
             for m in trac_url_pattern.finditer(text):
-                items.append((m.start(), IssueRef(kind="trac", number=int(m.group(1)))))
+                num_s = m.group(1)
+                if len(num_s) > MAX_REFERENCE_DIGITS:
+                    raise InvalidReferenceError(f"Oversized ticket number ({len(num_s)} digits)")
+                val = int(num_s)
+                if val <= 0 or val > MAX_REFERENCE_NUMBER:
+                    raise InvalidReferenceError(f"Invalid ticket number: {val}")
+                items.append((m.start(), IssueRef(kind="trac", number=val)))
 
             django_ticket_pattern = re.compile(
                 r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved|refs?):?\s+#(\d+)\b",
                 re.IGNORECASE,
             )
             for m in django_ticket_pattern.finditer(text):
-                items.append((m.start(), IssueRef(kind="trac", number=int(m.group(1)))))
+                num_s = m.group(1)
+                if len(num_s) > MAX_REFERENCE_DIGITS:
+                    raise InvalidReferenceError(f"Oversized ticket number ({len(num_s)} digits)")
+                val = int(num_s)
+                if val <= 0 or val > MAX_REFERENCE_NUMBER:
+                    raise InvalidReferenceError(f"Invalid ticket number: {val}")
+                items.append((m.start(), IssueRef(kind="trac", number=val)))
         else:
             gh_pattern = re.compile(
                 rf"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved):?\s+(?:#(\d+)|https://github\.com/{re.escape(repo)}/issues/(\d+))\b",
@@ -152,7 +172,12 @@ def linked_refs(repo: str, title: str, body: str) -> list[IssueRef]:
             )
             for m in gh_pattern.finditer(text):
                 num_str = m.group(1) or m.group(2)
-                items.append((m.start(), IssueRef(kind="github", number=int(num_str))))
+                if len(num_str) > MAX_REFERENCE_DIGITS:
+                    raise InvalidReferenceError(f"Oversized issue number ({len(num_str)} digits)")
+                val = int(num_str)
+                if val <= 0 or val > MAX_REFERENCE_NUMBER:
+                    raise InvalidReferenceError(f"Invalid issue number: {val}")
+                items.append((m.start(), IssueRef(kind="github", number=val)))
 
         items.sort(key=lambda x: x[0])
         return [ref for _, ref in items]
@@ -182,8 +207,9 @@ def fetch_issue_created(
         try:
             raw_data = http_get(url)
         except HttpError as exc:
-            if exc.status in (404, 410):
-                warnings_list.append(f"issue {ref.kind}#{ref.number} could not be fetched (HTTP {exc.status}); ignored")
+            st = getattr(exc, "status", None)
+            if st in (404, 410, "404", "410") or getattr(exc, "url", None) in (404, 410):
+                warnings_list.append(f"issue {ref.kind}#{ref.number} could not be fetched (HTTP {st}); ignored")
                 return None
             raise
         data = json.loads(raw_data.decode("utf-8"))
@@ -199,8 +225,9 @@ def fetch_issue_created(
         try:
             raw_data = http_get(url)
         except HttpError as exc:
-            if exc.status in (404, 410):
-                warnings_list.append(f"issue {ref.kind}#{ref.number} could not be fetched (HTTP {exc.status}); ignored")
+            st = getattr(exc, "status", None)
+            if st in (404, 410, "404", "410") or getattr(exc, "url", None) in (404, 410):
+                warnings_list.append(f"issue {ref.kind}#{ref.number} could not be fetched (HTTP {st}); ignored")
                 return None
             raise
         html_text = raw_data.decode("utf-8", errors="replace")
@@ -273,6 +300,41 @@ def repo_dates(
     return (base_commit_time, repo_first_commit_time)
 
 
+def _secure_rmdir_contents_at(dir_fd: int) -> None:
+    """Recursively delete all entries within dir_fd without following symlinks."""
+    for entry in list(os.scandir(dir_fd)):
+        try:
+            st = os.stat(entry.name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            sub_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            try:
+                _secure_rmdir_contents_at(sub_fd)
+            finally:
+                os.close(sub_fd)
+            os.rmdir(entry.name, dir_fd=dir_fd)
+        else:
+            os.unlink(entry.name, dir_fd=dir_fd)
+
+
+def atomic_write_bytes_at(parent_fd: int, filename: str, data: bytes) -> None:
+    """Publish a private file atomically relative to a retained directory descriptor."""
+    temp_name = "." + uuid.uuid4().hex + ".tmp"
+    fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
 def intake_task(
     instance_id: str,
     rows: dict[str, dict],
@@ -321,9 +383,17 @@ def intake_task(
         page_num += 1
 
     warnings_list: list[str] = []
-    refs = linked_refs(repo, pr_title, pr_body)
+    has_invalid_ref = False
+    try:
+        refs = linked_refs(repo, pr_title, pr_body)
+    except (InvalidReferenceError, ValueError):
+        refs = []
+        has_invalid_ref = True
+        warnings_list.append("invalid_reference_number; scope denied")
+
     issue_refs_meta: list[dict] = []
     resolved_issue_refs: list[tuple[datetime, IssueRef]] = []
+    unresolved_issue_refs: list[IssueRef] = []
 
     for ref in refs:
         created_dt = fetch_issue_created(ref, repo, http_get, warnings_list)
@@ -334,6 +404,11 @@ def intake_task(
         })
         if created_dt is not None:
             resolved_issue_refs.append((created_dt, ref))
+        else:
+            unresolved_issue_refs.append(ref)
+
+    if has_invalid_ref:
+        unresolved_issue_refs.append(IssueRef(kind="github", number=0))
 
     if resolved_issue_refs:
         earliest_issue_created, earliest_ref = min(resolved_issue_refs, key=lambda pair: pair[0])
@@ -342,12 +417,15 @@ def intake_task(
         earliest_issue_created = None
         issue_source = "none"
 
-    if not refs:
+    if not refs and not has_invalid_ref:
         warnings_list.append(f"No issue reference found in PR {pr_number} body")
-    elif not resolved_issue_refs:
+    elif not resolved_issue_refs and not has_invalid_ref:
         warnings_list.append(f"No valid issue reference resolved for PR {pr_number}")
-    elif len(resolved_issue_refs) > 1:
+    elif (len(resolved_issue_refs) + len(unresolved_issue_refs)) > 1:
         warnings_list.append(f"Multiple issue references resolved for PR {pr_number}; unverifiable content excluded")
+
+    if unresolved_issue_refs:
+        warnings_list.append(f"Unresolved issue references for PR {pr_number}; scope denied")
 
     base_commit_time, repo_first_commit_time = repo_dates(
         repo,
@@ -371,7 +449,7 @@ def intake_task(
     ]
     target_issue_number = (
         target_issue_numbers[0]
-        if len(target_issue_numbers) == 1
+        if len(target_issue_numbers) == 1 and not unresolved_issue_refs
         else None
     )
 
@@ -396,6 +474,7 @@ def intake_task(
         commit_shas=solution_commit_shas,
         snapshot_id=snapshot_id,
         refresh=refresh,
+        unresolved_target_refs=unresolved_issue_refs,
     )
 
     image = "swebench/sweb.eval.x86_64." + instance_id.lower().replace("__", "_1776_") + ":latest"
@@ -481,15 +560,35 @@ def intake_task(
             os.unlink("task.json", dir_fd=task_fd)
         except FileNotFoundError:
             pass
+
         for name in ("agent", "staging"):
-            directory = task_dir / name
-            checked_fd = open_secure_directory(directory)
-            os.close(checked_fd)
-            shutil.rmtree(directory)
-            checked_fd = open_secure_directory(directory)
-            os.close(checked_fd)
+            try:
+                sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=task_fd)
+                try:
+                    _secure_rmdir_contents_at(sub_fd)
+                finally:
+                    os.close(sub_fd)
+            except FileNotFoundError:
+                os.mkdir(name, mode=0o700, dir_fd=task_fd)
+
         for path, data in encoded.items():
-            atomic_write_bytes(task_dir / path, data)
+            if path == "task.json":
+                continue
+            sub_dir_name, file_name = path.split("/", 1)
+            sub_fd = os.open(sub_dir_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=task_fd)
+            try:
+                atomic_write_bytes_at(sub_fd, file_name, data)
+            finally:
+                os.close(sub_fd)
+
+        # Before publishing completion marker (task.json), verify task_dir has not been swapped
+        st_path = os.stat(task_dir, follow_symlinks=False)
+        st_fd = os.fstat(task_fd)
+        if stat.S_ISLNK(st_path.st_mode) or st_path.st_ino != st_fd.st_ino or st_path.st_dev != st_fd.st_dev:
+            raise IntakeError("task_directory_swapped")
+
+        if "task.json" in encoded:
+            atomic_write_bytes_at(task_fd, "task.json", encoded["task.json"])
     except Exception:
         raise IntakeError("task_publication_failed") from None
     finally:
