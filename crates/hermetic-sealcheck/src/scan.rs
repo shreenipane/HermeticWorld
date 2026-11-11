@@ -5,8 +5,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use hermetic_common::hash::sha256_hex;
-
 use crate::benchmark::BenchmarkSignatures;
 use crate::bytecode::check_pyc_bytecode;
 use crate::containers::{
@@ -418,7 +416,14 @@ pub fn match_unit(
     channel: &str,
     path: &str,
 ) -> Vec<Finding> {
-    match_unit_hashes(&compute_unit_hashes(text), fp, opts, detector, channel, path)
+    match_unit_hashes(
+        &compute_unit_hashes(text),
+        fp,
+        opts,
+        detector,
+        channel,
+        path,
+    )
 }
 
 /// Scan a problem statement for leaks (D0).

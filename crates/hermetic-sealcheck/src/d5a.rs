@@ -192,12 +192,7 @@ pub fn check_d5a_metadata(file_path: &Path, bytes: &[u8], opts: &ScanOptions) ->
     };
 
     let display_path = file_path.display().to_string();
-    check_d5a_name_and_version(
-        &found_name,
-        found_version.as_deref(),
-        &display_path,
-        opts,
-    )
+    check_d5a_name_and_version(&found_name, found_version.as_deref(), &display_path, opts)
 }
 
 /// Check found package name and version against target_packages and task_version for D5a.
@@ -249,7 +244,7 @@ pub fn check_d5a_name_and_version(
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -268,7 +263,7 @@ pub fn check_d5a_name_and_version(
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -287,7 +282,7 @@ pub fn check_d5a_name_and_version(
             return vec![Finding {
                 detector: "D5a".into(),
                 channel: "target_version_unknown".into(),
-                path: display_path.clone(),
+                path: display_path.to_string(),
                 visibility: opts.visibility,
                 severity: Severity::Info,
                 confidence: 1.0,
@@ -317,7 +312,7 @@ pub fn check_d5a_name_and_version(
         return vec![Finding {
             detector: "D5a".into(),
             channel: "target_version".into(),
-            path: display_path.clone(),
+            path: display_path.to_string(),
             visibility: opts.visibility,
             severity: Severity::Gate,
             confidence: 1.0,
@@ -338,7 +333,7 @@ pub fn check_d5a_name_and_version(
                         return vec![Finding {
                             detector: "D5a".into(),
                             channel: "target_dev_date".into(),
-                            path: display_path.clone(),
+                            path: display_path.to_string(),
                             visibility: opts.visibility,
                             severity: Severity::Gate,
                             confidence: 1.0,
@@ -356,7 +351,7 @@ pub fn check_d5a_name_and_version(
                         return vec![Finding {
                             detector: "D5a".into(),
                             channel: "target_dev_date".into(),
-                            path: display_path.clone(),
+                            path: display_path.to_string(),
                             visibility: opts.visibility,
                             severity: Severity::Gate,
                             confidence: 1.0,

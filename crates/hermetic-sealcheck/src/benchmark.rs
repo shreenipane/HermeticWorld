@@ -127,6 +127,30 @@ fn check_json_record_dump(value: &Value) -> bool {
     }
 }
 
+pub fn check_is_dataset_dump(content: &str, path: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            if check_json_record_dump(&val) {
+                return true;
+            }
+        }
+    }
+    if path.ends_with(".jsonl") || content.contains('\n') {
+        for line in content.lines() {
+            let l = line.trim();
+            if l.starts_with('{') {
+                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(l) {
+                    if map.contains_key("instance_id") && map.contains_key("patch") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Check content against D9 content signatures, canary strings, hosts, instance_id, and dataset dump.
 pub fn check_d9_content(
     path: &str,
@@ -185,30 +209,7 @@ pub fn check_d9_content(
     }
 
     // 4. JSON or JSONL file whose records contain both keys instance_id and patch
-    let mut is_dataset_dump = false;
-    let trimmed = content.trim();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-            if check_json_record_dump(&val) {
-                is_dataset_dump = true;
-            }
-        }
-    }
-    if !is_dataset_dump && (path.ends_with(".jsonl") || content.contains('\n')) {
-        for line in content.lines() {
-            let l = line.trim();
-            if l.starts_with('{') {
-                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(l) {
-                    if map.contains_key("instance_id") && map.contains_key("patch") {
-                        is_dataset_dump = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if is_dataset_dump {
+    if check_is_dataset_dump(content, path) {
         findings.push(Finding {
             detector: "D9".into(),
             channel: "dataset_dump".into(),
