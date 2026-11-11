@@ -144,9 +144,14 @@ pub fn filter_headers(
     );
 
     if let Some(ct) = content_type {
+        let content_range_bytes = content_range
+            .map(|cr| "content-range".len() + cr.len())
+            .unwrap_or(0);
+        let ct_header_bytes = "content-type".len() + ct.len();
         let valid_ct = if hermetic_common::validate_header_value(ct.as_bytes()).is_ok()
-            && ct.len() <= hermetic_common::MAX_RESPONSE_HEADERS_BYTES
             && ct.len() <= u16::MAX as usize
+            && total_bytes + ct_header_bytes + content_range_bytes
+                <= hermetic_common::MAX_RESPONSE_HEADERS_BYTES
         {
             ct
         } else {

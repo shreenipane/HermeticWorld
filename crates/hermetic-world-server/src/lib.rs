@@ -8,8 +8,9 @@ pub mod store;
 
 pub use limits::{LimitExceeded, Limits};
 pub use log::{
-    truncate_trailing_partial_line, verify_log, verify_log_ext, verify_log_recover, DedupeEntry,
-    LogError, LogEventParams, LogHead, LogManager, LogWriter, VerifyError, INITIAL_PREV_HASH,
+    head_path_for, truncate_trailing_partial_line, verify_log, verify_log_ext, verify_log_recover,
+    write_head_atomic, DedupeEntry, LogError, LogEventParams, LogHead, LogManager, LogWriter,
+    VerifyError, INITIAL_PREV_HASH,
 };
 pub use sandbox::{
     apply_landlock, apply_sandbox, apply_seccomp, SandboxError, SandboxLandlockStatus,

@@ -645,3 +645,91 @@ fn test_fix2_mixed_case_sidecar_headers() {
         "Mixed-case headers must be lowercased and retained"
     );
 }
+
+#[test]
+fn test_finding_reserve_header_space_for_content_range() {
+    use hermetic_world_server::filter_headers;
+
+    // 1. Direct unit test of filter_headers:
+    // With 8100-byte printable content-type, content-range must not be dropped.
+    let long_ct = "text/".to_string() + &"x".repeat(8095);
+    let cr_val = "bytes 0-0/1";
+    let headers = filter_headers(
+        Vec::new(),
+        Some(&long_ct),
+        1,
+        "Mon, 01 Jan 2024 00:00:00 GMT",
+        Some(cr_val),
+    );
+
+    let cr_hdr = headers.iter().find(|h| h.name == "content-range");
+    assert!(
+        cr_hdr.is_some(),
+        "content-range header must be retained even with large content-type"
+    );
+    assert_eq!(cr_hdr.unwrap().value, cr_val);
+
+    let ct_hdr = headers.iter().find(|h| h.name == "content-type");
+    assert!(ct_hdr.is_some(), "content-type header must be present");
+    assert_eq!(
+        ct_hdr.unwrap().value,
+        "application/octet-stream",
+        "content-type must fall back to application/octet-stream to fit content-range"
+    );
+
+    // 2. Integration test through server handling a single-part 206 range request
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let obj_dir = store_dir.join("example.com").join("files");
+    fs::create_dir_all(&obj_dir).expect("create obj dir");
+
+    let file_path = obj_dir.join("data.bin");
+    fs::write(&file_path, b"abcdef").expect("write file");
+
+    let sidecar_path = obj_dir.join("data.bin.headers.json");
+    let sidecar_content = serde_json::json!({
+        "content_type": long_ct,
+    });
+    fs::write(
+        &sidecar_path,
+        serde_json::to_string(&sidecar_content).expect("json"),
+    )
+    .expect("write sidecar");
+
+    let log_dir = temp.path().join("log");
+    let sock_path = temp.path().join("server.sock");
+    let sock = start_test_server(
+        &store_dir,
+        &log_dir,
+        &sock_path,
+        datetime!(2024-03-01 12:00:00 UTC),
+    );
+
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 101,
+        authority: "example.com".into(),
+        path_and_query: "/files/data.bin".into(),
+        range: Some((0, 0)),
+    };
+    let resp = send_req(&sock, &req);
+    assert_eq!(resp.status, 206);
+    assert_eq!(resp.body, b"a");
+
+    let hdrs: std::collections::HashMap<_, _> = resp
+        .headers
+        .iter()
+        .map(|h| (h.name.as_str(), h.value.as_str()))
+        .collect();
+
+    assert_eq!(
+        hdrs.get("content-range"),
+        Some(&"bytes 0-0/6"),
+        "206 response must contain Content-Range header"
+    );
+    assert_eq!(
+        hdrs.get("content-type"),
+        Some(&"application/octet-stream"),
+        "Content-Type must fall back to application/octet-stream"
+    );
+}
