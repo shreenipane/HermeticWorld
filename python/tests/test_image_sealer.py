@@ -16,6 +16,7 @@ from hermetic_slice.dockerutil import is_docker_available, run_docker
 from hermetic_slice.gitutil import run_git
 from hermetic_slice.image_sealer import (
     ImageSealError,
+    RESTORE_MODES_SH,
     gold_lines,
     measure,
     render_dockerfile,
@@ -47,6 +48,52 @@ def test_render_dockerfile() -> None:
         "RUN bash /tmp/restore-modes.sh && rm -f /tmp/restore-modes.sh\n"
     )
     assert rendered == expected
+
+
+def test_restore_modes_exact_modes_offline(tmp_path: Path) -> None:
+    """Offline regression test: mode restoration sets exact octal 644/755 even if created with 664."""
+    assert "chmod 644" in RESTORE_MODES_SH
+    assert "chmod 755" in RESTORE_MODES_SH
+    assert "chmod a-x" not in RESTORE_MODES_SH
+    assert "chmod a+x" not in RESTORE_MODES_SH
+
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    f_664 = repo_dir / "f_664.txt"
+    f_664.write_text("hello 664\n", encoding="utf-8")
+    os.chmod(f_664, 0o664)
+
+    f_755 = repo_dir / "f_755.sh"
+    f_755.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    os.chmod(f_755, 0o755)
+
+    run_git(["add", "f_664.txt", "f_755.sh"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Change /testbed in RESTORE_MODES_SH to repo_dir for offline execution
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+    mode_664 = oct(os.stat(f_664).st_mode & 0o777)
+    mode_755 = oct(os.stat(f_755).st_mode & 0o777)
+    assert mode_664 == "0o644"
+    assert mode_755 == "0o755"
 
 
 def test_verification_problems() -> None:

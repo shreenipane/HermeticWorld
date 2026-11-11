@@ -432,8 +432,8 @@ git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
     100755) printf '%s\0' "$path" >> /tmp/hermetic-755 ;;
   esac
 done
-xargs -0 -r chmod a-x -- < /tmp/hermetic-644
-xargs -0 -r chmod a+x -- < /tmp/hermetic-755
+xargs -0 -r chmod 644 -- < /tmp/hermetic-644
+xargs -0 -r chmod 755 -- < /tmp/hermetic-755
 rm -f /tmp/hermetic-644 /tmp/hermetic-755
 git update-index -q --refresh || true
 """

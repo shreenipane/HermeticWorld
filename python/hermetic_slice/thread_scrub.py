@@ -936,12 +936,14 @@ def _add_timeline_scrub_entries(
 ) -> None:
     """Scrub timeline items (cross references and connected events) on an issue."""
     for item in (issue_data.get("timelineItems") or {}).get("nodes") or []:
+        if not isinstance(item, dict):
+            continue
         typename = item.get("__typename")
         if typename == "CrossReferencedEvent":
-            src = item.get("source") or {}
-            src_url = src.get("url") or ""
-            src_num = src.get("number")
-            src_type = src.get("__typename")
+            src = item.get("source") if isinstance(item.get("source"), dict) else {}
+            src_url = src.get("url") if isinstance(src.get("url"), str) else ""
+            src_num = src.get("number") if type(src.get("number")) is int else None
+            src_type = src.get("__typename") if isinstance(src.get("__typename"), str) else None
             parsed = _parse_github_item_url(src_url)
             src_repo = parsed[0] if parsed else repo
             src_kind = parsed[1] if parsed else ("pull" if src_type == "PullRequest" else "issues")
@@ -962,16 +964,16 @@ def _add_timeline_scrub_entries(
                         url=f"https://api.github.com/repos/{src_repo}/issues/{src_number}",
                         reason="cross-references target issue",
                     ))
-            if item.get("url"):
+            if item.get("url") and isinstance(item.get("url"), str):
                 entries.append(ScrubEntry(kind="cross_reference", match="exact", url=item["url"], reason="cross-reference event on target issue"))
 
         elif typename == "ConnectedEvent":
             for conn_item in (item.get("source"), item.get("subject")):
-                if not conn_item:
+                if not isinstance(conn_item, dict):
                     continue
-                c_url = conn_item.get("url") or ""
-                c_num = conn_item.get("number")
-                c_type = conn_item.get("__typename")
+                c_url = conn_item.get("url") if isinstance(conn_item.get("url"), str) else ""
+                c_num = conn_item.get("number") if type(conn_item.get("number")) is int else None
+                c_type = conn_item.get("__typename") if isinstance(conn_item.get("__typename"), str) else None
                 parsed = _parse_github_item_url(c_url)
                 c_repo = parsed[0] if parsed else repo
                 c_kind = parsed[1] if parsed else ("pull" if c_type == "PullRequest" else "issues")
@@ -1007,7 +1009,10 @@ def _add_linked_refs_scrub_entries(
     from hermetic_slice.intake import linked_refs
 
     comments_nodes = list((issue_data.get("comments") or {}).get("nodes") or [])
-    text_corpus = [issue_data.get("body") or ""] + [c.get("body") or "" for c in comments_nodes]
+    issue_body = issue_data.get("body")
+    text_corpus = ([issue_body] if isinstance(issue_body, str) else []) + [
+        c.get("body") for c in comments_nodes if isinstance(c, dict) and isinstance(c.get("body"), str)
+    ]
     for text_sample in text_corpus:
         for ref in linked_refs(repo, "", text_sample):
             if ref.number not in target_issue_numbers:
@@ -1185,13 +1190,18 @@ def process_thread_scrub_and_revision(
 
             # Scrub post-T_world comments on this issue
             for c in (iss_data.get("comments") or {}).get("nodes") or []:
+                if not isinstance(c, dict):
+                    continue
                 c_created = parse_iso(c.get("createdAt"))
-                c_url = c.get("url")
-                c_id = c.get("databaseId")
+                c_url = c.get("url") if isinstance(c.get("url"), str) else None
+                c_id = c.get("databaseId") if type(c.get("databaseId")) is int else None
                 if not c_id and c_url:
                     m = re.search(r"#issuecomment-(\d+)", c_url)
                     if m:
-                        c_id = m.group(1)
+                        try:
+                            c_id = int(m.group(1))
+                        except ValueError:
+                            c_id = None
                 if c_created is None:
                     deny_unresolved_scope(all_entries)
                 if c_created and c_created > t_world:
@@ -1267,15 +1277,21 @@ def process_thread_scrub_and_revision(
     all_entries = list(pr_entries)
 
     for comment in comments_nodes:
+        if not isinstance(comment, dict):
+            hints_excluded_no_history += 1
+            continue
         c_created = parse_iso(comment.get("createdAt"))
         c_last_edited = parse_iso(comment.get("lastEditedAt"))
-        c_url = comment.get("url")
-        c_db_id = comment.get("databaseId")
+        c_url = comment.get("url") if isinstance(comment.get("url"), str) else None
+        c_db_id = comment.get("databaseId") if type(comment.get("databaseId")) is int else None
         if not c_db_id and c_url:
             m = re.search(r"#issuecomment-(\d+)", c_url)
             if m:
-                c_db_id = m.group(1)
-        c_comment_ident = str(c_db_id) if type(c_db_id) is int else "unknown"
+                try:
+                    c_db_id = int(m.group(1))
+                except ValueError:
+                    c_db_id = None
+        c_comment_ident = str(c_db_id) if c_db_id is not None else "unknown"
 
         # Defect 4: Comment with missing or unparseable createdAt
         if c_created is None:
@@ -1305,7 +1321,12 @@ def process_thread_scrub_and_revision(
             continue
         if c_last_edited is None:
             # Never edited: verified revision as of T_world
-            kept_comments_bodies.append(comment.get("body") or "")
+            c_body = comment.get("body")
+            if not isinstance(c_body, str):
+                hints_excluded_no_history += 1
+                warnings_list.append(f"Comment {c_comment_ident}: invalid_comment_body; excluded from hints")
+                continue
+            kept_comments_bodies.append(c_body)
             kept_comments_verified.append(True)
             continue
 
@@ -1322,8 +1343,9 @@ def process_thread_scrub_and_revision(
                 continue
 
             c_includes_created = comment.get("includesCreatedEdit")
+            c_body = comment.get("body") if isinstance(comment.get("body"), str) else ""
             c_rev = select_revision(
-                scraped_body=comment.get("body") or "",
+                scraped_body=c_body,
                 created_at=c_created,
                 last_edited_at=c_last_edited,
                 user_content_edits=c_edits,

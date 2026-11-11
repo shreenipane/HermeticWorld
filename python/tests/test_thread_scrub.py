@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -1115,6 +1116,186 @@ def test_defect2_truncated_history_raises_and_falls_back(tmp_path: Path) -> None
     assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
 
+def test_defect2_later_null_issue_node_response_falls_back(tmp_path: Path) -> None:
+    """Defect 2 variant: Later null issue/node responses raise and exclude unverifiable content."""
+    initial_issue = {
+        "id": "iss-1", "body": "initial", "createdAt": "2020-01-01T00:00:00Z",
+        "lastEditedAt": "2020-01-10T00:00:00Z", "includesCreatedEdit": True,
+        "userContentEdits": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+            "nodes": [{"editedAt": "2020-01-10T00:00:00Z", "diff": "late revision"}],
+        },
+        "comments": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        "timelineItems": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+    }
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    # Case A: Later issue response has null issue
+    def post_null_issue(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return {"data": {"repository": {"issue": deepcopy(initial_issue)}}}
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "IssueEditsPage":
+            return {"data": {"repository": {"issue": None}}}
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=302,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-05T00:00:00+00:00"),
+        scraped_problem_statement="Title: Truncated\nScraped body",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=post_null_issue,
+        cache_dir=tmp_path / "cache_null_issue",
+        warnings_list=warnings_list,
+    )
+    assert result.problem_statement_revision == "excluded"
+    assert result.problem_statement == ""
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
+
+    # Case B: Later comment response has null node
+    comment_node = {
+        "id": "c-1", "databaseId": 501, "createdAt": "2020-01-02T00:00:00Z",
+        "lastEditedAt": "2020-01-10T00:00:00Z", "includesCreatedEdit": True,
+        "userContentEdits": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+            "nodes": [{"editedAt": "2020-01-10T00:00:00Z", "diff": "late comment revision"}],
+        },
+    }
+    issue_with_comment = deepcopy(initial_issue)
+    issue_with_comment["lastEditedAt"] = None
+    issue_with_comment["userContentEdits"]["pageInfo"]["hasNextPage"] = False
+    issue_with_comment["comments"]["nodes"] = [comment_node]
+
+    def post_null_node(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return {"data": {"repository": {"issue": issue_with_comment}}}
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "CommentEditsPage":
+            return {"data": {"node": None}}
+        raise ValueError(f"Unexpected op: {op}")
+
+    warn_node: list[str] = []
+    res_node = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=302,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-05T00:00:00+00:00"),
+        scraped_problem_statement="Title: Comment Test\nScraped body",
+        scraped_hints="Comment hint",
+        token="test-token",
+        http_post_json=post_null_node,
+        cache_dir=tmp_path / "cache_null_node",
+        warnings_list=warn_node,
+    )
+    assert res_node.hints_excluded_no_history == 1
+    assert "late comment revision" not in res_node.hints_text
+    assert res_node.hints_text == ""
+
+
+def test_defect2_missing_later_page_info_falls_back(tmp_path: Path) -> None:
+    """Defect 2 variant: Missing later pageInfo raises and excludes unverifiable content."""
+    initial_issue = {
+        "id": "iss-2", "body": "initial", "createdAt": "2020-01-01T00:00:00Z",
+        "lastEditedAt": "2020-01-10T00:00:00Z", "includesCreatedEdit": True,
+        "userContentEdits": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+            "nodes": [{"editedAt": "2020-01-10T00:00:00Z", "diff": "late revision"}],
+        },
+        "comments": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        "timelineItems": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+    }
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def post_missing_page_info(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return {"data": {"repository": {"issue": deepcopy(initial_issue)}}}
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "IssueEditsPage":
+            return {"data": {"repository": {"issue": {"userContentEdits": {
+                "nodes": [{"editedAt": "2020-01-01T00:00:00Z", "diff": "verified original"}],
+            }}}}}
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=302,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-05T00:00:00+00:00"),
+        scraped_problem_statement="Title: Truncated\nScraped body",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=post_missing_page_info,
+        cache_dir=tmp_path / "cache_missing_page_info",
+        warnings_list=warnings_list,
+    )
+    assert result.problem_statement_revision == "excluded"
+    assert result.problem_statement == ""
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
+
+
+def test_defect2_paginated_comment_missing_id_falls_back(tmp_path: Path) -> None:
+    """Defect 2 variant: A paginated comment missing its ID raises missing_pagination_id and excludes comment."""
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+    comment_without_id = {
+        "databaseId": 502, "createdAt": "2020-01-02T00:00:00Z",
+        "lastEditedAt": "2020-01-10T00:00:00Z", "includesCreatedEdit": True,
+        "userContentEdits": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+            "nodes": [{"editedAt": "2020-01-10T00:00:00Z", "diff": "late comment revision"}],
+        },
+    }
+    issue_data = {
+        "id": "iss-3", "body": "initial", "createdAt": "2020-01-01T00:00:00Z",
+        "lastEditedAt": None, "includesCreatedEdit": True,
+        "userContentEdits": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        "comments": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [comment_without_id]},
+        "timelineItems": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+    }
+    calls = []
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        calls.append(op)
+        if op == "TargetIssueData":
+            return {"data": {"repository": {"issue": issue_data}}}
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=302,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-05T00:00:00+00:00"),
+        scraped_problem_statement="Title: Safe\nScraped body",
+        scraped_hints="Hint text",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache_missing_id",
+        warnings_list=warnings_list,
+    )
+    assert result.hints_excluded_no_history == 1
+    assert "late comment revision" not in result.hints_text
+    assert result.hints_text == ""
+    assert "CommentEditsPage" not in calls
+    assert any("failed fetching or processing edit history" in w for w in warnings_list)
+
+
 def test_defect3_missing_includes_created_edit_treated_as_not_including_creation(tmp_path: Path) -> None:
     """Defect 3: Missing includesCreatedEdit (omitted/null) is treated as not including creation edit."""
     fixture_data = load_fixture_json("issue_missing_includes_created_edit.json")
@@ -1253,6 +1434,35 @@ def test_defect5_comment_edit_pagination_errors_guarded_never_crash(tmp_path: Pa
     assert result_b.hints_excluded_no_history == 1
     assert "Comment with broken second page of edits" not in result_b.hints_text
     assert any("Comment 807: failed fetching or processing edit history" in w for w in warnings_b)
+
+    # Test Case C: Non-JSON bytes during comment edit pagination
+    def fake_post_non_json(url: str, payload: dict) -> bytes:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "CommentEditsPage":
+            return b"<html><body>502 Bad Gateway</body></html>"
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_c: list[str] = []
+    result_c = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=305,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Error guard\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post_non_json,
+        cache_dir=tmp_path / "cache_c",
+        warnings_list=warnings_c,
+    )
+    assert result_c.hints_excluded_no_history == 1
+    assert "Comment with broken second page of edits" not in result_c.hints_text
+    assert any("Comment 807: failed fetching or processing edit history" in w for w in warnings_c)
 
 
 def test_defect6_cache_refresh_for_mutable_graphql_snapshot(tmp_path: Path) -> None:
@@ -1461,6 +1671,61 @@ def test_defect9_solution_pr_entries_gaps_filled(tmp_path: Path) -> None:
         assert f"https://github.com/test-org/test-repo/commit/{sha}.patch" in urls
         assert f"https://api.github.com/repos/test-org/test-repo/commits/{sha}" in urls
         assert f"https://api.github.com/repos/test-org/test-repo/git/commits/{sha}" in urls
+
+
+def test_defect9_solution_pr_conversation_comments_multi_page_pagination(tmp_path: Path) -> None:
+    """Defect 9: Solution PR conversation comments are paginated across multiple pages and all scrubbed."""
+    issue_fixture = load_fixture_json("issue_never_edited.json")
+    pr_page1 = {
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "cursor_pr_comments_p2"},
+            "nodes": [
+                {"databaseId": 901, "url": "https://github.com/test-org/test-repo/pull/50#issuecomment-901"},
+            ],
+        },
+        "reviews": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+    }
+    pr_page2 = {
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {"databaseId": 902, "url": "https://github.com/test-org/test-repo/pull/50#issuecomment-902"},
+            ],
+        },
+    }
+    calls = []
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        calls.append(op)
+        if op == "TargetIssueData":
+            return issue_fixture
+        if op == "PullRequestData":
+            return {"data": {"repository": {"pullRequest": deepcopy(pr_page1)}}}
+        if op == "PullRequestCommentsPage":
+            assert payload["variables"]["cursor"] == "cursor_pr_comments_p2"
+            return {"data": {"repository": {"pullRequest": deepcopy(pr_page2)}}}
+        raise ValueError(f"Unexpected op: {op}")
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=102,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Solution PR gaps\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+    )
+    urls = [e["url"] for e in result.scrub_entries]
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/901" in urls
+    assert "https://github.com/test-org/test-repo/pull/50#issuecomment-901" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/902" in urls
+    assert "https://github.com/test-org/test-repo/pull/50#issuecomment-902" in urls
+    assert calls.count("PullRequestCommentsPage") == 1
 
 
 def test_defect10_prefixes_have_trailing_delimiter_and_match_field() -> None:
