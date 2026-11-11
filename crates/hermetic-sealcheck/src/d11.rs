@@ -653,6 +653,9 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
 
                 for line in &hunk.lines {
                     let trimmed = line.content.trim();
+                    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+                        continue;
+                    }
                     if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
                         let sec = trimmed[1..trimmed.len() - 1].trim().to_string();
                         current_section = Some(sec);
@@ -828,19 +831,96 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 let mut changed_lines = Vec::new();
                 let mut in_pytest11_group = false;
+                let mut depth: usize = 0;
+                let mut waiting_for_open = false;
+
                 for line in &hunk.lines {
-                    let trimmed = line.content.trim();
-                    if trimmed.contains("pytest11") {
-                        in_pytest11_group = true;
-                    }
+                    let mentions_pytest11 = line.content.contains("pytest11");
+
                     if (line.line_type == DiffLineType::Added
                         || line.line_type == DiffLineType::Removed)
-                        && (in_pytest11_group || trimmed.contains("pytest11"))
+                        && (in_pytest11_group || waiting_for_open || mentions_pytest11)
                     {
                         changed_lines.push(line.content.trim().to_string());
                     }
-                    if in_pytest11_group && (trimmed.starts_with(']') || trimmed.starts_with('}')) {
-                        in_pytest11_group = false;
+
+                    if mentions_pytest11 && depth == 0 && !waiting_for_open {
+                        if let Some(pos) = line.content.find("pytest11") {
+                            let after = &line.content[pos + "pytest11".len()..];
+                            let mut open_offset = None;
+                            for (byte_idx, ch) in after.char_indices() {
+                                if ch == '[' || ch == '(' || ch == '{' {
+                                    open_offset = Some(byte_idx + ch.len_utf8());
+                                    break;
+                                }
+                            }
+
+                            if let Some(start_offset) = open_offset {
+                                depth = 1;
+                                in_pytest11_group = true;
+                                waiting_for_open = false;
+
+                                for ch in after[start_offset..].chars() {
+                                    match ch {
+                                        '[' | '(' | '{' => depth += 1,
+                                        ']' | ')' | '}' => {
+                                            depth = depth.saturating_sub(1);
+                                            if depth == 0 {
+                                                in_pytest11_group = false;
+                                                break;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                waiting_for_open = true;
+                                in_pytest11_group = false;
+                                depth = 0;
+                            }
+                        }
+                    } else if waiting_for_open {
+                        let mut open_offset = None;
+                        for (byte_idx, ch) in line.content.char_indices() {
+                            if ch == '[' || ch == '(' || ch == '{' {
+                                open_offset = Some(byte_idx + ch.len_utf8());
+                                break;
+                            }
+                        }
+
+                        if let Some(start_offset) = open_offset {
+                            depth = 1;
+                            in_pytest11_group = true;
+                            waiting_for_open = false;
+
+                            for ch in line.content[start_offset..].chars() {
+                                match ch {
+                                    '[' | '(' | '{' => depth += 1,
+                                    ']' | ')' | '}' => {
+                                        depth = depth.saturating_sub(1);
+                                        if depth == 0 {
+                                            in_pytest11_group = false;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    } else if in_pytest11_group {
+                        for ch in line.content.chars() {
+                            match ch {
+                                '[' | '(' | '{' => depth += 1,
+                                ']' | ')' | '}' => {
+                                    depth = depth.saturating_sub(1);
+                                    if depth == 0 {
+                                        in_pytest11_group = false;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 if !changed_lines.is_empty() {

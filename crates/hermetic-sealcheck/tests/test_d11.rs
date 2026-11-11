@@ -603,3 +603,110 @@ fn test_sarif_scan_unchanged_drops_info() {
     assert_eq!(run.results[0].rule_id, "D1");
     assert_eq!(run.results[0].level, "error");
 }
+
+#[test]
+fn test_d11_setup_cfg_comment_in_entry_points_preserves_group() {
+    let patch_hash = "\
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -10,4 +10,5 @@
+ [options.entry_points]
+ pytest11 =
+ # plugins
++    myplugin = pkg.plugin
+ console_scripts =
+";
+    let findings_hash = check_d11(patch_hash, &D11Options::default());
+    assert_eq!(findings_hash.len(), 1);
+    assert_eq!(findings_hash[0].channel, "runner_config_section");
+    assert_eq!(findings_hash[0].path, "setup.cfg");
+    assert!(findings_hash[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("myplugin = pkg.plugin")));
+
+    let patch_semi = "\
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -10,4 +10,5 @@
+ [options.entry_points]
+ pytest11 =
+ ; plugins
++    myplugin = pkg.plugin
+ console_scripts =
+";
+    let findings_semi = check_d11(patch_semi, &D11Options::default());
+    assert_eq!(findings_semi.len(), 1);
+    assert_eq!(findings_semi[0].channel, "runner_config_section");
+    assert_eq!(findings_semi[0].path, "setup.cfg");
+    assert!(findings_semi[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("myplugin = pkg.plugin")));
+}
+
+#[test]
+fn test_d11_setup_py_unchanged_inline_followed_by_changed_version_gives_no_finding() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,4 +10,4 @@
+     entry_points={'pytest11': ['plugin = pkg.plugin']},
+-    version=\"1.0.0\",
++    version=\"2.0.0\",
+     description=\"pkg\",
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert!(
+        findings.is_empty(),
+        "Unchanged inline pytest11 group followed by changed version= must give no finding"
+    );
+}
+
+#[test]
+fn test_d11_setup_py_multiline_pytest11_changed_middle_line_flagged() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,5 +10,6 @@
+ entry_points={
+     'pytest11': [
++        'plugin = pkg.plugin',
+     ],
+ }
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "runner_config_section");
+    assert_eq!(findings[0].path, "setup.py");
+    assert!(findings[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("plugin = pkg.plugin")));
+}
+
+#[test]
+fn test_d11_setup_py_changed_line_with_inline_pytest11_flagged() {
+    let patch = "\
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -10,3 +10,4 @@
+ from setuptools import setup
+ setup(
++    entry_points={'pytest11': ['plugin = pkg.plugin']},
+ )
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "runner_config_section");
+    assert_eq!(findings[0].path, "setup.py");
+    assert!(findings[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("entry_points={'pytest11': ['plugin = pkg.plugin']}")));
+}
