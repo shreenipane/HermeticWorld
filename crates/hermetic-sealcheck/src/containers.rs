@@ -316,16 +316,7 @@ impl<'a> ContainerScanner<'a> {
 
             match ctype {
                 ContainerType::GitPack => {
-                    self.findings.push(Finding {
-                        detector: "D2".into(),
-                        channel: "container_skipped".into(),
-                        path: path.to_string(),
-                        visibility: self.opts.visibility,
-                        severity: Severity::Info,
-                        confidence: 0.0,
-                        hunk: None,
-                        evidence: vec!["git pack files skipped".into()],
-                    });
+                    self.scan_stray_pack(path, bytes, depth);
                 }
                 ContainerType::Pyc => {
                     let constants_text = extract_pyc_constants(bytes);
@@ -387,6 +378,54 @@ impl<'a> ContainerScanner<'a> {
         ));
         self.findings
             .extend(match_unit(text, self.fp, self.opts, "D2", "file", path));
+    }
+
+    fn scan_stray_pack(&mut self, path: &str, bytes: &[u8], depth: usize) {
+        let (blobs, has_unresolved_ref_delta, error) =
+            crate::gitstore::scan_stray_pack_slice(bytes, self.opts, &mut self.total_expanded);
+        for (offset, blob_bytes) in blobs {
+            let blob_path = format!("{}#{}", path, offset);
+            self.scan(&blob_path, &blob_bytes, depth + 1);
+        }
+        if has_unresolved_ref_delta {
+            self.findings.push(Finding {
+                detector: "D2".into(),
+                channel: "container_skipped".into(),
+                path: path.to_string(),
+                visibility: self.opts.visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec!["unresolved REF_DELTA in stray pack".into()],
+            });
+        }
+        match error {
+            None => {}
+            Some(crate::gitstore::GitError::LimitExceeded(msg)) => {
+                self.findings.push(Finding {
+                    detector: "D2".into(),
+                    channel: "container_bomb".into(),
+                    path: path.to_string(),
+                    visibility: self.opts.visibility,
+                    severity: Severity::Review,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec![msg],
+                });
+            }
+            Some(e) => {
+                self.findings.push(Finding {
+                    detector: "D2".into(),
+                    channel: "container_error".into(),
+                    path: path.to_string(),
+                    visibility: self.opts.visibility,
+                    severity: Severity::Info,
+                    confidence: 0.0,
+                    hunk: None,
+                    evidence: vec![format!("failed to parse stray git pack: {e}")],
+                });
+            }
+        }
     }
 
     fn scan_sqlite(&mut self, path: &str, bytes: &[u8]) {

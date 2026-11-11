@@ -58,6 +58,9 @@ pub struct ScanOptions {
     pub signatures: BenchmarkSignatures,
     /// Canonical directories never entered by `scan_tree`
     pub exclude_dirs: Vec<PathBuf>,
+    pub base_commit: Option<String>,
+    pub t_clock: Option<time::OffsetDateTime>,
+    pub max_delta_depth: usize,
 }
 
 impl Default for ScanOptions {
@@ -73,6 +76,9 @@ impl Default for ScanOptions {
             max_ratio: 200.0,
             signatures: BenchmarkSignatures::new(None),
             exclude_dirs: Vec::new(),
+            base_commit: None,
+            t_clock: None,
+            max_delta_depth: 4096,
         }
     }
 }
@@ -448,6 +454,14 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
     let root_str = root.display().to_string();
     let root_prefix_len = root_str.len();
 
+    let is_git_dir = |p: &Path| {
+        p.join("HEAD").is_file() && p.join("objects").is_dir() && p.join("refs").is_dir()
+    };
+
+    if is_git_dir(root) {
+        findings.extend(crate::d1::scan_git_repo(root, fp, opts));
+    }
+
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         let path = e.path();
         if root == Path::new("/") {
@@ -456,9 +470,14 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                 return false;
             }
         }
-        if e.file_type().is_dir() && !opts.exclude_dirs.is_empty() {
-            if let Ok(canon) = path.canonicalize() {
-                return !opts.exclude_dirs.iter().any(|d| canon.starts_with(d));
+        if e.file_type().is_dir() {
+            if e.file_name() == "objects" && path.parent().is_some_and(is_git_dir) {
+                return false;
+            }
+            if !opts.exclude_dirs.is_empty() {
+                if let Ok(canon) = path.canonicalize() {
+                    return !opts.exclude_dirs.iter().any(|d| canon.starts_with(d));
+                }
             }
         }
         true
@@ -490,6 +509,19 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
+        if entry.path_is_symlink() && entry.file_name() == ".git" {
+            findings.push(Finding {
+                detector: "D1".into(),
+                channel: "git_pointer".into(),
+                path: display_path.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec!["symlink named .git".into()],
+            });
+        }
+
         let metadata = if entry.path_is_symlink() {
             match std::fs::metadata(file_path) {
                 Ok(m) if m.is_file() => m,
@@ -506,6 +538,18 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                 }
             }
         } else if entry.file_type().is_file() {
+            if entry.file_name() == ".git" {
+                findings.push(Finding {
+                    detector: "D1".into(),
+                    channel: "git_pointer".into(),
+                    path: display_path.clone(),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec!["git pointer file present".into()],
+                });
+            }
             match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
@@ -513,6 +557,11 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                     continue;
                 }
             }
+        } else if entry.file_type().is_dir() {
+            if file_path != root && is_git_dir(file_path) {
+                findings.extend(crate::d1::scan_git_repo(file_path, fp, opts));
+            }
+            continue;
         } else {
             continue;
         };

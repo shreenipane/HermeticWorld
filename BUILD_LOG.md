@@ -29,6 +29,55 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-11: Phase 0 exit, T1.2 and T1.3 sealcheck, OpenRouter client
+
+- **Phase:** 0 and 1
+- **Type:** build + measurement + decision + incident
+- **Requirements:** TR-SC-4, TR-SC-6, TR-SC-7 (D1, D3, D6, D9), TR-SC-8
+- **Briefs:** `agy-tasks/T0.5`, `T0.6`, `T1.1`, `T1.2`, `T1.2a`, `T1.3`
+
+### Done
+- **T0.5, T0.6:** clean grader, oracle, Gemma agent loop, extractor and run record.
+- **T1.1:** Rust workspace, `hermetic-common`, sealcheck tier 1, D0, D2, JSON and SARIF.
+- **T1.2:** tier 3 winnowing, zip/tar/gz/bz2/xz/zstd/SQLite/`.pyc` scanning with bomb limits, D3, D9.
+- **T1.3:** a git object store read with no `git` process, D1 and D6.
+- **OpenRouter client** on `t0.7-openrouter`: `run-agent --provider openrouter`, refusing any model without a `:free` suffix.
+
+### Results / measurements
+- **Phase 0 exit met.** `django__django-11099` on Gemma 4 31B: `RESOLVED_FULL`, 3/3 `FAIL_TO_PASS`, 19/19 `PASS_TO_PASS`, 9 steps, 1134 s. The oracle passes on 10 of 10 tasks.
+- **Agent runs so far:**
+
+| Task | Model | Outcome | Steps | Wall |
+|---|---|---|---|---|
+| django-11099 | Gemma 4 31B | `RESOLVED_FULL` | 9 | 1134 s |
+| sympy-20590 | Gemma 4 31B | `RESOLVED_FULL` | 12 | 912 s |
+| pylint-7080 | Gemma 4 31B | `model_error` (HTTP 503), no model reply | 0 | 1342 s |
+| scikit-learn-13142 | Gemma 4 31B | `model_error`, no model reply | 0 | 1565 s |
+| pylint-7080 | Nemotron 3 Ultra free | `RESOLVED_NO`, hit a 30-step cap | 30 | 141 s |
+
+  A `model_error` with zero steps is an API outage, not a model failure, and isn't a score. Astropy, flask, pytest, sphinx and xarray have cut-off partial runs with no record.
+- **sealcheck on real images (T1.3):** all 10 sealed images pass D1, each in under 15 s and about 290 MB. Django's unsealed image is caught by `git_head`, `git_ref`, `git_state_file` and `git_unreachable_object`.
+- **Python 3.6 `.pyc`:** after the T1.2a header fix, 7 of 2,375 files in django-11099 are flagged stale.
+- **Performance:** a 50 MB synthetic tree scans in 4.23 s (budget 10 s).
+- **Tests:** 123 Rust tests pass on `t1.3`; fmt and clippy are clean.
+
+### Decisions
+- **Fast track (user):** two tracks at most, and scope sequenced so the leak report comes first. D7, D8, D10, D11, D12 and tier 2 move later. None are cut.
+- **Model change (user):** agent runs move to OpenRouter free models. Scores across models must not be combined. Run records name the model.
+- **Pylint reran at a 30-step cap**, against 60 for Gemma, to protect the free daily quota. It isn't a like-for-like result.
+- **An unsupported pack format gates** instead of being flagged for review, because D1 can't prove anything about a store it can't read. SHA-256 repositories remain `review`, as the brief says.
+- **Reviewer-written code:** the T1.3 review fixes and the OpenRouter client were written directly by the reviewer rather than agy, to save time.
+
+### Problems / open questions
+- **Memory kills.** Claude Code's safeguard killed background jobs repeatedly near 3–4 GB free, costing about 2.5 h on T1.3. The cause was Rust builds using all 16 threads. Builds are now capped at 4 jobs with debug info off, and T1.3 then built without a kill.
+- **D3 calibration:** the 7 stale `.pyc` files in django are conda build and sysconfig files rewritten at install time. They are correctly stale but aren't an answer leak. Decide how to treat them before E3.
+- **D6 on sealed images** reports 2026 image dates as `image_only` gates, as expected until Phase 2 flattens the image.
+- **Review bugs T1.2 and T1.3 tests missed:** 13 in T1.2 and 21 in T1.3 (12 from reading the code, 9 from CodeRabbit). The largest were every Python 3.6 `.pyc` being misparsed, a text file named `*.idx` stopping D1, and non-UTF-8 commits breaking the reachability walk.
+
+### Next
+- T1.4: binary tier, D3b, D5a. Then the E3 corpus and threshold calibration.
+- The E3 blind set needs leaks seeded by a second person. Disclosure of a leak report is the user's decision.
+
 ## 2026-11-11: T0.3a image sealer accepted, T0.4 frozen index and offline world merged, task swap (Phase 0)
 
 - **Phase:** 0

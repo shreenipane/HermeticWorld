@@ -80,6 +80,14 @@ struct ScanArgs {
     /// Output file path (defaults to stdout)
     #[arg(long)]
     out: Option<PathBuf>,
+
+    /// Path to docker inspect JSON array file
+    #[arg(long)]
+    oci_inspect: Option<PathBuf>,
+
+    /// Path to docker history JSON lines file
+    #[arg(long)]
+    oci_history: Option<PathBuf>,
 }
 
 fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -123,10 +131,30 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             visibility: vis.into(),
             signatures: signatures.clone(),
             exclude_dirs: canonical_task_dir.iter().cloned().collect(),
+            base_commit: Some(task.base_commit.clone()),
+            t_clock: Some(task.cutoffs.t_clock),
             ..Default::default()
         };
         let tree_findings = scan_tree(root, &fp, &opts);
         all_findings.extend(tree_findings);
+    }
+
+    if args.oci_inspect.is_some() || args.oci_history.is_some() {
+        let oci_opts = ScanOptions {
+            visibility: Visibility::ImageOnly,
+            signatures: signatures.clone(),
+            t_clock: Some(task.cutoffs.t_clock),
+            ..Default::default()
+        };
+        let oci_findings = hermetic_sealcheck::scan_oci(
+            args.oci_inspect.as_deref(),
+            args.oci_history.as_deref(),
+            Some(task.cutoffs.t_clock),
+            &fp,
+            &signatures,
+            &oci_opts,
+        )?;
+        all_findings.extend(oci_findings);
     }
 
     let gate = all_findings
