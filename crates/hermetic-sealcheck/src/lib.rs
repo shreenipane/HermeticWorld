@@ -5,16 +5,20 @@ pub mod binary;
 pub mod bytecode;
 pub mod containers;
 pub mod d1;
+pub mod d11;
+pub mod d12;
 pub mod d5a;
 pub mod d6;
 pub mod d8;
 pub mod diff;
+pub mod ext4;
 pub mod fingerprint;
 pub mod gitstore;
 pub mod index;
 pub mod normalize;
 pub mod sarif;
 pub mod scan;
+pub mod tier2;
 pub mod undated;
 pub mod winnow;
 
@@ -31,12 +35,15 @@ pub use containers::{
     scan_container_or_unit_with_root_prefix, CountingReader,
 };
 pub use d1::scan_git_repo;
+pub use d11::{check_d11, D11Options, PYTHON_STDLIB_MODULES};
+pub use d12::{check_d12, D12Options};
 pub use d5a::{check_d5a_metadata, parse_pep440, parse_pkg_metadata, pep503_normalize};
 pub use d6::{parse_oci_date, scan_oci, D6Error};
 pub use d8::check_d8;
 pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
 };
+pub use ext4::{scan_ext4_image, scan_ext4_slice, Ext4Error};
 pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
 pub use gitstore::{
     apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,
@@ -48,7 +55,10 @@ pub use index::{
 };
 pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
-pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};
+pub use sarif::{
+    generate_sarif, generate_sarif_with_options, generate_sarif_with_properties, SarifLog,
+    SarifRunProperties,
+};
 pub use scan::{
     compute_unit_hashes, match_unit, match_unit_hashes, scan_problem_statement, scan_tree,
     walk_tree, Finding, ScanOptions, Severity, TreeSink, UnitHashes, Visibility,

@@ -427,6 +427,7 @@ fn test_scan_and_query_undated_equivalence() {
             "D6",
             "D9:instance_id",
             "D9:external",
+            "T2",
             "D4",
             "D5a"
         ])
@@ -571,7 +572,7 @@ fn test_dated_scan_json_unchanged_no_mode() {
         "base_commit": "1234567890abcdef1234567890abcdef12345678",
         "cutoffs": {
             "t_world": "2024-01-01T00:00:00Z",
-            "t_clock": "2024-01-02T00:00:00Z"
+            "t_clock": "2030-01-01T00:00:00Z"
         }
     }"#;
     fs::write(task.join("task.json"), task_json).expect("write task.json");
