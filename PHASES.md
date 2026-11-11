@@ -68,14 +68,14 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2) (T1.1)
   - [ ] Tier 2: tree-sitter IDF symbols, as review (TR-SC-3)
   - [x] Tier 3: winnowing, k=8, w=8 (TR-SC-4) (T1.2)
-  - [ ] Binary tier (TR-SC-5)
+  - [x] Binary tier (TR-SC-5) (T1.4; `.pyc` coverage is weak, see BUILD_LOG)
 - [x] Container recursion with bomb limits, including git packs (TR-SC-6) (T1.2, T1.3)
-- [ ] Detectors D0–D12 (TR-SC-7): done D0, D1, D2, D3, D6, D9. In T1.4: D3b, D5a. Remaining, in order: D4, D5b, D7, D8, D10, D11, D12
+- [ ] Detectors D0–D12 (TR-SC-7): done D0, D1, D2, D3, D3b, D5a, D6, D9. Remaining, in order: D4, D5b, D7, D8, D10, D11, D12
 - [ ] Thread scrub and mutable-content revision rule (TR-SEAL-9)
 - [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [ ] Layer index plus per-task query, under 5 s (TR-SC-10)
-- [ ] E3 corpus: seeded leaks, blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
+- [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
 - [ ] Calibrate the tier-1 and tier-2 thresholds against E3
 
 ### Exit

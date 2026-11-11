@@ -29,6 +29,45 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-11: T1.4 binary tier, D3b and D5a; T1.5 E3 harness; first E3 numbers (Phase 1)
+
+- **Phase:** 1
+- **Type:** build + measurement
+- **Requirements:** TR-SC-5, TR-SC-7 (D3b, D5a); E3
+- **Briefs:** `agy-tasks/T1.4-binary-tier-d3b-d5a.md`, `agy-tasks/T1.5-e3-corpus.md`
+
+### Done
+- **T1.4:** binary-tier items, and D3b over ELF, Java class, wasm, Mach-O universal, minified bundles and `.pyc`. D5a reads package metadata on disk and inside wheels and eggs.
+- **T1.5:** the `e3-basetrees`, `e3-build` and `e3-run` commands. The corpus has 11 leak variants and 3 clean variants per task, plus 6 synthetic tasks (3 deletion-only, 3 one-character). Metrics come with Wilson 95% intervals.
+- **Review:**
+  - T1.4: 12 bugs fixed.
+  - T1.5: 4 fixes, including scoring D0 per task. The problem statement is the same for every case of a task, so per case it would have scored them all alike.
+
+### Results / measurements
+- **E3, seeded set:** 175 cases over 10 real and 6 synthetic tasks, seed 20261111, scanned with sealcheck at `c3449b5`.
+
+| Metric | Value | 95% interval |
+|---|---|---|
+| Precision | 100% (114 / 114) | 96.7–100% |
+| Recall | 89.8% (114 / 127) | 83.3–93.9% |
+
+  - **Clean cases:** 0 false gates out of 48, covering pre-fix files, 200 sampled base files per task, and another task's fix.
+  - **Detected every time:** post-fix files, the patch, a regenerated diff, zip, tar.gz, nested archives, SQLite, hidden-test lines, and every synthetic deletion-only and one-character fix.
+  - **Misses:**
+    - 10 of 10 `.pyc` cases;
+    - 2 of 10 reformatted hunks (scikit-learn, sympy);
+    - 1 of 9 hunks pasted into prose (sphinx).
+- **Why `.pyc` misses:** a `.pyc` holds names and constants, not source lines, so tiers 1 and 3 can't match it. The binary tier only scores identifiers or literals of 8+ characters that the fix adds and the base tree lacks. Most real fixes add none (0 items for scikit-learn, matplotlib, astropy), and django's fix has one per hunk, below the 2-item rule. The thresholds were **not** loosened to fit this corpus.
+- **D3b and D5a on real environments:** 0 D3b gates across 2,920 compiled libraries in four images. Two D5a false gates were found and fixed: matplotlib and astropy editable installs report the next release as a `.dev` version at the base commit.
+
+### Problems / open questions
+- E3's 90% recall target is defined on the **blind** and **real** sets. The blind set needs leaks seeded by someone other than us. The real set (pytest-6202 history, SWE-Bench+ cases, the Cybench config) isn't built yet.
+- `.pyc` recall needs another technique, for example fingerprints over each code object's name and constant sequence. Tier 2 (tree-sitter symbols) would help reformatted and prose leaks.
+- D3 still reports conda's rewritten sysconfig files as stale, a calibration decision for later.
+
+### Next
+- The E3 real set, then the layer index (TR-SC-10) and tier 2.
+
 ## 2026-11-11: Phase 0 exit, T1.2 and T1.3 sealcheck, OpenRouter client
 
 - **Phase:** 0 and 1
