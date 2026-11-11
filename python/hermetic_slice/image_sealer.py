@@ -422,19 +422,22 @@ def measure(image: str, task: dict, lines: list[str]) -> dict:
 # never touched.
 RESTORE_MODES_SH = r"""#!/bin/bash
 set -euo pipefail
-cd /testbed
-: > /tmp/hermetic-644; : > /tmp/hermetic-755
+cd "${1:-/testbed}"
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+: > "$TMPDIR/hermetic-644"; : > "$TMPDIR/hermetic-755"
 git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
   mode=${entry%% *}
   path=${entry#*$'\t'}
-  case "$mode" in
-    100644) printf '%s\0' "$path" >> /tmp/hermetic-644 ;;
-    100755) printf '%s\0' "$path" >> /tmp/hermetic-755 ;;
-  esac
+  if [ -f "./$path" ] && [ ! -L "./$path" ]; then
+    case "$mode" in
+      100644) printf '%s\0' "$path" >> "$TMPDIR/hermetic-644" ;;
+      100755) printf '%s\0' "$path" >> "$TMPDIR/hermetic-755" ;;
+    esac
+  fi
 done
-xargs -0 -r chmod a-x -- < /tmp/hermetic-644
-xargs -0 -r chmod a+x -- < /tmp/hermetic-755
-rm -f /tmp/hermetic-644 /tmp/hermetic-755
+xargs -0 -r chmod 644 -- < "$TMPDIR/hermetic-644"
+xargs -0 -r chmod 755 -- < "$TMPDIR/hermetic-755"
 git update-index -q --refresh || true
 """
 

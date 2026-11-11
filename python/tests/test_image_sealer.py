@@ -15,6 +15,7 @@ from hermetic_slice.__main__ import main
 from hermetic_slice.dockerutil import is_docker_available, run_docker
 from hermetic_slice.gitutil import run_git
 from hermetic_slice.image_sealer import (
+    RESTORE_MODES_SH,
     ImageSealError,
     gold_lines,
     measure,
@@ -300,6 +301,61 @@ def test_gold_lines(tmp_path: Path) -> None:
         "def secret_test_function_beta():",
     ])
     assert result == expected
+
+
+def test_restore_modes_sh_restores_exact_modes_and_skips_symlinks(tmp_path: Path) -> None:
+    """Offline regression test: RESTORE_MODES_SH enforces 0644/0755 and skips symlinks."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # file1: tracked as 100644, but has mode 0755 on disk (simulating SWE-bench executable-flip)
+    f1 = repo_dir / "file1.txt"
+    f1.write_text("file 1\n", encoding="utf-8")
+    run_git(["add", "file1.txt"], cwd=repo_dir)
+
+    # file2: tracked as 100644, but has mode 0664 on disk (e.g. host umask 0002)
+    f2 = repo_dir / "file2.txt"
+    f2.write_text("file 2\n", encoding="utf-8")
+    run_git(["add", "file2.txt"], cwd=repo_dir)
+
+    # script: tracked as 100755, but has mode 0644 on disk
+    f3 = repo_dir / "script.sh"
+    f3.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    run_git(["add", "script.sh"], cwd=repo_dir)
+    run_git(["update-index", "--chmod=+x", "script.sh"], cwd=repo_dir)
+
+    # Commit tree
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "base commit"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Now intentionally alter modes on disk
+    os.chmod(f1, 0o755)
+    os.chmod(f2, 0o664)
+    os.chmod(f3, 0o644)
+
+    # Add a symlink on disk pointing to an outside file to verify no chmod through symlink
+    target_outside = tmp_path / "outside.txt"
+    target_outside.write_text("outside", encoding="utf-8")
+    os.chmod(target_outside, 0o600)
+    symlink_file = repo_dir / "symlink.txt"
+    symlink_file.symlink_to(target_outside)
+
+    # Run RESTORE_MODES_SH passing repo_dir as $1
+    subprocess.run(["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)], check=True)
+
+    # Verify exact modes (mask with 0o777)
+    assert oct(f1.stat().st_mode & 0o777) == "0o644"
+    assert oct(f2.stat().st_mode & 0o777) == "0o644"
+    assert oct(f3.stat().st_mode & 0o777) == "0o755"
+    assert symlink_file.is_symlink()
+    assert oct(target_outside.stat().st_mode & 0o777) == "0o600"
+
 
 
 # =============================================================================
