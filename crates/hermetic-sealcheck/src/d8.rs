@@ -279,24 +279,24 @@ fn truncate_200(s: &str) -> String {
     }
 }
 
-fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+pub fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     let mut file = File::open(path)?;
     let mut buf = Vec::new();
-    Read::take(&mut file, max_bytes).read_to_end(&mut buf)?;
+    (&mut file).take(max_bytes).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-fn read_log_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+pub fn read_log_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len <= max_bytes {
         let mut buf = Vec::with_capacity(file_len as usize);
-        file.read_to_end(&mut buf)?;
+        (&mut file).take(max_bytes).read_to_end(&mut buf)?;
         Ok(buf)
     } else {
         file.seek(SeekFrom::Start(file_len - max_bytes))?;
         let mut buf = Vec::with_capacity(max_bytes as usize);
-        file.read_to_end(&mut buf)?;
+        (&mut file).take(max_bytes).read_to_end(&mut buf)?;
         if let Some(first_nl) = buf.iter().position(|&b| b == b'\n') {
             Ok(buf[first_nl + 1..].to_vec())
         } else {
@@ -314,12 +314,11 @@ enum PathStep {
 
 pub fn resolve_in_root(root: &Path, rel: &Path) -> Option<PathBuf> {
     let mut hops = 0usize;
-    let rel_stripped = rel.strip_prefix(root).unwrap_or(rel);
 
     let mut resolved: Vec<OsString> = Vec::new();
     let mut remaining: VecDeque<PathStep> = VecDeque::new();
 
-    for comp in rel_stripped.components() {
+    for comp in rel.components() {
         match comp {
             Component::Prefix(_) => {}
             Component::RootDir => remaining.push_back(PathStep::Root),
@@ -1021,75 +1020,75 @@ fn check_ca_bundle(
         }
     }
 
-    let cert_dir = match resolve_in_root(root, Path::new("etc/ssl/certs")) {
-        Some(d) => d,
-        None => {
-            findings.push(Finding {
-                detector: "D8".into(),
-                channel: "d8_error".into(),
-                path: root.join("etc/ssl/certs").display().to_string(),
-                visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec!["symlink loop or resolution failure".into()],
-            });
-            return;
-        }
-    };
-
-    if cert_dir.is_dir() {
-        match std::fs::read_dir(&cert_dir) {
-            Ok(entries) => {
-                let mut dir_files = Vec::new();
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let resolved = match resolve_in_root(root, &path) {
-                        Some(p) => p,
-                        None => {
-                            findings.push(Finding {
-                                detector: "D8".into(),
-                                channel: "d8_error".into(),
-                                path: path.display().to_string(),
-                                visibility,
-                                severity: Severity::Info,
-                                confidence: 0.0,
-                                hunk: None,
-                                evidence: vec!["symlink loop or resolution failure".into()],
-                            });
-                            continue;
+    if let Some(cert_dir) = resolve_in_root(root, Path::new("etc/ssl/certs")) {
+        if cert_dir.is_dir() {
+            match std::fs::read_dir(&cert_dir) {
+                Ok(entries) => {
+                    let mut dir_files = Vec::new();
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let rel_entry = match path.strip_prefix(root) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let resolved = match resolve_in_root(root, rel_entry) {
+                            Some(p) => p,
+                            None => {
+                                findings.push(Finding {
+                                    detector: "D8".into(),
+                                    channel: "d8_error".into(),
+                                    path: path.display().to_string(),
+                                    visibility,
+                                    severity: Severity::Info,
+                                    confidence: 0.0,
+                                    hunk: None,
+                                    evidence: vec!["symlink loop or resolution failure".into()],
+                                });
+                                continue;
+                            }
+                        };
+                        let ext_match = path.extension().is_some_and(|e| e == "pem" || e == "crt")
+                            || resolved
+                                .extension()
+                                .is_some_and(|e| e == "pem" || e == "crt");
+                        if resolved.is_file() && ext_match {
+                            dir_files.push(resolved);
                         }
-                    };
-                    let ext_match = path.extension().is_some_and(|e| e == "pem" || e == "crt")
-                        || resolved
-                            .extension()
-                            .is_some_and(|e| e == "pem" || e == "crt");
-                    if resolved.is_file() && ext_match {
-                        dir_files.push(resolved);
+                    }
+                    dir_files.sort();
+                    for path in dir_files.into_iter().take(2000) {
+                        if !cert_files.contains(&path) {
+                            cert_files.push(path);
+                        }
                     }
                 }
-                dir_files.sort();
-                for path in dir_files.into_iter().take(2000) {
-                    if !cert_files.contains(&path) {
-                        cert_files.push(path);
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        findings.push(Finding {
+                            detector: "D8".into(),
+                            channel: "d8_error".into(),
+                            path: cert_dir.display().to_string(),
+                            visibility,
+                            severity: Severity::Info,
+                            confidence: 0.0,
+                            hunk: None,
+                            evidence: vec![format!("cannot read dir: {e}")],
+                        });
                     }
-                }
-            }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    findings.push(Finding {
-                        detector: "D8".into(),
-                        channel: "d8_error".into(),
-                        path: cert_dir.display().to_string(),
-                        visibility,
-                        severity: Severity::Info,
-                        confidence: 0.0,
-                        hunk: None,
-                        evidence: vec![format!("cannot read dir: {e}")],
-                    });
                 }
             }
         }
+    } else {
+        findings.push(Finding {
+            detector: "D8".into(),
+            channel: "d8_error".into(),
+            path: root.join("etc/ssl/certs").display().to_string(),
+            visibility,
+            severity: Severity::Info,
+            confidence: 0.0,
+            hunk: None,
+            evidence: vec!["symlink loop or resolution failure".into()],
+        });
     }
 
     let begin_marker = b"-----BEGIN ";
@@ -1260,7 +1259,11 @@ fn check_kernel(
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        let resolved = match resolve_in_root(root, &path) {
+                        let rel_entry = match path.strip_prefix(root) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let resolved = match resolve_in_root(root, rel_entry) {
                             Some(p) => p,
                             None => {
                                 findings.push(Finding {
@@ -1359,7 +1362,11 @@ fn check_kernel(
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    let resolved = match resolve_in_root(root, &path) {
+                    let rel_entry = match path.strip_prefix(root) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let resolved = match resolve_in_root(root, rel_entry) {
                         Some(p) => p,
                         None => {
                             findings.push(Finding {
@@ -1860,7 +1867,11 @@ fn check_dated_logs(
                 if log_files.len() >= 500 {
                     break;
                 }
-                let resolved = match resolve_in_root(root, &path) {
+                let rel_entry = match path.strip_prefix(root) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let resolved = match resolve_in_root(root, rel_entry) {
                     Some(p) => p,
                     None => {
                         findings.push(Finding {
@@ -1889,7 +1900,11 @@ fn check_dated_logs(
                             if log_files.len() >= 500 {
                                 break;
                             }
-                            let sub_resolved = match resolve_in_root(root, &sub_path) {
+                            let rel_sub = match sub_path.strip_prefix(root) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let sub_resolved = match resolve_in_root(root, rel_sub) {
                                 Some(p) => p,
                                 None => {
                                     findings.push(Finding {
@@ -2051,7 +2066,11 @@ fn check_python_build(
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        let resolved = match resolve_in_root(root, &path) {
+                        let rel_entry = match path.strip_prefix(root) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let resolved = match resolve_in_root(root, rel_entry) {
                             Some(p) => p,
                             None => {
                                 findings.push(Finding {

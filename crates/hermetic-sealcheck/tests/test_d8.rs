@@ -5,8 +5,8 @@ use tempfile::tempdir;
 use time::macros::datetime;
 
 use hermetic_sealcheck::d8::{
-    check_d8, parse_kernel_version, parse_python_version, resolve_in_root, CPYTHON_RELEASES,
-    KERNEL_RELEASES, TZDATA_RELEASES, UBUNTU_RELEASES,
+    check_d8, parse_kernel_version, parse_python_version, read_file_capped, read_log_capped,
+    resolve_in_root, CPYTHON_RELEASES, KERNEL_RELEASES, TZDATA_RELEASES, UBUNTU_RELEASES,
 };
 use hermetic_sealcheck::{SealcheckReport, Visibility};
 
@@ -819,4 +819,137 @@ fn test_cli_d8_exit_codes_and_json_shape() {
         .status()
         .expect("run d8 bad arg");
     assert_eq!(status_bad_arg.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_ca_bundle_dir_symlink_loop_still_checks_collected_bundles() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // 1. etc/ssl/certs is a symlink loop
+    let etc = root.join("etc");
+    let ssl = etc.join("ssl");
+    fs::create_dir_all(&ssl).expect("mkdir ssl");
+    let certs_link = ssl.join("certs");
+    std::os::unix::fs::symlink("/etc/ssl/certs", &certs_link).expect("symlink");
+
+    // 2. etc/pki/tls/certs/ca-bundle.crt holds a certificate with notBefore after T_clock
+    let pki_certs = root.join("etc/pki/tls/certs");
+    fs::create_dir_all(&pki_certs).expect("mkdir pki_certs");
+    let pem_future = make_test_cert_pem(Some("240501000000Z"), None, Some("Future CA"));
+    fs::write(pki_certs.join("ca-bundle.crt"), pem_future).expect("write");
+
+    let t_clock = datetime!(2023-01-01 00:00:00 UTC);
+    let findings = check_d8(root, t_clock, Visibility::AgentVisible);
+
+    // Both the d8_error and the ca_bundle finding appear
+    let has_d8_error = findings.iter().any(|f| f.channel == "d8_error");
+    let has_ca_bundle = findings.iter().any(|f| f.channel == "ca_bundle");
+    assert!(
+        has_d8_error,
+        "Expected d8_error for etc/ssl/certs symlink loop"
+    );
+    assert!(
+        has_ca_bundle,
+        "Expected ca_bundle finding from ca-bundle.crt"
+    );
+}
+
+#[test]
+fn test_capped_reader_file_larger_than_cap() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("test.log");
+    let content = b"line 1: some prefix data\nline 2: middle content\nline 3: suffix data\n";
+    fs::write(&file_path, content).expect("write");
+    let file_len = content.len() as u64;
+
+    // Tail branch (file_len > max_bytes: seek, then take)
+    let cap_tail = 25u64;
+    assert!(file_len > cap_tail);
+    let tail_bytes = read_log_capped(&file_path, cap_tail).expect("read_log_capped tail");
+    assert!(
+        tail_bytes.len() <= cap_tail as usize,
+        "Tail branch read {} bytes, expected at most {}",
+        tail_bytes.len(),
+        cap_tail
+    );
+
+    // Full branch (file_len <= max_bytes: take without seek)
+    let cap_full = file_len + 50;
+    let full_bytes = read_log_capped(&file_path, cap_full).expect("read_log_capped full");
+    assert!(
+        full_bytes.len() <= cap_full as usize,
+        "Full branch read {} bytes, expected at most {}",
+        full_bytes.len(),
+        cap_full
+    );
+    assert_eq!(full_bytes, content);
+
+    // Also assert on read_file_capped with file larger than cap
+    let cap_file = 20u64;
+    let file_bytes = read_file_capped(&file_path, cap_file).expect("read_file_capped");
+    assert!(
+        file_bytes.len() <= cap_file as usize,
+        "read_file_capped read {} bytes, expected at most {}",
+        file_bytes.len(),
+        cap_file
+    );
+    assert_eq!(file_bytes.len(), cap_file as usize);
+}
+
+#[test]
+fn test_relative_root_named_etc_and_cli() {
+    let dir = tempdir().expect("tempdir");
+    let rootfs = dir.path().join("etc");
+    let inner_etc = rootfs.join("etc");
+    fs::create_dir_all(&inner_etc).expect("mkdir inner etc");
+
+    let os_release_content = "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\n";
+    fs::write(inner_etc.join("os-release"), os_release_content).expect("write os-release");
+
+    // Call resolve_in_root directly with root = <tempdir>/etc and rel = "etc/os-release",
+    // asserting it returns <tempdir>/etc/etc/os-release
+    let resolved = resolve_in_root(&rootfs, Path::new("etc/os-release"));
+    assert_eq!(
+        resolved,
+        Some(inner_etc.join("os-release")),
+        "resolve_in_root must return <tempdir>/etc/etc/os-release"
+    );
+
+    // Also assert directly with relative root = Path::new("etc")
+    let resolved_rel = resolve_in_root(Path::new("etc"), Path::new("etc/os-release"));
+    assert_eq!(
+        resolved_rel,
+        Some(std::path::PathBuf::from("etc/etc/os-release")),
+        "resolve_in_root must not strip 'etc' from rel when root is relative 'etc'"
+    );
+
+    // CLI test that runs the d8 binary with current_dir(<tempdir>) and --root etc,
+    // asserting the os_release finding from etc/etc/os-release appears
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let output = Command::new(bin_path)
+        .current_dir(dir.path())
+        .arg("d8")
+        .arg("--root")
+        .arg("etc")
+        .arg("--t-clock")
+        .arg("2023-01-01T00:00:00Z")
+        .output()
+        .expect("run d8 CLI with --root etc");
+
+    assert!(
+        output.status.success(),
+        "d8 CLI failed: stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: SealcheckReport =
+        serde_json::from_slice(&output.stdout).expect("parse sealcheck report");
+    assert!(
+        report.findings.iter().any(|f| f.channel == "os_release"),
+        "Expected os_release finding from etc/etc/os-release, findings: {:?}",
+        report.findings
+    );
 }
