@@ -6,7 +6,7 @@ use walkdir::WalkDir;
 use hermetic_common::hash::sha256_hex;
 
 use crate::diff::{parse_patch, DiffLineType, DiffParseError, FilePatch};
-use crate::normalize::{clean_line, normalize_diff_line, normalize_line};
+use crate::normalize::{clean_line, normalize_line};
 use crate::winnow::{kgram_hashes, tokenize, winnow_tokens};
 
 #[derive(Debug, thiserror::Error)]
@@ -213,11 +213,11 @@ impl FingerprintSet {
             for h in &file.hunks {
                 for l in &h.lines {
                     if l.line_type == DiffLineType::Added {
-                        if let Some(norm) = normalize_diff_line(&l.content) {
+                        if let Some(norm) = normalize_line(&l.content) {
                             diff_lines_seq.push(format!("+{}", norm));
                         }
                     } else if l.line_type == DiffLineType::Removed {
-                        if let Some(norm) = normalize_diff_line(&l.content) {
+                        if let Some(norm) = normalize_line(&l.content) {
                             diff_lines_seq.push(format!("-{}", norm));
                         }
                     }
@@ -249,13 +249,13 @@ impl FingerprintSet {
                 for diff_line in &hunk.lines {
                     match diff_line.line_type {
                         DiffLineType::Added => {
-                            if let Some(norm) = normalize_diff_line(&diff_line.content) {
+                            if let Some(norm) = normalize_line(&diff_line.content) {
                                 let hash = sha256_hex(norm.as_bytes());
                                 lines.push((hash, norm));
                             }
                         }
                         DiffLineType::Removed => {
-                            if let Some(norm) = normalize_diff_line(&diff_line.content) {
+                            if let Some(norm) = normalize_line(&diff_line.content) {
                                 let marker = format!("-{}", norm);
                                 let hash = sha256_hex(marker.as_bytes());
                                 removed_markers.push((hash, marker));
@@ -413,7 +413,7 @@ impl FingerprintSet {
                 let mut lines = Vec::new();
                 for diff_line in &hunk.lines {
                     if diff_line.line_type == DiffLineType::Added {
-                        if let Some(norm) = normalize_diff_line(&diff_line.content) {
+                        if let Some(norm) = normalize_line(&diff_line.content) {
                             let hash = sha256_hex(norm.as_bytes());
                             lines.push((hash, norm));
                         }
