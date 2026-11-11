@@ -165,6 +165,18 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
                 text: "Benchmark presence".to_string(),
             },
         },
+        SarifRule {
+            id: "D11".to_string(),
+            short_description: SarifMessage {
+                text: "Test-infrastructure changes in the agent's work".to_string(),
+            },
+        },
+        SarifRule {
+            id: "D12".to_string(),
+            short_description: SarifMessage {
+                text: "Real-date sentinel".to_string(),
+            },
+        },
     ];
 
     SarifLog {
