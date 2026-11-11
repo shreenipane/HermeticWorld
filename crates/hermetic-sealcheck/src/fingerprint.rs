@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -57,19 +57,20 @@ pub struct HunkFingerprints {
     pub winnow_fingerprints: HashSet<u64>,
     /// Binary tier items (identifiers and string literals)
     pub binary_items: Vec<String>,
-    /// Preconverted 64-bit line fingerprints: hash -> (weight, orig_hex_hash)
-    pub line_u64: HashMap<u64, (f64, String)>,
+    /// Preconverted 64-bit line fingerprints: hash -> (weight, orig_hex_hash). Ordered, so
+    /// matching (and so the evidence a finding keeps) is the same on every run.
+    pub line_u64: BTreeMap<u64, (f64, String)>,
     /// Preconverted 64-bit window fingerprints: hash -> (weight, orig_hex_hash)
-    pub window_u64: HashMap<u64, (f64, String)>,
+    pub window_u64: BTreeMap<u64, (f64, String)>,
     /// Preconverted 64-bit removed marker fingerprints: hash -> (weight, orig_hex_hash)
-    pub removed_u64: HashMap<u64, (f64, String)>,
+    pub removed_u64: BTreeMap<u64, (f64, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FingerprintSet {
     pub hunks: Vec<HunkFingerprints>,
     pub diff_shape_hashes: HashSet<String>,
-    pub diff_shape_u64: HashMap<u64, String>,
+    pub diff_shape_u64: BTreeMap<u64, String>,
     pub lines_count: usize,
     pub windows_count: usize,
     pub removed_markers_count: usize,
@@ -677,19 +678,19 @@ impl FingerprintSet {
             total_shapes += diff_shapes_map.len();
             total_winnow += winnow_fingerprints.len();
 
-            let mut line_u64 = HashMap::new();
+            let mut line_u64 = BTreeMap::new();
             for (hash, &w) in &line_fingerprints {
                 if let Some(u) = hex_to_u64(hash) {
                     line_u64.insert(u, (w, hash.clone()));
                 }
             }
-            let mut window_u64 = HashMap::new();
+            let mut window_u64 = BTreeMap::new();
             for (hash, &w) in &window_fingerprints {
                 if let Some(u) = hex_to_u64(hash) {
                     window_u64.insert(u, (w, hash.clone()));
                 }
             }
-            let mut removed_u64 = HashMap::new();
+            let mut removed_u64 = BTreeMap::new();
             for (hash, &w) in &removed_map {
                 if let Some(u) = hex_to_u64(hash) {
                     removed_u64.insert(u, (w, hash.clone()));
@@ -714,7 +715,7 @@ impl FingerprintSet {
             });
         }
 
-        let mut diff_shape_u64 = HashMap::new();
+        let mut diff_shape_u64 = BTreeMap::new();
         for hash in &all_diff_shapes {
             if let Some(u) = hex_to_u64(hash) {
                 diff_shape_u64.insert(u, hash.clone());

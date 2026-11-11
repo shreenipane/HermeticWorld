@@ -10,6 +10,7 @@ pub mod d6;
 pub mod diff;
 pub mod fingerprint;
 pub mod gitstore;
+pub mod index;
 pub mod normalize;
 pub mod sarif;
 pub mod scan;
@@ -38,9 +39,15 @@ pub use gitstore::{
     apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,
     ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
 };
+pub use index::{
+    query_index, write_index, IndexError, IndexReader, IndexRecord, IndexStats, NOT_COVERED,
+};
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use sarif::{generate_sarif, SarifLog};
-pub use scan::{scan_problem_statement, scan_tree, Finding, ScanOptions, Severity, Visibility};
+pub use scan::{
+    compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
+    ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
+};
 pub use winnow::{
     hash_kgram, kgram_hashes, tokenize, winnow_hashes, winnow_tokens, Token, WinnowFingerprint,
 };
@@ -65,4 +72,10 @@ pub struct SealcheckReport {
     pub fingerprints: FingerprintSummary,
     pub findings: Vec<Finding>,
     pub gate: bool,
+    /// `"query"` for a report answered from layer indexes; absent for a full scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Detectors a query report could not answer from its indexes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_covered: Vec<String>,
 }

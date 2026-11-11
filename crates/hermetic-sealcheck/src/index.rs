@@ -1,0 +1,970 @@
+//! Layer index and per-task query (TR-SC-10).
+//!
+//! `index` walks a tree once, exactly as `scan_tree` does, and records each unit's
+//! task-independent facts. `query` matches one task's fingerprints against those records
+//! without reading the tree again.
+//!
+//! # File format (version 1)
+//!
+//! The file is one zstd stream. Decompressed, it holds:
+//!
+//! ```text
+//! magic        6 bytes   "HWIDX1"
+//! version      u32       1
+//! root         str       the indexed root, as `scan` would display it
+//! count        u64       number of records
+//! record*      count times:
+//!     len      u64       payload length (at most MAX_RECORD_BYTES)
+//!     payload  len bytes: tag u8, then the fields below
+//! ```
+//!
+//! Integers are little-endian. `str` is a u32 byte length then UTF-8. `path` is a u8 kind
+//! (0: relative, so the full path is `root` + the string; 1: absolute) then a `str`.
+//! `set` is a u64 count then that many u64s, sorted ascending. `opt<T>` is a u8 (0 or 1)
+//! then `T` when 1.
+//!
+//! | tag | record    | fields |
+//! |-----|-----------|--------|
+//! | 1   | file      | path, size u64, mtime seconds i64, mtime nanos u32, mode u32 |
+//! | 2   | fixed     | path, detector str, channel str, severity u8, confidence f64, hunk opt<u64>, evidence (u32 count, str*) |
+//! | 3   | path      | path |
+//! | 4   | text      | path, D9 flags u8, line set, window set, removed-marker set, diff-shape set, winnow set |
+//! | 5   | binary    | path, channel str, exact set, token set |
+//! | 6   | pkg       | path, name str, version opt<str> |
+//!
+//! `fixed` holds a finding that depends on the unit alone (errors, bombs, skipped
+//! binaries); its visibility comes from the query. Text hashes are the first 8 bytes of
+//! each sha256 (`sha256_u64`); winnow hashes are already 64-bit. D9 flags are those of
+//! `d9_builtin_content_flags`.
+//!
+//! Binary strings are stored hashed: `exact` holds every exact string and every whole
+//! printable run, `token` the `[A-Za-z0-9_]+` pieces of the runs. **Limit:** a binary item
+//! holding a character outside `[A-Za-z0-9_]` matches only a whole stored string, not a
+//! substring of a printable run, as `scan` would allow.
+//!
+//! # Not covered by a query
+//!
+//! D1 (git stores), D3 (`.pyc` headers against source), D6 (OCI metadata), the D9
+//! instance-id check and external signatures need the live tree or the task's identity.
+//! A query report says so in `not_covered`.
+//!
+//! # Reading hostile files
+//!
+//! The reader never trusts a length or count: no buffer is sized from one, every count is
+//! capped by the bytes left in its record, a short read is `Truncated`, and bytes after the
+//! last record are rejected.
+
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use crate::benchmark::{
+    check_d9_path_builtin, d9_builtin_content_findings, d9_builtin_content_flags,
+};
+use crate::binary::{match_hashed_binary_items, BinaryStrings, HashedBinaryStrings};
+use crate::containers::UnitSink;
+use crate::d5a::{check_d5a_name_and_version, is_pkg_metadata_file, parse_pkg_metadata};
+use crate::fingerprint::FingerprintSet;
+use crate::scan::{
+    compute_unit_hashes, match_unit_hashes, walk_tree, Finding, ScanOptions, Severity, TreeSink,
+    UnitHashes,
+};
+
+pub const MAGIC: &[u8; 6] = b"HWIDX1";
+pub const FORMAT_VERSION: u32 = 1;
+/// The largest record payload the reader accepts.
+pub const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// The longest root path the reader accepts.
+pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
+
+/// Detectors a query can't answer from an index.
+pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external"];
+
+const TAG_FILE: u8 = 1;
+const TAG_FIXED: u8 = 2;
+const TAG_PATH: u8 = 3;
+const TAG_TEXT: u8 = 4;
+const TAG_BINARY: u8 = 5;
+const TAG_PKG: u8 = 6;
+
+#[derive(Debug, thiserror::Error)]
+pub enum IndexError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("not a sealcheck index (bad magic)")]
+    BadMagic,
+    #[error("unsupported index format version {0}")]
+    UnsupportedVersion(u32),
+    #[error("index truncated: {0}")]
+    Truncated(String),
+    #[error("malformed index: {0}")]
+    Malformed(String),
+    #[error("index root is not valid UTF-8: {0}")]
+    NonUtf8Root(PathBuf),
+}
+
+/// A unit path: relative to the index root (the full path is `root + rel`), or absolute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexPath {
+    Rel(String),
+    Abs(String),
+}
+
+impl IndexPath {
+    fn from_display(root: &str, display: &str) -> Self {
+        match display.strip_prefix(root) {
+            Some(rel) if !root.is_empty() => IndexPath::Rel(rel.to_string()),
+            _ => IndexPath::Abs(display.to_string()),
+        }
+    }
+
+    /// The path as `scan` reports it.
+    pub fn display(&self, root: &str) -> String {
+        match self {
+            IndexPath::Rel(rel) => format!("{root}{rel}"),
+            IndexPath::Abs(abs) => abs.clone(),
+        }
+    }
+}
+
+/// A finding that depends on the unit alone. Visibility is applied at query time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFinding {
+    pub detector: String,
+    pub channel: String,
+    pub path: IndexPath,
+    pub severity: Severity,
+    pub confidence: f64,
+    pub hunk: Option<u64>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexRecord {
+    File {
+        path: IndexPath,
+        size: u64,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        mode: u32,
+    },
+    Fixed(StoredFinding),
+    Path {
+        path: IndexPath,
+    },
+    Text {
+        path: IndexPath,
+        d9_flags: u8,
+        hashes: UnitHashes,
+    },
+    Binary {
+        path: IndexPath,
+        channel: String,
+        strings: HashedBinaryStrings,
+    },
+    Pkg {
+        path: IndexPath,
+        name: String,
+        version: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------------------
+// Building records
+// ---------------------------------------------------------------------------------------
+
+/// The `TreeSink` that turns every unit the walk reaches into an `IndexRecord`.
+pub struct IndexSink<F: FnMut(IndexRecord)> {
+    root: String,
+    emit: F,
+}
+
+impl<F: FnMut(IndexRecord)> IndexSink<F> {
+    pub fn new(root: String, emit: F) -> Self {
+        Self { root, emit }
+    }
+
+    fn ipath(&self, display: &str) -> IndexPath {
+        IndexPath::from_display(&self.root, display)
+    }
+}
+
+impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
+    fn fixed(&mut self, finding: Finding) {
+        let path = self.ipath(&finding.path);
+        (self.emit)(IndexRecord::Fixed(StoredFinding {
+            detector: finding.detector,
+            channel: finding.channel,
+            path,
+            severity: finding.severity,
+            confidence: finding.confidence,
+            hunk: finding.hunk.map(|h| h as u64),
+            evidence: finding.evidence,
+        }));
+    }
+
+    fn path(&mut self, _match_path: &str, display_path: &str) {
+        let path = self.ipath(display_path);
+        (self.emit)(IndexRecord::Path { path });
+    }
+
+    fn text(&mut self, path: &str, text: &str) {
+        let record = IndexRecord::Text {
+            path: self.ipath(path),
+            d9_flags: d9_builtin_content_flags(path, text),
+            hashes: compute_unit_hashes(text),
+        };
+        (self.emit)(record);
+    }
+
+    fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
+        let record = IndexRecord::Binary {
+            path: self.ipath(path),
+            channel: channel.to_string(),
+            strings: HashedBinaryStrings::from_strings(&strings),
+        };
+        (self.emit)(record);
+    }
+
+    fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
+        if !is_pkg_metadata_file(Path::new(path)) {
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        if let (Some(name), version) = parse_pkg_metadata(&text) {
+            let record = IndexRecord::Pkg {
+                path: self.ipath(path),
+                name,
+                version,
+            };
+            (self.emit)(record);
+        }
+    }
+}
+
+impl<F: FnMut(IndexRecord)> TreeSink for IndexSink<F> {
+    fn git_repo(&mut self, _dir: &Path) {}
+    fn d1_finding(&mut self, _finding: Finding) {}
+    fn pyc_file(&mut self, _path: &Path, _display_path: &str) {}
+
+    fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        let (mtime_secs, mtime_nanos) = match metadata.modified() {
+            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => (
+                    i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                    d.subsec_nanos(),
+                ),
+                Err(e) => {
+                    let d = e.duration();
+                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+                    if d.subsec_nanos() == 0 {
+                        (-secs, 0)
+                    } else {
+                        (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+                    }
+                }
+            },
+            Err(_) => (0, 0),
+        };
+        let record = IndexRecord::File {
+            path: self.ipath(display_path),
+            size: metadata.len(),
+            mtime_secs,
+            mtime_nanos,
+            mode: file_mode(metadata),
+        };
+        (self.emit)(record);
+    }
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn file_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// The options an index walk uses: the default limits, with no task.
+pub fn index_scan_options() -> ScanOptions {
+    ScanOptions::default()
+}
+
+/// Walk `root` and collect its records in memory.
+pub fn collect_records(root: &Path) -> Vec<IndexRecord> {
+    let root_str = root.display().to_string();
+    let mut records = Vec::new();
+    let opts = index_scan_options();
+    walk_tree(root, &opts, IndexSink::new(root_str, |r| records.push(r)));
+    records
+}
+
+/// Statistics from building an index.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexStats {
+    pub records: u64,
+    pub files: u64,
+}
+
+/// Index `root` into the file `out`. The file is written to a temporary name beside `out`
+/// and renamed into place, so a failed run never leaves a partial index.
+pub fn write_index(root: &Path, out: &Path) -> Result<IndexStats, IndexError> {
+    let root_str = root
+        .to_str()
+        .map(|_| root.display().to_string())
+        .ok_or_else(|| IndexError::NonUtf8Root(root.to_path_buf()))?;
+    let dir = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+
+    // Records go to a scratch file first: the header's count is known only at the end.
+    let mut scratch = tempfile::tempfile_in(&dir)?;
+    let mut stats = IndexStats::default();
+    let mut write_err: Option<io::Error> = None;
+    {
+        let mut w = BufWriter::new(&mut scratch);
+        let mut payload = Vec::new();
+        let opts = index_scan_options();
+        walk_tree(
+            root,
+            &opts,
+            IndexSink::new(root_str.clone(), |r| {
+                if write_err.is_some() {
+                    return;
+                }
+                if matches!(r, IndexRecord::File { .. }) {
+                    stats.files += 1;
+                }
+                payload.clear();
+                encode_record(&r, &mut payload);
+                let res = w
+                    .write_all(&(payload.len() as u64).to_le_bytes())
+                    .and_then(|_| w.write_all(&payload));
+                match res {
+                    Ok(()) => stats.records += 1,
+                    Err(e) => write_err = Some(e),
+                }
+            }),
+        );
+        if let Some(e) = write_err {
+            return Err(e.into());
+        }
+        w.flush()?;
+    }
+    scratch.seek(SeekFrom::Start(0))?;
+
+    let tmp_out = tempfile::NamedTempFile::new_in(&dir)?;
+    {
+        let mut enc = zstd::stream::write::Encoder::new(BufWriter::new(tmp_out.as_file()), 3)?;
+        // A checksum makes a corrupted frame an error, not silently different records.
+        enc.include_checksum(true)?;
+        let mut header = Vec::new();
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        put_str(&mut header, &root_str);
+        header.extend_from_slice(&stats.records.to_le_bytes());
+        enc.write_all(&header)?;
+        io::copy(&mut BufReader::new(&mut scratch), &mut enc)?;
+        let mut inner = enc.finish()?;
+        inner.flush()?;
+    }
+    tmp_out.persist(out).map_err(|e| IndexError::Io(e.error))?;
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------------------
+
+fn put_u8(b: &mut Vec<u8>, v: u8) {
+    b.push(v);
+}
+fn put_u32(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u64(b: &mut Vec<u8>, v: u64) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+fn put_str(b: &mut Vec<u8>, s: &str) {
+    // Unit text and paths come from members capped far below 4 GiB, but never wrap.
+    let bytes = s.as_bytes();
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    put_u32(b, len);
+    b.extend_from_slice(&bytes[..len as usize]);
+}
+fn put_opt_str(b: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            put_u8(b, 1);
+            put_str(b, s);
+        }
+        None => put_u8(b, 0),
+    }
+}
+fn put_path(b: &mut Vec<u8>, p: &IndexPath) {
+    match p {
+        IndexPath::Rel(s) => {
+            put_u8(b, 0);
+            put_str(b, s);
+        }
+        IndexPath::Abs(s) => {
+            put_u8(b, 1);
+            put_str(b, s);
+        }
+    }
+}
+fn put_set(b: &mut Vec<u8>, set: &HashSet<u64>) {
+    let mut v: Vec<u64> = set.iter().copied().collect();
+    v.sort_unstable();
+    put_u64(b, v.len() as u64);
+    for h in v {
+        put_u64(b, h);
+    }
+}
+fn severity_code(s: Severity) -> u8 {
+    match s {
+        Severity::Gate => 0,
+        Severity::Review => 1,
+        Severity::Info => 2,
+    }
+}
+
+/// Encode one record's payload (tag and fields, without the length prefix).
+pub fn encode_record(r: &IndexRecord, b: &mut Vec<u8>) {
+    match r {
+        IndexRecord::File {
+            path,
+            size,
+            mtime_secs,
+            mtime_nanos,
+            mode,
+        } => {
+            put_u8(b, TAG_FILE);
+            put_path(b, path);
+            put_u64(b, *size);
+            b.extend_from_slice(&mtime_secs.to_le_bytes());
+            put_u32(b, *mtime_nanos);
+            put_u32(b, *mode);
+        }
+        IndexRecord::Fixed(f) => {
+            put_u8(b, TAG_FIXED);
+            put_path(b, &f.path);
+            put_str(b, &f.detector);
+            put_str(b, &f.channel);
+            put_u8(b, severity_code(f.severity));
+            b.extend_from_slice(&f.confidence.to_le_bytes());
+            match f.hunk {
+                Some(h) => {
+                    put_u8(b, 1);
+                    put_u64(b, h);
+                }
+                None => put_u8(b, 0),
+            }
+            let n = u32::try_from(f.evidence.len()).unwrap_or(u32::MAX);
+            put_u32(b, n);
+            for e in f.evidence.iter().take(n as usize) {
+                put_str(b, e);
+            }
+        }
+        IndexRecord::Path { path } => {
+            put_u8(b, TAG_PATH);
+            put_path(b, path);
+        }
+        IndexRecord::Text {
+            path,
+            d9_flags,
+            hashes,
+        } => {
+            put_u8(b, TAG_TEXT);
+            put_path(b, path);
+            put_u8(b, *d9_flags);
+            put_set(b, &hashes.line_hashes);
+            put_set(b, &hashes.window_hashes);
+            put_set(b, &hashes.removed_marker_hashes);
+            put_set(b, &hashes.diff_shape_hashes);
+            put_set(b, &hashes.winnow_hashes);
+        }
+        IndexRecord::Binary {
+            path,
+            channel,
+            strings,
+        } => {
+            put_u8(b, TAG_BINARY);
+            put_path(b, path);
+            put_str(b, channel);
+            put_set(b, &strings.exact);
+            put_set(b, &strings.tokens);
+        }
+        IndexRecord::Pkg {
+            path,
+            name,
+            version,
+        } => {
+            put_u8(b, TAG_PKG);
+            put_path(b, path);
+            put_str(b, name);
+            put_opt_str(b, version.as_deref());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------------------
+
+/// A bounds-checked cursor over one record's payload.
+struct Cur<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn remaining(&self) -> usize {
+        self.b.len() - self.pos
+    }
+    fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8], IndexError> {
+        if n > self.remaining() {
+            return Err(IndexError::Malformed(format!(
+                "{what}: needs {n} bytes, record has {} left",
+                self.remaining()
+            )));
+        }
+        let s = &self.b[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn u8(&mut self, what: &str) -> Result<u8, IndexError> {
+        Ok(self.take(1, what)?[0])
+    }
+    fn u32(&mut self, what: &str) -> Result<u32, IndexError> {
+        let s = self.take(4, what)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn arr8(&mut self, what: &str) -> Result<[u8; 8], IndexError> {
+        let s = self.take(8, what)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Ok(a)
+    }
+    fn u64(&mut self, what: &str) -> Result<u64, IndexError> {
+        Ok(u64::from_le_bytes(self.arr8(what)?))
+    }
+    fn i64(&mut self, what: &str) -> Result<i64, IndexError> {
+        Ok(i64::from_le_bytes(self.arr8(what)?))
+    }
+    fn f64(&mut self, what: &str) -> Result<f64, IndexError> {
+        Ok(f64::from_le_bytes(self.arr8(what)?))
+    }
+    fn str(&mut self, what: &str) -> Result<String, IndexError> {
+        let len = self.u32(what)? as usize;
+        let s = self.take(len, what)?;
+        String::from_utf8(s.to_vec())
+            .map_err(|_| IndexError::Malformed(format!("{what}: not UTF-8")))
+    }
+    fn flag(&mut self, what: &str) -> Result<bool, IndexError> {
+        match self.u8(what)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            v => Err(IndexError::Malformed(format!("{what}: bad flag {v}"))),
+        }
+    }
+    fn path(&mut self) -> Result<IndexPath, IndexError> {
+        let abs = self.flag("path kind")?;
+        let s = self.str("path")?;
+        Ok(if abs {
+            IndexPath::Abs(s)
+        } else {
+            IndexPath::Rel(s)
+        })
+    }
+    fn set(&mut self, what: &str) -> Result<HashSet<u64>, IndexError> {
+        let n = self.u64(what)?;
+        // Cap the count by the bytes left before allocating anything.
+        if n > (self.remaining() / 8) as u64 {
+            return Err(IndexError::Malformed(format!(
+                "{what}: count {n} exceeds the {} bytes left",
+                self.remaining()
+            )));
+        }
+        let n = n as usize;
+        let mut set = HashSet::with_capacity(n);
+        for _ in 0..n {
+            set.insert(self.u64(what)?);
+        }
+        Ok(set)
+    }
+}
+
+/// Decode one record's payload. The whole payload must be used.
+pub fn decode_record(payload: &[u8]) -> Result<IndexRecord, IndexError> {
+    let mut c = Cur { b: payload, pos: 0 };
+    let tag = c.u8("record tag")?;
+    let rec = match tag {
+        TAG_FILE => IndexRecord::File {
+            path: c.path()?,
+            size: c.u64("file size")?,
+            mtime_secs: c.i64("mtime")?,
+            mtime_nanos: {
+                let n = c.u32("mtime nanos")?;
+                if n >= 1_000_000_000 {
+                    return Err(IndexError::Malformed(format!(
+                        "mtime nanos {n} out of range"
+                    )));
+                }
+                n
+            },
+            mode: c.u32("mode")?,
+        },
+        TAG_FIXED => {
+            let path = c.path()?;
+            let detector = c.str("detector")?;
+            let channel = c.str("channel")?;
+            let severity = match c.u8("severity")? {
+                0 => Severity::Gate,
+                1 => Severity::Review,
+                2 => Severity::Info,
+                v => return Err(IndexError::Malformed(format!("bad severity {v}"))),
+            };
+            let confidence = c.f64("confidence")?;
+            let hunk = if c.flag("hunk flag")? {
+                Some(c.u64("hunk")?)
+            } else {
+                None
+            };
+            let n = c.u32("evidence count")?;
+            // Each evidence string takes at least its 4-byte length.
+            if n as usize > c.remaining() / 4 {
+                return Err(IndexError::Malformed(format!(
+                    "evidence count {n} exceeds the bytes left"
+                )));
+            }
+            let mut evidence = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                evidence.push(c.str("evidence")?);
+            }
+            IndexRecord::Fixed(StoredFinding {
+                detector,
+                channel,
+                path,
+                severity,
+                confidence,
+                hunk,
+                evidence,
+            })
+        }
+        TAG_PATH => IndexRecord::Path { path: c.path()? },
+        TAG_TEXT => IndexRecord::Text {
+            path: c.path()?,
+            d9_flags: c.u8("d9 flags")?,
+            hashes: UnitHashes {
+                line_hashes: c.set("line hashes")?,
+                window_hashes: c.set("window hashes")?,
+                removed_marker_hashes: c.set("removed-marker hashes")?,
+                diff_shape_hashes: c.set("diff-shape hashes")?,
+                winnow_hashes: c.set("winnow hashes")?,
+            },
+        },
+        TAG_BINARY => IndexRecord::Binary {
+            path: c.path()?,
+            channel: c.str("binary channel")?,
+            strings: HashedBinaryStrings {
+                exact: c.set("exact strings")?,
+                tokens: c.set("run tokens")?,
+            },
+        },
+        TAG_PKG => {
+            let path = c.path()?;
+            let name = c.str("package name")?;
+            let version = if c.flag("version flag")? {
+                Some(c.str("package version")?)
+            } else {
+                None
+            };
+            IndexRecord::Pkg {
+                path,
+                name,
+                version,
+            }
+        }
+        t => return Err(IndexError::Malformed(format!("unknown record tag {t}"))),
+    };
+    if c.remaining() != 0 {
+        return Err(IndexError::Malformed(format!(
+            "{} trailing bytes in record",
+            c.remaining()
+        )));
+    }
+    Ok(rec)
+}
+
+/// Read exactly `n` bytes, or report what was being read as truncated.
+fn read_exact_or_truncated<R: Read>(
+    r: &mut R,
+    buf: &mut [u8],
+    what: &str,
+) -> Result<(), IndexError> {
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => IndexError::Truncated(what.to_string()),
+        _ => IndexError::Io(e),
+    })
+}
+
+/// Streams the records of one index file.
+pub struct IndexReader<R: Read> {
+    inner: R,
+    root: String,
+    count: u64,
+    read: u64,
+    finished: bool,
+}
+
+impl IndexReader<zstd::stream::read::Decoder<'static, BufReader<File>>> {
+    pub fn open(path: &Path) -> Result<Self, IndexError> {
+        let f = File::open(path)?;
+        let dec = zstd::stream::read::Decoder::new(f)?;
+        Self::new(dec)
+    }
+}
+
+impl<R: Read> IndexReader<R> {
+    /// Read the header from a decompressed stream.
+    pub fn new(mut inner: R) -> Result<Self, IndexError> {
+        let mut magic = [0u8; 6];
+        read_exact_or_truncated(&mut inner, &mut magic, "magic")?;
+        if &magic != MAGIC {
+            return Err(IndexError::BadMagic);
+        }
+        let mut b4 = [0u8; 4];
+        read_exact_or_truncated(&mut inner, &mut b4, "version")?;
+        let version = u32::from_le_bytes(b4);
+        if version != FORMAT_VERSION {
+            return Err(IndexError::UnsupportedVersion(version));
+        }
+        read_exact_or_truncated(&mut inner, &mut b4, "root length")?;
+        let root_len = u32::from_le_bytes(b4);
+        if root_len > MAX_ROOT_BYTES {
+            return Err(IndexError::Malformed(format!(
+                "root length {root_len} over the {MAX_ROOT_BYTES}-byte limit"
+            )));
+        }
+        let mut root = vec![0u8; root_len as usize];
+        read_exact_or_truncated(&mut inner, &mut root, "root")?;
+        let root = String::from_utf8(root)
+            .map_err(|_| IndexError::Malformed("root is not UTF-8".into()))?;
+        let mut b8 = [0u8; 8];
+        read_exact_or_truncated(&mut inner, &mut b8, "record count")?;
+        let count = u64::from_le_bytes(b8);
+        Ok(Self {
+            inner,
+            root,
+            count,
+            read: 0,
+            finished: false,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The next record, `None` after the last one. A count larger than the records present
+    /// is `Truncated`; bytes after the last record are `Malformed`.
+    pub fn next_record(&mut self) -> Result<Option<IndexRecord>, IndexError> {
+        if self.finished {
+            return Ok(None);
+        }
+        if self.read == self.count {
+            let mut probe = [0u8; 1];
+            loop {
+                match self.inner.read(&mut probe) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        return Err(IndexError::Malformed("data after the last record".into()))
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(IndexError::Io(e)),
+                }
+            }
+            self.finished = true;
+            return Ok(None);
+        }
+        let what = format!("record {} of {}", self.read + 1, self.count);
+        let mut b8 = [0u8; 8];
+        read_exact_or_truncated(&mut self.inner, &mut b8, &what)?;
+        let len = u64::from_le_bytes(b8);
+        if len > MAX_RECORD_BYTES {
+            return Err(IndexError::Malformed(format!(
+                "{what}: length {len} over the {MAX_RECORD_BYTES}-byte limit"
+            )));
+        }
+        // Grow only as bytes arrive: a hostile length can't force a large allocation.
+        let mut payload = Vec::new();
+        (&mut self.inner).take(len).read_to_end(&mut payload)?;
+        if payload.len() as u64 != len {
+            return Err(IndexError::Truncated(format!(
+                "{what}: length {len} runs past the end ({} bytes present)",
+                payload.len()
+            )));
+        }
+        let rec = decode_record(&payload)?;
+        self.read += 1;
+        Ok(Some(rec))
+    }
+
+    /// Read every remaining record.
+    pub fn read_all(&mut self) -> Result<Vec<IndexRecord>, IndexError> {
+        let mut out = Vec::new();
+        while let Some(r) = self.next_record()? {
+            out.push(r);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------------------
+
+/// Whether `display` lies inside one of the excluded directories, judged by path text.
+/// `canon_root` is the canonical form of the index root, when it still exists.
+fn is_excluded(
+    path: &IndexPath,
+    root: &str,
+    canon_root: Option<&str>,
+    exclude: &[PathBuf],
+) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    let full = match (path, canon_root) {
+        (IndexPath::Rel(rel), Some(c)) => format!("{c}{rel}"),
+        _ => path.display(root),
+    };
+    exclude.iter().any(|d| {
+        let d = d.display().to_string();
+        full == d
+            || full
+                .strip_prefix(&d)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+    })
+}
+
+/// Match one record against a task, appending its findings.
+pub fn query_record(
+    rec: &IndexRecord,
+    root: &str,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+    findings: &mut Vec<Finding>,
+) {
+    match rec {
+        IndexRecord::File { .. } => {}
+        IndexRecord::Fixed(f) => findings.push(Finding {
+            detector: f.detector.clone(),
+            channel: f.channel.clone(),
+            path: f.path.display(root),
+            visibility: opts.visibility,
+            severity: f.severity,
+            confidence: f.confidence,
+            hunk: f.hunk.and_then(|h| usize::try_from(h).ok()),
+            evidence: f.evidence.clone(),
+        }),
+        IndexRecord::Path { path } => {
+            let display = path.display(root);
+            let match_path = match display.get(root.len()..) {
+                Some(rel) if !rel.is_empty() => rel.trim_start_matches(['/', '\\']),
+                _ => display.as_str(),
+            };
+            findings.extend(check_d9_path_builtin(match_path, &display, opts.visibility));
+        }
+        IndexRecord::Text {
+            path,
+            d9_flags,
+            hashes,
+        } => {
+            let display = path.display(root);
+            findings.extend(d9_builtin_content_findings(
+                &display,
+                *d9_flags,
+                opts.visibility,
+            ));
+            findings.extend(match_unit_hashes(hashes, fp, opts, "D2", "file", &display));
+        }
+        IndexRecord::Binary {
+            path,
+            channel,
+            strings,
+        } => {
+            let display = path.display(root);
+            findings.extend(match_hashed_binary_items(
+                strings, fp, opts, channel, &display,
+            ));
+        }
+        IndexRecord::Pkg {
+            path,
+            name,
+            version,
+        } => {
+            let display = path.display(root);
+            findings.extend(check_d5a_name_and_version(
+                name,
+                version.as_deref(),
+                &display,
+                opts,
+            ));
+        }
+    }
+}
+
+/// Match a task against every record of one index file. `opts.visibility` is the
+/// visibility of the indexed root; `opts.exclude_dirs` are skipped as `scan` skips them.
+pub fn query_index(
+    index: &Path,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+) -> Result<Vec<Finding>, IndexError> {
+    let mut reader = IndexReader::open(index)?;
+    query_reader(&mut reader, fp, opts)
+}
+
+/// `query_index` over an already opened reader.
+pub fn query_reader<R: Read>(
+    reader: &mut IndexReader<R>,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+) -> Result<Vec<Finding>, IndexError> {
+    let root = reader.root().to_string();
+    let canon_root = if opts.exclude_dirs.is_empty() {
+        None
+    } else {
+        Path::new(&root)
+            .canonicalize()
+            .ok()
+            .map(|p| p.display().to_string())
+    };
+    let mut findings = Vec::new();
+    while let Some(rec) = reader.next_record()? {
+        let path = match &rec {
+            IndexRecord::File { path, .. }
+            | IndexRecord::Path { path }
+            | IndexRecord::Text { path, .. }
+            | IndexRecord::Binary { path, .. }
+            | IndexRecord::Pkg { path, .. } => path,
+            IndexRecord::Fixed(f) => &f.path,
+        };
+        if is_excluded(path, &root, canon_root.as_deref(), &opts.exclude_dirs) {
+            continue;
+        }
+        query_record(&rec, &root, fp, opts, &mut findings);
+    }
+    Ok(findings)
+}

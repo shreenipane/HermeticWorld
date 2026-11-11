@@ -869,6 +869,18 @@ pub fn extract_pyc_strings(body: &[u8]) -> HashSet<String> {
     out
 }
 
+/// The binary-tier strings of a `.pyc`: its marshal strings, matched exactly.
+pub fn pyc_binary_strings(bytes: &[u8]) -> BinaryStrings {
+    let header = crate::bytecode::pyc_magic(bytes)
+        .map(crate::bytecode::pyc_header_len)
+        .unwrap_or(0);
+    let body = bytes.get(header..).unwrap_or(&[]);
+    BinaryStrings {
+        exact_strings: extract_pyc_strings(body),
+        printable_runs: Vec::new(),
+    }
+}
+
 /// D3b over a `.pyc` (channel `binary_pyc`): the binary tier on its marshal strings.
 pub fn scan_pyc_strings(
     path: &str,
@@ -876,15 +888,60 @@ pub fn scan_pyc_strings(
     fp: &FingerprintSet,
     opts: &ScanOptions,
 ) -> Vec<Finding> {
-    let header = crate::bytecode::pyc_magic(bytes)
-        .map(crate::bytecode::pyc_header_len)
-        .unwrap_or(0);
-    let body = bytes.get(header..).unwrap_or(&[]);
-    let extracted = BinaryStrings {
-        exact_strings: extract_pyc_strings(body),
-        printable_runs: Vec::new(),
-    };
-    match_binary_items(&extracted, fp, opts, "binary_pyc", path)
+    match_binary_items(&pyc_binary_strings(bytes), fp, opts, "binary_pyc", path)
+}
+
+/// A recognised binary (ELF, Java class, Mach-O universal, wasm): its D3b channel and its
+/// parsed strings. `None` when `bytes` is none of these formats.
+pub fn recognize_binary(
+    bytes: &[u8],
+) -> Option<(&'static str, Result<BinaryStrings, BinaryMalformed>)> {
+    if bytes.starts_with(b"\x7fELF") {
+        Some(("binary_elf", parse_elf(bytes)))
+    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) && is_java_class(bytes) {
+        Some(("binary_class", parse_class(bytes)))
+    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) {
+        // Same magic as a class file: a Mach-O universal binary. Search its strings.
+        Some((
+            "binary_macho",
+            Ok(BinaryStrings {
+                exact_strings: HashSet::new(),
+                printable_runs: extract_printable_runs(bytes, 6),
+            }),
+        ))
+    } else if bytes.starts_with(b"\0asm") {
+        Some(("binary_wasm", parse_wasm(bytes)))
+    } else {
+        None
+    }
+}
+
+/// The info finding for a malformed binary. Its strings are still searched, through
+/// `malformed_fallback_strings`.
+pub fn malformed_binary_finding(
+    path: &str,
+    channel: &str,
+    err: &str,
+    opts: &ScanOptions,
+) -> Finding {
+    Finding {
+        detector: "D3b".into(),
+        channel: "binary_malformed".into(),
+        path: path.to_string(),
+        visibility: opts.visibility,
+        severity: Severity::Info,
+        confidence: 0.0,
+        hunk: None,
+        evidence: vec![format!("malformed {}: {}", channel, err)],
+    }
+}
+
+/// A corrupted header must not hide the file's strings: search its printable runs.
+pub fn malformed_fallback_strings(bytes: &[u8]) -> BinaryStrings {
+    BinaryStrings {
+        exact_strings: HashSet::new(),
+        printable_runs: extract_printable_runs(bytes, 6),
+    }
 }
 
 /// If `bytes` is a recognised binary (ELF, Class, wasm), parse and scan it for D3b.
@@ -895,47 +952,103 @@ pub fn scan_binary_if_recognized(
     fp: &FingerprintSet,
     opts: &ScanOptions,
 ) -> Option<Vec<Finding>> {
-    let (channel, res) = if bytes.starts_with(b"\x7fELF") {
-        ("binary_elf", parse_elf(bytes))
-    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) && is_java_class(bytes) {
-        ("binary_class", parse_class(bytes))
-    } else if bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) {
-        // Same magic as a class file: a Mach-O universal binary. Search its strings.
-        (
-            "binary_macho",
-            Ok(BinaryStrings {
-                exact_strings: HashSet::new(),
-                printable_runs: extract_printable_runs(bytes, 6),
-            }),
-        )
-    } else if bytes.starts_with(b"\0asm") {
-        ("binary_wasm", parse_wasm(bytes))
-    } else {
-        return None;
-    };
-
+    let (channel, res) = recognize_binary(bytes)?;
     match res {
         Ok(extracted) => Some(match_binary_items(&extracted, fp, opts, channel, path)),
         Err(BinaryMalformed(err)) => {
-            let mut findings = vec![Finding {
-                detector: "D3b".into(),
-                channel: "binary_malformed".into(),
-                path: path.to_string(),
-                visibility: opts.visibility,
-                severity: Severity::Info,
-                confidence: 0.0,
-                hunk: None,
-                evidence: vec![format!("malformed {}: {}", channel, err)],
-            }];
-            // A corrupted header must not hide the file's strings.
-            let fallback = BinaryStrings {
-                exact_strings: HashSet::new(),
-                printable_runs: extract_printable_runs(bytes, 6),
-            };
-            findings.extend(match_binary_items(&fallback, fp, opts, channel, path));
+            let mut findings = vec![malformed_binary_finding(path, channel, &err, opts)];
+            findings.extend(match_binary_items(
+                &malformed_fallback_strings(bytes),
+                fp,
+                opts,
+                channel,
+                path,
+            ));
             Some(findings)
         }
     }
+}
+
+/// True when every character of `s` is in `[A-Za-z0-9_]`, the characters that bound a
+/// whole-token match inside a printable run.
+pub fn is_word_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The maximal `[A-Za-z0-9_]+` pieces of a printable run. An item made only of those
+/// characters matches the run as a whole token exactly when it equals one of these pieces.
+pub fn word_tokens(run: &str) -> impl Iterator<Item = &str> {
+    run.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+}
+
+/// Binary-tier strings reduced to 64-bit hashes, as stored in a layer index.
+///
+/// `exact` holds every exact string and every whole printable run; `tokens` holds the
+/// `[A-Za-z0-9_]+` pieces of the runs. An item that holds any other character can only
+/// match a whole stored string, not a substring of a run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HashedBinaryStrings {
+    pub exact: HashSet<u64>,
+    pub tokens: HashSet<u64>,
+}
+
+impl HashedBinaryStrings {
+    pub fn from_strings(strings: &BinaryStrings) -> Self {
+        let h = |s: &str| crate::fingerprint::sha256_u64(s.as_bytes());
+        let mut exact: HashSet<u64> = strings.exact_strings.iter().map(|s| h(s)).collect();
+        let mut tokens = HashSet::new();
+        for run in &strings.printable_runs {
+            exact.insert(h(run));
+            for t in word_tokens(run) {
+                tokens.insert(h(t));
+            }
+        }
+        Self { exact, tokens }
+    }
+
+    fn contains_item(&self, item: &str, item_hash: u64) -> bool {
+        self.exact.contains(&item_hash) || (is_word_token(item) && self.tokens.contains(&item_hash))
+    }
+}
+
+/// `match_binary_items` over hashed strings. Gives the same findings, except that an item
+/// holding a character outside `[A-Za-z0-9_]` is not found as a substring of a run.
+pub fn match_hashed_binary_items(
+    extracted: &HashedBinaryStrings,
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+    channel: &str,
+    path: &str,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for hunk in &fp.hunks {
+        if hunk.binary_items.len() < 2 {
+            continue;
+        }
+        let matched_items: Vec<String> = hunk
+            .binary_items
+            .iter()
+            .filter(|item| {
+                extracted.contains_item(item, crate::fingerprint::sha256_u64(item.as_bytes()))
+            })
+            .cloned()
+            .collect();
+        let confidence = matched_items.len() as f64 / hunk.binary_items.len() as f64;
+        if confidence >= opts.binary_threshold {
+            findings.push(Finding {
+                detector: "D3b".into(),
+                channel: channel.into(),
+                path: path.to_string(),
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: (confidence * 100.0).round() / 100.0,
+                hunk: Some(hunk.hunk_index),
+                evidence: matched_items.into_iter().take(5).collect(),
+            });
+        }
+    }
+    findings
 }
 
 /// Scan a minified bundle for D3b (channel `binary_minified`).

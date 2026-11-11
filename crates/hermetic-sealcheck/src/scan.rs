@@ -5,12 +5,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use hermetic_common::hash::sha256_hex;
-
 use crate::benchmark::BenchmarkSignatures;
 use crate::bytecode::check_pyc_bytecode;
 use crate::containers::{
-    detect_container_type, scan_container_or_unit_with_root_prefix, ContainerType,
+    detect_container_type, ContainerScanner, ContainerType, MatchSink, UnitSink,
 };
 use crate::diff::parse_patch;
 use crate::fingerprint::{sha256_u64, FingerprintSet};
@@ -375,7 +373,10 @@ pub fn match_unit_hashes(
             let mut winnow_matched_count = 0;
             let mut winnow_evidence = Vec::new();
 
-            for &whash in &hunk.winnow_fingerprints {
+            // Sorted, so the evidence kept is the same on every run.
+            let mut winnow_sorted: Vec<u64> = hunk.winnow_fingerprints.iter().copied().collect();
+            winnow_sorted.sort_unstable();
+            for whash in winnow_sorted {
                 if unit.winnow_hashes.contains(&whash) {
                     winnow_matched_count += 1;
                     if winnow_evidence.len() < 5 {
@@ -418,7 +419,14 @@ pub fn match_unit(
     channel: &str,
     path: &str,
 ) -> Vec<Finding> {
-    match_unit_hashes(&compute_unit_hashes(text), fp, opts, detector, channel, path)
+    match_unit_hashes(
+        &compute_unit_hashes(text),
+        fp,
+        opts,
+        detector,
+        channel,
+        path,
+    )
 }
 
 /// Scan a problem statement for leaks (D0).
@@ -465,9 +473,79 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
     findings
 }
 
+/// What the tree walk reports besides units: the parts of `scan_tree` that need the live
+/// tree or the task (D1 git stores, D3 `.pyc` headers) and each loose file's metadata.
+pub trait TreeSink: UnitSink {
+    /// A git directory found by the walk (D1).
+    fn git_repo(&mut self, dir: &Path);
+    /// A D1 finding made by the walk itself (a `.git` pointer file or symlink).
+    fn d1_finding(&mut self, finding: Finding);
+    /// A loose `.pyc`, before it is read, for its D3 header check.
+    fn pyc_file(&mut self, path: &Path, display_path: &str);
+    /// A loose file the walk is about to read, with its metadata.
+    fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata);
+}
+
+/// The sink `scan_tree` uses: `MatchSink` plus the D1 and D3 checks.
+struct TreeMatchSink<'a> {
+    inner: MatchSink<'a>,
+}
+
+impl UnitSink for TreeMatchSink<'_> {
+    fn fixed(&mut self, finding: Finding) {
+        self.inner.fixed(finding);
+    }
+    fn path(&mut self, match_path: &str, display_path: &str) {
+        self.inner.path(match_path, display_path);
+    }
+    fn text(&mut self, path: &str, text: &str) {
+        self.inner.text(path, text);
+    }
+    fn binary(&mut self, path: &str, channel: &str, strings: crate::binary::BinaryStrings) {
+        self.inner.binary(path, channel, strings);
+    }
+    fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
+        self.inner.pkg_metadata(path, bytes);
+    }
+}
+
+impl TreeSink for TreeMatchSink<'_> {
+    fn git_repo(&mut self, dir: &Path) {
+        let found = crate::d1::scan_git_repo(dir, self.inner.fp, self.inner.opts);
+        self.inner.findings.extend(found);
+    }
+    fn d1_finding(&mut self, finding: Finding) {
+        self.inner.findings.push(finding);
+    }
+    fn pyc_file(&mut self, path: &Path, display_path: &str) {
+        match check_pyc_bytecode(path, self.inner.opts.visibility) {
+            Ok(d3_findings) => self.inner.findings.extend(d3_findings),
+            Err(e) => self.inner.findings.push(Finding {
+                detector: "D2".into(),
+                channel: "scan_error".into(),
+                path: display_path.to_string(),
+                visibility: self.inner.opts.visibility,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!("pyc check error: {e}")],
+            }),
+        }
+    }
+    fn loose_file(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
+}
+
 /// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
-    let mut findings = Vec::new();
+    let sink = TreeMatchSink {
+        inner: MatchSink::new(fp, &opts.signatures, opts),
+    };
+    walk_tree(root, opts, sink).inner.findings
+}
+
+/// Walk `root` as `scan_tree` does (pruning, symlinks, size limits, container recursion)
+/// and report everything to `sink`. Returns the sink.
+pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S {
     let root_str = root.display().to_string();
     let root_prefix_len = root_str.len();
 
@@ -476,7 +554,7 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
     };
 
     if is_git_dir(root) {
-        findings.extend(crate::d1::scan_git_repo(root, fp, opts));
+        sink.git_repo(root);
     }
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
@@ -519,7 +597,7 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
                     .path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| root.display().to_string());
-                findings.push(error_finding(path, format!("walk error: {e}")));
+                sink.fixed(error_finding(path, format!("walk error: {e}")));
                 continue;
             }
         };
@@ -527,7 +605,7 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         let display_path = file_path.display().to_string();
 
         if entry.path_is_symlink() && entry.file_name() == ".git" {
-            findings.push(Finding {
+            sink.d1_finding(Finding {
                 detector: "D1".into(),
                 channel: "git_pointer".into(),
                 path: display_path.clone(),
@@ -543,20 +621,20 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             match std::fs::metadata(file_path) {
                 Ok(m) if m.is_file() => m,
                 Ok(_) => {
-                    findings.push(error_finding(
+                    sink.fixed(error_finding(
                         display_path,
                         "symlink to a non-file not followed".into(),
                     ));
                     continue;
                 }
                 Err(e) => {
-                    findings.push(error_finding(display_path, format!("broken symlink: {e}")));
+                    sink.fixed(error_finding(display_path, format!("broken symlink: {e}")));
                     continue;
                 }
             }
         } else if entry.file_type().is_file() {
             if entry.file_name() == ".git" {
-                findings.push(Finding {
+                sink.d1_finding(Finding {
                     detector: "D1".into(),
                     channel: "git_pointer".into(),
                     path: display_path.clone(),
@@ -570,13 +648,13 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    findings.push(error_finding(display_path, format!("metadata error: {e}")));
+                    sink.fixed(error_finding(display_path, format!("metadata error: {e}")));
                     continue;
                 }
             }
         } else if entry.file_type().is_dir() {
             if file_path != root && is_git_dir(file_path) {
-                findings.extend(crate::d1::scan_git_repo(file_path, fp, opts));
+                sink.git_repo(file_path);
             }
             continue;
         } else {
@@ -611,7 +689,7 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
             };
 
             if !is_large_archive {
-                findings.push(Finding {
+                sink.fixed(Finding {
                     detector: "D2".into(),
                     channel: "file".into(),
                     path: display_path,
@@ -632,36 +710,23 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         // Loose .pyc check: PEP 552 bytecode check (D3)
         let is_pyc = file_path.extension().is_some_and(|ext| ext == "pyc");
         if is_pyc {
-            match check_pyc_bytecode(file_path, opts.visibility) {
-                Ok(d3_findings) => findings.extend(d3_findings),
-                Err(e) => {
-                    findings.push(error_finding(
-                        display_path.clone(),
-                        format!("pyc check error: {e}"),
-                    ));
-                }
-            }
+            sink.pyc_file(file_path, &display_path);
         }
 
         // Read file bytes
         let bytes = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(e) => {
-                findings.push(error_finding(display_path, format!("read error: {e}")));
+                sink.fixed(error_finding(display_path, format!("read error: {e}")));
                 continue;
             }
         };
 
-        let unit_findings = scan_container_or_unit_with_root_prefix(
-            &display_path,
-            &bytes,
-            fp,
-            &opts.signatures,
-            opts,
-            root_prefix_len,
-        );
-        findings.extend(unit_findings);
+        sink.loose_file(&display_path, &metadata);
+        let mut scanner = ContainerScanner::new(opts, sink, root_prefix_len);
+        scanner.scan(&display_path, &bytes, 0);
+        sink = scanner.sink;
     }
 
-    findings
+    sink
 }
