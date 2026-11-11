@@ -371,6 +371,9 @@ fn test_perf_tier2_4mb_unit_200_hunks_under_2s() {
         binary_items_count: 0,
         binary_subtracted_count: 0,
         hash_to_evidence: std::collections::HashMap::new(),
+        skipped_files_count: 0,
+        baseline_incomplete: false,
+        baseline_skipped_bytes: 0,
         tier2_capped: false,
         tier2_chosen_files: Vec::new(),
     };

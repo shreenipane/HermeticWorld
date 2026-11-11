@@ -64,6 +64,7 @@ pub struct ScanOptions {
     pub max_delta_depth: usize,
     pub target_packages: Vec<String>,
     pub task_version: Option<String>,
+    pub undated: bool,
 }
 
 impl Default for ScanOptions {
@@ -86,6 +87,7 @@ impl Default for ScanOptions {
             max_delta_depth: 4096,
             target_packages: Vec::new(),
             task_version: None,
+            undated: false,
         }
     }
 }
@@ -555,13 +557,22 @@ impl UnitSink for TreeMatchSink<'_> {
 
 impl TreeSink for TreeMatchSink<'_> {
     fn git_repo(&mut self, dir: &Path) {
+        if self.inner.opts.undated {
+            return;
+        }
         let found = crate::d1::scan_git_repo(dir, self.inner.fp, self.inner.opts);
         self.inner.findings.extend(found);
     }
     fn d1_finding(&mut self, finding: Finding) {
+        if self.inner.opts.undated {
+            return;
+        }
         self.inner.findings.push(finding);
     }
     fn pyc_file(&mut self, path: &Path, display_path: &str) {
+        if self.inner.opts.undated {
+            return;
+        }
         match check_pyc_bytecode(path, self.inner.opts.visibility) {
             Ok(d3_findings) => self.inner.findings.extend(d3_findings),
             Err(e) => self.inner.findings.push(Finding {
