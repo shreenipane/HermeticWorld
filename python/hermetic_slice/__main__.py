@@ -90,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
     e3_run_parser.add_argument("--out", type=Path, required=True, help="Output directory for metrics and results")
     e3_run_parser.add_argument("--blind", type=Path, default=None, help="Optional directory containing blind cases")
 
+    build_rootfs_parser = subparsers.add_parser("build-rootfs", help="Build reproducible ext4 rootfs image with D4 guard")
+    build_rootfs_parser.add_argument("--src", type=Path, required=True, help="Source directory containing rootfs tree")
+    build_rootfs_parser.add_argument("--out", type=Path, required=True, help="Output image file")
+    build_rootfs_parser.add_argument("--t-clock", required=True, help="Clock cutoff in RFC 3339 / ISO 8601")
+    build_rootfs_parser.add_argument("--world-id", required=True, help="World identifier")
+    build_rootfs_parser.add_argument("--size-mib", type=int, default=None, help="Filesystem size in MiB")
+    build_rootfs_parser.add_argument("--sealcheck-bin", type=Path, default=None, help="Path to sealcheck binary")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -535,6 +543,31 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except Exception as exc:
             print(f"Error running e3: {exc}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "build-rootfs":
+        from hermetic_slice.rootfs import RootfsGateError, build_rootfs
+
+        try:
+            t_clock = datetime.fromisoformat(args.t_clock)
+            if t_clock.tzinfo is None or t_clock.tzinfo.utcoffset(t_clock) is None:
+                raise ValueError(f"--t-clock must be timezone-aware: {args.t_clock}")
+            t_clock = t_clock.astimezone(timezone.utc)
+            res = build_rootfs(
+                src=args.src,
+                out_image=args.out,
+                t_clock=t_clock,
+                world_id=args.world_id,
+                size_mib=args.size_mib,
+                sealcheck_bin=args.sealcheck_bin,
+            )
+            print(json.dumps(res, indent=2))
+            return 0
+        except RootfsGateError as exc:
+            print(f"Rootfs gate error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
 
     return 1
