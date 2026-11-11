@@ -98,13 +98,13 @@ def test_pytest_6202_end_to_end(tmp_path: Path) -> None:
     agent_files = list(agent_dir.iterdir())
     assert agent_files == [agent_dir / "problem_statement.md"], "agent/ must contain only problem_statement.md"
 
-    # Problem statement matches row
-    assert (agent_dir / "problem_statement.md").read_text(encoding="utf-8", newline="") == row_copy["problem_statement"]
+    # Unverifiable scraped content is excluded (review item 1).
+    assert (agent_dir / "problem_statement.md").read_text(encoding="utf-8", newline="") == ""
 
     # Patches are byte-equal
     assert (staging_dir / "gold.patch").read_bytes() == row_copy["patch"].encode("utf-8")
     assert (staging_dir / "test.patch").read_bytes() == row_copy["test_patch"].encode("utf-8")
-    assert (staging_dir / "hints.txt").read_bytes() == row_copy["hints_text"].encode("utf-8")
+    assert (staging_dir / "hints.txt").read_bytes() == b""
 
     # task.json validation
     task_json_raw = task_json_file.read_text(encoding="utf-8")
@@ -132,7 +132,7 @@ def test_pytest_6202_end_to_end(tmp_path: Path) -> None:
     assert task_data["image"] == "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-6202:latest"
 
     # Warnings
-    assert any("problem_statement taken as scraped" in w for w in task_data["warnings"])
+    assert any("unverifiable_content_excluded" in w for w in task_data["warnings"])
 
 
 # ---------------------------------------------------------------------------

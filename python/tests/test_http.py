@@ -249,3 +249,87 @@ def test_make_http_post_json_errors_not_cached(tmp_path: Path) -> None:
         res2 = http_post("https://api.github.com/graphql", {"query": "bad_query"})
         assert res2 == res1
         assert mock_urlopen.call_count == 2
+
+
+def _post_cache_file(cache_dir: Path, snapshot: str = "snapshot") -> Path:
+    import hashlib
+    import json
+    key = hashlib.sha256(("https://api.github.com/graphql" + json.dumps({"query": "q"}, sort_keys=True)).encode()).hexdigest()
+    snapshot_key = hashlib.sha256(snapshot.encode()).hexdigest()
+    return cache_dir / "http" / f"{snapshot_key}_{key}.body"
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize("source", ["network", "cache"])
+def test_http_body_reads_are_bounded(tmp_path: Path, method: str, source: str) -> None:
+    import hashlib
+    import hermetic_slice.http as module
+    cache = tmp_path / "cache"
+    url = "https://api.github.com/graphql"
+    cache_file = (cache / "http" / (hashlib.sha256(url.encode()).hexdigest() + ".body")) if method == "get" else _post_cache_file(cache)
+    oversized = b"x" * 65
+    if source == "cache":
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_bytes(oversized)
+    class Transport(io.BytesIO):
+        status = 200
+        def read(self, size=-1):
+            assert size == 65, "response reads must use the named byte cap"
+            return super().read(size)
+    factory = make_http_get if method == "get" else make_http_post_json
+    options = {} if method == "get" else {"snapshot_id": "snapshot"}
+    client = factory(cache, **options)
+    with patch.object(module, "MAX_HTTP_BODY_BYTES", 64), patch("urllib.request.urlopen", return_value=Transport(oversized)) as network:
+        with pytest.raises(ValueError, match="http_body_limit|invalid_cache_file"):
+            client(url) if method == "get" else client(url, {"query": "q"})
+    assert network.call_count == (1 if source == "network" else 0)
+    if source == "network":
+        assert not cache_file.exists()
+
+
+def test_snapshot_traversal_is_hashed_inside_cache(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    snapshot = "../escape"
+    class Transport(io.BytesIO):
+        status = 200
+    client = make_http_post_json(cache, snapshot_id=snapshot)
+    with patch("urllib.request.urlopen", return_value=Transport(b'{"data":{}}')) as network:
+        assert client("https://api.github.com/graphql", {"query": "q"}) == {"data": {}}
+        assert client("https://api.github.com/graphql", {"query": "q"}) == {"data": {}}
+    assert network.call_count == 1
+    expected = _post_cache_file(cache, snapshot)
+    assert list(cache.rglob("*.body")) == [expected]
+    assert not list(tmp_path.glob("escape*"))
+    assert expected.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("kind", ["file_symlink", "directory_symlink", "ancestor_symlink", "fifo"])
+def test_cache_rejects_links_and_special_files_without_opening(tmp_path: Path, kind: str) -> None:
+    import os
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "secret"
+    sentinel.write_bytes(b'{"data":"outside secret"}')
+    if kind == "ancestor_symlink":
+        cache.symlink_to(outside, target_is_directory=True)
+    else:
+        cache.mkdir()
+        if kind == "directory_symlink":
+            (cache / "http").symlink_to(outside, target_is_directory=True)
+        else:
+            (cache / "http").mkdir()
+            path = _post_cache_file(cache)
+            if kind == "file_symlink":
+                path.symlink_to(sentinel)
+            else:
+                os.mkfifo(path)
+    client = make_http_post_json(cache, snapshot_id="snapshot")
+    # A path-based read would follow links or block on the FIFO. Guard it so
+    # this regression itself terminates against the vulnerable implementation.
+    with patch.object(Path, "read_bytes", side_effect=AssertionError("unchecked_path_read")), patch("urllib.request.urlopen") as network:
+        with pytest.raises(ValueError, match="invalid_cache_directory|invalid_cache_file"):
+            client("https://api.github.com/graphql", {"query": "q"})
+    assert network.call_count == 0
+    assert sentinel.read_bytes() == b'{"data":"outside secret"}'
+    assert sorted(p.name for p in outside.iterdir()) == ["secret"]

@@ -198,16 +198,16 @@ def test_no_token_falls_back_to_as_scraped_with_warning(tmp_path: Path) -> None:
     # No GraphQL call made
     assert mock_post.call_count == 0
 
-    # Content unchanged
-    assert result.problem_statement == scraped_ps
-    assert result.hints_text == scraped_hints
-    assert result.problem_statement_revision == "as_scraped"
+    # Unverifiable content excluded
+    assert result.problem_statement == ""
+    assert result.hints_text == ""
+    assert result.problem_statement_revision == "excluded"
     assert result.chosen_revision_edited_at is None
     assert result.edits_ignored == 0
     assert result.hints_revisioned is False
 
     # Existing warning is present
-    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
     # Static solution PR endpoints are still generated
     pr_urls = [e["url"] for e in result.scrub_entries]
@@ -467,12 +467,12 @@ def test_malformed_and_error_graphql_responses(tmp_path: Path) -> None:
     )
 
     # Never crashed; fell back with warning
-    assert result_a.problem_statement == "Problem statement unchanged"
-    assert result_a.hints_text == "Hints unchanged"
-    assert result_a.problem_statement_revision == "as_scraped"
+    assert result_a.problem_statement == ""
+    assert result_a.hints_text == ""
+    assert result_a.problem_statement_revision == "excluded"
     assert result_a.hints_revisioned is False
-    assert any("GraphQL request for issue #100 failed" in w for w in warnings_list_a)
-    assert any("problem_statement taken as scraped" in w for w in warnings_list_a)
+    assert any("pr_discovery_failed; repository_scope_denied" in w for w in warnings_list_a)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list_a)
 
     # Case B: GraphQL response with missing repository
     warnings_list_b: list[str] = []
@@ -489,9 +489,9 @@ def test_malformed_and_error_graphql_responses(tmp_path: Path) -> None:
         cache_dir=tmp_path / "cache_b",
         warnings_list=warnings_list_b,
     )
-    assert result_b.problem_statement == "Problem statement unchanged"
-    assert result_b.problem_statement_revision == "as_scraped"
-    assert any("GraphQL repository not found" in w for w in warnings_list_b)
+    assert result_b.problem_statement == ""
+    assert result_b.problem_statement_revision == "excluded"
+    assert any("pr_discovery_failed; repository_scope_denied" in w for w in warnings_list_b)
 
     # Case C: Network HttpError
     warnings_list_c: list[str] = []
@@ -512,9 +512,9 @@ def test_malformed_and_error_graphql_responses(tmp_path: Path) -> None:
         cache_dir=tmp_path / "cache_c",
         warnings_list=warnings_list_c,
     )
-    assert result_c.problem_statement == "Problem statement unchanged"
-    assert result_c.problem_statement_revision == "as_scraped"
-    assert any("HTTP 500" in w for w in warnings_list_c)
+    assert result_c.problem_statement == ""
+    assert result_c.problem_statement_revision == "excluded"
+    assert any("pr_discovery_failed; repository_scope_denied" in w for w in warnings_list_c)
 
 
 # ---------------------------------------------------------------------------
@@ -685,10 +685,10 @@ def test_regression_null_diff_not_substituted_with_scraped_body(tmp_path: Path) 
     )
 
     # Must NOT certify as revision_at_t_world
-    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement_revision == "excluded"
     assert result.chosen_revision_edited_at is None
-    assert any("historical revision diff is null" in w for w in warnings_list)
-    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+    assert any("invalid_revision" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
     # Unit-level test on select_revision with null diff
     rev = select_revision(
@@ -699,9 +699,9 @@ def test_regression_null_diff_not_substituted_with_scraped_body(tmp_path: Path) 
         t_world=t_world,
         is_target_issue=False,
     )
-    assert rev.revision_type == "as_scraped"
+    assert rev.revision_type == "excluded"
     assert rev.warning is not None
-    assert "historical revision diff is null" in rev.warning
+    assert "invalid_revision" in rev.warning
 
 
 def test_regression_null_connections_partial_graphql_response(tmp_path: Path) -> None:
@@ -735,8 +735,8 @@ def test_regression_null_connections_partial_graphql_response(tmp_path: Path) ->
         warnings_list=warnings_list,
     )
 
-    assert result.problem_statement == scraped_ps
-    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement == ""
+    assert result.problem_statement_revision == "excluded"
 
 
 def test_regression_keep_collected_pr_entries_on_issue_failure(tmp_path: Path) -> None:
@@ -770,8 +770,8 @@ def test_regression_keep_collected_pr_entries_on_issue_failure(tmp_path: Path) -
     )
 
     # Problem statement falls back with warning
-    assert result.problem_statement_revision == "as_scraped"
-    assert any("GraphQL request for issue #999 failed" in w for w in warnings_list)
+    assert result.problem_statement_revision == "excluded"
+    assert any("issue_discovery_failed; repository_scope_denied" in w for w in warnings_list)
 
     # Collected PR review comments are preserved in scrub_entries
     urls = [e["url"] for e in result.scrub_entries]
@@ -811,9 +811,9 @@ def test_regression_edited_issue_empty_edits_not_certified_as_scraped(tmp_path: 
         warnings_list=warnings_list,
     )
 
-    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement_revision == "excluded"
     assert any("userContentEdits is missing or empty" in w for w in warnings_list)
-    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
 
 def test_regression_paginate_pr_thread_comments(tmp_path: Path) -> None:
@@ -937,9 +937,9 @@ def test_regression_includes_created_edit_false_safe_fallback(tmp_path: Path) ->
 
     # Post-cutoff edit must NOT be chosen as first_revision
     assert "Later edit text after cutoff" not in result.problem_statement
-    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement_revision == "excluded"
     assert any("includesCreatedEdit is false" in w for w in warnings_list)
-    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
 
 def test_regression_multi_issue_problem_statement_preserved(tmp_path: Path) -> None:
@@ -994,12 +994,12 @@ def test_regression_multi_issue_problem_statement_preserved(tmp_path: Path) -> N
     )
 
     task_json = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-    assert task_json["problem_statement_revision"] == "as_scraped"
+    assert task_json["problem_statement_revision"] == "excluded"
     assert any("Multiple issue references resolved" in w for w in task_json["warnings"])
 
-    # Problem statement is preserved in full without dropping issue 2
+    # Multi-issue statements cannot be verified and are excluded in full.
     ps_file_content = (task_dir / "agent" / "problem_statement.md").read_text(encoding="utf-8")
-    assert ps_file_content == multi_ps
+    assert ps_file_content == ""
 
 
 def test_regression_solution_pr_issues_api_representation_blocked() -> None:
@@ -1077,7 +1077,7 @@ def test_defect1_comment_without_usable_history_dropped_and_counted(tmp_path: Pa
 
 
 def test_defect2_truncated_history_raises_and_falls_back(tmp_path: Path) -> None:
-    """Defect 2: Incomplete/truncated edit history raises GraphQLResponseError inside guarded path and falls back to as_scraped."""
+    """Defect 2: Incomplete/truncated edit history raises GraphQLResponseError inside guarded path and excludes unverifiable content."""
     fixture_data = load_fixture_json("issue_truncated_history.json")
     pr_fixture = load_fixture_json("pull_request_scrub.json")
 
@@ -1107,12 +1107,12 @@ def test_defect2_truncated_history_raises_and_falls_back(tmp_path: Path) -> None
         warnings_list=warnings_list,
     )
 
-    # Must fall back cleanly to as_scraped, never first_revision / revision_at_t_world
-    assert result.problem_statement_revision == "as_scraped"
-    assert result.problem_statement == scraped_ps
+    # Must exclude unverifiable content, never first_revision / revision_at_t_world
+    assert result.problem_statement_revision == "excluded"
+    assert result.problem_statement == ""
     assert "Later revision that should never be certified" not in result.problem_statement
-    assert any("endCursor is missing" in w for w in warnings_list)
-    assert any("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)" in w for w in warnings_list)
+    assert any("issue_discovery_failed; repository_scope_denied" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
 
 def test_defect3_missing_includes_created_edit_treated_as_not_including_creation(tmp_path: Path) -> None:
@@ -1146,11 +1146,11 @@ def test_defect3_missing_includes_created_edit_treated_as_not_including_creation
         warnings_list=warnings_list,
     )
 
-    # Must not assume creation edit was included; falls back to as_scraped
-    assert result.problem_statement_revision == "as_scraped"
-    assert result.problem_statement == scraped_ps
+    # Must not assume creation edit was included; excludes unverifiable content
+    assert result.problem_statement_revision == "excluded"
+    assert result.problem_statement == ""
     assert any("includesCreatedEdit is false / not true" in w for w in warnings_list)
-    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
 
 def test_defect4_comment_missing_or_unparseable_created_at_excluded(tmp_path: Path) -> None:
@@ -1522,10 +1522,10 @@ def test_defect11_multi_issue_scrubs_every_referenced_issue(tmp_path: Path) -> N
         warnings_list=warnings_list,
     )
 
-    # 1. Statement left as scraped with explicit warning
-    assert result.problem_statement_revision == "as_scraped"
-    assert result.problem_statement == scraped_ps
-    assert any("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)" in w for w in warnings_list)
+    # 1. Unverifiable statement excluded with explicit warning
+    assert result.problem_statement_revision == "excluded"
+    assert result.problem_statement == ""
+    assert any("unverifiable_content_excluded" in w for w in warnings_list)
 
     # 2. Every referenced issue was scrubbed
     urls = {e["url"] for e in result.scrub_entries}
@@ -1545,7 +1545,7 @@ def test_defect11_multi_issue_scrubs_every_referenced_issue(tmp_path: Path) -> N
 
 def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> None:
     """Defect 12: Warning restored for every path where problem statement is not revision-checked."""
-    expected_warning = "problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)"
+    expected_warning = "unverifiable_content_excluded"
     pr_fixture = load_fixture_json("pull_request_scrub.json")
 
     # Path 1: No GitHub target issue (e.g. Trac or no issue reference)
@@ -1564,7 +1564,7 @@ def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> 
         cache_dir=tmp_path / "cache_p1",
         warnings_list=warn_p1,
     )
-    assert res_p1.problem_statement_revision == "as_scraped"
+    assert res_p1.problem_statement_revision == "excluded"
     assert expected_warning in warn_p1
 
     # Path 2: Multi-issue path
@@ -1583,7 +1583,7 @@ def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> 
         cache_dir=tmp_path / "cache_p2",
         warnings_list=warn_p2,
     )
-    assert res_p2.problem_statement_revision == "as_scraped"
+    assert res_p2.problem_statement_revision == "excluded"
     assert expected_warning in warn_p2
 
     # Path 3: Fallback due to missing token / failed GraphQL
@@ -1602,6 +1602,6 @@ def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> 
         cache_dir=tmp_path / "cache_p3",
         warnings_list=warn_p3,
     )
-    assert res_p3.problem_statement_revision == "as_scraped"
+    assert res_p3.problem_statement_revision == "excluded"
     assert expected_warning in warn_p3
 

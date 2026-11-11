@@ -6,7 +6,7 @@ This module implements:
    - Replaces scraped problem statement body with the newest revision dated at or before T_world.
    - Revisions hints: filters comments to those created at or before T_world, taking each
      at its revision as of T_world.
-   - Records metadata: problem_statement_revision (as_scraped | revision_at_t_world | first_revision),
+   - Records metadata: problem_statement_revision (as_scraped | revision_at_t_world | first_revision | excluded),
      the chosen revision's editedAt, number of edits ignored, and hints_revisioned.
 2. Target-thread scrub list:
    - Discovers all resources that must not be served by the frozen world:
@@ -53,6 +53,7 @@ Entry fields:
     * "comment": Target issue discussion comment created after T_world or PR conversation comment
     * "cross_reference": Issue, PR, or timeline event that links to the target issue
     * "cross_reference_prefix": URL prefixes covering sub-pages of a referencing PR
+    * "unresolved_scope": Required prefix denial of GitHub services after incomplete discovery
 - match (str): Matching semantics ("exact" or "prefix").
 - reason (str): Human-readable explanation of why this resource must not be served.
 - url (str): Exact URL or URL prefix blocked.
@@ -97,7 +98,7 @@ class ScrubEntry:
 @dataclass(frozen=True)
 class RevisionResult:
     body: str
-    revision_type: str  # "as_scraped" | "revision_at_t_world" | "first_revision"
+    revision_type: str  # "as_scraped" | "revision_at_t_world" | "first_revision" | "excluded"
     edited_at: str | None
     edits_ignored: int
     warning: str | None = None
@@ -126,7 +127,7 @@ def iso_utc(dt: datetime) -> str:
 
 def parse_iso(dt_str: str | None) -> datetime | None:
     """Parse ISO 8601 string into a UTC timezone-aware datetime."""
-    if not dt_str:
+    if not isinstance(dt_str, str) or not dt_str or len(dt_str) > 128:
         return None
     s = dt_str
     if s.endswith("Z"):
@@ -172,8 +173,14 @@ def select_revision(
     - If T_world is earlier than issue's creation (for target issue), take the first revision.
     - Otherwise, newest revision with editedAt <= T_world.
     - If none qualifies and created_at <= T_world, take the first revision (the oldest edit).
-    - If history is missing or incomplete, fall back to scraped text with an explicit warning.
+    - If history is missing or incomplete, exclude the content with an explicit warning.
     """
+    if (not isinstance(scraped_body, str) or
+            any(not isinstance(edit, dict) or
+                parse_iso(edit.get("editedAt") or edit.get("createdAt")) is None or
+                not isinstance(edit.get("diff") if edit.get("diff") is not None else edit.get("body"), str)
+                for edit in user_content_edits)):
+        return RevisionResult("", "excluded", None, 0, "invalid_revision; content excluded")
     if last_edited_at is None:
         return RevisionResult(
             body=scraped_body,
@@ -184,33 +191,33 @@ def select_revision(
 
     if not user_content_edits:
         return RevisionResult(
-            body=scraped_body,
-            revision_type="as_scraped",
+            body="",
+            revision_type="excluded",
             edited_at=None,
             edits_ignored=0,
-            warning="document was edited but userContentEdits is missing or empty; fell back to scraped body",
+            warning="document was edited but userContentEdits is missing or empty; content excluded",
         )
 
     # userContentEdits is newest first
     if is_target_issue and created_at is not None and t_world < created_at:
         if includes_created_edit is not True:
             return RevisionResult(
-                body=scraped_body,
-                revision_type="as_scraped",
+                body="",
+                revision_type="excluded",
                 edited_at=None,
                 edits_ignored=0,
-                warning="edit history does not include creation edit (includesCreatedEdit is false / not true); fell back to scraped body",
+                warning="edit history does not include creation edit (includesCreatedEdit is false / not true); content excluded",
             )
         first_rev = user_content_edits[-1]
         diff_val = first_rev.get("diff")
         body_val = first_rev.get("body")
         if diff_val is None and body_val is None:
             return RevisionResult(
-                body=scraped_body,
-                revision_type="as_scraped",
+                body="",
+                revision_type="excluded",
                 edited_at=None,
                 edits_ignored=0,
-                warning="historical revision diff is null; fell back to scraped body",
+                warning="historical revision diff is null; content excluded",
             )
         chosen_body = diff_val if diff_val is not None else body_val
         rev_dt = parse_iso(first_rev.get("editedAt") or first_rev.get("createdAt"))
@@ -228,11 +235,11 @@ def select_revision(
             body_val = edit.get("body")
             if diff_val is None and body_val is None:
                 return RevisionResult(
-                    body=scraped_body,
-                    revision_type="as_scraped",
+                    body="",
+                    revision_type="excluded",
                     edited_at=None,
                     edits_ignored=0,
-                    warning="historical revision diff is null; fell back to scraped body",
+                    warning="historical revision diff is null; content excluded",
                 )
             chosen_body = diff_val if diff_val is not None else body_val
             return RevisionResult(
@@ -245,11 +252,11 @@ def select_revision(
     # None qualified: take oldest revision (first revision) only if history confirms creation edit
     if includes_created_edit is not True:
         return RevisionResult(
-            body=scraped_body,
-            revision_type="as_scraped",
+            body="",
+            revision_type="excluded",
             edited_at=None,
             edits_ignored=0,
-            warning="no qualifying edit before T_world and history does not include creation edit (includesCreatedEdit is false / not true); fell back to scraped body",
+            warning="no qualifying edit before T_world and history does not include creation edit (includesCreatedEdit is false / not true); content excluded",
         )
 
     first_rev = user_content_edits[-1]
@@ -257,11 +264,11 @@ def select_revision(
     body_val = first_rev.get("body")
     if diff_val is None and body_val is None:
         return RevisionResult(
-            body=scraped_body,
-            revision_type="as_scraped",
+            body="",
+            revision_type="excluded",
             edited_at=None,
             edits_ignored=0,
-            warning="historical revision diff is null; fell back to scraped body",
+            warning="historical revision diff is null; content excluded",
         )
     chosen_body = diff_val if diff_val is not None else body_val
     rev_dt = parse_iso(first_rev.get("editedAt") or first_rev.get("createdAt"))
@@ -660,284 +667,178 @@ query PullRequestReviewThreadCommentsPage($id: ID!, $cursor: String!) {
 """
 
 
+MAX_GRAPHQL_PAGES = 128
+MAX_CONNECTION_PAGES = 32
+MAX_CONNECTION_NODES = 10000
+MAX_GRAPHQL_NODES = 100000
+MAX_GRAPHQL_BYTES = 32 * 1024 * 1024
+MAX_GRAPHQL_DEPTH = 32
+MAX_GRAPHQL_CURSOR_LENGTH = 1024
+MAX_RESOURCE_URL_LENGTH = 2048
+MAX_RESOURCE_ID_LENGTH = 128
+MAX_DATABASE_ID = (1 << 63) - 1
+
+
+def _measure_response(value: Any, depth: int = 0) -> tuple[int, int]:
+    if depth > MAX_GRAPHQL_DEPTH:
+        raise GraphQLResponseError("response_depth_limit")
+    nodes, size = 1, 0
+    if isinstance(value, (bytes, bytearray)):
+        size = len(value)
+    elif isinstance(value, str):
+        size = len(value.encode("utf-8"))
+    elif isinstance(value, (dict, list)):
+        values = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, child in values:
+            count, length = _measure_response(child, depth + 1)
+            nodes += count
+            size += length + (len(key.encode("utf-8")) if isinstance(key, str) else 0)
+            if nodes > MAX_GRAPHQL_NODES or size > MAX_GRAPHQL_BYTES:
+                raise GraphQLResponseError("response_aggregate_limit")
+    elif value is not None and type(value) not in (int, float, bool):
+        raise GraphQLResponseError("invalid_response_type")
+    if size > MAX_GRAPHQL_BYTES:
+        raise GraphQLResponseError("response_aggregate_limit")
+    return nodes, size
+
+
+class _RunClient:
+    def __init__(self, client: HttpPostJson) -> None:
+        self.client = client
+        self.pages = self.nodes = self.size = 0
+
+    def __call__(self, url: str, payload: Any) -> Any:
+        self.pages += 1
+        if self.pages > MAX_GRAPHQL_PAGES:
+            raise GraphQLResponseError("response_page_limit")
+        response = self.client(url, payload)
+        nodes, size = _measure_response(response)
+        self.nodes += nodes
+        self.size += size
+        if self.nodes > MAX_GRAPHQL_NODES or self.size > MAX_GRAPHQL_BYTES:
+            raise GraphQLResponseError("response_aggregate_limit")
+        return response
+
+
 def _post_graphql(http_post_json: HttpPostJson, query: str, variables: dict[str, Any], operation_name: str) -> dict[str, Any]:
-    """Execute a GraphQL query, checking for errors array and malformed structure."""
-    payload = {
-        "operationName": operation_name,
-        "query": query,
-        "variables": variables,
-    }
-    resp = http_post_json(GITHUB_GRAPHQL_URL, payload)
-    if isinstance(resp, (bytes, bytearray)):
-        resp = json.loads(resp.decode("utf-8"))
+    try:
+        resp = http_post_json(GITHUB_GRAPHQL_URL, {
+            "operationName": operation_name, "query": query, "variables": variables,
+        })
+        if isinstance(resp, (bytes, bytearray)):
+            if len(resp) > MAX_GRAPHQL_BYTES:
+                raise GraphQLResponseError("response_byte_limit")
+            resp = json.loads(resp.decode("utf-8"))
+        _measure_response(resp)
+        if not isinstance(resp, dict) or resp.get("errors") or not isinstance(resp.get("data"), dict):
+            raise GraphQLResponseError("invalid_graphql_response")
+        return resp["data"]
+    except Exception:
+        raise GraphQLResponseError("graphql_request_failed") from None
 
-    if not isinstance(resp, dict):
-        raise GraphQLResponseError(f"Expected dict response from GraphQL, got {type(resp).__name__}")
 
-    errors = resp.get("errors")
-    if errors:
-        raise GraphQLResponseError(f"GraphQL errors: {errors}")
+def _object(parent: Any, field: str) -> dict[str, Any]:
+    if not isinstance(parent, dict) or not isinstance(parent.get(field), dict):
+        raise GraphQLResponseError("missing_response_object")
+    return parent[field]
 
-    data = resp.get("data")
-    if data is None:
-        raise GraphQLResponseError("GraphQL response missing 'data' field")
 
-    return data
+def _connection(connection: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not isinstance(connection, dict):
+        raise GraphQLResponseError("missing_connection")
+    nodes, info = connection.get("nodes"), connection.get("pageInfo")
+    if (not isinstance(nodes, list) or len(nodes) > MAX_CONNECTION_NODES or
+            any(not isinstance(n, dict) for n in nodes) or
+            not isinstance(info, dict) or type(info.get("hasNextPage")) is not bool):
+        raise GraphQLResponseError("invalid_connection")
+    if info["hasNextPage"] and (not isinstance(info.get("endCursor"), str) or
+            not info["endCursor"] or len(info["endCursor"]) > MAX_GRAPHQL_CURSOR_LENGTH):
+        raise GraphQLResponseError("invalid_connection_cursor")
+    return list(nodes), info
+
+
+def _paginate(client: HttpPostJson, initial: Any, query: str, variables: dict[str, Any],
+              operation: str, path: tuple[str, ...]) -> list[dict[str, Any]]:
+    nodes, info = _connection(initial)
+    seen: set[str] = set()
+    pages = 1
+    while info["hasNextPage"]:
+        cursor = info["endCursor"]
+        if cursor in seen or pages >= MAX_CONNECTION_PAGES:
+            raise GraphQLResponseError("pagination_limit_or_cycle")
+        seen.add(cursor)
+        if "id" in variables and (not isinstance(variables["id"], str) or not variables["id"]):
+            raise GraphQLResponseError("missing_pagination_id")
+        page: Any = _post_graphql(client, query, dict(variables, cursor=cursor), operation)
+        for field in path:
+            page = _object(page, field)
+        more, info = _connection(page)
+        if len(nodes) + len(more) > MAX_CONNECTION_NODES:
+            raise GraphQLResponseError("connection_node_limit")
+        nodes.extend(more)
+        pages += 1
+    return nodes
+
+
+def _validate_fields(node: dict[str, Any]) -> None:
+    for key in ("body", "diff", "id", "url", "__typename"):
+        value = node.get(key)
+        if value is not None and (not isinstance(value, str) or
+                (key == "id" and len(value) > MAX_RESOURCE_ID_LENGTH)):
+            raise GraphQLResponseError("invalid_content_field")
+    for key in ("databaseId", "number"):
+        value = node.get(key)
+        if value is not None and (type(value) is not int or value <= 0 or value > MAX_DATABASE_ID):
+            raise GraphQLResponseError("invalid_identifier")
+    url = node.get("url")
+    if url is not None and (len(url) > MAX_RESOURCE_URL_LENGTH or not re.fullmatch(r"https://(?:api\.)?github\.com/[A-Za-z0-9_./#?=&%-]+", url)):
+        raise GraphQLResponseError("invalid_resource_url")
 
 
 def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str, issue_number: int) -> dict[str, Any]:
-    """Fetch complete issue data with pagination for edits, comments, and timeline items."""
-    vars_main = {"owner": owner, "repo": name, "number": issue_number}
-    data = _post_graphql(http_post_json, TARGET_ISSUE_QUERY, vars_main, "TargetIssueData")
-    repo = data.get("repository")
-    if repo is None:
-        raise GraphQLResponseError(f"GraphQL repository not found for variables: {vars_main}")
-    issue = repo.get("issue")
-    if not issue:
-        raise GraphQLResponseError(f"Issue #{issue_number} not found in {owner}/{name}")
-
-    # Normalize nullable connections
-    for field in ("userContentEdits", "comments", "timelineItems"):
-        if issue.get(field) is None:
-            issue[field] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
-
-    # Paginate issue userContentEdits if needed
-    edits_field = issue.get("userContentEdits") or {}
-    edits_nodes = list(edits_field.get("nodes") or [])
-    page_info = edits_field.get("pageInfo") or {}
-    while page_info.get("hasNextPage"):
-        cursor = page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"Issue #{issue_number} userContentEdits hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            ISSUE_EDITS_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
-            "IssueEditsPage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} userContentEdits page missing repository")
-        p_issue = repo_obj.get("issue")
-        if not isinstance(p_issue, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} userContentEdits page missing issue")
-        p_edits = p_issue.get("userContentEdits")
-        if not isinstance(p_edits, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} userContentEdits page missing userContentEdits")
-        page_info = p_edits.get("pageInfo")
-        if not isinstance(page_info, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} userContentEdits page missing pageInfo")
-        edits_nodes.extend(p_edits.get("nodes") or [])
-    if "userContentEdits" in issue and issue["userContentEdits"] is not None:
-        issue["userContentEdits"]["nodes"] = edits_nodes
-
-    # Paginate comments if needed
-    comments_field = issue.get("comments") or {}
-    comments_nodes = list(comments_field.get("nodes") or [])
-    c_page_info = comments_field.get("pageInfo") or {}
-    while c_page_info.get("hasNextPage"):
-        cursor = c_page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"Issue #{issue_number} comments hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            ISSUE_COMMENTS_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
-            "IssueCommentsPage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} comments page missing repository")
-        p_issue = repo_obj.get("issue")
-        if not isinstance(p_issue, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} comments page missing issue")
-        p_comments = p_issue.get("comments")
-        if not isinstance(p_comments, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} comments page missing comments")
-        c_page_info = p_comments.get("pageInfo")
-        if not isinstance(c_page_info, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} comments page missing pageInfo")
-        comments_nodes.extend(p_comments.get("nodes") or [])
-    if "comments" in issue and issue["comments"] is not None:
-        issue["comments"]["nodes"] = comments_nodes
-
-    for comment in comments_nodes:
-        if comment.get("userContentEdits") is None:
-            comment["userContentEdits"] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
-
-    # Paginate timeline items if needed
-    timeline_field = issue.get("timelineItems") or {}
-    timeline_nodes = list(timeline_field.get("nodes") or [])
-    t_page_info = timeline_field.get("pageInfo") or {}
-    while t_page_info.get("hasNextPage"):
-        cursor = t_page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"Issue #{issue_number} timelineItems hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            ISSUE_TIMELINE_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
-            "IssueTimelinePage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} timeline page missing repository")
-        p_issue = repo_obj.get("issue")
-        if not isinstance(p_issue, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} timeline page missing issue")
-        p_timeline = p_issue.get("timelineItems")
-        if not isinstance(p_timeline, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} timeline page missing timelineItems")
-        t_page_info = p_timeline.get("pageInfo")
-        if not isinstance(t_page_info, dict):
-            raise GraphQLResponseError(f"Issue #{issue_number} timeline page missing pageInfo")
-        timeline_nodes.extend(p_timeline.get("nodes") or [])
-    if "timelineItems" in issue and issue["timelineItems"] is not None:
-        issue["timelineItems"]["nodes"] = timeline_nodes
-
+    variables = {"owner": owner, "repo": name, "number": issue_number}
+    data = _post_graphql(http_post_json, TARGET_ISSUE_QUERY, variables, "TargetIssueData")
+    issue = _object(_object(data, "repository"), "issue")
+    _validate_fields(issue)
+    for field, query, operation in (
+        ("userContentEdits", ISSUE_EDITS_PAGE_QUERY, "IssueEditsPage"),
+        ("comments", ISSUE_COMMENTS_PAGE_QUERY, "IssueCommentsPage"),
+        ("timelineItems", ISSUE_TIMELINE_PAGE_QUERY, "IssueTimelinePage"),
+    ):
+        nodes = _paginate(http_post_json, issue.get(field), query, variables,
+                          operation, ("repository", "issue", field))
+        for node in nodes:
+            _validate_fields(node)
+            if field == "timelineItems":
+                if node.get("__typename") not in ("CrossReferencedEvent", "ConnectedEvent"):
+                    raise GraphQLResponseError("invalid_timeline_node")
+                for key in ("source", "subject"):
+                    if node.get(key) is not None:
+                        _validate_fields(_object(node, key))
+        issue[field]["nodes"] = nodes
     return issue
 
 
 def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str, pr_number: int) -> dict[str, Any]:
-    """Fetch pull request reviews, review comment threads, and conversation comments with pagination."""
-    vars_main = {"owner": owner, "repo": name, "number": pr_number}
-    data = _post_graphql(http_post_json, PULL_REQUEST_QUERY, vars_main, "PullRequestData")
-    repo = data.get("repository")
-    if repo is None:
-        raise GraphQLResponseError(f"GraphQL repository not found for variables: {vars_main}")
-    pr = repo.get("pullRequest")
-    if not pr:
-        raise GraphQLResponseError(f"Pull request #{pr_number} not found in {owner}/{name}")
-
-    # Normalize nullable connections
-    for field in ("reviews", "reviewThreads", "comments"):
-        if pr.get(field) is None:
-            pr[field] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
-
-    # Paginate PR conversation comments (Defect 9)
-    comments_field = pr.get("comments") or {}
-    pr_comments_nodes = list(comments_field.get("nodes") or [])
-    c_page_info = comments_field.get("pageInfo") or {}
-    while c_page_info.get("hasNextPage"):
-        cursor = c_page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"PR #{pr_number} comments hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            PR_COMMENTS_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": pr_number, "cursor": cursor},
-            "PullRequestCommentsPage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} comments pagination missing repository")
-        p_pr = repo_obj.get("pullRequest")
-        if not isinstance(p_pr, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} comments pagination missing pullRequest")
-        p_comments = p_pr.get("comments")
-        if not isinstance(p_comments, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} comments pagination missing comments")
-        c_page_info = p_comments.get("pageInfo")
-        if not isinstance(c_page_info, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} comments pagination missing pageInfo")
-        pr_comments_nodes.extend(p_comments.get("nodes") or [])
-    if "comments" in pr and pr["comments"] is not None:
-        pr["comments"]["nodes"] = pr_comments_nodes
-
-    # Paginate reviews
-    reviews_field = pr.get("reviews") or {}
-    reviews_nodes = list(reviews_field.get("nodes") or [])
-    r_page_info = reviews_field.get("pageInfo") or {}
-    while r_page_info.get("hasNextPage"):
-        cursor = r_page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"PR #{pr_number} reviews hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            PR_REVIEWS_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": pr_number, "cursor": cursor},
-            "PullRequestReviewsPage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviews pagination missing repository")
-        p_pr = repo_obj.get("pullRequest")
-        if not isinstance(p_pr, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviews pagination missing pullRequest")
-        p_reviews = p_pr.get("reviews")
-        if not isinstance(p_reviews, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviews pagination missing reviews")
-        r_page_info = p_reviews.get("pageInfo")
-        if not isinstance(r_page_info, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviews pagination missing pageInfo")
-        reviews_nodes.extend(p_reviews.get("nodes") or [])
-    if "reviews" in pr and pr["reviews"] is not None:
-        pr["reviews"]["nodes"] = reviews_nodes
-
-    # Paginate review threads
-    threads_field = pr.get("reviewThreads") or {}
-    threads_nodes = list(threads_field.get("nodes") or [])
-    t_page_info = threads_field.get("pageInfo") or {}
-    while t_page_info.get("hasNextPage"):
-        cursor = t_page_info.get("endCursor")
-        if not cursor:
-            raise GraphQLResponseError(f"PR #{pr_number} reviewThreads hasNextPage is true but endCursor is missing")
-        pdata = _post_graphql(
-            http_post_json,
-            PR_THREADS_PAGE_QUERY,
-            {"owner": owner, "repo": name, "number": pr_number, "cursor": cursor},
-            "PullRequestThreadsPage",
-        )
-        repo_obj = pdata.get("repository")
-        if not isinstance(repo_obj, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviewThreads pagination missing repository")
-        p_pr = repo_obj.get("pullRequest")
-        if not isinstance(p_pr, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviewThreads pagination missing pullRequest")
-        p_threads = p_pr.get("reviewThreads")
-        if not isinstance(p_threads, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviewThreads pagination missing reviewThreads")
-        t_page_info = p_threads.get("pageInfo")
-        if not isinstance(t_page_info, dict):
-            raise GraphQLResponseError(f"PR #{pr_number} reviewThreads pagination missing pageInfo")
-        threads_nodes.extend(p_threads.get("nodes") or [])
-
-    # Paginate comments inside each review thread
-    for thread in threads_nodes:
-        if thread.get("comments") is None:
-            thread["comments"] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
-        thread_id = thread.get("id")
-        c_field = thread.get("comments") or {}
-        c_nodes = list(c_field.get("nodes") or [])
-        c_page_info = c_field.get("pageInfo") or {}
-        while c_page_info.get("hasNextPage"):
-            if not thread_id:
-                raise GraphQLResponseError(f"PR #{pr_number} reviewThread has hasNextPage=True but id is missing")
-            cursor = c_page_info.get("endCursor")
-            if not cursor:
-                raise GraphQLResponseError(f"PR #{pr_number} reviewThread {thread_id} comments hasNextPage is true but endCursor is missing")
-            pdata = _post_graphql(
-                http_post_json,
-                PR_THREAD_COMMENTS_PAGE_QUERY,
-                {"id": thread_id, "cursor": cursor},
-                "PullRequestReviewThreadCommentsPage",
-            )
-            node_obj = pdata.get("node")
-            if not isinstance(node_obj, dict):
-                raise GraphQLResponseError(f"PR #{pr_number} reviewThread {thread_id} comments pagination missing node")
-            p_comments = node_obj.get("comments")
-            if not isinstance(p_comments, dict):
-                raise GraphQLResponseError(f"PR #{pr_number} reviewThread {thread_id} comments pagination missing comments")
-            c_page_info = p_comments.get("pageInfo")
-            if not isinstance(c_page_info, dict):
-                raise GraphQLResponseError(f"PR #{pr_number} reviewThread {thread_id} comments pagination missing pageInfo")
-            c_nodes.extend(p_comments.get("nodes") or [])
-        if "comments" in thread and thread["comments"] is not None:
-            thread["comments"]["nodes"] = c_nodes
-
-    if "reviewThreads" in pr and pr["reviewThreads"] is not None:
-        pr["reviewThreads"]["nodes"] = threads_nodes
-
+    variables = {"owner": owner, "repo": name, "number": pr_number}
+    data = _post_graphql(http_post_json, PULL_REQUEST_QUERY, variables, "PullRequestData")
+    pr = _object(_object(data, "repository"), "pullRequest")
+    for field, query, operation in (
+        ("comments", PR_COMMENTS_PAGE_QUERY, "PullRequestCommentsPage"),
+        ("reviews", PR_REVIEWS_PAGE_QUERY, "PullRequestReviewsPage"),
+        ("reviewThreads", PR_THREADS_PAGE_QUERY, "PullRequestThreadsPage"),
+    ):
+        nodes = _paginate(http_post_json, pr.get(field), query, variables,
+                          operation, ("repository", "pullRequest", field))
+        for node in nodes:
+            _validate_fields(node)
+            if field == "reviewThreads":
+                node["comments"]["nodes"] = _paginate(
+                    http_post_json, node.get("comments"), PR_THREAD_COMMENTS_PAGE_QUERY,
+                    {"id": node.get("id")}, "PullRequestReviewThreadCommentsPage", ("node", "comments"))
+                for comment in node["comments"]["nodes"]:
+                    _validate_fields(comment)
+        pr[field]["nodes"] = nodes
     return pr
 
 def _parse_github_item_url(url: str | None) -> tuple[str, str, int] | None:
@@ -1146,15 +1047,21 @@ def process_thread_scrub_and_revision(
     """Perform mutable-content revisioning and thread-scrub list generation.
 
     If token is not configured, or if GraphQL returns errors/malformed responses,
-    falls back cleanly to scraped content and records warnings, never crashing.
+    excludes unverifiable content and denies unresolved repository resources.
     """
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+        raise GraphQLResponseError("invalid_repository")
     owner, name = repo.split("/", 1)
     base_entries = get_solution_pr_scrub_entries(repo, pr_number, commit_shas=commit_shas)
 
     if target_issue_numbers is None:
         target_issue_numbers = [target_issue_number] if target_issue_number is not None else []
 
-    unrev_warning = "problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)"
+    unrev_warning = "unverifiable_content_excluded"
+
+    def deny_unresolved_scope(entries: list[ScrubEntry]) -> None:
+        for url in ("https://github.com/", "https://api.github.com/"):
+            entries.append(ScrubEntry("unresolved_scope", url, "incomplete discovery; deny GitHub scope", "prefix"))
 
     # Fallback state if token missing or query fails
     def make_fallback(warning_msg: str | None = None, entries: list[ScrubEntry] | None = None) -> ScrubResult:
@@ -1162,14 +1069,16 @@ def process_thread_scrub_and_revision(
             warnings_list.append(warning_msg)
         if unrev_warning not in warnings_list:
             warnings_list.append(unrev_warning)
+        denied = list(entries if entries is not None else base_entries)
+        deny_unresolved_scope(denied)
         return ScrubResult(
-            problem_statement=scraped_problem_statement,
-            hints_text=scraped_hints,
-            problem_statement_revision="as_scraped",
+            problem_statement="",
+            hints_text="",
+            problem_statement_revision="excluded",
             chosen_revision_edited_at=None,
             edits_ignored=0,
             hints_revisioned=False,
-            scrub_entries=dedupe_and_sort_entries(entries if entries is not None else base_entries),
+            scrub_entries=dedupe_and_sort_entries(denied),
             hints_excluded_no_history=0,
             hints_excluded_no_created_at=0,
         )
@@ -1180,6 +1089,11 @@ def process_thread_scrub_and_revision(
     post_client = http_post_json if http_post_json is not None else make_http_post_json(
         cache_dir, token=token, snapshot_id=snapshot_id, refresh=refresh
     )
+
+    begin_snapshot = getattr(post_client, "begin_snapshot", None)
+    if begin_snapshot is not None:
+        post_client = begin_snapshot(snapshot_id=snapshot_id, refresh=refresh)
+    post_client = _RunClient(post_client)
 
     # 1. Fetch Pull Request scrub items (reviews, review comments, conversation comments)
     pr_entries: list[ScrubEntry] = list(base_entries)
@@ -1237,17 +1151,17 @@ def process_thread_scrub_and_revision(
                     url=f"https://api.github.com/repos/{repo}/issues/comments/{c_id}",
                     reason="solution PR conversation comment API URL",
                 ))
-    except Exception as exc:
-        warnings_list.append(f"Failed fetching PR scrub details via GraphQL ({exc}); using static PR endpoints")
+    except Exception:
+        return make_fallback("pr_discovery_failed; repository_scope_denied", pr_entries)
 
     # Case A: No target GitHub issue to revision (Trac, Django, no issue reference)
     if len(target_issue_numbers) == 0:
         if unrev_warning not in warnings_list:
             warnings_list.append(unrev_warning)
         return ScrubResult(
-            problem_statement=scraped_problem_statement,
-            hints_text=scraped_hints,
-            problem_statement_revision="as_scraped",
+            problem_statement="",
+            hints_text="",
+            problem_statement_revision="excluded",
             chosen_revision_edited_at=None,
             edits_ignored=0,
             hints_revisioned=False,
@@ -1266,9 +1180,8 @@ def process_thread_scrub_and_revision(
         for iss_num in target_issue_numbers:
             try:
                 iss_data = fetch_target_issue_data(post_client, owner, name, iss_num)
-            except Exception as exc:
-                warnings_list.append(f"GraphQL request for issue #{iss_num} failed ({exc}); skipping scrub for issue #{iss_num}")
-                continue
+            except Exception:
+                return make_fallback("issue_discovery_failed; repository_scope_denied", all_entries)
 
             # Scrub post-T_world comments on this issue
             for c in (iss_data.get("comments") or {}).get("nodes") or []:
@@ -1279,6 +1192,8 @@ def process_thread_scrub_and_revision(
                     m = re.search(r"#issuecomment-(\d+)", c_url)
                     if m:
                         c_id = m.group(1)
+                if c_created is None:
+                    deny_unresolved_scope(all_entries)
                 if c_created and c_created > t_world:
                     if c_url:
                         all_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="target issue comment created after T_world"))
@@ -1294,9 +1209,9 @@ def process_thread_scrub_and_revision(
             _add_linked_refs_scrub_entries(all_entries, iss_data, repo, target_set)
 
         return ScrubResult(
-            problem_statement=scraped_problem_statement,
-            hints_text=scraped_hints,
-            problem_statement_revision="as_scraped",
+            problem_statement="",
+            hints_text="",
+            problem_statement_revision="excluded",
             chosen_revision_edited_at=None,
             edits_ignored=0,
             hints_revisioned=False,
@@ -1309,21 +1224,21 @@ def process_thread_scrub_and_revision(
     single_issue_number = target_issue_numbers[0]
     try:
         issue_data = fetch_target_issue_data(post_client, owner, name, single_issue_number)
-    except Exception as exc:
+    except Exception:
         return make_fallback(
-            f"GraphQL request for issue #{single_issue_number} failed ({exc}); falling back to scraped content",
+            "issue_discovery_failed; repository_scope_denied",
             entries=pr_entries,
         )
 
     # 3. Revision target issue problem statement
-    title, body_scraped = split_title_and_body(scraped_problem_statement)
+    title, _ = split_title_and_body(scraped_problem_statement)
     issue_created = parse_iso(issue_data.get("createdAt")) or target_issue_created
     last_edited = parse_iso(issue_data.get("lastEditedAt"))
     user_edits = list((issue_data.get("userContentEdits") or {}).get("nodes") or [])
     includes_created = issue_data.get("includesCreatedEdit")
 
     rev_res = select_revision(
-        scraped_body=body_scraped,
+        scraped_body=issue_data.get("body"),
         created_at=issue_created,
         last_edited_at=last_edited,
         user_content_edits=user_edits,
@@ -1331,13 +1246,17 @@ def process_thread_scrub_and_revision(
         is_target_issue=True,
         includes_created_edit=includes_created,
     )
+    if ("lastEditedAt" not in issue_data or
+            (issue_data["lastEditedAt"] is not None and last_edited is None) or
+            issue_created is None):
+        rev_res = RevisionResult("", "excluded", None, 0, "invalid_issue_edit_status; content excluded")
     if rev_res.warning:
         warnings_list.append(rev_res.warning)
-    if rev_res.revision_type == "as_scraped" and (last_edited is not None or rev_res.warning):
+    if rev_res.revision_type == "excluded":
         if unrev_warning not in warnings_list:
             warnings_list.append(unrev_warning)
 
-    final_problem_statement = reconstruct_problem_statement(title, rev_res.body)
+    final_problem_statement = reconstruct_problem_statement(title, rev_res.body) if rev_res.revision_type != "excluded" else ""
 
     # 4. Revision hints & target issue comments scrub
     comments_nodes = list((issue_data.get("comments") or {}).get("nodes") or [])
@@ -1356,10 +1275,11 @@ def process_thread_scrub_and_revision(
             m = re.search(r"#issuecomment-(\d+)", c_url)
             if m:
                 c_db_id = m.group(1)
-        c_comment_ident = str(c_db_id or comment.get("id") or c_url or "unknown")
+        c_comment_ident = str(c_db_id) if type(c_db_id) is int else "unknown"
 
         # Defect 4: Comment with missing or unparseable createdAt
         if c_created is None:
+            deny_unresolved_scope(all_entries)
             hints_excluded_no_created_at += 1
             warnings_list.append(f"Comment {c_comment_ident}: missing or unparseable createdAt; excluded from hints")
             continue
@@ -1378,6 +1298,11 @@ def process_thread_scrub_and_revision(
             continue
 
         # Comment was created at or before T_world
+        if ("lastEditedAt" not in comment or
+                (comment["lastEditedAt"] is not None and c_last_edited is None)):
+            hints_excluded_no_history += 1
+            warnings_list.append(f"Comment {c_comment_ident}: invalid_edit_status; excluded from hints")
+            continue
         if c_last_edited is None:
             # Never edited: verified revision as of T_world
             kept_comments_bodies.append(comment.get("body") or "")
@@ -1386,34 +1311,9 @@ def process_thread_scrub_and_revision(
 
         # Comment has lastEditedAt set: must have usable history
         try:
-            c_edits_obj = comment.get("userContentEdits") or {}
-            c_edits = list(c_edits_obj.get("nodes") or [])
-            c_page_info = c_edits_obj.get("pageInfo") or {}
-            c_id = comment.get("id")
-
-            # Defect 2: Paginate userContentEdits with incomplete checks
-            while c_page_info.get("hasNextPage"):
-                if not c_id:
-                    raise GraphQLResponseError(f"Comment {c_comment_ident} has hasNextPage=True but id is missing")
-                cursor = c_page_info.get("endCursor")
-                if not cursor:
-                    raise GraphQLResponseError(f"Comment {c_comment_ident} has hasNextPage=True but endCursor is missing")
-                pdata = _post_graphql(
-                    post_client,
-                    COMMENT_EDITS_PAGE_QUERY,
-                    {"id": c_id, "cursor": cursor},
-                    "CommentEditsPage",
-                )
-                node_data = pdata.get("node")
-                if not isinstance(node_data, dict):
-                    raise GraphQLResponseError(f"Comment {c_comment_ident} pagination missing node")
-                c_p_edits = node_data.get("userContentEdits")
-                if not isinstance(c_p_edits, dict):
-                    raise GraphQLResponseError(f"Comment {c_comment_ident} pagination missing userContentEdits")
-                c_page_info = c_p_edits.get("pageInfo")
-                if not isinstance(c_page_info, dict):
-                    raise GraphQLResponseError(f"Comment {c_comment_ident} pagination missing pageInfo")
-                c_edits.extend(c_p_edits.get("nodes") or [])
+            c_edits = _paginate(post_client, comment.get("userContentEdits"),
+                                 COMMENT_EDITS_PAGE_QUERY, {"id": comment.get("id")},
+                                 "CommentEditsPage", ("node", "userContentEdits"))
 
             # Defect 1: check empty userContentEdits
             if not c_edits:
@@ -1433,8 +1333,8 @@ def process_thread_scrub_and_revision(
             )
 
             # Defect 1: If includesCreatedEdit is not true and no edit qualifies,
-            # or chosen diff is null, select_revision returns as_scraped with warning
-            if c_rev.revision_type == "as_scraped" or c_rev.warning:
+            # or chosen diff is null, select_revision excludes the content with a warning
+            if c_rev.revision_type in ("as_scraped", "excluded") or c_rev.warning:
                 hints_excluded_no_history += 1
                 warnings_list.append(f"Comment {c_comment_ident}: {c_rev.warning or 'no usable edit history'}; excluded from hints")
                 continue
@@ -1442,10 +1342,10 @@ def process_thread_scrub_and_revision(
             kept_comments_bodies.append(c_rev.body)
             kept_comments_verified.append(True)
 
-        except Exception as exc:
+        except Exception:
             # Defect 5: comment edit pagination failure cleanly caught
             hints_excluded_no_history += 1
-            warnings_list.append(f"Comment {c_comment_ident}: failed fetching or processing edit history ({exc}); excluded from hints")
+            warnings_list.append(f"Comment {c_comment_ident}: failed fetching or processing edit history; excluded from hints")
             continue
 
     final_hints = "\n".join(kept_comments_bodies) if kept_comments_bodies else ""

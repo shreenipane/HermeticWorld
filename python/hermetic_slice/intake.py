@@ -13,8 +13,11 @@ import urllib.parse
 
 from hermetic_slice.cutoffs import Cutoffs, FixCommit, compute_cutoffs, ensure_utc
 from hermetic_slice.gitutil import GitError, run_git
-from hermetic_slice.http import HttpError, HttpGet, HttpPostJson, atomic_write_bytes
+from hermetic_slice.http import HttpError, HttpGet, HttpPostJson, atomic_write_bytes, open_secure_directory
 from hermetic_slice.thread_scrub import process_thread_scrub_and_revision
+
+
+MAX_TASK_ARTIFACT_BYTES = 32 * 1024 * 1024
 
 
 class IntakeError(Exception):
@@ -284,6 +287,8 @@ def intake_task(
     refresh: bool = False,
 ) -> Path:
     """Ingest a SWE-bench task, computing cutoffs and creating isolated staging/agent files."""
+    if not isinstance(instance_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", instance_id) or instance_id in (".", ".."):
+        raise IntakeError("invalid_instance_id")
     if instance_id not in rows:
         raise IntakeError(f"Task instance ID {instance_id} not found in verified rows")
 
@@ -342,7 +347,7 @@ def intake_task(
     elif not resolved_issue_refs:
         warnings_list.append(f"No valid issue reference resolved for PR {pr_number}")
     elif len(resolved_issue_refs) > 1:
-        warnings_list.append(f"Multiple issue references resolved for PR {pr_number}; problem statement left as scraped")
+        warnings_list.append(f"Multiple issue references resolved for PR {pr_number}; unverifiable content excluded")
 
     base_commit_time, repo_first_commit_time = repo_dates(
         repo,
@@ -449,25 +454,46 @@ def intake_task(
         "warnings": warnings_list,
     }
 
-    task_dir = out_dir / instance_id
-    agent_dir = task_dir / "agent"
-    staging_dir = task_dir / "staging"
-    if agent_dir.exists():
-        shutil.rmtree(agent_dir)
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    agent_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    # Validate and encode every artifact before changing the published task.
+    artifacts = {
+        "agent/problem_statement.md": scrub_result.problem_statement,
+        "staging/gold.patch": row.get("patch", ""),
+        "staging/test.patch": row.get("test_patch", ""),
+        "staging/hints.txt": scrub_result.hints_text,
+        "staging/thread_scrub.json": json.dumps(scrub_result.scrub_entries, indent=2, sort_keys=True) + "\n",
+        "task.json": json.dumps(task_json_data, indent=2, sort_keys=True) + "\n",
+    }
+    encoded = {}
+    for path, content in artifacts.items():
+        if not isinstance(content, str) or len(content) > MAX_TASK_ARTIFACT_BYTES:
+            raise IntakeError("invalid_task_artifact")
+        data = content.encode("utf-8")
+        if len(data) > MAX_TASK_ARTIFACT_BYTES:
+            raise IntakeError("task_artifact_limit")
+        encoded[path] = data
 
-    (task_dir / "task.json").write_text(json.dumps(task_json_data, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
-    (agent_dir / "problem_statement.md").write_text(scrub_result.problem_statement, encoding="utf-8", newline="")
-    (staging_dir / "gold.patch").write_text(row.get("patch", ""), encoding="utf-8", newline="")
-    (staging_dir / "test.patch").write_text(row.get("test_patch", ""), encoding="utf-8", newline="")
-    (staging_dir / "hints.txt").write_text(scrub_result.hints_text, encoding="utf-8", newline="")
-    (staging_dir / "thread_scrub.json").write_text(
-        json.dumps(scrub_result.scrub_entries, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    task_dir = out_dir / instance_id
+    task_fd = None
+    try:
+        task_fd = open_secure_directory(task_dir)
+        # task.json is the completion marker; invalidate it before replacing artifacts.
+        try:
+            os.unlink("task.json", dir_fd=task_fd)
+        except FileNotFoundError:
+            pass
+        for name in ("agent", "staging"):
+            directory = task_dir / name
+            checked_fd = open_secure_directory(directory)
+            os.close(checked_fd)
+            shutil.rmtree(directory)
+            checked_fd = open_secure_directory(directory)
+            os.close(checked_fd)
+        for path, data in encoded.items():
+            atomic_write_bytes(task_dir / path, data)
+    except Exception:
+        raise IntakeError("task_publication_failed") from None
+    finally:
+        if task_fd is not None:
+            os.close(task_fd)
 
     return task_dir
