@@ -1,0 +1,42 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_defect2",
+        "databaseId": 302,
+        "url": "https://github.com/test-org/test-repo/issues/302",
+        "body": "Scraped body of issue with truncated history",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": "2020-01-05T10:00:00Z",
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": true,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-05T10:00:00Z",
+              "editedAt": "2020-01-05T10:00:00Z",
+              "diff": "Later revision that should never be certified"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

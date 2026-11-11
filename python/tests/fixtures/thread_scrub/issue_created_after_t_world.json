@@ -8,6 +8,7 @@
         "body": "Second revision with new details",
         "createdAt": "2020-02-01T10:00:00Z",
         "lastEditedAt": "2020-02-05T10:00:00Z",
+        "includesCreatedEdit": true,
         "userContentEdits": {
           "pageInfo": {
             "hasNextPage": false,

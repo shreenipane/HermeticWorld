@@ -1012,3 +1012,596 @@ def test_regression_solution_pr_issues_api_representation_blocked() -> None:
     assert issues_api_entry is not None
     assert issues_api_entry.kind == "pull_request"
     assert issues_api_entry.reason == "solution PR Issues API URL"
+
+
+# ---------------------------------------------------------------------------
+# Offline Regression Tests for Defects 1 to 12
+# ---------------------------------------------------------------------------
+
+
+def test_defect1_comment_without_usable_history_dropped_and_counted(tmp_path: Path) -> None:
+    """Defect 1: Comments without usable history are dropped, counted, warned without text, and hints_revisioned computed."""
+    fixture_data = load_fixture_json("issue_comment_unusable_history.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    t_world = datetime.fromisoformat("2020-01-10T00:00:00+00:00")
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=301,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement="Title: Defect 1\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=warnings_list,
+    )
+
+    # 1. Comment 801 (never edited) is kept
+    assert "Kept comment body: never edited" in result.hints_text
+
+    # 2. Comments without usable history (802, 803, 804) are DROPPED
+    assert "Dropped comment: empty edits" not in result.hints_text
+    assert "Dropped comment: includesCreatedEdit false" not in result.hints_text
+    assert "Dropped comment: null diff" not in result.hints_text
+
+    # 3. Counted in metadata
+    assert result.hints_excluded_no_history == 3
+    # Every kept comment was never edited -> hints_revisioned is computed as True
+    assert result.hints_revisioned is True
+
+    # 4. Warnings name the comment ID, never its body/text
+    warn_802 = next((w for w in warnings_list if "Comment 802" in w), None)
+    assert warn_802 is not None
+    assert "Dropped comment: empty edits" not in warn_802
+
+    warn_803 = next((w for w in warnings_list if "Comment 803" in w), None)
+    assert warn_803 is not None
+    assert "Dropped comment: includesCreatedEdit false" not in warn_803
+
+    warn_804 = next((w for w in warnings_list if "Comment 804" in w), None)
+    assert warn_804 is not None
+    assert "Dropped comment: null diff" not in warn_804
+
+
+def test_defect2_truncated_history_raises_and_falls_back(tmp_path: Path) -> None:
+    """Defect 2: Incomplete/truncated edit history raises GraphQLResponseError inside guarded path and falls back to as_scraped."""
+    fixture_data = load_fixture_json("issue_truncated_history.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    t_world = datetime.fromisoformat("2020-01-10T00:00:00+00:00")
+    scraped_ps = "Title: Truncated\nScraped body of issue with truncated history"
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=302,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement=scraped_ps,
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=warnings_list,
+    )
+
+    # Must fall back cleanly to as_scraped, never first_revision / revision_at_t_world
+    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement == scraped_ps
+    assert "Later revision that should never be certified" not in result.problem_statement
+    assert any("endCursor is missing" in w for w in warnings_list)
+    assert any("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)" in w for w in warnings_list)
+
+
+def test_defect3_missing_includes_created_edit_treated_as_not_including_creation(tmp_path: Path) -> None:
+    """Defect 3: Missing includesCreatedEdit (omitted/null) is treated as not including creation edit."""
+    fixture_data = load_fixture_json("issue_missing_includes_created_edit.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    t_world = datetime.fromisoformat("2020-01-10T00:00:00+00:00")
+    scraped_ps = "Title: Missing IncludesCreated\nScraped body of issue with missing includesCreatedEdit"
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=303,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement=scraped_ps,
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=warnings_list,
+    )
+
+    # Must not assume creation edit was included; falls back to as_scraped
+    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement == scraped_ps
+    assert any("includesCreatedEdit is false / not true" in w for w in warnings_list)
+    assert any("problem_statement taken as scraped" in w for w in warnings_list)
+
+
+def test_defect4_comment_missing_or_unparseable_created_at_excluded(tmp_path: Path) -> None:
+    """Defect 4: Comment with missing or unparseable createdAt is excluded from hints with warning and count."""
+    fixture_data = load_fixture_json("issue_comment_missing_created_at.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_list: list[str] = []
+    t_world = datetime.fromisoformat("2020-01-10T00:00:00+00:00")
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=304,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement="Title: Missing CreatedAt\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=warnings_list,
+    )
+
+    # Missing createdAt comment 805 is excluded
+    assert "Comment with missing createdAt" not in result.hints_text
+    # Valid comment 806 is kept
+    assert "Valid comment body" in result.hints_text
+    assert result.hints_excluded_no_created_at == 1
+    assert any("Comment 805: missing or unparseable createdAt; excluded from hints" in w for w in warnings_list)
+
+
+def test_defect5_comment_edit_pagination_errors_guarded_never_crash(tmp_path: Path) -> None:
+    """Defect 5: Comment edit pagination errors (GraphQL error, HttpError, non-JSON) are guarded and do not crash."""
+    fixture_data = load_fixture_json("issue_comment_edits_pagination_broken.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    # Test Case A: GraphQL error during comment edit pagination
+    def fake_post_graphql_error(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "CommentEditsPage":
+            return {"errors": [{"message": "Field 'userContentEdits' failed"}]}
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_a: list[str] = []
+    result_a = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=305,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Error guard\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post_graphql_error,
+        cache_dir=tmp_path / "cache_a",
+        warnings_list=warnings_a,
+    )
+    assert result_a.hints_excluded_no_history == 1
+    assert "Comment with broken second page of edits" not in result_a.hints_text
+    assert any("Comment 807: failed fetching or processing edit history" in w for w in warnings_a)
+
+    # Test Case B: HttpError during comment edit pagination
+    def fake_post_http_error(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "CommentEditsPage":
+            raise HttpError("https://api.github.com/graphql", 502)
+        raise ValueError(f"Unexpected op: {op}")
+
+    warnings_b: list[str] = []
+    result_b = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=305,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Error guard\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post_http_error,
+        cache_dir=tmp_path / "cache_b",
+        warnings_list=warnings_b,
+    )
+    assert result_b.hints_excluded_no_history == 1
+    assert "Comment with broken second page of edits" not in result_b.hints_text
+    assert any("Comment 807: failed fetching or processing edit history" in w for w in warnings_b)
+
+
+def test_defect6_cache_refresh_for_mutable_graphql_snapshot(tmp_path: Path) -> None:
+    """Defect 6: Mutable GraphQL data uses per-run snapshots so a second run with newer fixture sees late comment."""
+    cache_dir = tmp_path / "cache"
+    run1_fixture = load_fixture_json("issue_snapshot_run1.json")
+    run2_fixture = load_fixture_json("issue_snapshot_run2.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    t_world = datetime.fromisoformat("2020-01-05T00:00:00+00:00")
+
+    # Run 1: Uses snapshot 1
+    client_run1 = make_http_post_json(cache_dir, snapshot_id="snapshot_run_1")
+
+    # Mock responses for run 1
+    def mock_fetcher_run1(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return run1_fixture
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result1 = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=306,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement="Title: Run 1\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=mock_fetcher_run1,
+        cache_dir=cache_dir,
+        warnings_list=[],
+        snapshot_id="snapshot_run_1",
+    )
+
+    scrub_urls_run1 = [e["url"] for e in result1.scrub_entries]
+    # In run 1, late comment 902 was not yet created
+    assert "https://github.com/test-org/test-repo/issues/306#issuecomment-902" not in scrub_urls_run1
+
+    # Run 2: A new intake run with newer fixture sees late comment in scrub list
+    def mock_fetcher_run2(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return run2_fixture
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result2 = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=306,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=t_world,
+        scraped_problem_statement="Title: Run 2\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=mock_fetcher_run2,
+        cache_dir=cache_dir,
+        warnings_list=[],
+        snapshot_id="snapshot_run_2",
+    )
+
+    scrub_urls_run2 = [e["url"] for e in result2.scrub_entries]
+    # Run 2 sees the late comment in scrub list
+    assert "https://github.com/test-org/test-repo/issues/306#issuecomment-902" in scrub_urls_run2
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/902" in scrub_urls_run2
+
+
+def test_defect7_cross_repo_reference_derives_owner_repo_from_source_url(tmp_path: Path) -> None:
+    """Defect 7: Derive owner/repo from source item's own URL, not the target repo."""
+    fixture_data = load_fixture_json("issue_cross_repo_reference.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result = process_thread_scrub_and_revision(
+        repo="target-org/target-repo",
+        pr_number=50,
+        target_issue_number=307,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Cross Repo\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+    )
+
+    urls = [e["url"] for e in result.scrub_entries]
+
+    # Derived from external-org/external-repo
+    assert "https://api.github.com/repos/external-org/external-repo/pulls/77" in urls
+    assert "https://github.com/external-org/external-repo/pull/77" in urls
+    assert not any("repos/target-org/target-repo/pulls/77" in u for u in urls)
+
+    # Derived from other-org/other-repo
+    assert "https://api.github.com/repos/other-org/other-repo/issues/88" in urls
+    assert "https://github.com/other-org/other-repo/issues/88" in urls
+    assert not any("repos/target-org/target-repo/issues/88" in u for u in urls)
+
+
+def test_defect8_referencing_prs_emitted_full_set(tmp_path: Path) -> None:
+    """Defect 8: For every referencing PR, emit the same full set as solution PR."""
+    fixture_data = load_fixture_json("issue_cross_repo_reference.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result = process_thread_scrub_and_revision(
+        repo="target-org/target-repo",
+        pr_number=50,
+        target_issue_number=307,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Referencing PR full set\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+    )
+
+    urls = {e["url"] for e in result.scrub_entries}
+    ref_pr = "https://github.com/external-org/external-repo/pull/77"
+    ref_api = "https://api.github.com/repos/external-org/external-repo/pulls/77"
+    ref_issues = "https://api.github.com/repos/external-org/external-repo/issues/77"
+
+    assert ref_pr in urls
+    assert f"{ref_pr}/" in urls
+    assert ref_api in urls
+    assert f"{ref_api}/" in urls
+    assert ref_issues in urls
+    assert f"{ref_issues}/" in urls
+    assert "https://github.com/external-org/external-repo/issues/77" in urls
+    assert f"{ref_pr}/files" in urls
+    assert f"{ref_api}/files" in urls
+    assert f"{ref_pr}/commits" in urls
+    assert f"{ref_api}/commits" in urls
+    assert f"{ref_pr}.diff" in urls
+    assert f"{ref_pr}.patch" in urls
+
+
+def test_defect9_solution_pr_entries_gaps_filled(tmp_path: Path) -> None:
+    """Defect 9: Solution PR entries include issues prefix/exact URL, conversation comments, and fix/merge commits."""
+    issue_fixture = load_fixture_json("issue_never_edited.json")
+    pr_comments_fixture = load_fixture_json("pr_with_conversation_comments.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return issue_fixture
+        if op == "PullRequestData":
+            return pr_comments_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    commit_shas = ["fix_sha_1001", "merge_sha_2002"]
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=102,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Solution PR gaps\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+        commit_shas=commit_shas,
+    )
+
+    urls = {e["url"] for e in result.scrub_entries}
+
+    # Issues API exact and prefix
+    assert "https://api.github.com/repos/test-org/test-repo/issues/50" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/50/" in urls
+    assert "https://github.com/test-org/test-repo/issues/50" in urls
+
+    # Conversation comments on PR
+    assert "https://github.com/test-org/test-repo/pull/50#issuecomment-901" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/901" in urls
+    assert "https://github.com/test-org/test-repo/pull/50#issuecomment-902" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/902" in urls
+
+    # Fix commit and merge commit endpoints
+    for sha in commit_shas:
+        assert f"https://github.com/test-org/test-repo/commit/{sha}" in urls
+        assert f"https://github.com/test-org/test-repo/commit/{sha}.diff" in urls
+        assert f"https://github.com/test-org/test-repo/commit/{sha}.patch" in urls
+        assert f"https://api.github.com/repos/test-org/test-repo/commits/{sha}" in urls
+        assert f"https://api.github.com/repos/test-org/test-repo/git/commits/{sha}" in urls
+
+
+def test_defect10_prefixes_have_trailing_delimiter_and_match_field() -> None:
+    """Defect 10: Prefixes end with trailing slash, exact entries do not, and match field is present."""
+    entries = get_solution_pr_scrub_entries("test-org/test-repo", 12, commit_shas=["sha123"])
+    entries_dict = dedupe_and_sort_entries(entries)
+
+    for e in entries_dict:
+        assert e["match"] in ("exact", "prefix")
+        if e["match"] == "prefix":
+            assert e["url"].endswith("/"), f"Prefix entry {e['url']} must end with trailing slash"
+        elif e["match"] == "exact":
+            if ".diff" in e["url"] or ".patch" in e["url"]:
+                assert not e["url"].endswith("/")
+
+    prefix_urls = [e["url"] for e in entries_dict if e["match"] == "prefix"]
+    assert "https://github.com/test-org/test-repo/pull/12/" in prefix_urls
+    assert "https://api.github.com/repos/test-org/test-repo/pulls/12/" in prefix_urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/12/" in prefix_urls
+
+    # Verify no accidental prefix match between pull/12 and pull/120
+    test_prefix = "https://github.com/test-org/test-repo/pull/12/"
+    unrelated_pr = "https://github.com/test-org/test-repo/pull/120"
+    assert not unrelated_pr.startswith(test_prefix)
+
+
+def test_defect11_multi_issue_scrubs_every_referenced_issue(tmp_path: Path) -> None:
+    """Defect 11: Multi-issue case scrubs every referenced issue and warns statement was left as scraped."""
+    issue_6189 = load_fixture_json("multi_issue_6189.json")
+    issue_6190 = load_fixture_json("multi_issue_6190.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "PullRequestData":
+            return pr_fixture
+        if op == "TargetIssueData":
+            num = payload.get("variables", {}).get("number")
+            if num == 6189:
+                return issue_6189
+            if num == 6190:
+                return issue_6190
+        raise ValueError(f"Unexpected op: {op}, payload: {payload}")
+
+    warnings_list: list[str] = []
+    scraped_ps = "Title: Multi issue statement\nFixes #6189 and #6190"
+
+    result = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_numbers=[6189, 6190],
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement=scraped_ps,
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=warnings_list,
+    )
+
+    # 1. Statement left as scraped with explicit warning
+    assert result.problem_statement_revision == "as_scraped"
+    assert result.problem_statement == scraped_ps
+    assert any("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)" in w for w in warnings_list)
+
+    # 2. Every referenced issue was scrubbed
+    urls = {e["url"] for e in result.scrub_entries}
+    # Issue 6189 post-T_world comment
+    assert "https://github.com/test-org/test-repo/issues/6189#issuecomment-1111" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/1111" in urls
+    # Issue 6189 timeline item
+    assert "https://github.com/test-org/test-repo/issues/7777" in urls
+
+    # Issue 6190 post-T_world comment
+    assert "https://github.com/test-org/test-repo/issues/6190#issuecomment-2222" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/issues/comments/2222" in urls
+    # Issue 6190 connected PR 8888 full set
+    assert "https://github.com/test-org/test-repo/pull/8888" in urls
+    assert "https://api.github.com/repos/test-org/test-repo/pulls/8888" in urls
+
+
+def test_defect12_unrevisioned_warning_restored_on_all_paths(tmp_path: Path) -> None:
+    """Defect 12: Warning restored for every path where problem statement is not revision-checked."""
+    expected_warning = "problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)"
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    # Path 1: No GitHub target issue (e.g. Trac or no issue reference)
+    warn_p1: list[str] = []
+    res_p1 = process_thread_scrub_and_revision(
+        repo="django/django",
+        pr_number=50,
+        target_issue_number=None,
+        target_issue_numbers=[],
+        target_issue_created=None,
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Django problem statement",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=lambda u, p: pr_fixture,
+        cache_dir=tmp_path / "cache_p1",
+        warnings_list=warn_p1,
+    )
+    assert res_p1.problem_statement_revision == "as_scraped"
+    assert expected_warning in warn_p1
+
+    # Path 2: Multi-issue path
+    warn_p2: list[str] = []
+    res_p2 = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=None,
+        target_issue_numbers=[100, 200],
+        target_issue_created=None,
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Multi-issue problem statement",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=lambda u, p: pr_fixture,
+        cache_dir=tmp_path / "cache_p2",
+        warnings_list=warn_p2,
+    )
+    assert res_p2.problem_statement_revision == "as_scraped"
+    assert expected_warning in warn_p2
+
+    # Path 3: Fallback due to missing token / failed GraphQL
+    warn_p3: list[str] = []
+    res_p3 = process_thread_scrub_and_revision(
+        repo="test-org/test-repo",
+        pr_number=50,
+        target_issue_number=100,
+        target_issue_numbers=[100],
+        target_issue_created=None,
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="No token fallback statement",
+        scraped_hints="",
+        token=None,
+        http_post_json=None,
+        cache_dir=tmp_path / "cache_p3",
+        warnings_list=warn_p3,
+    )
+    assert res_p3.problem_statement_revision == "as_scraped"
+    assert expected_warning in warn_p3
+

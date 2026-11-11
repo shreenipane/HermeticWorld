@@ -1,0 +1,59 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_defect7",
+        "databaseId": 307,
+        "url": "https://github.com/target-org/target-repo/issues/307",
+        "body": "Issue with cross repo references",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "__typename": "CrossReferencedEvent",
+              "url": "https://github.com/target-org/target-repo/issues/307#event-crossref-1",
+              "source": {
+                "__typename": "PullRequest",
+                "number": 77,
+                "url": "https://github.com/external-org/external-repo/pull/77"
+              }
+            },
+            {
+              "__typename": "ConnectedEvent",
+              "source": {
+                "__typename": "Issue",
+                "number": 88,
+                "url": "https://github.com/other-org/other-repo/issues/88"
+              },
+              "subject": {
+                "__typename": "Issue",
+                "number": 307,
+                "url": "https://github.com/target-org/target-repo/issues/307"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

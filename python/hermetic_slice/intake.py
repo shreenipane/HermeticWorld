@@ -280,6 +280,8 @@ def intake_task(
     *,
     token: str | None = None,
     http_post_json: HttpPostJson | None = None,
+    snapshot_id: str | None = None,
+    refresh: bool = False,
 ) -> Path:
     """Ingest a SWE-bench task, computing cutoffs and creating isolated staging/agent files."""
     if instance_id not in rows:
@@ -357,15 +359,27 @@ def intake_task(
         repo_first_commit_time=repo_first_commit_time,
     )
 
+    target_issue_numbers = [
+        ref.number
+        for _, ref in resolved_issue_refs
+        if ref.kind == "github"
+    ]
     target_issue_number = (
-        earliest_ref.number
-        if (len(resolved_issue_refs) == 1 and earliest_ref.kind == "github")
+        target_issue_numbers[0]
+        if len(target_issue_numbers) == 1
         else None
     )
+
+    solution_commit_shas: list[str] = [fc.sha for fc in fix_commits]
+    merge_sha = pr_data.get("merge_commit_sha")
+    if merge_sha and merge_sha not in solution_commit_shas:
+        solution_commit_shas.append(merge_sha)
+
     scrub_result = process_thread_scrub_and_revision(
         repo=repo,
         pr_number=pr_number,
         target_issue_number=target_issue_number,
+        target_issue_numbers=target_issue_numbers,
         target_issue_created=earliest_issue_created,
         t_world=cutoffs.t_world,
         scraped_problem_statement=row.get("problem_statement", ""),
@@ -374,6 +388,9 @@ def intake_task(
         http_post_json=http_post_json,
         cache_dir=cache_dir,
         warnings_list=warnings_list,
+        commit_shas=solution_commit_shas,
+        snapshot_id=snapshot_id,
+        refresh=refresh,
     )
 
     image = "swebench/sweb.eval.x86_64." + instance_id.lower().replace("__", "_1776_") + ":latest"
@@ -408,6 +425,8 @@ def intake_task(
             "repo_first_commit_time": iso_utc(repo_first_commit_time),
         },
         "environment_setup_commit": row.get("environment_setup_commit", ""),
+        "hints_excluded_no_created_at": scrub_result.hints_excluded_no_created_at,
+        "hints_excluded_no_history": scrub_result.hints_excluded_no_history,
         "hints_revisioned": scrub_result.hints_revisioned,
         "image": image,
         "instance_id": instance_id,

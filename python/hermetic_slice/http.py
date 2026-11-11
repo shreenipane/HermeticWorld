@@ -13,6 +13,7 @@ import time
 from typing import Any
 import urllib.error
 import urllib.request
+import uuid
 
 
 class HttpError(Exception):
@@ -107,9 +108,18 @@ def make_http_post_json(
     *,
     sleep: Callable[[float], None] = time.sleep,
     token: str | None = None,
+    snapshot_id: str | None = None,
+    refresh: bool = False,
 ) -> HttpPostJson:
-    """Create an HttpPostJson callable backed by a disk cache, token handling, and retry logic."""
+    """Create an HttpPostJson callable backed by a disk cache, token handling, and retry logic.
+
+    Mutable GraphQL data is cached per consistent snapshot. A unique snapshot_id isolates
+    intake runs so cached pages from an older run are not reused across runs, while pages
+    within one run are cached and reused.
+    """
     http_cache_dir = cache_dir / "http"
+    if snapshot_id is None or refresh:
+        snapshot_id = uuid.uuid4().hex
 
     def http_post_json_fn(url: str, payload: Any) -> Any:
         if isinstance(payload, str):
@@ -118,7 +128,7 @@ def make_http_post_json(
             body_str = json.dumps(payload, sort_keys=True)
 
         cache_key = hashlib.sha256((url + body_str).encode("utf-8")).hexdigest()
-        cache_file = http_cache_dir / f"{cache_key}.body"
+        cache_file = http_cache_dir / f"{snapshot_id}_{cache_key}.body"
         if cache_file.exists():
             return json.loads(cache_file.read_bytes().decode("utf-8"))
 
@@ -173,10 +183,18 @@ def http_post_json(
     cache_dir: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
     token: str | None = None,
+    snapshot_id: str | None = None,
+    refresh: bool = False,
 ) -> Any:
     """Execute an HTTP POST request sending JSON, optionally cached."""
     if cache_dir is not None:
-        caller = make_http_post_json(cache_dir, sleep=sleep, token=token)
+        caller = make_http_post_json(
+            cache_dir,
+            sleep=sleep,
+            token=token,
+            snapshot_id=snapshot_id,
+            refresh=refresh,
+        )
         return caller(url, payload)
 
     if isinstance(payload, str):
