@@ -1,0 +1,18 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_null_conns",
+        "databaseId": 203,
+        "url": "https://github.com/test-org/test-repo/issues/203",
+        "body": "Issue with null GraphQL connections",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": null,
+        "comments": null,
+        "timelineItems": null
+      }
+    }
+  }
+}

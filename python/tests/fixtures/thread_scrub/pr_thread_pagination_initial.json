@@ -1,0 +1,42 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR_kwDOtest_thread_p1",
+        "databaseId": 50,
+        "url": "https://github.com/test-org/test-repo/pull/50",
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "PRRT_kwDOthread1",
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": true,
+                  "endCursor": "thread_comments_cursor_p1"
+                },
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOcomment1",
+                    "databaseId": 701,
+                    "url": "https://github.com/test-org/test-repo/pull/50#discussion_r701"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -87,6 +87,7 @@ class RevisionResult:
     revision_type: str  # "as_scraped" | "revision_at_t_world" | "first_revision"
     edited_at: str | None
     edits_ignored: int
+    warning: str | None = None
 
 
 @dataclass
@@ -147,6 +148,7 @@ def select_revision(
     user_content_edits: list[dict[str, Any]],
     t_world: datetime,
     is_target_issue: bool = False,
+    includes_created_edit: bool | None = None,
 ) -> RevisionResult:
     """Select the appropriate revision of a mutable document as of T_world.
 
@@ -155,8 +157,9 @@ def select_revision(
     - If T_world is earlier than issue's creation (for target issue), take the first revision.
     - Otherwise, newest revision with editedAt <= T_world.
     - If none qualifies and created_at <= T_world, take the first revision (the oldest edit).
+    - If history is missing or incomplete, fall back to scraped text with an explicit warning.
     """
-    if last_edited_at is None or not user_content_edits:
+    if last_edited_at is None:
         return RevisionResult(
             body=scraped_body,
             revision_type="as_scraped",
@@ -164,10 +167,37 @@ def select_revision(
             edits_ignored=0,
         )
 
+    if not user_content_edits:
+        return RevisionResult(
+            body=scraped_body,
+            revision_type="as_scraped",
+            edited_at=None,
+            edits_ignored=0,
+            warning="document was edited but userContentEdits is missing or empty; fell back to scraped body",
+        )
+
     # userContentEdits is newest first
     if is_target_issue and created_at is not None and t_world < created_at:
+        if includes_created_edit is False:
+            return RevisionResult(
+                body=scraped_body,
+                revision_type="as_scraped",
+                edited_at=None,
+                edits_ignored=0,
+                warning="edit history does not include creation edit (includesCreatedEdit is false); fell back to scraped body",
+            )
         first_rev = user_content_edits[-1]
-        chosen_body = first_rev.get("diff") if first_rev.get("diff") is not None else first_rev.get("body", scraped_body)
+        diff_val = first_rev.get("diff")
+        body_val = first_rev.get("body")
+        if diff_val is None and body_val is None:
+            return RevisionResult(
+                body=scraped_body,
+                revision_type="as_scraped",
+                edited_at=None,
+                edits_ignored=0,
+                warning="historical revision diff is null; fell back to scraped body",
+            )
+        chosen_body = diff_val if diff_val is not None else body_val
         rev_dt = parse_iso(first_rev.get("editedAt") or first_rev.get("createdAt"))
         return RevisionResult(
             body=chosen_body,
@@ -179,7 +209,17 @@ def select_revision(
     for idx, edit in enumerate(user_content_edits):
         edit_dt = parse_iso(edit.get("editedAt") or edit.get("createdAt"))
         if edit_dt and edit_dt <= t_world:
-            chosen_body = edit.get("diff") if edit.get("diff") is not None else edit.get("body", scraped_body)
+            diff_val = edit.get("diff")
+            body_val = edit.get("body")
+            if diff_val is None and body_val is None:
+                return RevisionResult(
+                    body=scraped_body,
+                    revision_type="as_scraped",
+                    edited_at=None,
+                    edits_ignored=0,
+                    warning="historical revision diff is null; fell back to scraped body",
+                )
+            chosen_body = diff_val if diff_val is not None else body_val
             return RevisionResult(
                 body=chosen_body,
                 revision_type="revision_at_t_world",
@@ -187,9 +227,28 @@ def select_revision(
                 edits_ignored=idx,
             )
 
-    # None qualified: take oldest revision (first revision)
+    # None qualified: take oldest revision (first revision) only if history confirms creation edit
+    if includes_created_edit is False:
+        return RevisionResult(
+            body=scraped_body,
+            revision_type="as_scraped",
+            edited_at=None,
+            edits_ignored=0,
+            warning="no qualifying edit before T_world and history does not include creation edit (includesCreatedEdit is false); fell back to scraped body",
+        )
+
     first_rev = user_content_edits[-1]
-    chosen_body = first_rev.get("diff") if first_rev.get("diff") is not None else first_rev.get("body", scraped_body)
+    diff_val = first_rev.get("diff")
+    body_val = first_rev.get("body")
+    if diff_val is None and body_val is None:
+        return RevisionResult(
+            body=scraped_body,
+            revision_type="as_scraped",
+            edited_at=None,
+            edits_ignored=0,
+            warning="historical revision diff is null; fell back to scraped body",
+        )
+    chosen_body = diff_val if diff_val is not None else body_val
     rev_dt = parse_iso(first_rev.get("editedAt") or first_rev.get("createdAt"))
     return RevisionResult(
         body=chosen_body,
@@ -220,6 +279,7 @@ query TargetIssueData(
       body
       createdAt
       lastEditedAt
+      includesCreatedEdit
       userContentEdits(first: 100, after: $editsCursor) {
         pageInfo {
           hasNextPage
@@ -243,6 +303,7 @@ query TargetIssueData(
           body
           createdAt
           lastEditedAt
+          includesCreatedEdit
           userContentEdits(first: 100) {
             pageInfo {
               hasNextPage
@@ -278,6 +339,17 @@ query TargetIssueData(
             }
           }
           ... on ConnectedEvent {
+            source {
+              __typename
+              ... on Issue {
+                number
+                url
+              }
+              ... on PullRequest {
+                number
+                url
+              }
+            }
             subject {
               __typename
               ... on Issue {
@@ -301,6 +373,7 @@ ISSUE_EDITS_PAGE_QUERY = """
 query IssueEditsPage($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
+      includesCreatedEdit
       userContentEdits(first: 100, after: $cursor) {
         pageInfo {
           hasNextPage
@@ -333,6 +406,7 @@ query IssueCommentsPage($owner: String!, $repo: String!, $number: Int!, $cursor:
           body
           createdAt
           lastEditedAt
+          includesCreatedEdit
           userContentEdits(first: 100) {
             pageInfo {
               hasNextPage
@@ -377,6 +451,17 @@ query IssueTimelinePage($owner: String!, $repo: String!, $number: Int!, $cursor:
             }
           }
           ... on ConnectedEvent {
+            source {
+              __typename
+              ... on Issue {
+                number
+                url
+              }
+              ... on PullRequest {
+                number
+                url
+              }
+            }
             subject {
               __typename
               ... on Issue {
@@ -389,6 +474,26 @@ query IssueTimelinePage($owner: String!, $repo: String!, $number: Int!, $cursor:
               }
             }
           }
+        }
+      }
+    }
+  }
+}
+"""
+
+COMMENT_EDITS_PAGE_QUERY = """
+query CommentEditsPage($id: ID!, $cursor: String!) {
+  node(id: $id) {
+    ... on Comment {
+      userContentEdits(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          createdAt
+          editedAt
+          diff
         }
       }
     }
@@ -420,6 +525,7 @@ query PullRequestData($owner: String!, $repo: String!, $number: Int!, $reviewsCu
           endCursor
         }
         nodes {
+          id
           comments(first: 100) {
             pageInfo {
               hasNextPage
@@ -468,6 +574,7 @@ query PullRequestThreadsPage($owner: String!, $repo: String!, $number: Int!, $cu
           endCursor
         }
         nodes {
+          id
           comments(first: 100) {
             pageInfo {
               hasNextPage
@@ -479,6 +586,26 @@ query PullRequestThreadsPage($owner: String!, $repo: String!, $number: Int!, $cu
               url
             }
           }
+        }
+      }
+    }
+  }
+}
+"""
+
+PR_THREAD_COMMENTS_PAGE_QUERY = """
+query PullRequestReviewThreadCommentsPage($id: ID!, $cursor: String!) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
+          url
         }
       }
     }
@@ -509,10 +636,6 @@ def _post_graphql(http_post_json: HttpPostJson, query: str, variables: dict[str,
     if data is None:
         raise GraphQLResponseError("GraphQL response missing 'data' field")
 
-    repo_obj = data.get("repository")
-    if repo_obj is None:
-        raise GraphQLResponseError(f"GraphQL repository not found for variables: {variables}")
-
     return data
 
 
@@ -520,9 +643,17 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
     """Fetch complete issue data with pagination for edits, comments, and timeline items."""
     vars_main = {"owner": owner, "repo": name, "number": issue_number}
     data = _post_graphql(http_post_json, TARGET_ISSUE_QUERY, vars_main, "TargetIssueData")
-    issue = data["repository"].get("issue")
+    repo = data.get("repository")
+    if repo is None:
+        raise GraphQLResponseError(f"GraphQL repository not found for variables: {vars_main}")
+    issue = repo.get("issue")
     if not issue:
         raise GraphQLResponseError(f"Issue #{issue_number} not found in {owner}/{name}")
+
+    # Normalize nullable connections
+    for field in ("userContentEdits", "comments", "timelineItems"):
+        if issue.get(field) is None:
+            issue[field] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
 
     # Paginate issue userContentEdits if needed
     edits_field = issue.get("userContentEdits") or {}
@@ -536,11 +667,11 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
             {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
             "IssueEditsPage",
         )
-        p_issue = pdata["repository"]["issue"]
+        p_issue = (pdata.get("repository") or {}).get("issue") or {}
         p_edits = p_issue.get("userContentEdits") or {}
         edits_nodes.extend(p_edits.get("nodes") or [])
         page_info = p_edits.get("pageInfo") or {}
-    if "userContentEdits" in issue:
+    if "userContentEdits" in issue and issue["userContentEdits"] is not None:
         issue["userContentEdits"]["nodes"] = edits_nodes
 
     # Paginate comments if needed
@@ -555,12 +686,16 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
             {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
             "IssueCommentsPage",
         )
-        p_issue = pdata["repository"]["issue"]
+        p_issue = (pdata.get("repository") or {}).get("issue") or {}
         p_comments = p_issue.get("comments") or {}
         comments_nodes.extend(p_comments.get("nodes") or [])
         c_page_info = p_comments.get("pageInfo") or {}
-    if "comments" in issue:
+    if "comments" in issue and issue["comments"] is not None:
         issue["comments"]["nodes"] = comments_nodes
+
+    for comment in comments_nodes:
+        if comment.get("userContentEdits") is None:
+            comment["userContentEdits"] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
 
     # Paginate timeline items if needed
     timeline_field = issue.get("timelineItems") or {}
@@ -574,11 +709,11 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
             {"owner": owner, "repo": name, "number": issue_number, "cursor": cursor},
             "IssueTimelinePage",
         )
-        p_issue = pdata["repository"]["issue"]
+        p_issue = (pdata.get("repository") or {}).get("issue") or {}
         p_timeline = p_issue.get("timelineItems") or {}
         timeline_nodes.extend(p_timeline.get("nodes") or [])
         t_page_info = p_timeline.get("pageInfo") or {}
-    if "timelineItems" in issue:
+    if "timelineItems" in issue and issue["timelineItems"] is not None:
         issue["timelineItems"]["nodes"] = timeline_nodes
 
     return issue
@@ -588,9 +723,17 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
     """Fetch pull request reviews and review comment threads with pagination."""
     vars_main = {"owner": owner, "repo": name, "number": pr_number}
     data = _post_graphql(http_post_json, PULL_REQUEST_QUERY, vars_main, "PullRequestData")
-    pr = data["repository"].get("pullRequest")
+    repo = data.get("repository")
+    if repo is None:
+        raise GraphQLResponseError(f"GraphQL repository not found for variables: {vars_main}")
+    pr = repo.get("pullRequest")
     if not pr:
         raise GraphQLResponseError(f"Pull request #{pr_number} not found in {owner}/{name}")
+
+    # Normalize nullable connections
+    for field in ("reviews", "reviewThreads"):
+        if pr.get(field) is None:
+            pr[field] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
 
     # Paginate reviews
     reviews_field = pr.get("reviews") or {}
@@ -604,11 +747,11 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
             {"owner": owner, "repo": name, "number": pr_number, "cursor": cursor},
             "PullRequestReviewsPage",
         )
-        p_pr = pdata["repository"]["pullRequest"]
+        p_pr = (pdata.get("repository") or {}).get("pullRequest") or {}
         p_reviews = p_pr.get("reviews") or {}
         reviews_nodes.extend(p_reviews.get("nodes") or [])
         r_page_info = p_reviews.get("pageInfo") or {}
-    if "reviews" in pr:
+    if "reviews" in pr and pr["reviews"] is not None:
         pr["reviews"]["nodes"] = reviews_nodes
 
     # Paginate review threads
@@ -623,11 +766,35 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
             {"owner": owner, "repo": name, "number": pr_number, "cursor": cursor},
             "PullRequestThreadsPage",
         )
-        p_pr = pdata["repository"]["pullRequest"]
+        p_pr = (pdata.get("repository") or {}).get("pullRequest") or {}
         p_threads = p_pr.get("reviewThreads") or {}
         threads_nodes.extend(p_threads.get("nodes") or [])
         t_page_info = p_threads.get("pageInfo") or {}
-    if "reviewThreads" in pr:
+
+    # Paginate comments inside each review thread
+    for thread in threads_nodes:
+        if thread.get("comments") is None:
+            thread["comments"] = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
+        thread_id = thread.get("id")
+        c_field = thread.get("comments") or {}
+        c_nodes = list(c_field.get("nodes") or [])
+        c_page_info = c_field.get("pageInfo") or {}
+        while c_page_info.get("hasNextPage") and c_page_info.get("endCursor") and thread_id:
+            cursor = c_page_info["endCursor"]
+            pdata = _post_graphql(
+                http_post_json,
+                PR_THREAD_COMMENTS_PAGE_QUERY,
+                {"id": thread_id, "cursor": cursor},
+                "PullRequestReviewThreadCommentsPage",
+            )
+            node_obj = pdata.get("node") or {}
+            p_comments = node_obj.get("comments") or {}
+            c_nodes.extend(p_comments.get("nodes") or [])
+            c_page_info = p_comments.get("pageInfo") or {}
+        if "comments" in thread and thread["comments"] is not None:
+            thread["comments"]["nodes"] = c_nodes
+
+    if "reviewThreads" in pr and pr["reviewThreads"] is not None:
         pr["reviewThreads"]["nodes"] = threads_nodes
 
     return pr
@@ -638,6 +805,7 @@ def get_solution_pr_scrub_entries(repo: str, pr_number: int) -> list[ScrubEntry]
     entries: list[ScrubEntry] = [
         ScrubEntry(kind="pull_request", url=f"https://github.com/{repo}/pull/{pr_number}", reason="solution PR HTML URL"),
         ScrubEntry(kind="pull_request", url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}", reason="solution PR API URL"),
+        ScrubEntry(kind="pull_request", url=f"https://api.github.com/repos/{repo}/issues/{pr_number}", reason="solution PR Issues API URL"),
         ScrubEntry(kind="pull_request", url=f"https://github.com/{repo}/pull/{pr_number}/files", reason="solution PR files view"),
         ScrubEntry(kind="pull_request", url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files", reason="solution PR files API"),
         ScrubEntry(kind="pull_request", url=f"https://github.com/{repo}/pull/{pr_number}/commits", reason="solution PR commits view"),
@@ -689,7 +857,7 @@ def process_thread_scrub_and_revision(
     base_entries = get_solution_pr_scrub_entries(repo, pr_number)
 
     # Fallback state if token missing or query fails
-    def make_fallback(warning_msg: str | None = None) -> ScrubResult:
+    def make_fallback(warning_msg: str | None = None, entries: list[ScrubEntry] | None = None) -> ScrubResult:
         if warning_msg:
             warnings_list.append(warning_msg)
         warnings_list.append("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)")
@@ -700,11 +868,11 @@ def process_thread_scrub_and_revision(
             chosen_revision_edited_at=None,
             edits_ignored=0,
             hints_revisioned=False,
-            scrub_entries=dedupe_and_sort_entries(base_entries),
+            scrub_entries=dedupe_and_sort_entries(entries if entries is not None else base_entries),
         )
 
     if not token and http_post_json is None:
-        return make_fallback()
+        return make_fallback(entries=base_entries)
 
     post_client = http_post_json if http_post_json is not None else make_http_post_json(cache_dir, token=token)
 
@@ -712,7 +880,7 @@ def process_thread_scrub_and_revision(
     pr_entries: list[ScrubEntry] = list(base_entries)
     try:
         pr_data = fetch_pull_request_data(post_client, owner, name, pr_number)
-        for review in pr_data.get("reviews", {}).get("nodes", []):
+        for review in (pr_data.get("reviews") or {}).get("nodes") or []:
             rev_url = review.get("url")
             rev_id = review.get("databaseId")
             if not rev_id and rev_url:
@@ -728,8 +896,8 @@ def process_thread_scrub_and_revision(
                     reason="solution PR review",
                 ))
 
-        for thread in pr_data.get("reviewThreads", {}).get("nodes", []):
-            for rc in thread.get("comments", {}).get("nodes", []):
+        for thread in (pr_data.get("reviewThreads") or {}).get("nodes") or []:
+            for rc in (thread.get("comments") or {}).get("nodes") or []:
                 rc_url = rc.get("url")
                 rc_id = rc.get("databaseId")
                 if not rc_id and rc_url:
@@ -763,13 +931,17 @@ def process_thread_scrub_and_revision(
     try:
         issue_data = fetch_target_issue_data(post_client, owner, name, target_issue_number)
     except Exception as exc:
-        return make_fallback(f"GraphQL request for issue #{target_issue_number} failed ({exc}); falling back to scraped content")
+        return make_fallback(
+            f"GraphQL request for issue #{target_issue_number} failed ({exc}); falling back to scraped content",
+            entries=pr_entries,
+        )
 
     # 3. Revision target issue problem statement
     title, body_scraped = split_title_and_body(scraped_problem_statement)
     issue_created = parse_iso(issue_data.get("createdAt")) or target_issue_created
     last_edited = parse_iso(issue_data.get("lastEditedAt"))
-    user_edits = list(issue_data.get("userContentEdits", {}).get("nodes") or [])
+    user_edits = list((issue_data.get("userContentEdits") or {}).get("nodes") or [])
+    includes_created = issue_data.get("includesCreatedEdit")
 
     rev_res = select_revision(
         scraped_body=body_scraped,
@@ -778,11 +950,17 @@ def process_thread_scrub_and_revision(
         user_content_edits=user_edits,
         t_world=t_world,
         is_target_issue=True,
+        includes_created_edit=includes_created,
     )
+    if rev_res.warning:
+        warnings_list.append(rev_res.warning)
+    if rev_res.revision_type == "as_scraped" and (last_edited is not None or rev_res.warning):
+        warnings_list.append("problem_statement taken as scraped, not at its revision as of T_world (Phase 0 gap, spec section 4)")
+
     final_problem_statement = reconstruct_problem_statement(title, rev_res.body)
 
     # 4. Revision hints & target issue comments scrub
-    comments_nodes = list(issue_data.get("comments", {}).get("nodes") or [])
+    comments_nodes = list((issue_data.get("comments") or {}).get("nodes") or [])
     kept_comments_bodies: list[str] = []
     all_entries = list(pr_entries)
 
@@ -807,8 +985,25 @@ def process_thread_scrub_and_revision(
                     reason="target issue comment created after T_world",
                 ))
         else:
-            # Kept comment: take at revision as of T_world
-            c_edits = list(comment.get("userContentEdits", {}).get("nodes") or [])
+            # Kept comment: paginate userContentEdits if hasNextPage
+            c_edits_obj = comment.get("userContentEdits") or {}
+            c_edits = list(c_edits_obj.get("nodes") or [])
+            c_page_info = c_edits_obj.get("pageInfo") or {}
+            c_id = comment.get("id")
+            while c_page_info.get("hasNextPage") and c_page_info.get("endCursor") and c_id:
+                cursor = c_page_info["endCursor"]
+                pdata = _post_graphql(
+                    post_client,
+                    COMMENT_EDITS_PAGE_QUERY,
+                    {"id": c_id, "cursor": cursor},
+                    "CommentEditsPage",
+                )
+                node_data = pdata.get("node") or {}
+                c_p_edits = node_data.get("userContentEdits") or {}
+                c_edits.extend(c_p_edits.get("nodes") or [])
+                c_page_info = c_p_edits.get("pageInfo") or {}
+
+            c_includes_created = comment.get("includesCreatedEdit")
             c_rev = select_revision(
                 scraped_body=comment.get("body") or "",
                 created_at=c_created,
@@ -816,13 +1011,16 @@ def process_thread_scrub_and_revision(
                 user_content_edits=c_edits,
                 t_world=t_world,
                 is_target_issue=False,
+                includes_created_edit=c_includes_created,
             )
+            if c_rev.warning:
+                warnings_list.append(f"Comment {c_db_id or c_url}: {c_rev.warning}")
             kept_comments_bodies.append(c_rev.body)
 
     final_hints = "\n".join(kept_comments_bodies) if kept_comments_bodies else ""
 
     # 5. Scrub timeline items linking to target issue
-    for item in issue_data.get("timelineItems", {}).get("nodes") or []:
+    for item in (issue_data.get("timelineItems") or {}).get("nodes") or []:
         typename = item.get("__typename")
         if typename == "CrossReferencedEvent":
             src = item.get("source") or {}
@@ -841,19 +1039,23 @@ def process_thread_scrub_and_revision(
             if item.get("url"):
                 all_entries.append(ScrubEntry(kind="cross_reference", url=item["url"], reason="cross-reference event on target issue"))
         elif typename == "ConnectedEvent":
-            subj = item.get("subject") or {}
-            subj_url = subj.get("url")
-            subj_num = subj.get("number")
-            subj_type = subj.get("__typename")
-            if subj_url:
-                all_entries.append(ScrubEntry(kind="cross_reference", url=subj_url, reason="connected to target issue"))
-            if subj_num:
-                sub = "pulls" if subj_type == "PullRequest" else "issues"
-                all_entries.append(ScrubEntry(
-                    kind="cross_reference",
-                    url=f"https://api.github.com/repos/{repo}/{sub}/{subj_num}",
-                    reason="connected to target issue",
-                ))
+            for conn_item in (item.get("source"), item.get("subject")):
+                if not conn_item:
+                    continue
+                c_url = conn_item.get("url")
+                c_num = conn_item.get("number")
+                c_type = conn_item.get("__typename")
+                if c_num == target_issue_number and c_type == "Issue":
+                    continue
+                if c_url:
+                    all_entries.append(ScrubEntry(kind="cross_reference", url=c_url, reason="connected to target issue"))
+                if c_num:
+                    sub = "pulls" if c_type == "PullRequest" else "issues"
+                    all_entries.append(ScrubEntry(
+                        kind="cross_reference",
+                        url=f"https://api.github.com/repos/{repo}/{sub}/{c_num}",
+                        reason="connected to target issue",
+                    ))
 
     # 6. linked_refs parser applied the other way where cheap
     from hermetic_slice.intake import linked_refs

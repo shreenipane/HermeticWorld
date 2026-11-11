@@ -339,6 +339,8 @@ def intake_task(
         warnings_list.append(f"No issue reference found in PR {pr_number} body")
     elif not resolved_issue_refs:
         warnings_list.append(f"No valid issue reference resolved for PR {pr_number}")
+    elif len(resolved_issue_refs) > 1:
+        warnings_list.append(f"Multiple issue references resolved for PR {pr_number}; problem statement left as scraped")
 
     base_commit_time, repo_first_commit_time = repo_dates(
         repo,
@@ -355,7 +357,11 @@ def intake_task(
         repo_first_commit_time=repo_first_commit_time,
     )
 
-    target_issue_number = earliest_ref.number if (resolved_issue_refs and earliest_ref.kind == "github") else None
+    target_issue_number = (
+        earliest_ref.number
+        if (len(resolved_issue_refs) == 1 and earliest_ref.kind == "github")
+        else None
+    )
     scrub_result = process_thread_scrub_and_revision(
         repo=repo,
         pr_number=pr_number,
