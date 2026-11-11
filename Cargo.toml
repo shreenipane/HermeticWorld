@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/hermetic-common",
+    "crates/hermetic-gateway",
     "crates/hermetic-sealcheck",
 ]
 resolver = "2"
