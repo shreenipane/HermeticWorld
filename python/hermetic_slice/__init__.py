@@ -7,6 +7,19 @@ from hermetic_slice.cutoffs import (
     compute_cutoffs,
     ensure_utc,
 )
+from hermetic_slice.dispositions import (
+    DispositionsError,
+    MalformedGateOutputError,
+    MissingDispositionError,
+    RedactedSpan,
+    TaskDispositionResult,
+    decide_task_disposition,
+    find_spans_in_text,
+    process_dispositions,
+    redact_problem_statement,
+    MAX_REDACTION_FRACTION,
+    MIN_REMAINING_CHARS,
+)
 from hermetic_slice.eval_spec import (
     EvalSpecError,
     load_eval_rows,
@@ -57,4 +70,15 @@ __all__ = [
     "validate_patch",
     "verify_sealed_repo",
     "write_eval_spec",
+    "DispositionsError",
+    "MalformedGateOutputError",
+    "MissingDispositionError",
+    "RedactedSpan",
+    "TaskDispositionResult",
+    "decide_task_disposition",
+    "find_spans_in_text",
+    "process_dispositions",
+    "redact_problem_statement",
+    "MAX_REDACTION_FRACTION",
+    "MIN_REMAINING_CHARS",
 ]

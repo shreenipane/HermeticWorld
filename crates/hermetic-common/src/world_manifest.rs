@@ -671,6 +671,20 @@ impl WorldManifest {
 
         Ok((target_value, proof))
     }
+
+    /// Add a disposition to this manifest (§5.5, TR-SEAL-11).
+    pub fn add_disposition(
+        &mut self,
+        kind: DispositionKind,
+        detector: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.dispositions.push(Disposition {
+            kind,
+            detector: detector.into(),
+            detail: detail.into(),
+        });
+    }
 }
 
 /// Verify a Merkle inclusion proof for a path and value against an expected root.
