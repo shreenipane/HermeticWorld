@@ -31,6 +31,8 @@ pub struct TaskJson {
     pub instance_id: String,
     pub repo: String,
     pub base_commit: String,
+    #[serde(default)]
+    pub version: Option<String>,
     pub cutoffs: CutoffsRecord,
 }
 
@@ -39,6 +41,8 @@ pub struct TaskInput {
     pub instance_id: String,
     pub repo: String,
     pub base_commit: String,
+    #[serde(default)]
+    pub version: Option<String>,
     pub cutoffs: CutoffsRecord,
     pub gold_patch: String,
     pub test_patch: String,
@@ -74,6 +78,7 @@ impl TaskInput {
             instance_id: task_json.instance_id,
             repo: task_json.repo,
             base_commit: task_json.base_commit,
+            version: task_json.version,
             cutoffs: task_json.cutoffs,
             gold_patch,
             test_patch,

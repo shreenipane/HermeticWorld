@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 pub mod benchmark;
+pub mod binary;
 pub mod bytecode;
 pub mod containers;
 pub mod d1;
+pub mod d5a;
 pub mod d6;
 pub mod diff;
 pub mod fingerprint;
@@ -16,12 +18,17 @@ pub mod winnow;
 use serde::{Deserialize, Serialize};
 
 pub use benchmark::{BenchmarkSignatures, ExternalSignature};
+pub use binary::{
+    is_minified_bundle, parse_class, parse_elf, parse_minified, parse_wasm,
+    scan_binary_if_recognized, scan_minified_bundle,
+};
 pub use bytecode::{check_pyc_bytecode, locate_pyc_source, pyc_header_len, pyc_magic};
 pub use containers::{
     detect_container_type, extract_pyc_constants, is_tar, scan_container_or_unit,
     scan_container_or_unit_with_root_prefix, CountingReader,
 };
 pub use d1::scan_git_repo;
+pub use d5a::{check_d5a_metadata, parse_pep440, parse_pkg_metadata, pep503_normalize};
 pub use d6::{parse_oci_date, scan_oci, D6Error};
 pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
@@ -47,6 +54,8 @@ pub struct FingerprintSummary {
     pub subtracted: usize,
     pub winnow: usize,
     pub winnow_subtracted: usize,
+    pub binary_items: usize,
+    pub binary_subtracted: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
