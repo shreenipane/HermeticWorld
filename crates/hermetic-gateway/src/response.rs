@@ -2,15 +2,18 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 use crate::error::{
-    is_recognised_error_type, AnthropicErrorResponse, API_ERROR, AUTHENTICATION_ERROR,
-    INVALID_REQUEST_ERROR, NOT_FOUND_ERROR, OVERLOADED_ERROR, PERMISSION_ERROR, RATE_LIMIT_ERROR,
-    REQUEST_TOO_LARGE,
+    is_recognised_error_type, AnthropicErrorResponse, DateFormatError, GatewayError, API_ERROR,
+    AUTHENTICATION_ERROR, INVALID_REQUEST_ERROR, NOT_FOUND_ERROR, OVERLOADED_ERROR,
+    PERMISSION_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
 };
+use crate::quota::QuotaTracker;
 
 #[derive(Debug, Clone)]
 pub struct GuestClock {
@@ -40,13 +43,17 @@ impl GuestClock {
 
     /// Formats guest time in IMF-fixdate format (RFC 7231 / RFC 9110):
     /// `Sun, 06 Nov 1994 08:49:37 GMT`
-    pub fn format_imf_fixdate(&self) -> String {
+    pub fn format_imf_fixdate(&self) -> Result<String, DateFormatError> {
         format_imf_fixdate(self.now())
     }
 }
 
-pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
-    let weekday = match dt.weekday() {
+pub fn format_imf_fixdate(dt: OffsetDateTime) -> Result<String, DateFormatError> {
+    let utc_dt = dt
+        .checked_to_offset(time::UtcOffset::UTC)
+        .ok_or(DateFormatError)?;
+
+    let weekday = match utc_dt.weekday() {
         time::Weekday::Monday => "Mon",
         time::Weekday::Tuesday => "Tue",
         time::Weekday::Wednesday => "Wed",
@@ -55,7 +62,7 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
         time::Weekday::Saturday => "Sat",
         time::Weekday::Sunday => "Sun",
     };
-    let month = match dt.month() {
+    let month = match utc_dt.month() {
         time::Month::January => "Jan",
         time::Month::February => "Feb",
         time::Month::March => "Mar",
@@ -69,16 +76,16 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
         time::Month::November => "Nov",
         time::Month::December => "Dec",
     };
-    format!(
+    Ok(format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         weekday,
-        dt.day(),
+        utc_dt.day(),
         month,
-        dt.year(),
-        dt.hour(),
-        dt.minute(),
-        dt.second()
-    )
+        utc_dt.year(),
+        utc_dt.hour(),
+        utc_dt.minute(),
+        utc_dt.second()
+    ))
 }
 
 /// Parse an HTTP-date (IMF-fixdate) or RFC 3339 string into OffsetDateTime.
@@ -179,7 +186,7 @@ pub struct FilteredHeaders {
 pub fn filter_response_headers(
     raw_headers: &[(String, String)],
     clock: &GuestClock,
-) -> FilteredHeaders {
+) -> Result<FilteredHeaders, GatewayError> {
     let mut agent_headers = Vec::new();
     let mut dropped_headers = BTreeMap::new();
 
@@ -215,12 +222,12 @@ pub fn filter_response_headers(
     }
 
     // Always provide guest Date header
-    agent_headers.push(("Date".to_string(), clock.format_imf_fixdate()));
+    agent_headers.push(("Date".to_string(), clock.format_imf_fixdate()?));
 
-    FilteredHeaders {
+    Ok(FilteredHeaders {
         agent_headers,
         dropped_headers,
-    }
+    })
 }
 
 /// Recursively rewrite any field named created, created_at, updated_at, expires_at
@@ -234,6 +241,10 @@ pub fn rewrite_json_timestamps(val: &mut serde_json::Value, clock: &GuestClock) 
     match val {
         serde_json::Value::Object(map) => {
             for (k, v) in map.iter_mut() {
+                // Do not descend into any content block's "input" object or into "partial_json" strings
+                if k == "input" || k == "partial_json" {
+                    continue;
+                }
                 if k == "created" || k == "created_at" || k == "updated_at" || k == "expires_at" {
                     match v {
                         serde_json::Value::Number(_) => {
@@ -385,13 +396,49 @@ pub fn sanitize_sse_event(event_block: &str, clock: &GuestClock) -> (String, Str
     (out, usage)
 }
 
+/// Guard that records token usage and releases the concurrency slot exactly once.
+pub struct StreamSlotGuard {
+    quota: Arc<QuotaTracker>,
+    usage: Arc<Mutex<StreamUsage>>,
+    released: AtomicBool,
+}
+
+impl StreamSlotGuard {
+    pub fn new(quota: Arc<QuotaTracker>, usage: Arc<Mutex<StreamUsage>>) -> Self {
+        Self {
+            quota,
+            usage,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    pub fn record_and_release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            let u = match self.usage.lock() {
+                Ok(g) => *g,
+                Err(p) => *p.into_inner(),
+            };
+            let _ = self
+                .quota
+                .record_usage_and_release(u.input_tokens, u.output_tokens);
+        }
+    }
+}
+
+impl Drop for StreamSlotGuard {
+    fn drop(&mut self) {
+        self.record_and_release();
+    }
+}
+
 /// A reader wrapper that consumes an incoming SSE stream, sanitises each event,
 /// and produces sanitized SSE byte stream.
 pub struct SanitizingSseReader<R: Read> {
     reader: BufReader<R>,
     clock: GuestClock,
     buffer: Vec<u8>,
-    usage: StreamUsage,
+    usage: Arc<Mutex<StreamUsage>>,
+    slot_guard: Option<Arc<StreamSlotGuard>>,
     eof: bool,
 }
 
@@ -404,13 +451,33 @@ impl<R: Read> SanitizingSseReader<R> {
             reader: BufReader::new(reader),
             clock,
             buffer: Vec::new(),
-            usage: StreamUsage::default(),
+            usage: Arc::new(Mutex::new(StreamUsage::default())),
+            slot_guard: None,
+            eof: false,
+        }
+    }
+
+    pub fn with_slot_guard(
+        reader: R,
+        clock: GuestClock,
+        usage: Arc<Mutex<StreamUsage>>,
+        slot_guard: Arc<StreamSlotGuard>,
+    ) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            clock,
+            buffer: Vec::new(),
+            usage,
+            slot_guard: Some(slot_guard),
             eof: false,
         }
     }
 
     pub fn usage(&self) -> StreamUsage {
-        self.usage
+        match self.usage.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
     }
 
     /// Read next event block from reader.
@@ -456,11 +523,10 @@ impl<R: Read> Read for SanitizingSseReader<R> {
         while self.buffer.is_empty() && !self.eof {
             if let Some(event_block) = self.fetch_next_event()? {
                 let (sanitized_event, ev_usage) = sanitize_sse_event(&event_block, &self.clock);
-                self.usage.input_tokens = self.usage.input_tokens.max(ev_usage.input_tokens);
-                self.usage.output_tokens = self
-                    .usage
-                    .output_tokens
-                    .saturating_add(ev_usage.output_tokens);
+                if let Ok(mut u) = self.usage.lock() {
+                    u.input_tokens = u.input_tokens.max(ev_usage.input_tokens);
+                    u.output_tokens = u.output_tokens.max(ev_usage.output_tokens);
+                }
                 self.buffer.extend_from_slice(sanitized_event.as_bytes());
             } else {
                 break;
@@ -468,6 +534,9 @@ impl<R: Read> Read for SanitizingSseReader<R> {
         }
 
         if self.buffer.is_empty() {
+            if let Some(guard) = &self.slot_guard {
+                guard.record_and_release();
+            }
             return Ok(0);
         }
 

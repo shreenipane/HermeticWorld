@@ -22,9 +22,9 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
 time = { workspace = true }
-getrandom = "0.4.3"
-tiny_http = "0.12.0"
-ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
+getrandom = "=0.4.3"
+tiny_http = "=0.12.0"
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

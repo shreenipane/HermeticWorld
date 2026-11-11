@@ -2,6 +2,7 @@
 
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
+use std::error::Error;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -27,7 +28,13 @@ impl UpstreamClient {
     pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB limit
 
     pub fn new(config: Arc<GatewayConfig>) -> Self {
-        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(std::time::Duration::from_secs(30))
+            .timeout_read(std::time::Duration::from_secs(
+                config.upstream_read_timeout_s,
+            ))
+            .build();
         Self { agent, config }
     }
 
@@ -79,7 +86,11 @@ impl UpstreamClient {
                 } else {
                     let mut reader = resp.into_reader().take(Self::MAX_RESPONSE_BYTES as u64);
                     let mut body = String::new();
-                    reader.read_to_string(&mut body)?;
+                    if let Err(e) = reader.read_to_string(&mut body) {
+                        return Err(GatewayError::UpstreamTimeout(format!(
+                            "Upstream read timed out: {e}"
+                        )));
+                    }
                     Ok(UpstreamResponse::Body {
                         status,
                         headers,
@@ -103,9 +114,30 @@ impl UpstreamClient {
                     body,
                 })
             }
-            Err(ureq::Error::Transport(e)) => Err(GatewayError::UpstreamError(format!(
-                "Upstream transport error: {e}"
-            ))),
+            Err(ureq::Error::Transport(e)) => {
+                let err_str = e.to_string();
+                if e.kind() == ureq::ErrorKind::Io {
+                    if let Some(io_err) =
+                        e.source().and_then(|s| s.downcast_ref::<std::io::Error>())
+                    {
+                        if io_err.kind() == std::io::ErrorKind::TimedOut {
+                            return Err(GatewayError::UpstreamTimeout(format!(
+                                "Upstream transport timed out: {err_str}"
+                            )));
+                        }
+                    }
+                }
+                if err_str.to_lowercase().contains("timed out")
+                    || err_str.to_lowercase().contains("timeout")
+                {
+                    return Err(GatewayError::UpstreamTimeout(format!(
+                        "Upstream transport timed out: {err_str}"
+                    )));
+                }
+                Err(GatewayError::UpstreamError(format!(
+                    "Upstream transport error: {err_str}"
+                )))
+            }
         }
     }
 }

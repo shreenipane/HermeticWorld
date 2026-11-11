@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::anthropic::{parse_and_validate_request, ANTHROPIC_ADAPTER_VERSION};
 use crate::config::GatewayConfig;
 use crate::error::{
-    AnthropicErrorResponse, INVALID_REQUEST_ERROR, NOT_FOUND_ERROR, RATE_LIMIT_ERROR,
-    REQUEST_TOO_LARGE,
+    standard_message_for_type, AnthropicErrorResponse, API_ERROR, INVALID_REQUEST_ERROR,
+    NOT_FOUND_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
 };
 use crate::history::HistoryLog;
 use crate::log::{HostLogEntry, HostLogger};
@@ -19,7 +19,7 @@ use crate::nonce::RunNonce;
 use crate::quota::QuotaTracker;
 use crate::response::{
     filter_response_headers, rewrite_json_timestamps, sanitize_error_body, GuestClock,
-    SanitizingSseReader,
+    SanitizingSseReader, StreamSlotGuard, StreamUsage,
 };
 use crate::upstream::{UpstreamClient, UpstreamResponse};
 
@@ -109,16 +109,34 @@ impl GatewayServer {
         message: &str,
         endpoint: &str,
     ) {
-        let resp_body = AnthropicErrorResponse::new(err_type, message).to_json_string();
-        let mut response = Response::from_string(resp_body).with_status_code(status);
+        let (resp_msg, log_msg) = if err_type == API_ERROR {
+            (standard_message_for_type(API_ERROR), message)
+        } else {
+            (message, message)
+        };
+        let resp_body = AnthropicErrorResponse::new(err_type, resp_msg).to_json_string();
+        let body_bytes = resp_body.into_bytes();
+        let body_len = body_bytes.len();
 
-        if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-            response.add_header(h);
+        let mut headers = Vec::new();
+        if let Ok(h) = Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"application/json; charset=utf-8"[..],
+        ) {
+            headers.push(h);
         }
-        let date_hdr = self.clock.format_imf_fixdate();
-        if let Ok(h) = Header::from_bytes(&b"Date"[..], date_hdr.as_bytes()) {
-            response.add_header(h);
+        if let Ok(date_hdr) = self.clock.format_imf_fixdate() {
+            if let Ok(h) = Header::from_bytes(&b"Date"[..], date_hdr.as_bytes()) {
+                headers.push(h);
+            }
         }
+        let response = Response::new(
+            status.into(),
+            headers,
+            Cursor::new(body_bytes),
+            Some(body_len),
+            None,
+        );
 
         self.logger.log(&HostLogEntry {
             timestamp: self
@@ -133,7 +151,7 @@ impl GatewayServer {
             client_status: status,
             upstream_status: None,
             dropped_headers: BTreeMap::new(),
-            original_error_body: None,
+            original_error_body: Some(log_msg.to_string()),
             history_rewrite: false,
             history_rewrites_total: self.history.rewrites_total(),
             quotas: self.quota.snapshot(),
@@ -374,20 +392,55 @@ impl GatewayServer {
                 headers,
                 body: upstream_body,
             }) => {
-                let filtered = filter_response_headers(&headers, &self.clock);
+                let filtered = match filter_response_headers(&headers, &self.clock) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.quota.release_concurrent();
+                        self.respond_with_error(
+                            request,
+                            e.status_code(),
+                            e.error_type(),
+                            &e.to_string(),
+                            &endpoint,
+                        );
+                        return;
+                    }
+                };
 
                 if !(200..300).contains(&status) {
                     // Non-2xx upstream error: sanitize body, preserve status
                     self.quota.release_concurrent();
                     let (sanitized_body, _) = sanitize_error_body(status, &upstream_body);
+                    let body_bytes = sanitized_body.into_bytes();
+                    let body_len = body_bytes.len();
 
-                    let mut resp =
-                        Response::from_string(sanitized_body.clone()).with_status_code(status);
+                    let mut resp_headers = Vec::new();
+                    if let Ok(h) = Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json; charset=utf-8"[..],
+                    ) {
+                        resp_headers.push(h);
+                    }
+
                     for (k, v) in &filtered.agent_headers {
-                        if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                            resp.add_header(h);
+                        let k_lower = k.to_lowercase();
+                        if k_lower != "content-type"
+                            && k_lower != "content-length"
+                            && k_lower != "content-encoding"
+                        {
+                            if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
+                                resp_headers.push(h);
+                            }
                         }
                     }
+
+                    let resp = Response::new(
+                        status.into(),
+                        resp_headers,
+                        Cursor::new(body_bytes),
+                        Some(body_len),
+                        None,
+                    );
 
                     self.logger.log(&HostLogEntry {
                         timestamp: self
@@ -439,12 +492,25 @@ impl GatewayServer {
                         .quota
                         .record_usage_and_release(input_tokens, output_tokens);
 
-                    let mut resp = Response::from_string(final_body).with_status_code(status);
+                    let body_bytes = final_body.into_bytes();
+                    let body_len = body_bytes.len();
+
+                    let mut resp_headers = Vec::new();
                     for (k, v) in &filtered.agent_headers {
-                        if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                            resp.add_header(h);
+                        if !k.eq_ignore_ascii_case("content-length") {
+                            if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
+                                resp_headers.push(h);
+                            }
                         }
                     }
+
+                    let resp = Response::new(
+                        status.into(),
+                        resp_headers,
+                        Cursor::new(body_bytes),
+                        Some(body_len),
+                        None,
+                    );
 
                     self.logger.log(&HostLogEntry {
                         timestamp: self
@@ -473,22 +539,48 @@ impl GatewayServer {
                 headers,
                 reader,
             }) => {
-                let filtered = filter_response_headers(&headers, &self.clock);
-                let sse_reader = SanitizingSseReader::new(reader, self.clock.clone());
+                let filtered = match filter_response_headers(&headers, &self.clock) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.quota.release_concurrent();
+                        self.respond_with_error(
+                            request,
+                            e.status_code(),
+                            e.error_type(),
+                            &e.to_string(),
+                            &endpoint,
+                        );
+                        return;
+                    }
+                };
+
+                let shared_usage = Arc::new(Mutex::new(StreamUsage::default()));
+                let slot_guard = Arc::new(StreamSlotGuard::new(
+                    self.quota.clone(),
+                    shared_usage.clone(),
+                ));
+
+                let sse_reader = SanitizingSseReader::with_slot_guard(
+                    reader,
+                    self.clock.clone(),
+                    shared_usage,
+                    slot_guard.clone(),
+                );
 
                 let mut resp_headers = Vec::new();
                 for (k, v) in &filtered.agent_headers {
-                    if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                        resp_headers.push(h);
+                    if !k.eq_ignore_ascii_case("content-length") {
+                        if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
+                            resp_headers.push(h);
+                        }
                     }
                 }
 
                 let tiny_response =
                     Response::new(status.into(), resp_headers, sse_reader, None, None);
 
-                // Note: when tiny_http streams the response, we log afterwards
                 let _ = request.respond(tiny_response);
-                self.quota.release_concurrent();
+                slot_guard.record_and_release();
 
                 self.logger.log(&HostLogEntry {
                     timestamp: self

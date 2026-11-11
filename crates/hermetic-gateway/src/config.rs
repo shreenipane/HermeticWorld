@@ -23,10 +23,17 @@ pub struct GatewayConfigFile {
     pub log_dir: PathBuf,
 
     pub api_key_file: PathBuf,
+
+    #[serde(default = "default_upstream_read_timeout_s")]
+    pub upstream_read_timeout_s: u64,
 }
 
 fn default_upstream_base_url() -> String {
     "https://api.anthropic.com".to_string()
+}
+
+fn default_upstream_read_timeout_s() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +45,7 @@ pub struct GatewayConfig {
     pub quotas: QuotasConfig,
     pub log_dir: PathBuf,
     pub api_key_file: PathBuf,
+    pub upstream_read_timeout_s: u64,
     /// Loaded once into memory; never logged.
     api_key: String,
 }
@@ -75,6 +83,7 @@ impl GatewayConfig {
             quotas: parsed.quotas,
             log_dir: parsed.log_dir,
             api_key_file: parsed.api_key_file,
+            upstream_read_timeout_s: parsed.upstream_read_timeout_s,
             api_key,
         })
     }
@@ -99,8 +108,14 @@ impl GatewayConfig {
             quotas,
             log_dir,
             api_key_file,
+            upstream_read_timeout_s: 120,
             api_key,
         }
+    }
+
+    pub fn with_upstream_read_timeout_s(mut self, timeout_s: u64) -> Self {
+        self.upstream_read_timeout_s = timeout_s;
+        self
     }
 
     /// Access the API key in memory only.

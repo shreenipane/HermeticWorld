@@ -79,6 +79,10 @@ impl AnthropicErrorResponse {
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("Date formatting error: conversion out of range")]
+pub struct DateFormatError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("Invalid request: {0}")]
@@ -96,8 +100,14 @@ pub enum GatewayError {
     #[error("Upstream error: {0}")]
     UpstreamError(String),
 
+    #[error("Upstream timeout: {0}")]
+    UpstreamTimeout(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Date formatting error: {0}")]
+    Date(#[from] DateFormatError),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -111,7 +121,9 @@ impl GatewayError {
             GatewayError::RequestTooLarge(_) => 413,
             GatewayError::RateLimitExceeded(_) => 429,
             GatewayError::UpstreamError(_) => 502,
+            GatewayError::UpstreamTimeout(_) => 500,
             GatewayError::Io(_) => 500,
+            GatewayError::Date(_) => 500,
             GatewayError::Json(_) => 400,
         }
     }
@@ -123,7 +135,9 @@ impl GatewayError {
             GatewayError::RequestTooLarge(_) => REQUEST_TOO_LARGE,
             GatewayError::RateLimitExceeded(_) => RATE_LIMIT_ERROR,
             GatewayError::UpstreamError(_) => API_ERROR,
+            GatewayError::UpstreamTimeout(_) => API_ERROR,
             GatewayError::Io(_) => API_ERROR,
+            GatewayError::Date(_) => API_ERROR,
             GatewayError::Json(_) => INVALID_REQUEST_ERROR,
         }
     }
@@ -143,7 +157,11 @@ impl GatewayError {
                 AnthropicErrorResponse::new(RATE_LIMIT_ERROR, msg.clone())
             }
             GatewayError::UpstreamError(msg) => AnthropicErrorResponse::new(API_ERROR, msg.clone()),
+            GatewayError::UpstreamTimeout(msg) => {
+                AnthropicErrorResponse::new(API_ERROR, msg.clone())
+            }
             GatewayError::Io(e) => AnthropicErrorResponse::new(API_ERROR, e.to_string()),
+            GatewayError::Date(e) => AnthropicErrorResponse::new(API_ERROR, e.to_string()),
             GatewayError::Json(e) => {
                 AnthropicErrorResponse::new(INVALID_REQUEST_ERROR, e.to_string())
             }

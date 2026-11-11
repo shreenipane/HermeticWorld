@@ -31,6 +31,18 @@ impl TestEnv {
         allowed_betas: Vec<String>,
         quotas: QuotasConfig,
     ) -> Self {
+        let t_clock =
+            OffsetDateTime::parse("2026-11-11T12:00:00Z", &Rfc3339).expect("Valid RFC3339 t-clock");
+        Self::new_with_options(pinned_models, allowed_betas, quotas, t_clock, None)
+    }
+
+    pub fn new_with_options(
+        pinned_models: Vec<String>,
+        allowed_betas: Vec<String>,
+        quotas: QuotasConfig,
+        t_clock: OffsetDateTime,
+        upstream_read_timeout_s: Option<u64>,
+    ) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create tempdir");
         let key_path = temp_dir.path().join("upstream_api_key.txt");
         let api_key = "test-secret-gateway-key-xyz".to_string();
@@ -43,7 +55,7 @@ impl TestEnv {
             Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("Failed to bind mock upstream"));
         let mock_addr = mock_server.server_addr().to_ip().expect("mock ip");
 
-        let config = GatewayConfig::from_raw(
+        let mut config = GatewayConfig::from_raw(
             format!("http://{mock_addr}"),
             "2023-06-01".to_string(),
             allowed_betas,
@@ -54,8 +66,9 @@ impl TestEnv {
             api_key.clone(),
         );
 
-        let t_clock =
-            OffsetDateTime::parse("2026-11-11T12:00:00Z", &Rfc3339).expect("Valid RFC3339 t-clock");
+        if let Some(timeout_s) = upstream_read_timeout_s {
+            config = config.with_upstream_read_timeout_s(timeout_s);
+        }
 
         let gateway =
             Arc::new(GatewayServer::new(config, t_clock).expect("Failed to create GatewayServer"));
