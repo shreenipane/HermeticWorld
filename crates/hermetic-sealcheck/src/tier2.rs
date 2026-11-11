@@ -420,19 +420,13 @@ pub fn extract_hunk_symbols_and_anchors(
     (symbols, anchors)
 }
 
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 pub fn find_first_anchor<'a>(text: &str, anchors: &'a [String]) -> Option<&'a str> {
     for anchor in anchors {
         if anchor.is_empty() {
             continue;
         }
-        let a_bytes = anchor.as_bytes();
-        let t_bytes = text.as_bytes();
-        let a_len = a_bytes.len();
-        if a_len > t_bytes.len() {
+        let a_len = anchor.len();
+        if a_len > text.len() {
             continue;
         }
 
@@ -441,22 +435,22 @@ pub fn find_first_anchor<'a>(text: &str, anchors: &'a [String]) -> Option<&'a st
             let idx = start_idx + found_idx;
             let end_idx = idx + a_len;
 
-            let start_ok = if idx == 0 {
-                true
-            } else {
-                !is_word_char(t_bytes[idx - 1])
+            let start_ok = match text[..idx].chars().next_back() {
+                None => true,
+                Some(c) => !c.is_alphanumeric() && c != '_',
             };
 
-            let end_ok = if end_idx == t_bytes.len() {
-                true
-            } else {
-                !is_word_char(t_bytes[end_idx])
+            let end_ok = match text[end_idx..].chars().next() {
+                None => true,
+                Some(c) => !c.is_alphanumeric() && c != '_',
             };
 
             if start_ok && end_ok {
                 return Some(anchor.as_str());
             }
-            start_idx = idx + 1;
+
+            let step = text[idx..].chars().next().map_or(1, |c| c.len_utf8());
+            start_idx = idx + step;
         }
     }
     None
@@ -471,19 +465,19 @@ fn is_ident_token(s: &str) -> bool {
 }
 
 fn is_number_token(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let first = s.as_bytes()[0];
-    first.is_ascii_digit()
+    s.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
-pub fn extract_unit_candidate_symbols(text: &str) -> HashSet<String> {
+pub fn extract_unit_symbols_and_anchors(text: &str) -> (HashSet<String>, HashSet<String>) {
     let mut symbols = HashSet::new();
+    let mut anchor_tokens = HashSet::new();
 
     let tokens = tokenize(text);
     for tok in &tokens {
-        if is_ident_token(&tok.text) || is_number_token(&tok.text) {
+        if is_ident_token(&tok.text) {
+            symbols.insert(tok.text.clone());
+            anchor_tokens.insert(tok.text.clone());
+        } else if is_number_token(&tok.text) {
             symbols.insert(tok.text.clone());
         } else if let Some(lit) = extract_string_literal_content(&tok.text) {
             symbols.insert(lit);
@@ -502,20 +496,31 @@ pub fn extract_unit_candidate_symbols(text: &str) -> HashSet<String> {
                 chain.push('.');
                 chain.push_str(&tokens[j + 1].text);
                 symbols.insert(chain.clone());
+                anchor_tokens.insert(chain.clone());
                 j += 2;
             }
         }
         i += 1;
     }
 
-    extract_delimited_spans(text, '`', '`', &mut symbols);
-    extract_delimited_spans(text, '\'', '\'', &mut symbols);
-    extract_delimited_spans(text, '"', '"', &mut symbols);
+    extract_delimited_spans_into(text, '`', '`', &mut symbols, &mut anchor_tokens);
+    extract_delimited_spans_into(text, '\'', '\'', &mut symbols, &mut anchor_tokens);
+    extract_delimited_spans_into(text, '"', '"', &mut symbols, &mut anchor_tokens);
 
-    symbols
+    (symbols, anchor_tokens)
 }
 
-fn extract_delimited_spans(text: &str, open: char, close: char, symbols: &mut HashSet<String>) {
+pub fn extract_unit_candidate_symbols(text: &str) -> HashSet<String> {
+    extract_unit_symbols_and_anchors(text).0
+}
+
+fn extract_delimited_spans_into(
+    text: &str,
+    open: char,
+    close: char,
+    symbols: &mut HashSet<String>,
+    anchor_tokens: &mut HashSet<String>,
+) {
     let mut start_idx = 0;
     while let Some(o_idx) = text[start_idx..].find(open) {
         let abs_open = start_idx + o_idx;
@@ -524,9 +529,13 @@ fn extract_delimited_spans(text: &str, open: char, close: char, symbols: &mut Ha
             let span = rest[..c_idx].trim();
             if !span.is_empty() && span.len() <= 500 && !span.contains('\n') {
                 symbols.insert(span.to_string());
+                anchor_tokens.insert(span.to_string());
                 let span_tokens = tokenize(span);
                 for tok in &span_tokens {
-                    if is_ident_token(&tok.text) || is_number_token(&tok.text) {
+                    if is_ident_token(&tok.text) {
+                        symbols.insert(tok.text.clone());
+                        anchor_tokens.insert(tok.text.clone());
+                    } else if is_number_token(&tok.text) {
                         symbols.insert(tok.text.clone());
                     } else if let Some(lit) = extract_string_literal_content(&tok.text) {
                         symbols.insert(lit);
@@ -544,6 +553,7 @@ fn extract_delimited_spans(text: &str, open: char, close: char, symbols: &mut Ha
                             chain.push('.');
                             chain.push_str(&span_tokens[l + 1].text);
                             symbols.insert(chain.clone());
+                            anchor_tokens.insert(chain.clone());
                             l += 2;
                         }
                     }
@@ -555,6 +565,18 @@ fn extract_delimited_spans(text: &str, open: char, close: char, symbols: &mut Ha
             break;
         }
     }
+}
+
+pub fn find_first_anchor_in_tokens<'a>(
+    anchors: &'a [String],
+    unit_anchor_tokens: &HashSet<String>,
+) -> Option<&'a str> {
+    for anchor in anchors {
+        if unit_anchor_tokens.contains(anchor) {
+            return Some(anchor.as_str());
+        }
+    }
+    None
 }
 
 pub fn match_tier2_for_unit(
@@ -571,8 +593,33 @@ pub fn match_tier2_for_unit(
         return None;
     }
 
-    let matched_anchor = find_first_anchor(unit_text, &hunk.tier2_anchors)?;
-    let unit_symbols = extract_unit_candidate_symbols(unit_text);
+    let (unit_symbols, unit_anchor_tokens) = extract_unit_symbols_and_anchors(unit_text);
+    match_tier2_with_context(
+        &unit_symbols,
+        &unit_anchor_tokens,
+        hunk,
+        opts,
+        detector,
+        path,
+    )
+}
+
+pub fn match_tier2_with_context(
+    unit_symbols: &HashSet<String>,
+    unit_anchor_tokens: &HashSet<String>,
+    hunk: &HunkFingerprints,
+    opts: &ScanOptions,
+    detector: &str,
+    path: &str,
+) -> Option<Finding> {
+    if hunk.tier2_total_weight <= 0.0
+        || hunk.tier2_symbols.len() < 2
+        || hunk.tier2_anchors.is_empty()
+    {
+        return None;
+    }
+
+    let matched_anchor = find_first_anchor_in_tokens(&hunk.tier2_anchors, unit_anchor_tokens)?;
 
     let mut matched_symbols = Vec::new();
     let mut matched_weight = 0.0;

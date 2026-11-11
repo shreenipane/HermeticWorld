@@ -480,12 +480,29 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
         .filter_map(|f| f.hunk)
         .collect();
 
-    for hunk in &fp.hunks {
-        if gate_hunks.contains(&hunk.hunk_index) {
-            continue;
-        }
-        if let Some(t2_finding) = hunk.match_tier2(text, opts, "D0", problem_path) {
-            findings.push(t2_finding);
+    let has_tier2_candidates = fp.hunks.iter().any(|h| {
+        !gate_hunks.contains(&h.hunk_index)
+            && h.tier2_total_weight > 0.0
+            && h.tier2_symbols.len() >= 2
+            && !h.tier2_anchors.is_empty()
+    });
+
+    if has_tier2_candidates {
+        let (unit_symbols, unit_anchor_tokens) =
+            crate::tier2::extract_unit_symbols_and_anchors(text);
+        for hunk in &fp.hunks {
+            if gate_hunks.contains(&hunk.hunk_index) {
+                continue;
+            }
+            if let Some(t2_finding) = hunk.match_tier2_with_context(
+                &unit_symbols,
+                &unit_anchor_tokens,
+                opts,
+                "D0",
+                problem_path,
+            ) {
+                findings.push(t2_finding);
+            }
         }
     }
 
