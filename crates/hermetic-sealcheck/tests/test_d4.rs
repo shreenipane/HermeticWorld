@@ -398,7 +398,7 @@ fn test_index_round_trip_member_time_and_query_equivalence() {
 
     // Verify format version and member-time records in reader
     let mut reader = IndexReader::open(&idx_path).expect("open index");
-    assert_eq!(FORMAT_VERSION, 3);
+    assert_eq!(FORMAT_VERSION, 4);
 
     let mut found_member_times = Vec::new();
     let root_str = reader.root().to_string();
@@ -484,14 +484,58 @@ fn test_version_2_index_still_reads() {
 // Part C: ext4 image verification (mke2fs and hostile inputs)
 // =======================================================================================
 
-fn mke2fs_available() -> bool {
-    Command::new("mke2fs").arg("-V").output().is_ok()
+fn parse_mke2fs_version(output: &str) -> Option<(u32, u32, u32)> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("mke2fs ") {
+            let ver_str = rest.split_whitespace().next()?;
+            let mut parts = ver_str.split('.');
+            let major = parts.next()?.parse::<u32>().ok()?;
+            let minor = parts.next()?.parse::<u32>().ok()?;
+            let patch = parts.next()?.parse::<u32>().ok()?;
+            return Some((major, minor, patch));
+        }
+    }
+    None
+}
+
+fn mke2fs_version() -> Option<(u32, u32, u32)> {
+    let output = Command::new("mke2fs").arg("-V").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(v) = parse_mke2fs_version(&stdout) {
+        return Some(v);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_mke2fs_version(&stderr)
+}
+
+#[test]
+fn test_mke2fs_version_parser() {
+    assert_eq!(
+        parse_mke2fs_version("mke2fs 1.47.2 (1-Jan-2025)"),
+        Some((1, 47, 2))
+    );
+    assert_eq!(
+        parse_mke2fs_version("mke2fs 1.46.5 (30-Dec-2021)"),
+        Some((1, 46, 5))
+    );
+    assert!(parse_mke2fs_version("mke2fs 1.47.2 (1-Jan-2025)").unwrap() >= (1, 47, 1));
+    assert!(parse_mke2fs_version("mke2fs 1.46.5 (30-Dec-2021)").unwrap() < (1, 47, 1));
 }
 
 #[test]
 fn test_ext4_mke2fs_suite() {
-    if !mke2fs_available() {
-        println!("skipping ext4 tests: mke2fs not found");
+    let ver = match mke2fs_version() {
+        Some(v) => v,
+        None => {
+            println!("skipping ext4 tests: mke2fs not found or output not parseable");
+            return;
+        }
+    };
+    if ver < (1, 47, 1) {
+        println!(
+            "skipping ext4 tests: mke2fs version {}.{}.{} is below 1.47.1",
+            ver.0, ver.1, ver.2
+        );
         return;
     }
 
@@ -532,7 +576,7 @@ fn test_ext4_mke2fs_suite() {
         .expect("mke2fs clean");
     assert!(st.success(), "mke2fs clean image creation failed");
 
-    let clean_findings = scan_ext4_image(&clean_img, t_clock());
+    let clean_findings = scan_ext4_image(&clean_img, t_clock()).expect("scan clean");
     let clean_gates: Vec<_> = clean_findings
         .iter()
         .filter(|f| f.severity == Severity::Gate)
@@ -636,7 +680,7 @@ fn test_ext4_mke2fs_suite() {
         fs::write(&late_img, img_bytes).expect("write patched img");
     }
 
-    let late_findings = scan_ext4_image(&late_img, t_clock());
+    let late_findings = scan_ext4_image(&late_img, t_clock()).expect("scan late");
     let inode_gates: Vec<_> = late_findings
         .iter()
         .filter(|f| f.severity == Severity::Gate && f.channel == "inode")
@@ -683,7 +727,7 @@ fn test_ext4_mke2fs_suite() {
     // 3. T_clock earlier than SOURCE_DATE_EPOCH -> superblock gates
     // -----------------------------------------------------------------------------------
     let early_t_clock = datetime!(2024-01-01 00:00:00 UTC); // 1 day before SOURCE_DATE_EPOCH
-    let sb_findings = scan_ext4_image(&clean_img, early_t_clock);
+    let sb_findings = scan_ext4_image(&clean_img, early_t_clock).expect("scan sb");
     let sb_gates: Vec<_> = sb_findings
         .iter()
         .filter(|f| f.severity == Severity::Gate && f.channel == "superblock")
@@ -713,12 +757,11 @@ fn test_ext4_mke2fs_suite() {
 fn test_ext4_hostile_truncated_superblock() {
     // Fewer than 2048 bytes (superblock starts at 1024 and needs 1024 bytes)
     let truncated = vec![0u8; 1500];
-    let findings = scan_ext4_slice("truncated.img", &truncated, t_clock());
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].detector, "D4");
-    assert_eq!(findings[0].channel, "image_malformed");
-    assert_eq!(findings[0].severity, Severity::Info);
-    assert!(findings[0].evidence[0].contains("too small for superblock"));
+    let res = scan_ext4_slice("truncated.img", &truncated, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(ref msg)) if msg.contains("too small for superblock")),
+        "expected Malformed, got {res:?}"
+    );
 }
 
 #[test]
@@ -727,10 +770,11 @@ fn test_ext4_hostile_bad_magic() {
     // Offset 1024 + 0x38 = magic
     data[1024 + 0x38] = 0x34;
     data[1024 + 0x39] = 0x12; // 0x1234 instead of 0xEF53
-    let findings = scan_ext4_slice("bad_magic.img", &data, t_clock());
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].channel, "image_malformed");
-    assert!(findings[0].evidence[0].contains("bad magic"));
+    let res = scan_ext4_slice("bad_magic.img", &data, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(ref msg)) if msg.contains("bad magic")),
+        "expected Malformed, got {res:?}"
+    );
 }
 
 #[test]
@@ -748,9 +792,11 @@ fn test_ext4_hostile_huge_inodes_per_group() {
     // Huge inodes per group: 0xFFFFFFFF
     data[1024 + 0x28..1024 + 0x2C].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
 
-    let findings = scan_ext4_slice("huge_inodes.img", &data, t_clock());
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].channel, "image_malformed");
+    let res = scan_ext4_slice("huge_inodes.img", &data, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(_))),
+        "expected Malformed, got {res:?}"
+    );
 }
 
 #[test]
@@ -770,10 +816,11 @@ fn test_ext4_hostile_group_count_past_file() {
     data[1024 + 0x20..1024 + 0x24].copy_from_slice(&10u32.to_le_bytes());
     data[1024 + 0x04..1024 + 0x08].copy_from_slice(&10u32.to_le_bytes());
 
-    let findings = scan_ext4_slice("past_file.img", &data, t_clock());
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].channel, "image_malformed");
-    assert!(findings[0].evidence[0].contains("group count past the file"));
+    let res = scan_ext4_slice("past_file.img", &data, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(ref msg)) if msg.contains("group count past the file")),
+        "expected Malformed, got {res:?}"
+    );
 }
 
 #[test]
@@ -799,10 +846,11 @@ fn test_ext4_hostile_descriptor_table_past_end() {
     // Descriptor size = 512 bytes (512 * 10 = 5120 bytes, offset 2048 + 5120 > 4096)
     data[1024 + 0xFE..1024 + 0x100].copy_from_slice(&512u16.to_le_bytes());
 
-    let findings = scan_ext4_slice("desc_past_end.img", &data, t_clock());
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].channel, "image_malformed");
-    assert!(findings[0].evidence[0].contains("descriptor table past the end"));
+    let res = scan_ext4_slice("desc_past_end.img", &data, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(ref msg)) if msg.contains("descriptor table past the end")),
+        "expected Malformed, got {res:?}"
+    );
 }
 
 #[test]
@@ -826,4 +874,127 @@ fn test_ext4_hostile_every_single_byte_flip_never_panics() {
             baseline[idx] ^= flip; // restore
         }
     }
+}
+
+#[test]
+fn test_ext4_huge_hi_descriptor_fields_malformed() {
+    let mut data = vec![0u8; 8192];
+    // Superblock
+    data[1024 + 0x38] = 0x53;
+    data[1024 + 0x39] = 0xEF; // magic
+    data[1024 + 0x58] = 128; // inode size
+    data[1024..1024 + 4].copy_from_slice(&10u32.to_le_bytes()); // inodes count
+    data[1024 + 0x28..1024 + 0x2C].copy_from_slice(&10u32.to_le_bytes()); // inodes per group
+    data[1024 + 0x04..1024 + 0x08].copy_from_slice(&8u32.to_le_bytes()); // blocks count
+    data[1024 + 0x20..1024 + 0x24].copy_from_slice(&8u32.to_le_bytes()); // blocks per group
+    data[1024 + 0x14..1024 + 0x18].copy_from_slice(&1u32.to_le_bytes()); // first data block
+    data[1024 + 0x60..1024 + 0x64].copy_from_slice(&0x0080u32.to_le_bytes()); // 64-bit feature
+    data[1024 + 0xFE..1024 + 0x100].copy_from_slice(&64u16.to_le_bytes()); // desc size 64
+
+    // GDT starts at block 2 = offset 2048
+    let gdt_offset = 2048;
+    // Set huge _hi for inode bitmap (offset 0x24 in 64-byte descriptor)
+    data[gdt_offset + 0x24..gdt_offset + 0x28].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    // Set huge _hi for inode table (offset 0x28 in 64-byte descriptor)
+    data[gdt_offset + 0x28..gdt_offset + 0x2C].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+    let res = scan_ext4_slice("huge_hi.img", &data, t_clock());
+    assert!(
+        matches!(res, Err(hermetic_sealcheck::Ext4Error::Malformed(_))),
+        "huge _hi fields must return Malformed with no panic, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_ext4_fuzz_descriptor_table_random_u32() {
+    let mut baseline = vec![0u8; 8192];
+    baseline[1024 + 0x38] = 0x53;
+    baseline[1024 + 0x39] = 0xEF; // magic
+    baseline[1024 + 0x58] = 128; // inode size
+    baseline[1024..1024 + 4].copy_from_slice(&10u32.to_le_bytes());
+    baseline[1024 + 0x28..1024 + 0x2C].copy_from_slice(&10u32.to_le_bytes());
+    baseline[1024 + 0x04..1024 + 0x08].copy_from_slice(&8u32.to_le_bytes());
+    baseline[1024 + 0x20..1024 + 0x24].copy_from_slice(&8u32.to_le_bytes());
+    baseline[1024 + 0x14..1024 + 0x18].copy_from_slice(&1u32.to_le_bytes());
+    baseline[1024 + 0x60..1024 + 0x64].copy_from_slice(&0x0080u32.to_le_bytes());
+    baseline[1024 + 0xFE..1024 + 0x100].copy_from_slice(&64u16.to_le_bytes());
+
+    let gdt_start = 2048;
+    let gdt_len = 64;
+
+    let mut state: u64 = 0x4d59_5f53_4545_4431;
+    let mut rand_u32 = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 32) as u32
+    };
+
+    for _ in 0..500 {
+        let mut fuzzed = baseline.clone();
+        for off in (0..gdt_len).step_by(4) {
+            let val = rand_u32();
+            fuzzed[gdt_start + off..gdt_start + off + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let _ = scan_ext4_slice("fuzz_desc.img", &fuzzed, t_clock());
+    }
+}
+
+#[test]
+fn test_d4_image_cli_missing_path_exits_1() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let res = Command::new(bin_path)
+        .arg("d4-image")
+        .arg("--image")
+        .arg("nonexistent_path_d4_image.img")
+        .arg("--t-clock")
+        .arg("2024-01-02T00:00:00Z")
+        .output()
+        .expect("run d4-image missing");
+    assert_eq!(res.status.code(), Some(1));
+}
+
+#[test]
+fn test_d4_image_cli_truncated_image_exits_1() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let d = tempdir().expect("tempdir");
+    let img = d.path().join("trunc.img");
+    fs::write(&img, vec![0u8; 100]).expect("write");
+    let res = Command::new(bin_path)
+        .arg("d4-image")
+        .arg("--image")
+        .arg(&img)
+        .arg("--t-clock")
+        .arg("2024-01-02T00:00:00Z")
+        .output()
+        .expect("run d4-image trunc");
+    assert_eq!(res.status.code(), Some(1));
+}
+
+#[test]
+fn test_d4_image_cli_meta_bg_exits_1_naming_meta_bg() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let d = tempdir().expect("tempdir");
+    let img = d.path().join("meta_bg.img");
+    let mut data = vec![0u8; 8192];
+    data[1024 + 0x38] = 0x53;
+    data[1024 + 0x39] = 0xEF; // magic
+                              // s_feature_incompat at 1024 + 0x60 has EXT4_FEATURE_INCOMPAT_META_BG (0x0010)
+    data[1024 + 0x60] = 0x10;
+    fs::write(&img, &data).expect("write");
+
+    let res = Command::new(bin_path)
+        .arg("d4-image")
+        .arg("--image")
+        .arg(&img)
+        .arg("--t-clock")
+        .arg("2024-01-02T00:00:00Z")
+        .output()
+        .expect("run d4-image meta_bg");
+    assert_eq!(res.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("meta_bg"),
+        "error must name meta_bg, got: {stderr}"
+    );
 }

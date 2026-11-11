@@ -366,7 +366,16 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut target_packages = vec![repo_pkg.to_string()];
     target_packages.extend(args.target_package);
 
+    let mut not_covered_set: Vec<String> = NOT_COVERED.iter().map(|s| s.to_string()).collect();
     for (idx, index) in args.indexes.iter().enumerate() {
+        let reader = hermetic_sealcheck::IndexReader::open(index)?;
+        let v = reader.version();
+        for item in hermetic_sealcheck::index::not_covered_for_version(v) {
+            let s = item.to_string();
+            if !not_covered_set.contains(&s) {
+                not_covered_set.push(s);
+            }
+        }
         let vis = args
             .root_visibilities
             .get(idx)
@@ -384,20 +393,21 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         all_findings.extend(query_index(index, &fp, &opts)?);
     }
 
+    let not_covered_refs: Vec<&str> = not_covered_set.iter().map(|s| s.as_str()).collect();
     write_report(
         all_findings,
         Some(&fp),
         task.instance_id,
         args.format,
         args.out,
-        Some(NOT_COVERED),
+        Some(&not_covered_refs),
     )
 }
 
 fn run_d4_image(args: D4ImageArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let t_clock = hermetic_common::cutoff::parse_utc_datetime(&args.t_clock)
         .map_err(|e| format!("invalid --t-clock: {e}"))?;
-    let findings = hermetic_sealcheck::scan_ext4_image(&args.image, t_clock);
+    let findings = hermetic_sealcheck::scan_ext4_image(&args.image, t_clock)?;
     write_report(
         findings,
         None,
