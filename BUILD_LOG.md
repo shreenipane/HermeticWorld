@@ -29,6 +29,137 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-11: T1.6 layer index and per-task query (Phase 1)
+
+- **Phase:** 1
+- **Type:** build + measurement
+- **Requirements:** TR-SC-10
+- **Briefs:** `agy-tasks/T1.6-layer-index.md`
+- **Merge commits:** `edfe238`
+
+### Done
+- Built layer indexing and caching in `crates/hermetic-sealcheck`:
+  - `src/index.rs`: layer index format (format version 2) storing inode times, package manifests with dates, line/window/winnow hashes, and D9 benchmark presence indicators; bounded unit merge, exclusion paths, canonical root support, record limits, and SARIF output mode.
+  - Per-task query: matches tasks against pre-computed layer index records without re-traversing layer filesystem trees.
+  - CLI subcommands in `src/main.rs`: `index-layer` and `query-index`.
+- Modules involved: `crates/hermetic-sealcheck` (`src/index.rs`, `src/main.rs`, `src/lib.rs`, `src/scan.rs`, `src/benchmark.rs`, `src/binary.rs`, `src/containers.rs`, `src/d5a.rs`, `src/fingerprint.rs`, `src/sarif.rs`).
+- Tests: `crates/hermetic-sealcheck/tests/test_index.rs`.
+
+### Results / measurements
+- Query time: 0.11 s on a 50 MB, 5,000-file tree (target budget < 5 s).
+
+---
+
+## 2026-11-11: T1.7 detector D4 inode and superblock times (Phase 1)
+
+- **Phase:** 1
+- **Type:** build
+- **Requirements:** TR-SC-7 (D4), TR-SEAL-8
+- **Briefs:** `agy-tasks/T1.7-d4-times.md`
+- **Merge commits:** `a89c697`
+
+### Done
+- Built detector D4 checking inode and superblock times against `T_clock`:
+  - Live tree scan: loose files, directories, and symlinks with mtime after `T_clock` trigger a gate finding (`channel: mtime`). Tar and zip members with mtimes newer than `T_clock` trigger gate findings (`channel: member_mtime`).
+  - Index integration: member times stored in record tag 9 (format version 3, backward compatible with version 2), allowing `query-index` to evaluate D4 findings.
+  - Direct ext4 image inspection in `src/ext4.rs`: CLI subcommand `d4-image` parses ext4 structures directly without mounting, checking superblock times and in-use inode times (including extra-epoch bits) against `T_clock`; malformed images fail closed or record info findings.
+- Modules involved: `crates/hermetic-sealcheck` (`src/ext4.rs`, `src/scan.rs`, `src/index.rs`, `src/containers.rs`, `src/main.rs`, `src/lib.rs`).
+- Tests: `crates/hermetic-sealcheck/tests/test_d4.rs` (live trees, archive members, index round-trip/query equivalence, mke2fs ext4 clean/late images, corrupted and boundary-case images), with updates in `tests/test_cli.rs`, `tests/test_d5a.rs`, `tests/test_d6.rs`, `tests/test_index.rs`.
+
+---
+
+## 2026-11-11: T1.8 detectors D11 and D12 (Phase 1)
+
+- **Phase:** 1
+- **Type:** build
+- **Requirements:** TR-SC-7 (D11, D12), TR-SEC-5
+- **Merge commits:** `057ef23`
+
+### Done
+- Built detectors D11 (test-infrastructure changes) and D12 (real-date sentinel):
+  - D11 (`hermetic-sealcheck d11 --patch FILE`): inspects unified diff patches for modifications to test infrastructure: `conftest.py`, `pytest.ini`, `tox.ini`, `sitecustomize`, `usercustomize`, `.pth`, `egg-info` / `dist-info` metadata files, benchmark test files, pytest and coverage sections and `pytest11` entry points in `setup.cfg`, `pyproject.toml`, and `setup.py`, monkey-patching of test frameworks or interpreter internals, and modules shadowing the standard library or installed packages. Advisory severity (`review`), exit code 0.
+  - D12 (`hermetic-sealcheck d12 --path ... --real-date YYYY-MM-DD`): scans text leaving the VM for real execution date across formats (ISO, US, European, English month names, RFC 2822, HTTP-date, epoch seconds and milliseconds), host names, and host paths. Advisory severity (`review`), exit code 0.
+  - Added SARIF reporting rules and CLI dispatch for D11 and D12.
+- Modules involved: `crates/hermetic-sealcheck` (`src/d11.rs`, `src/d12.rs`, `src/main.rs`, `src/sarif.rs`, `src/lib.rs`).
+- Tests: `crates/hermetic-sealcheck/tests/test_d11.rs`, `crates/hermetic-sealcheck/tests/test_d12.rs`.
+
+---
+
+## 2026-11-11: T1.9 undated mode (Phase 1)
+
+- **Phase:** 1
+- **Type:** build
+- **Requirements:** TR-SC-9
+- **Briefs:** `agy-tasks/T1.9-undated-mode.md`
+- **Merge commits:** `958fabe`
+
+### Done
+- Built undated mode for benchmark tasks lacking commit history and cutoff dates (`scan --undated` and `query --undated`):
+  - Fingerprints all files under `solution/` and `tests/` as added lines (`FingerprintSet::from_files`), subtracting base-tree baselines.
+  - Streaming baseline subtraction for large base-tree files over size caps with bounded lines; incomplete baselines are recorded when overall budgets are exhausted.
+  - Executes D0 on task instructions, D2, D3b, and D9 on roots, and D6 when OCI files are provided; cutoff-dependent detectors D1, D3, D4, and D5a are skipped and reported in `not_covered`.
+  - Fixes for YAML block scalars (folded and literal), indentation indicators, inline `#` comments, and duplicate-line weighting across both dated and undated paths.
+- Modules involved: `crates/hermetic-sealcheck` (`src/undated.rs`, `src/fingerprint.rs`, `src/main.rs`, `src/scan.rs`, `src/index.rs`, `src/lib.rs`).
+- Tests: `crates/hermetic-sealcheck/tests/test_undated.rs`, `crates/hermetic-sealcheck/tests/test_tier2.rs`.
+
+---
+
+## 2026-11-11: T1.10 detector D8 coherence tells (Phase 1)
+
+- **Phase:** 1
+- **Type:** build
+- **Requirements:** TR-SC-7 (D8)
+- **Merge commits:** `c6a57a1`
+
+### Done
+- Built detector D8 (`hermetic-sealcheck d8 --root DIR --t-clock RFC3339`):
+  - Inspects rootfs details that indicate a date later than `T_clock`. Advisory `info` severity only, never gates.
+  - Inspects channels: `os_release` (built-in Linux distribution release-date tables; versions newer than tables flagged), `tzdata`, `ca_bundle` (handwritten PEM and DER certificate parser checking `notBefore` validity), `kernel` modules, `dated_log` (syslog and journal logs read from tail for recent entries, parsing years adjacent to timestamps), and `python_build` (sysconfig timestamps).
+  - Path safety and boundaries: `resolve_in_root` chroot-style symlink resolution preventing host filesystem escapes, root-relative path resolution, and bounded reads using `take()` to prevent unbounded log consumption.
+- Modules involved: `crates/hermetic-sealcheck` (`src/d8.rs`, `src/main.rs`, `src/lib.rs`).
+- Tests: `crates/hermetic-sealcheck/tests/test_d8.rs`.
+
+---
+
+## 2026-11-11: T1.11 Tier 2 tree-sitter IDF symbols (Phase 1)
+
+- **Phase:** 1
+- **Type:** build
+- **Requirements:** TR-SC-3
+- **Briefs:** `agy-tasks/T1.11-tier2.md`
+- **Merge commits:** `16639ae`
+
+### Done
+- Built Tier 2 statement symbol fingerprinting:
+  - Tree-sitter integration for Python (pinned `tree-sitter = 0.25.0`, `tree-sitter-python = 0.25.0`) collecting identifiers, attribute chains, keyword arguments, and literals from modified statements in the patch.
+  - Symbols weighted by inverse document frequency (IDF) over a deterministic sorted sample of the base tree.
+  - File, module, function, and class names serve as anchors. A text unit containing an anchor plus at least 2 symbols carrying >= `tier2_threshold` (default 0.35) of a hunk's weight flags a `review` finding under D0 or D2 (suppressed if a Tier 1 or Tier 3 gate already covers the hunk). Never gates.
+  - Prose-aware scanner preserving markdown heading anchors, safe UTF-8 character boundary stepping, handling of renames and deletion-only hunks, and single tokenization pass per text unit.
+  - `query-index` reports Tier 2 as not covered.
+- Modules involved: `crates/hermetic-sealcheck` (`src/tier2.rs`, `src/fingerprint.rs`, `src/scan.rs`, `src/containers.rs`, `src/index.rs`, `src/lib.rs`, `Cargo.toml`).
+- Tests: `crates/hermetic-sealcheck/tests/test_tier2.rs`, `crates/hermetic-sealcheck/tests/test_index.rs`.
+
+---
+
+## 2026-11-11: T2.6 world manifest and world_root (Phase 2)
+
+- **Phase:** 2
+- **Type:** build
+- **Requirements:** TR-SEAL-11, TR-SEAL-12; §13.1
+- **Briefs:** `agy-tasks/T2.6-world-manifest.md`
+- **Merge commits:** `b684b58`
+
+### Done
+- Built the world manifest and `world_root` Merkle tree verification:
+  - `WorldManifest` struct in `crates/hermetic-common/src/world_manifest.rs` covering all §13.1 field groups (Identity, Cutoffs, Content, Substrate, Network, Run spec, Evidence), `deny_unknown_fields`, and validation reporting all schema, format, calendar date, and timestamp constraint errors.
+  - `world_root`: BLAKE3 binary Merkle root over canonical sorted `(field path, JSON scalar)` leaves with domain separation (`hw-leaf\0`, `hw-node\0`, `hw-empty\0`). Generates and verifies cryptographic inclusion proofs (`inclusion_proof`, `verify_inclusion`). Schema and tree pinned with a fixed known-answer test.
+  - Deterministic tree digest (`digest_tree`, `digest_file`): raw-byte path and symlink target hashing on Unix, entry kind, owner-executable bit (ignoring timestamps and ownership), BLAKE3 content stream, domain tag `hw-tree\0`.
+  - CLI binary `hermetic-manifest` (`crates/hermetic-common/src/bin/hermetic_manifest.rs`) providing subcommands: `root`, `verify`, `prove`, `check-proof`, `digest-tree`, and `digest-file`.
+- Modules involved: `crates/hermetic-common` (`src/world_manifest.rs`, `src/bin/hermetic_manifest.rs`, `src/lib.rs`, `Cargo.toml`).
+- Tests: `crates/hermetic-common/tests/test_world_manifest.rs`.
+
+---
+
 ## 2026-11-11: T1.4 binary tier, D3b and D5a; T1.5 E3 harness; first E3 numbers (Phase 1)
 
 - **Phase:** 1
