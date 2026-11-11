@@ -39,9 +39,9 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ### Done
 - Built layer indexing and caching in `crates/hermetic-sealcheck`:
-  - `src/index.rs`: layer index format (format version 2) storing inode times, package manifests with dates, line/window/winnow hashes, and D9 benchmark presence indicators; bounded unit merge, exclusion paths, canonical root support, record limits, and SARIF output mode.
+  - `src/index.rs`: layer index format (format version 2) storing inode times, package names and optional versions for D5a (package-date coverage deferred), line/window/winnow hashes, and D9 benchmark presence indicators; bounded unit merge, exclusion paths, canonical root support, record limits, and SARIF output mode.
   - Per-task query: matches tasks against pre-computed layer index records without re-traversing layer filesystem trees.
-  - CLI subcommands in `src/main.rs`: `index-layer` and `query-index`.
+  - CLI subcommands in `src/main.rs`: `index` and `query`.
 - Modules involved: `crates/hermetic-sealcheck` (`src/index.rs`, `src/main.rs`, `src/lib.rs`, `src/scan.rs`, `src/benchmark.rs`, `src/binary.rs`, `src/containers.rs`, `src/d5a.rs`, `src/fingerprint.rs`, `src/sarif.rs`).
 - Tests: `crates/hermetic-sealcheck/tests/test_index.rs`.
 
@@ -61,7 +61,7 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 ### Done
 - Built detector D4 checking inode and superblock times against `T_clock`:
   - Live tree scan: loose files, directories, and symlinks with mtime after `T_clock` trigger a gate finding (`channel: mtime`). Tar and zip members with mtimes newer than `T_clock` trigger gate findings (`channel: member_mtime`).
-  - Index integration: member times stored in record tag 9 (format version 3, backward compatible with version 2), allowing `query-index` to evaluate D4 findings.
+  - Index integration: format version 4 stores member times in record tag 9, directories in tag 10, and symlinks in tag 11, allowing `query` to evaluate D4 findings. The reader remains compatible with versions 2 and 3; version 2 lacks member, directory, and symlink times, while version 3 lacks directory and symlink times, with those gaps reported in `not_covered`.
   - Direct ext4 image inspection in `src/ext4.rs`: CLI subcommand `d4-image` parses ext4 structures directly without mounting, checking superblock times and in-use inode times (including extra-epoch bits) against `T_clock`; malformed images fail closed or record info findings.
 - Modules involved: `crates/hermetic-sealcheck` (`src/ext4.rs`, `src/scan.rs`, `src/index.rs`, `src/containers.rs`, `src/main.rs`, `src/lib.rs`).
 - Tests: `crates/hermetic-sealcheck/tests/test_d4.rs` (live trees, archive members, index round-trip/query equivalence, mke2fs ext4 clean/late images, corrupted and boundary-case images), with updates in `tests/test_cli.rs`, `tests/test_d5a.rs`, `tests/test_d6.rs`, `tests/test_index.rs`.
@@ -135,7 +135,7 @@ A dated, append-only record of what was built, measured and decided. Newest entr
   - Symbols weighted by inverse document frequency (IDF) over a deterministic sorted sample of the base tree.
   - File, module, function, and class names serve as anchors. A text unit containing an anchor plus at least 2 symbols carrying >= `tier2_threshold` (default 0.35) of a hunk's weight flags a `review` finding under D0 or D2 (suppressed if a Tier 1 or Tier 3 gate already covers the hunk). Never gates.
   - Prose-aware scanner preserving markdown heading anchors, safe UTF-8 character boundary stepping, handling of renames and deletion-only hunks, and single tokenization pass per text unit.
-  - `query-index` reports Tier 2 as not covered.
+  - `query` reports Tier 2 as not covered.
 - Modules involved: `crates/hermetic-sealcheck` (`src/tier2.rs`, `src/fingerprint.rs`, `src/scan.rs`, `src/containers.rs`, `src/index.rs`, `src/lib.rs`, `Cargo.toml`).
 - Tests: `crates/hermetic-sealcheck/tests/test_tier2.rs`, `crates/hermetic-sealcheck/tests/test_index.rs`.
 
