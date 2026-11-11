@@ -86,3 +86,34 @@ fn test_sandbox_child_process() {
         );
     }
 }
+
+#[test]
+fn test_fix7_sandbox_child_outside_fixture_failure() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let log_dir = temp.path().join("log");
+    std::fs::create_dir_all(&store_dir).expect("create store");
+    std::fs::create_dir_all(&log_dir).expect("create log");
+
+    let bin = bin_path();
+    let invalid_outside = temp.path().join("nonexistent_dir").join("outside.txt");
+
+    let output = Command::new(&bin)
+        .env("HERMETIC_CHILD_ROLE", "sandbox")
+        .env("HERMETIC_TEST_STORE", &store_dir)
+        .env("HERMETIC_TEST_LOG", &log_dir)
+        .env("HERMETIC_TEST_OUTSIDE", &invalid_outside)
+        .output()
+        .expect("spawn child process");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "Child process must exit with non-zero code 2 on fixture write failure before sandbox"
+    );
+    assert!(
+        stderr.contains("Failed to create outside fixture file"),
+        "Child process must emit clear error message on fixture write failure: {stderr}"
+    );
+}

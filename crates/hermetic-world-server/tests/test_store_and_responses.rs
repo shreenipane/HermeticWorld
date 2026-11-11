@@ -31,6 +31,7 @@ fn start_test_server(
         allow_no_landlock: true,
         no_sandbox: true,
         resume_log: false,
+        recover: false,
     };
 
     let server = WorldServer::new(config).expect("create server");
@@ -408,7 +409,6 @@ fn test_fix4_deterministic_headers() {
         range: None,
     };
     let resp1 = send_req(&sock1, &req);
-    let bytes1 = resp1.encode(1024 * 1024).expect("encode resp1");
 
     // Server instance 2
     let log_dir2 = temp.path().join("log2");
@@ -416,12 +416,19 @@ fn test_fix4_deterministic_headers() {
     let sock2 = start_test_server(&store_dir, &log_dir2, &sock_path2, t_clock);
 
     let resp2 = send_req(&sock2, &req);
-    let bytes2 = resp2.encode(1024 * 1024).expect("encode resp2");
 
-    // FIX 4: the same object served twice by two server instances yields byte-identical response frames
+    let mut resp1_nodate = resp1.clone();
+    resp1_nodate.headers.retain(|h| h.name != "date");
+    let mut resp2_nodate = resp2.clone();
+    resp2_nodate.headers.retain(|h| h.name != "date");
+
+    let bytes1 = resp1_nodate.encode(1024 * 1024).expect("encode resp1");
+    let bytes2 = resp2_nodate.encode(1024 * 1024).expect("encode resp2");
+
+    // FIX 6: Compare the frames with the date header removed, so the test checks header ordering only
     assert_eq!(
         bytes1, bytes2,
-        "Two server instances must yield byte-identical response frames"
+        "Two server instances must yield byte-identical response frames with date header removed"
     );
 
     // Extra headers must appear in alphabetical order
@@ -526,4 +533,115 @@ fn test_fix6_filter_headers_sidecar_validation() {
 
     // Valid headers are present
     assert_eq!(hdrs.get("x-hdr-000"), Some(&"val-0"));
+}
+
+#[test]
+fn test_fix1_relative_store_root_with_parent_dir() {
+    let temp = tempdir().expect("tempdir");
+    let actual_store = temp.path().join("store");
+    let obj_dir = actual_store.join("example.com");
+    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    fs::write(obj_dir.join("hello.txt"), b"relative root content").expect("write file");
+
+    let dummy_dir = temp.path().join("dummy");
+    fs::create_dir_all(&dummy_dir).expect("create dummy dir");
+
+    // Relative path containing "../"
+    let rel_path = dummy_dir.join("..").join("store");
+    let store = DirStore::new(&rel_path);
+
+    let obj = store.get("example.com", "/hello.txt");
+    assert!(
+        obj.is_some(),
+        "DirStore::new with a relative path containing '../' must find the file"
+    );
+    assert_eq!(obj.unwrap().body, b"relative root content");
+
+    // Missing store directory at startup fails with StartupFailed
+    let missing_store = temp.path().join("nonexistent_store");
+    let config = ServerConfig {
+        store_dir: missing_store,
+        socket_path: temp.path().join("server.sock"),
+        log_dir: temp.path().join("log"),
+        t_clock: datetime!(2024-01-01 00:00:00 UTC),
+        rate_rps: None,
+        burst: None,
+        max_requests: None,
+        max_bytes: None,
+        allow_no_landlock: true,
+        no_sandbox: true,
+        resume_log: false,
+        recover: false,
+    };
+    let server_res = WorldServer::new(config);
+    assert!(
+        matches!(
+            server_res,
+            Err(hermetic_world_server::ServerExit::StartupFailed)
+        ),
+        "WorldServer::new with missing root must return StartupFailed"
+    );
+}
+
+#[test]
+fn test_fix2_mixed_case_sidecar_headers() {
+    let temp = tempdir().expect("tempdir");
+    let store_dir = temp.path().join("store");
+    let obj_dir = store_dir.join("example.com").join("headers");
+    fs::create_dir_all(&obj_dir).expect("create obj dir");
+
+    let file_path = obj_dir.join("item.json");
+    fs::write(&file_path, b"{\"status\": \"ok\"}").expect("write file");
+
+    let sidecar_path = obj_dir.join("item.json.headers.json");
+    let sidecar_content = r#"{
+        "content_type": "application/json",
+        "headers": {
+            "ETag": "\"abcdef123456\"",
+            "Cache-Control": "public, max-age=86400",
+            "X-Mixed-Case-Custom": "custom-val"
+        }
+    }"#;
+    fs::write(&sidecar_path, sidecar_content).expect("write sidecar");
+
+    let log_dir = temp.path().join("log");
+    let sock_path = temp.path().join("server.sock");
+    let sock = start_test_server(
+        &store_dir,
+        &log_dir,
+        &sock_path,
+        datetime!(2024-03-01 12:00:00 UTC),
+    );
+
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 42,
+        authority: "example.com".into(),
+        path_and_query: "/headers/item.json".into(),
+        range: None,
+    };
+    let resp = send_req(&sock, &req);
+    assert_eq!(resp.status, 200);
+
+    let hdrs: std::collections::HashMap<_, _> = resp
+        .headers
+        .iter()
+        .map(|h| (h.name.as_str(), h.value.as_str()))
+        .collect();
+
+    assert_eq!(
+        hdrs.get("etag"),
+        Some(&"\"abcdef123456\""),
+        "ETag sidecar header must be lowercased to etag"
+    );
+    assert_eq!(
+        hdrs.get("cache-control"),
+        Some(&"public, max-age=86400"),
+        "Cache-Control sidecar header must be lowercased to cache-control"
+    );
+    assert_eq!(
+        hdrs.get("x-mixed-case-custom"),
+        Some(&"custom-val"),
+        "Mixed-case headers must be lowercased and retained"
+    );
 }

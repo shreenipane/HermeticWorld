@@ -47,6 +47,7 @@ pub struct ServerConfig {
     pub allow_no_landlock: bool,
     pub no_sandbox: bool, // For in-process unit testing without restricting cargo test runner
     pub resume_log: bool,
+    pub recover: bool,
 }
 
 /// Format an OffsetDateTime in IMF-fixdate format (RFC 7231 / RFC 9110), e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
@@ -187,13 +188,8 @@ pub fn filter_headers(
         {
             continue;
         }
-        // Name must be a lowercase token
-        if name != lower {
-            eprintln!("Dropping header '{name}': name is not lowercase");
-            continue;
-        }
-
-        try_push(name, val, &mut out, &mut total_bytes);
+        // FIX 2: lowercase mixed-case header names and validate lowercased form
+        try_push(lower, val, &mut out, &mut total_bytes);
     }
 
     out
@@ -208,10 +204,27 @@ pub struct WorldServer {
 }
 
 impl WorldServer {
-    pub fn new(config: ServerConfig) -> Result<Self, ServerExit> {
+    pub fn new(mut config: ServerConfig) -> Result<Self, ServerExit> {
+        // FIX 1: Resolve the configured store root to an absolute path at startup
+        let store_dir = match config.store_dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "Failed to canonicalize store root {:?}: {e}",
+                    config.store_dir
+                );
+                return Err(ServerExit::StartupFailed);
+            }
+        };
+        config.store_dir = store_dir;
+
         // Step 1: Open store directory and create log files
         let store = DirStore::new(&config.store_dir);
-        let log = match LogManager::new_opts(&config.log_dir, config.resume_log) {
+        let log = match LogManager::new_opts_recover(
+            &config.log_dir,
+            config.resume_log,
+            config.recover,
+        ) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("{e}");
@@ -266,12 +279,18 @@ impl WorldServer {
 
             let exit = self.handle_connection(&mut stream);
             if exit != ServerExit::Normal {
-                let _ = self.log.finish();
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return Err(ServerExit::LogFailed);
+                }
                 return Err(exit);
             }
         }
 
-        let _ = self.log.finish();
+        if let Err(e) = self.log.finish() {
+            eprintln!("log_failed: {e}");
+            return Err(ServerExit::LogFailed);
+        }
         Ok(())
     }
 
@@ -306,7 +325,10 @@ impl WorldServer {
                         let _ = self.log.finish();
                         return ServerExit::LogFailed;
                     }
-                    let _ = self.log.finish();
+                    if let Err(e) = self.log.finish() {
+                        eprintln!("log_failed: {e}");
+                        return ServerExit::LogFailed;
+                    }
                     return ServerExit::Tampered;
                 }
                 Err(e) => {
@@ -335,7 +357,10 @@ impl WorldServer {
                     let _ = self.log.finish();
                     return ServerExit::LogFailed;
                 }
-                let _ = self.log.finish();
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return ServerExit::LogFailed;
+                }
                 return ServerExit::LimitExceeded;
             }
 
@@ -443,7 +468,10 @@ impl WorldServer {
                     let _ = self.log.finish();
                     return ServerExit::LogFailed;
                 }
-                let _ = self.log.finish();
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return ServerExit::LogFailed;
+                }
                 return ServerExit::LimitExceeded;
             }
 
@@ -474,7 +502,10 @@ impl WorldServer {
                     let _ = self.log.finish();
                     return ServerExit::LogFailed;
                 }
-                let _ = self.log.finish();
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return ServerExit::LogFailed;
+                }
                 return ServerExit::Normal;
             }
 

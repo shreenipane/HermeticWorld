@@ -12,9 +12,15 @@ fn normalize_components(path: &Path) -> PathBuf {
             std::path::Component::Prefix(p) => out.push(p.as_os_str()),
             std::path::Component::RootDir => out.push(comp.as_os_str()),
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
+            std::path::Component::ParentDir => match out.components().next_back() {
+                Some(std::path::Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(std::path::Component::RootDir) => {}
+                _ => {
+                    out.push(comp.as_os_str());
+                }
+            },
             std::path::Component::Normal(c) => out.push(c),
         }
     }
@@ -40,16 +46,20 @@ pub fn is_inside_root(root: &Path, path: &Path) -> bool {
         return false;
     }
 
-    if let (Ok(canon_root), Ok(canon_path)) = (root.canonicalize(), path.canonicalize()) {
-        let mut c_root_comps = canon_root.components();
-        let mut c_path_comps = canon_path.components();
-        for r in &mut c_root_comps {
-            match c_path_comps.next() {
-                Some(p) if p == r => {}
-                _ => return false,
+    if let Ok(canon_root) = root.canonicalize() {
+        if let Ok(canon_path) = path.canonicalize() {
+            let mut c_root_comps = canon_root.components();
+            let mut c_path_comps = canon_path.components();
+            for r in &mut c_root_comps {
+                match c_path_comps.next() {
+                    Some(p) if p == r => {}
+                    _ => return false,
+                }
             }
-        }
-        if c_path_comps.next().is_none() {
+            if c_path_comps.next().is_none() {
+                return false;
+            }
+        } else if path.is_symlink() {
             return false;
         }
     }
@@ -95,9 +105,9 @@ struct Custom404 {
 
 impl DirStore {
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
-        Self {
-            root: normalize_components(root.as_ref()),
-        }
+        let p = root.as_ref();
+        let canon = p.canonicalize().unwrap_or_else(|_| normalize_components(p));
+        Self { root: canon }
     }
 
     /// Return custom or default 404 response for the given authority: (status, content_type, body).

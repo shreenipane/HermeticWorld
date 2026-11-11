@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use hermetic_world_server::{verify_log_ext, ServerConfig, ServerExit, WorldServer};
+use hermetic_world_server::{verify_log_recover, ServerConfig, ServerExit, WorldServer};
 use std::path::PathBuf;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -47,6 +47,9 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     resume_log: bool,
+
+    #[arg(long, default_value_t = false)]
+    recover: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -61,6 +64,9 @@ enum Commands {
 
         #[arg(long, default_value_t = false)]
         allow_unanchored: bool,
+
+        #[arg(long, default_value_t = false)]
+        recover: bool,
     },
 }
 
@@ -77,9 +83,14 @@ fn run_sandbox_child_test() {
     let store_file = store_path.join("test.txt");
     let _ = std::fs::write(&store_file, b"read only content");
 
-    // FIX 9: Create the outside file BEFORE applying the sandbox
-    let outside = std::env::temp_dir().join("hw_test_outside.txt");
-    let _ = std::fs::write(&outside, b"secret");
+    // FIX 7: Create the outside file BEFORE applying the sandbox; hard fail on error
+    let outside = std::env::var("HERMETIC_TEST_OUTSIDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("hw_test_outside.txt"));
+    if let Err(e) = std::fs::write(&outside, b"secret") {
+        eprintln!("Failed to create outside fixture file {:?}: {e}", outside);
+        std::process::exit(2);
+    }
 
     let status = match hermetic_world_server::apply_sandbox(&store_path, &log_path, true) {
         Ok(s) => s,
@@ -149,6 +160,7 @@ fn main() {
         path,
         log,
         allow_unanchored,
+        recover,
     }) = cli.cmd
     {
         let target_path = path
@@ -161,7 +173,7 @@ fn main() {
             target_path
         };
 
-        match verify_log_ext(&log_file, allow_unanchored) {
+        match verify_log_recover(&log_file, allow_unanchored, recover) {
             Ok(count) => {
                 println!("Log verified: {count} records in {}", log_file.display());
                 std::process::exit(0);
@@ -178,6 +190,13 @@ fn main() {
         eprintln!("Error: --store DIR is required");
         std::process::exit(1);
     });
+    let store_dir = match store_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: store root does not exist: {e}");
+            std::process::exit(1);
+        }
+    };
     let socket_path = cli.socket.unwrap_or_else(|| {
         eprintln!("Error: --socket PATH is required");
         std::process::exit(1);
@@ -208,6 +227,7 @@ fn main() {
         allow_no_landlock: cli.allow_no_landlock,
         no_sandbox: cli.no_sandbox,
         resume_log: cli.resume_log,
+        recover: cli.recover,
     };
 
     let server = match WorldServer::new(config) {

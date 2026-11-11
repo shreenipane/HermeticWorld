@@ -426,3 +426,208 @@ fn test_fix8_resume_log_and_dedupe_accumulation() {
     assert_eq!(item3_entry.first_seen_seq, 5);
     assert_eq!(item3_entry.last_seen_seq, 5);
 }
+
+#[test]
+fn test_fix3_resume_missing_dedupe_rebuild() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+
+    // First run: log 2 requests for the same path
+    {
+        let mut lm = LogManager::new(&log_dir).expect("create log manager");
+        for i in 1..=2 {
+            lm.log_event(&LogEventParams {
+                elapsed_ms: i * 10,
+                request_id: i,
+                method: "GET",
+                authority: "pypi.org",
+                path_and_query: "/simple/requests/",
+                range: None,
+                status: "200",
+                bytes: 100,
+            })
+            .expect("log event");
+        }
+        lm.finish().expect("finish");
+    }
+
+    let dedupe_path = log_dir.join("dedupe.json");
+    assert!(dedupe_path.is_file(), "dedupe.json must exist after finish");
+    // Delete dedupe.json between runs
+    fs::remove_file(&dedupe_path).expect("delete dedupe.json");
+    assert!(!dedupe_path.exists());
+
+    // Second run with --resume-log
+    {
+        let mut lm2 = LogManager::new_opts(&log_dir, true).expect("resume log manager");
+        assert_eq!(lm2.current_seq(), 2);
+
+        // Log a 3rd request for the same path
+        lm2.log_event(&LogEventParams {
+            elapsed_ms: 30,
+            request_id: 3,
+            method: "GET",
+            authority: "pypi.org",
+            path_and_query: "/simple/requests/",
+            range: None,
+            status: "200",
+            bytes: 100,
+        })
+        .expect("log event");
+
+        lm2.finish().expect("finish");
+    }
+
+    // Verify counts include the first run's requests
+    assert!(dedupe_path.is_file());
+    let dedupe_content = fs::read_to_string(&dedupe_path).expect("read dedupe.json");
+    let map: BTreeMap<String, DedupeEntry> =
+        serde_json::from_str(&dedupe_content).expect("parse dedupe.json");
+    let entry = map
+        .get("pypi.org /simple/requests/ 200")
+        .expect("entry for requests 200");
+    assert_eq!(
+        entry.count, 3,
+        "Dedupe count must accumulate to 3 even when dedupe.json was deleted"
+    );
+    assert_eq!(entry.first_seen_seq, 1);
+    assert_eq!(entry.last_seen_seq, 3);
+}
+
+struct FailingSyncWriter {
+    inner: Vec<u8>,
+}
+
+impl std::io::Write for FailingSyncWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk flush failed on finish"))
+    }
+}
+
+impl hermetic_world_server::LogWriter for FailingSyncWriter {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk sync failed on finish"))
+    }
+}
+
+#[test]
+fn test_fix4_finish_failure_prevents_head_anchor() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+    fs::create_dir_all(&log_dir).expect("create log dir");
+
+    let writer = FailingSyncWriter { inner: Vec::new() };
+    let mut lm = LogManager::new_with_writer(&log_dir, writer);
+
+    // finish() should fail on flush/sync
+    let res = lm.finish();
+    assert!(
+        res.is_err(),
+        "finish() must return error on flush/sync failure"
+    );
+
+    // Head file MUST NOT be written
+    let head_path = log_dir.join("requests.log.head");
+    assert!(
+        !head_path.exists(),
+        "requests.log.head must not be written if sync/flush fails"
+    );
+}
+
+#[test]
+fn test_fix5_crash_recovery() {
+    let temp = tempdir().expect("tempdir");
+    let log_dir = temp.path().join("log");
+
+    // Write records and simulate a crash (no finish)
+    {
+        let mut lm = LogManager::new(&log_dir).expect("create log manager");
+        for i in 1..=4 {
+            lm.log_event(&LogEventParams {
+                elapsed_ms: i * 10,
+                request_id: i,
+                method: "GET",
+                authority: "example.com",
+                path_and_query: &format!("/page/{i}"),
+                range: None,
+                status: "200",
+                bytes: 100 * i,
+            })
+            .expect("log event");
+        }
+        // Crash: do NOT call finish()!
+        // Head file is missing.
+    }
+
+    let log_path = log_dir.join("requests.log");
+    let head_path = log_dir.join("requests.log.head");
+    assert!(
+        !head_path.exists(),
+        "Head file must not exist before finish"
+    );
+
+    // Without --recover, verify_log and resume fail
+    let verify_res = verify_log(&log_path);
+    assert!(
+        verify_res.is_err(),
+        "verify_log without --recover must fail on unanchored crash"
+    );
+
+    let resume_fail = LogManager::new_opts(&log_dir, true);
+    assert!(
+        resume_fail.is_err(),
+        "Resume without --recover must fail when head is missing"
+    );
+
+    // With --recover, verify_log_recover and resume succeed
+    let mut lm_recovered = LogManager::new_opts_recover(&log_dir, true, true)
+        .expect("Resume with --recover must succeed");
+    assert_eq!(lm_recovered.current_seq(), 4);
+    assert!(
+        head_path.is_file(),
+        "Head file must be re-anchored by recovery"
+    );
+
+    // Resume writing
+    lm_recovered
+        .log_event(&LogEventParams {
+            elapsed_ms: 50,
+            request_id: 5,
+            method: "GET",
+            authority: "example.com",
+            path_and_query: "/page/5",
+            range: None,
+            status: "200",
+            bytes: 500,
+        })
+        .expect("log event");
+    lm_recovered.finish().expect("finish");
+
+    let count = verify_log(&log_path).expect("Final log must verify");
+    assert_eq!(count, 5);
+
+    // Test trailing partial line truncation during recovery:
+    // Append partial unclosed JSON without trailing newline
+    use std::io::Write;
+    {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("open log");
+        file.write_all(b"{\"seq\":6,\"incomplete\":\"data")
+            .expect("write partial line");
+    }
+
+    // Now resume with --recover truncates the partial line and recovers
+    let mut lm_partial_recovered = LogManager::new_opts_recover(&log_dir, true, true)
+        .expect("Resume with --recover must truncate partial line and succeed");
+    assert_eq!(lm_partial_recovered.current_seq(), 5);
+
+    lm_partial_recovered.finish().expect("finish");
+    let count2 = verify_log(&log_path).expect("Verified count after partial line truncation");
+    assert_eq!(count2, 5);
+}
