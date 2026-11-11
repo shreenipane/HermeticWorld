@@ -24,19 +24,23 @@ fn strip_quotes(s: &str) -> &str {
 
 fn strip_inline_comment(s: &str) -> &str {
     let mut in_quote = None;
-    for (i, b) in s.bytes().enumerate() {
-        match in_quote {
-            Some(q) => {
-                if b == q {
-                    in_quote = None;
-                }
+    let mut escaped = false;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' && q == b'"' {
+                escaped = true;
+            } else if b == q {
+                in_quote = None;
             }
-            None => {
-                if b == b'"' || b == b'\'' {
-                    in_quote = Some(b);
-                } else if b == b'#' {
-                    return s[..i].trim();
-                }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'#' {
+            let is_start_or_preceded_by_ws = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            if is_start_or_preceded_by_ws {
+                return s[..i].trim();
             }
         }
     }
@@ -113,35 +117,60 @@ fn get_directory_name(task_dir: &Path) -> String {
         .to_string()
 }
 
-fn is_block_scalar_indicator(s: &str) -> bool {
-    if !s.starts_with('|') && !s.starts_with('>') {
-        return false;
-    }
-    let rest = &s[1..];
-    if rest.is_empty() {
-        return true;
-    }
-    if rest.len() > 3 {
-        return false;
-    }
-    let mut has_chomp = false;
-    let mut has_indent = false;
-    for ch in rest.chars() {
-        if ch == '+' || ch == '-' {
-            if has_chomp {
-                return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockStyle {
+    Literal,
+    Folded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chomping {
+    Clip,
+    Strip,
+    Keep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockHeader {
+    style: BlockStyle,
+    chomping: Chomping,
+    indent: Option<usize>,
+}
+
+fn parse_block_header(s: &str) -> Option<BlockHeader> {
+    let mut chars = s.chars();
+    let style = match chars.next()? {
+        '|' => BlockStyle::Literal,
+        '>' => BlockStyle::Folded,
+        _ => return None,
+    };
+    let mut chomping = Chomping::Clip;
+    let mut indent = None;
+    for ch in chars {
+        if ch == '+' {
+            if chomping != Chomping::Clip {
+                return None;
             }
-            has_chomp = true;
+            chomping = Chomping::Keep;
+        } else if ch == '-' {
+            if chomping != Chomping::Clip {
+                return None;
+            }
+            chomping = Chomping::Strip;
         } else if ch.is_ascii_digit() && ch != '0' {
-            if has_indent {
-                return false;
+            if indent.is_some() {
+                return None;
             }
-            has_indent = true;
+            indent = ch.to_digit(10).map(|d| d as usize);
         } else {
-            return false;
+            return None;
         }
     }
-    true
+    Some(BlockHeader {
+        style,
+        chomping,
+        indent,
+    })
 }
 
 fn extract_yaml_instruction(content: &str) -> Option<String> {
@@ -151,11 +180,12 @@ fn extract_yaml_instruction(content: &str) -> Option<String> {
         if trimmed.starts_with('#') {
             continue;
         }
+        let parent_indent = line.len() - line.trim_start().len();
         if let Some(rest) = trimmed.strip_prefix("instruction:") {
             let after_colon = strip_inline_comment(rest).trim();
-            if is_block_scalar_indicator(after_colon) {
-                let mut block_lines = Vec::new();
-                let mut block_indent = None;
+            if let Some(header) = parse_block_header(after_colon) {
+                let mut block_lines: Vec<&str> = Vec::new();
+                let mut block_indent = header.indent.map(|ind| parent_indent + ind);
                 for next_line in &lines[i + 1..] {
                     if next_line.trim().is_empty() {
                         block_lines.push("");
@@ -164,7 +194,7 @@ fn extract_yaml_instruction(content: &str) -> Option<String> {
                     let indent = next_line.len() - next_line.trim_start().len();
                     match block_indent {
                         None => {
-                            if indent == 0 {
+                            if indent <= parent_indent {
                                 break;
                             }
                             block_indent = Some(indent);
@@ -174,13 +204,64 @@ fn extract_yaml_instruction(content: &str) -> Option<String> {
                             if indent < base_indent {
                                 break;
                             }
-                            let slice_idx = indent.min(base_indent);
-                            block_lines.push(&next_line[slice_idx..]);
+                            block_lines.push(&next_line[base_indent..]);
                         }
                     }
                 }
                 if !block_lines.is_empty() {
-                    return Some(block_lines.join("\n"));
+                    let mut trailing_empty = 0;
+                    while trailing_empty < block_lines.len()
+                        && block_lines[block_lines.len() - 1 - trailing_empty].is_empty()
+                    {
+                        trailing_empty += 1;
+                    }
+                    let content_lines = &block_lines[..block_lines.len() - trailing_empty];
+                    if content_lines.is_empty() && trailing_empty == 0 {
+                        continue;
+                    }
+
+                    let mut result = match header.style {
+                        BlockStyle::Literal => content_lines.join("\n"),
+                        BlockStyle::Folded => {
+                            let mut folded = String::new();
+                            for (idx, &cline) in content_lines.iter().enumerate() {
+                                if idx == 0 {
+                                    folded.push_str(cline);
+                                } else {
+                                    let prev = content_lines[idx - 1];
+                                    let prev_equally = !prev.is_empty() && !prev.starts_with(' ');
+                                    let curr_equally = !cline.is_empty() && !cline.starts_with(' ');
+                                    if prev_equally && curr_equally {
+                                        folded.push(' ');
+                                    } else {
+                                        folded.push('\n');
+                                    }
+                                    folded.push_str(cline);
+                                }
+                            }
+                            folded
+                        }
+                    };
+
+                    match header.chomping {
+                        Chomping::Strip => {
+                            // Strip: none
+                        }
+                        Chomping::Clip => {
+                            if trailing_empty > 0 {
+                                result.push('\n');
+                            }
+                        }
+                        Chomping::Keep => {
+                            if trailing_empty > 0 {
+                                result.push('\n');
+                                for _ in 0..trailing_empty {
+                                    result.push('\n');
+                                }
+                            }
+                        }
+                    }
+                    return Some(result);
                 }
             } else if !after_colon.is_empty() {
                 let unquoted = strip_quotes(after_colon);

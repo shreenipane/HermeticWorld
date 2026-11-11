@@ -768,13 +768,19 @@ fn test_undated_mode_sarif_output_has_properties() {
 fn test_fix1_yaml_block_scalar_headers_with_and_without_comments() {
     let headers = ["|", "|-", ">", ">+", "|2"];
     for header in headers {
+        let expected = if header.starts_with('>') {
+            "the block instruction line 1 the block instruction line 2"
+        } else {
+            "the block instruction line 1\nthe block instruction line 2"
+        };
+
         // Without comment
         let yaml_no_comment = format!("id: test-task\ninstruction: {header}\n  the block instruction line 1\n  the block instruction line 2\n");
         let dir_no_comment = tempdir().expect("tempdir");
         fs::write(dir_no_comment.path().join("task.yaml"), &yaml_no_comment).expect("write yaml");
         let task = load_undated_task(dir_no_comment.path()).expect("load task");
         assert_eq!(
-            task.instruction, "the block instruction line 1\nthe block instruction line 2",
+            task.instruction, expected,
             "failed for header without comment: {header}"
         );
 
@@ -788,7 +794,7 @@ fn test_fix1_yaml_block_scalar_headers_with_and_without_comments() {
         .expect("write yaml");
         let task = load_undated_task(dir_with_comment.path()).expect("load task");
         assert_eq!(
-            task.instruction, "the block instruction line 1\nthe block instruction line 2",
+            task.instruction, expected,
             "failed for header with comment: {header}"
         );
     }
@@ -1131,4 +1137,298 @@ fn test_fix6_identical_base_and_solution_binary_subtracted_no_gate() {
     assert_eq!(json["gate"], false);
     assert_eq!(json["fingerprints"]["binary_items"], 0);
     assert!(json["fingerprints"]["binary_subtracted"].as_u64().unwrap() >= 2);
+}
+
+#[test]
+fn test_regression_fix1_folded_scalars_blank_lines_and_chomping() {
+    // 1. Blank lines inside a folded block
+    let dir_blank = tempdir().expect("tempdir");
+    let yaml_blank = "id: task-blank\ninstruction: >\n  first para line 1\n  first para line 2\n\n  second para line 1\n  second para line 2\n";
+    fs::write(dir_blank.path().join("task.yaml"), yaml_blank).expect("write yaml");
+    let task_blank = load_undated_task(dir_blank.path()).expect("load task");
+    assert_eq!(
+        task_blank.instruction,
+        "first para line 1 first para line 2\n\nsecond para line 1 second para line 2"
+    );
+
+    // 2. More-indented lines inside a folded block
+    let dir_indented = tempdir().expect("tempdir");
+    let yaml_indented = "id: task-indented\ninstruction: >\n  first line\n    more indented 1\n    more indented 2\n  second line\n";
+    fs::write(dir_indented.path().join("task.yaml"), yaml_indented).expect("write yaml");
+    let task_indented = load_undated_task(dir_indented.path()).expect("load task");
+    assert_eq!(
+        task_indented.instruction,
+        "first line\n  more indented 1\n  more indented 2\nsecond line"
+    );
+
+    // 3. Chomping indicators for literal block (|): strip, clip, keep
+    // Strip (-): no trailing newline
+    let dir_strip = tempdir().expect("tempdir");
+    let yaml_strip = "id: task-strip\ninstruction: |-\n  line 1\n  line 2\n\n";
+    fs::write(dir_strip.path().join("task.yaml"), yaml_strip).expect("write yaml");
+    let task_strip = load_undated_task(dir_strip.path()).expect("load task");
+    assert_eq!(task_strip.instruction, "line 1\nline 2");
+
+    // Clip (default): one trailing newline
+    let dir_clip = tempdir().expect("tempdir");
+    let yaml_clip = "id: task-clip\ninstruction: |\n  line 1\n  line 2\n\n";
+    fs::write(dir_clip.path().join("task.yaml"), yaml_clip).expect("write yaml");
+    let task_clip = load_undated_task(dir_clip.path()).expect("load task");
+    assert_eq!(task_clip.instruction, "line 1\nline 2\n");
+
+    // Keep (+): all trailing newlines (content line break + 1 blank line = 2 newlines)
+    let dir_keep = tempdir().expect("tempdir");
+    let yaml_keep = "id: task-keep\ninstruction: |+\n  line 1\n  line 2\n\n";
+    fs::write(dir_keep.path().join("task.yaml"), yaml_keep).expect("write yaml");
+    let task_keep = load_undated_task(dir_keep.path()).expect("load task");
+    assert_eq!(task_keep.instruction, "line 1\nline 2\n\n");
+
+    // 4. Chomping indicators for folded block (>): strip, clip, keep
+    // Strip (-): folded, no trailing newline
+    let dir_fstrip = tempdir().expect("tempdir");
+    let yaml_fstrip = "id: task-fstrip\ninstruction: >-\n  line 1\n  line 2\n\n";
+    fs::write(dir_fstrip.path().join("task.yaml"), yaml_fstrip).expect("write yaml");
+    let task_fstrip = load_undated_task(dir_fstrip.path()).expect("load task");
+    assert_eq!(task_fstrip.instruction, "line 1 line 2");
+
+    // Clip (default): folded, one trailing newline
+    let dir_fclip = tempdir().expect("tempdir");
+    let yaml_fclip = "id: task-fclip\ninstruction: >\n  line 1\n  line 2\n\n";
+    fs::write(dir_fclip.path().join("task.yaml"), yaml_fclip).expect("write yaml");
+    let task_fclip = load_undated_task(dir_fclip.path()).expect("load task");
+    assert_eq!(task_fclip.instruction, "line 1 line 2\n");
+
+    // Keep (+): folded, all trailing newlines (content line break + 1 blank line = 2 newlines)
+    let dir_fkeep = tempdir().expect("tempdir");
+    let yaml_fkeep = "id: task-fkeep\ninstruction: >+\n  line 1\n  line 2\n\n";
+    fs::write(dir_fkeep.path().join("task.yaml"), yaml_fkeep).expect("write yaml");
+    let task_fkeep = load_undated_task(dir_fkeep.path()).expect("load task");
+    assert_eq!(task_fkeep.instruction, "line 1 line 2\n\n");
+}
+
+#[test]
+fn test_regression_fix2_hash_inside_values() {
+    // 1. "C# support"
+    let dir1 = tempdir().expect("tempdir");
+    fs::write(
+        dir1.path().join("task.yaml"),
+        "id: task1\ninstruction: Implement C# support\n",
+    )
+    .expect("write");
+    let t1 = load_undated_task(dir1.path()).expect("load");
+    assert_eq!(t1.instruction, "Implement C# support");
+
+    // 2. "issue#12"
+    let dir2 = tempdir().expect("tempdir");
+    fs::write(
+        dir2.path().join("task.yaml"),
+        "id: task2\ninstruction: Fix issue#12\n",
+    )
+    .expect("write");
+    let t2 = load_undated_task(dir2.path()).expect("load");
+    assert_eq!(t2.instruction, "Fix issue#12");
+
+    // 3. quoted "a # b" value (double and single)
+    let dir3 = tempdir().expect("tempdir");
+    fs::write(
+        dir3.path().join("task.yaml"),
+        "id: task3\ninstruction: \"a # b\"\n",
+    )
+    .expect("write");
+    let t3 = load_undated_task(dir3.path()).expect("load");
+    assert_eq!(t3.instruction, "a # b");
+
+    let dir3s = tempdir().expect("tempdir");
+    fs::write(
+        dir3s.path().join("task.yaml"),
+        "id: task3s\ninstruction: 'a # b'\n",
+    )
+    .expect("write");
+    let t3s = load_undated_task(dir3s.path()).expect("load");
+    assert_eq!(t3s.instruction, "a # b");
+
+    // 4. "value # real comment"
+    let dir4 = tempdir().expect("tempdir");
+    fs::write(
+        dir4.path().join("task.yaml"),
+        "id: task4\ninstruction: my_value # real comment\n",
+    )
+    .expect("write");
+    let t4 = load_undated_task(dir4.path()).expect("load");
+    assert_eq!(t4.instruction, "my_value");
+}
+
+#[test]
+fn test_regression_fix3_indentation_indicator() {
+    // 1. With indicator |2: content indentation is parent (0) + 2 = 2.
+    // "    first" (4 spaces >= 2) keeps 2 extra spaces -> "  first".
+    // "  second" (2 spaces >= 2) belongs to block -> "second".
+    let dir_ind = tempdir().expect("tempdir");
+    let yaml_ind = "id: task-ind\ninstruction: |2\n    first\n  second\nother: 123\n";
+    fs::write(dir_ind.path().join("task.yaml"), yaml_ind).expect("write");
+    let t_ind = load_undated_task(dir_ind.path()).expect("load");
+    assert_eq!(t_ind.instruction, "  first\nsecond");
+
+    // 2. Case without indicator: first line sets indentation to 4.
+    // "    first" has 4 spaces -> "first".
+    // "  second" has 2 spaces < 4 -> terminates block!
+    let dir_no_ind = tempdir().expect("tempdir");
+    let yaml_no_ind = "id: task-no-ind\ninstruction: |\n    first\n  second\nother: 123\n";
+    fs::write(dir_no_ind.path().join("task.yaml"), yaml_no_ind).expect("write");
+    let t_no_ind = load_undated_task(dir_no_ind.path()).expect("load");
+    assert_eq!(t_no_ind.instruction, "first");
+
+    // 3. Folded with indicator and chomping: >-2
+    let dir_f2 = tempdir().expect("tempdir");
+    let yaml_f2 = "id: task-f2\ninstruction: >-2\n    first\n    second\n  third\n";
+    fs::write(dir_f2.path().join("task.yaml"), yaml_f2).expect("write");
+    let t_f2 = load_undated_task(dir_f2.path()).expect("load");
+    // "    first" and "    second" have extra indent (4 - 2 = 2 spaces).
+    // In folded scalar, more-indented lines keep newlines:
+    assert_eq!(t_f2.instruction, "  first\n  second\nthird");
+}
+
+#[test]
+fn test_regression_fix4_oversized_baseline_subtraction_and_budget() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+
+    // Create a 17 MiB baseline text file containing a distinctive solution line
+    let base_dir = tempdir().expect("base dir");
+    let base_file = base_dir.path().join("large_baseline.txt");
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&base_file).expect("create large baseline");
+        let line = "normal baseline filler line repeated for size padding\n";
+        let target_size = 17 * 1024 * 1024;
+        let mut written = 0;
+        // Write the distinctive solution line near the middle of the file (e.g. at ~10 MiB)
+        while written < 10 * 1024 * 1024 {
+            f.write_all(line.as_bytes()).expect("write");
+            written += line.len();
+        }
+        let secret_line =
+            "let distinctive_solution_line = \"unique_secret_baseline_token_12345\";\n";
+        f.write_all(secret_line.as_bytes()).expect("write secret");
+        written += secret_line.len();
+        while written < target_size {
+            f.write_all(line.as_bytes()).expect("write");
+            written += line.len();
+        }
+    }
+
+    // Solution containing the distinctive line
+    let task_dir = tempdir().expect("task dir");
+    fs::create_dir_all(task_dir.path().join("solution")).expect("mkdir solution");
+    fs::write(
+        task_dir.path().join("solution/sol.rs"),
+        "let distinctive_solution_line = \"unique_secret_baseline_token_12345\";\n",
+    )
+    .expect("write solution");
+
+    let task = load_undated_task(task_dir.path()).expect("load task");
+
+    // Part A: With standard/default budget (64 MiB), the 17 MiB baseline file is fully processed.
+    // The solution line is subtracted against the base tree!
+    let fp = FingerprintSet::from_files(&task.files, base_dir.path()).expect("from_files");
+    assert_eq!(
+        fp.lines_count, 0,
+        "solution line present in 17 MiB base file must be subtracted (surviving lines = 0)"
+    );
+    assert_eq!(
+        fp.subtracted_count, 1,
+        "solution line must be recorded as subtracted"
+    );
+    assert!(
+        !fp.baseline_incomplete,
+        "baseline must not be marked incomplete under standard budget"
+    );
+
+    // Clean scan root containing the same line: must NOT produce a Gate!
+    let scan_root = tempdir().expect("scan root");
+    fs::write(
+        scan_root.path().join("sol.rs"),
+        "let distinctive_solution_line = \"unique_secret_baseline_token_12345\";\n",
+    )
+    .expect("write scan file");
+
+    let findings = scan_tree(
+        scan_root.path(),
+        &fp,
+        &ScanOptions {
+            undated: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        findings.iter().all(|f| f.severity != Severity::Gate),
+        "scanning root with subtracted baseline line must produce no Gate: {findings:?}"
+    );
+
+    // CLI test with default budget: exits 0, no Gate
+    let out = Command::new(bin_path)
+        .arg("scan")
+        .arg("--undated")
+        .arg("--task")
+        .arg(task_dir.path())
+        .arg("--base-tree")
+        .arg(base_dir.path())
+        .arg("--root")
+        .arg(scan_root.path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("scan");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse json");
+    assert_eq!(json["gate"], false);
+
+    // Part B: With a tiny test budget (e.g. 1024 bytes), baseline is incomplete and emits Info finding
+    let fp_tiny = FingerprintSet::from_files_with_budget(&task.files, base_dir.path(), Some(1024))
+        .expect("from_files_with_budget");
+    assert!(fp_tiny.baseline_incomplete);
+    assert!(
+        fp_tiny.baseline_skipped_bytes > 0,
+        "skipped bytes must be recorded: {}",
+        fp_tiny.baseline_skipped_bytes
+    );
+
+    // CLI test with tiny budget: emits Info finding "baseline incomplete: N bytes not subtracted"
+    let clean_empty_root = tempdir().expect("clean empty root");
+    let out_tiny = Command::new(bin_path)
+        .arg("scan")
+        .arg("--undated")
+        .arg("--task")
+        .arg(task_dir.path())
+        .arg("--base-tree")
+        .arg(base_dir.path())
+        .arg("--root")
+        .arg(clean_empty_root.path())
+        .arg("--baseline-budget")
+        .arg("1024")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("scan tiny");
+    assert_eq!(out_tiny.status.code(), Some(0));
+    let json_tiny: serde_json::Value =
+        serde_json::from_slice(&out_tiny.stdout).expect("parse json");
+    let findings_tiny = json_tiny["findings"].as_array().expect("findings array");
+    let incomplete_finding = findings_tiny
+        .iter()
+        .find(|f| f["channel"] == "baseline_incomplete" && f["severity"] == "info")
+        .expect("must emit baseline_incomplete Info finding");
+    assert!(
+        incomplete_finding["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("baseline incomplete:"),
+        "evidence must contain 'baseline incomplete:': {incomplete_finding:?}"
+    );
+    assert!(
+        incomplete_finding["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("bytes not subtracted"),
+        "evidence must contain 'bytes not subtracted': {incomplete_finding:?}"
+    );
 }

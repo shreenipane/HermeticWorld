@@ -80,6 +80,10 @@ struct QueryArgs {
     /// Target package names for D5a target version check (repeatable)
     #[arg(long = "target-package")]
     target_package: Vec<String>,
+
+    /// Baseline byte budget for subtraction
+    #[arg(long)]
+    baseline_budget: Option<usize>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +154,10 @@ struct ScanArgs {
     /// Target package names for D5a target version check (repeatable)
     #[arg(long = "target-package")]
     target_package: Vec<String>,
+
+    /// Baseline byte budget for subtraction
+    #[arg(long)]
+    baseline_budget: Option<usize>,
 }
 
 fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -165,7 +173,11 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
-        let mut fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        let mut fp = FingerprintSet::from_files_with_budget(
+            &undated_task.files,
+            &args.base_tree,
+            args.baseline_budget,
+        )?;
         fp.skipped_files_count += undated_task.skipped_files_count;
 
         let signatures = if let Some(ref sig_file) = args.signatures {
@@ -194,6 +206,22 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 evidence: vec![format!(
                     "skipped {} task files exceeding size limit",
                     fp.skipped_files_count
+                )],
+            });
+        }
+
+        if fp.baseline_incomplete {
+            all_findings.push(Finding {
+                detector: "D2".into(),
+                channel: "baseline_incomplete".into(),
+                path: args.base_tree.display().to_string(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!(
+                    "baseline incomplete: {} bytes not subtracted",
+                    fp.baseline_skipped_bytes
                 )],
             });
         }
@@ -410,7 +438,11 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
-        let mut fp = FingerprintSet::from_files(&undated_task.files, &args.base_tree)?;
+        let mut fp = FingerprintSet::from_files_with_budget(
+            &undated_task.files,
+            &args.base_tree,
+            args.baseline_budget,
+        )?;
         fp.skipped_files_count += undated_task.skipped_files_count;
 
         let signatures = BenchmarkSignatures::new(Some(undated_task.instance_id.clone()));
@@ -434,6 +466,22 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 evidence: vec![format!(
                     "skipped {} task files exceeding size limit",
                     fp.skipped_files_count
+                )],
+            });
+        }
+
+        if fp.baseline_incomplete {
+            all_findings.push(Finding {
+                detector: "D2".into(),
+                channel: "baseline_incomplete".into(),
+                path: args.base_tree.display().to_string(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![format!(
+                    "baseline incomplete: {} bytes not subtracted",
+                    fp.baseline_skipped_bytes
                 )],
             });
         }

@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -84,6 +84,8 @@ pub struct FingerprintSet {
     /// Maps fingerprint hash to representative evidence text
     pub hash_to_evidence: HashMap<String, String>,
     pub skipped_files_count: usize,
+    pub baseline_incomplete: bool,
+    pub baseline_skipped_bytes: u64,
 }
 
 struct CandidateHunk {
@@ -497,13 +499,30 @@ impl FingerprintSet {
             }
         }
 
-        Ok(finish_fingerprint_set(candidate_hunks, base_tree_root, 0))
+        let baseline_budget = std::env::var("HERMETIC_BASELINE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64 * 1024 * 1024);
+        Ok(finish_fingerprint_set(
+            candidate_hunks,
+            base_tree_root,
+            0,
+            baseline_budget,
+        ))
     }
 
     /// Build tier 1, tier 3, and binary tier fingerprints from task files in undated mode (TR-SC-9).
     pub fn from_files(
         files: &[(String, Vec<u8>)],
         base_tree: &Path,
+    ) -> Result<Self, FingerprintError> {
+        Self::from_files_with_budget(files, base_tree, None)
+    }
+
+    pub fn from_files_with_budget(
+        files: &[(String, Vec<u8>)],
+        base_tree: &Path,
+        budget: Option<usize>,
     ) -> Result<Self, FingerprintError> {
         const MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
         const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
@@ -668,11 +687,63 @@ impl FingerprintSet {
             }
         }
 
+        let baseline_budget = budget
+            .or_else(|| {
+                std::env::var("HERMETIC_BASELINE_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(64 * 1024 * 1024);
+
         Ok(finish_fingerprint_set(
             candidate_hunks,
             base_tree,
             skipped_files_count,
+            baseline_budget,
         ))
+    }
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line_buf: &mut Vec<u8>,
+    max_line_len: usize,
+) -> std::io::Result<Option<bool>> {
+    line_buf.clear();
+    let mut overlong = false;
+    let mut total_read = 0;
+    loop {
+        let (done, used) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if total_read == 0 && !overlong {
+                    return Ok(None);
+                }
+                return Ok(Some(!overlong));
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                let to_take = pos + 1;
+                if !overlong && line_buf.len() + to_take <= max_line_len {
+                    line_buf.extend_from_slice(&available[..to_take]);
+                } else {
+                    overlong = true;
+                }
+                (true, to_take)
+            } else {
+                let to_take = available.len();
+                if !overlong && line_buf.len() + to_take <= max_line_len {
+                    line_buf.extend_from_slice(&available[..to_take]);
+                } else {
+                    overlong = true;
+                }
+                (false, to_take)
+            }
+        };
+        total_read += used;
+        reader.consume(used);
+        if done {
+            return Ok(Some(!overlong));
+        }
     }
 }
 
@@ -680,6 +751,7 @@ fn finish_fingerprint_set(
     candidate_hunks: Vec<CandidateHunk>,
     base_tree_root: &Path,
     skipped_files_count: usize,
+    baseline_budget: usize,
 ) -> FingerprintSet {
     // Baseline subtraction (TR-SC-1, TR-SC-4 & TR-SC-5): walk base_tree_root
     let mut base_line_counts: HashMap<String, usize> = HashMap::new();
@@ -687,31 +759,54 @@ fn finish_fingerprint_set(
     let mut base_window_hashes: HashSet<String> = HashSet::new();
     let mut base_winnow_hashes: HashSet<u64> = HashSet::new();
     let mut base_binary_tokens: HashSet<String> = HashSet::new();
+    let mut baseline_bytes_used: usize = 0;
+    let mut baseline_incomplete: bool = false;
+    let mut baseline_skipped_bytes: u64 = 0;
 
     if base_tree_root.exists() {
+        let mut base_entries: Vec<std::path::PathBuf> = Vec::new();
         for entry in WalkDir::new(base_tree_root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
             .flatten()
         {
             if entry.file_type().is_file() {
-                const MAX_BASELINE_FILE_BYTES: u64 = 16 * 1024 * 1024;
-                if let Ok(meta) = entry.metadata() {
-                    if meta.len() > MAX_BASELINE_FILE_BYTES {
-                        continue;
-                    }
-                }
+                base_entries.push(entry.into_path());
+            }
+        }
+        base_entries.sort();
+
+        for file_path in base_entries {
+            let Ok(meta) = fs::metadata(&file_path) else {
+                continue;
+            };
+            let file_len = meta.len();
+
+            if baseline_bytes_used >= baseline_budget {
+                baseline_incomplete = true;
+                baseline_skipped_bytes += file_len;
+                continue;
+            }
+
+            let remaining_budget = (baseline_budget - baseline_bytes_used) as u64;
+            let allowed_bytes = file_len.min(remaining_budget);
+            if file_len > remaining_budget {
+                baseline_incomplete = true;
+                baseline_skipped_bytes += file_len - remaining_budget;
+                baseline_bytes_used = baseline_budget;
+            } else {
+                baseline_bytes_used += file_len as usize;
+            }
+
+            let Ok(file) = fs::File::open(&file_path) else {
+                continue;
+            };
+
+            const MAX_BASELINE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+            if file_len <= MAX_BASELINE_FILE_BYTES && file_len <= remaining_budget {
                 let mut bytes = Vec::new();
-                if let Ok(file) = fs::File::open(entry.path()) {
-                    if file
-                        .take(MAX_BASELINE_FILE_BYTES + 1)
-                        .read_to_end(&mut bytes)
-                        .is_err()
-                        || bytes.len() as u64 > MAX_BASELINE_FILE_BYTES
-                    {
-                        continue;
-                    }
-                } else {
+                let mut handle = file.take(allowed_bytes + 1);
+                if handle.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > allowed_bytes {
                     continue;
                 }
 
@@ -783,6 +878,90 @@ fn finish_fingerprint_set(
                         base_tokens.into_iter().map(|t| t.text).collect();
                     for hash in kgram_hashes(&base_token_texts) {
                         base_winnow_hashes.insert(hash);
+                    }
+                }
+            } else {
+                let mut reader = std::io::BufReader::new(file.take(allowed_bytes));
+                let is_binary = {
+                    let available = match reader.fill_buf() {
+                        Ok(buf) => buf,
+                        Err(_) => continue,
+                    };
+                    let head = &available[..available.len().min(8192)];
+                    head.contains(&0)
+                };
+
+                if is_binary {
+                    continue;
+                }
+
+                const MAX_LINE_BYTES: usize = 1024 * 1024; // 1 MiB per line
+                let mut line_buf = Vec::new();
+                let mut window_lines: VecDeque<String> = VecDeque::new();
+                let mut token_window: VecDeque<String> = VecDeque::new();
+
+                while let Ok(Some(valid)) =
+                    read_bounded_line(&mut reader, &mut line_buf, MAX_LINE_BYTES)
+                {
+                    if !valid {
+                        window_lines.clear();
+                        token_window.clear();
+                        continue;
+                    }
+
+                    let text_line = String::from_utf8_lossy(&line_buf);
+                    let clean = text_line.trim_end_matches(&['\r', '\n'][..]);
+
+                    if let Some(norm) = normalize_line(clean) {
+                        *base_line_counts.entry(norm.clone()).or_insert(0) += 1;
+                        base_line_hashes.insert(sha256_hex(norm.as_bytes()));
+                    }
+
+                    if !window_lines.is_empty() {
+                        let w = [&window_lines[window_lines.len() - 1], clean];
+                        if !w.iter().all(|l| normalize_line(l).is_none()) {
+                            let norm_w = w
+                                .iter()
+                                .map(|l| clean_line(l, false))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                        }
+                    }
+                    if window_lines.len() >= 2 {
+                        let w = [
+                            &window_lines[window_lines.len() - 2],
+                            &window_lines[window_lines.len() - 1],
+                            clean,
+                        ];
+                        if !w.iter().all(|l| normalize_line(l).is_none()) {
+                            let norm_w = w
+                                .iter()
+                                .map(|l| clean_line(l, false))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+                        }
+                    }
+                    window_lines.push_back(clean.to_string());
+                    if window_lines.len() > 2 {
+                        window_lines.pop_front();
+                    }
+
+                    let line_tokens = tokenize(clean);
+                    for tok in line_tokens {
+                        base_binary_tokens.insert(tok.text.clone());
+                        if let Some(literal_content) =
+                            crate::binary::extract_string_literal_content(&tok.text)
+                        {
+                            base_binary_tokens.insert(literal_content);
+                        }
+                        token_window.push_back(tok.text);
+                        if token_window.len() == 8 {
+                            let slice: Vec<String> = token_window.iter().cloned().collect();
+                            base_winnow_hashes.insert(crate::winnow::hash_kgram(&slice));
+                            token_window.pop_front();
+                        }
                     }
                 }
             }
@@ -984,5 +1163,7 @@ fn finish_fingerprint_set(
         binary_subtracted_count,
         hash_to_evidence,
         skipped_files_count,
+        baseline_incomplete,
+        baseline_skipped_bytes,
     }
 }
