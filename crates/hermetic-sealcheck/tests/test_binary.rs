@@ -879,3 +879,38 @@ fn test_hostile_nobits_shstrtab_is_not_a_panic() {
     let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
     assert!(findings.iter().any(|f| f.channel == "binary_malformed"));
 }
+
+#[test]
+fn test_real_pyc_of_the_fix_gates_on_the_binary_tier() {
+    // Compile with the real interpreter: names in a .pyc run into the next marshal byte.
+    let base = tempdir().expect("tempdir");
+    let fp = leak_fp(base.path());
+    let src_dir = tempdir().expect("tempdir");
+    let src = src_dir.path().join("foo.py");
+    fs::write(
+        &src,
+        "def foo():\n    elf_leaked_func_one()\n    elf_leaked_func_two()\n",
+    )
+    .unwrap();
+    let dir = tempdir().expect("tempdir");
+    let pyc = dir.path().join("foo.pyc");
+    let status = Command::new("python3")
+        .args(["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)"])
+        .arg(&src)
+        .arg(&pyc)
+        .status()
+        .expect("python3 runs");
+    assert!(status.success());
+    let gates = d3b_gates(dir.path(), &fp);
+    assert!(gates.iter().any(|g| g.channel == "binary_pyc"), "{gates:?}");
+}
+
+#[test]
+fn test_pyc_strings_read_length_prefixed_records() {
+    // 'Z' | 0x80 (interned short ascii, ref flag), length, bytes, then an opcode byte 's'.
+    let mut body = vec![0xda, 15];
+    body.extend_from_slice(b"effective_hours");
+    body.push(b's');
+    let strings = hermetic_sealcheck::binary::extract_pyc_strings(&body);
+    assert!(strings.contains("effective_hours"), "{strings:?}");
+}

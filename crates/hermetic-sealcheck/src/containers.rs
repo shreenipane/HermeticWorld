@@ -323,6 +323,10 @@ impl<'a> ContainerScanner<'a> {
                     if !constants_text.is_empty() {
                         self.scan_text(path, &constants_text);
                     }
+                    // Names and constants, matched exactly by the binary tier
+                    self.findings.extend(crate::binary::scan_pyc_strings(
+                        path, bytes, self.fp, self.opts,
+                    ));
                 }
                 ContainerType::Sqlite => {
                     self.scan_sqlite(path, bytes);

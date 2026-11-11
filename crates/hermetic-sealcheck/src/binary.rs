@@ -831,6 +831,62 @@ fn is_java_class(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && u16::from_be_bytes([bytes[6], bytes[7]]) >= 45
 }
 
+/// Strings a `.pyc` stores, read from marshal's length-prefixed string records without a
+/// full unmarshal. Names and constants run straight into the next opcode byte, as in
+/// `effective_hourss`, so a printable-run search can't find them as whole tokens.
+///
+/// Every position whose type code (the 0x80 ref flag masked off) is a string type, and
+/// whose length prefix covers printable bytes only, yields a candidate. A false candidate
+/// costs nothing: candidates are only compared for equality with the fix's items.
+pub fn extract_pyc_strings(body: &[u8]) -> HashSet<String> {
+    let printable = |s: &[u8]| s.iter().all(|&b| (0x20..=0x7e).contains(&b));
+    let mut out = HashSet::new();
+    for i in 0..body.len() {
+        let (len, start) = match body[i] & 0x7f {
+            // short ascii (interned): one-byte length
+            b'z' | b'Z' => match body.get(i + 1) {
+                Some(&l) => (l as usize, i + 2),
+                None => continue,
+            },
+            // ascii, unicode, bytes, interned: four-byte little-endian length
+            b'a' | b'A' | b'u' | b't' | b's' => match body.get(i + 1..i + 5) {
+                Some(l) => (u32::from_le_bytes([l[0], l[1], l[2], l[3]]) as usize, i + 5),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if len < 8 {
+            continue;
+        }
+        if let Some(s) = start.checked_add(len).and_then(|end| body.get(start..end)) {
+            if printable(s) {
+                if let Ok(text) = std::str::from_utf8(s) {
+                    out.insert(text.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// D3b over a `.pyc` (channel `binary_pyc`): the binary tier on its marshal strings.
+pub fn scan_pyc_strings(
+    path: &str,
+    bytes: &[u8],
+    fp: &FingerprintSet,
+    opts: &ScanOptions,
+) -> Vec<Finding> {
+    let header = crate::bytecode::pyc_magic(bytes)
+        .map(crate::bytecode::pyc_header_len)
+        .unwrap_or(0);
+    let body = bytes.get(header..).unwrap_or(&[]);
+    let extracted = BinaryStrings {
+        exact_strings: extract_pyc_strings(body),
+        printable_runs: Vec::new(),
+    };
+    match_binary_items(&extracted, fp, opts, "binary_pyc", path)
+}
+
 /// If `bytes` is a recognised binary (ELF, Class, wasm), parse and scan it for D3b.
 /// Returns `Some(findings)` if recognised, or `None` if not a recognised binary format.
 pub fn scan_binary_if_recognized(
