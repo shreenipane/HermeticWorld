@@ -422,23 +422,81 @@ def measure(image: str, task: dict, lines: list[str]) -> dict:
 # never touched.
 RESTORE_MODES_SH = r"""#!/bin/bash
 set -euo pipefail
-cd "${1:-/testbed}"
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
-: > "$TMPDIR/hermetic-644"; : > "$TMPDIR/hermetic-755"
-git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
-  mode=${entry%% *}
-  path=${entry#*$'\t'}
-  if [ -f "./$path" ] && [ ! -L "./$path" ]; then
-    case "$mode" in
-      100644) printf '%s\0' "$path" >> "$TMPDIR/hermetic-644" ;;
-      100755) printf '%s\0' "$path" >> "$TMPDIR/hermetic-755" ;;
-    esac
-  fi
-done
-xargs -0 -r chmod 644 -- < "$TMPDIR/hermetic-644"
-xargs -0 -r chmod 755 -- < "$TMPDIR/hermetic-755"
-git update-index -q --refresh || true
+TARGET_DIR="${1:-/testbed}"
+cd "$TARGET_DIR"
+
+PYTHON_BIN=$(command -v python3 || command -v python)
+"$PYTHON_BIN" - "$TARGET_DIR" <<'PY_EOF'
+import os
+import stat
+import subprocess
+import sys
+
+target_dir = sys.argv[1]
+proc = subprocess.run(
+    ["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+    stdout=subprocess.PIPE,
+    check=True,
+    cwd=target_dir,
+)
+
+root_fd = os.open(target_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_bytes = entry.split(b"\t", 1)
+            mode = meta.split(b" ")[0]
+        except ValueError:
+            continue
+
+        if mode == b"100644":
+            target_mode = 0o644
+        elif mode == b"100755":
+            target_mode = 0o755
+        else:
+            continue
+
+        parts = [p for p in path_bytes.split(b"/") if p and p != b"."]
+        if not parts or any(p == b".." for p in parts):
+            continue
+
+        curr_fd = root_fd
+        close_curr = False
+        skip = False
+
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=curr_fd)
+            except OSError:
+                skip = True
+                break
+            if close_curr:
+                os.close(curr_fd)
+            curr_fd = next_fd
+            close_curr = True
+
+        if not skip:
+            file_name = parts[-1]
+            try:
+                file_fd = os.open(file_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=curr_fd)
+                try:
+                    st = os.fstat(file_fd)
+                    if stat.S_ISREG(st.st_mode):
+                        os.fchmod(file_fd, target_mode)
+                finally:
+                    os.close(file_fd)
+            except OSError:
+                pass
+
+        if close_curr:
+            os.close(curr_fd)
+finally:
+    os.close(root_fd)
+
+subprocess.run(["git", "update-index", "-q", "--refresh"], cwd=target_dir, check=False)
+PY_EOF
 """
 
 

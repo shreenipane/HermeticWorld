@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -409,3 +410,202 @@ def test_persisted_spans_must_match_actual_redaction_markers(task_world):
     sidecar.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(d.DispositionsError, match="mismatch"):
         d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_regression_defect1_oversized_leaking_file_refuses_repair(task_world):
+    """Defect 1: real sealcheck with an oversized leaking file refuses repair."""
+    tasks, task, root, initial, binary = task_world
+    oversized = root / "large_leak.txt"
+    with open(oversized, "wb") as f:
+        f.seek(64 * 1024 * 1024 + 1024)
+        f.write(b"def main():\n    " + LEAK.encode("utf-8") + b"\n")
+    backdate(root)
+    with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
+        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_regression_defect2_conflicting_inline_disk_patches_refused(task_world):
+    """Defect 2: conflicting inline/disk patches cannot become repaired."""
+    tasks, task, root, initial, binary = task_world
+    conflicting = copy.deepcopy(initial)
+    conflicting["gold_patch"] = ""
+    conflicting["test_patch"] = ""
+    start = STATEMENT.encode("utf-8").index(LEAK.encode("utf-8"))
+    conflicting["explicit_spans"] = [(start, start + len(LEAK))]
+    with pytest.raises(d.DispositionsError, match="Conflicting inline"):
+        d.process_dispositions([conflicting], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_regression_defect3_cli_without_tasks_dir_emits_durable_artifacts(task_world, tmp_path):
+    """Defect 3: CLI without --tasks-dir emits durable repaired content, metadata, and manifest."""
+    _, _, _, initial, binary = task_world
+    initial.update(problem_statement=STATEMENT, task_json=complete_task("task_one"),
+                   gold_patch=PATCH, test_patch="", manifest=complete_manifest("task_one"))
+    source, out = tmp_path / "input.json", tmp_path / "output.json"
+    source.write_text(json.dumps([initial]), encoding="utf-8")
+    code = d.dispositions_cli(["--gate-output", str(source), "--out", str(out), "--sealcheck", binary])
+    assert code == 0
+    records = json.loads(out.read_text(encoding="utf-8"))
+    assert len(records) == 1
+    entry = records[0]
+    assert entry["disposition"] == "repaired"
+    assert "redacted_statement" in entry
+    assert LEAK not in entry["redacted_statement"]
+    assert "[REDACTED]" in entry["redacted_statement"]
+    assert "problem_statement_redacted" in entry
+    assert isinstance(entry["problem_statement_redacted"]["spans"], list)
+    assert len(entry["problem_statement_redacted"]["spans"]) >= 1
+    assert "manifest" in entry
+    assert entry["manifest"]["dispositions"][-1]["kind"] == "repaired"
+
+
+def test_regression_defect4_replace_config_and_root_ancestor_rejected(task_world, tmp_path):
+    """Defect 4: replace configuration files and root ancestors between validation and subprocess access."""
+    tasks, task, root, initial, binary = task_world
+    sig_file = tmp_path / "signatures.json"
+    sig_file.write_text(json.dumps({}), encoding="utf-8")
+    initial["scan_config"]["signatures"] = str(sig_file)
+    validated = d.validate_scan_config(initial["scan_config"])
+
+    outside = tmp_path / "outside_secret"
+    outside.write_text("OUTSIDE_SECRET", encoding="utf-8")
+    sig_file.unlink()
+    sig_file.symlink_to(outside)
+    with pytest.raises(d.DispositionsError):
+        d.run_real_sealcheck(task, binary, scan_config=validated)
+
+    sig_file.unlink()
+    sig_file.write_text(json.dumps({}), encoding="utf-8")
+    initial["scan_config"] = {"base_tree": initial["scan_config"]["base_tree"], "roots": [{"path": str(root), "visibility": "agent_visible"}]}
+    validated = d.validate_scan_config(initial["scan_config"])
+    nested_root = root / "sub" / "leaf"
+    nested_root.mkdir(parents=True)
+    validated["roots"] = [{"path": str(nested_root), "visibility": "agent_visible"}]
+
+    shutil.rmtree(root / "sub")
+    (root / "sub").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(d.DispositionsError):
+        d.run_real_sealcheck(task, binary, scan_config=validated)
+
+
+def test_regression_defect5_replace_agent_during_scan_ensures_verified_repair(task_world, monkeypatch):
+    """Defect 5: replace agent during scanning requires verified repair at published task path."""
+    tasks, task, _, initial, binary = task_world
+    scan = d.run_real_sealcheck
+    def racing_scan(*args, **kwargs):
+        task.joinpath("agent").rename(task / "renamed_agent")
+        replacement_agent = task / "agent"
+        replacement_agent.mkdir(parents=True, exist_ok=True)
+        (replacement_agent / "problem_statement.md").write_text(STATEMENT, encoding="utf-8")
+        return scan(*args, **kwargs)
+    monkeypatch.setattr(d, "run_real_sealcheck", racing_scan)
+    entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert entries[0]["disposition"] == "repaired"
+    published_statement = (task / "agent/problem_statement.md").read_text(encoding="utf-8")
+    assert LEAK not in published_statement
+    assert published_statement == entries[0]["redacted_statement"]
+
+
+def test_regression_defect7_exclusion_without_rescan_inputs(tmp_path):
+    """Defect 7: unsupported-detector and issue-text-is-the-fix reports without re-scan inputs."""
+    reports = [
+        {
+            "task_id": "task__d2_unsupported",
+            "gate": True,
+            "not_covered": [],
+            "findings": [
+                {
+                    "detector": "D2",
+                    "channel": "file",
+                    "path": "leaked.py",
+                    "visibility": "agent_visible",
+                    "severity": "gate",
+                    "confidence": 1.0,
+                    "evidence": ["some leak"],
+                }
+            ],
+        },
+        {
+            "task_id": "task__issue_text_fix",
+            "gate": True,
+            "not_covered": [],
+            "issue_text_is_the_fix": True,
+            "findings": [
+                {
+                    "detector": "D0",
+                    "channel": "problem_statement",
+                    "path": "agent/problem_statement.md",
+                    "visibility": "agent_visible",
+                    "severity": "gate",
+                    "confidence": 1.0,
+                    "evidence": ["fix in text"],
+                }
+            ],
+        },
+    ]
+    source, out = tmp_path / "input.json", tmp_path / "output.json"
+    source.write_text(json.dumps(reports), encoding="utf-8")
+    code = d.dispositions_cli(["--gate-output", str(source), "--out", str(out)])
+    assert code == 0
+    records = json.loads(out.read_text(encoding="utf-8"))
+    assert len(records) == 2
+    r_a = next(r for r in records if r["task_id"] == "task__d2_unsupported")
+    assert r_a["disposition"] == "excluded"
+    assert "D2" in r_a["detectors"]
+    r_b = next(r for r in records if r["task_id"] == "task__issue_text_fix")
+    assert r_b["disposition"] == "excluded"
+    assert "D0" in r_b["detectors"]
+
+
+def test_regression_defect8_clean_and_excluded_rerun_idempotent(tmp_path):
+    """Defect 8: process clean and excluded tasks twice against their persisted manifests."""
+    tasks = tmp_path / "tasks"
+    tasks.mkdir(parents=True)
+    reports = []
+    for tid, findings in (("task_clean_8", []), ("task_excluded_8", [{**d0(), "detector": "D2"}])):
+        t_dir = tasks / tid
+        (t_dir / "agent").mkdir(parents=True)
+        (t_dir / "agent/problem_statement.md").write_text("Issue statement text.", encoding="utf-8")
+        manifest = complete_manifest(tid)
+        (t_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        (t_dir / "task.json").write_text(json.dumps(complete_task(tid)), encoding="utf-8")
+        reports.append(report(tid, findings))
+    out1 = tmp_path / "out1.json"
+    entries1, _ = d.process_dispositions(reports, tasks_dir=tasks, out_path=out1)
+    manifest_bytes_run1 = {
+        tid: (tasks / tid / "manifest.json").read_bytes()
+        for tid in ("task_clean_8", "task_excluded_8")
+    }
+    out2 = tmp_path / "out2.json"
+    entries2, _ = d.process_dispositions(reports, tasks_dir=tasks, out_path=out2)
+    manifest_bytes_run2 = {
+        tid: (tasks / tid / "manifest.json").read_bytes()
+        for tid in ("task_clean_8", "task_excluded_8")
+    }
+    assert manifest_bytes_run1 == manifest_bytes_run2
+    assert entries1 == entries2
+    assert [e["world_version"] for e in entries1] == [e["world_version"] for e in entries2]
+
+
+def test_regression_defect9_secret_bearing_missing_paths_never_leak(tmp_path, capsys):
+    """Defect 9: exercise both CLI entry points and API with secret-bearing missing paths."""
+    from hermetic_slice.__main__ import main as cli_main
+    secret_name = "SECRET_TOKEN_XYZ_12345"
+    missing_gate_path = tmp_path / f"{secret_name}.json"
+    with pytest.raises(d.DispositionsError) as exc_info:
+        d.process_dispositions(missing_gate_path)
+    assert secret_name not in str(exc_info.value)
+    assert secret_name not in repr(exc_info.value)
+
+    capsys.readouterr()
+    code1 = d.dispositions_cli(["--gate-output", str(missing_gate_path)])
+    assert code1 != 0
+    cap1 = capsys.readouterr()
+    assert secret_name not in cap1.err
+    assert secret_name not in cap1.out
+
+    code2 = cli_main(["dispositions", "--gate-output", str(missing_gate_path)])
+    assert code2 != 0
+    cap2 = capsys.readouterr()
+    assert secret_name not in cap2.err
+    assert secret_name not in cap2.out

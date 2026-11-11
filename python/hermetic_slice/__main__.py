@@ -563,8 +563,8 @@ def main(argv: list[str] | None = None) -> int:
         except (MalformedGateOutputError, MissingDispositionError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        except Exception as exc:
-            print(f"Fatal error processing dispositions: {exc}", file=sys.stderr)
+        except Exception:
+            print("Fatal error processing dispositions: verification failed", file=sys.stderr)
             return 2
 
     return 1

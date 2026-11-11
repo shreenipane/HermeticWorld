@@ -357,6 +357,60 @@ def test_restore_modes_sh_restores_exact_modes_and_skips_symlinks(tmp_path: Path
     assert oct(target_outside.stat().st_mode & 0o777) == "0o600"
 
 
+def test_restore_modes_sh_tracked_ancestor_and_final_symlinks_never_chmod(tmp_path: Path) -> None:
+    """Offline regression test for Defect 6: tracked ancestor symlinks and final symlinks never chmod outside files."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # 1. Tracked ancestor scenario: HEAD tracks pkg/secret as 100644
+    pkg_dir = repo_dir / "pkg"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    secret_tracked = pkg_dir / "secret"
+    secret_tracked.write_text("secret content\n", encoding="utf-8")
+    run_git(["add", "pkg/secret"], cwd=repo_dir)
+
+    # 2. Tracked final symlink scenario: HEAD tracks tracked_sym.txt as 100644
+    tracked_sym = repo_dir / "tracked_sym.txt"
+    tracked_sym.write_text("regular file initially\n", encoding="utf-8")
+    run_git(["add", "tracked_sym.txt"], cwd=repo_dir)
+
+    # Commit tree
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "base commit with tracked files"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Now setup hostile on-disk scenario:
+    # A) Replace pkg directory with a symlink to outside_dir containing 0600 secret
+    shutil.rmtree(pkg_dir)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_secret = outside_dir / "secret"
+    outside_secret.write_text("outside secret\n", encoding="utf-8")
+    os.chmod(outside_secret, 0o600)
+    pkg_dir.symlink_to(outside_dir, target_is_directory=True)
+
+    # B) Replace tracked_sym.txt with a symlink to outside_file containing 0600 content
+    tracked_sym.unlink()
+    outside_file = tmp_path / "outside_file.txt"
+    outside_file.write_text("outside file content\n", encoding="utf-8")
+    os.chmod(outside_file, 0o600)
+    tracked_sym.symlink_to(outside_file)
+
+    # Run RESTORE_MODES_SH
+    subprocess.run(["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)], check=True)
+
+    # Verify outside files were NEVER chmod'd to 0644!
+    assert oct(outside_secret.stat().st_mode & 0o777) == "0o600"
+    assert oct(outside_file.stat().st_mode & 0o777) == "0o600"
+    assert pkg_dir.is_symlink()
+    assert tracked_sym.is_symlink()
+
+
 
 # =============================================================================
 # Docker Integration Tests (Requires working Docker inside WSL/Linux)
