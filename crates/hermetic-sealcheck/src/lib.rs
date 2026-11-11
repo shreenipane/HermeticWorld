@@ -40,10 +40,11 @@ pub use gitstore::{
     ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
 };
 pub use index::{
-    query_index, write_index, IndexError, IndexReader, IndexRecord, IndexStats, NOT_COVERED,
+    query_index, write_index, write_index_with_threshold, IndexError, IndexReader, IndexRecord,
+    IndexStats, NOT_COVERED,
 };
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
-pub use sarif::{generate_sarif, SarifLog};
+pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};
 pub use scan::{
     compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
     ScanOptions, Severity, TreeSink, UnitHashes, Visibility,

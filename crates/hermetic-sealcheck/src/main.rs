@@ -7,9 +7,9 @@ use std::process::ExitCode;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    generate_sarif, query_index, scan_problem_statement, scan_tree, write_index,
-    BenchmarkSignatures, Finding, FingerprintSet, FingerprintSummary, ScanOptions, SealcheckReport,
-    Severity, Visibility, NOT_COVERED,
+    generate_sarif, generate_sarif_with_properties, query_index, scan_problem_statement, scan_tree,
+    write_index, BenchmarkSignatures, Finding, FingerprintSet, FingerprintSummary,
+    SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility, NOT_COVERED,
 };
 
 #[derive(Parser, Debug)]
@@ -238,7 +238,16 @@ fn write_report(
 
     let output_str = match format {
         OutputFormat::Sarif => {
-            let sarif = generate_sarif(&all_findings);
+            let sarif = match query_mode {
+                Some(not_covered) => generate_sarif_with_properties(
+                    &all_findings,
+                    Some(SarifRunProperties {
+                        mode: "query".to_string(),
+                        not_covered: not_covered.iter().map(|s| s.to_string()).collect(),
+                    }),
+                ),
+                None => generate_sarif(&all_findings),
+            };
             serde_json::to_string_pretty(&sarif)?
         }
         OutputFormat::Json => {

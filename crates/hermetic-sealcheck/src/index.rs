@@ -9,13 +9,14 @@
 //! The file is one zstd stream. Decompressed, it holds:
 //!
 //! ```text
-//! magic        6 bytes   "HWIDX1"
-//! version      u32       1
-//! root         str       the indexed root, as `scan` would display it
-//! count        u64       number of records
-//! record*      count times:
-//!     len      u64       payload length (at most MAX_RECORD_BYTES)
-//!     payload  len bytes: tag u8, then the fields below
+//! magic           6 bytes   "HWIDX1"
+//! version         u32       1
+//! root            str       the indexed root, as `scan` would display it
+//! canonical_root  str       root canonicalized at index time ("" if failed)
+//! count           u64       number of records
+//! record*         count times:
+//!     len         u64       payload length (at most MAX_RECORD_BYTES)
+//!     payload     len bytes: tag u8, then the fields below
 //! ```
 //!
 //! Integers are little-endian. `str` is a u32 byte length then UTF-8. `path` is a u8 kind
@@ -31,6 +32,8 @@
 //! | 4   | text      | path, D9 flags u8, line set, window set, removed-marker set, diff-shape set, winnow set |
 //! | 5   | binary    | path, channel str, exact set, token set |
 //! | 6   | pkg       | path, name str, version opt<str> |
+//! | 7   | text cont | path, line set, window set, removed-marker set, diff-shape set, winnow set |
+//! | 8   | bin cont  | path, channel str, exact set, token set |
 //!
 //! `fixed` holds a finding that depends on the unit alone (errors, bombs, skipped
 //! binaries); its visibility comes from the query. Text hashes are the first 8 bytes of
@@ -74,7 +77,7 @@ use crate::scan::{
 pub const MAGIC: &[u8; 6] = b"HWIDX1";
 pub const FORMAT_VERSION: u32 = 1;
 /// The largest record payload the reader accepts.
-pub const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 /// The longest root path the reader accepts.
 pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 
@@ -87,6 +90,8 @@ const TAG_PATH: u8 = 3;
 const TAG_TEXT: u8 = 4;
 const TAG_BINARY: u8 = 5;
 const TAG_PKG: u8 = 6;
+const TAG_TEXT_CONT: u8 = 7;
+const TAG_BINARY_CONT: u8 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -167,6 +172,15 @@ pub enum IndexRecord {
         path: IndexPath,
         name: String,
         version: Option<String>,
+    },
+    TextCont {
+        path: IndexPath,
+        hashes: UnitHashes,
+    },
+    BinaryCont {
+        path: IndexPath,
+        channel: String,
+        strings: HashedBinaryStrings,
     },
 }
 
@@ -313,10 +327,24 @@ pub struct IndexStats {
 /// Index `root` into the file `out`. The file is written to a temporary name beside `out`
 /// and renamed into place, so a failed run never leaves a partial index.
 pub fn write_index(root: &Path, out: &Path) -> Result<IndexStats, IndexError> {
+    write_index_with_threshold(root, out, MAX_RECORD_BYTES)
+}
+
+/// `write_index` with a configurable record split threshold (for testing).
+pub fn write_index_with_threshold(
+    root: &Path,
+    out: &Path,
+    max_record_bytes: u64,
+) -> Result<IndexStats, IndexError> {
     let root_str = root
         .to_str()
         .map(|_| root.display().to_string())
         .ok_or_else(|| IndexError::NonUtf8Root(root.to_path_buf()))?;
+    let canonical_root_str = root
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let dir = match out.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -342,12 +370,35 @@ pub fn write_index(root: &Path, out: &Path) -> Result<IndexStats, IndexError> {
                 }
                 payload.clear();
                 encode_record(&r, &mut payload);
-                let res = w
-                    .write_all(&(payload.len() as u64).to_le_bytes())
-                    .and_then(|_| w.write_all(&payload));
-                match res {
-                    Ok(()) => stats.records += 1,
-                    Err(e) => write_err = Some(e),
+                if payload.len() as u64 <= max_record_bytes {
+                    let res = w
+                        .write_all(&(payload.len() as u64).to_le_bytes())
+                        .and_then(|_| w.write_all(&payload));
+                    match res {
+                        Ok(()) => stats.records += 1,
+                        Err(e) => write_err = Some(e),
+                    }
+                } else if let Some(chunks) = split_record(&r, max_record_bytes) {
+                    for chunk in chunks {
+                        let res = w
+                            .write_all(&(chunk.len() as u64).to_le_bytes())
+                            .and_then(|_| w.write_all(&chunk));
+                        match res {
+                            Ok(()) => stats.records += 1,
+                            Err(e) => {
+                                write_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let res = w
+                        .write_all(&(payload.len() as u64).to_le_bytes())
+                        .and_then(|_| w.write_all(&payload));
+                    match res {
+                        Ok(()) => stats.records += 1,
+                        Err(e) => write_err = Some(e),
+                    }
                 }
             }),
         );
@@ -367,6 +418,7 @@ pub fn write_index(root: &Path, out: &Path) -> Result<IndexStats, IndexError> {
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         put_str(&mut header, &root_str);
+        put_str(&mut header, &canonical_root_str);
         header.extend_from_slice(&stats.records.to_le_bytes());
         enc.write_all(&header)?;
         io::copy(&mut BufReader::new(&mut scratch), &mut enc)?;
@@ -418,19 +470,172 @@ fn put_path(b: &mut Vec<u8>, p: &IndexPath) {
         }
     }
 }
+fn put_hash_slice(b: &mut Vec<u8>, slice: &[u64]) {
+    put_u64(b, slice.len() as u64);
+    for h in slice {
+        put_u64(b, *h);
+    }
+}
+
 fn put_set(b: &mut Vec<u8>, set: &HashSet<u64>) {
     let mut v: Vec<u64> = set.iter().copied().collect();
     v.sort_unstable();
-    put_u64(b, v.len() as u64);
-    for h in v {
-        put_u64(b, h);
-    }
+    put_hash_slice(b, &v);
 }
 fn severity_code(s: Severity) -> u8 {
     match s {
         Severity::Gate => 0,
         Severity::Review => 1,
         Severity::Info => 2,
+    }
+}
+
+/// Split a text or binary record across consecutive records when its encoded payload
+/// exceeds `max_record_bytes`.
+fn split_record(r: &IndexRecord, max_record_bytes: u64) -> Option<Vec<Vec<u8>>> {
+    match r {
+        IndexRecord::Text {
+            path,
+            d9_flags,
+            hashes,
+        } => {
+            let mut line_v: Vec<u64> = hashes.line_hashes.iter().copied().collect();
+            line_v.sort_unstable();
+            let mut window_v: Vec<u64> = hashes.window_hashes.iter().copied().collect();
+            window_v.sort_unstable();
+            let mut removed_v: Vec<u64> = hashes.removed_marker_hashes.iter().copied().collect();
+            removed_v.sort_unstable();
+            let mut diff_v: Vec<u64> = hashes.diff_shape_hashes.iter().copied().collect();
+            diff_v.sort_unstable();
+            let mut winnow_v: Vec<u64> = hashes.winnow_hashes.iter().copied().collect();
+            winnow_v.sort_unstable();
+
+            let mut line_idx = 0;
+            let mut window_idx = 0;
+            let mut removed_idx = 0;
+            let mut diff_idx = 0;
+            let mut winnow_idx = 0;
+
+            let mut is_first = true;
+            let mut chunks = Vec::new();
+
+            loop {
+                let mut buf = Vec::new();
+                if is_first {
+                    put_u8(&mut buf, TAG_TEXT);
+                    put_path(&mut buf, path);
+                    put_u8(&mut buf, *d9_flags);
+                } else {
+                    put_u8(&mut buf, TAG_TEXT_CONT);
+                    put_path(&mut buf, path);
+                }
+                let overhead = buf.len() + 5 * 8;
+                let budget_bytes = max_record_bytes.saturating_sub(overhead as u64);
+                let mut budget_hashes = (budget_bytes / 8) as usize;
+                if budget_hashes == 0 {
+                    budget_hashes = 1;
+                }
+
+                let take_line = budget_hashes.min(line_v.len() - line_idx);
+                let line_slice = &line_v[line_idx..line_idx + take_line];
+                line_idx += take_line;
+                budget_hashes -= take_line;
+
+                let take_window = budget_hashes.min(window_v.len() - window_idx);
+                let window_slice = &window_v[window_idx..window_idx + take_window];
+                window_idx += take_window;
+                budget_hashes -= take_window;
+
+                let take_removed = budget_hashes.min(removed_v.len() - removed_idx);
+                let removed_slice = &removed_v[removed_idx..removed_idx + take_removed];
+                removed_idx += take_removed;
+                budget_hashes -= take_removed;
+
+                let take_diff = budget_hashes.min(diff_v.len() - diff_idx);
+                let diff_slice = &diff_v[diff_idx..diff_idx + take_diff];
+                diff_idx += take_diff;
+                budget_hashes -= take_diff;
+
+                let take_winnow = budget_hashes.min(winnow_v.len() - winnow_idx);
+                let winnow_slice = &winnow_v[winnow_idx..winnow_idx + take_winnow];
+                winnow_idx += take_winnow;
+
+                put_hash_slice(&mut buf, line_slice);
+                put_hash_slice(&mut buf, window_slice);
+                put_hash_slice(&mut buf, removed_slice);
+                put_hash_slice(&mut buf, diff_slice);
+                put_hash_slice(&mut buf, winnow_slice);
+
+                chunks.push(buf);
+                is_first = false;
+
+                if line_idx == line_v.len()
+                    && window_idx == window_v.len()
+                    && removed_idx == removed_v.len()
+                    && diff_idx == diff_v.len()
+                    && winnow_idx == winnow_v.len()
+                {
+                    break;
+                }
+            }
+            Some(chunks)
+        }
+        IndexRecord::Binary {
+            path,
+            channel,
+            strings,
+        } => {
+            let mut exact_v: Vec<u64> = strings.exact.iter().copied().collect();
+            exact_v.sort_unstable();
+            let mut token_v: Vec<u64> = strings.tokens.iter().copied().collect();
+            token_v.sort_unstable();
+
+            let mut exact_idx = 0;
+            let mut token_idx = 0;
+
+            let mut is_first = true;
+            let mut chunks = Vec::new();
+
+            loop {
+                let mut buf = Vec::new();
+                if is_first {
+                    put_u8(&mut buf, TAG_BINARY);
+                    put_path(&mut buf, path);
+                    put_str(&mut buf, channel);
+                } else {
+                    put_u8(&mut buf, TAG_BINARY_CONT);
+                    put_path(&mut buf, path);
+                    put_str(&mut buf, channel);
+                }
+                let overhead = buf.len() + 2 * 8;
+                let budget_bytes = max_record_bytes.saturating_sub(overhead as u64);
+                let mut budget_hashes = (budget_bytes / 8) as usize;
+                if budget_hashes == 0 {
+                    budget_hashes = 1;
+                }
+
+                let take_exact = budget_hashes.min(exact_v.len() - exact_idx);
+                let exact_slice = &exact_v[exact_idx..exact_idx + take_exact];
+                exact_idx += take_exact;
+                budget_hashes -= take_exact;
+
+                let take_token = budget_hashes.min(token_v.len() - token_idx);
+                let token_slice = &token_v[token_idx..token_idx + take_token];
+                token_idx += take_token;
+
+                put_hash_slice(&mut buf, exact_slice);
+                put_hash_slice(&mut buf, token_slice);
+
+                chunks.push(buf);
+                is_first = false;
+
+                if exact_idx == exact_v.len() && token_idx == token_v.len() {
+                    break;
+                }
+            }
+            Some(chunks)
+        }
+        _ => None,
     }
 }
 
@@ -509,6 +714,26 @@ pub fn encode_record(r: &IndexRecord, b: &mut Vec<u8>) {
             put_path(b, path);
             put_str(b, name);
             put_opt_str(b, version.as_deref());
+        }
+        IndexRecord::TextCont { path, hashes } => {
+            put_u8(b, TAG_TEXT_CONT);
+            put_path(b, path);
+            put_set(b, &hashes.line_hashes);
+            put_set(b, &hashes.window_hashes);
+            put_set(b, &hashes.removed_marker_hashes);
+            put_set(b, &hashes.diff_shape_hashes);
+            put_set(b, &hashes.winnow_hashes);
+        }
+        IndexRecord::BinaryCont {
+            path,
+            channel,
+            strings,
+        } => {
+            put_u8(b, TAG_BINARY_CONT);
+            put_path(b, path);
+            put_str(b, channel);
+            put_set(b, &strings.exact);
+            put_set(b, &strings.tokens);
         }
     }
 }
@@ -691,6 +916,24 @@ pub fn decode_record(payload: &[u8]) -> Result<IndexRecord, IndexError> {
                 version,
             }
         }
+        TAG_TEXT_CONT => IndexRecord::TextCont {
+            path: c.path()?,
+            hashes: UnitHashes {
+                line_hashes: c.set("line hashes")?,
+                window_hashes: c.set("window hashes")?,
+                removed_marker_hashes: c.set("removed-marker hashes")?,
+                diff_shape_hashes: c.set("diff-shape hashes")?,
+                winnow_hashes: c.set("winnow hashes")?,
+            },
+        },
+        TAG_BINARY_CONT => IndexRecord::BinaryCont {
+            path: c.path()?,
+            channel: c.str("binary channel")?,
+            strings: HashedBinaryStrings {
+                exact: c.set("exact strings")?,
+                tokens: c.set("run tokens")?,
+            },
+        },
         t => return Err(IndexError::Malformed(format!("unknown record tag {t}"))),
     };
     if c.remaining() != 0 {
@@ -718,6 +961,7 @@ fn read_exact_or_truncated<R: Read>(
 pub struct IndexReader<R: Read> {
     inner: R,
     root: String,
+    canonical_root: String,
     count: u64,
     read: u64,
     finished: bool,
@@ -756,12 +1000,26 @@ impl<R: Read> IndexReader<R> {
         read_exact_or_truncated(&mut inner, &mut root, "root")?;
         let root = String::from_utf8(root)
             .map_err(|_| IndexError::Malformed("root is not UTF-8".into()))?;
+
+        read_exact_or_truncated(&mut inner, &mut b4, "canonical_root length")?;
+        let canonical_root_len = u32::from_le_bytes(b4);
+        if canonical_root_len > MAX_ROOT_BYTES {
+            return Err(IndexError::Malformed(format!(
+                "canonical_root length {canonical_root_len} over the {MAX_ROOT_BYTES}-byte limit"
+            )));
+        }
+        let mut canonical_root = vec![0u8; canonical_root_len as usize];
+        read_exact_or_truncated(&mut inner, &mut canonical_root, "canonical_root")?;
+        let canonical_root = String::from_utf8(canonical_root)
+            .map_err(|_| IndexError::Malformed("canonical_root is not UTF-8".into()))?;
+
         let mut b8 = [0u8; 8];
         read_exact_or_truncated(&mut inner, &mut b8, "record count")?;
         let count = u64::from_le_bytes(b8);
         Ok(Self {
             inner,
             root,
+            canonical_root,
             count,
             read: 0,
             finished: false,
@@ -770,6 +1028,10 @@ impl<R: Read> IndexReader<R> {
 
     pub fn root(&self) -> &str {
         &self.root
+    }
+
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
     }
 
     pub fn count(&self) -> u64 {
@@ -834,28 +1096,28 @@ impl<R: Read> IndexReader<R> {
 // Query
 // ---------------------------------------------------------------------------------------
 
-/// Whether `display` lies inside one of the excluded directories, judged by path text.
-/// `canon_root` is the canonical form of the index root, when it still exists.
-fn is_excluded(
-    path: &IndexPath,
-    root: &str,
-    canon_root: Option<&str>,
-    exclude: &[PathBuf],
-) -> bool {
+fn strip_leading_sep(rel: &str) -> &str {
+    #[cfg(windows)]
+    {
+        rel.trim_start_matches(['/', '\\'])
+    }
+    #[cfg(not(windows))]
+    {
+        rel.trim_start_matches('/')
+    }
+}
+
+/// Whether `path` lies inside one of the excluded directories.
+/// Compares component-wise with `Path::starts_with` on the canonical root.
+fn is_excluded(path: &IndexPath, canon_root: &Path, exclude: &[PathBuf]) -> bool {
     if exclude.is_empty() {
         return false;
     }
-    let full = match (path, canon_root) {
-        (IndexPath::Rel(rel), Some(c)) => format!("{c}{rel}"),
-        _ => path.display(root),
+    let full = match path {
+        IndexPath::Rel(rel) => canon_root.join(strip_leading_sep(rel)),
+        IndexPath::Abs(abs) => PathBuf::from(abs),
     };
-    exclude.iter().any(|d| {
-        let d = d.display().to_string();
-        full == d
-            || full
-                .strip_prefix(&d)
-                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
-    })
+    exclude.iter().any(|d| full.starts_with(d))
 }
 
 /// Match one record against a task, appending its findings.
@@ -867,7 +1129,9 @@ pub fn query_record(
     findings: &mut Vec<Finding>,
 ) {
     match rec {
-        IndexRecord::File { .. } => {}
+        IndexRecord::File { .. }
+        | IndexRecord::TextCont { .. }
+        | IndexRecord::BinaryCont { .. } => {}
         IndexRecord::Fixed(f) => findings.push(Finding {
             detector: f.detector.clone(),
             channel: f.channel.clone(),
@@ -944,27 +1208,88 @@ pub fn query_reader<R: Read>(
 ) -> Result<Vec<Finding>, IndexError> {
     let root = reader.root().to_string();
     let canon_root = if opts.exclude_dirs.is_empty() {
-        None
+        PathBuf::new()
     } else {
-        Path::new(&root)
-            .canonicalize()
-            .ok()
-            .map(|p| p.display().to_string())
+        let cr = reader.canonical_root();
+        if !cr.is_empty() {
+            PathBuf::from(cr)
+        } else {
+            Path::new(&root)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&root))
+        }
     };
     let mut findings = Vec::new();
-    while let Some(rec) = reader.next_record()? {
-        let path = match &rec {
-            IndexRecord::File { path, .. }
-            | IndexRecord::Path { path }
-            | IndexRecord::Text { path, .. }
-            | IndexRecord::Binary { path, .. }
-            | IndexRecord::Pkg { path, .. } => path,
-            IndexRecord::Fixed(f) => &f.path,
-        };
-        if is_excluded(path, &root, canon_root.as_deref(), &opts.exclude_dirs) {
-            continue;
+    let mut pending: Option<IndexRecord> = None;
+
+    let flush_pending = |pending: Option<IndexRecord>, findings: &mut Vec<Finding>| {
+        if let Some(rec) = pending {
+            let path = match &rec {
+                IndexRecord::File { path, .. }
+                | IndexRecord::Path { path }
+                | IndexRecord::Text { path, .. }
+                | IndexRecord::Binary { path, .. }
+                | IndexRecord::Pkg { path, .. } => path,
+                IndexRecord::Fixed(f) => &f.path,
+                IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
+            };
+            if !is_excluded(path, &canon_root, &opts.exclude_dirs) {
+                query_record(&rec, &root, fp, opts, findings);
+            }
         }
-        query_record(&rec, &root, fp, opts, &mut findings);
+    };
+
+    while let Some(rec) = reader.next_record()? {
+        match rec {
+            IndexRecord::TextCont { path, hashes } => match pending.as_mut() {
+                Some(IndexRecord::Text {
+                    path: prev_path,
+                    hashes: prev_hashes,
+                    ..
+                }) if prev_path == &path => {
+                    prev_hashes.line_hashes.extend(hashes.line_hashes);
+                    prev_hashes.window_hashes.extend(hashes.window_hashes);
+                    prev_hashes
+                        .removed_marker_hashes
+                        .extend(hashes.removed_marker_hashes);
+                    prev_hashes
+                        .diff_shape_hashes
+                        .extend(hashes.diff_shape_hashes);
+                    prev_hashes.winnow_hashes.extend(hashes.winnow_hashes);
+                }
+                _ => {
+                    return Err(IndexError::Malformed(
+                        "text continuation without matching predecessor".to_string(),
+                    ));
+                }
+            },
+            IndexRecord::BinaryCont {
+                path,
+                channel,
+                strings,
+            } => match pending.as_mut() {
+                Some(IndexRecord::Binary {
+                    path: prev_path,
+                    channel: prev_channel,
+                    strings: prev_strings,
+                    ..
+                }) if prev_path == &path && prev_channel == &channel => {
+                    prev_strings.exact.extend(strings.exact);
+                    prev_strings.tokens.extend(strings.tokens);
+                }
+                _ => {
+                    return Err(IndexError::Malformed(
+                        "binary continuation without matching predecessor".to_string(),
+                    ));
+                }
+            },
+            other => {
+                flush_pending(pending.take(), &mut findings);
+                pending = Some(other);
+            }
+        }
     }
+    flush_pending(pending.take(), &mut findings);
+
     Ok(findings)
 }

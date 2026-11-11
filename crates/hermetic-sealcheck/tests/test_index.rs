@@ -8,10 +8,10 @@ use std::time::Instant;
 
 use tempfile::{tempdir, TempDir};
 
-use hermetic_sealcheck::index::{collect_records, IndexReader, MAGIC};
+use hermetic_sealcheck::index::{collect_records, IndexReader, MAGIC, MAX_RECORD_BYTES};
 use hermetic_sealcheck::{
-    query_index, scan_tree, write_index, Finding, FingerprintSet, IndexError, ScanOptions,
-    Severity, Visibility,
+    query_index, scan_tree, write_index, write_index_with_threshold, Finding, FingerprintSet,
+    IndexError, ScanOptions, Severity, Visibility,
 };
 
 const BASE_CODE: &str = "def process(values):\n    total = sum(values)\n    return total\n";
@@ -374,6 +374,52 @@ fn equivalence_with_excluded_task_dir() {
 }
 
 #[test]
+fn equivalence_with_excluded_task_dir_trailing_slash() {
+    let t = task();
+    let root = tempdir().expect("tempdir");
+    let task_dir = root.path().join("tasks/x__y-1");
+    fs::create_dir_all(&task_dir).expect("mkdir");
+    fs::write(task_dir.join("gold.patch"), GOLD_PATCH).expect("write");
+    fs::write(root.path().join("leak.py"), POST_FIX).expect("write");
+    let o = ScanOptions {
+        exclude_dirs: vec![task_dir.canonicalize().expect("canon")],
+        ..opts()
+    };
+    let trailing_root = PathBuf::from(format!("{}/", root.path().display()));
+    let scanned = covered_sorted(scan_tree(&trailing_root, &t.fp, &o));
+    let dir = tempdir().expect("tempdir");
+    let idx = dir.path().join("trailing.hwidx");
+    write_index(&trailing_root, &idx).expect("write index");
+    let queried = covered_sorted(query_index(&idx, &t.fp, &o).expect("query"));
+    assert_eq!(scanned, queried, "scan and query differ for trailing slash");
+    assert!(!queried.iter().any(|s| s.contains("gold.patch")));
+    assert!(gates_with(&queried, "leak.py") > 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalence_task_backslash_leak_unix() {
+    let t = task();
+    let root = tempdir().expect("tempdir");
+    let task_dir = root.path().join("task");
+    fs::create_dir_all(&task_dir).expect("mkdir");
+    fs::write(task_dir.join("gold.patch"), GOLD_PATCH).expect("write");
+    // A file literally named task\leak.py in root (next to excluded dir task/)
+    fs::write(root.path().join("task\\leak.py"), POST_FIX).expect("write");
+    let o = ScanOptions {
+        exclude_dirs: vec![task_dir.canonicalize().expect("canon")],
+        ..opts()
+    };
+    let scanned = covered_sorted(scan_tree(root.path(), &t.fp, &o));
+    let (_d, idx) = index_of(root.path());
+    let queried = covered_sorted(query_index(&idx, &t.fp, &o).expect("query"));
+    assert_eq!(scanned, queried);
+    assert!(!queried.iter().any(|s| s.contains("gold.patch")));
+    assert!(gates_with(&scanned, "leak.py") > 0);
+    assert!(gates_with(&queried, "leak.py") > 0);
+}
+
+#[test]
 fn query_applies_the_queried_visibility() {
     let t = task();
     let root = tempdir().expect("tempdir");
@@ -442,7 +488,14 @@ fn valid_raw_index() -> (Vec<u8>, usize) {
     let (_d, idx) = index_of(root.path());
     let raw = zstd::decode_all(File::open(&idx).expect("open")).expect("decode");
     let root_len = u32::from_le_bytes([raw[10], raw[11], raw[12], raw[13]]) as usize;
-    (raw, 6 + 4 + 4 + root_len + 8)
+    let cr_off = 14 + root_len;
+    let cr_len = u32::from_le_bytes([
+        raw[cr_off],
+        raw[cr_off + 1],
+        raw[cr_off + 2],
+        raw[cr_off + 3],
+    ]) as usize;
+    (raw, cr_off + 4 + cr_len + 8)
 }
 
 fn read_raw(raw: &[u8]) -> Result<Vec<hermetic_sealcheck::IndexRecord>, IndexError> {
@@ -505,10 +558,74 @@ fn hostile_bad_version() {
 #[test]
 fn hostile_length_past_the_end() {
     let (mut raw, first) = valid_raw_index();
-    raw[first..first + 8].copy_from_slice(&(1u64 << 30).to_le_bytes());
+    raw[first..first + 8].copy_from_slice(&100_000u64.to_le_bytes());
     assert!(matches!(read_raw(&raw), Err(IndexError::Truncated(_))));
     raw[first..first + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(matches!(read_raw(&raw), Err(IndexError::Malformed(_))));
+}
+
+#[test]
+fn hostile_length_max_record_bytes_plus_one_is_malformed() {
+    let (mut raw, first) = valid_raw_index();
+    raw[first..first + 8].copy_from_slice(&(MAX_RECORD_BYTES + 1).to_le_bytes());
+    let res = read_raw(&raw);
+    assert!(
+        matches!(res, Err(IndexError::Malformed(ref msg)) if msg.contains("limit")),
+        "expected Malformed over limit, got {res:?}"
+    );
+}
+
+#[test]
+fn hostile_orphan_continuation_is_malformed() {
+    let t = task();
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("orphan.hwidx");
+
+    let mut raw = Vec::new();
+    raw.extend_from_slice(MAGIC);
+    raw.extend_from_slice(&1u32.to_le_bytes());
+    raw.extend_from_slice(&4u32.to_le_bytes());
+    raw.extend_from_slice(b"root");
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    raw.extend_from_slice(&1u64.to_le_bytes());
+
+    let mut payload = Vec::new();
+    payload.push(7u8);
+    payload.push(0u8);
+    payload.extend_from_slice(&4u32.to_le_bytes());
+    payload.extend_from_slice(b"s.py");
+    for _ in 0..5 {
+        payload.extend_from_slice(&0u64.to_le_bytes());
+    }
+
+    raw.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    raw.extend_from_slice(&payload);
+
+    fs::write(&path, zstd::encode_all(&raw[..], 3).expect("encode")).expect("write");
+    let res = query_index(&path, &t.fp, &opts());
+    assert!(
+        matches!(res, Err(IndexError::Malformed(ref msg)) if msg.contains("continuation")),
+        "expected Malformed for orphan continuation, got {res:?}"
+    );
+}
+
+#[test]
+fn split_continuation_records_match_scan() {
+    let t = task();
+    let root = tempdir().expect("tempdir");
+    fs::write(root.path().join("service.py"), POST_FIX).expect("write text");
+    fs::write(root.path().join("lib.so"), build_elf64_le(FIX_ITEMS)).expect("write binary");
+    let out_dir = tempdir().expect("tempdir");
+    let idx = out_dir.path().join("split.hwidx");
+
+    let stats = write_index_with_threshold(root.path(), &idx, 64).expect("write split index");
+    assert!(stats.records > 10, "records were split: {}", stats.records);
+
+    let scanned = covered_sorted(scan_tree(root.path(), &t.fp, &opts()));
+    let queried = covered_sorted(query_index(&idx, &t.fp, &opts()).expect("query"));
+    assert_eq!(scanned, queried);
+    assert!(gates_with(&queried, "service.py") > 0);
+    assert!(gates_with(&queried, "binary_elf") > 0);
 }
 
 #[test]
@@ -772,6 +889,137 @@ fn cli_index_and_query_match_scan() {
         .output()
         .expect("run query");
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn cli_query_relative_root_from_different_cwd() {
+    let bin = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let parent = tempdir().expect("tempdir");
+    let workdir_a = parent.path().join("workdir_a");
+    let workdir_b = parent.path().join("workdir_b");
+    fs::create_dir_all(&workdir_a).expect("mkdir a");
+    fs::create_dir_all(&workdir_b).expect("mkdir b");
+
+    let base = parent.path().join("base");
+    fs::create_dir_all(&base).expect("mkdir base");
+    fs::write(base.join("service.py"), BASE_CODE).expect("write base");
+
+    let image = workdir_a.join("image");
+    fs::create_dir_all(&image).expect("mkdir image");
+    fs::write(image.join("leak.py"), POST_FIX).expect("write leak");
+    let task = image.join("task");
+    write_task(&task);
+
+    let idx = parent.path().join("image.hwidx");
+
+    // Index with relative --root "image" from workdir_a
+    let st = Command::new(bin)
+        .current_dir(&workdir_a)
+        .args(["index", "--root", "image", "--out"])
+        .arg(&idx)
+        .status()
+        .expect("run index");
+    assert_eq!(st.code(), Some(0));
+
+    // Full scan from workdir_a with --root image
+    let scan = Command::new(bin)
+        .current_dir(&workdir_a)
+        .args(["scan", "--task"])
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base)
+        .args(["--root", "image"])
+        .output()
+        .expect("run scan");
+
+    // Query from workdir_b
+    let query = Command::new(bin)
+        .current_dir(&workdir_b)
+        .args(["query", "--task"])
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base)
+        .arg("--index")
+        .arg(&idx)
+        .output()
+        .expect("run query");
+
+    assert_eq!(scan.status.code(), Some(2));
+    assert_eq!(query.status.code(), Some(2));
+
+    let (_sv, sf) = report_findings(&scan.stdout);
+    let (_qv, qf) = report_findings(&query.stdout);
+    assert_eq!(sf, qf);
+    assert!(
+        !qf.iter().any(|f| f.contains("gold.patch")),
+        "task dir leaked into findings: {qf:#?}"
+    );
+    assert!(gates_with(&qf, "leak.py") > 0);
+}
+
+#[test]
+fn cli_sarif_query_and_scan_properties() {
+    let bin = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let parent = tempdir().expect("tempdir");
+    let base = parent.path().join("base");
+    fs::create_dir_all(&base).expect("mkdir");
+    fs::write(base.join("service.py"), BASE_CODE).expect("write");
+    let root = parent.path().join("image");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(root.join("leak.py"), POST_FIX).expect("write");
+    let task = parent.path().join("task");
+    write_task(&task);
+    let idx = parent.path().join("image.hwidx");
+
+    let st = Command::new(bin)
+        .args(["index", "--root"])
+        .arg(&root)
+        .arg("--out")
+        .arg(&idx)
+        .status()
+        .expect("run index");
+    assert_eq!(st.code(), Some(0));
+
+    let scan = Command::new(bin)
+        .args(["scan", "--format", "sarif", "--task"])
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base)
+        .arg("--root")
+        .arg(&root)
+        .output()
+        .expect("run scan sarif");
+
+    let query = Command::new(bin)
+        .args(["query", "--format", "sarif", "--task"])
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base)
+        .arg("--index")
+        .arg(&idx)
+        .output()
+        .expect("run query sarif");
+
+    assert_eq!(scan.status.code(), Some(2));
+    assert_eq!(query.status.code(), Some(2));
+
+    let scan_json: serde_json::Value = serde_json::from_slice(&scan.stdout).expect("scan json");
+    let query_json: serde_json::Value = serde_json::from_slice(&query.stdout).expect("query json");
+
+    // Scan SARIF has no properties on runs[0]
+    assert!(
+        scan_json["runs"][0].get("properties").is_none(),
+        "scan SARIF should not have properties: {:?}",
+        scan_json["runs"][0].get("properties")
+    );
+
+    // Query SARIF contains runs[0].properties.mode == "query" and the five not_covered values
+    let props = &query_json["runs"][0]["properties"];
+    assert_eq!(props["mode"], "query");
+    assert_eq!(
+        props["not_covered"],
+        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external"])
+    );
 }
 
 // ---------------------------------------------------------------------------------------
