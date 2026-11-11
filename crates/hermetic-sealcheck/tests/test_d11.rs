@@ -370,3 +370,236 @@ diff --git a/conftest.py b/conftest.py
     let findings = json["findings"].as_array().expect("findings array");
     assert!(!findings.is_empty());
 }
+
+#[test]
+fn test_d11_pytest11_continuation_line_flagged() {
+    let patch = "\
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -10,3 +10,4 @@
+ [options.entry_points]
+ pytest11 =
++    myplugin = mypkg.plugin
+ console_scripts =
+";
+    let findings = check_d11(patch, &D11Options::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].channel, "runner_config_section");
+    assert_eq!(findings[0].path, "setup.cfg");
+    assert!(findings[0]
+        .evidence
+        .iter()
+        .any(|e| e.contains("myplugin = mypkg.plugin")));
+}
+
+#[test]
+fn test_d11_renames_both_directions_including_no_hunks() {
+    // 1. Rename away: conftest.py -> disabled.py (no hunks)
+    let patch_away_no_hunks = "\
+diff --git a/conftest.py b/disabled.py
+similarity index 100%
+rename from conftest.py
+rename to disabled.py
+";
+    let f_away = check_d11(patch_away_no_hunks, &D11Options::default());
+    assert_eq!(f_away.len(), 1);
+    assert_eq!(f_away[0].channel, "test_infra_file");
+    assert_eq!(f_away[0].path, "conftest.py");
+    assert_eq!(
+        f_away[0].evidence,
+        vec!["renamed to disabled.py".to_string()]
+    );
+
+    // 2. Rename to: normal.py -> conftest.py (no hunks)
+    let patch_to_no_hunks = "\
+diff --git a/normal.py b/conftest.py
+similarity index 100%
+rename from normal.py
+rename to conftest.py
+";
+    let f_to = check_d11(patch_to_no_hunks, &D11Options::default());
+    assert_eq!(f_to.len(), 1);
+    assert_eq!(f_to[0].channel, "test_infra_file");
+    assert_eq!(f_to[0].path, "conftest.py");
+    assert!(f_to[0].evidence[0].contains("Test infrastructure file modified or added"));
+
+    // 3. Benchmark test file rename away: tests/test_bench.py -> tests/disabled_bench.py
+    let opts = D11Options {
+        benchmark_test_files: vec!["tests/test_bench.py".to_string()],
+        installed_packages: vec![],
+    };
+    let patch_bench_away = "\
+diff --git a/tests/test_bench.py b/tests/disabled_bench.py
+similarity index 100%
+rename from tests/test_bench.py
+rename to tests/disabled_bench.py
+";
+    let f_bench_away = check_d11(patch_bench_away, &opts);
+    assert_eq!(f_bench_away.len(), 1);
+    assert_eq!(f_bench_away[0].channel, "benchmark_test_file");
+    assert_eq!(f_bench_away[0].path, "tests/test_bench.py");
+    assert_eq!(
+        f_bench_away[0].evidence,
+        vec!["renamed to tests/disabled_bench.py".to_string()]
+    );
+
+    // 4. Benchmark test file rename to: tests/old.py -> tests/test_bench.py
+    let patch_bench_to = "\
+diff --git a/tests/old.py b/tests/test_bench.py
+similarity index 100%
+rename from tests/old.py
+rename to tests/test_bench.py
+";
+    let f_bench_to = check_d11(patch_bench_to, &opts);
+    assert_eq!(f_bench_to.len(), 1);
+    assert_eq!(f_bench_to[0].channel, "benchmark_test_file");
+    assert_eq!(f_bench_to[0].path, "tests/test_bench.py");
+    assert!(f_bench_to[0].evidence[0].contains("Benchmark test file modified"));
+}
+
+#[test]
+fn test_d11_unknown_section_in_setup_cfg_and_pyproject() {
+    // "addopts = --ignore=tests" with no header in hunk: flagged as section unknown
+    let patch_unknown = "\
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -10,1 +10,1 @@
++addopts = --ignore=tests
+";
+    let f_unknown = check_d11(patch_unknown, &D11Options::default());
+    assert_eq!(f_unknown.len(), 1);
+    assert_eq!(f_unknown[0].channel, "runner_config_section");
+    assert_eq!(
+        f_unknown[0].evidence,
+        vec![
+            "section unknown (header outside the diff context): addopts = --ignore=tests"
+                .to_string()
+        ]
+    );
+
+    // change under visible [metadata] header: still NOT flagged
+    let patch_metadata = "\
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,3 +1,3 @@
+ [metadata]
+-name = old
++name = new
+";
+    let f_meta = check_d11(patch_metadata, &D11Options::default());
+    assert!(
+        f_meta.is_empty(),
+        "change under visible [metadata] header must not be flagged"
+    );
+}
+
+#[test]
+fn test_d11_double_prefix_stripping() {
+    // new file a/json.py gives no shadowing finding
+    let patch_a_json = "\
+diff --git a/a/json.py b/a/json.py
+new file mode 100644
+--- /dev/null
++++ b/a/json.py
+@@ -0,0 +1,2 @@
++def loads():
++    return {}
+";
+    let f_json = check_d11(patch_a_json, &D11Options::default());
+    assert!(
+        f_json.is_empty(),
+        "a/json.py is inside directory 'a/' and must NOT be flagged as top-level shadowing"
+    );
+
+    // benchmark entry written as "b/tests/test_x.py" still matches tests/test_x.py
+    let opts = D11Options {
+        benchmark_test_files: vec!["b/tests/test_x.py".to_string()],
+        installed_packages: vec![],
+    };
+    let patch_bench = "\
+diff --git a/tests/test_x.py b/tests/test_x.py
+--- a/tests/test_x.py
++++ b/tests/test_x.py
+@@ -1,1 +1,2 @@
+ def test_x():
++    pass
+";
+    let f_bench = check_d11(patch_bench, &opts);
+    assert_eq!(f_bench.len(), 1);
+    assert_eq!(f_bench[0].channel, "benchmark_test_file");
+    assert_eq!(f_bench[0].path, "tests/test_x.py");
+}
+
+#[test]
+fn test_d11_cli_sarif_garbage_input_has_note_for_patch_error() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let dir = tempdir().expect("tempdir");
+    let patch_file = dir.path().join("garbage.patch");
+    let out_file = dir.path().join("report.sarif");
+
+    fs::write(&patch_file, "this is not a valid git diff @@ bad @@").expect("write garbage");
+
+    let status = Command::new(bin_path)
+        .arg("d11")
+        .arg("--patch")
+        .arg(&patch_file)
+        .arg("--format")
+        .arg("sarif")
+        .arg("--out")
+        .arg(&out_file)
+        .status()
+        .expect("run hermetic-sealcheck d11");
+
+    assert_eq!(status.code(), Some(0));
+
+    let sarif_str = fs::read_to_string(&out_file).expect("read sarif");
+    let json: Value = serde_json::from_str(&sarif_str).expect("parse sarif json");
+
+    let results = json["runs"][0]["results"]
+        .as_array()
+        .expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ruleId"], "D11");
+    assert_eq!(results[0]["level"], "note");
+    assert!(results[0]["message"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("patch_error"));
+}
+
+#[test]
+fn test_sarif_scan_unchanged_drops_info() {
+    use hermetic_sealcheck::{generate_sarif, Finding, Severity, Visibility};
+
+    let findings = vec![
+        Finding {
+            detector: "D1".to_string(),
+            channel: "git_branch".to_string(),
+            path: "repo/.git".to_string(),
+            visibility: Visibility::AgentVisible,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["leaked branch".to_string()],
+        },
+        Finding {
+            detector: "D12".to_string(),
+            channel: "skipped_symlink".to_string(),
+            path: "repo/link".to_string(),
+            visibility: Visibility::AgentVisible,
+            severity: Severity::Info,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["symlink not followed".to_string()],
+        },
+    ];
+
+    let default_sarif = generate_sarif(&findings);
+    let run = &default_sarif.runs[0];
+    assert_eq!(run.results.len(), 1);
+    assert_eq!(run.results[0].rule_id, "D1");
+    assert_eq!(run.results[0].level, "error");
+}

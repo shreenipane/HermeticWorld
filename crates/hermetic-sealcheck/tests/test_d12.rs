@@ -297,3 +297,213 @@ fn test_d12_fuzz_every_byte_and_random_input_never_panics() {
     let findings2 = check_d12("fuzz_weird.txt", &weird, &opts);
     let _ = findings2.len();
 }
+
+#[test]
+fn test_d12_utf8_char_boundary_safety_never_panics() {
+    let opts = D12Options {
+        real_date: test_real_date(),
+        tolerance_days: 1,
+        host_names: vec!["host".to_string()],
+        host_paths: vec!["/path".to_string()],
+    };
+
+    // The exact bug report input: "11 Nov 2026 08:12:31 +000é"
+    let buggy_input = "11 Nov 2026 08:12:31 +000é";
+    let findings = check_d12("test.log", buggy_input, &opts);
+    assert!(!findings.is_empty());
+
+    // Several multibyte suffixes after every date format
+    let multibyte_suffixes = ["é", "🚀", "\u{FFFF}", "\u{10FFFF}", "日本語", "€€€"];
+    let base_formats = [
+        "2026-11-11",
+        "2026/11/11",
+        "20261111",
+        "11/11/2026",
+        "11-11-2026",
+        "11.11.2026",
+        "Nov 11, 2026",
+        "11 November 2026",
+        "2026-Nov-11",
+        "Wed, 11 Nov 2026",
+        "Wed, 11 Nov 2026 08:12:31 GMT",
+        "Wed, 11 Nov 2026 08:12:31 +0000",
+        "Wednesday, 11-Nov-26 08:12:31 GMT",
+        "Wed Nov 11 08:12:31 2026",
+        "1794355200",
+        "1794355200000",
+    ];
+
+    for base in base_formats {
+        for suffix in multibyte_suffixes {
+            let text = format!("{base}{suffix}");
+            let _ = check_d12("test.log", &text, &opts);
+            let text_space = format!("{base} {suffix}");
+            let _ = check_d12("test.log", &text_space, &opts);
+        }
+    }
+}
+
+#[test]
+fn test_d12_year_first_formats_not_ambiguous() {
+    let real_date = test_real_date(); // 2026-11-11
+    let opts = D12Options {
+        real_date,
+        tolerance_days: 1,
+        host_names: vec![],
+        host_paths: vec![],
+    };
+
+    // 2026-12-11 and 20261211 are Dec 11 2026 (month 12, day 11).
+    // They are 1 month away from 2026-11-11, so with tolerance 1 they must NOT be flagged.
+    let text_ymd = "Dates: 2026-12-11 and 20261211 and 2026/12/11";
+    let findings_ymd = check_d12("test.log", text_ymd, &opts);
+    assert!(
+        findings_ymd.is_empty(),
+        "Year-first formats 2026-12-11 and 20261211 must NOT be flagged with real date 2026-11-11 tolerance 1: got {:?}",
+        findings_ymd
+    );
+
+    // 12/11/2026 is ambiguous (could be 12 Nov 2026 or 11 Dec 2026).
+    // 12 Nov 2026 is within 1 day of 2026-11-11, so 12/11/2026 STILL IS flagged!
+    let text_ambiguous = "Ambiguous date: 12/11/2026";
+    let findings_ambiguous = check_d12("test.log", text_ambiguous, &opts);
+    assert_eq!(
+        findings_ambiguous.len(),
+        1,
+        "Ambiguous date 12/11/2026 must still be flagged"
+    );
+    assert_eq!(findings_ambiguous[0].channel, "real_date");
+}
+
+#[test]
+fn test_d12_host_paths_slash_on_8mib_and_1000_distinct_dates_cap() {
+    let real_date = test_real_date(); // 2026-11-11
+    let opts = D12Options {
+        real_date,
+        tolerance_days: 1,
+        host_names: vec![],
+        host_paths: vec!["/".to_string()],
+    };
+
+    // 1. host_paths ["/"] on 8 MiB of slashes
+    let eight_mib_slashes = "/".repeat(8 * 1024 * 1024);
+    let start_time = std::time::Instant::now();
+    let findings_slashes = check_d12("slashes.txt", &eight_mib_slashes, &opts);
+    let elapsed = start_time.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "8 MiB slashes took {:?}, expected well under 2s",
+        elapsed
+    );
+    assert_eq!(
+        findings_slashes.len(),
+        1,
+        "Expected exactly 1 host_path finding for slashes"
+    );
+    assert_eq!(findings_slashes[0].channel, "host_path");
+
+    // 2. 1,000 distinct dates in the window give exactly 50 findings
+    let mut thousand_dates = String::new();
+    for sec in 0..1000 {
+        let h = sec / 3600;
+        let m = (sec % 3600) / 60;
+        let s = sec % 60;
+        thousand_dates.push_str(&format!(
+            "Wed, 11 Nov 2026 {:02}:{:02}:{:02} GMT\n",
+            h, m, s
+        ));
+    }
+    let opts_dates = D12Options {
+        real_date,
+        tolerance_days: 1,
+        host_names: vec![],
+        host_paths: vec![],
+    };
+    let findings_1000 = check_d12("dates.txt", &thousand_dates, &opts_dates);
+    assert_eq!(
+        findings_1000.len(),
+        50,
+        "1,000 distinct dates in window must produce exactly 50 findings"
+    );
+}
+
+#[test]
+fn test_d12_4mib_words_scans_under_2s_without_quadratic_copying() {
+    let opts = D12Options {
+        real_date: test_real_date(),
+        tolerance_days: 1,
+        host_names: vec!["myhost".to_string()],
+        host_paths: vec!["/var/data".to_string()],
+    };
+
+    // Create 4 MiB of space-separated words without dates
+    let word = "banana apple cherry orange elephant computer keyboard window ";
+    let repeats = (4 * 1024 * 1024) / word.len() + 1;
+    let four_mib_text = word.repeat(repeats);
+
+    let start_time = std::time::Instant::now();
+    let findings = check_d12("corpus.txt", &four_mib_text, &opts);
+    let elapsed = start_time.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "4 MiB words scan took {:?}, expected well under 2s",
+        elapsed
+    );
+    assert!(findings.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_d12_directory_scan_skips_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let dir = tempdir().expect("tempdir");
+
+    let real_file = dir.path().join("real.txt");
+    fs::write(&real_file, "clean content").expect("write real file");
+
+    let symlink_file = dir.path().join("link_to_real.txt");
+    symlink(&real_file, &symlink_file).expect("create symlink");
+
+    let out_file = dir.path().join("report.json");
+
+    let status = Command::new(bin_path)
+        .arg("d12")
+        .arg("--path")
+        .arg(dir.path())
+        .arg("--real-date")
+        .arg("2026-11-11")
+        .arg("--format")
+        .arg("json")
+        .arg("--out")
+        .arg(&out_file)
+        .status()
+        .expect("run hermetic-sealcheck d12");
+
+    assert_eq!(status.code(), Some(0));
+
+    let report_str = fs::read_to_string(&out_file).expect("read report");
+    let json: Value = serde_json::from_str(&report_str).expect("parse json");
+
+    let findings = json["findings"].as_array().expect("findings array");
+    let symlink_findings: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["channel"] == "skipped_symlink")
+        .collect();
+
+    assert_eq!(
+        symlink_findings.len(),
+        1,
+        "Expected exactly 1 skipped_symlink finding"
+    );
+    assert_eq!(symlink_findings[0]["detector"], "D12");
+    assert_eq!(symlink_findings[0]["severity"], "info");
+    assert_eq!(
+        symlink_findings[0]["path"],
+        symlink_file.display().to_string()
+    );
+    assert_eq!(symlink_findings[0]["evidence"][0], "symlink not followed");
+}

@@ -8,10 +8,10 @@ use walkdir::WalkDir;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    check_d11, check_d12, generate_sarif, generate_sarif_with_properties, query_index,
-    scan_problem_statement, scan_tree, write_index, BenchmarkSignatures, D11Options, D12Options,
-    Finding, FingerprintSet, FingerprintSummary, SarifRunProperties, ScanOptions, SealcheckReport,
-    Severity, Visibility, NOT_COVERED,
+    check_d11, check_d12, generate_sarif, generate_sarif_with_options,
+    generate_sarif_with_properties, query_index, scan_problem_statement, scan_tree, write_index,
+    BenchmarkSignatures, D11Options, D12Options, Finding, FingerprintSet, FingerprintSummary,
+    SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility, NOT_COVERED,
 };
 
 #[derive(Parser, Debug)]
@@ -461,8 +461,25 @@ fn run_d12(args: D12Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     const MAX_SIZE: u64 = 64 * 1024 * 1024;
 
     for target in &args.path {
-        if !target.exists() {
-            return Err(format!("path does not exist: {}", target.display()).into());
+        let sym_meta = match fs::symlink_metadata(target) {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(format!("path does not exist: {}", target.display()).into());
+            }
+        };
+
+        if sym_meta.file_type().is_symlink() {
+            findings.push(Finding {
+                detector: "D12".to_string(),
+                channel: "skipped_symlink".to_string(),
+                path: target.display().to_string(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec!["symlink not followed".to_string()],
+            });
+            continue;
         }
 
         if target.is_file() {
@@ -487,7 +504,18 @@ fn run_d12(args: D12Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         } else if target.is_dir() {
             for entry in WalkDir::new(target) {
                 let entry = entry?;
-                if entry.file_type().is_file() {
+                if entry.file_type().is_symlink() {
+                    findings.push(Finding {
+                        detector: "D12".to_string(),
+                        channel: "skipped_symlink".to_string(),
+                        path: entry.path().display().to_string(),
+                        visibility: Visibility::AgentVisible,
+                        severity: Severity::Info,
+                        confidence: 1.0,
+                        hunk: None,
+                        evidence: vec!["symlink not followed".to_string()],
+                    });
+                } else if entry.file_type().is_file() {
                     let p = entry.path();
                     let meta = entry.metadata()?;
                     if meta.len() > MAX_SIZE {
@@ -527,12 +555,13 @@ fn write_advisory_report(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_str = match format {
         OutputFormat::Sarif => {
-            let sarif = generate_sarif_with_properties(
+            let sarif = generate_sarif_with_options(
                 &all_findings,
                 Some(SarifRunProperties {
                     mode: mode.to_string(),
                     not_covered: Vec::new(),
                 }),
+                true,
             );
             serde_json::to_string_pretty(&sarif)?
         }

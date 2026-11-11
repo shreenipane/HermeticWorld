@@ -48,7 +48,10 @@ pub use index::{
     IndexStats, NOT_COVERED,
 };
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
-pub use sarif::{generate_sarif, generate_sarif_with_properties, SarifLog, SarifRunProperties};
+pub use sarif::{
+    generate_sarif, generate_sarif_with_options, generate_sarif_with_properties, SarifLog,
+    SarifRunProperties,
+};
 pub use scan::{
     compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
     ScanOptions, Severity, TreeSink, UnitHashes, Visibility,

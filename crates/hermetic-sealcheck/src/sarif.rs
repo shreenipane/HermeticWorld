@@ -75,10 +75,27 @@ pub struct SarifLog {
 
 /// Convert findings to a valid SARIF 2.1.0 log.
 pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
+    generate_sarif_with_options(findings, None, false)
+}
+
+/// Convert findings to a valid SARIF 2.1.0 log with optional run properties (e.g. query mode).
+pub fn generate_sarif_with_properties(
+    findings: &[Finding],
+    properties: Option<SarifRunProperties>,
+) -> SarifLog {
+    generate_sarif_with_options(findings, properties, false)
+}
+
+/// Convert findings to a valid SARIF 2.1.0 log with optional run properties and info findings.
+pub fn generate_sarif_with_options(
+    findings: &[Finding],
+    properties: Option<SarifRunProperties>,
+    include_info: bool,
+) -> SarifLog {
     let mut results = Vec::new();
 
     for f in findings {
-        if f.severity == Severity::Info {
+        if f.severity == Severity::Info && !include_info {
             continue;
         }
 
@@ -190,19 +207,7 @@ pub fn generate_sarif(findings: &[Finding]) -> SarifLog {
                 },
             },
             results,
-            properties: None,
+            properties,
         }],
     }
-}
-
-/// Convert findings to a valid SARIF 2.1.0 log with optional run properties (e.g. query mode).
-pub fn generate_sarif_with_properties(
-    findings: &[Finding],
-    properties: Option<SarifRunProperties>,
-) -> SarifLog {
-    let mut log = generate_sarif(findings);
-    if let Some(run) = log.runs.first_mut() {
-        run.properties = properties;
-    }
-    log
 }
