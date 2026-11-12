@@ -481,10 +481,17 @@ pub(crate) fn get_current_uid() -> Result<u32, TrustError> {
     Ok(meta.uid())
 }
 
-#[cfg(unix)]
-// Linux open(2) flags: O_NOFOLLOW (0o400000) prevents following symlinks, O_NONBLOCK (0o4000) prevents blocking on FIFOs
+// Linux x86_64 open(2) flags: O_NOFOLLOW (0o400000) prevents following symlinks,
+// O_NONBLOCK (0o4000) prevents blocking on FIFOs. The values differ on other
+// targets (aarch64: 0o400000 is O_LARGEFILE), so any other target is rejected.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!(
+    "hermetic-trust hard-codes Linux x86_64 open(2) flag values (O_NOFOLLOW, O_NONBLOCK); \
+     add correct values for this target before building"
+);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NONBLOCK: i32 = 0o4000;
 
 /// Read and validate seed file: regular file owned by current user, mode & 0o077 == 0, exactly 32 bytes.

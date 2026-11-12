@@ -89,26 +89,28 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
         }
     }
 
-    // Stack of open directory handles: (File, rel_path)
-    let mut handle_stack: Vec<(fs::File, PathBuf)> = vec![(root_handle, PathBuf::new())];
+    // Only the current directory handle (plus the root handle) is kept open; the
+    // path is tracked as a rootfs-relative PathBuf and `..` re-opens the parent
+    // from the root handle, so descriptor use does not grow with path depth.
+    let mut current_dir = root_handle.try_clone()?;
+    let mut current_rel = PathBuf::new();
     let mut hops = 0;
     const MAX_HOPS: usize = 40;
 
     while let Some(comp) = queue.pop_front() {
         if comp == Path::new("..") {
-            if handle_stack.len() > 1 {
-                handle_stack.pop();
+            if current_rel.pop() {
+                current_dir = open_rel_dir_from_root(&root_handle, &current_rel)?;
             }
             continue;
         }
 
-        let current_fd = handle_stack.last().unwrap().0.as_raw_fd();
+        let current_fd = current_dir.as_raw_fd();
         let child_proc = PathBuf::from(format!("/proc/self/fd/{}", current_fd)).join(&comp);
 
         let meta = match fs::symlink_metadata(&child_proc) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut current_rel = handle_stack.last().unwrap().1.clone();
                 current_rel.push(&comp);
                 for rem in queue {
                     if rem == Path::new("..") {
@@ -119,13 +121,9 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
                 }
                 return Ok(rootfs.join(current_rel));
             }
-            Err(e) => {
-                return Err(TrustError::Symlink(format!(
-                    "metadata {}: {}",
-                    comp.display(),
-                    e
-                )));
-            }
+            // Host-side I/O failures (EMFILE, EACCES, ...) are not rootfs
+            // content problems: surface them as I/O errors so callers fail closed.
+            Err(e) => return Err(TrustError::Io(e)),
         };
 
         if meta.is_symlink() {
@@ -134,44 +132,29 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
                 return Err(TrustError::Symlink("symlink loop detected".to_string()));
             }
 
-            let target = fs::read_link(&child_proc)
-                .map_err(|e| TrustError::Symlink(format!("read_link {}: {}", comp.display(), e)))?;
+            let target = fs::read_link(&child_proc)?;
 
             if target.is_absolute() {
-                handle_stack.truncate(1);
-                let rel_target = target.strip_prefix("/").unwrap_or(&target);
-                let target_comps: Vec<PathBuf> = rel_target
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(n) => Some(PathBuf::from(n)),
-                        Component::ParentDir => Some(PathBuf::from("..")),
-                        Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
-                    })
-                    .collect();
+                current_dir = root_handle.try_clone()?;
+                current_rel = PathBuf::new();
+            }
+            let target_comps: Vec<PathBuf> = target
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(n) => Some(PathBuf::from(n)),
+                    Component::ParentDir => Some(PathBuf::from("..")),
+                    Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+                })
+                .collect();
 
-                for c in target_comps.into_iter().rev() {
-                    queue.push_front(c);
-                }
-            } else {
-                let target_comps: Vec<PathBuf> = target
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(n) => Some(PathBuf::from(n)),
-                        Component::ParentDir => Some(PathBuf::from("..")),
-                        Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
-                    })
-                    .collect();
-
-                for c in target_comps.into_iter().rev() {
-                    queue.push_front(c);
-                }
+            for c in target_comps.into_iter().rev() {
+                queue.push_front(c);
             }
         } else if meta.is_dir() {
             let next_dir = open_child_dir(current_fd, comp.as_os_str())?;
-            let next_rel = handle_stack.last().unwrap().1.join(&comp);
-            handle_stack.push((next_dir, next_rel));
+            current_dir = next_dir;
+            current_rel.push(&comp);
         } else {
-            let mut current_rel = handle_stack.last().unwrap().1.clone();
             current_rel.push(&comp);
             if !queue.is_empty() {
                 return Err(TrustError::Symlink(format!(
@@ -183,8 +166,7 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
         }
     }
 
-    let final_rel = &handle_stack.last().unwrap().1;
-    Ok(rootfs.join(final_rel))
+    Ok(rootfs.join(current_rel))
 }
 
 /// Named cap for CA certificate input (1 MiB)
@@ -203,15 +185,23 @@ pub const MAX_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 /// Named limit for total report entries
 pub const MAX_REPORT_ENTRIES: usize = 10_000;
 
-#[cfg(unix)]
+// Linux x86_64 open(2) flag and errno values. They differ on other targets
+// (e.g. on aarch64 0o400000 is O_LARGEFILE and 0o200000 is O_DIRECT), which would
+// silently disable every symlink protection, so any other target is rejected.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!(
+    "hermetic-trust hard-codes Linux x86_64 open(2) flag values (O_NOFOLLOW, O_DIRECTORY, ...); \
+     add correct values for this target before building"
+);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NONBLOCK: i32 = 0o4000;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_DIRECTORY: i32 = 0o200000;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_CLOEXEC: i32 = 0o2000000;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ELOOP: i32 = 40;
 
 pub static FORCE_CHOWN_FAILURE: std::sync::atomic::AtomicBool =
@@ -345,6 +335,37 @@ pub fn open_child_dir<P: AsRef<std::ffi::OsStr> + ?Sized>(
         return Err(TrustError::Cert("not a directory".to_string()));
     }
     Ok(f)
+}
+
+/// Build the error that aborts an install when discovery hits a host-side
+/// failure (I/O error, descriptor exhaustion, ...) rather than a rootfs content
+/// problem. Discovery never silently skips on such failures.
+fn discovery_failure(path: &str, e: &dyn std::fmt::Display) -> TrustError {
+    TrustError::Cert(format!("rootfs discovery failed at '{}': {}", path, e))
+}
+
+/// Open the directory at `rel` (relative to the directory `root`) by walking one
+/// component at a time from `root` with O_DIRECTORY | O_NOFOLLOW. At most two
+/// descriptors (plus `root`) are open at any moment. An empty `rel` returns a
+/// fresh handle to `root` itself.
+fn open_rel_dir_from_root(root: &fs::File, rel: &Path) -> Result<fs::File, TrustError> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut current = root.try_clone()?;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => {
+                let next = open_child_dir(current.as_raw_fd(), c)?;
+                current = next;
+            }
+            _ => {
+                return Err(TrustError::Cert(
+                    "unexpected non-normal path component".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(current)
 }
 
 /// Open parent directory handle for a rootfs-relative path, anchoring every step to descriptors.
@@ -880,13 +901,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 let target_meta = match fs::symlink_metadata(&target) {
                     Ok(m) => m,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => {
-                        skipped_paths.push(SkippedPath {
-                            path: rel_str.to_string(),
-                            reason: "cannot stat target".to_string(),
-                        });
-                        continue;
-                    }
+                    Err(e) => return Err(discovery_failure(rel_str, &e)),
                 };
 
                 let rel_target = make_rel_path(&target);
@@ -923,16 +938,13 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     format: CandidateFormat::Pem,
                 });
             }
-            Err(e) => {
-                let reason = match e {
-                    TrustError::Symlink(ref s) => s.clone(),
-                    _ => "cannot stat target".to_string(),
-                };
+            Err(TrustError::Symlink(reason)) => {
                 skipped_paths.push(SkippedPath {
                     path: rel_str.to_string(),
                     reason,
                 });
             }
+            Err(e) => return Err(discovery_failure(rel_str, &e)),
         }
     }
 
@@ -953,9 +965,11 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
         let dir_exists = match resolve_in_rootfs(rootfs, &dir_path) {
             Ok(resolved_dir) => match fs::symlink_metadata(&resolved_dir) {
                 Ok(m) => m.is_dir(),
-                Err(_) => false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(discovery_failure(dir_rel, &e)),
             },
-            Err(_) => false,
+            Err(TrustError::Symlink(_)) => false,
+            Err(e) => return Err(discovery_failure(dir_rel, &e)),
         };
 
         if dir_exists {
@@ -963,7 +977,12 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             match resolve_in_rootfs(rootfs, &file_path) {
                 Ok(target) => {
                     let rel_target = make_rel_path(&target);
-                    if let Ok(m) = fs::symlink_metadata(&target) {
+                    let target_meta = match fs::symlink_metadata(&target) {
+                        Ok(m) => Some(m),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => return Err(discovery_failure(file_rel, &e)),
+                    };
+                    if let Some(m) = target_meta {
                         if m.is_dir() {
                             skipped_paths.push(SkippedPath {
                                 path: encode_path_lossless(&rel_target),
@@ -1002,24 +1021,29 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         format: CandidateFormat::Pem,
                     });
                 }
-                Err(e) => {
-                    let reason = match e {
-                        TrustError::Symlink(ref s) => s.clone(),
-                        _ => "cannot stat target".to_string(),
-                    };
+                Err(TrustError::Symlink(reason)) => {
                     skipped_paths.push(SkippedPath {
                         path: file_rel.to_string(),
                         reason,
                     });
                 }
+                Err(e) => return Err(discovery_failure(file_rel, &e)),
             }
         }
     }
 
-    // 3. Tree Walk (Bounded Discovery using validated directory handles)
-    let mut dirs_to_visit = vec![(root_handle.try_clone()?, PathBuf::new(), 0usize)];
+    // 3. Tree Walk (Bounded Discovery).
+    //
+    // The pending queue holds rootfs-relative paths, never open descriptors, so the
+    // number of descriptors held is bounded (root handle, at most two handles while
+    // re-opening a directory component by component, and one for enumeration)
+    // regardless of tree shape. Each directory is re-opened from the root handle
+    // with O_DIRECTORY|O_NOFOLLOW per component. Any open or enumeration failure
+    // aborts the whole install before anything in the rootfs is modified, so the
+    // result never depends on the host's open-file limit.
+    let mut dirs_to_visit: Vec<(PathBuf, usize)> = vec![(PathBuf::new(), 0usize)];
 
-    while let Some((current_dir_handle, current_rel, depth)) = dirs_to_visit.pop() {
+    while let Some((current_rel, depth)) = dirs_to_visit.pop() {
         if depth > MAX_TREE_DEPTH {
             return Err(TrustError::Cert(
                 "rootfs directory depth exceeds limit".to_string(),
@@ -1032,17 +1056,21 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             }
         });
 
-        let current_proc_path = format!("/proc/self/fd/{}", current_dir_handle.as_raw_fd());
-        let dir_entries = match fs::read_dir(&current_proc_path) {
-            Ok(e) => e,
-            Err(_) => {
-                skipped_paths.push(SkippedPath {
-                    path: encode_path_lossless(&current_rel),
-                    reason: "read_dir error".to_string(),
-                });
-                continue;
-            }
+        let discovery_err = |what: &str, e: &dyn std::fmt::Display| {
+            TrustError::Cert(format!(
+                "rootfs discovery failed: {} '{}': {}",
+                what,
+                encode_path_lossless(&current_rel),
+                e
+            ))
         };
+
+        let current_dir_handle = open_rel_dir_from_root(&root_handle, &current_rel)
+            .map_err(|e| discovery_err("cannot open directory", &e))?;
+
+        let current_proc_path = format!("/proc/self/fd/{}", current_dir_handle.as_raw_fd());
+        let dir_entries = fs::read_dir(&current_proc_path)
+            .map_err(|e| discovery_err("cannot enumerate directory", &e))?;
 
         // Defect 3: Enforce entry budget WHILE enumerating, before retaining each entry
         let mut sorted_entries = Vec::new();
@@ -1054,31 +1082,18 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 ));
             }
 
-            match entry {
-                Ok(e) => sorted_entries.push(e),
-                Err(_) => {
-                    skipped_paths.push(SkippedPath {
-                        path: encode_path_lossless(&current_rel),
-                        reason: "read_dir error".to_string(),
-                    });
-                }
-            }
+            let e = entry.map_err(|e| discovery_err("cannot enumerate directory", &e))?;
+            let file_type = e
+                .file_type()
+                .map_err(|err| discovery_err("cannot read entry type in", &err))?;
+            sorted_entries.push((e.file_name(), file_type));
         }
-        sorted_entries.sort_by_key(|e| e.file_name());
+        // Release enumeration and directory descriptors before descending.
+        drop(current_dir_handle);
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for entry in sorted_entries {
-            let file_name = entry.file_name();
+        for (file_name, file_type) in sorted_entries {
             let entry_rel = current_rel.join(&file_name);
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => {
-                    skipped_paths.push(SkippedPath {
-                        path: encode_path_lossless(&entry_rel),
-                        reason: "file_type error".to_string(),
-                    });
-                    continue;
-                }
-            };
 
             if file_type.is_dir() {
                 if file_name == "cacert.pem" {
@@ -1101,15 +1116,9 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     continue;
                 }
 
-                // Defect 1: Open child directory handle safely with O_DIRECTORY | O_NOFOLLOW
-                match open_child_dir(current_dir_handle.as_raw_fd(), comp_as_os_str(&file_name)) {
-                    Ok(child_handle) => {
-                        dirs_to_visit.push((child_handle, entry_rel, depth + 1));
-                    }
-                    Err(_) => {
-                        continue;
-                    }
-                }
+                // Queue the relative path only; it is re-opened from the root
+                // handle (O_DIRECTORY | O_NOFOLLOW per component) when visited.
+                dirs_to_visit.push((entry_rel, depth + 1));
                 continue;
             }
 
@@ -1126,12 +1135,18 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         Ok(target) => {
                             let target_meta = match fs::symlink_metadata(&target) {
                                 Ok(m) => m,
-                                Err(_) => {
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                     skipped_paths.push(SkippedPath {
                                         path: encode_path_lossless(&entry_rel),
                                         reason: "cannot stat target".to_string(),
                                     });
                                     continue;
+                                }
+                                Err(e) => {
+                                    return Err(discovery_failure(
+                                        &encode_path_lossless(&entry_rel),
+                                        &e,
+                                    ))
                                 }
                             };
 
@@ -1174,15 +1189,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 format: CandidateFormat::Pem,
                             });
                         }
-                        Err(e) => {
-                            let reason = match e {
-                                TrustError::Symlink(ref s) => s.clone(),
-                                _ => "cannot stat target".to_string(),
-                            };
+                        Err(TrustError::Symlink(reason)) => {
                             skipped_paths.push(SkippedPath {
                                 path: encode_path_lossless(&entry_rel),
                                 reason,
                             });
+                        }
+                        Err(e) => {
+                            return Err(discovery_failure(&encode_path_lossless(&entry_rel), &e))
                         }
                     }
                 }
@@ -1191,12 +1205,18 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     Ok(target) => {
                         let target_meta = match fs::symlink_metadata(&target) {
                             Ok(m) => m,
-                            Err(_) => {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 skipped_paths.push(SkippedPath {
                                     path: encode_path_lossless(&entry_rel),
                                     reason: "cannot stat target".to_string(),
                                 });
                                 continue;
+                            }
+                            Err(e) => {
+                                return Err(discovery_failure(
+                                    &encode_path_lossless(&entry_rel),
+                                    &e,
+                                ))
                             }
                         };
 
@@ -1236,16 +1256,13 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             format: CandidateFormat::Jks,
                         });
                     }
-                    Err(e) => {
-                        let reason = match e {
-                            TrustError::Symlink(ref s) => s.clone(),
-                            _ => "cannot stat target".to_string(),
-                        };
+                    Err(TrustError::Symlink(reason)) => {
                         skipped_paths.push(SkippedPath {
                             path: encode_path_lossless(&entry_rel),
                             reason,
                         });
                     }
+                    Err(e) => return Err(discovery_failure(&encode_path_lossless(&entry_rel), &e)),
                 }
             }
         }
@@ -1603,10 +1620,6 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
         skipped_paths,
         env_defaults,
     })
-}
-
-fn comp_as_os_str(name: &std::ffi::OsStr) -> &std::ffi::OsStr {
-    name
 }
 
 /// Check if report destination collides with any existing or planned trust store target in rootfs.

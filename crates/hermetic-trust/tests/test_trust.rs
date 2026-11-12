@@ -2564,3 +2564,207 @@ fn test_regression_jks_duplicate_alias_and_private_key_collision_both_orders() {
         "Keystore bytes must remain unchanged on duplicate alias"
     );
 }
+
+/// Wait for a child process with a deadline; kill it and panic on timeout.
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("try_wait child") {
+            Some(_) => return child.wait_with_output().expect("collect child output"),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child process timed out after {:?}", timeout);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// Build a rootfs whose discovery would need far more descriptors than a small
+/// RLIMIT_NOFILE allows if every pending directory held an open handle: a wide
+/// level of sibling directories plus a deep certifi bundle visited last.
+fn build_wide_deep_rootfs(rootfs: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let system_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&system_dir).expect("create system dir");
+    let system_bundle = system_dir.join("ca-certificates.crt");
+    fs::write(&system_bundle, b"").expect("write system bundle");
+
+    let wide = rootfs.join("opt/app/node_modules");
+    for i in 0..300 {
+        fs::create_dir_all(wide.join(format!("pkg{:04}/lib", i))).expect("create pkg dir");
+    }
+
+    let mut deep = rootfs.join("opt/venv");
+    for i in 0..40 {
+        deep = deep.join(format!("d{:02}", i));
+    }
+    let certifi_dir = deep.join("site-packages/certifi");
+    fs::create_dir_all(&certifi_dir).expect("create certifi dir");
+    let certifi_bundle = certifi_dir.join("cacert.pem");
+    fs::write(&certifi_bundle, b"").expect("write certifi bundle");
+    (system_bundle, certifi_bundle)
+}
+
+#[test]
+fn test_discovery_bounded_descriptors_under_low_nofile_limit() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_ca(
+        "fd-budget-world",
+        datetime!(2024-01-01 00:00:00 UTC),
+        &[9u8; 32],
+    )
+    .expect("mint ca");
+    let ca_path = temp_dir.path().join("CA.pem");
+    fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+
+    let rootfs = temp_dir.path().join("rootfs");
+    let (system_bundle, certifi_bundle) = build_wide_deep_rootfs(&rootfs);
+
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-trust");
+    // Run the CLI with a tiny open-file limit (far below the 300+ pending dirs).
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n 32 && exec \"$0\" install --rootfs \"$1\" --ca-cert \"$2\"")
+        .arg(bin_path)
+        .arg(&rootfs)
+        .arg(&ca_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn install under low nofile limit");
+    let output = wait_child_with_timeout(child, std::time::Duration::from_secs(120));
+
+    let system_after = fs::read(&system_bundle).expect("read system bundle");
+    let certifi_after = fs::read(&certifi_bundle).expect("read certifi bundle");
+    let ca_bytes = ca.cert_pem.as_bytes();
+    let contains_ca = |b: &[u8]| b.windows(ca_bytes.len()).any(|w| w == ca_bytes);
+
+    if output.status.success() {
+        // Success must mean every bundle was processed.
+        assert!(contains_ca(&system_after), "system bundle not updated");
+        assert!(
+            contains_ca(&certifi_after),
+            "install succeeded but deep certifi bundle was silently skipped; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        // Failure must leave everything unmodified.
+        assert!(
+            system_after.is_empty(),
+            "failed install modified system bundle"
+        );
+        assert!(
+            certifi_after.is_empty(),
+            "failed install modified certifi bundle"
+        );
+    }
+    // With a bounded descriptor budget the install must actually succeed.
+    assert!(
+        output.status.success(),
+        "install failed under a 32-descriptor limit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The report must not depend on the descriptor limit.
+    let rootfs2 = temp_dir.path().join("rootfs2");
+    build_wide_deep_rootfs(&rootfs2);
+    let report_low = String::from_utf8_lossy(&output.stdout).to_string();
+    let child_high = Command::new(bin_path)
+        .args(["install", "--rootfs"])
+        .arg(&rootfs2)
+        .arg("--ca-cert")
+        .arg(&ca_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn install with default limit");
+    let output_high = wait_child_with_timeout(child_high, std::time::Duration::from_secs(120));
+    assert!(output_high.status.success());
+    assert_eq!(report_low, String::from_utf8_lossy(&output_high.stdout));
+}
+
+#[test]
+fn test_discovery_failure_aborts_install_without_modification() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_ca(
+        "discovery-fail-world",
+        datetime!(2024-01-01 00:00:00 UTC),
+        &[10u8; 32],
+    )
+    .expect("mint ca");
+
+    let rootfs = temp_dir.path().join("rootfs");
+    let system_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&system_dir).expect("create system dir");
+    let system_bundle = system_dir.join("ca-certificates.crt");
+    fs::write(&system_bundle, b"").expect("write system bundle");
+    let certifi_dir = rootfs.join("zzz/site-packages/certifi");
+    fs::create_dir_all(&certifi_dir).expect("create certifi");
+    fs::write(certifi_dir.join("cacert.pem"), b"").expect("write certifi");
+
+    // Before a queued directory is visited, swap it for a symlink to a host
+    // directory. Re-opening it with O_NOFOLLOW must fail, and that failure must
+    // abort the whole install before anything is modified.
+    let host_dir = temp_dir.path().join("host");
+    fs::create_dir_all(&host_dir).expect("create host dir");
+    let zzz = rootfs.join("zzz");
+    let zzz_moved = temp_dir.path().join("zzz_moved");
+    let calls = std::cell::Cell::new(0usize);
+    let guard = hermetic_trust::set_before_dir_enum_hook_guard(move || {
+        calls.set(calls.get() + 1);
+        // Call 1 visits the root; call 2 visits "zzz" (last sorted entry, popped first).
+        if calls.get() == 2 {
+            fs::rename(&zzz, &zzz_moved).expect("move zzz");
+            std::os::unix::fs::symlink(&host_dir, &zzz).expect("symlink zzz");
+        }
+    });
+    let result = install_ca(&rootfs, &ca.cert_pem);
+    drop(guard);
+
+    assert!(result.is_err(), "install must fail when discovery fails");
+    assert!(
+        fs::read(&system_bundle)
+            .expect("read system bundle")
+            .is_empty(),
+        "system bundle modified despite discovery failure"
+    );
+    assert_eq!(
+        fs::read_dir(temp_dir.path().join("host"))
+            .expect("read host dir")
+            .count(),
+        0,
+        "host directory touched"
+    );
+
+    // Unreadable directory: enumeration failure must also abort (skipped when
+    // running with privileges that bypass permission checks).
+    let rootfs2 = temp_dir.path().join("rootfs2");
+    let system_dir2 = rootfs2.join("etc/ssl/certs");
+    fs::create_dir_all(&system_dir2).expect("create system dir2");
+    let system_bundle2 = system_dir2.join("ca-certificates.crt");
+    fs::write(&system_bundle2, b"").expect("write system bundle2");
+    let locked = rootfs2.join("locked");
+    fs::create_dir_all(&locked).expect("create locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod locked");
+    let bypass = fs::read_dir(&locked).is_ok();
+    let result2 = install_ca(&rootfs2, &ca.cert_pem);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore locked");
+    if !bypass {
+        assert!(
+            result2.is_err(),
+            "install must fail on unreadable directory"
+        );
+        assert!(
+            fs::read(&system_bundle2)
+                .expect("read system bundle2")
+                .is_empty(),
+            "system bundle modified despite enumeration failure"
+        );
+    }
+}
