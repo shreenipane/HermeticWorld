@@ -542,6 +542,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-grader-sandbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hermetic-netvm-http"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hermetic-sealcheck"
 version = "0.1.0"
 dependencies = [
