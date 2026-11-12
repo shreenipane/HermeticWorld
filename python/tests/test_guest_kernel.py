@@ -24,9 +24,20 @@ def config(values=None):
 @pytest.fixture
 def lock():
     value = k.load_lock(ROOT / "kernel.lock.json")
-    value.update(sha256=hashlib.sha256(b"source").hexdigest(), release_date="2025-02-01T00:00:00Z",
+    value.update(sha256=hashlib.sha256(b"source").hexdigest(),
                  builder_image="hermetic/kernel-builder:6.1-v1@sha256:" + "a" * 64)
     return value
+
+
+def test_checked_in_lock_real_pins():
+    raw = json.loads((ROOT / "kernel.lock.json").read_text())
+    assert raw["sha256"] == "874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3"
+    assert raw["release_date"] == "2025-02-01T00:00:00Z"
+    assert raw["builder_image"] == "hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER"
+    assert raw["version"] == "6.1.128"
+    assert raw["source_url"] == "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz"
+    assert raw["build_user"] == "hermetic"
+    assert raw["build_host"] == "hermetic"
 
 
 @pytest.mark.parametrize("name,rule", k.RULES.items())
@@ -276,6 +287,11 @@ def test_cli_status_json_and_errors(tmp_path, capsys):
     assert "SECRET" not in capsys.readouterr().out
     assert main(["kernel-build", "--tarball", str(path), "--out", str(tmp_path)]) == 1
     assert "placeholder" in capsys.readouterr().out
+    # Test placeholder refusal using an explicit fixture copy
+    placeholder_lock = tmp_path / "placeholder_lock.json"
+    placeholder_lock.write_text(json.dumps({**k.load_lock(ROOT / "kernel.lock.json"), "sha256": k.PLACEHOLDER}))
+    assert main(["kernel-build", "--lock", str(placeholder_lock), "--tarball", str(path), "--out", str(tmp_path)]) == 1
+    assert "placeholder" in capsys.readouterr().out
 
 
 def test_cli_build_wired(build_inputs, monkeypatch, capsys):
@@ -523,10 +539,24 @@ def test_unsafe_output_directory_and_placeholder_create_nothing(build_inputs, mo
         k.build_kernel(lock, source, out)
     out.chmod(0o700)
     assert list(out.iterdir()) == []
-    lock.write_text((ROOT / "kernel.lock.json").read_text())
+    placeholder_copy = dict(k.load_lock(ROOT / "kernel.lock.json"))
+    placeholder_copy["sha256"] = k.PLACEHOLDER
+    lock.write_text(json.dumps(placeholder_copy))
     with pytest.raises(k.KernelError, match="placeholder"):
         k.build_kernel(lock, source, out)
     assert list(out.iterdir()) == []
+
+
+def test_integration_kernel_build_script():
+    script_path = Path(__file__).absolute().parents[2] / "scripts/integration/kernel-build.sh"
+    assert script_path.is_file()
+    content = script_path.read_text()
+    assert "set -euo pipefail" in content
+    assert "sudo" not in content
+    assert "debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc" in content
+    assert "hermetic/kernel-builder:6.1-v1" in content
+    assert "kernel-build" in content
+    assert "build-record.json" in content
 
 
 def test_unterminated_second_banner_rejected(tmp_path, lock):

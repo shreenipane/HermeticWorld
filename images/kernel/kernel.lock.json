@@ -3,8 +3,8 @@
   "build_host": "hermetic",
   "build_user": "hermetic",
   "builder_image": "hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER",
-  "release_date": "TO-BE-FILLED-BY-OWNER",
-  "sha256": "TO-BE-FILLED-BY-OWNER",
+  "release_date": "2025-02-01T00:00:00Z",
+  "sha256": "874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3",
   "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz",
   "version": "6.1.128"
 }

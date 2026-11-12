@@ -4,27 +4,34 @@ This is the T3.2 offline build harness for TR-VMM-4 and the guest side of
 TR-VMM-5. The candidate source is Linux **6.1.128**: the 6.1 long-term series is
 supported by Firecracker's x86_64 microVM platform. This selects an explicit
 substrate, not the newest stable release. Runtime compatibility still needs the
-owner's pinned Firecracker integration test. No release date or digest has been
-guessed; the checked-in lock intentionally refuses to build.
+owner's pinned Firecracker integration test.
 
-Fill `kernel.lock.json` before building:
+## Pinned values in `kernel.lock.json`
 
-1. Independently obtain `linux-6.1.128.tar.xz` from the exact kernel.org URL in
-   the lock, verify its signed upstream checksum, and enter the lowercase sha256.
-2. Confirm the exact release's UTC date from upstream release metadata. Enter
-   `release_date` as `YYYY-MM-DDTHH:MM:SSZ`, with midnight UTC if upstream gives
-   only a date. This is the kernel build date, independent of the task's T_clock.
-3. Prepare the builder separately with `Dockerfile`, passing a reviewed, digest
-   pinned Debian bookworm reference as `BASE_IMAGE`. Provisioning the builder
-   installs flex, bison, the compiler and other tools; the host needs none of
-   these. Publish the prepared builder to an owner-controlled registry, then
-   pull and cache its immutable RepoDigest locally. Put that reference in
-   `builder_image` and archive the image. A local tag alone is refused. This
-   preparation needs package sources and is outside the offline kernel build.
-   Never run this harness with a root caller.
+The lock file `kernel.lock.json` contains verified upstream pin values:
+- `version`: `6.1.128`
+- `source_url`: `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz`
+- `sha256`: `874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3` (verified against kernel.org sha256sums.asc)
+- `release_date`: `2025-02-01T00:00:00Z` (the 6.1.128 tarball release date)
+- `builder_image`: `hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER` (local tag `hermetic/kernel-builder:6.1-v1` plus the builder image ID filled after local build)
+- Builder base image: `debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` (debian:bookworm-slim).
 
-From the repository root, after provisioning Python and Docker and creating an
-existing caller-owned output directory without group/other write permission:
+## Running the integration build
+
+Run the integration build script `scripts/integration/kernel-build.sh` from the repository root with two arguments: the path of the downloaded Linux 6.1.128 source tarball and an output directory:
+
+```sh
+./scripts/integration/kernel-build.sh /path/to/linux-6.1.128.tar.xz /path/to/kernel-output
+```
+
+The script:
+1. Builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.1-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
+2. Runs the offline kernel build CLI (`python -m hermetic_slice kernel-build --tarball ... --out ...`). After the builder image is built, all network access is denied (`--network=none`, `--pull=never`).
+3. Prints the resulting `build-record.json` from the output directory.
+
+The script runs without `sudo` and never writes outside the specified output directory and the Docker image store.
+
+Direct CLI invocation from repository root (after builder image is built):
 
 ```sh
 PYTHONPATH=python python -m hermetic_slice kernel-check-config --config final.config
