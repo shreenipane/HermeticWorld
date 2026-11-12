@@ -1,0 +1,59 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_defect5",
+        "databaseId": 305,
+        "url": "https://github.com/test-org/test-repo/issues/305",
+        "body": "Issue body",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOcomment_failing_page",
+              "databaseId": 807,
+              "url": "https://github.com/test-org/test-repo/issues/305#issuecomment-807",
+              "body": "Comment with broken second page of edits",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": "2020-01-04T10:00:00Z",
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": true,
+                  "endCursor": "cursor_broken_edit_page"
+                },
+                "nodes": [
+                  {
+                    "createdAt": "2020-01-04T10:00:00Z",
+                    "editedAt": "2020-01-04T10:00:00Z",
+                    "diff": "Edit from page 1"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

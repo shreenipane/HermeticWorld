@@ -1,0 +1,8 @@
+{
+  "errors": [
+    {
+      "message": "Field 'userContentEdits' doesn't exist on type 'Issue'",
+      "locations": [{"line": 10, "column": 7}]
+    }
+  ]
+}
