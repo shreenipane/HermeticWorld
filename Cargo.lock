@@ -588,6 +588,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-vmm"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hermetic-world-server"
 version = "0.1.0"
 dependencies = [
