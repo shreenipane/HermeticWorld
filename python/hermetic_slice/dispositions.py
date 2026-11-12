@@ -762,8 +762,8 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
                             raise DispositionsError("Failed to create symlink in snapshot") from e
                         try:
                             os.utime(link_dst, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
-                        except (OSError, NotImplementedError):
-                            pass
+                        except (OSError, NotImplementedError) as e:
+                            raise DispositionsError("Failed to preserve symlink timestamp in snapshot") from e
                     elif stat.S_ISDIR(info.st_mode):
                         child_dst = curr_dst / name
                         dir_times.append((child_dst, info.st_atime_ns, info.st_mtime_ns))

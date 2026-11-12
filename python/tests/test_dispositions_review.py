@@ -1172,3 +1172,57 @@ def test_regression_destination_utime_failure_fails_closed(task_world, monkeypat
     assert (task / "task.json").read_bytes() == task_json_before
     assert (task / "agent/problem_statement.md").read_bytes() == statement_before
     assert (task / "manifest.json").read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("error_cls", [OSError, NotImplementedError])
+def test_regression_symlink_destination_utime_failure_fails_closed(task_world, monkeypatch, error_cls):
+    """Major defect: destination symlink utime failure fails closed with sanitized error; task artifacts unchanged."""
+    tasks, task, root, initial, binary = task_world
+
+    # Create a confined symlink pointing within root and backdate the symlink itself
+    target_file = root / "confined_target.txt"
+    target_file.write_text("safe target content\n", encoding="utf-8")
+    symlink_file = root / "confined_symlink"
+    symlink_file.symlink_to("confined_target.txt")
+    os.utime(symlink_file, (STAMP, STAMP), follow_symlinks=False)
+    backdate(root)
+
+    # Verify that the symlink itself was backdated
+    assert os.stat(symlink_file, follow_symlinks=False).st_mtime == STAMP
+
+    task_json_before = (task / "task.json").read_bytes()
+    statement_before = (task / "agent/problem_statement.md").read_bytes()
+    manifest_before = (task / "manifest.json").read_bytes()
+
+    orig_utime = os.utime
+    utime_failed = False
+
+    def failing_utime(path, *args, **kwargs):
+        nonlocal utime_failed
+        p_str = str(path)
+        if "disposition_config_" in p_str and p_str.endswith("confined_symlink") and kwargs.get("follow_symlinks") is False:
+            utime_failed = True
+            raise error_cls("Injected destination symlink utime fault")
+        return orig_utime(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "utime", failing_utime)
+
+    subprocess_executed = False
+    orig_bounded_process = d.bounded_process
+
+    def spy_process(cmd, *args, **kwargs):
+        nonlocal subprocess_executed
+        subprocess_executed = True
+        return orig_bounded_process(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(d, "bounded_process", spy_process)
+
+    with pytest.raises(d.DispositionsError, match="Failed to preserve symlink timestamp in snapshot"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+
+    assert utime_failed
+    assert not subprocess_executed
+    assert (task / "task.json").read_bytes() == task_json_before
+    assert (task / "agent/problem_statement.md").read_bytes() == statement_before
+    assert (task / "manifest.json").read_bytes() == manifest_before
+
