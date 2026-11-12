@@ -122,7 +122,13 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T2.1 review): the Landlock failure-injection test sets a process-global flag while other tests start sandboxed servers; isolate it in a child process
   - [ ] Deferred (T2.1 review): no test stalls a child, thread or socket to prove the bounded test helpers actually time out
   - [ ] Deferred (T2.1): publication and endpoint reclaim trust same-uid processes and root (directories must be owned by the server uid and not group/other writable); `renameat2(RENAME_NOREPLACE)` is not used because the crate forbids unsafe code
-- [ ] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10)
+- [x] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10) (T2.5)
+  - [ ] Deferred (T2.5 review, non-blocking): a duplicate-alias error copies keystore alias text (incl. control characters) into `skipped_paths.reason` and reports; return a fixed code
+  - [ ] Deferred (T2.5 review): certificate validation gaps: unique-ID fields skipped unvalidated, BOOLEAN accepts any non-zero byte, `pathLenConstraint` checked by tag only, critical SAN/SKI/AKI payloads not validated
+  - [ ] Deferred (T2.5 review): the process-global test hooks `FORCE_CHOWN_FAILURE` and `BEFORE_USE_HOOK` are public and consulted in production paths; move injection to test-only, per-thread code
+  - [ ] Deferred (T2.5 review): CA seed and plaintext key PEM buffers are not zeroised; two guarded `unwrap()` calls remain; no compile-failure check for unsupported targets
+  - [ ] Deferred (T2.5): on-disk ownership with a guest owner different from the sealing user is tested only by recording the ownership step, because this host cannot create user namespaces; run `test_created_entries_owned_by_guest_owner_in_user_namespace` where `unshare -Ur` works
+  - [ ] Deferred (T2.5, owner decision): the installer's check-then-use protection assumes exclusive access to the rootfs; the full fix needs `openat2`/`cap-std` (new dependency)
 - [ ] Gateway with the Anthropic adapter (TR-GW-*)
 - [ ] Container isolation of the agent, with the run spec applied
 - [x] Manifest with `world_root`
