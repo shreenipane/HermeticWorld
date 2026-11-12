@@ -7,6 +7,7 @@ members = [
     "crates/hermetic-trust",
     "crates/hermetic-world-server",
     "crates/hermetic-vmm",
+    "crates/hermetic-grader-result",
 ]
 resolver = "2"
 
