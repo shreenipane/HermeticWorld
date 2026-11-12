@@ -116,7 +116,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T2.4): `_make_output_dirs` still creates missing output directories by path (the directory is then opened anchored and checked before any write)
   - [ ] Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
   - [ ] Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
-- [ ] Open (T2.2, found while gating T2.4): `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run (handlers still held after 8 s) and passed in every rerun; establish whether this is test timing under load or a real slot leak
+- [ ] Open, postponed by the owner on 2026-11-12 (T2.2): gateway deadline handling. `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run; investigation found no slot leak (load timing, inferred, not reproduced) but a real defect: the next request's head deadline is armed at hand-off and overwrites the current request's body deadline (body deadline cut to the head deadline; kept-alive connections closed after any request longer than the head deadline). A first fix is on branch `t2.2` (`b0c7867`, not merged) and was rejected in review: its wait for request completion is unbounded (a retained writer plus a client disconnect parks the connection thread forever), two loosened timing tests no longer prove their deadline, and the two new regressions are not deterministic. Review: `t2.2-codex-deadline-rearm-20261112`
 - [ ] Package world (TR-PKG-*)
   - [ ] Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [ ] Yanked-release handling
@@ -168,9 +168,9 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** Linux x86 with KVM (bare metal, or EC2 with nested virtualization).
 
 ### Deliverables
-- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1)
-- [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5)
-- [ ] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*)
+- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (in progress: T3.3, brief in `agy-tasks/`)
+- [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
+- [ ] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (in progress: T3.1, brief in `agy-tasks/`)
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
 - [ ] AgentVM on a CoW world; Mode H through vsock 5000
 - [ ] Mode G: `/opt/agent` volume, model path NetVM → gateway (cut list: optional)
