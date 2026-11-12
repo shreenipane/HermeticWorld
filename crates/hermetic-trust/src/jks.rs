@@ -293,24 +293,51 @@ pub fn inject_ca_into_jks(
 ) -> Result<Option<Vec<u8>>, TrustError> {
     let (_version, entries, existing_hash) = parse_jks(data)?;
 
+    let digest_len = 20usize;
+    let data_len_without_digest = data
+        .len()
+        .checked_sub(digest_len)
+        .ok_or_else(|| TrustError::Jks("keystore data shorter than digest".to_string()))?;
+    let data_to_hash = data
+        .get(..data_len_without_digest)
+        .ok_or_else(|| TrustError::Jks("keystore data slice error".to_string()))?;
+
     // FIX 4: Verify existing integrity digest with "changeit" first
-    let expected_hash = compute_jks_integrity_hash(JKS_DEFAULT_PASSWORD, &data[..data.len() - 20]);
+    let expected_hash = compute_jks_integrity_hash(JKS_DEFAULT_PASSWORD, data_to_hash);
     if existing_hash != expected_hash {
         return Err(TrustError::UnknownKeystorePassword);
     }
 
-    // FIX 3: Check if hermetic-world-ca already exists
+    // 1. Check for private key alias collision with hermetic-world-ca across all entries
     for entry in &entries {
-        if entry.alias() == "hermetic-world-ca" {
-            match entry {
-                JksEntry::PrivateKey { .. } => {
-                    return Err(TrustError::AliasCollisionWithPrivateKey);
-                }
-                JksEntry::TrustedCert { cert_der, .. } => {
-                    if cert_der.as_slice() == ca_cert_der {
-                        return Ok(None); // Exact cert already present: idempotent!
-                    }
-                }
+        if entry.alias().eq_ignore_ascii_case("hermetic-world-ca")
+            && matches!(entry, JksEntry::PrivateKey { .. })
+        {
+            return Err(TrustError::AliasCollisionWithPrivateKey);
+        }
+    }
+
+    // 2. Validate all entries and reject duplicate aliases
+    let mut seen_aliases = std::collections::HashSet::new();
+    for entry in &entries {
+        let alias_norm = entry.alias().to_lowercase();
+        if !seen_aliases.insert(alias_norm) {
+            return Err(TrustError::Jks(format!(
+                "duplicate alias '{}' in keystore",
+                entry.alias()
+            )));
+        }
+    }
+
+    // 3. Check if hermetic-world-ca exact CA cert is already present (idempotent)
+    for entry in &entries {
+        if let JksEntry::TrustedCert {
+            cert_der, alias, ..
+        } = entry
+        {
+            if alias.eq_ignore_ascii_case("hermetic-world-ca") && cert_der.as_slice() == ca_cert_der
+            {
+                return Ok(None); // Exact cert already present: idempotent!
             }
         }
     }
@@ -324,7 +351,8 @@ pub fn inject_ca_into_jks(
     let filtered_entries: Vec<&JksEntry> = entries
         .iter()
         .filter(|e| {
-            !(e.alias() == "hermetic-world-ca" && matches!(e, JksEntry::TrustedCert { .. }))
+            !(e.alias().eq_ignore_ascii_case("hermetic-world-ca")
+                && matches!(e, JksEntry::TrustedCert { .. }))
         })
         .collect();
 

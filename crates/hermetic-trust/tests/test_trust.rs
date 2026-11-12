@@ -2111,3 +2111,456 @@ fn test_defect11_hostname_validation_and_derivation() {
     let leaf_pair = mint_leaf(&ca, &["a.local", "b.local"], t_clock).expect("mint pair");
     assert!(!leaf_pair.cert_der.is_empty());
 }
+
+fn sign_custom_tbs(tbs_der: &[u8], key: &rsa::RsaPrivateKey) -> String {
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use sha2::Sha256;
+    let signing_key = SigningKey::<Sha256>::new(key.clone());
+    let sig = signing_key.sign(tbs_der);
+    let sig_bit_str = hermetic_trust::asn1::encode_bit_string(0, &sig.to_vec());
+    let sig_alg = hermetic_trust::asn1::encode_sha256_with_rsa_algorithm();
+    let cert_der = hermetic_trust::asn1::encode_sequence(&[tbs_der, &sig_alg, &sig_bit_str]);
+    pem::encode(&pem::Pem::new("CERTIFICATE", cert_der))
+}
+
+fn create_multi_entry_jks(entries: &[(&str, bool, &[u8])], password: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&hermetic_trust::JKS_MAGIC.to_be_bytes());
+    data.extend_from_slice(&hermetic_trust::JKS_VERSION_2.to_be_bytes());
+    data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+    for (alias, is_pk, bytes) in entries {
+        if *is_pk {
+            // KeyEntry tag = 1
+            data.extend_from_slice(&1u32.to_be_bytes());
+            let alias_bytes = alias.as_bytes();
+            data.extend_from_slice(&(alias_bytes.len() as u16).to_be_bytes());
+            data.extend_from_slice(alias_bytes);
+            data.extend_from_slice(&0i64.to_be_bytes()); // date_ms
+            data.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(bytes);
+            data.extend_from_slice(&0u32.to_be_bytes()); // chain_len = 0
+        } else {
+            // TrustedCertEntry tag = 2
+            data.extend_from_slice(&2u32.to_be_bytes());
+            let alias_bytes = alias.as_bytes();
+            data.extend_from_slice(&(alias_bytes.len() as u16).to_be_bytes());
+            data.extend_from_slice(alias_bytes);
+            data.extend_from_slice(&0i64.to_be_bytes()); // date_ms
+            let cert_type = "X.509".as_bytes();
+            data.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
+            data.extend_from_slice(cert_type);
+            data.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(bytes);
+        }
+    }
+
+    let hash = hermetic_trust::compute_jks_integrity_hash(password, &data);
+    data.extend_from_slice(&hash);
+    data
+}
+
+// Regression test for item 1: malformed multibyte UTCTime and GeneralizedTime values
+#[test]
+fn test_regression_malformed_multibyte_asn1_time() {
+    use hermetic_trust::asn1::*;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"ORIGINAL_BUNDLE\n").expect("write original");
+
+    let seed: [u8; 32] = [42u8; 32];
+    let ca = mint_ca("time-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let (_not_before, not_after) =
+        compute_ca_validity(datetime!(2024-01-01 00:00:00 UTC)).expect("validity");
+
+    let version_der = encode_explicit(0, &encode_integer(&[2]));
+    let serial_der = encode_integer(&[1u8; 16]);
+    let sig_alg_der = encode_sha256_with_rsa_algorithm();
+
+    let bc_value = encode_sequence(&[&encode_boolean(true)]);
+    let bc_extn = encode_sequence(&[
+        &encode_oid(OID_BASIC_CONSTRAINTS),
+        &encode_boolean(true),
+        &encode_octet_string(&bc_value),
+    ]);
+    let ku_bits = encode_bit_string(1, &[0x06]);
+    let ku_extn = encode_sequence(&[
+        &encode_oid(OID_KEY_USAGE),
+        &encode_boolean(true),
+        &encode_octet_string(&ku_bits),
+    ]);
+    let extensions_seq = encode_sequence(&[&bc_extn, &ku_extn]);
+    let extensions_der = encode_explicit(3, &extensions_seq);
+
+    // 1. Malformed multibyte UTCTime: 13 bytes containing 3-byte euro sign: "€000000000Z"
+    let malformed_utctime = "€000000000Z".as_bytes();
+    assert_eq!(malformed_utctime.len(), 13);
+    let validity_utctime = encode_sequence(&[
+        &encode_tlv(0x17, malformed_utctime),
+        &encode_der_time(not_after),
+    ]);
+    let tbs_utctime = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_utctime,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &extensions_der,
+    ]);
+    let cert_pem_utctime = sign_custom_tbs(&tbs_utctime, &ca.key);
+    let res_utctime = install_ca(&rootfs, &cert_pem_utctime);
+    assert!(
+        res_utctime.is_err(),
+        "install_ca must reject certificate containing multibyte UTCTime without panicking"
+    );
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged after malformed UTCTime"
+    );
+
+    // 2. Malformed multibyte GeneralizedTime: 15 bytes containing 3-byte euro sign: "€00000000000Z"
+    let malformed_gentime = "€00000000000Z".as_bytes();
+    assert_eq!(malformed_gentime.len(), 15);
+    let validity_gentime = encode_sequence(&[
+        &encode_tlv(0x18, malformed_gentime),
+        &encode_der_time(not_after),
+    ]);
+    let tbs_gentime = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_gentime,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &extensions_der,
+    ]);
+    let cert_pem_gentime = sign_custom_tbs(&tbs_gentime, &ca.key);
+    let res_gentime = install_ca(&rootfs, &cert_pem_gentime);
+    assert!(
+        res_gentime.is_err(),
+        "install_ca must reject certificate containing multibyte GeneralizedTime without panicking"
+    );
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged after malformed GeneralizedTime"
+    );
+}
+
+// Regression test for item 2: structural and constraint validation with re-signed certificates
+#[test]
+fn test_regression_ca_cert_structural_and_constraint_validation_resigned() {
+    use hermetic_trust::asn1::*;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"ORIGINAL_BUNDLE\n").expect("write original");
+
+    let seed: [u8; 32] = [43u8; 32];
+    let ca = mint_ca("val-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let (not_before, not_after) =
+        compute_ca_validity(datetime!(2024-01-01 00:00:00 UTC)).expect("validity");
+
+    let version_der = encode_explicit(0, &encode_integer(&[2]));
+    let serial_der = encode_integer(&[2u8; 16]);
+    let sig_alg_der = encode_sha256_with_rsa_algorithm();
+    let validity_der =
+        encode_sequence(&[&encode_der_time(not_before), &encode_der_time(not_after)]);
+
+    let bc_value = encode_sequence(&[&encode_boolean(true)]);
+    let bc_extn = encode_sequence(&[
+        &encode_oid(OID_BASIC_CONSTRAINTS),
+        &encode_boolean(true),
+        &encode_octet_string(&bc_value),
+    ]);
+    let ku_valid = encode_bit_string(1, &[0x06]);
+    let ku_extn_valid = encode_sequence(&[
+        &encode_oid(OID_KEY_USAGE),
+        &encode_boolean(true),
+        &encode_octet_string(&ku_valid),
+    ]);
+
+    // Subtest 1: Re-signed cert with critical keyUsage permitting ONLY digitalSignature (bit 0 = 0x80)
+    let ku_digsig_only = encode_bit_string(7, &[0x80]);
+    let ku_extn_digsig = encode_sequence(&[
+        &encode_oid(OID_KEY_USAGE),
+        &encode_boolean(true), // critical
+        &encode_octet_string(&ku_digsig_only),
+    ]);
+    let exts_digsig = encode_explicit(3, &encode_sequence(&[&bc_extn, &ku_extn_digsig]));
+    let tbs_digsig = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_digsig,
+    ]);
+    let pem_digsig = sign_custom_tbs(&tbs_digsig, &ca.key);
+    let res1 = install_ca(&rootfs, &pem_digsig);
+    assert!(
+        res1.is_err(),
+        "Critical keyUsage without keyCertSign must be rejected"
+    );
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 2: Re-signed cert with unknown critical extension
+    let unknown_extn = encode_sequence(&[
+        &encode_oid(&[0x55, 0x1D, 0x99]), // unknown OID
+        &encode_boolean(true),            // critical!
+        &encode_octet_string(b"unknown_payload"),
+    ]);
+    let exts_unknown = encode_explicit(
+        3,
+        &encode_sequence(&[&bc_extn, &ku_extn_valid, &unknown_extn]),
+    );
+    let tbs_unknown = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_unknown,
+    ]);
+    let pem_unknown = sign_custom_tbs(&tbs_unknown, &ca.key);
+    let res2 = install_ca(&rootfs, &pem_unknown);
+    assert!(res2.is_err(), "Unknown critical extension must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 3: Re-signed cert with duplicate extensions
+    let exts_dup = encode_explicit(3, &encode_sequence(&[&bc_extn, &bc_extn]));
+    let tbs_dup = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_dup,
+    ]);
+    let pem_dup = sign_custom_tbs(&tbs_dup, &ca.key);
+    let res3 = install_ca(&rootfs, &pem_dup);
+    assert!(res3.is_err(), "Duplicate extensions must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 4: Re-signed cert with trailing fields in TBSCertificate
+    let exts_valid = encode_explicit(3, &encode_sequence(&[&bc_extn, &ku_extn_valid]));
+    let trailing_field = encode_integer(&[0x42]);
+    let tbs_trailing = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_valid,
+        &trailing_field, // Trailing item!
+    ]);
+    let pem_trailing = sign_custom_tbs(&tbs_trailing, &ca.key);
+    let res4 = install_ca(&rootfs, &pem_trailing);
+    assert!(
+        res4.is_err(),
+        "Trailing fields in TBSCertificate must be rejected"
+    );
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 5: Re-signed cert with invalid version (v1 integer 0 instead of v3 integer 2)
+    let version_v1 = encode_explicit(0, &encode_integer(&[0]));
+    let tbs_v1 = encode_sequence(&[
+        &version_v1,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_valid,
+    ]);
+    let pem_v1 = sign_custom_tbs(&tbs_v1, &ca.key);
+    let res5 = install_ca(&rootfs, &pem_v1);
+    assert!(res5.is_err(), "Version v1 with extensions must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 6: Re-signed cert with missing version (defaults to v1)
+    let tbs_no_ver = encode_sequence(&[
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_valid,
+    ]);
+    let pem_no_ver = sign_custom_tbs(&tbs_no_ver, &ca.key);
+    let res6 = install_ca(&rootfs, &pem_no_ver);
+    assert!(
+        res6.is_err(),
+        "Missing version in TBSCertificate must be rejected"
+    );
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 7: Re-signed cert with altered issuer (issuer != subject)
+    let other_dn = hermetic_trust::cert::encode_dn("Different CA", Some("Different Org"));
+    let tbs_diff_issuer = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &other_dn, // altered issuer
+        &validity_der,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_valid,
+    ]);
+    let pem_diff_issuer = sign_custom_tbs(&tbs_diff_issuer, &ca.key);
+    let res7 = install_ca(&rootfs, &pem_diff_issuer);
+    assert!(res7.is_err(), "Altered issuer must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 8: Invalid signature (signature bits corrupted)
+    let mut bad_sig_cert_der = ca.cert_der.clone();
+    let last = bad_sig_cert_der.len() - 1;
+    bad_sig_cert_der[last] ^= 0xFF;
+    let pem_bad_sig = pem::encode(&pem::Pem::new("CERTIFICATE", bad_sig_cert_der));
+    let res8 = install_ca(&rootfs, &pem_bad_sig);
+    assert!(res8.is_err(), "Tampered signature must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+
+    // Subtest 9: Malformed validity (notBefore after notAfter)
+    let malformed_validity =
+        encode_sequence(&[&encode_der_time(not_after), &encode_der_time(not_before)]);
+    let tbs_bad_validity = encode_sequence(&[
+        &version_der,
+        &serial_der,
+        &sig_alg_der,
+        &ca.subject_dn_der,
+        &malformed_validity,
+        &ca.subject_dn_der,
+        &ca.spki_der,
+        &exts_valid,
+    ]);
+    let pem_bad_validity = sign_custom_tbs(&tbs_bad_validity, &ca.key);
+    let res9 = install_ca(&rootfs, &pem_bad_validity);
+    assert!(res9.is_err(), "notBefore after notAfter must be rejected");
+    assert_eq!(fs::read(&bundle_path).expect("read"), b"ORIGINAL_BUNDLE\n");
+}
+
+// Regression test for item 9: JKS duplicate alias and private key collision in both orders
+#[test]
+fn test_regression_jks_duplicate_alias_and_private_key_collision_both_orders() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let jks_dir = rootfs.join("usr/lib/jvm/lib/security");
+    fs::create_dir_all(&jks_dir).expect("create jks dir");
+    let jks_path = jks_dir.join("cacerts");
+
+    let seed: [u8; 32] = [44u8; 32];
+    let ca = mint_ca("jks-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let dummy_pk_bytes = [10u8, 20, 30, 40];
+
+    // Order 1: Matching TrustedCert first, PrivateKey second (both with alias "hermetic-world-ca")
+    let entries_order1: [(&str, bool, &[u8]); 2] = [
+        ("hermetic-world-ca", false, &ca.cert_der),
+        ("hermetic-world-ca", true, &dummy_pk_bytes),
+    ];
+    let jks_order1 = create_multi_entry_jks(&entries_order1, "changeit");
+    fs::write(&jks_path, &jks_order1).expect("write order1");
+
+    // Direct check on inject_ca_into_jks
+    let direct_res1 = hermetic_trust::inject_ca_into_jks(&jks_order1, &ca.cert_der, 0);
+    assert!(
+        matches!(direct_res1, Err(TrustError::AliasCollisionWithPrivateKey)),
+        "Order 1 must return AliasCollisionWithPrivateKey, got {:?}",
+        direct_res1
+    );
+
+    // End-to-end check via install_ca
+    let report1 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca order1");
+    let skipped1 = report1
+        .skipped_paths
+        .iter()
+        .find(|s| s.reason == "alias collision with private key");
+    assert!(
+        skipped1.is_some(),
+        "Report must skip on alias collision with private key in order 1"
+    );
+    assert_eq!(
+        fs::read(&jks_path).expect("read jks"),
+        jks_order1,
+        "Keystore bytes must remain unchanged in order 1"
+    );
+
+    // Order 2: PrivateKey first, Matching TrustedCert second (both with alias "hermetic-world-ca")
+    let entries_order2: [(&str, bool, &[u8]); 2] = [
+        ("hermetic-world-ca", true, &dummy_pk_bytes),
+        ("hermetic-world-ca", false, &ca.cert_der),
+    ];
+    let jks_order2 = create_multi_entry_jks(&entries_order2, "changeit");
+    fs::write(&jks_path, &jks_order2).expect("write order2");
+
+    // Direct check on inject_ca_into_jks
+    let direct_res2 = hermetic_trust::inject_ca_into_jks(&jks_order2, &ca.cert_der, 0);
+    assert!(
+        matches!(direct_res2, Err(TrustError::AliasCollisionWithPrivateKey)),
+        "Order 2 must return AliasCollisionWithPrivateKey, got {:?}",
+        direct_res2
+    );
+
+    // End-to-end check via install_ca
+    let report2 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca order2");
+    let skipped2 = report2
+        .skipped_paths
+        .iter()
+        .find(|s| s.reason == "alias collision with private key");
+    assert!(
+        skipped2.is_some(),
+        "Report must skip on alias collision with private key in order 2"
+    );
+    assert_eq!(
+        fs::read(&jks_path).expect("read jks"),
+        jks_order2,
+        "Keystore bytes must remain unchanged in order 2"
+    );
+
+    // Order 3: Duplicate TrustedCert entries with the same alias
+    let entries_order3: [(&str, bool, &[u8]); 2] = [
+        ("hermetic-world-ca", false, &ca.cert_der),
+        ("hermetic-world-ca", false, &ca.cert_der),
+    ];
+    let jks_order3 = create_multi_entry_jks(&entries_order3, "changeit");
+    fs::write(&jks_path, &jks_order3).expect("write order3");
+
+    let direct_res3 = hermetic_trust::inject_ca_into_jks(&jks_order3, &ca.cert_der, 0);
+    assert!(
+        direct_res3.is_err(),
+        "Duplicate TrustedCert alias must be rejected"
+    );
+    let report3 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca order3");
+    assert!(
+        report3
+            .skipped_paths
+            .iter()
+            .any(|s| s.path.ends_with("cacerts")),
+        "Report must skip on duplicate alias in order 3"
+    );
+    assert_eq!(
+        fs::read(&jks_path).expect("read jks"),
+        jks_order3,
+        "Keystore bytes must remain unchanged on duplicate alias"
+    );
+}

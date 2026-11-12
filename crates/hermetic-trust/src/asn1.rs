@@ -266,43 +266,75 @@ pub fn parse_sequence_items(mut input: &[u8]) -> Result<Vec<Tlv<'_>>, TrustError
     Ok(items)
 }
 
+fn parse_ascii_2digits(bytes: &[u8], offset: usize) -> Result<u8, TrustError> {
+    let d0 = bytes
+        .get(offset)
+        .ok_or_else(|| TrustError::Cert("truncated ASN.1 time digits".to_string()))?;
+    let next_off = offset
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("offset overflow".to_string()))?;
+    let d1 = bytes
+        .get(next_off)
+        .ok_or_else(|| TrustError::Cert("truncated ASN.1 time digits".to_string()))?;
+
+    if !d0.is_ascii_digit() || !d1.is_ascii_digit() {
+        return Err(TrustError::Cert(
+            "non-ASCII digit in ASN.1 time".to_string(),
+        ));
+    }
+    let tens = (d0.wrapping_sub(b'0'))
+        .checked_mul(10)
+        .ok_or_else(|| TrustError::Cert("arithmetic overflow in ASN.1 time".to_string()))?;
+    let units = d1.wrapping_sub(b'0');
+    tens.checked_add(units)
+        .ok_or_else(|| TrustError::Cert("arithmetic overflow in ASN.1 time".to_string()))
+}
+
+fn parse_ascii_4digits(bytes: &[u8], offset: usize) -> Result<i32, TrustError> {
+    let hi = parse_ascii_2digits(bytes, offset)? as i32;
+    let next_off = offset
+        .checked_add(2)
+        .ok_or_else(|| TrustError::Cert("offset overflow".to_string()))?;
+    let lo = parse_ascii_2digits(bytes, next_off)? as i32;
+    let hi_val = hi
+        .checked_mul(100)
+        .ok_or_else(|| TrustError::Cert("arithmetic overflow in ASN.1 time".to_string()))?;
+    hi_val
+        .checked_add(lo)
+        .ok_or_else(|| TrustError::Cert("arithmetic overflow in ASN.1 time".to_string()))
+}
+
 /// Parse an ASN.1 Time (UTCTime tag 0x17 or GeneralizedTime tag 0x18) into OffsetDateTime.
 pub fn parse_asn1_time(tlv: &Tlv<'_>) -> Result<time::OffsetDateTime, TrustError> {
-    let s = std::str::from_utf8(tlv.value)
-        .map_err(|_| TrustError::Cert("ASN.1 time is not valid UTF-8/ASCII".to_string()))?;
-    if !s.ends_with('Z') {
-        return Err(TrustError::Cert("ASN.1 time must end with 'Z'".to_string()));
-    }
     match tlv.tag {
         0x17 => {
             // UTCTime: YYMMDDHHMMSSZ (13 chars)
-            if s.len() != 13 {
+            if tlv.value.len() != 13 {
                 return Err(TrustError::Cert(format!(
                     "invalid UTCTime length {}, expected 13 (YYMMDDHHMMSSZ)",
-                    s.len()
+                    tlv.value.len()
                 )));
             }
-            let yy: i32 = s[0..2]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime year".to_string()))?;
-            let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
-            let month_num: u8 = s[2..4]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime month".to_string()))?;
+            if tlv.value.get(12) != Some(&b'Z') {
+                return Err(TrustError::Cert("UTCTime must end with 'Z'".to_string()));
+            }
+            let yy = parse_ascii_2digits(tlv.value, 0)? as i32;
+            let year = if yy >= 50 {
+                1900i32
+                    .checked_add(yy)
+                    .ok_or_else(|| TrustError::Cert("year overflow".to_string()))?
+            } else {
+                2000i32
+                    .checked_add(yy)
+                    .ok_or_else(|| TrustError::Cert("year overflow".to_string()))?
+            };
+            let month_num = parse_ascii_2digits(tlv.value, 2)?;
             let month = time::Month::try_from(month_num)
                 .map_err(|_| TrustError::Cert("invalid UTCTime month number".to_string()))?;
-            let day: u8 = s[4..6]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime day".to_string()))?;
-            let hour: u8 = s[6..8]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime hour".to_string()))?;
-            let minute: u8 = s[8..10]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime minute".to_string()))?;
-            let second: u8 = s[10..12]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid UTCTime second".to_string()))?;
+            let day = parse_ascii_2digits(tlv.value, 4)?;
+            let hour = parse_ascii_2digits(tlv.value, 6)?;
+            let minute = parse_ascii_2digits(tlv.value, 8)?;
+            let second = parse_ascii_2digits(tlv.value, 10)?;
 
             let date = time::Date::from_calendar_date(year, month, day).map_err(|e| {
                 TrustError::Cert(format!("invalid calendar date in UTCTime: {}", e))
@@ -313,33 +345,26 @@ pub fn parse_asn1_time(tlv: &Tlv<'_>) -> Result<time::OffsetDateTime, TrustError
         }
         0x18 => {
             // GeneralizedTime: YYYYMMDDHHMMSSZ (15 chars)
-            if s.len() != 15 {
+            if tlv.value.len() != 15 {
                 return Err(TrustError::Cert(format!(
                     "invalid GeneralizedTime length {}, expected 15 (YYYYMMDDHHMMSSZ)",
-                    s.len()
+                    tlv.value.len()
                 )));
             }
-            let year: i32 = s[0..4]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime year".to_string()))?;
-            let month_num: u8 = s[4..6]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime month".to_string()))?;
+            if tlv.value.get(14) != Some(&b'Z') {
+                return Err(TrustError::Cert(
+                    "GeneralizedTime must end with 'Z'".to_string(),
+                ));
+            }
+            let year = parse_ascii_4digits(tlv.value, 0)?;
+            let month_num = parse_ascii_2digits(tlv.value, 4)?;
             let month = time::Month::try_from(month_num).map_err(|_| {
                 TrustError::Cert("invalid GeneralizedTime month number".to_string())
             })?;
-            let day: u8 = s[6..8]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime day".to_string()))?;
-            let hour: u8 = s[8..10]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime hour".to_string()))?;
-            let minute: u8 = s[10..12]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime minute".to_string()))?;
-            let second: u8 = s[12..14]
-                .parse()
-                .map_err(|_| TrustError::Cert("invalid GeneralizedTime second".to_string()))?;
+            let day = parse_ascii_2digits(tlv.value, 6)?;
+            let hour = parse_ascii_2digits(tlv.value, 8)?;
+            let minute = parse_ascii_2digits(tlv.value, 10)?;
+            let second = parse_ascii_2digits(tlv.value, 12)?;
 
             let date = time::Date::from_calendar_date(year, month, day).map_err(|e| {
                 TrustError::Cert(format!("invalid calendar date in GeneralizedTime: {}", e))
@@ -408,67 +433,110 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         ));
     }
     let mut idx = 0;
-    // Optional version: tag 0xA0 [0]
-    if tbs_items[idx].tag == 0xA0 {
-        let ver_items = parse_sequence_items(tbs_items[idx].value)?;
-        if ver_items.len() != 1 || ver_items[0].tag != 0x02 {
+    // Version: tag 0xA0 [0]
+    let ver_item = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("too few items in TBSCertificate".to_string()))?;
+    if ver_item.tag == 0xA0 {
+        let ver_items = parse_sequence_items(ver_item.value)?;
+        if ver_items.len() != 1 {
             return Err(TrustError::Cert(
-                "invalid version in TBSCertificate".to_string(),
+                "invalid version sequence in TBSCertificate".to_string(),
             ));
         }
-        idx += 1;
+        let ver_val = ver_items
+            .first()
+            .ok_or_else(|| TrustError::Cert("missing version item".to_string()))?;
+        if ver_val.tag != 0x02 || ver_val.value != [0x02] {
+            return Err(TrustError::Cert(
+                "unsupported certificate version: expected v3 (2)".to_string(),
+            ));
+        }
+        idx = idx
+            .checked_add(1)
+            .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    } else {
+        return Err(TrustError::Cert(
+            "missing version in TBSCertificate: CA certificates with extensions must be v3"
+                .to_string(),
+        ));
     }
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x02 {
+    let serial_item = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing serialNumber in TBSCertificate".to_string()))?;
+    if serial_item.tag != 0x02 {
         return Err(TrustError::Cert(
             "missing or invalid serialNumber in TBSCertificate".to_string(),
         ));
     }
-    idx += 1;
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    let tbs_sig_alg = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing signature in TBSCertificate".to_string()))?;
+    if tbs_sig_alg.tag != 0x30 {
         return Err(TrustError::Cert(
             "missing or invalid signature in TBSCertificate".to_string(),
         ));
     }
-    let tbs_sig_alg = &tbs_items[idx];
     if sig_alg_tlv.raw != tbs_sig_alg.raw {
         return Err(TrustError::Cert(
             "certificate signatureAlgorithm does not match tbsCertificate.signature".to_string(),
         ));
     }
-    idx += 1;
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    let issuer_tlv = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing issuer in TBSCertificate".to_string()))?;
+    if issuer_tlv.tag != 0x30 {
         return Err(TrustError::Cert(
             "missing or invalid issuer in TBSCertificate".to_string(),
         ));
     }
-    let issuer_tlv = &tbs_items[idx];
-    idx += 1;
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    let validity_tlv = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing validity in TBSCertificate".to_string()))?;
+    if validity_tlv.tag != 0x30 {
         return Err(TrustError::Cert(
             "missing or invalid validity in TBSCertificate".to_string(),
         ));
     }
-    let validity_tlv = &tbs_items[idx];
     let validity_items = parse_sequence_items(validity_tlv.value)?;
     if validity_items.len() != 2 {
         return Err(TrustError::Cert(
             "validity must contain exactly notBefore and notAfter".to_string(),
         ));
     }
-    let not_before = parse_asn1_time(&validity_items[0])?;
-    let not_after = parse_asn1_time(&validity_items[1])?;
+    let not_before_item = validity_items
+        .first()
+        .ok_or_else(|| TrustError::Cert("missing notBefore".to_string()))?;
+    let not_after_item = validity_items
+        .get(1)
+        .ok_or_else(|| TrustError::Cert("missing notAfter".to_string()))?;
+    let not_before = parse_asn1_time(not_before_item)?;
+    let not_after = parse_asn1_time(not_after_item)?;
     if not_before > not_after {
         return Err(TrustError::Cert(
             "validity notBefore is after notAfter".to_string(),
         ));
     }
-    idx += 1;
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    let subject_tlv = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing subject in TBSCertificate".to_string()))?;
+    if subject_tlv.tag != 0x30 {
         return Err(TrustError::Cert(
             "missing or invalid subject in TBSCertificate".to_string(),
         ));
     }
-    let subject_tlv = &tbs_items[idx];
 
     // Require and verify self-signed CA format: issuer must match subject
     if issuer_tlv.raw != subject_tlv.raw {
@@ -477,62 +545,225 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         ));
     }
 
-    idx += 1;
-    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+    let spki_tlv = tbs_items.get(idx).ok_or_else(|| {
+        TrustError::Cert("missing subjectPublicKeyInfo in TBSCertificate".to_string())
+    })?;
+    if spki_tlv.tag != 0x30 {
         return Err(TrustError::Cert(
             "missing or invalid subjectPublicKeyInfo in TBSCertificate".to_string(),
         ));
     }
-    let spki_tlv = &tbs_items[idx];
-    idx += 1;
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
 
     // Skip optional [1] issuerUniqueID, [2] subjectUniqueID
-    while idx < tbs_items.len()
-        && (tbs_items[idx].tag == 0x81
-            || tbs_items[idx].tag == 0x82
-            || tbs_items[idx].tag == 0xA1
-            || tbs_items[idx].tag == 0xA2)
-    {
-        idx += 1;
+    while let Some(item) = tbs_items.get(idx) {
+        if item.tag == 0x81 || item.tag == 0x82 || item.tag == 0xA1 || item.tag == 0xA2 {
+            idx = idx
+                .checked_add(1)
+                .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+        } else {
+            break;
+        }
     }
 
     // Find extensions ([3] EXPLICIT tag 0xA3)
+    let ext_tlv = tbs_items
+        .get(idx)
+        .ok_or_else(|| TrustError::Cert("missing extensions in CA certificate".to_string()))?;
+    if ext_tlv.tag != 0xA3 {
+        return Err(TrustError::Cert(
+            "expected [3] EXPLICIT extensions in TBSCertificate".to_string(),
+        ));
+    }
+    let ext_seq_items = parse_sequence_items(ext_tlv.value)?;
+    if ext_seq_items.len() != 1 {
+        return Err(TrustError::Cert(
+            "invalid extensions wrapper in TBSCertificate".to_string(),
+        ));
+    }
+    let ext_seq = ext_seq_items
+        .first()
+        .ok_or_else(|| TrustError::Cert("missing extensions sequence".to_string()))?;
+    if ext_seq.tag != 0x30 {
+        return Err(TrustError::Cert(
+            "extensions wrapper is not a SEQUENCE".to_string(),
+        ));
+    }
+
     let mut found_ca_true = false;
-    if idx < tbs_items.len() && tbs_items[idx].tag == 0xA3 {
-        let ext_seq_items = parse_sequence_items(tbs_items[idx].value)?;
-        if ext_seq_items.len() == 1 && ext_seq_items[0].tag == 0x30 {
-            let extensions = parse_sequence_items(ext_seq_items[0].value)?;
-            for ext in extensions {
-                if ext.tag != 0x30 {
-                    continue;
+    let mut seen_oids = std::collections::HashSet::new();
+
+    let extensions = parse_sequence_items(ext_seq.value)?;
+    for ext in &extensions {
+        if ext.tag != 0x30 {
+            return Err(TrustError::Cert(
+                "extension item is not a SEQUENCE".to_string(),
+            ));
+        }
+        let ext_parts = parse_sequence_items(ext.value)?;
+        let (oid, is_critical, extn_value) = match ext_parts.len() {
+            2 => {
+                let p0 = ext_parts
+                    .first()
+                    .ok_or_else(|| TrustError::Cert("missing extension OID".to_string()))?;
+                let p1 = ext_parts
+                    .get(1)
+                    .ok_or_else(|| TrustError::Cert("missing extension value".to_string()))?;
+                if p0.tag != 0x06 {
+                    return Err(TrustError::Cert("missing extension OID".to_string()));
                 }
-                let ext_parts = parse_sequence_items(ext.value)?;
-                if ext_parts.len() < 2 {
-                    continue;
+                if p1.tag != 0x04 {
+                    return Err(TrustError::Cert(
+                        "invalid extension value tag: expected OCTET STRING".to_string(),
+                    ));
                 }
-                if ext_parts[0].tag == 0x06 && ext_parts[0].value == OID_BASIC_CONSTRAINTS {
-                    let last = &ext_parts[ext_parts.len() - 1];
-                    if last.tag == 0x04 {
-                        if let Ok(bc_items) = parse_sequence_items(last.value) {
-                            if bc_items.len() == 1 && bc_items[0].tag == 0x30 {
-                                if let Ok(bc_inner) = parse_sequence_items(bc_items[0].value) {
-                                    if !bc_inner.is_empty()
-                                        && bc_inner[0].tag == 0x01
-                                        && bc_inner[0].value.iter().any(|&b| b != 0)
-                                    {
-                                        found_ca_true = true;
-                                    }
-                                }
-                            }
-                        }
+                (p0.value, false, p1.value)
+            }
+            3 => {
+                let p0 = ext_parts
+                    .first()
+                    .ok_or_else(|| TrustError::Cert("missing extension OID".to_string()))?;
+                let p1 = ext_parts
+                    .get(1)
+                    .ok_or_else(|| TrustError::Cert("missing extension critical".to_string()))?;
+                let p2 = ext_parts
+                    .get(2)
+                    .ok_or_else(|| TrustError::Cert("missing extension value".to_string()))?;
+                if p0.tag != 0x06 {
+                    return Err(TrustError::Cert("missing extension OID".to_string()));
+                }
+                if p1.tag != 0x01 {
+                    return Err(TrustError::Cert(
+                        "invalid extension critical tag: expected BOOLEAN".to_string(),
+                    ));
+                }
+                if p2.tag != 0x04 {
+                    return Err(TrustError::Cert(
+                        "invalid extension value tag: expected OCTET STRING".to_string(),
+                    ));
+                }
+                let crit = p1.value.iter().any(|&b| b != 0);
+                (p0.value, crit, p2.value)
+            }
+            _ => {
+                return Err(TrustError::Cert(
+                    "invalid extension SEQUENCE structure".to_string(),
+                ));
+            }
+        };
+
+        if !seen_oids.insert(oid.to_vec()) {
+            return Err(TrustError::Cert(format!(
+                "duplicate extension in certificate: OID {:?}",
+                oid
+            )));
+        }
+
+        let is_known = matches!(
+            oid,
+            OID_BASIC_CONSTRAINTS
+                | OID_KEY_USAGE
+                | OID_SUBJECT_KEY_IDENTIFIER
+                | OID_AUTHORITY_KEY_IDENTIFIER
+                | OID_SUBJECT_ALT_NAME
+        );
+        if is_critical && !is_known {
+            return Err(TrustError::Cert(format!(
+                "unknown critical extension: OID {:?}",
+                oid
+            )));
+        }
+
+        if oid == OID_BASIC_CONSTRAINTS {
+            let (bc_tlv, rem) = parse_tlv(extn_value)?;
+            if !rem.is_empty() || bc_tlv.tag != 0x30 {
+                return Err(TrustError::Cert(
+                    "invalid basicConstraints OCTET STRING: expected SEQUENCE".to_string(),
+                ));
+            }
+            let bc_items = parse_sequence_items(bc_tlv.value)?;
+            if !bc_items.is_empty() {
+                let ca_bool = bc_items
+                    .first()
+                    .ok_or_else(|| TrustError::Cert("missing cA".to_string()))?;
+                if ca_bool.tag != 0x01 {
+                    return Err(TrustError::Cert(
+                        "invalid basicConstraints cA: expected BOOLEAN".to_string(),
+                    ));
+                }
+                if ca_bool.value.iter().any(|&b| b != 0) {
+                    found_ca_true = true;
+                }
+                if bc_items.len() > 2 {
+                    return Err(TrustError::Cert(
+                        "invalid basicConstraints: too many elements".to_string(),
+                    ));
+                }
+                if bc_items.len() == 2 {
+                    let path_len = bc_items
+                        .get(1)
+                        .ok_or_else(|| TrustError::Cert("missing pathLen".to_string()))?;
+                    if path_len.tag != 0x02 {
+                        return Err(TrustError::Cert(
+                            "invalid basicConstraints pathLenConstraint: expected INTEGER"
+                                .to_string(),
+                        ));
                     }
                 }
             }
+        } else if oid == OID_KEY_USAGE {
+            let (ku_tlv, rem) = parse_tlv(extn_value)?;
+            if !rem.is_empty() || ku_tlv.tag != 0x03 {
+                return Err(TrustError::Cert(
+                    "invalid keyUsage OCTET STRING: expected BIT STRING".to_string(),
+                ));
+            }
+            let unused_bits = *ku_tlv
+                .value
+                .first()
+                .ok_or_else(|| TrustError::Cert("empty keyUsage BIT STRING".to_string()))?;
+            if unused_bits > 7 {
+                return Err(TrustError::Cert(
+                    "invalid unused bits count in keyUsage BIT STRING".to_string(),
+                ));
+            }
+            let has_key_cert_sign =
+                if ku_tlv.value.len() < 2 || (ku_tlv.value.len() == 2 && unused_bits > 2) {
+                    false
+                } else {
+                    let b1 = *ku_tlv
+                        .value
+                        .get(1)
+                        .ok_or_else(|| TrustError::Cert("missing keyUsage byte".to_string()))?;
+                    (b1 & 0x04) != 0
+                };
+            if !has_key_cert_sign {
+                return Err(TrustError::Cert(
+                    "keyUsage does not permit keyCertSign".to_string(),
+                ));
+            }
         }
     }
+
     if !found_ca_true {
         return Err(TrustError::Cert(
             "certificate is not a CA: missing or false basicConstraints CA:true".to_string(),
+        ));
+    }
+
+    idx = idx
+        .checked_add(1)
+        .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
+
+    // Validate that there are no trailing fields in TBSCertificate
+    if idx != tbs_items.len() {
+        return Err(TrustError::Cert(
+            "trailing fields in TBSCertificate".to_string(),
         ));
     }
 
@@ -541,8 +772,12 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
     if spki_parts.len() != 2 {
         return Err(TrustError::Cert("invalid SPKI in certificate".to_string()));
     }
-    let alg_tlv = &spki_parts[0];
-    let spk_bit_string = &spki_parts[1];
+    let alg_tlv = spki_parts
+        .first()
+        .ok_or_else(|| TrustError::Cert("missing SPKI alg".to_string()))?;
+    let spk_bit_string = spki_parts
+        .get(1)
+        .ok_or_else(|| TrustError::Cert("missing SPKI pubkey".to_string()))?;
     if alg_tlv.tag != 0x30 || spk_bit_string.tag != 0x03 {
         return Err(TrustError::Cert(
             "invalid SPKI algorithm or public key tag".to_string(),
@@ -556,20 +791,26 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         ));
     }
 
-    if spk_bit_string.value.is_empty() || spk_bit_string.value[0] != 0 {
+    if spk_bit_string.value.is_empty() || spk_bit_string.value.first() != Some(&0) {
         return Err(TrustError::Cert("invalid BIT STRING in SPKI".to_string()));
     }
-    let pkcs1_der = &spk_bit_string.value[1..];
+    let pkcs1_der = spk_bit_string
+        .value
+        .get(1..)
+        .ok_or_else(|| TrustError::Cert("empty SPKI BIT STRING".to_string()))?;
     use rsa::pkcs1::DecodeRsaPublicKey;
     let public_key = rsa::RsaPublicKey::from_pkcs1_der(pkcs1_der).map_err(|e| {
         TrustError::Cert(format!("failed to parse RSA public key from SPKI: {}", e))
     })?;
 
     // Verify self-signed signature
-    if sig_val_tlv.value.is_empty() || sig_val_tlv.value[0] != 0 {
+    if sig_val_tlv.value.is_empty() || sig_val_tlv.value.first() != Some(&0) {
         return Err(TrustError::Cert("invalid signature BIT STRING".to_string()));
     }
-    let sig_bytes = &sig_val_tlv.value[1..];
+    let sig_bytes = sig_val_tlv
+        .value
+        .get(1..)
+        .ok_or_else(|| TrustError::Cert("empty signature BIT STRING".to_string()))?;
 
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
