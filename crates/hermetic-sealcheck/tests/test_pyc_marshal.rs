@@ -1772,3 +1772,341 @@ fn t112_final_finding4_nested_named_function_is_not_folded() {
     assert!(!keep.symbols.contains("valid"), "{keep:?}");
     assert!(objects.iter().any(|c| c.name == "helper"));
 }
+
+// =========================================================================
+// T1.12 Codex re-review fixes (2026-11-12)
+// =========================================================================
+
+fn marshal_float(v: f64) -> Vec<u8> {
+    let mut b = vec![b'g'];
+    b.extend_from_slice(&v.to_le_bytes());
+    b
+}
+
+fn marshal_unicode(s: &str) -> Vec<u8> {
+    let mut b = vec![b'u'];
+    b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    b.extend_from_slice(s.as_bytes());
+    b
+}
+
+fn marshal_big_tuple(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![b'('];
+    b.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for it in items {
+        b.extend_from_slice(it);
+    }
+    b
+}
+
+/// A non-negative decimal integer as a marshal `l` object (15-bit digits).
+fn marshal_long_decimal(decimal: &str) -> Vec<u8> {
+    let mut digits: Vec<u32> = decimal.bytes().map(|b| u32::from(b - b'0')).collect();
+    let mut out: Vec<u16> = Vec::new();
+    while digits.iter().any(|&d| d != 0) {
+        let mut rem = 0u32;
+        let mut next = Vec::with_capacity(digits.len());
+        for d in &digits {
+            let cur = rem * 10 + d;
+            next.push(cur / 32768);
+            rem = cur % 32768;
+        }
+        out.push(rem as u16);
+        digits = next;
+    }
+    marshal_long(out.len() as i32, &out)
+}
+
+/// The fingerprint of a one-file task from `base` to `fixed` (whole-file replacement).
+fn task_fp(file: &str, base: &str, fixed: &str) -> (tempfile::TempDir, FingerprintSet) {
+    let parent = tempdir().expect("tempdir");
+    fs::write(parent.path().join(file), base).expect("base");
+    let old: Vec<&str> = base.lines().collect();
+    let new: Vec<&str> = fixed.lines().collect();
+    let mut patch = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,{} +1,{} @@\n",
+        old.len(),
+        new.len()
+    );
+    for l in &old {
+        patch.push_str(&format!("-{l}\n"));
+    }
+    for l in &new {
+        patch.push_str(&format!("+{l}\n"));
+    }
+    let fp = FingerprintSet::from_task(&patch, "", parent.path()).expect("fingerprints");
+    (parent, fp)
+}
+
+fn fp_for<'a>(
+    fp: &'a FingerprintSet,
+    name: &str,
+) -> &'a hermetic_sealcheck::fingerprint::PycFunctionFingerprint {
+    fp.hunks
+        .iter()
+        .flat_map(|h| h.pyc_fingerprints.iter())
+        .find(|f| f.function_name == name)
+        .unwrap_or_else(|| panic!("no fingerprint for {name}: {:?}", fp.hunks))
+}
+
+/// Re-review 1: scope discovery must not clone a long parent path into every child.
+#[test]
+fn t112_rereview_finding1_long_class_name_many_methods_bounded() {
+    const CHILD: &str = "HERMETIC_T112_RR1_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_rereview_finding1_long_class_name_many_methods_bounded",
+            CHILD,
+            CHILD_MEM_KIB,
+            240,
+        ));
+        return;
+    }
+    let class_name = format!("C{}", "x".repeat(1024 * 1024));
+    let mut base = format!("class {class_name}:\n");
+    for i in 0..10_000 {
+        base.push_str(&format!("    def m{i}(self):\n        return {i}\n"));
+    }
+    let parent = tempdir().expect("tempdir");
+    fs::write(parent.path().join("big.py"), &base).expect("base");
+    // Change the last method's return value.
+    let line = 1 + 2 * 10_000;
+    let patch = format!(
+        "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n@@ -{line},1 +{line},1 @@\n-        return 9999\n+        return 77777\n"
+    );
+    use hermetic_sealcheck::fingerprint::FingerprintError;
+    match FingerprintSet::from_task(&patch, "", parent.path()) {
+        Ok(fp) => assert!(fp_for(&fp, "m9999").added.contains("77777")),
+        Err(FingerprintError::WorkBudgetExceeded) => {}
+        Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
+/// Re-review 2: `def`, `class` and `async def` separated by tabs are definitions.
+#[test]
+fn t112_rereview_finding2_tab_separated_definition_headers() {
+    let cases = [
+        (
+            "def\tf():\n    return 2\n",
+            "def\tf():\n    return 3\n",
+            "f",
+        ),
+        (
+            "class\tC:\n    def\tg(self):\n        return 2\n",
+            "class\tC:\n    def\tg(self):\n        return 3\n",
+            "g",
+        ),
+        (
+            "async\tdef  \th():\n    return 2\n",
+            "async\tdef  \th():\n    return 3\n",
+            "h",
+        ),
+    ];
+    for (base, fixed, name) in cases {
+        let (_dir, fp) = task_fp("m.py", base, fixed);
+        let f = fp_for(&fp, name);
+        assert!(f.added.contains("3"), "{f:?}");
+        assert!(
+            !fp.hunks
+                .iter()
+                .flat_map(|h| h.pyc_fingerprints.iter())
+                .any(|f| f.function_name == "<module>" && f.added.contains("3")),
+            "the change must not be attributed to the module"
+        );
+        let fixed_38 = build_pyc_38(name, &[marshal_int(3)], &[], &[]);
+        let base_38 = build_pyc_38(name, &[marshal_int(2)], &[], &[]);
+        assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+        let fixed_311 = build_pyc_311(name, name, &[marshal_int(3)], &[], &[]);
+        let base_311 = build_pyc_311(name, name, &[marshal_int(2)], &[], &[]);
+        assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
+    }
+}
+
+/// Re-review 3: a triple-quoted default spanning lines does not end the header early.
+#[test]
+fn t112_rereview_finding3_triple_quoted_default_in_header() {
+    let base = "def f(x=\"\"\"a\n):\nb\"\"\"):\n    return x\n";
+    let fixed = "def f(x=\"\"\"c\n):\nb\"\"\"):\n    return x\n";
+    let (_dir, fp) = task_fp("m.py", base, fixed);
+    let module = fp_for(&fp, "<module>");
+    assert!(module.added.contains("c\n):\nb"), "{module:?}");
+    assert!(module.removed.contains("a\n):\nb"), "{module:?}");
+    let code_f = raw_code_38("f", &[], &[], &["x"]);
+    let fixed_pyc = build_pyc_38(
+        "<module>",
+        &[marshal_short_ascii("c\n):\nb"), code_f.clone()],
+        &["f"],
+        &[],
+    );
+    let base_pyc = build_pyc_38(
+        "<module>",
+        &[marshal_short_ascii("a\n):\nb"), code_f],
+        &["f"],
+        &[],
+    );
+    assert_both_pyc_matchers(&fp, &fixed_pyc, &base_pyc);
+}
+
+/// (base source, fixed source, base consts, fixed consts, base names, fixed names)
+type LiteralCase = (
+    String,
+    String,
+    Vec<Vec<u8>>,
+    Vec<Vec<u8>>,
+    Vec<&'static str>,
+    Vec<&'static str>,
+);
+
+/// Re-review 4: literals normalised to their compiled form.
+#[test]
+fn t112_rereview_finding4_literals_match_compiled_constants() {
+    let big_base = "1000000000000000000000000000000000000000001";
+    let big_fixed = "2000000000000000000000000000000000000000002";
+    let underscored = |d: &str| {
+        let mut s = String::new();
+        for (i, c) in d.chars().enumerate() {
+            if i > 0 && (d.len() - i).is_multiple_of(3) {
+                s.push('_');
+            }
+            s.push(c);
+        }
+        s
+    };
+    // (base source, fixed source, base consts, fixed consts, base names, fixed names)
+    let cases: Vec<LiteralCase> = vec![
+        (
+            "def f(x):\n    return .3\n".into(),
+            "def f(x):\n    return .4\n".into(),
+            vec![marshal_float(0.3)],
+            vec![marshal_float(0.4)],
+            vec![],
+            vec![],
+        ),
+        (
+            "def f(x):\n    return \"\\N{BULLET} \\N{em dash} one\"\n".into(),
+            "def f(x):\n    return \"\\N{BULLET} \\N{em dash} two\"\n".into(),
+            vec![marshal_unicode("\u{2022} \u{2014} one")],
+            vec![marshal_unicode("\u{2022} \u{2014} two")],
+            vec![],
+            vec![],
+        ),
+        (
+            // Not in the built-in name table: matched through the string skeleton.
+            "def f(x):\n    return \"\\N{HEAVY BLACK HEART} one\"\n".into(),
+            "def f(x):\n    return \"\\N{HEAVY BLACK HEART} two\"\n".into(),
+            vec![marshal_unicode("\u{2764} one")],
+            vec![marshal_unicode("\u{2764} two")],
+            vec![],
+            vec![],
+        ),
+        (
+            "def f(x):\n    return f\"v{x.a}\"\n".into(),
+            "def f(x):\n    return f\"v{x.b}\"\n".into(),
+            vec![marshal_short_ascii("v")],
+            vec![marshal_short_ascii("v")],
+            vec!["a"],
+            vec!["b"],
+        ),
+        (
+            format!("def f(x):\n    return {}\n", underscored(big_base)),
+            format!("def f(x):\n    return {}\n", underscored(big_fixed)),
+            vec![marshal_long_decimal(big_base)],
+            vec![marshal_long_decimal(big_fixed)],
+            vec![],
+            vec![],
+        ),
+    ];
+    for (base, fixed, base_consts, fixed_consts, base_names, fixed_names) in cases {
+        let (_dir, fp) = task_fp("m.py", &base, &fixed);
+        let f = fp_for(&fp, "f");
+        assert!(!f.added.is_empty(), "{fixed}: {f:?}");
+        let fixed_38 = build_pyc_38("f", &fixed_consts, &fixed_names, &["x"]);
+        let base_38 = build_pyc_38("f", &base_consts, &base_names, &["x"]);
+        assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+        let fixed_311 = build_pyc_311("f", "f", &fixed_consts, &fixed_names, &["x"]);
+        let base_311 = build_pyc_311("f", "f", &base_consts, &base_names, &["x"]);
+        assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
+    }
+    // The f-string expression symbols and literal piece are what the fingerprint holds.
+    let (_dir, fp) = task_fp(
+        "m.py",
+        "def f(x):\n    return f\"v{x.a}\"\n",
+        "def f(x):\n    return f\"v{x.b}\"\n",
+    );
+    let f = fp_for(&fp, "f");
+    assert!(f.added.contains("b") && f.removed.contains("a"), "{f:?}");
+    assert!(
+        !f.added.contains("{x.b}") && !f.added.contains("f"),
+        "{f:?}"
+    );
+}
+
+/// Re-review 5: large legitimate constant tables stay within the marshal budgets, and
+/// exceeding a real limit is reported as a coverage gap.
+#[test]
+fn t112_rereview_finding5_large_constant_tables_and_explicit_limit_gap() {
+    use hermetic_sealcheck::{parse_pyc_code_objects_outcome, PycParseOutcome};
+    let (_dir, fp) = task_fp(
+        "m.py",
+        "def f():\n    return 2\n",
+        "def f():\n    return 3\n",
+    );
+    let ints: Vec<Vec<u8>> = (0..16_384).map(|i| marshal_int(1000 + i)).collect();
+    let floats: Vec<Vec<u8>> = (0..16_384)
+        .map(|i| marshal_float(f64::from(i) + 0.5))
+        .collect();
+    let strings: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| marshal_unicode(&format!("{i:05}{}", "s".repeat(1000))))
+        .collect();
+    let build = |ret: i32| {
+        let code_f = raw_code_38("f", &[marshal_int(ret)], &[], &[]);
+        build_pyc_38(
+            "<module>",
+            &[
+                marshal_big_tuple(&ints),
+                marshal_big_tuple(&floats),
+                marshal_big_tuple(&strings),
+                code_f,
+            ],
+            &["f", "TABLE"],
+            &[],
+        )
+    };
+    let fixed = build(3);
+    let base = build(2);
+    match parse_pyc_code_objects_outcome(&fixed) {
+        PycParseOutcome::Parsed(objects) => assert!(objects.iter().any(|o| o.name == "f")),
+        other => panic!("large legitimate tables must parse: {other:?}"),
+    }
+    assert_both_pyc_matchers(&fp, &fixed, &base);
+
+    // Nesting past the reader's depth limit is a reported gap, not silence.
+    let mut deep = vec![0x55, 0x0d, 0x0d, 0x0a];
+    deep.extend_from_slice(&[0u8; 12]);
+    for _ in 0..200 {
+        deep.extend_from_slice(&[b')', 1]);
+    }
+    deep.extend_from_slice(&marshal_int(1));
+    assert!(matches!(
+        parse_pyc_code_objects_outcome(&deep),
+        PycParseOutcome::LimitExceeded(_)
+    ));
+    // A truncated stream is malformed, which is not a coverage gap.
+    let truncated = &fixed[..fixed.len() / 2];
+    assert_eq!(
+        parse_pyc_code_objects_outcome(truncated),
+        PycParseOutcome::Malformed
+    );
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("deep.pyc"), &deep).expect("write");
+    fs::write(dir.path().join("cut.pyc"), truncated).expect("write");
+    let findings = scan_tree(dir.path(), &fp, &ScanOptions::default());
+    let gaps: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.channel == "pyc_limit_exceeded")
+        .collect();
+    assert_eq!(gaps.len(), 1, "{findings:?}");
+    assert!(gaps[0].path.ends_with("deep.pyc"));
+    assert_eq!(gaps[0].severity, Severity::Info);
+}

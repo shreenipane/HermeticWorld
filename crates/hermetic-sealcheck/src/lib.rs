@@ -56,7 +56,10 @@ pub use index::{
 };
 pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
-pub use pyc_marshal::{parse_pyc_code_objects, HashedPycCodeObject, PycCodeObject};
+pub use pyc_marshal::{
+    parse_pyc_code_objects, parse_pyc_code_objects_outcome, HashedPycCodeObject, PycCodeObject,
+    PycParseOutcome,
+};
 pub use sarif::{
     generate_sarif, generate_sarif_with_options, generate_sarif_with_properties, SarifLog,
     SarifRunProperties,

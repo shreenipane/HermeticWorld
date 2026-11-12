@@ -313,15 +313,31 @@ fn get_line_indent(line: &str) -> Option<usize> {
     None
 }
 
+/// Whitespace that separates Python tokens on one line (space, tab, form feed).
+fn is_py_inline_space(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\x0c'
+}
+
+/// Strips the keyword `kw` from the start of `s` when it is a whole token followed by
+/// inline whitespace, and returns the rest with that whitespace removed.
+fn strip_py_keyword<'s>(s: &'s str, kw: &str) -> Option<&'s str> {
+    let rest = s.strip_prefix(kw)?;
+    if !rest.starts_with(is_py_inline_space) {
+        return None;
+    }
+    Some(rest.trim_start_matches(is_py_inline_space))
+}
+
 fn parse_def_or_class(line: &str) -> Option<(String, bool)> {
-    let trimmed = line.trim_start();
-    let (ident_part, is_class) = if let Some(rest) = trimmed.strip_prefix("def ") {
-        (rest.trim_start(), false)
-    } else if let Some(rest) = trimmed.strip_prefix("async def ") {
-        (rest.trim_start(), false)
+    let trimmed = line.trim_start_matches(is_py_inline_space);
+    let (ident_part, is_class) = if let Some(rest) = strip_py_keyword(trimmed, "def") {
+        (rest, false)
+    } else if let Some(rest) =
+        strip_py_keyword(trimmed, "async").and_then(|r| strip_py_keyword(r, "def"))
+    {
+        (rest, false)
     } else {
-        let rest = trimmed.strip_prefix("class ")?;
-        (rest.trim_start(), true)
+        (strip_py_keyword(trimmed, "class")?, true)
     };
 
     let mut end = 0;
@@ -535,8 +551,28 @@ fn decode_py_string_literal(tok_text: &str) -> Option<String> {
     if is_raw {
         return Some(content.to_string());
     }
+    Some(decode_py_escapes(content))
+}
 
-    // Decode escapes
+/// Prefix that marks a string skeleton symbol (see `pyc_string_skeleton`).
+pub(crate) const PYC_SKELETON_PREFIX: &str = "\u{1}pyc-skeleton:";
+
+/// The skeleton of a string: every non-ASCII character replaced by U+FFFD, behind
+/// `PYC_SKELETON_PREFIX`. A source literal with a `\N{...}` escape whose name is not in the
+/// built-in table can only be matched through its skeleton; the marshal side adds the
+/// skeleton of every non-ASCII string constant.
+pub(crate) fn pyc_string_skeleton(s: &str) -> String {
+    let mut out = String::with_capacity(PYC_SKELETON_PREFIX.len().saturating_add(s.len()));
+    out.push_str(PYC_SKELETON_PREFIX);
+    out.extend(s.chars().map(|c| if c.is_ascii() { c } else { '\u{FFFD}' }));
+    out
+}
+
+/// Decodes the backslash escapes of a non-raw string body as the compiler does. When a
+/// `\N{...}` name is unknown, the result is the skeleton of the string, with that character
+/// standing for any non-ASCII character.
+fn decode_py_escapes(content: &str) -> String {
+    let mut unknown_name = false;
     let mut out = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
     while let Some(c) = chars.next() {
@@ -665,6 +701,28 @@ fn decode_py_string_literal(tok_text: &str) -> Option<String> {
                         out.push_str(&octal);
                     }
                 }
+                Some('N') if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    let mut name = String::new();
+                    let mut closed = false;
+                    for n in chars.by_ref() {
+                        if n == '}' {
+                            closed = true;
+                            break;
+                        }
+                        if name.len() >= 128 {
+                            break;
+                        }
+                        name.push(n);
+                    }
+                    match lookup_unicode_name(&name).filter(|_| closed) {
+                        Some(ch) => out.push(ch),
+                        None => {
+                            unknown_name = true;
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                }
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -677,11 +735,409 @@ fn decode_py_string_literal(tok_text: &str) -> Option<String> {
             out.push(c);
         }
     }
+    if unknown_name {
+        pyc_string_skeleton(&out)
+    } else {
+        out
+    }
+}
+
+/// Characters for common `\N{...}` names and aliases (matched case-insensitively), plus the
+/// algorithmic ASCII letter, digit, Greek letter and CJK ideograph names. Other names fall
+/// back to skeleton matching.
+fn lookup_unicode_name(name: &str) -> Option<char> {
+    let upper = name.trim().to_ascii_uppercase();
+    if let Some(l) = upper.strip_prefix("LATIN CAPITAL LETTER ") {
+        let mut it = l.chars();
+        return match (it.next(), it.next()) {
+            (Some(c), None) if c.is_ascii_uppercase() => Some(c),
+            _ => None,
+        };
+    }
+    if let Some(l) = upper.strip_prefix("LATIN SMALL LETTER ") {
+        let mut it = l.chars();
+        return match (it.next(), it.next()) {
+            (Some(c), None) if c.is_ascii_uppercase() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        };
+    }
+    if let Some(hex) = upper.strip_prefix("CJK UNIFIED IDEOGRAPH-") {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+    }
+    const DIGITS: &[&str] = &[
+        "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE",
+    ];
+    if let Some(d) = upper.strip_prefix("DIGIT ") {
+        let idx = DIGITS.iter().position(|n| *n == d)?;
+        return char::from_digit(u32::try_from(idx).ok()?, 10);
+    }
+    // Greek letters in code-point order from U+03B1 (small) / U+0391 (capital); the
+    // capital block has an unassigned slot where final sigma sits in the small block.
+    const GREEK: &[&str] = &[
+        "ALPHA",
+        "BETA",
+        "GAMMA",
+        "DELTA",
+        "EPSILON",
+        "ZETA",
+        "ETA",
+        "THETA",
+        "IOTA",
+        "KAPPA",
+        "LAMDA",
+        "MU",
+        "NU",
+        "XI",
+        "OMICRON",
+        "PI",
+        "RHO",
+        "FINAL SIGMA",
+        "SIGMA",
+        "TAU",
+        "UPSILON",
+        "PHI",
+        "CHI",
+        "PSI",
+        "OMEGA",
+    ];
+    for (base, prefix) in [
+        (0x03B1u32, "GREEK SMALL LETTER "),
+        (0x0391u32, "GREEK CAPITAL LETTER "),
+    ] {
+        if let Some(g) = upper.strip_prefix(prefix) {
+            if base == 0x0391 && g == "FINAL SIGMA" {
+                return None;
+            }
+            let idx = GREEK.iter().position(|n| *n == g)?;
+            return char::from_u32(base.checked_add(u32::try_from(idx).ok()?)?);
+        }
+    }
+    const TABLE: &[(&str, char)] = &[
+        ("NULL", '\0'),
+        ("NUL", '\0'),
+        ("CHARACTER TABULATION", '\t'),
+        ("HORIZONTAL TABULATION", '\t'),
+        ("TAB", '\t'),
+        ("LINE FEED", '\n'),
+        ("NEW LINE", '\n'),
+        ("END OF LINE", '\n'),
+        ("LF", '\n'),
+        ("NL", '\n'),
+        ("EOL", '\n'),
+        ("LINE TABULATION", '\u{0B}'),
+        ("FORM FEED", '\u{0C}'),
+        ("FF", '\u{0C}'),
+        ("CARRIAGE RETURN", '\r'),
+        ("CR", '\r'),
+        ("ESCAPE", '\u{1B}'),
+        ("ESC", '\u{1B}'),
+        ("DELETE", '\u{7F}'),
+        ("DEL", '\u{7F}'),
+        ("SPACE", ' '),
+        ("SP", ' '),
+        ("EXCLAMATION MARK", '!'),
+        ("QUOTATION MARK", '"'),
+        ("NUMBER SIGN", '#'),
+        ("DOLLAR SIGN", '$'),
+        ("PERCENT SIGN", '%'),
+        ("AMPERSAND", '&'),
+        ("APOSTROPHE", '\''),
+        ("LEFT PARENTHESIS", '('),
+        ("RIGHT PARENTHESIS", ')'),
+        ("ASTERISK", '*'),
+        ("PLUS SIGN", '+'),
+        ("COMMA", ','),
+        ("HYPHEN-MINUS", '-'),
+        ("FULL STOP", '.'),
+        ("SOLIDUS", '/'),
+        ("COLON", ':'),
+        ("SEMICOLON", ';'),
+        ("LESS-THAN SIGN", '<'),
+        ("EQUALS SIGN", '='),
+        ("GREATER-THAN SIGN", '>'),
+        ("QUESTION MARK", '?'),
+        ("COMMERCIAL AT", '@'),
+        ("LEFT SQUARE BRACKET", '['),
+        ("REVERSE SOLIDUS", '\\'),
+        ("RIGHT SQUARE BRACKET", ']'),
+        ("CIRCUMFLEX ACCENT", '^'),
+        ("LOW LINE", '_'),
+        ("GRAVE ACCENT", '`'),
+        ("LEFT CURLY BRACKET", '{'),
+        ("VERTICAL LINE", '|'),
+        ("RIGHT CURLY BRACKET", '}'),
+        ("TILDE", '~'),
+        ("NO-BREAK SPACE", '\u{A0}'),
+        ("NBSP", '\u{A0}'),
+        ("INVERTED EXCLAMATION MARK", '\u{A1}'),
+        ("CENT SIGN", '\u{A2}'),
+        ("POUND SIGN", '\u{A3}'),
+        ("YEN SIGN", '\u{A5}'),
+        ("SECTION SIGN", '\u{A7}'),
+        ("COPYRIGHT SIGN", '\u{A9}'),
+        ("LEFT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{AB}'),
+        ("NOT SIGN", '\u{AC}'),
+        ("SOFT HYPHEN", '\u{AD}'),
+        ("SHY", '\u{AD}'),
+        ("REGISTERED SIGN", '\u{AE}'),
+        ("DEGREE SIGN", '\u{B0}'),
+        ("PLUS-MINUS SIGN", '\u{B1}'),
+        ("MICRO SIGN", '\u{B5}'),
+        ("PILCROW SIGN", '\u{B6}'),
+        ("MIDDLE DOT", '\u{B7}'),
+        ("RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{BB}'),
+        ("INVERTED QUESTION MARK", '\u{BF}'),
+        ("MULTIPLICATION SIGN", '\u{D7}'),
+        ("DIVISION SIGN", '\u{F7}'),
+        ("EN DASH", '\u{2013}'),
+        ("EM DASH", '\u{2014}'),
+        ("LEFT SINGLE QUOTATION MARK", '\u{2018}'),
+        ("RIGHT SINGLE QUOTATION MARK", '\u{2019}'),
+        ("LEFT DOUBLE QUOTATION MARK", '\u{201C}'),
+        ("RIGHT DOUBLE QUOTATION MARK", '\u{201D}'),
+        ("DAGGER", '\u{2020}'),
+        ("BULLET", '\u{2022}'),
+        ("HORIZONTAL ELLIPSIS", '\u{2026}'),
+        ("ZERO WIDTH SPACE", '\u{200B}'),
+        ("ZWSP", '\u{200B}'),
+        ("ZERO WIDTH NON-JOINER", '\u{200C}'),
+        ("ZWNJ", '\u{200C}'),
+        ("ZERO WIDTH JOINER", '\u{200D}'),
+        ("ZWJ", '\u{200D}'),
+        ("EURO SIGN", '\u{20AC}'),
+        ("TRADE MARK SIGN", '\u{2122}'),
+        ("LEFTWARDS ARROW", '\u{2190}'),
+        ("UPWARDS ARROW", '\u{2191}'),
+        ("RIGHTWARDS ARROW", '\u{2192}'),
+        ("DOWNWARDS ARROW", '\u{2193}'),
+        ("INFINITY", '\u{221E}'),
+        ("SNOWMAN", '\u{2603}'),
+        ("BLACK STAR", '\u{2605}'),
+        ("WHITE STAR", '\u{2606}'),
+        ("CHECK MARK", '\u{2713}'),
+        ("HEAVY CHECK MARK", '\u{2714}'),
+        ("BALLOT X", '\u{2717}'),
+        ("ZERO WIDTH NO-BREAK SPACE", '\u{FEFF}'),
+        ("BYTE ORDER MARK", '\u{FEFF}'),
+        ("BOM", '\u{FEFF}'),
+        ("REPLACEMENT CHARACTER", '\u{FFFD}'),
+    ];
+    TABLE.iter().find(|(n, _)| *n == upper).map(|(_, c)| *c)
+}
+
+/// Nesting limit for f-strings inside f-string replacement fields.
+const MAX_FSTRING_DEPTH: usize = 4;
+
+/// The symbols a string-literal token contributes to a code object: the decoded constant
+/// for an ordinary string, or for an f-string its literal pieces (constants) plus the
+/// symbols of its replacement-field expressions and format specs. `None` when the token
+/// is not a string literal.
+fn py_literal_symbols(tok_text: &str) -> Option<Vec<String>> {
+    py_literal_symbols_depth(tok_text, 0)
+}
+
+fn py_literal_symbols_depth(tok_text: &str, depth: usize) -> Option<Vec<String>> {
+    let quote_start = tok_text
+        .bytes()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(tok_text.len());
+    let prefix = tok_text.get(..quote_start)?;
+    if !prefix.contains(['f', 'F']) {
+        return decode_py_string_literal(tok_text).map(|c| vec![c]);
+    }
+    if prefix.len() > 2 || !prefix.chars().all(|c| "fFrR".contains(c)) {
+        return None;
+    }
+    let is_raw = prefix.contains(['r', 'R']);
+    let rest = tok_text.get(quote_start..)?;
+    let quote = ["\"\"\"", "'''", "\"", "'"]
+        .into_iter()
+        .find(|q| rest.starts_with(q))?;
+    let inner = rest.strip_prefix(quote).unwrap_or(rest);
+    let body = inner.strip_suffix(quote).unwrap_or(inner);
+    let mut out = Vec::new();
+    fstring_body_symbols(body, is_raw, depth, &mut out);
     Some(out)
 }
 
+fn push_fstring_literal(raw_piece: &str, is_raw: bool, literal: &mut String) {
+    if is_raw {
+        literal.push_str(raw_piece);
+    } else {
+        literal.push_str(&decode_py_escapes(raw_piece));
+    }
+}
+
+/// Splits an f-string body into literal pieces (constants) and replacement fields, whose
+/// expression symbols and format-spec pieces are added recursively.
+fn fstring_body_symbols(body: &str, is_raw: bool, depth: usize, out: &mut Vec<String>) {
+    let bytes = body.as_bytes();
+    let mut literal = String::new();
+    let mut piece_start = 0usize;
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if (b == b'{' || b == b'}') && bytes.get(i.saturating_add(1)) == Some(&b) {
+            push_fstring_literal(body.get(piece_start..i).unwrap_or(""), is_raw, &mut literal);
+            literal.push(char::from(b));
+            i = i.saturating_add(2);
+            piece_start = i;
+            continue;
+        }
+        if b == b'{' {
+            push_fstring_literal(body.get(piece_start..i).unwrap_or(""), is_raw, &mut literal);
+            let field_start = i.saturating_add(1);
+            let field_end = fstring_field_end(bytes, field_start);
+            let field = body.get(field_start..field_end).unwrap_or("");
+            let (expr, spec, self_doc) = split_fstring_field(field);
+            if self_doc {
+                // `{x=}` stores the expression text and `=` as a literal piece.
+                literal.push_str(field.get(..expr.len().saturating_add(1)).unwrap_or(""));
+            }
+            if !literal.is_empty() {
+                out.push(std::mem::take(&mut literal));
+            }
+            if depth < MAX_FSTRING_DEPTH {
+                out.extend(collect_symbol_set_depth(&[expr], depth.saturating_add(1)));
+                if let Some(spec) = spec {
+                    fstring_body_symbols(spec, is_raw, depth.saturating_add(1), out);
+                }
+            }
+            i = field_end.saturating_add(1);
+            piece_start = i;
+            continue;
+        }
+        i = i.saturating_add(1);
+    }
+    push_fstring_literal(body.get(piece_start..).unwrap_or(""), is_raw, &mut literal);
+    if !literal.is_empty() {
+        out.push(literal);
+    }
+}
+
+/// Index of the `}` closing the replacement field that starts at `start` (or the body end).
+fn fstring_field_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = start;
+    while let Some(&b) = bytes.get(i) {
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i = i.saturating_add(1);
+            } else if b == q {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b'}' if depth == 0 => return i,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    bytes.len()
+}
+
+/// Splits a replacement field into its expression, optional format spec, and whether it
+/// is a self-documenting `expr=` field.
+fn split_fstring_field(field: &str) -> (&str, Option<&str>, bool) {
+    let bytes = field.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut expr_end = bytes.len();
+    let mut spec = None;
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i = i.saturating_add(1);
+            } else if b == q {
+                quote = None;
+            }
+            i = i.saturating_add(1);
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'!' if depth == 0 && bytes.get(i.saturating_add(1)) != Some(&b'=') => {
+                expr_end = i;
+                spec = field
+                    .get(i..)
+                    .and_then(|r| r.find(':'))
+                    .and_then(|colon| field.get(i.saturating_add(colon).saturating_add(1)..));
+                break;
+            }
+            b':' if depth == 0 => {
+                expr_end = i;
+                spec = field.get(i.saturating_add(1)..);
+                break;
+            }
+            _ => {}
+        }
+        i = i.saturating_add(1);
+    }
+    let expr = field.get(..expr_end).unwrap_or("");
+    let trimmed = expr.trim_end();
+    let self_doc = trimmed.ends_with('=')
+        && !trimmed.ends_with("==")
+        && !trimmed.ends_with("!=")
+        && !trimmed.ends_with("<=")
+        && !trimmed.ends_with(">=");
+    let expr = if self_doc {
+        trimmed.strip_suffix('=').unwrap_or(trimmed)
+    } else {
+        expr
+    };
+    (expr, spec, self_doc)
+}
+
+/// Merges a `.` immediately followed (no whitespace) by a digit token into one float
+/// token: Python's tokenizer reads `.3` and `.3e5` as numbers.
+fn merge_leading_dot_floats(
+    text: &str,
+    tokens: Vec<crate::winnow::Token>,
+) -> Vec<crate::winnow::Token> {
+    let mut out: Vec<crate::winnow::Token> = Vec::with_capacity(tokens.len());
+    let mut source_end = 0usize;
+    let mut iter = tokens.into_iter().peekable();
+    while let Some(mut token) = iter.next() {
+        let start = text
+            .get(source_end..)
+            .and_then(|s| s.find(&token.text))
+            .and_then(|offset| source_end.checked_add(offset))
+            .unwrap_or(source_end);
+        source_end = start.saturating_add(token.text.len());
+        if token.text == "." {
+            let adjacent_digit = iter.peek().is_some_and(|next| {
+                next.text.starts_with(|c: char| c.is_ascii_digit())
+                    && text
+                        .get(source_end..)
+                        .is_some_and(|s| s.starts_with(&next.text))
+            });
+            // `1..3`-style input and attribute access never put a digit right after `.`
+            // in valid code, except a float literal.
+            let after_number = out
+                .last()
+                .is_some_and(|p| p.text.starts_with(|c: char| c.is_ascii_digit()));
+            if adjacent_digit && !after_number {
+                if let Some(number) = iter.next() {
+                    source_end = source_end.saturating_add(number.text.len());
+                    token.text.push_str(&number.text);
+                }
+            }
+        }
+        out.push(token);
+    }
+    out
+}
+
 fn pyc_literal_tokens(text: &str) -> Vec<crate::winnow::Token> {
-    let tokens = crate::winnow::tokenize(text);
+    let tokens = merge_leading_dot_floats(text, crate::winnow::tokenize(text));
     let mut result: Vec<crate::winnow::Token> = Vec::new();
     let mut iter = tokens.into_iter().peekable();
     let mut source_end = 0usize;
@@ -693,7 +1149,10 @@ fn pyc_literal_tokens(text: &str) -> Vec<crate::winnow::Token> {
             .unwrap_or(source_end);
         source_end = start.saturating_add(token.text.len());
         let prefix = token.text.to_ascii_lowercase();
-        if matches!(prefix.as_str(), "r" | "b" | "u" | "br" | "rb") {
+        if matches!(
+            prefix.as_str(),
+            "r" | "b" | "u" | "br" | "rb" | "f" | "rf" | "fr"
+        ) {
             if let Some(next) = iter.peek() {
                 if next.text.starts_with(['\'', '"'])
                     && text
@@ -749,11 +1208,7 @@ fn pyc_literal_tokens(text: &str) -> Vec<crate::winnow::Token> {
                         | "@"
                 )
             });
-            if unary
-                && iter
-                    .peek()
-                    .is_some_and(|next| next.text.starts_with(|c: char| c.is_ascii_digit()))
-            {
+            if unary && iter.peek().is_some_and(|next| is_pyc_number(&next.text)) {
                 if let Some(number) = iter.next() {
                     if let Some(offset) = text.get(source_end..).and_then(|s| s.find(&number.text))
                     {
@@ -776,12 +1231,91 @@ fn pyc_literal_tokens(text: &str) -> Vec<crate::winnow::Token> {
 }
 
 fn is_pyc_number(text: &str) -> bool {
-    text.strip_prefix('-')
-        .unwrap_or(text)
-        .starts_with(|c: char| c.is_ascii_digit())
+    let t = text.strip_prefix('-').unwrap_or(text);
+    let t = t.strip_prefix('.').unwrap_or(t);
+    t.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Most bits of an integer the marshal reader decodes (256 15-bit digits); a longer
+/// literal can never match a marshalled constant and is left as source text. This also
+/// bounds the conversion work per literal byte by a constant.
+const MAX_BIG_INT_LITERAL_BITS: usize = 256 * 15;
+
+/// Converts the digits of an integer literal in `radix` (2, 8, 10 or 16) to decimal text
+/// without leading zeros, using base-1e9 limbs. `None` on a non-digit or an overlong input.
+fn big_int_to_decimal(digits: &str, radix: u32) -> Option<String> {
+    let bits_per_digit: usize = match radix {
+        2 => 1,
+        8 => 3,
+        10 => 3, // log2(10) > 3: a slightly generous cap
+        16 => 4,
+        _ => return None,
+    };
+    let max_digits = MAX_BIG_INT_LITERAL_BITS / bits_per_digit + 1;
+    if digits.is_empty() || digits.len() > max_digits {
+        return None;
+    }
+    const LIMB: u64 = 1_000_000_000;
+    // Little-endian base-1e9 limbs.
+    let mut limbs: Vec<u64> = vec![0];
+    for c in digits.chars() {
+        let d = u64::from(c.to_digit(radix)?);
+        let mut carry = d;
+        for limb in limbs.iter_mut() {
+            let v = limb.checked_mul(u64::from(radix))?.checked_add(carry)?;
+            *limb = v % LIMB;
+            carry = v / LIMB;
+        }
+        while carry > 0 {
+            limbs.push(carry % LIMB);
+            carry /= LIMB;
+        }
+    }
+    while limbs.len() > 1 && limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    let mut out = String::new();
+    for (i, limb) in limbs.iter().rev().enumerate() {
+        if i == 0 {
+            out.push_str(&limb.to_string());
+        } else {
+            out.push_str(&format!("{limb:09}"));
+        }
+    }
+    Some(out)
 }
 
 fn normalize_py_numeric_literal(text: &str) -> String {
+    let normalized = normalize_py_numeric_literal_small(text);
+    if normalized != text {
+        return normalized;
+    }
+    // Integers beyond i128, as the compiler stores them: decimal, no `_`, no leading zeros.
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let s = body.replace('_', "");
+    let lower = s.to_ascii_lowercase();
+    let converted = if let Some(h) = lower.strip_prefix("0x") {
+        big_int_to_decimal(h, 16)
+    } else if let Some(o) = lower.strip_prefix("0o") {
+        big_int_to_decimal(o, 8)
+    } else if let Some(b) = lower.strip_prefix("0b") {
+        big_int_to_decimal(b, 2)
+    } else if lower.bytes().all(|b| b.is_ascii_digit()) {
+        big_int_to_decimal(&lower, 10)
+    } else {
+        None
+    };
+    match converted {
+        Some(v) if v == "0" => v,
+        Some(v) => format!("{sign}{v}"),
+        None => text.to_string(),
+    }
+}
+
+fn normalize_py_numeric_literal_small(text: &str) -> String {
     let s = text.replace('_', "");
     if s.starts_with("0x") || s.starts_with("0X") {
         if let Ok(v) = i128::from_str_radix(&s[2..], 16) {
@@ -806,6 +1340,10 @@ fn normalize_py_numeric_literal(text: &str) -> String {
 }
 
 fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
+    collect_symbol_set_depth(lines, 0)
+}
+
+fn collect_symbol_set_depth(lines: &[&str], depth: usize) -> HashSet<String> {
     let text = lines.join("\n");
     let tokens = pyc_literal_tokens(&text);
     let mut symbols = HashSet::new();
@@ -813,8 +1351,8 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     let starts = statement_starts(&tokens);
 
     for (idx, tok) in tokens.iter().enumerate() {
-        if let Some(content) = decode_py_string_literal(&tok.text) {
-            symbols.insert(content);
+        if let Some(contents) = py_literal_symbols_depth(&tok.text, depth) {
+            symbols.extend(contents);
             prev_is_dot = false;
         } else if is_pyc_number(&tok.text) {
             symbols.insert(normalize_py_numeric_literal(&tok.text));
@@ -962,6 +1500,8 @@ fn parse_def_or_class_header(
     let mut depth = 0usize;
     let mut header_end = def_line;
     let mut colon_byte_idx = None;
+    // Triple-quote state carries across the physical lines of the logical header.
+    let mut in_triple: Option<u8> = None;
 
     for (idx, line) in lines.iter().enumerate().skip(def_line) {
         if idx > def_line && !is_cont.get(idx).copied().unwrap_or(false) {
@@ -974,12 +1514,30 @@ fn parse_def_or_class_header(
         let len = bytes.len();
 
         while i < len {
+            let at = |k: usize| bytes.get(k).copied();
             let b = bytes[i];
+            if let Some(q) = in_triple {
+                // Inside a triple-quoted string, which may span lines of the header.
+                if b == b'\\' {
+                    i = i.saturating_add(2);
+                } else if b == q && at(i + 1) == Some(q) && at(i + 2) == Some(q) {
+                    in_triple = None;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
             if b == b'#' {
                 break;
             }
             if b == b'\'' || b == b'"' {
                 let quote = b;
+                if at(i + 1) == Some(quote) && at(i + 2) == Some(quote) {
+                    in_triple = Some(quote);
+                    i += 3;
+                    continue;
+                }
                 i += 1;
                 while i < len {
                     if bytes[i] == b'\\' && i + 1 < len {
@@ -1050,8 +1608,8 @@ fn parse_def_or_class_header(
                 continue;
             }
             if in_parens {
-                if let Some(content) = decode_py_string_literal(&tok.text) {
-                    enclosing_symbols.insert(content);
+                if let Some(contents) = py_literal_symbols(&tok.text) {
+                    enclosing_symbols.extend(contents);
                     prev_is_dot = false;
                 } else if is_pyc_number(&tok.text) {
                     enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
@@ -1141,8 +1699,8 @@ fn parse_def_or_class_header(
                 }
 
                 if state == ParamState::InAnnotation || state == ParamState::InDefault {
-                    if let Some(content) = decode_py_string_literal(&tok.text) {
-                        enclosing_symbols.insert(content);
+                    if let Some(contents) = py_literal_symbols(&tok.text) {
+                        enclosing_symbols.extend(contents);
                         prev_is_dot = false;
                     } else if is_pyc_number(&tok.text) {
                         enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
@@ -1170,8 +1728,8 @@ fn parse_def_or_class_header(
                 }
                 prev_was_dash = tok.text == "-";
                 if in_return_ann {
-                    if let Some(content) = decode_py_string_literal(&tok.text) {
-                        enclosing_symbols.insert(content);
+                    if let Some(contents) = py_literal_symbols(&tok.text) {
+                        enclosing_symbols.extend(contents);
                         prev_is_dot = false;
                     } else if is_pyc_number(&tok.text) {
                         enclosing_symbols.insert(normalize_py_numeric_literal(&tok.text));
@@ -1206,19 +1764,43 @@ struct PycDefinition {
     end_line: usize,
     base_indent: usize,
     parent: Option<usize>,
-    key: Vec<(String, usize)>,
+    /// Fixed-size identity of the parent scope path (all zeros at module level).
+    parent_path: ScopePathId,
+    /// Fixed-size identity of this definition's scope path: the parent path, the name and
+    /// the occurrence of that name in the parent. Two analyses (base and fixed) compare these
+    /// without cloning whole paths.
+    path: ScopePathId,
 }
 
+type ScopePathId = [u8; 32];
+
+fn child_scope_path(parent: &ScopePathId, name: &str, ordinal: usize) -> ScopePathId {
+    let mut h = Sha256::new();
+    h.update(parent);
+    h.update((name.len() as u64).to_le_bytes());
+    h.update(name.as_bytes());
+    h.update((ordinal as u64).to_le_bytes());
+    h.finalize().into()
+}
+
+/// Discovers the `def`/`class` scopes of a file.
+///
+/// Work and memory are linear in the file: each definition stores only its own name and
+/// fixed-size path identities, occurrences are counted per (parent path, name hash), and
+/// the line-to-scope map is built in one pass. One budget unit is charged per line and per
+/// 1 KiB of definition name.
 fn pyc_definitions(
     lines: &[String],
     continuation: &[bool],
-) -> (Vec<PycDefinition>, Vec<Option<usize>>) {
+    budget: &mut WorkBudget,
+) -> Result<(Vec<PycDefinition>, Vec<Option<usize>>), FingerprintError> {
     let mut definitions: Vec<PycDefinition> = Vec::new();
     let mut scopes: Vec<(usize, usize)> = Vec::new();
-    let mut occurrences = HashMap::new();
+    let mut occurrences: HashMap<(ScopePathId, ScopePathId), usize> = HashMap::new();
     let mut active_stack: Vec<(usize, usize)> = Vec::new();
 
     for (pos, line) in lines.iter().enumerate() {
+        budget.charge(1)?;
         if continuation.get(pos).copied().unwrap_or(false) {
             continue;
         }
@@ -1239,13 +1821,13 @@ fn pyc_definitions(
             scopes.pop();
         }
         if let Some((name, _)) = parse_def_or_class(line) {
+            budget.charge(name.len() / 1024)?;
             let parent = scopes.last().and_then(|(_, index)| definitions.get(*index));
-            let mut key = parent.map(|d| d.key.clone()).unwrap_or_default();
+            let parent_path = parent.map(|d| d.path).unwrap_or([0u8; 32]);
             let parent_pos = parent.map(|d| d.pos);
-            let ordinal = occurrences
-                .entry((key.clone(), name.clone()))
-                .or_insert(0usize);
-            key.push((name.clone(), *ordinal));
+            let name_id: ScopePathId = Sha256::digest(name.as_bytes()).into();
+            let ordinal = occurrences.entry((parent_path, name_id)).or_insert(0usize);
+            let path = child_scope_path(&parent_path, &name, *ordinal);
             *ordinal = ordinal.saturating_add(1);
             let def_idx = definitions.len();
             scopes.push((indent, def_idx));
@@ -1256,21 +1838,33 @@ fn pyc_definitions(
                 end_line: lines.len(),
                 base_indent: indent,
                 parent: parent_pos,
-                key,
+                parent_path,
+                path,
             });
         }
     }
 
+    // Innermost enclosing definition per line, in one pass: definitions are in source
+    // order and properly nested, so a stack of open definitions suffices.
     let mut line_scopes = vec![None; lines.len()];
-    for (idx, def) in definitions.iter().enumerate() {
-        for l in def.pos..def.end_line.min(lines.len()) {
-            if let Some(slot) = line_scopes.get_mut(l) {
-                *slot = Some(idx);
-            }
+    let mut open: Vec<usize> = Vec::new();
+    let mut next_def = 0usize;
+    for (l, slot) in line_scopes.iter_mut().enumerate() {
+        while open
+            .last()
+            .and_then(|&i| definitions.get(i))
+            .is_some_and(|d| d.end_line <= l)
+        {
+            open.pop();
         }
+        while definitions.get(next_def).is_some_and(|d| d.pos == l) {
+            open.push(next_def);
+            next_def = next_def.saturating_add(1);
+        }
+        *slot = open.last().copied();
     }
 
-    (definitions, line_scopes)
+    Ok((definitions, line_scopes))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1456,11 +2050,7 @@ fn corresponding_pyc_definition(
     let Some(source_def) = source_def else {
         return Ok(None);
     };
-    let key = &source_def.key;
-    let parent_key = match key.get(..key.len().saturating_sub(1)) {
-        Some(k) => k,
-        None => return Ok(None),
-    };
+    let parent_key = source_def.parent_path;
 
     let candidates = match destination.definitions_by_name.get(name) {
         Some(c) => c,
@@ -1471,9 +2061,7 @@ fn corresponding_pyc_definition(
     let best = candidates
         .iter()
         .filter_map(|&idx| destination.definitions.get(idx))
-        .filter(|d| {
-            !used.contains(&d.pos) && d.key.get(..d.key.len().saturating_sub(1)) == Some(parent_key)
-        })
+        .filter(|d| !used.contains(&d.pos) && d.parent_path == parent_key)
         .min_by_key(|d| (d.pos.abs_diff(hint), d.pos))
         .map(|d| d.pos);
 
@@ -1488,14 +2076,14 @@ struct PycFileAnalysis<'a> {
     definitions_by_name: HashMap<String, Vec<usize>>,
     line_scopes: Vec<Option<usize>>,
     headers: HashMap<usize, Option<ParsedDefHeader>>,
-    scope_membership: HashMap<usize, (String, usize)>,
+    scope_membership: HashMap<usize, Option<usize>>,
     symbols: HashMap<(String, usize), HashSet<String>>,
 }
 
 impl<'a> PycFileAnalysis<'a> {
-    fn new(lines: &'a [String]) -> Self {
+    fn new(lines: &'a [String], budget: &mut WorkBudget) -> Result<Self, FingerprintError> {
         let continuation = compute_line_continuation(lines);
-        let (definitions, line_scopes) = pyc_definitions(lines, &continuation);
+        let (definitions, line_scopes) = pyc_definitions(lines, &continuation, budget)?;
         let mut definition_by_pos = HashMap::with_capacity(definitions.len());
         let mut definitions_by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, def) in definitions.iter().enumerate() {
@@ -1505,7 +2093,7 @@ impl<'a> PycFileAnalysis<'a> {
                 .or_default()
                 .push(idx);
         }
-        Self {
+        Ok(Self {
             lines,
             continuation,
             definitions,
@@ -1515,7 +2103,7 @@ impl<'a> PycFileAnalysis<'a> {
             headers: HashMap::new(),
             scope_membership: HashMap::new(),
             symbols: HashMap::new(),
-        }
+        })
     }
 
     fn get_or_parse_header(
@@ -1532,26 +2120,32 @@ impl<'a> PycFileAnalysis<'a> {
         Ok(self.headers.get(&def_pos).and_then(|opt| opt.as_ref()))
     }
 
+    /// The innermost definition (by index) enclosing line `pos`, or `None` for module level.
     fn get_scope_for_pos(
         &mut self,
         pos: usize,
         budget: &mut WorkBudget,
-    ) -> Result<(String, usize), FingerprintError> {
+    ) -> Result<Option<usize>, FingerprintError> {
         if let Some(scope) = self.scope_membership.get(&pos) {
-            return Ok(scope.clone());
+            return Ok(*scope);
         }
         budget.charge(1)?;
-        let scope = if let Some(&Some(def_idx)) = self.line_scopes.get(pos) {
-            if let Some(def) = self.definitions.get(def_idx) {
-                (def.name.clone(), def.pos)
-            } else {
-                ("<module>".to_string(), 0)
-            }
-        } else {
-            ("<module>".to_string(), 0)
-        };
-        self.scope_membership.insert(pos, scope.clone());
+        let scope = self
+            .line_scopes
+            .get(pos)
+            .copied()
+            .flatten()
+            .filter(|&i| i < self.definitions.len());
+        self.scope_membership.insert(pos, scope);
         Ok(scope)
+    }
+
+    /// The `(name, position)` of a scope; names are cloned once per distinct scope.
+    fn scope_name(&self, scope: Option<usize>) -> (String, usize) {
+        scope
+            .and_then(|i| self.definitions.get(i))
+            .map(|d| (d.name.clone(), d.pos))
+            .unwrap_or_else(|| ("<module>".to_string(), 0))
     }
 
     fn changed_scopes(
@@ -1560,12 +2154,12 @@ impl<'a> PycFileAnalysis<'a> {
         budget: &mut WorkBudget,
     ) -> Result<Vec<(String, usize)>, FingerprintError> {
         let mut result = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<Option<usize>> = HashSet::new();
         for &pos in positions {
             budget.charge(1)?;
             let enclosing = self.get_scope_for_pos(pos, budget)?;
-            if seen.insert(enclosing.clone()) {
-                result.push(enclosing);
+            if seen.insert(enclosing) {
+                result.push(self.scope_name(enclosing));
             }
             let idx = self.definitions.partition_point(|d| d.pos <= pos);
             if idx > 0 {
@@ -1574,16 +2168,10 @@ impl<'a> PycFileAnalysis<'a> {
                     let parent_pos = def.parent;
                     if let Some(header) = self.get_or_parse_header(def_pos, budget)? {
                         if pos <= header.header_end {
-                            let parent = parent_pos.and_then(|p| {
-                                self.definition_by_pos
-                                    .get(&p)
-                                    .and_then(|&i| self.definitions.get(i))
-                            });
-                            let enclosing_header_parent = parent
-                                .map(|d| (d.name.clone(), d.pos))
-                                .unwrap_or_else(|| ("<module>".to_string(), 0));
-                            if seen.insert(enclosing_header_parent.clone()) {
-                                result.push(enclosing_header_parent);
+                            let parent_scope =
+                                parent_pos.and_then(|p| self.definition_by_pos.get(&p).copied());
+                            if seen.insert(parent_scope) {
+                                result.push(self.scope_name(parent_scope));
                             }
                         }
                     }
@@ -2059,12 +2647,15 @@ impl FingerprintSet {
                 apply_patch_to_base(file, base_tree_root);
 
             let mut fixed_analysis = if file_path.ends_with(".py") {
-                Some(PycFileAnalysis::new(&post_fix_lines))
+                Some(PycFileAnalysis::new(&post_fix_lines, &mut budget)?)
             } else {
                 None
             };
             let mut base_analysis = if file_path.ends_with(".py") {
-                base_lines.as_ref().map(|b| PycFileAnalysis::new(b))
+                base_lines
+                    .as_ref()
+                    .map(|b| PycFileAnalysis::new(b, &mut budget))
+                    .transpose()?
             } else {
                 None
             };
@@ -3249,8 +3840,10 @@ mod t112_final_review_tests {
         let mut lines: Vec<String> = (0..n).map(|i| format!("def f{i}()")).collect();
         lines.push("Y = 1".to_string());
         let (symbols, used) = run_bounded(60, move || {
-            let mut analysis = PycFileAnalysis::new(&lines);
             let mut budget = WorkBudget::new(DEFAULT_MAX_FINGERPRINT_WORK);
+            let Ok(mut analysis) = PycFileAnalysis::new(&lines, &mut budget) else {
+                return (Err(FingerprintError::WorkBudgetExceeded), budget.used());
+            };
             let symbols = analysis.extract_symbols("<module>", 0, &mut budget);
             (symbols, budget.used())
         });

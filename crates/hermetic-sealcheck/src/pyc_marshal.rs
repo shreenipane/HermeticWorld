@@ -6,11 +6,13 @@ use crate::scan::{Finding, ScanOptions, Severity};
 
 // Aggregate per-stream limits cover parsing, reference expansion and extraction.
 const MAX_MARSHAL_INPUT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_MARSHAL_ALLOC_BYTES: usize = 32 * 1024 * 1024;
-const MAX_MARSHAL_PROCESSED_BYTES: usize = 32 * 1024 * 1024;
-const MAX_MARSHAL_WORK: usize = 200_000;
+const MAX_MARSHAL_ALLOC_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MARSHAL_PROCESSED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MARSHAL_WORK: usize = 2_000_000;
 const MAX_MARSHAL_GRAPH_DEPTH: usize = 64;
-const MAX_NUMERIC_ALLOCATION_BYTES: usize = 2048;
+/// Charged for one small int or binary float: its decimal text (at most 24 bytes for an
+/// `f64`, 11 for an `i32`) plus the shared-string header.
+const SCALAR_NUMERIC_ALLOCATION_BYTES: usize = 48;
 const CONTAINER_ALLOCATION_FACTOR: usize = 2;
 
 pub const MAX_MARSHAL_LONG_DIGITS: usize = 256;
@@ -303,8 +305,8 @@ impl<'a> MarshalParser<'a> {
             b'S' => MarshalValue::StopIteration,
             b'.' => MarshalValue::Ellipsis,
             b'i' => {
-                self.charge_allocation(MAX_NUMERIC_ALLOCATION_BYTES)?;
-                self.charge_bytes(MAX_NUMERIC_ALLOCATION_BYTES)?;
+                self.charge_allocation(SCALAR_NUMERIC_ALLOCATION_BYTES)?;
+                self.charge_bytes(4)?;
                 let v = self.read_i32()?;
                 MarshalValue::Int(v.to_string().into())
             }
@@ -389,8 +391,8 @@ impl<'a> MarshalParser<'a> {
                 MarshalValue::Float(text.into())
             }
             b'g' => {
-                self.charge_allocation(MAX_NUMERIC_ALLOCATION_BYTES)?;
-                self.charge_bytes(MAX_NUMERIC_ALLOCATION_BYTES)?;
+                self.charge_allocation(SCALAR_NUMERIC_ALLOCATION_BYTES)?;
+                self.charge_bytes(8)?;
                 let bytes = self.read_bytes(8)?;
                 let f = f64::from_le_bytes(bytes.try_into().map_err(|_| MarshalError::Truncated)?);
                 MarshalValue::Float(f.to_string().into())
@@ -633,6 +635,22 @@ impl<'a> MarshalParser<'a> {
                 }
             }
         }
+        // Skeletons let a source literal with an unknown `\N{...}` name match the constant.
+        let non_ascii: Vec<&String> = symbols.iter().filter(|s| !s.is_ascii()).collect();
+        let skeleton_bytes = non_ascii.iter().fold(0usize, |acc, s| {
+            // U+FFFD may be longer than the character it replaces.
+            acc.saturating_add(s.len().saturating_mul(2))
+                .saturating_add(crate::fingerprint::PYC_SKELETON_PREFIX.len())
+        });
+        let skeleton_count = non_ascii.len();
+        self.charge_work(skeleton_count)?;
+        self.charge_bytes(skeleton_bytes)?;
+        self.charge_allocation(skeleton_bytes.saturating_add(skeleton_count.saturating_mul(64)))?;
+        let skeletons: Vec<String> = non_ascii
+            .into_iter()
+            .map(|s| crate::fingerprint::pyc_string_skeleton(s))
+            .collect();
+        symbols.extend(skeletons);
         let index = self.code_objects.len();
         self.code_objects.push(PycCodeObject {
             name,
@@ -693,28 +711,51 @@ fn is_expression_scope_name(name: &str) -> bool {
     EXPRESSION_SCOPE_NAMES.contains(&name)
 }
 
-/// Parse all code objects from the marshal stream of a `.pyc` file.
-/// Unparseable input falls back silently to returning an empty `Vec`.
-pub fn parse_pyc_code_objects(bytes: &[u8]) -> Vec<PycCodeObject> {
+/// The result of reading the code objects of a `.pyc` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PycParseOutcome {
+    /// Every code object of the stream.
+    Parsed(Vec<PycCodeObject>),
+    /// The stream is not a well-formed marshal stream; there is nothing to check.
+    Malformed,
+    /// A resource limit (input size, nesting, work, bytes or allocation) stopped the read.
+    /// The file's code objects were not checked, which is a coverage gap to report.
+    LimitExceeded(String),
+}
+
+/// Reads all code objects of a `.pyc` file, telling malformed input apart from input that
+/// exceeds the reader's resource limits.
+pub fn parse_pyc_code_objects_outcome(bytes: &[u8]) -> PycParseOutcome {
     if bytes.len() > MAX_MARSHAL_INPUT_BYTES {
-        return Vec::new();
+        return PycParseOutcome::LimitExceeded(format!(
+            "pyc larger than {MAX_MARSHAL_INPUT_BYTES} bytes"
+        ));
     }
-    let magic = match crate::bytecode::pyc_magic(bytes) {
-        Some(m) => m,
-        None => return Vec::new(),
+    let Some(magic) = crate::bytecode::pyc_magic(bytes) else {
+        return PycParseOutcome::Malformed;
     };
     let header_len = crate::bytecode::pyc_header_len(magic);
-    if bytes.len() <= header_len {
-        return Vec::new();
-    }
-    let Some(body) = bytes.get(header_len..) else {
-        return Vec::new();
+    let Some(body) = bytes.get(header_len..).filter(|b| !b.is_empty()) else {
+        return PycParseOutcome::Malformed;
     };
     let mut parser = MarshalParser::new(body, magic);
-    if parser.read_object().is_err() {
-        return Vec::new();
+    match parser.read_object() {
+        Ok(_) => PycParseOutcome::Parsed(parser.code_objects),
+        Err(e @ (MarshalError::BudgetLimit | MarshalError::RecursionLimit)) => {
+            PycParseOutcome::LimitExceeded(e.to_string())
+        }
+        Err(_) => PycParseOutcome::Malformed,
     }
-    parser.code_objects
+}
+
+/// Parse all code objects from the marshal stream of a `.pyc` file.
+/// Unparseable input, and input over the resource limits, return an empty `Vec`; use
+/// `parse_pyc_code_objects_outcome` to tell those cases apart.
+pub fn parse_pyc_code_objects(bytes: &[u8]) -> Vec<PycCodeObject> {
+    match parse_pyc_code_objects_outcome(bytes) {
+        PycParseOutcome::Parsed(objects) => objects,
+        PycParseOutcome::Malformed | PycParseOutcome::LimitExceeded(_) => Vec::new(),
+    }
 }
 
 /// Match extracted code objects against FingerprintSet (D3b, channel `binary_pyc_function`).

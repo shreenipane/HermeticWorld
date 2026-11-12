@@ -485,9 +485,26 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     // Names and constants, matched exactly by the binary tier
                     self.sink
                         .binary(path, "binary_pyc", crate::binary::pyc_binary_strings(bytes));
-                    let code_objects = crate::pyc_marshal::parse_pyc_code_objects(bytes);
-                    if !code_objects.is_empty() {
-                        self.sink.pyc_code_objects(path, &code_objects);
+                    match crate::pyc_marshal::parse_pyc_code_objects_outcome(bytes) {
+                        crate::pyc_marshal::PycParseOutcome::Parsed(code_objects) => {
+                            if !code_objects.is_empty() {
+                                self.sink.pyc_code_objects(path, &code_objects);
+                            }
+                        }
+                        crate::pyc_marshal::PycParseOutcome::LimitExceeded(reason) => {
+                            // Coverage gap: the function-level check did not run.
+                            self.push(Finding {
+                                detector: "D3b".into(),
+                                channel: "pyc_limit_exceeded".into(),
+                                path: path.to_string(),
+                                visibility: self.opts.visibility,
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec![format!("pyc code objects not checked: {reason}")],
+                            });
+                        }
+                        crate::pyc_marshal::PycParseOutcome::Malformed => {}
                     }
                 }
                 ContainerType::Sqlite => {
