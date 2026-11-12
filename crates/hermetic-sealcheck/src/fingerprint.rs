@@ -168,6 +168,11 @@ pub struct FingerprintSet {
     pub tier2_capped: bool,
     /// The base-tree Python files sampled for Tier 2 IDF
     pub tier2_chosen_files: Vec<PathBuf>,
+    /// `\N{...}` names (upper case, sorted, at most `MAX_UNRESOLVED_UNICODE_NAMES`) the
+    /// Unicode name table did not know while fingerprinting `.pyc` scopes.
+    pub unresolved_unicode_names: Vec<String>,
+    /// Further distinct unresolved names beyond that bound.
+    pub unresolved_unicode_names_omitted: usize,
 }
 
 struct CandidateHunk {
@@ -512,7 +517,7 @@ fn is_contextual_keyword(tokens: &[crate::winnow::Token], idx: usize, is_start: 
     }
 }
 
-fn decode_py_string_literal(tok_text: &str) -> Option<String> {
+fn decode_py_string_literal(tok_text: &str, unresolved: &mut UnresolvedNames) -> Option<String> {
     let bytes = tok_text.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -551,27 +556,60 @@ fn decode_py_string_literal(tok_text: &str) -> Option<String> {
     if is_raw {
         return Some(content.to_string());
     }
-    Some(decode_py_escapes(content))
+    Some(decode_py_escapes(content, unresolved))
 }
 
-/// Delimits a `\N{...}` escape whose name the Unicode name table does not know. The
-/// source-side symbol keeps the name between two of these marks, so different unknown
-/// names stay distinct, and `FingerprintSet::coverage_gap_findings` reports them.
-pub(crate) const UNRESOLVED_NAME_MARK: char = '\u{FFFF}';
+/// Most distinct unresolved `\N{...}` names a fingerprint set records; more are counted.
+pub const MAX_UNRESOLVED_UNICODE_NAMES: usize = 64;
 
-/// The unresolved `\N{...}` names recorded in a symbol by `decode_py_escapes`.
-fn unresolved_unicode_names(symbol: &str) -> impl Iterator<Item = &str> {
-    symbol
-        .split(UNRESOLVED_NAME_MARK)
-        .skip(1)
-        .step_by(2)
-        .filter_map(|piece| piece.strip_prefix("\\N{")?.strip_suffix('}'))
+/// The `\N{...}` names the Unicode name table did not know, recorded out of band where
+/// the lookup fails: sorted, de-duplicated and bounded.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct UnresolvedNames {
+    names: std::collections::BTreeSet<String>,
+    omitted: usize,
 }
 
-/// Decodes the backslash escapes of a non-raw string body as the compiler does. A
-/// `\N{...}` name missing from the Unicode name table is kept, upper-cased, between two
-/// `UNRESOLVED_NAME_MARK`s.
-fn decode_py_escapes(content: &str) -> String {
+impl UnresolvedNames {
+    fn record(&mut self, name: &str) {
+        if self.names.contains(name) {
+            return;
+        }
+        if self.names.len() < MAX_UNRESOLVED_UNICODE_NAMES {
+            self.names.insert(name.to_string());
+        } else {
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, other: &UnresolvedNames) {
+        for name in &other.names {
+            self.record(name);
+        }
+        self.omitted = self.omitted.saturating_add(other.omitted);
+    }
+}
+
+/// Prefix of the symbol for a string with an unresolved `\N{...}` name. The rest is a
+/// length-prefixed encoding of its pieces: `L<bytes>:<text>` for decoded text and
+/// `N<bytes>:<NAME>` for each unresolved name, so different names give different symbols
+/// and the encoding is unambiguous. Names are reported from `UnresolvedNames`, never by
+/// parsing symbols.
+const UNRESOLVED_SYMBOL_PREFIX: &str = "\u{FFFF}pyc-unresolved-name:";
+
+fn push_length_prefixed(out: &mut String, tag: char, text: &str) {
+    out.push(tag);
+    out.push_str(&text.len().to_string());
+    out.push(':');
+    out.push_str(text);
+}
+
+/// Decodes the backslash escapes of a non-raw string body as the compiler does. A string
+/// with a `\N{...}` name missing from the Unicode name table becomes an
+/// `UNRESOLVED_SYMBOL_PREFIX` symbol, and the name is recorded in `unresolved`.
+fn decode_py_escapes(content: &str, unresolved: &mut UnresolvedNames) -> String {
+    let mut encoded: Option<String> = None;
+    let mut run_start = 0usize;
     let mut out = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
     while let Some(c) = chars.next() {
@@ -717,11 +755,12 @@ fn decode_py_escapes(content: &str) -> String {
                     match crate::unicode_names::lookup(&name).filter(|_| !overlong) {
                         Some(ch) => out.push(ch),
                         None => {
-                            out.push(UNRESOLVED_NAME_MARK);
-                            out.push_str("\\N{");
-                            out.push_str(&name.to_uppercase());
-                            out.push('}');
-                            out.push(UNRESOLVED_NAME_MARK);
+                            let upper = name.to_uppercase();
+                            unresolved.record(&upper);
+                            let enc = encoded.get_or_insert_with(String::new);
+                            push_length_prefixed(enc, 'L', out.get(run_start..).unwrap_or(""));
+                            push_length_prefixed(enc, 'N', &upper);
+                            run_start = out.len();
                         }
                     }
                 }
@@ -737,7 +776,13 @@ fn decode_py_escapes(content: &str) -> String {
             out.push(c);
         }
     }
-    out
+    match encoded {
+        Some(mut enc) => {
+            push_length_prefixed(&mut enc, 'L', out.get(run_start..).unwrap_or(""));
+            format!("{UNRESOLVED_SYMBOL_PREFIX}{enc}")
+        }
+        None => out,
+    }
 }
 
 /// Nesting limit for f-strings inside f-string replacement fields.
@@ -747,18 +792,22 @@ const MAX_FSTRING_DEPTH: usize = 4;
 /// for an ordinary string, or for an f-string its literal pieces (constants) plus the
 /// symbols of its replacement-field expressions and format specs. `None` when the token
 /// is not a string literal.
-fn py_literal_symbols(tok_text: &str) -> Option<Vec<String>> {
-    py_literal_symbols_depth(tok_text, 0)
+fn py_literal_symbols(tok_text: &str, unresolved: &mut UnresolvedNames) -> Option<Vec<String>> {
+    py_literal_symbols_depth(tok_text, 0, unresolved)
 }
 
-fn py_literal_symbols_depth(tok_text: &str, depth: usize) -> Option<Vec<String>> {
+fn py_literal_symbols_depth(
+    tok_text: &str,
+    depth: usize,
+    unresolved: &mut UnresolvedNames,
+) -> Option<Vec<String>> {
     let quote_start = tok_text
         .bytes()
         .position(|b| !b.is_ascii_alphabetic())
         .unwrap_or(tok_text.len());
     let prefix = tok_text.get(..quote_start)?;
     if !prefix.contains(['f', 'F']) {
-        return decode_py_string_literal(tok_text).map(|c| vec![c]);
+        return decode_py_string_literal(tok_text, unresolved).map(|c| vec![c]);
     }
     if prefix.len() > 2 || !prefix.chars().all(|c| "fFrR".contains(c)) {
         return None;
@@ -771,35 +820,56 @@ fn py_literal_symbols_depth(tok_text: &str, depth: usize) -> Option<Vec<String>>
     let inner = rest.strip_prefix(quote).unwrap_or(rest);
     let body = inner.strip_suffix(quote).unwrap_or(inner);
     let mut out = Vec::new();
-    fstring_body_symbols(body, is_raw, depth, &mut out);
+    fstring_body_symbols(body, is_raw, depth, &mut out, unresolved);
     Some(out)
 }
 
-fn push_fstring_literal(raw_piece: &str, is_raw: bool, literal: &mut String) {
+fn push_fstring_literal(
+    raw_piece: &str,
+    is_raw: bool,
+    literal: &mut String,
+    unresolved: &mut UnresolvedNames,
+) {
     if is_raw {
         literal.push_str(raw_piece);
     } else {
-        literal.push_str(&decode_py_escapes(raw_piece));
+        literal.push_str(&decode_py_escapes(raw_piece, unresolved));
     }
 }
 
 /// Splits an f-string body into literal pieces (constants) and replacement fields, whose
 /// expression symbols and format-spec pieces are added recursively.
-fn fstring_body_symbols(body: &str, is_raw: bool, depth: usize, out: &mut Vec<String>) {
+fn fstring_body_symbols(
+    body: &str,
+    is_raw: bool,
+    depth: usize,
+    out: &mut Vec<String>,
+    unresolved: &mut UnresolvedNames,
+) {
     let bytes = body.as_bytes();
     let mut literal = String::new();
     let mut piece_start = 0usize;
     let mut i = 0usize;
     while let Some(&b) = bytes.get(i) {
         if (b == b'{' || b == b'}') && bytes.get(i.saturating_add(1)) == Some(&b) {
-            push_fstring_literal(body.get(piece_start..i).unwrap_or(""), is_raw, &mut literal);
+            push_fstring_literal(
+                body.get(piece_start..i).unwrap_or(""),
+                is_raw,
+                &mut literal,
+                unresolved,
+            );
             literal.push(char::from(b));
             i = i.saturating_add(2);
             piece_start = i;
             continue;
         }
         if b == b'{' {
-            push_fstring_literal(body.get(piece_start..i).unwrap_or(""), is_raw, &mut literal);
+            push_fstring_literal(
+                body.get(piece_start..i).unwrap_or(""),
+                is_raw,
+                &mut literal,
+                unresolved,
+            );
             let field_start = i.saturating_add(1);
             let field_end = fstring_field_end(bytes, field_start);
             let field = body.get(field_start..field_end).unwrap_or("");
@@ -812,9 +882,13 @@ fn fstring_body_symbols(body: &str, is_raw: bool, depth: usize, out: &mut Vec<St
                 out.push(std::mem::take(&mut literal));
             }
             if depth < MAX_FSTRING_DEPTH {
-                out.extend(collect_symbol_set_depth(&[expr], depth.saturating_add(1)));
+                out.extend(collect_symbol_set_depth(
+                    &[expr],
+                    depth.saturating_add(1),
+                    unresolved,
+                ));
                 if let Some(spec) = spec {
-                    fstring_body_symbols(spec, is_raw, depth.saturating_add(1), out);
+                    fstring_body_symbols(spec, is_raw, depth.saturating_add(1), out, unresolved);
                 }
             }
             i = field_end.saturating_add(1);
@@ -823,7 +897,12 @@ fn fstring_body_symbols(body: &str, is_raw: bool, depth: usize, out: &mut Vec<St
         }
         i = i.saturating_add(1);
     }
-    push_fstring_literal(body.get(piece_start..).unwrap_or(""), is_raw, &mut literal);
+    push_fstring_literal(
+        body.get(piece_start..).unwrap_or(""),
+        is_raw,
+        &mut literal,
+        unresolved,
+    );
     if !literal.is_empty() {
         out.push(literal);
     }
@@ -1154,11 +1233,15 @@ fn normalize_py_numeric_literal_small(text: &str) -> String {
     text.to_string()
 }
 
-fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
-    collect_symbol_set_depth(lines, 0)
+fn collect_symbol_set(lines: &[&str], unresolved: &mut UnresolvedNames) -> HashSet<String> {
+    collect_symbol_set_depth(lines, 0, unresolved)
 }
 
-fn collect_symbol_set_depth(lines: &[&str], depth: usize) -> HashSet<String> {
+fn collect_symbol_set_depth(
+    lines: &[&str],
+    depth: usize,
+    unresolved: &mut UnresolvedNames,
+) -> HashSet<String> {
     let text = lines.join("\n");
     let tokens = pyc_literal_tokens(&text);
     let mut symbols = HashSet::new();
@@ -1166,7 +1249,7 @@ fn collect_symbol_set_depth(lines: &[&str], depth: usize) -> HashSet<String> {
     let starts = statement_starts(&tokens);
 
     for (idx, tok) in tokens.iter().enumerate() {
-        if let Some(contents) = py_literal_symbols_depth(&tok.text, depth) {
+        if let Some(contents) = py_literal_symbols_depth(&tok.text, depth, unresolved) {
             symbols.extend(contents);
             prev_is_dot = false;
         } else if is_pyc_number(&tok.text) {
@@ -1304,6 +1387,7 @@ fn parse_def_or_class_header(
     def_line: usize,
     is_cont: &[bool],
     budget: &mut WorkBudget,
+    unresolved: &mut UnresolvedNames,
 ) -> Result<Option<ParsedDefHeader>, FingerprintError> {
     if def_line >= lines.len() {
         return Ok(None);
@@ -1423,7 +1507,7 @@ fn parse_def_or_class_header(
                 continue;
             }
             if in_parens {
-                if let Some(contents) = py_literal_symbols(&tok.text) {
+                if let Some(contents) = py_literal_symbols(&tok.text, unresolved) {
                     enclosing_symbols.extend(contents);
                     prev_is_dot = false;
                 } else if is_pyc_number(&tok.text) {
@@ -1514,7 +1598,7 @@ fn parse_def_or_class_header(
                 }
 
                 if state == ParamState::InAnnotation || state == ParamState::InDefault {
-                    if let Some(contents) = py_literal_symbols(&tok.text) {
+                    if let Some(contents) = py_literal_symbols(&tok.text, unresolved) {
                         enclosing_symbols.extend(contents);
                         prev_is_dot = false;
                     } else if is_pyc_number(&tok.text) {
@@ -1543,7 +1627,7 @@ fn parse_def_or_class_header(
                 }
                 prev_was_dash = tok.text == "-";
                 if in_return_ann {
-                    if let Some(contents) = py_literal_symbols(&tok.text) {
+                    if let Some(contents) = py_literal_symbols(&tok.text, unresolved) {
                         enclosing_symbols.extend(contents);
                         prev_is_dot = false;
                     } else if is_pyc_number(&tok.text) {
@@ -1892,6 +1976,8 @@ struct PycFileAnalysis<'a> {
     line_scopes: Vec<Option<usize>>,
     headers: HashMap<usize, Option<ParsedDefHeader>>,
     scope_membership: HashMap<usize, Option<usize>>,
+    /// `\N{...}` names the Unicode table did not know, met while extracting symbols.
+    unresolved: UnresolvedNames,
     symbols: HashMap<(String, usize), HashSet<String>>,
 }
 
@@ -1917,6 +2003,7 @@ impl<'a> PycFileAnalysis<'a> {
             line_scopes,
             headers: HashMap::new(),
             scope_membership: HashMap::new(),
+            unresolved: UnresolvedNames::default(),
             symbols: HashMap::new(),
         })
     }
@@ -1928,8 +2015,13 @@ impl<'a> PycFileAnalysis<'a> {
     ) -> Result<Option<&ParsedDefHeader>, FingerprintError> {
         if !self.headers.contains_key(&def_pos) {
             budget.charge(1)?;
-            let parsed =
-                parse_def_or_class_header(self.lines, def_pos, &self.continuation, budget)?;
+            let parsed = parse_def_or_class_header(
+                self.lines,
+                def_pos,
+                &self.continuation,
+                budget,
+                &mut self.unresolved,
+            )?;
             self.headers.insert(def_pos, parsed);
         }
         Ok(self.headers.get(&def_pos).and_then(|opt| opt.as_ref()))
@@ -2078,7 +2170,7 @@ impl<'a> PycFileAnalysis<'a> {
                     }
                 }
                 budget.charge(span_lines.len())?;
-                let syms = collect_symbol_set(&span_lines);
+                let syms = collect_symbol_set(&span_lines, &mut self.unresolved);
                 module_symbols.extend(syms);
                 line_idx = span_end;
             }
@@ -2150,7 +2242,7 @@ impl<'a> PycFileAnalysis<'a> {
                 }
             }
             budget.charge(span_lines.len())?;
-            let syms = collect_symbol_set(&span_lines);
+            let syms = collect_symbol_set(&span_lines, &mut self.unresolved);
             symbols.extend(syms);
             line_idx = span_end;
         }
@@ -2205,7 +2297,7 @@ impl<'a> PycFileAnalysis<'a> {
                 }
             }
             budget.charge(span_lines.len())?;
-            let syms = collect_symbol_set(&span_lines);
+            let syms = collect_symbol_set(&span_lines, &mut self.unresolved);
             symbols.extend(syms);
             line_idx = span_end;
         }
@@ -2383,31 +2475,21 @@ fn compute_pyc_function_fingerprints(
 
 impl FingerprintSet {
     /// Info findings for fingerprint coverage gaps found while fingerprinting. Today: a
-    /// changed string literal uses a `\N{...}` name missing from the Unicode name table
-    /// (newer than Unicode 16.0), so its compiled constant cannot be reproduced and the
-    /// `.pyc` function check cannot match that literal. `path` names the task.
+    /// string literal in an analysed scope uses a `\N{...}` name missing from the Unicode
+    /// name table (newer than Unicode 16.0), so its compiled constant cannot be reproduced
+    /// and the `.pyc` function check cannot match that literal. `path` names the task.
     pub fn coverage_gap_findings(&self, path: &str) -> Vec<crate::scan::Finding> {
-        let mut names = std::collections::BTreeSet::new();
-        for fp in self
-            .hunks
-            .iter()
-            .flat_map(|h| h.pyc_fingerprints.iter().chain(h.pyc_fingerprint.iter()))
-        {
-            for symbol in fp.added.iter().chain(fp.removed.iter()) {
-                if symbol.contains(UNRESOLVED_NAME_MARK) {
-                    names.extend(unresolved_unicode_names(symbol).map(str::to_string));
-                }
-            }
-        }
-        if names.is_empty() {
+        if self.unresolved_unicode_names.is_empty() {
             return Vec::new();
         }
+        let total = self
+            .unresolved_unicode_names
+            .len()
+            .saturating_add(self.unresolved_unicode_names_omitted);
         let mut evidence = vec![format!(
-            "{} \\N{{...}} name(s) unknown to the Unicode {} name table; .pyc constants with them are not matched",
-            names.len(),
-            "16.0.0"
+            "{total} \\N{{...}} name(s) unknown to the Unicode 16.0.0 name table; .pyc constants with them are not matched"
         )];
-        evidence.extend(names.into_iter().take(5));
+        evidence.extend(self.unresolved_unicode_names.iter().take(5).cloned());
         vec![crate::scan::Finding {
             detector: "D3b".into(),
             channel: "pyc_unknown_unicode_name".into(),
@@ -2483,6 +2565,7 @@ impl FingerprintSet {
         let mut budget = WorkBudget::new(budget_limit);
         let gold_patch = parse_patch(gold_patch_str)?;
         let test_patch = parse_patch(test_patch_str)?;
+        let mut unresolved = UnresolvedNames::default();
 
         let mut candidate_hunks: Vec<CandidateHunk> = Vec::new();
         let mut global_hunk_counter = 0;
@@ -2815,6 +2898,12 @@ impl FingerprintSet {
                 });
                 global_hunk_counter += 1;
             }
+            if let Some(a) = &fixed_analysis {
+                unresolved.merge(&a.unresolved);
+            }
+            if let Some(a) = &base_analysis {
+                unresolved.merge(&a.unresolved);
+            }
         }
 
         // 2. Process test patch (lines added by test patch)
@@ -2862,14 +2951,17 @@ impl FingerprintSet {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64 * 1024 * 1024);
-        Ok(finish_fingerprint_set(
+        let mut set = finish_fingerprint_set(
             candidate_hunks,
             base_tree_root,
             0,
             baseline_budget,
             tier2_max_files,
             tier2_max_bytes,
-        ))
+        );
+        set.unresolved_unicode_names = unresolved.names.into_iter().collect();
+        set.unresolved_unicode_names_omitted = unresolved.omitted;
+        Ok(set)
     }
 
     /// Build tier 1, tier 3, and binary tier fingerprints from task files in undated mode (TR-SC-9).
@@ -3572,6 +3664,8 @@ fn finish_fingerprint_set(
         baseline_skipped_bytes,
         tier2_capped,
         tier2_chosen_files,
+        unresolved_unicode_names: Vec::new(),
+        unresolved_unicode_names_omitted: 0,
     }
 }
 
@@ -3717,14 +3811,20 @@ mod t112_final_review_tests {
         lines.push("    return 1".to_string());
         let cont = compute_line_continuation(&lines);
         let mut budget = WorkBudget::new(DEFAULT_MAX_FINGERPRINT_WORK);
-        let parsed = parse_def_or_class_header(&lines, 0, &cont, &mut budget)
-            .expect("within budget")
-            .expect("header");
+        let parsed = parse_def_or_class_header(
+            &lines,
+            0,
+            &cont,
+            &mut budget,
+            &mut UnresolvedNames::default(),
+        )
+        .expect("within budget")
+        .expect("header");
         assert_eq!(parsed.header_end, 1001);
         assert!(budget.used() >= 1002, "charged {}", budget.used());
         let mut tiny = WorkBudget::new(10);
         assert!(matches!(
-            parse_def_or_class_header(&lines, 0, &cont, &mut tiny),
+            parse_def_or_class_header(&lines, 0, &cont, &mut tiny, &mut UnresolvedNames::default()),
             Err(FingerprintError::WorkBudgetExceeded)
         ));
     }
@@ -3737,7 +3837,7 @@ mod t112_final_review_tests {
         lines.push(")".to_string());
         let symbols = run_bounded(60, move || {
             let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-            collect_symbol_set(&refs)
+            collect_symbol_set(&refs, &mut UnresolvedNames::default())
         });
         assert!(symbols.contains("X"));
         assert!(symbols.contains("match"));

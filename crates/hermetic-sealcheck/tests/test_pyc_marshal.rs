@@ -2196,3 +2196,61 @@ fn t112_priorcheck_finding4_unknown_name_is_a_reported_gap() {
         .iter()
         .any(|e| e == "NOT A REAL CHARACTER NAME"));
 }
+
+/// Prior-check 2: unknown names are tracked out of band, so a literal holding a real
+/// U+FFFF does not hide them from the coverage-gap finding.
+#[test]
+fn t112_priorcheck2_unknown_names_reported_despite_literal_u_ffff() {
+    let (_dir, fp) = task_fp(
+        "m.py",
+        "def f():\n    return \"\u{FFFF}\\N{NOT A REAL CHARACTER NAME}\"\n",
+        "def f():\n    return \"\u{FFFF}\\N{ANOTHER MADE UP NAME}\"\n",
+    );
+    let f = fp_for(&fp, "f");
+    assert_eq!(f.added.len(), 1, "{f:?}");
+    assert_eq!(f.removed.len(), 1, "{f:?}");
+    assert_ne!(f.added, f.removed);
+    let gaps = fp.coverage_gap_findings("task.json");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].channel, "pyc_unknown_unicode_name");
+    for name in ["ANOTHER MADE UP NAME", "NOT A REAL CHARACTER NAME"] {
+        assert!(gaps[0].evidence.iter().any(|e| e == name), "{gaps:?}");
+    }
+}
+
+/// Prior-check 2: literal text that looks like an unresolved-name encoding is ordinary
+/// content: no gap finding, and the change still gates as a plain constant.
+#[test]
+fn t112_priorcheck2_marker_lookalike_literal_is_not_a_gap() {
+    let lookalikes = [
+        (
+            "\u{FFFF}pyc-unresolved-name:L0:N4:FAKEL0:",
+            "\u{FFFF}pyc-unresolved-name:L0:N4:FAKKL0:",
+        ),
+        (
+            "\u{FFFF}\\\\N{FAKE NAME}\u{FFFF}",
+            "\u{FFFF}\\\\N{FAKE NAMF}\u{FFFF}",
+        ),
+    ];
+    for (base_lit, fixed_lit) in lookalikes {
+        let (_dir, fp) = task_fp(
+            "m.py",
+            &format!("def f():\n    return \"{base_lit}\"\n"),
+            &format!("def f():\n    return \"{fixed_lit}\"\n"),
+        );
+        assert!(
+            fp.coverage_gap_findings("task.json").is_empty(),
+            "{base_lit:?}"
+        );
+        assert!(fp.unresolved_unicode_names.is_empty());
+        // `\\` in the source is one backslash in the compiled constant.
+        let compiled = |s: &str| s.replace("\\\\", "\\");
+        let fixed_const = [marshal_unicode(&compiled(fixed_lit))];
+        let base_const = [marshal_unicode(&compiled(base_lit))];
+        assert_both_pyc_matchers(
+            &fp,
+            &build_pyc_38("f", &fixed_const, &[], &[]),
+            &build_pyc_38("f", &base_const, &[], &[]),
+        );
+    }
+}

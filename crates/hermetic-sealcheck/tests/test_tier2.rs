@@ -378,6 +378,8 @@ fn test_perf_tier2_4mb_unit_200_hunks_under_2s() {
         baseline_skipped_bytes: 0,
         tier2_capped: false,
         tier2_chosen_files: Vec::new(),
+        unresolved_unicode_names: Vec::new(),
+        unresolved_unicode_names_omitted: 0,
     };
 
     let opts = ScanOptions::default();
