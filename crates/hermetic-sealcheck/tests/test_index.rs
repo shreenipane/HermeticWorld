@@ -244,6 +244,15 @@ fn marshal_bytes(bytes: &[u8]) -> Vec<u8> {
     b
 }
 
+fn marshal_frozenset(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![b'>'];
+    b.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for it in items {
+        b.extend_from_slice(it);
+    }
+    b
+}
+
 fn build_pyc_38(name: &str, consts: &[Vec<u8>], names: &[&str], varnames: &[&str]) -> Vec<u8> {
     let mut pyc = Vec::new();
     // Header (16 bytes): magic 3413 (Python 3.8)
@@ -674,6 +683,58 @@ fn equivalence_pyc_code_objects_38_and_311() {
     fs::write(root_311.path().join("service.pyc"), &pyc_fixed_311).expect("write pyc");
     let f_311 = assert_equivalent(root_311.path(), &t, &opts());
     assert_eq!(gates_with(&f_311, "binary_pyc_function"), 1, "{f_311:#?}");
+}
+
+#[test]
+fn test_regression_defect5_frozenset_scan_and_index_query_integration() {
+    let base = "def f(x):\n    return x in {2, 3}\n";
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,2 @@\n-def f(x):\n-    return x in {2, 3}\n+def f(x):\n+    return x in {2, 4}\n";
+    let t = custom_task("service.py", base, patch);
+
+    let fs_fixed = marshal_frozenset(&[marshal_int(2), marshal_int(4)]);
+    let fs_base = marshal_frozenset(&[marshal_int(2), marshal_int(3)]);
+
+    // 1. Python 3.8 frozenset: both scan and query gate on fixed, not base
+    let root_fixed_38 = tempdir().expect("tempdir");
+    let pyc_fixed_38 = build_pyc_38("f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    fs::write(root_fixed_38.path().join("service.pyc"), &pyc_fixed_38).expect("write pyc");
+    let f_fixed_38 = assert_equivalent(root_fixed_38.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_fixed_38, "binary_pyc_function"),
+        1,
+        "{f_fixed_38:#?}"
+    );
+
+    let root_base_38 = tempdir().expect("tempdir");
+    let pyc_base_38 = build_pyc_38("f", std::slice::from_ref(&fs_base), &[], &["x"]);
+    fs::write(root_base_38.path().join("service.pyc"), &pyc_base_38).expect("write pyc");
+    let f_base_38 = assert_equivalent(root_base_38.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_base_38, "binary_pyc_function"),
+        0,
+        "{f_base_38:#?}"
+    );
+
+    // 2. Python 3.11 frozenset: both scan and query gate on fixed, not base
+    let root_fixed_311 = tempdir().expect("tempdir");
+    let pyc_fixed_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    fs::write(root_fixed_311.path().join("service.pyc"), &pyc_fixed_311).expect("write pyc");
+    let f_fixed_311 = assert_equivalent(root_fixed_311.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_fixed_311, "binary_pyc_function"),
+        1,
+        "{f_fixed_311:#?}"
+    );
+
+    let root_base_311 = tempdir().expect("tempdir");
+    let pyc_base_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_base), &[], &["x"]);
+    fs::write(root_base_311.path().join("service.pyc"), &pyc_base_311).expect("write pyc");
+    let f_base_311 = assert_equivalent(root_base_311.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_base_311, "binary_pyc_function"),
+        0,
+        "{f_base_311:#?}"
+    );
 }
 
 #[test]

@@ -13,6 +13,10 @@ const MAX_MARSHAL_GRAPH_DEPTH: usize = 64;
 const MAX_NUMERIC_ALLOCATION_BYTES: usize = 2048;
 const CONTAINER_ALLOCATION_FACTOR: usize = 2;
 
+pub const MAX_MARSHAL_LONG_DIGITS: usize = 256;
+pub const MAX_MARSHAL_LONG_ALLOCATION_BYTES: usize = 2048;
+pub const MAX_MARSHAL_LONG_PROCESSING_STEPS: usize = 65536;
+
 /// A parsed code object from a `.pyc` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PycCodeObject {
@@ -65,9 +69,9 @@ enum MarshalValue {
     String(Arc<str>),
     Bytes(Arc<[u8]>),
     Tuple(Arc<[MarshalValue]>, usize),
+    FrozenSet(Arc<[MarshalValue]>, usize),
     List,
     Dict,
-    Set,
     Code,
     Other,
 }
@@ -160,7 +164,9 @@ impl<'a> MarshalParser<'a> {
         let mut graph_depth = 1usize;
         for _ in 0..count {
             let item = self.read_object()?;
-            if let MarshalValue::Tuple(_, child_depth) = &item {
+            if let MarshalValue::Tuple(_, child_depth) | MarshalValue::FrozenSet(_, child_depth) =
+                &item
+            {
                 graph_depth = graph_depth.max(child_depth.saturating_add(1));
             }
             if graph_depth > MAX_MARSHAL_GRAPH_DEPTH {
@@ -169,6 +175,29 @@ impl<'a> MarshalParser<'a> {
             items.push(item);
         }
         Ok(MarshalValue::Tuple(items.into(), graph_depth))
+    }
+
+    fn read_frozenset(&mut self, count: usize) -> Result<MarshalValue, MarshalError> {
+        if count > self.remaining() {
+            return Err(MarshalError::Truncated);
+        }
+        self.charge_entries::<MarshalValue>(count)?;
+        self.charge_entries::<MarshalValue>(count)?;
+        let mut items = Vec::with_capacity(count);
+        let mut graph_depth = 1usize;
+        for _ in 0..count {
+            let item = self.read_object()?;
+            if let MarshalValue::Tuple(_, child_depth) | MarshalValue::FrozenSet(_, child_depth) =
+                &item
+            {
+                graph_depth = graph_depth.max(child_depth.saturating_add(1));
+            }
+            if graph_depth > MAX_MARSHAL_GRAPH_DEPTH {
+                return Err(MarshalError::RecursionLimit);
+            }
+            items.push(item);
+        }
+        Ok(MarshalValue::FrozenSet(items.into(), graph_depth))
     }
 
     fn remaining(&self) -> usize {
@@ -279,42 +308,74 @@ impl<'a> MarshalParser<'a> {
                 MarshalValue::Int(v.to_string().into())
             }
             b'l' => {
-                self.charge_allocation(MAX_NUMERIC_ALLOCATION_BYTES)?;
-                self.charge_bytes(MAX_NUMERIC_ALLOCATION_BYTES)?;
                 let n = self.read_i32()?;
                 let count = n.unsigned_abs() as usize;
                 if count > self.remaining() / 2 {
                     return Err(MarshalError::Truncated);
                 }
-                let digits_bytes =
-                    self.read_bytes(count.checked_mul(2).ok_or(MarshalError::BudgetLimit)?)?;
-                if count == 0 {
-                    MarshalValue::Int("0".into())
-                } else if count == 1 {
-                    let d0 = u16::from_le_bytes(
-                        digits_bytes
-                            .try_into()
-                            .map_err(|_| MarshalError::Truncated)?,
-                    ) as i64;
-                    let val = if n < 0 { -d0 } else { d0 };
-                    MarshalValue::Int(val.to_string().into())
-                } else if count <= 4 {
-                    let mut val: u128 = 0;
-                    for (i, digit) in digits_bytes.as_chunks::<2>().0.iter().enumerate() {
-                        let d = u16::from_le_bytes(*digit) as u128;
-                        val = val.saturating_add(
-                            d.checked_shl(15u32.saturating_mul(i as u32))
-                                .ok_or(MarshalError::BudgetLimit)?,
-                        );
-                    }
-                    let s = if n < 0 {
-                        format!("-{}", val)
-                    } else {
-                        val.to_string()
-                    };
-                    MarshalValue::Int(s.into())
-                } else {
+                if count > MAX_MARSHAL_LONG_DIGITS {
+                    let bytes_len = count.checked_mul(2).ok_or(MarshalError::BudgetLimit)?;
+                    self.read_bytes(bytes_len)?;
                     MarshalValue::Other
+                } else {
+                    let bytes_len = count.checked_mul(2).ok_or(MarshalError::BudgetLimit)?;
+                    let digits_bytes = self.read_bytes(bytes_len)?;
+                    self.charge_bytes(bytes_len)?;
+                    let alloc =
+                        (count.saturating_mul(5) + 16).min(MAX_MARSHAL_LONG_ALLOCATION_BYTES);
+                    self.charge_allocation(alloc)?;
+                    let work = (count.saturating_mul(count).saturating_mul(5))
+                        .min(MAX_MARSHAL_LONG_PROCESSING_STEPS);
+                    self.charge_work(work)?;
+
+                    if count == 0 {
+                        MarshalValue::Int("0".into())
+                    } else if count <= 8 {
+                        let mut val: u128 = 0;
+                        for (i, digit) in digits_bytes.as_chunks::<2>().0.iter().enumerate() {
+                            let d = u16::from_le_bytes(*digit) as u128;
+                            val = val.saturating_add(
+                                d.checked_shl(15u32.saturating_mul(i as u32))
+                                    .ok_or(MarshalError::BudgetLimit)?,
+                            );
+                        }
+                        let s = if n < 0 {
+                            format!("-{}", val)
+                        } else {
+                            val.to_string()
+                        };
+                        MarshalValue::Int(s.into())
+                    } else {
+                        let mut digits: Vec<u16> = digits_bytes
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|chunk| u16::from_le_bytes(*chunk))
+                            .collect();
+                        let mut dec_digits: Vec<u8> = Vec::with_capacity(count.saturating_mul(5));
+                        while !digits.is_empty() {
+                            let mut rem: u32 = 0;
+                            for d in digits.iter_mut().rev() {
+                                let cur = (rem << 15) | (*d as u32);
+                                *d = (cur / 10) as u16;
+                                rem = cur % 10;
+                            }
+                            dec_digits.push(b'0' + rem as u8);
+                            while digits.last() == Some(&0) {
+                                digits.pop();
+                            }
+                        }
+                        if dec_digits.is_empty() {
+                            dec_digits.push(b'0');
+                        }
+                        dec_digits.reverse();
+                        let mut s = String::with_capacity(dec_digits.len() + 1);
+                        if n < 0 {
+                            s.push('-');
+                        }
+                        s.push_str(std::str::from_utf8(&dec_digits).unwrap_or("0"));
+                        MarshalValue::Int(s.into())
+                    }
                 }
             }
             b'f' => {
@@ -399,13 +460,7 @@ impl<'a> MarshalParser<'a> {
             }
             b'<' | b'>' => {
                 let count = self.read_u32()? as usize;
-                if count > self.remaining() {
-                    return Err(MarshalError::Truncated);
-                }
-                for _ in 0..count {
-                    self.read_object()?;
-                }
-                MarshalValue::Set
+                self.read_frozenset(count)?
             }
             b':' => {
                 self.read_object()?;
@@ -552,7 +607,7 @@ impl<'a> MarshalParser<'a> {
             }
         }
 
-        if let MarshalValue::Tuple(items, _) = consts_obj {
+        if let MarshalValue::Tuple(items, _) | MarshalValue::FrozenSet(items, _) = consts_obj {
             self.charge_entries::<&MarshalValue>(items.len())?;
             let mut stack: Vec<&MarshalValue> = items.iter().collect();
             while let Some(value) = stack.pop() {
@@ -567,7 +622,7 @@ impl<'a> MarshalParser<'a> {
                             symbols.insert(self.copy_symbol(s)?);
                         }
                     }
-                    MarshalValue::Tuple(children, _) => {
+                    MarshalValue::Tuple(children, _) | MarshalValue::FrozenSet(children, _) => {
                         self.charge_entries::<&MarshalValue>(children.len())?;
                         stack.extend(children.iter().rev());
                     }

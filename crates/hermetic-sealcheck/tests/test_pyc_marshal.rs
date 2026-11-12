@@ -32,6 +32,24 @@ fn marshal_bytes(bytes: &[u8]) -> Vec<u8> {
     b
 }
 
+fn marshal_long(n: i32, digits: &[u16]) -> Vec<u8> {
+    let mut b = vec![b'l'];
+    b.extend_from_slice(&n.to_le_bytes());
+    for &d in digits {
+        b.extend_from_slice(&d.to_le_bytes());
+    }
+    b
+}
+
+fn marshal_frozenset(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![b'>'];
+    b.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for it in items {
+        b.extend_from_slice(it);
+    }
+    b
+}
+
 pub fn build_pyc_38(name: &str, consts: &[Vec<u8>], names: &[&str], varnames: &[&str]) -> Vec<u8> {
     let mut pyc = Vec::new();
     // Header (16 bytes): magic 3413 (Python 3.8)
@@ -1077,4 +1095,214 @@ fn inserted_same_named_definition_preserves_patch_position_pairing() {
     assert!(methods
         .iter()
         .all(|f| !f.added.contains("2") && !f.added.contains("3")));
+}
+
+#[test]
+fn test_regression_defect1_large_patch_bounded_work_and_budget_error() {
+    let parent = tempdir().expect("tempdir");
+    let mut base = String::new();
+    let n = 20_000;
+    for i in 0..n {
+        base.push_str(&format!("def f{i}():\n    return {i}\n"));
+    }
+    fs::write(parent.path().join("large.py"), &base).expect("base");
+
+    let patch = "diff --git a/large.py b/large.py\n--- a/large.py\n+++ b/large.py\n@@ -1,4 +1,4 @@\n def f0():\n-    return 0\n+    return 99999\n@@ -39999,2 +39999,2 @@\n def f19999():\n-    return 19999\n+    return 88888\n";
+    let start = std::time::Instant::now();
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 10,
+        "processing large file must complete within bounded work (took {elapsed:?})"
+    );
+    assert_eq!(fp.hunks.len(), 2);
+
+    use hermetic_sealcheck::fingerprint::FingerprintError;
+    let constrained = FingerprintSet::from_task_with_budget(patch, "", parent.path(), Some(10));
+    assert!(
+        matches!(constrained, Err(FingerprintError::WorkBudgetExceeded)),
+        "must return deterministic budget error: {constrained:?}"
+    );
+}
+
+#[test]
+fn test_regression_defect2_contextual_keywords_as_identifiers() {
+    let parent = tempdir().expect("tempdir");
+    let base = "def f(x):\n    return x\n";
+    fs::write(parent.path().join("service.py"), base).expect("base");
+
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,2 @@\n def f(x):\n-    return x\n+    return type(x)\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let f_fp = &fp.hunks[0].pyc_fingerprints[0];
+    assert!(
+        f_fp.added.contains("type"),
+        "type as an identifier must enter added symbols: {:?}",
+        f_fp.added
+    );
+
+    let fixed_pyc = build_pyc_38("f", &[], &["type"], &["x"]);
+    let base_pyc = build_pyc_38("f", &[], &[], &["x"]);
+    assert_both_pyc_matchers(&fp, &fixed_pyc, &base_pyc);
+
+    let patch_match = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,4 @@\n def f(x):\n-    return x\n+    match = 1\n+    case = 2\n+    return match + case\n";
+    let fp_match = FingerprintSet::from_task(patch_match, "", parent.path()).expect("fingerprints");
+    let f_fp_match = &fp_match.hunks[0].pyc_fingerprints[0];
+    assert!(f_fp_match.added.contains("match"));
+    assert!(f_fp_match.added.contains("case"));
+}
+
+#[test]
+fn test_regression_defect3_multiline_string_spans_in_functions_and_modules() {
+    let parent = tempdir().expect("tempdir");
+
+    // 1. Multiline string in a function body
+    let fn_base = "def f():\n    return \"\"\"a\nb\"\"\"\n";
+    fs::write(parent.path().join("fn_mod.py"), fn_base).expect("write fn_base");
+    let fn_patch = "diff --git a/fn_mod.py b/fn_mod.py\n--- a/fn_mod.py\n+++ b/fn_mod.py\n@@ -1,3 +1,3 @@\n def f():\n-    return \"\"\"a\n+    return \"\"\"c\n b\"\"\"\n";
+    let fp_fn = FingerprintSet::from_task(fn_patch, "", parent.path()).expect("fingerprints");
+    let f_fp = &fp_fn.hunks[0].pyc_fingerprints[0];
+    assert!(
+        f_fp.added.contains("c\nb"),
+        "added symbols must contain complete constant 'c\\nb': {:?}",
+        f_fp.added
+    );
+    assert!(
+        f_fp.removed.contains("a\nb"),
+        "removed symbols must contain complete constant 'a\\nb': {:?}",
+        f_fp.removed
+    );
+    assert!(
+        !f_fp.added.contains("c"),
+        "added symbols must not fragment multiline string into 'c'"
+    );
+
+    let fixed_fn_pyc = build_pyc_38("f", &[marshal_short_ascii("c\nb")], &[], &[]);
+    let base_fn_pyc = build_pyc_38("f", &[marshal_short_ascii("a\nb")], &[], &[]);
+    assert_both_pyc_matchers(&fp_fn, &fixed_fn_pyc, &base_fn_pyc);
+
+    // 2. Multiline string at module level
+    let mod_base = "DOC = \"\"\"hello\nworld\"\"\"\n";
+    fs::write(parent.path().join("mod_doc.py"), mod_base).expect("write mod_base");
+    let mod_patch = "diff --git a/mod_doc.py b/mod_doc.py\n--- a/mod_doc.py\n+++ b/mod_doc.py\n@@ -1,2 +1,2 @@\n DOC = \"\"\"hello\n-world\"\"\"\n+universe\"\"\"\n";
+    let fp_mod = FingerprintSet::from_task(mod_patch, "", parent.path()).expect("fingerprints");
+    let m_fp = &fp_mod.hunks[0].pyc_fingerprints[0];
+    assert_eq!(m_fp.function_name, "<module>");
+    assert!(
+        m_fp.added.contains("hello\nuniverse"),
+        "module added symbols must contain complete constant: {:?}",
+        m_fp.added
+    );
+    assert!(
+        m_fp.removed.contains("hello\nworld"),
+        "module removed symbols must contain complete constant: {:?}",
+        m_fp.removed
+    );
+
+    let fixed_mod_pyc = build_pyc_38(
+        "<module>",
+        &[marshal_short_ascii("hello\nuniverse")],
+        &["DOC"],
+        &[],
+    );
+    let base_mod_pyc = build_pyc_38(
+        "<module>",
+        &[marshal_short_ascii("hello\nworld")],
+        &["DOC"],
+        &[],
+    );
+    assert_both_pyc_matchers(&fp_mod, &fixed_mod_pyc, &base_mod_pyc);
+}
+
+#[test]
+fn test_regression_defect4_five_digit_integers_positive_and_negative() {
+    let parent = tempdir().expect("tempdir");
+
+    // Positive five-digit integers
+    // 1152921504606846976 is 2^60 (digits: [0, 0, 0, 0, 1])
+    // 1152921504606846977 is 2^60 + 1 (digits: [1, 0, 0, 0, 1])
+    let pos_base = "def f(x):\n    return 1152921504606846976\n";
+    fs::write(parent.path().join("pos.py"), pos_base).expect("pos base");
+    let pos_patch = "diff --git a/pos.py b/pos.py\n--- a/pos.py\n+++ b/pos.py\n@@ -1,2 +1,2 @@\n def f(x):\n-    return 1152921504606846976\n+    return 1152921504606846977\n";
+    let fp_pos = FingerprintSet::from_task(pos_patch, "", parent.path()).expect("fingerprints");
+    let f_pos = &fp_pos.hunks[0].pyc_fingerprints[0];
+    assert!(
+        f_pos.added.contains("1152921504606846977"),
+        "source fingerprint must contain 5-digit int: {:?}",
+        f_pos.added
+    );
+    assert!(
+        f_pos.removed.contains("1152921504606846976"),
+        "source fingerprint must contain removed 5-digit int: {:?}",
+        f_pos.removed
+    );
+
+    let fixed_pos_pyc = build_pyc_38("f", &[marshal_long(5, &[1, 0, 0, 0, 1])], &[], &["x"]);
+    let base_pos_pyc = build_pyc_38("f", &[marshal_long(5, &[0, 0, 0, 0, 1])], &[], &["x"]);
+    assert_both_pyc_matchers(&fp_pos, &fixed_pos_pyc, &base_pos_pyc);
+
+    // Negative five-digit integers
+    let neg_base = "def f(x):\n    return -1152921504606846976\n";
+    fs::write(parent.path().join("neg.py"), neg_base).expect("neg base");
+    let neg_patch = "diff --git a/neg.py b/neg.py\n--- a/neg.py\n+++ b/neg.py\n@@ -1,2 +1,2 @@\n def f(x):\n-    return -1152921504606846976\n+    return -1152921504606846977\n";
+    let fp_neg = FingerprintSet::from_task(neg_patch, "", parent.path()).expect("fingerprints");
+    let f_neg = &fp_neg.hunks[0].pyc_fingerprints[0];
+    assert!(
+        f_neg.added.contains("-1152921504606846977"),
+        "source fingerprint must contain negative 5-digit int: {:?}",
+        f_neg.added
+    );
+    assert!(
+        f_neg.removed.contains("-1152921504606846976"),
+        "source fingerprint must contain negative removed 5-digit int: {:?}",
+        f_neg.removed
+    );
+
+    let fixed_neg_pyc = build_pyc_38("f", &[marshal_long(-5, &[1, 0, 0, 0, 1])], &[], &["x"]);
+    let base_neg_pyc = build_pyc_38("f", &[marshal_long(-5, &[0, 0, 0, 0, 1])], &[], &["x"]);
+    assert_both_pyc_matchers(&fp_neg, &fixed_neg_pyc, &base_neg_pyc);
+}
+
+#[test]
+fn test_regression_defect5_frozenset_constants_38_and_311() {
+    let parent = tempdir().expect("tempdir");
+    let base = "def f(x):\n    return x in {2, 3}\n";
+    fs::write(parent.path().join("service.py"), base).expect("base");
+
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,2 @@\n def f(x):\n-    return x in {2, 3}\n+    return x in {2, 4}\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let f_fp = &fp.hunks[0].pyc_fingerprints[0];
+    assert!(f_fp.added.contains("4"));
+    assert!(f_fp.removed.contains("3"));
+
+    // 1. Python 3.8 hand-marshalled frozenset constants
+    let fs_fixed = marshal_frozenset(&[marshal_int(2), marshal_int(4)]);
+    let fs_base = marshal_frozenset(&[marshal_int(2), marshal_int(3)]);
+    let fixed_38 = build_pyc_38("f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    let base_38 = build_pyc_38("f", std::slice::from_ref(&fs_base), &[], &["x"]);
+
+    let objs_38 = parse_pyc_code_objects(&fixed_38);
+    assert_eq!(objs_38.len(), 1);
+    assert!(
+        objs_38[0].symbols.contains("4"),
+        "Python 3.8 frozenset must expose scalar constant '4': {:?}",
+        objs_38[0].symbols
+    );
+    assert!(objs_38[0].symbols.contains("2"));
+
+    assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+
+    // 2. Python 3.11 hand-marshalled frozenset constants
+    let fixed_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    let base_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_base), &[], &["x"]);
+
+    let objs_311 = parse_pyc_code_objects(&fixed_311);
+    assert_eq!(objs_311.len(), 1);
+    assert!(
+        objs_311[0].symbols.contains("4"),
+        "Python 3.11 frozenset must expose scalar constant '4': {:?}",
+        objs_311[0].symbols
+    );
+    assert!(objs_311[0].symbols.contains("2"));
+
+    assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
 }

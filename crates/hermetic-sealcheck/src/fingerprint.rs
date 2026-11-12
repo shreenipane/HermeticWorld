@@ -37,6 +37,35 @@ pub enum FingerprintError {
     Diff(#[from] DiffParseError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Work budget exceeded")]
+    WorkBudgetExceeded,
+}
+
+pub const DEFAULT_MAX_FINGERPRINT_WORK: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl WorkBudget {
+    pub fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    pub fn charge(&mut self, amount: usize) -> Result<(), FingerprintError> {
+        self.used = self.used.saturating_add(amount);
+        if self.used > self.limit {
+            Err(FingerprintError::WorkBudgetExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,10 +383,109 @@ fn is_py_keyword(s: &str) -> bool {
             | "while"
             | "with"
             | "yield"
-            | "match"
-            | "case"
-            | "type"
     )
+}
+
+fn is_statement_start(tokens: &[crate::winnow::Token], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let prev = &tokens[idx - 1];
+    if prev.text == ";" || prev.text == ":" {
+        return true;
+    }
+    if prev.line < tokens[idx].line {
+        let mut depth = 0usize;
+        for t in &tokens[..idx] {
+            match t.text.as_str() {
+                "(" | "[" | "{" => depth = depth.saturating_add(1),
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_contextual_keyword(tokens: &[crate::winnow::Token], idx: usize) -> bool {
+    let tok = &tokens[idx];
+    if !is_statement_start(tokens, idx) {
+        return false;
+    }
+    match tok.text.as_str() {
+        "type" => {
+            // PEP 695 type alias: `type Alias = ...` or `type Alias[T] = ...`
+            let Some(next) = tokens.get(idx + 1) else {
+                return false;
+            };
+            if !crate::binary::is_identifier(&next.text) || is_py_keyword(&next.text) {
+                return false;
+            }
+            let mut depth = 0usize;
+            for t in &tokens[idx + 2..] {
+                if t.line > tok.line && depth == 0 {
+                    break;
+                }
+                match t.text.as_str() {
+                    "(" | "[" | "{" => depth = depth.saturating_add(1),
+                    ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                    ";" if depth == 0 => break,
+                    ":" if depth == 0 => break,
+                    "=" if depth == 0 => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        "match" => {
+            let Some(next) = tokens.get(idx + 1) else {
+                return false;
+            };
+            if next.text == "=" || next.text.ends_with('=') || next.text == "." {
+                return false;
+            }
+            let mut depth = 0usize;
+            for t in &tokens[idx + 1..] {
+                if t.line > tok.line && depth == 0 {
+                    break;
+                }
+                match t.text.as_str() {
+                    "(" | "[" | "{" => depth = depth.saturating_add(1),
+                    ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                    ":" if depth == 0 => return true,
+                    ";" if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            false
+        }
+        "case" => {
+            let Some(next) = tokens.get(idx + 1) else {
+                return false;
+            };
+            if next.text == "=" || next.text.ends_with('=') || next.text == "." {
+                return false;
+            }
+            let mut depth = 0usize;
+            for t in &tokens[idx + 1..] {
+                if t.line > tok.line && depth == 0 {
+                    break;
+                }
+                match t.text.as_str() {
+                    "(" | "[" | "{" => depth = depth.saturating_add(1),
+                    ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                    ":" if depth == 0 => return true,
+                    ";" if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 fn decode_py_string_literal(tok_text: &str) -> Option<String> {
@@ -652,7 +780,7 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     let mut symbols = HashSet::new();
     let mut prev_is_dot = false;
 
-    for tok in &tokens {
+    for (idx, tok) in tokens.iter().enumerate() {
         if let Some(content) = decode_py_string_literal(&tok.text) {
             symbols.insert(content);
             prev_is_dot = false;
@@ -660,7 +788,7 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
             symbols.insert(normalize_py_numeric_literal(&tok.text));
             prev_is_dot = false;
         } else if crate::binary::is_identifier(&tok.text) {
-            if prev_is_dot || !is_py_keyword(&tok.text) {
+            if prev_is_dot || (!is_py_keyword(&tok.text) && !is_contextual_keyword(&tokens, idx)) {
                 symbols.insert(tok.text.clone());
             }
             prev_is_dot = false;
@@ -1108,40 +1236,6 @@ fn pyc_definitions(lines: &[String], continuation: &[bool]) -> Vec<PycDefinition
     definitions
 }
 
-fn changed_pyc_scopes(
-    lines: &[String],
-    positions: &[usize],
-    continuation: &[bool],
-    definitions: &[PycDefinition],
-) -> Vec<(String, usize)> {
-    let mut result = Vec::new();
-    for &pos in positions {
-        let (name, _, def_pos) = find_enclosing_function_for_pos(lines, pos, continuation);
-        if !result.contains(&(name.clone(), def_pos)) {
-            result.push((name, def_pos));
-        }
-        for definition in definitions {
-            if definition.pos > pos {
-                break;
-            }
-            if let Some(header) = parse_def_or_class_header(lines, definition.pos, continuation) {
-                if pos <= header.header_end {
-                    let parent = definition
-                        .parent
-                        .and_then(|p| definitions.iter().find(|d| d.pos == p));
-                    let enclosing = parent
-                        .map(|d| (d.name.clone(), d.pos))
-                        .unwrap_or_else(|| ("<module>".to_string(), 0));
-                    if !result.contains(&enclosing) {
-                        result.push(enclosing);
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
 // Project positions through context and replacement blocks. An insertion or
 // deletion with no opposite-side lines cannot supply a corresponding definition.
 fn pyc_patch_position(hunk: &crate::diff::Hunk, pos: usize, from_fixed: bool) -> Option<usize> {
@@ -1227,26 +1321,220 @@ fn corresponding_pyc_definition(
         .map(|d| d.pos)
 }
 
-fn extract_symbols_for_function(
-    lines: &[String],
-    function_name: &str,
-    hint_pos: usize,
-) -> HashSet<String> {
-    if lines.is_empty() {
-        return HashSet::new();
+struct PycFileAnalysis<'a> {
+    lines: &'a [String],
+    continuation: Vec<bool>,
+    definitions: Vec<PycDefinition>,
+    headers: HashMap<usize, Option<ParsedDefHeader>>,
+    scope_membership: HashMap<usize, (String, usize)>,
+    symbols: HashMap<(String, usize), HashSet<String>>,
+}
+
+impl<'a> PycFileAnalysis<'a> {
+    fn new(lines: &'a [String]) -> Self {
+        let continuation = compute_line_continuation(lines);
+        let definitions = pyc_definitions(lines, &continuation);
+        Self {
+            lines,
+            continuation,
+            definitions,
+            headers: HashMap::new(),
+            scope_membership: HashMap::new(),
+            symbols: HashMap::new(),
+        }
     }
-    let is_cont = compute_line_continuation(lines);
 
-    if function_name == "<module>" {
-        let mut module_symbols = HashSet::new();
+    fn get_or_parse_header(
+        &mut self,
+        def_pos: usize,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<&ParsedDefHeader>, FingerprintError> {
+        if !self.headers.contains_key(&def_pos) {
+            budget.charge(1)?;
+            let parsed = parse_def_or_class_header(self.lines, def_pos, &self.continuation);
+            self.headers.insert(def_pos, parsed);
+        }
+        Ok(self.headers.get(&def_pos).and_then(|opt| opt.as_ref()))
+    }
+
+    fn get_scope_for_pos(
+        &mut self,
+        pos: usize,
+        budget: &mut WorkBudget,
+    ) -> Result<(String, usize), FingerprintError> {
+        if let Some(scope) = self.scope_membership.get(&pos) {
+            return Ok(scope.clone());
+        }
+        budget.charge(1)?;
+        let (name, _, def_pos) =
+            find_enclosing_function_for_pos(self.lines, pos, &self.continuation);
+        let scope = (name, def_pos);
+        self.scope_membership.insert(pos, scope.clone());
+        Ok(scope)
+    }
+
+    fn changed_scopes(
+        &mut self,
+        positions: &[usize],
+        budget: &mut WorkBudget,
+    ) -> Result<Vec<(String, usize)>, FingerprintError> {
+        let mut result = Vec::new();
+        for &pos in positions {
+            let enclosing = self.get_scope_for_pos(pos, budget)?;
+            if !result.contains(&enclosing) {
+                result.push(enclosing);
+            }
+            let idx = self.definitions.partition_point(|d| d.pos <= pos);
+            if idx > 0 {
+                let def = &self.definitions[idx - 1];
+                let def_pos = def.pos;
+                let parent_pos = def.parent;
+                if let Some(header) = self.get_or_parse_header(def_pos, budget)? {
+                    if pos <= header.header_end {
+                        let parent =
+                            parent_pos.and_then(|p| self.definitions.iter().find(|d| d.pos == p));
+                        let enclosing_header_parent = parent
+                            .map(|d| (d.name.clone(), d.pos))
+                            .unwrap_or_else(|| ("<module>".to_string(), 0));
+                        if !result.contains(&enclosing_header_parent) {
+                            result.push(enclosing_header_parent);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_or_extract_symbols(
+        &mut self,
+        function_name: &str,
+        hint_pos: usize,
+        budget: &mut WorkBudget,
+    ) -> Result<HashSet<String>, FingerprintError> {
+        let key = (function_name.to_string(), hint_pos);
+        if let Some(syms) = self.symbols.get(&key) {
+            return Ok(syms.clone());
+        }
+        let syms = self.extract_symbols(function_name, hint_pos, budget)?;
+        self.symbols.insert(key, syms.clone());
+        Ok(syms)
+    }
+
+    fn extract_symbols(
+        &mut self,
+        function_name: &str,
+        hint_pos: usize,
+        budget: &mut WorkBudget,
+    ) -> Result<HashSet<String>, FingerprintError> {
+        if self.lines.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        if function_name == "<module>" {
+            let mut module_symbols = HashSet::new();
+            let mut skip_until_indent: Option<usize> = None;
+            let mut line_idx = 0;
+
+            while line_idx < self.lines.len() {
+                let line = &self.lines[line_idx];
+
+                if let Some(skip_indent) = skip_until_indent {
+                    if self.continuation[line_idx] {
+                        line_idx += 1;
+                        continue;
+                    }
+                    if let Some(indent) = get_line_indent(line) {
+                        if indent > skip_indent {
+                            line_idx += 1;
+                            continue;
+                        } else {
+                            skip_until_indent = None;
+                        }
+                    } else {
+                        line_idx += 1;
+                        continue;
+                    }
+                }
+
+                if !self.continuation[line_idx] && parse_def_or_class(line).is_some() {
+                    let def_indent = get_line_indent(line).unwrap_or(0);
+                    if let Some(parsed) = self.get_or_parse_header(line_idx, budget)? {
+                        let header_end = parsed.header_end;
+                        let enclosing_syms = parsed.enclosing_symbols.clone();
+                        module_symbols.extend(enclosing_syms);
+                        skip_until_indent = Some(def_indent);
+                        line_idx = header_end + 1;
+                        continue;
+                    }
+                }
+
+                let mut span_end = line_idx + 1;
+                while span_end < self.lines.len() && self.continuation[span_end] {
+                    span_end += 1;
+                }
+                let span_lines: Vec<&str> = self.lines[line_idx..span_end]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                budget.charge(span_lines.len())?;
+                let syms = collect_symbol_set(&span_lines);
+                module_symbols.extend(syms);
+                line_idx = span_end;
+            }
+
+            return Ok(module_symbols);
+        }
+
+        let candidate = self
+            .definitions
+            .iter()
+            .filter(|d| d.name == function_name)
+            .min_by_key(|d| d.pos.abs_diff(hint_pos));
+
+        let Some(def) = candidate else {
+            return Ok(HashSet::new());
+        };
+        let def_line = def.pos;
+        let base_indent = get_line_indent(&self.lines[def_line]).unwrap_or(0);
+
+        let mut end_line = self.lines.len();
+        for (j, line) in self.lines.iter().enumerate().skip(def_line + 1) {
+            if self.continuation[j] {
+                continue;
+            }
+            if let Some(indent) = get_line_indent(line) {
+                if indent <= base_indent {
+                    end_line = j;
+                    break;
+                }
+            }
+        }
+
+        let mut symbols = HashSet::new();
+        let parsed_header = self.get_or_parse_header(def_line, budget)?;
+        let (header_end, inline_body) = if let Some(parsed) = parsed_header {
+            if !parsed.is_class {
+                symbols.extend(parsed.func_symbols.clone());
+            }
+            (parsed.header_end, parsed.inline_body.clone())
+        } else {
+            (def_line, None)
+        };
+
+        if let Some(body_text) = inline_body {
+            budget.charge(1)?;
+            let syms = collect_symbol_set(&[&body_text]);
+            symbols.extend(syms);
+        }
+
         let mut skip_until_indent: Option<usize> = None;
-        let mut line_idx = 0;
-
-        while line_idx < lines.len() {
-            let line = &lines[line_idx];
+        let mut line_idx = header_end + 1;
+        while line_idx < end_line {
+            let line = &self.lines[line_idx];
 
             if let Some(skip_indent) = skip_until_indent {
-                if is_cont[line_idx] {
+                if self.continuation[line_idx] {
                     line_idx += 1;
                     continue;
                 }
@@ -1263,124 +1551,43 @@ fn extract_symbols_for_function(
                 }
             }
 
-            if !is_cont[line_idx] && parse_def_or_class(line).is_some() {
-                let def_indent = get_line_indent(line).unwrap_or(0);
-                if let Some(parsed) = parse_def_or_class_header(lines, line_idx, &is_cont) {
-                    module_symbols.extend(parsed.enclosing_symbols);
-                    skip_until_indent = Some(def_indent);
-                    line_idx = parsed.header_end + 1;
+            if !self.continuation[line_idx] && parse_def_or_class(line).is_some() {
+                let nested_indent = get_line_indent(line).unwrap_or(base_indent + 1);
+                if let Some(parsed) = self.get_or_parse_header(line_idx, budget)? {
+                    let header_end = parsed.header_end;
+                    let enclosing_syms = parsed.enclosing_symbols.clone();
+                    symbols.extend(enclosing_syms);
+                    skip_until_indent = Some(nested_indent);
+                    line_idx = header_end + 1;
                     continue;
                 }
             }
 
-            let syms = collect_symbol_set(&[line.as_str()]);
-            module_symbols.extend(syms);
-            line_idx += 1;
-        }
-
-        return module_symbols;
-    }
-
-    let mut candidates = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if !is_cont[idx] {
-            if let Some((name, _)) = parse_def_or_class(line) {
-                if name == function_name {
-                    if let Some(indent) = get_line_indent(line) {
-                        candidates.push((idx, indent));
-                    }
-                }
+            let mut span_end = line_idx + 1;
+            while span_end < end_line && self.continuation[span_end] {
+                span_end += 1;
             }
+            let span_lines: Vec<&str> = self.lines[line_idx..span_end]
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            budget.charge(span_lines.len())?;
+            let syms = collect_symbol_set(&span_lines);
+            symbols.extend(syms);
+            line_idx = span_end;
         }
+
+        Ok(symbols)
     }
-    if candidates.is_empty() {
-        return HashSet::new();
-    }
-
-    let &(def_line, base_indent) = candidates
-        .iter()
-        .min_by_key(|(idx, _)| idx.abs_diff(hint_pos))
-        .unwrap_or(&candidates[0]);
-
-    let mut end_line = lines.len();
-    for (j, line) in lines.iter().enumerate().skip(def_line + 1) {
-        if is_cont[j] {
-            continue;
-        }
-        if let Some(indent) = get_line_indent(line) {
-            if indent <= base_indent {
-                end_line = j;
-                break;
-            }
-        }
-    }
-
-    let mut symbols = HashSet::new();
-    let parsed_header = parse_def_or_class_header(lines, def_line, &is_cont);
-    let (header_end, inline_body) = if let Some(parsed) = parsed_header {
-        if !parsed.is_class {
-            symbols.extend(parsed.func_symbols);
-        }
-        (parsed.header_end, parsed.inline_body)
-    } else {
-        (def_line, None)
-    };
-
-    if let Some(body_text) = inline_body {
-        let syms = collect_symbol_set(&[&body_text]);
-        symbols.extend(syms);
-    }
-
-    let mut skip_until_indent: Option<usize> = None;
-    let mut line_idx = header_end + 1;
-    while line_idx < end_line {
-        let line = &lines[line_idx];
-
-        if let Some(skip_indent) = skip_until_indent {
-            if is_cont[line_idx] {
-                line_idx += 1;
-                continue;
-            }
-            if let Some(indent) = get_line_indent(line) {
-                if indent > skip_indent {
-                    line_idx += 1;
-                    continue;
-                } else {
-                    skip_until_indent = None;
-                }
-            } else {
-                line_idx += 1;
-                continue;
-            }
-        }
-
-        if !is_cont[line_idx] && parse_def_or_class(line).is_some() {
-            let nested_indent = get_line_indent(line).unwrap_or(base_indent + 1);
-            if let Some(parsed) = parse_def_or_class_header(lines, line_idx, &is_cont) {
-                symbols.extend(parsed.enclosing_symbols);
-                skip_until_indent = Some(nested_indent);
-                line_idx = parsed.header_end + 1;
-                continue;
-            }
-        }
-
-        let syms = collect_symbol_set(&[line.as_str()]);
-        symbols.extend(syms);
-        line_idx += 1;
-    }
-
-    symbols
 }
 
 fn compute_pyc_function_fingerprints(
     hunk: &crate::diff::Hunk,
-    post_fix_lines: &[String],
+    fixed_analysis: &mut PycFileAnalysis,
     changed_pos: &[usize],
-    base_lines: Option<&[String]>,
-) -> Vec<PycFunctionFingerprint> {
-    let post_fix_cont = compute_line_continuation(post_fix_lines);
-    let base_cont = base_lines.map(compute_line_continuation);
-
+    mut base_analysis: Option<&mut PycFileAnalysis>,
+    budget: &mut WorkBudget,
+) -> Result<Vec<PycFunctionFingerprint>, FingerprintError> {
     let base_start = if hunk.header.old_range.start > 0 {
         hunk.header.old_range.start - 1
     } else {
@@ -1405,38 +1612,29 @@ fn compute_pyc_function_fingerprints(
         base_hunk_lines.push(base_start);
     }
 
-    let fixed_definitions = pyc_definitions(post_fix_lines, &post_fix_cont);
-    let base_definitions = base_lines
-        .map(|base| pyc_definitions(base, base_cont.as_deref().unwrap_or(&[])))
-        .unwrap_or_default();
-    let base_defs = base_lines
-        .map(|base| {
-            changed_pyc_scopes(
-                base,
-                &base_hunk_lines,
-                base_cont.as_deref().unwrap_or(&[]),
-                &base_definitions,
-            )
-        })
-        .unwrap_or_default();
-    let fixed_defs = changed_pyc_scopes(
-        post_fix_lines,
-        changed_pos,
-        &post_fix_cont,
-        &fixed_definitions,
-    );
+    let base_defs = if let Some(ref mut base_ana) = base_analysis {
+        base_ana.changed_scopes(&base_hunk_lines, budget)?
+    } else {
+        Vec::new()
+    };
+    let fixed_defs = fixed_analysis.changed_scopes(changed_pos, budget)?;
+
     let mut targets: Vec<(String, Option<usize>, Option<usize>)> = Vec::new();
     let mut used_base = HashSet::new();
     let mut used_fixed = HashSet::new();
     for (name, pos) in fixed_defs {
-        let base_pos = corresponding_pyc_definition(
-            &name,
-            pos,
-            pyc_patch_position(hunk, pos, true),
-            &fixed_definitions,
-            &base_definitions,
-            &used_base,
-        );
+        let base_pos = if let Some(ref base_ana) = base_analysis {
+            corresponding_pyc_definition(
+                &name,
+                pos,
+                pyc_patch_position(hunk, pos, true),
+                &fixed_analysis.definitions,
+                &base_ana.definitions,
+                &used_base,
+            )
+        } else {
+            None
+        };
         if name != "<module>" {
             if let Some(base_pos) = base_pos {
                 used_base.insert(base_pos);
@@ -1452,14 +1650,18 @@ fn compute_pyc_function_fingerprints(
         {
             continue;
         }
-        let fixed_pos = corresponding_pyc_definition(
-            &name,
-            pos,
-            pyc_patch_position(hunk, pos, false),
-            &base_definitions,
-            &fixed_definitions,
-            &used_fixed,
-        );
+        let fixed_pos = if let Some(ref base_ana) = base_analysis {
+            corresponding_pyc_definition(
+                &name,
+                pos,
+                pyc_patch_position(hunk, pos, false),
+                &base_ana.definitions,
+                &fixed_analysis.definitions,
+                &used_fixed,
+            )
+        } else {
+            None
+        };
         if name != "<module>" {
             if let Some(fixed_pos) = fixed_pos {
                 used_fixed.insert(fixed_pos);
@@ -1484,18 +1686,18 @@ fn compute_pyc_function_fingerprints(
 
     for (function_name, f_hint, b_hint) in targets {
         let fixed_symbols = if let Some(f_pos) = f_hint {
-            extract_symbols_for_function(post_fix_lines, &function_name, f_pos)
+            fixed_analysis.get_or_extract_symbols(&function_name, f_pos, budget)?
         } else if function_name == "<module>" {
-            extract_symbols_for_function(post_fix_lines, "<module>", 0)
+            fixed_analysis.get_or_extract_symbols("<module>", 0, budget)?
         } else {
             HashSet::new()
         };
 
-        let base_symbols = if let Some(base) = base_lines {
+        let base_symbols = if let Some(ref mut base_ana) = base_analysis {
             if let Some(b_pos) = b_hint {
-                extract_symbols_for_function(base, &function_name, b_pos)
+                base_ana.get_or_extract_symbols(&function_name, b_pos, budget)?
             } else if function_name == "<module>" {
-                extract_symbols_for_function(base, "<module>", 0)
+                base_ana.get_or_extract_symbols("<module>", 0, budget)?
             } else {
                 HashSet::new()
             }
@@ -1533,7 +1735,7 @@ fn compute_pyc_function_fingerprints(
         });
     }
 
-    result
+    Ok(result)
 }
 
 impl FingerprintSet {
@@ -1562,6 +1764,48 @@ impl FingerprintSet {
         tier2_max_files: usize,
         tier2_max_bytes: u64,
     ) -> Result<Self, FingerprintError> {
+        Self::from_task_with_caps_and_budget(
+            gold_patch_str,
+            test_patch_str,
+            base_tree_root,
+            tier2_max_files,
+            tier2_max_bytes,
+            None,
+        )
+    }
+
+    pub fn from_task_with_budget(
+        gold_patch_str: &str,
+        test_patch_str: &str,
+        base_tree_root: &Path,
+        work_budget: Option<usize>,
+    ) -> Result<Self, FingerprintError> {
+        Self::from_task_with_caps_and_budget(
+            gold_patch_str,
+            test_patch_str,
+            base_tree_root,
+            Self::DEFAULT_TIER2_MAX_FILES,
+            Self::DEFAULT_TIER2_MAX_BYTES,
+            work_budget,
+        )
+    }
+
+    pub fn from_task_with_caps_and_budget(
+        gold_patch_str: &str,
+        test_patch_str: &str,
+        base_tree_root: &Path,
+        tier2_max_files: usize,
+        tier2_max_bytes: u64,
+        work_budget: Option<usize>,
+    ) -> Result<Self, FingerprintError> {
+        let budget_limit = work_budget
+            .or_else(|| {
+                std::env::var("HERMETIC_FINGERPRINT_WORK_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(DEFAULT_MAX_FINGERPRINT_WORK);
+        let mut budget = WorkBudget::new(budget_limit);
         let gold_patch = parse_patch(gold_patch_str)?;
         let test_patch = parse_patch(test_patch_str)?;
 
@@ -1579,6 +1823,17 @@ impl FingerprintSet {
 
             let (post_fix_lines, hunk_changed_positions, base_lines) =
                 apply_patch_to_base(file, base_tree_root);
+
+            let mut fixed_analysis = if file_path.ends_with(".py") {
+                Some(PycFileAnalysis::new(&post_fix_lines))
+            } else {
+                None
+            };
+            let mut base_analysis = if file_path.ends_with(".py") {
+                base_lines.as_ref().map(|b| PycFileAnalysis::new(b))
+            } else {
+                None
+            };
 
             let post_fix_text = post_fix_lines.join("\n");
             let all_tokens = tokenize(&post_fix_text);
@@ -1852,16 +2107,17 @@ impl FingerprintSet {
                     }
                 }
 
-                let pyc_fingerprints = if file_path.ends_with(".py") {
+                let pyc_fingerprints = if let Some(ref mut fixed_ana) = fixed_analysis {
                     compute_pyc_function_fingerprints(
                         hunk,
-                        &post_fix_lines,
+                        fixed_ana,
                         hunk_changed_positions
                             .get(hunk_idx)
                             .map(|v| v.as_slice())
                             .unwrap_or(&[]),
-                        base_lines.as_deref(),
-                    )
+                        base_analysis.as_mut(),
+                        &mut budget,
+                    )?
                 } else {
                     Vec::new()
                 };
