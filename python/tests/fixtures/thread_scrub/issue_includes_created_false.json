@@ -1,0 +1,42 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_inc_created_false",
+        "databaseId": 206,
+        "url": "https://github.com/test-org/test-repo/issues/206",
+        "body": "Scraped body of issue without creation edit",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": "2020-01-10T10:00:00Z",
+        "includesCreatedEdit": false,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-10T10:00:00Z",
+              "editedAt": "2020-01-10T10:00:00Z",
+              "diff": "Later edit text after cutoff"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

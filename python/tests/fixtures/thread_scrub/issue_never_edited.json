@@ -1,0 +1,35 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest102",
+        "databaseId": 102,
+        "url": "https://github.com/test-org/test-repo/issues/102",
+        "body": "Never edited issue body text.",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

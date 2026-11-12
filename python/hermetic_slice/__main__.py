@@ -12,7 +12,7 @@ import sys
 
 from hermetic_slice.eval_spec import load_eval_rows, prepare_eval_script, write_eval_spec
 from hermetic_slice.grader import oracle_check
-from hermetic_slice.http import make_http_get
+from hermetic_slice.http import make_http_get, make_http_post_json
 from hermetic_slice.image_sealer import seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
 from hermetic_slice.pkg_index import build_index, env_info
@@ -133,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
 
         token = os.environ.get("GITHUB_TOKEN")
         http_get = make_http_get(args.cache, token=token)
+        http_post_json = make_http_post_json(args.cache, token=token) if token else None
 
         try:
             rows = load_verified(http_get, args.cache)
@@ -146,7 +147,15 @@ def main(argv: list[str] | None = None) -> int:
                 if task_id not in rows:
                     raise IntakeError(f"Unknown instance_id: {task_id}")
 
-                task_dir = intake_task(task_id, rows, http_get, args.cache, args.out)
+                task_dir = intake_task(
+                    task_id,
+                    rows,
+                    http_get,
+                    args.cache,
+                    args.out,
+                    token=token,
+                    http_post_json=http_post_json,
+                )
                 task_data = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
 
                 t_world = task_data["cutoffs"]["t_world"]

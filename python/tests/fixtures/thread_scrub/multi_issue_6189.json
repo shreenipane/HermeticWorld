@@ -1,0 +1,63 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOmulti_6189",
+        "databaseId": 6189,
+        "url": "https://github.com/test-org/test-repo/issues/6189",
+        "body": "First issue body",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOcomment_6189_late",
+              "databaseId": 1111,
+              "url": "https://github.com/test-org/test-repo/issues/6189#issuecomment-1111",
+              "body": "Post T_world comment on issue 6189",
+              "createdAt": "2020-01-15T10:00:00Z",
+              "lastEditedAt": null,
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "__typename": "CrossReferencedEvent",
+              "url": "https://github.com/test-org/test-repo/issues/6189#event-cross-1",
+              "source": {
+                "__typename": "Issue",
+                "number": 7777,
+                "url": "https://github.com/test-org/test-repo/issues/7777"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest103",
+        "databaseId": 103,
+        "url": "https://github.com/test-org/test-repo/issues/103",
+        "body": "Issue discussing bug and hints.",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOtest_c1",
+              "databaseId": 201,
+              "url": "https://github.com/test-org/test-repo/issues/103#issuecomment-201",
+              "body": "Comment 1: The fix is to add return True",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": "2020-01-08T10:00:00Z",
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": [
+                  {
+                    "createdAt": "2020-01-08T10:00:00Z",
+                    "editedAt": "2020-01-08T10:00:00Z",
+                    "diff": "Comment 1: The fix is to add return True"
+                  },
+                  {
+                    "createdAt": "2020-01-02T10:00:00Z",
+                    "editedAt": "2020-01-02T10:00:00Z",
+                    "diff": "Comment 1: I reproduced the bug"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "IC_kwDOtest_c2",
+              "databaseId": 202,
+              "url": "https://github.com/test-org/test-repo/issues/103#issuecomment-202",
+              "body": "Comment 2: Late comment with complete patch",
+              "createdAt": "2020-01-08T10:00:00Z",
+              "lastEditedAt": null,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

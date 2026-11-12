@@ -1,0 +1,67 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOmulti_6190",
+        "databaseId": 6190,
+        "url": "https://github.com/test-org/test-repo/issues/6190",
+        "body": "Second issue body",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOcomment_6190_late",
+              "databaseId": 2222,
+              "url": "https://github.com/test-org/test-repo/issues/6190#issuecomment-2222",
+              "body": "Post T_world comment on issue 6190",
+              "createdAt": "2020-01-20T10:00:00Z",
+              "lastEditedAt": null,
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "__typename": "ConnectedEvent",
+              "source": {
+                "__typename": "PullRequest",
+                "number": 8888,
+                "url": "https://github.com/test-org/test-repo/pull/8888"
+              },
+              "subject": {
+                "__typename": "Issue",
+                "number": 6190,
+                "url": "https://github.com/test-org/test-repo/issues/6190"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

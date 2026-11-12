@@ -71,8 +71,15 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] Binary tier (TR-SC-5) (T1.4; `.pyc` coverage is weak, see BUILD_LOG)
 - [x] Container recursion with bomb limits, including git packs (TR-SC-6) (T1.2, T1.3)
 - [ ] Detectors D0–D12 (TR-SC-7): done D0, D1, D2, D3, D3b, D5a, D6, D9. Remaining, in order: D4, D5b, D7, D8, D10, D11, D12
-- [ ] Thread scrub and mutable-content revision rule (TR-SEAL-9)
-- [x] Dispositions: `repaired` / `excluded`, never silent (§5.5) (T1.14)
+- [x] Thread scrub and mutable-content revision rule (TR-SEAL-9) (T1.13)
+  - [ ] Deferred (T1.13 review, non-blocking): scrub URL matching misses aliases of the same resource (`www.github.com`, `http://`, trailing-dot host, empty path segments, `/repositories/{id}/...`); canonicalise or deny them before a WorldServer maps aliases to stored content
+  - [ ] Deferred (T1.13 review): the CLI secret-safety test calls `intake` with arguments the parser rejects, so the exception path is never exercised; use valid arguments and assert the mock ran
+  - [ ] Deferred (T1.13 review): `open_secure_directory` refuses operator-supplied roots that traverse symlinks; decide whether a trusted prefix may be resolved (no-follow stays for everything beneath it)
+  - [ ] Deferred (T1.13 review): task publication wraps every failure as `task_publication_failed` and drops the cause; pass `IntakeError` through and keep the error class
+  - [ ] Deferred (T1.13 review): decide whether the scrub fallback paths should return the as-scraped statement with `problem_statement_revision = as_scraped` and a warning (today they exclude content)
+  - [ ] Deferred (T1.13 review): fixture `pytest_issue_6189_edits.json` has a creation edit dated before the issue's creation; the cache case in `test_http.py` can pass before the bounded-read check
+  - [ ] Deferred (gates): Docker tests use fixed image and network names (`hermetic-test/fake-swebench`, `hermetic-world-test-inst-1-net`), so two py-gate runs at once make `test_cli_seal_images` and `test_world_probe_cli` fail; use per-run names
+- [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [x] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
