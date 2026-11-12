@@ -47,6 +47,7 @@ pub struct ClientConnection {
 
     // HERMETIC PATCH: the connection's absolute read deadline, and where its values come from.
     read_deadline: DeadlineCell,
+    write_deadline: DeadlineCell,
     deadlines: Arc<Mutex<RequestDeadlines>>,
 }
 
@@ -70,7 +71,7 @@ enum ReadError {
 impl ClientConnection {
     /// Creates a new `ClientConnection` that takes ownership of the `TcpStream`.
     pub fn new(
-        write_socket: RefinedTcpStream,
+        mut write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
         probe: Option<Connection>,
         deadlines: Arc<Mutex<RequestDeadlines>>,
@@ -79,6 +80,8 @@ impl ClientConnection {
         let secure = read_socket.secure();
         let read_deadline: DeadlineCell = Arc::new(Mutex::new(None));
         read_socket.set_deadline_cell(read_deadline.clone());
+        let write_deadline: DeadlineCell = Arc::new(Mutex::new(None));
+        write_socket.set_write_deadline_cell(write_deadline.clone());
 
         let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
         let first_header = source.next().unwrap();
@@ -92,6 +95,7 @@ impl ClientConnection {
             secure,
             probe,
             read_deadline,
+            write_deadline,
             deadlines,
         }
     }
@@ -228,7 +232,8 @@ impl ClientConnection {
         // HERMETIC PATCH: attach a duplicate socket handle (see `probe`).
         let request = request
             .with_peer_probe(self.probe.as_ref().and_then(|c| c.try_clone().ok()))
-            .with_read_deadline_cell(self.read_deadline.clone());
+            .with_read_deadline_cell(self.read_deadline.clone())
+            .with_write_deadline_cell(self.write_deadline.clone());
 
         // return the request
         Ok(request)

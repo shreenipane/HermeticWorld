@@ -104,6 +104,15 @@ impl Connection {
         }
     }
 
+    /// HERMETIC PATCH: sets the socket write timeout (used for absolute write deadlines).
+    pub(crate) fn set_write_timeout(&self, t: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_write_timeout(t),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_write_timeout(t),
+        }
+    }
+
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         match self {
             Self::Tcp(s) => s.try_clone().map(Self::from),

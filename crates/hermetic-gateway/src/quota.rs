@@ -75,6 +75,10 @@ struct QuotaState {
     /// Slots (counted in `concurrent_requests`) whose client has closed its side while the
     /// upstream work goes on.
     draining_requests: u64,
+    /// Usage reported so far by requests still running (not yet in the totals above). Counted
+    /// against the token caps together with the totals, so concurrent streams share the cap.
+    live_input_tokens: u64,
+    live_output_tokens: u64,
     limit_exceeded: bool,
     limit_exceeded_reason: Option<String>,
 }
@@ -118,6 +122,8 @@ impl QuotaTracker {
                 output_tokens: 0,
                 concurrent_requests: 0,
                 draining_requests: 0,
+                live_input_tokens: 0,
+                live_output_tokens: 0,
                 limit_exceeded: false,
                 limit_exceeded_reason: None,
             }),
@@ -228,18 +234,25 @@ impl QuotaTracker {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<(), QuotaBreach> {
-        self.finish(input_tokens, output_tokens, false)
+        self.finish(input_tokens, output_tokens, false, (0, 0))
     }
 
     /// Records a finished request's usage and releases its slot (`was_draining`: the slot had
     /// been marked draining). Returns the breach if the usage crosses a token cap.
+    ///
+    /// `live` is the request's usage previously reported through `update_live`; it is moved
+    /// from the live sum into the totals (replaced by the final usage), so nothing is counted
+    /// twice.
     pub fn finish(
         &self,
         input_tokens: u64,
         output_tokens: u64,
         was_draining: bool,
+        live: (u64, u64),
     ) -> Result<(), QuotaBreach> {
         let mut state = self.lock();
+        state.live_input_tokens = state.live_input_tokens.saturating_sub(live.0);
+        state.live_output_tokens = state.live_output_tokens.saturating_sub(live.1);
         state.concurrent_requests = state.concurrent_requests.saturating_sub(1);
         if was_draining {
             state.draining_requests = state.draining_requests.saturating_sub(1);
@@ -261,8 +274,14 @@ impl QuotaTracker {
         if state.limit_exceeded {
             return Err(state.terminal());
         }
-        let total_in = state.input_tokens.saturating_add(pending_in);
-        let total_out = state.output_tokens.saturating_add(pending_out);
+        let total_in = state
+            .input_tokens
+            .saturating_add(state.live_input_tokens)
+            .saturating_add(pending_in);
+        let total_out = state
+            .output_tokens
+            .saturating_add(state.live_output_tokens)
+            .saturating_add(pending_out);
         if let Some(limit) = self.config.max_input_tokens {
             if total_in > limit {
                 return Err(state.mark(QuotaBreach::InputTokensExceeded {
@@ -293,6 +312,36 @@ impl QuotaTracker {
     ) -> Result<(), QuotaBreach> {
         let mut state = self.lock();
         self.check_tokens_locked(&mut state, pending_in, pending_out)?;
+        if let Some(limit) = self.config.max_wall_time_seconds {
+            if elapsed_secs >= limit {
+                return Err(state.mark(QuotaBreach::WallTimeExceeded {
+                    elapsed_secs,
+                    limit,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// A running request's usage changed from `prev` to `now` (both as last reported): updates
+    /// the shared live sum atomically and checks the token caps against completed + all live
+    /// usage, and `elapsed_secs` against the wall-time limit. A breach is marked terminal.
+    pub fn update_live(
+        &self,
+        prev: (u64, u64),
+        now: (u64, u64),
+        elapsed_secs: u64,
+    ) -> Result<(), QuotaBreach> {
+        let mut state = self.lock();
+        state.live_input_tokens = state
+            .live_input_tokens
+            .saturating_sub(prev.0)
+            .saturating_add(now.0);
+        state.live_output_tokens = state
+            .live_output_tokens
+            .saturating_sub(prev.1)
+            .saturating_add(now.1);
+        self.check_tokens_locked(&mut state, 0, 0)?;
         if let Some(limit) = self.config.max_wall_time_seconds {
             if elapsed_secs >= limit {
                 return Err(state.mark(QuotaBreach::WallTimeExceeded {

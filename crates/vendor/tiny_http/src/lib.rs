@@ -117,6 +117,7 @@ pub use connection::{ConfigListenAddr, ListenAddr, Listener};
 pub use request::{ReadWrite, Request};
 pub use response::{Response, ResponseBox, MAX_IDENTITY_BUFFER_BYTES};
 pub use test::TestRequest;
+pub use util::refined_tcp_stream::DeadlineHandle;
 
 mod client;
 mod common;

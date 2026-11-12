@@ -44,10 +44,34 @@ pub const REQUEST_HEAD_DEADLINE: Duration = Duration::from_secs(60);
 /// discarding the unread body of a refused request. Past it the request gets a 400.
 pub const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Longest a single write of a response to the agent may block (the agent stopped reading).
-/// A stream is long-lived, so this is a per-write stall limit; the stream's total duration is
-/// bounded by the wall-time quota and the upstream timeouts.
-pub const RESPONSE_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Absolute deadline for writing a whole non-streaming response (or error) to the agent,
+/// counted from when writing starts. Enforced by the vendored tiny_http before every socket
+/// write; past it the connection is dropped and the handler is freed.
+pub const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Minimum-progress rule for streams: every chunk of a stream handed to the writer (at most
+/// one SSE event or 8 KiB) must be written within this absolute deadline, so a reader that
+/// stops or slows below that pace loses the stream and frees the handler.
+pub const STREAM_CHUNK_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Renews the connection's write deadline each time a chunk of the stream is handed out.
+struct ChunkDeadlineReader<R: Read> {
+    inner: R,
+    handle: Option<tiny_http::DeadlineHandle>,
+    per_chunk: Duration,
+}
+
+impl<R: Read> Read for ChunkDeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Some(h) = self.handle.as_ref() {
+                h.set(Some(std::time::Instant::now() + self.per_chunk));
+            }
+        }
+        Ok(n)
+    }
+}
 
 /// Body bytes read (and reserved from the budget) per step.
 const BODY_READ_CHUNK: usize = 64 * 1024;
@@ -138,6 +162,8 @@ pub struct GatewayServer {
     max_in_flight: usize,
     body_budget: Arc<BodyBudget>,
     client_deadlines: RequestDeadlines,
+    /// (whole non-streaming response, per stream chunk) write deadlines.
+    write_deadlines: (Duration, Duration),
 }
 
 impl GatewayServer {
@@ -212,6 +238,7 @@ impl GatewayServer {
                 head: Some(REQUEST_HEAD_DEADLINE),
                 body: Some(REQUEST_BODY_DEADLINE),
             },
+            write_deadlines: (RESPONSE_WRITE_DEADLINE, STREAM_CHUNK_WRITE_DEADLINE),
         })
     }
 
@@ -221,6 +248,25 @@ impl GatewayServer {
             head: Some(head),
             body: Some(body),
         };
+        self
+    }
+
+    /// Overrides `RESPONSE_WRITE_DEADLINE` and `STREAM_CHUNK_WRITE_DEADLINE` (tests).
+    pub fn with_response_write_deadlines(
+        mut self,
+        response: Duration,
+        stream_chunk: Duration,
+    ) -> Self {
+        self.write_deadlines = (response, stream_chunk);
+        self
+    }
+
+    /// Overrides how long a request waits for a slot held by a draining request (tests).
+    pub fn with_drain_wait(mut self, wait: Duration) -> Self {
+        self.quota = Arc::new(QuotaTracker::with_drain_wait(
+            self.config.quotas.clone(),
+            wait,
+        ));
         self
     }
 
@@ -404,15 +450,19 @@ impl GatewayServer {
             quotas: self.quota.snapshot(),
         });
 
+        self.arm_write_deadline(&request, self.write_deadlines.0);
         let _ = request.respond(response);
     }
 
-    pub fn handle_agent_request(&self, mut request: Request) {
-        // A response write may block at most RESPONSE_WRITE_STALL_TIMEOUT per write.
-        let peer = request.try_clone_peer_tcp_stream();
-        if let Some(p) = peer.as_ref() {
-            let _ = p.set_write_timeout(Some(RESPONSE_WRITE_STALL_TIMEOUT));
+    /// Arms the absolute write deadline for the response about to be written.
+    fn arm_write_deadline(&self, request: &Request, d: Duration) {
+        if let Some(h) = request.write_deadline() {
+            h.set(Some(std::time::Instant::now() + d));
         }
+    }
+
+    pub fn handle_agent_request(&self, mut request: Request) {
+        let peer = request.try_clone_peer_tcp_stream();
         let method = request.method().clone();
         let url = request.url().to_string();
 
@@ -776,6 +826,7 @@ impl GatewayServer {
                         quotas: self.quota.snapshot(),
                     });
 
+                    self.arm_write_deadline(&request, self.write_deadlines.0);
                     let _ = request.respond(resp);
                 } else {
                     // 2xx upstream response: fail-closed sanitisation. A body that is not one
@@ -846,6 +897,7 @@ impl GatewayServer {
                         quotas: self.quota.snapshot(),
                     });
 
+                    self.arm_write_deadline(&request, self.write_deadlines.0);
                     let _ = request.respond(resp);
                 }
             }
@@ -888,9 +940,15 @@ impl GatewayServer {
                 }
                 self.ensure_date_header(&mut resp_headers);
 
+                let sse_reader = ChunkDeadlineReader {
+                    inner: sse_reader,
+                    handle: request.write_deadline(),
+                    per_chunk: self.write_deadlines.1,
+                };
                 let tiny_response =
                     Response::new(status.into(), resp_headers, sse_reader, None, None);
 
+                self.arm_write_deadline(&request, self.write_deadlines.1);
                 let _ = request.respond(tiny_response);
                 let _ = slot.record_and_release();
 

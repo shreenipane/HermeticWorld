@@ -792,3 +792,338 @@ fn test_15_echoed_api_key_is_redacted_in_host_log() {
     assert!(!log.contains(&key), "API key in host log: {log}");
     assert!(log.contains("<redacted>"), "{log}");
 }
+
+// ---------- prior-check follow-ups (2, 6, 8, 9, 10) ----------
+
+#[test]
+fn test_2b_tool_input_exemption_only_at_tool_content_locations() {
+    let clock = GuestClock::frozen(t_clock_2019(), Duration::from_secs(0));
+    // The reviewer's case: a tool_use-shaped object outside message content.
+    let mut v: serde_json::Value = serde_json::from_str(&format!(
+        r#"{{"metadata":{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}}}"#
+    ))
+    .unwrap();
+    rewrite_json_timestamps(&mut v, &clock);
+    assert!(!v.to_string().contains(REAL_DATE), "{v}");
+
+    // Nested deeper inside a content block's other fields: still rewritten.
+    let mut v: serde_json::Value = serde_json::from_str(&format!(
+        r#"{{"content":[{{"type":"text","text":"x","extra":{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}}}]}}"#
+    ))
+    .unwrap();
+    rewrite_json_timestamps(&mut v, &clock);
+    assert!(!v.to_string().contains(REAL_DATE), "{v}");
+
+    // The validated locations keep tool input unchanged.
+    let mut start: serde_json::Value = serde_json::from_str(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"n","input":{"created_at":1700000000}}}"#,
+    )
+    .unwrap();
+    rewrite_json_timestamps(&mut start, &clock);
+    assert_eq!(start["content_block"]["input"]["created_at"], 1700000000);
+    let mut msg_start: serde_json::Value = serde_json::from_str(
+        r#"{"type":"message_start","message":{"content":[{"type":"tool_use","id":"t","name":"n","input":{"created_at":1700000000}}]}}"#,
+    )
+    .unwrap();
+    rewrite_json_timestamps(&mut msg_start, &clock);
+    assert_eq!(
+        msg_start["message"]["content"][0]["input"]["created_at"],
+        1700000000
+    );
+    // But not a `content_block` outside a content_block_start event.
+    let mut other: serde_json::Value = serde_json::from_str(&format!(
+        r#"{{"type":"something_else","content_block":{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}}}"#
+    ))
+    .unwrap();
+    rewrite_json_timestamps(&mut other, &clock);
+    assert!(!other.to_string().contains(REAL_DATE), "{other}");
+}
+
+#[test]
+fn test_6b_nested_typed_blocks_reject_unknown_fields() {
+    let env = env_2019(QuotasConfig::default());
+    let img = r#"{"type":"base64","media_type":"image/png","data":"AA=="}"#;
+    let bodies = [
+        format!(
+            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":[{{"type":"image","source":{img},"unexpected":true}}]}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":[{{"type":"text","text":"x","unexpected":true}}]}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":[{{"type":"image","source":{img},"unexpected":true}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":[{{"type":"text","text":"x","cache_control":{{"type":"ephemeral","unexpected":1}}}}]}}]}}"#
+        ),
+    ];
+    for b in &bodies {
+        let out = expect_status(post(&env, b), 400);
+        assert!(out.contains("invalid_request_error"), "{b}: {out}");
+    }
+    match env.mock_server.recv_timeout(Duration::from_millis(300)) {
+        Ok(None) => {}
+        other => panic!(
+            "upstream must receive nothing, got {:?}",
+            other.map(|r| r.is_some())
+        ),
+    }
+}
+
+#[test]
+fn test_8b_slow_readers_are_dropped_at_the_write_deadline_and_service_recovers() {
+    let env = TestEnv::new_with_setup(QuotasConfig::default(), t_clock_2019(), None, |g| {
+        g.with_request_limits(2, 1024 * 1024)
+            .with_response_write_deadlines(Duration::from_secs(1), Duration::from_secs(1))
+    });
+    // Upstream: a 20 MiB non-streaming reply (more than loopback socket buffers hold) and an
+    // endless (capped) stream; neither client reads.
+    let mock = env.mock_server.clone();
+    let h = thread::spawn(move || {
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let req = common::recv_upstream(&mock);
+            workers.push(thread::spawn(move || {
+                let mut req = req;
+                let mut body = String::new();
+                let _ = req.as_reader().take(1024 * 1024).read_to_string(&mut body);
+                if body.contains("\"stream\":true") {
+                    let produced = Arc::new(AtomicUsize::new(0));
+                    let p = CappedProducer {
+                        chunk: b"event: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec(),
+                        pos: 0,
+                        cap: 24 * 1024 * 1024,
+                        produced,
+                        pause: Duration::ZERO,
+                    };
+                    let _ = req.respond(Response::new(
+                        200.into(),
+                        vec![
+                            Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                                .unwrap(),
+                        ],
+                        p,
+                        None,
+                        None,
+                    ));
+                } else {
+                    let big = format!(
+                        "{{\"id\":\"m\",\"type\":\"message\",\"content\":[],\"pad\":\"{}\"}}",
+                        "x".repeat(20 * 1024 * 1024)
+                    );
+                    let _ = req.respond(Response::from_string(big));
+                }
+            }));
+        }
+        for w in workers {
+            common::join_within(w);
+        }
+    });
+
+    let send = |stream: bool| {
+        let body = simple_body(stream);
+        let mut s = connect(&env.gateway_url);
+        s.write_all(
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: x\r\nanthropic-version: 2023-06-01\r\ncontent-type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        s
+    };
+    let a = send(false);
+    let b = send(true);
+    let deadline = Instant::now() + common::TEST_WAIT;
+    while env.gateway_server.in_flight_requests() < 2 {
+        assert!(Instant::now() < deadline, "slow readers never in flight");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Neither client reads; both handlers must be freed by the write deadlines.
+    let start = Instant::now();
+    while env.gateway_server.in_flight_requests() > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "slow readers still hold handlers after {:?}",
+            start.elapsed()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let err = common::test_client()
+        .post(&format!("{}/v1/nope", env.gateway_url))
+        .send_string("{}")
+        .unwrap_err();
+    assert!(matches!(err, ureq::Error::Status(404, _)), "{err:?}");
+    drop(a);
+    drop(b);
+    common::join_within(h);
+}
+
+/// Yields `first`, then waits (bounded) until `gate` reaches `n`, pauses, then yields `second`.
+struct TwoPhase {
+    first: Cursor<Vec<u8>>,
+    second: Cursor<Vec<u8>>,
+    gate: Arc<AtomicUsize>,
+    n: usize,
+    counted: bool,
+}
+
+impl Read for TwoPhase {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.first.read(buf)?;
+        if k > 0 {
+            return Ok(k);
+        }
+        if !self.counted {
+            self.counted = true;
+            self.gate.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.gate.load(Ordering::SeqCst) < self.n && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        self.second.read(buf)
+    }
+}
+
+#[test]
+fn test_9b_concurrent_streams_share_the_token_cap() {
+    let env = env_2019(QuotasConfig {
+        max_output_tokens: Some(10),
+        ..Default::default()
+    });
+    let pad = "p".repeat(10_000); // large events, so each is flushed to the gateway at once
+    let gate = Arc::new(AtomicUsize::new(0));
+    let mock = env.mock_server.clone();
+    let mock_pad = pad.clone();
+    let h = thread::spawn(move || {
+        let mut workers = Vec::new();
+        for i in 0..2 {
+            let req = common::recv_upstream(&mock);
+            let gate = gate.clone();
+            let pad = mock_pad.clone();
+            workers.push(thread::spawn(move || {
+                // The event, then a long comment so the mock's chunked writer flushes the
+                // whole event before this stream pauses (the gateway drops comments).
+                let first = format!(
+                    "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m{i}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":6}}}}}}\n\n: {pad}{pad}\n\n"
+                );
+                let second = format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"AFTER_BREACH_{i}{pad}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                );
+                let body = TwoPhase {
+                    first: Cursor::new(first.into_bytes()),
+                    second: Cursor::new(second.into_bytes()),
+                    gate,
+                    n: 2,
+                    counted: false,
+                };
+                let _ = req.respond(Response::new(
+                    200.into(),
+                    vec![Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .unwrap()],
+                    body,
+                    None,
+                    None,
+                ));
+            }));
+        }
+        for w in workers {
+            common::join_within(w);
+        }
+    });
+
+    let url = env.gateway_url.clone();
+    let clients: Vec<_> = (0..2)
+        .map(|_| {
+            let url = url.clone();
+            thread::spawn(move || {
+                let res = common::test_client()
+                    .post(&format!("{url}/v1/messages"))
+                    .set("anthropic-version", "2023-06-01")
+                    .set("content-type", "application/json")
+                    .send_string(&simple_body(true));
+                match res {
+                    Ok(r) => {
+                        let mut out = String::new();
+                        let _ = r.into_reader().take(1024 * 1024).read_to_string(&mut out);
+                        out
+                    }
+                    Err(e) => format!("ERR {e}"),
+                }
+            })
+        })
+        .collect();
+    let outs: Vec<String> = clients.into_iter().map(common::join_within).collect();
+    common::join_within(h);
+    for out in &outs {
+        assert!(
+            !out.contains("AFTER_BREACH"),
+            "stream continued past the shared cap"
+        );
+        assert!(
+            out.contains("rate_limit_error"),
+            "stream not stopped: {}",
+            &out[..out.len().min(300)]
+        );
+    }
+    let snap = env.gateway_server.quota().snapshot();
+    assert!(snap.limit_exceeded, "{snap:?}");
+}
+
+#[test]
+fn test_10b_waiting_past_the_drain_deadline_gets_bounded_529() {
+    let env = TestEnv::new_with_setup(
+        QuotasConfig {
+            max_concurrent_requests: Some(1),
+            ..Default::default()
+        },
+        t_clock_2019(),
+        None,
+        |g| g.with_drain_wait(Duration::from_secs(1)),
+    );
+    let mock = env.mock_server.clone();
+    let h = thread::spawn(move || {
+        // Only the first request ever reaches upstream; it is held past the drain deadline.
+        let req = common::recv_upstream(&mock);
+        thread::sleep(Duration::from_secs(4));
+        req.respond(Response::from_string(
+            r#"{"id":"m","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ))
+        .unwrap();
+    });
+
+    let body = simple_body(false);
+    let mut a = connect(&env.gateway_url);
+    a.write_all(
+        format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: x\r\nanthropic-version: 2023-06-01\r\ncontent-type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    a.shutdown(Shutdown::Write).unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    let start = Instant::now();
+    let out = expect_status(post(&env, &body), 529);
+    let waited = start.elapsed();
+    assert!(out.contains("overloaded_error"), "{out}");
+    assert!(
+        waited < Duration::from_secs(3),
+        "wait not bounded: {waited:?}"
+    );
+    let snap = env.gateway_server.quota().snapshot();
+    assert_eq!(snap.concurrent_requests, 1, "slot must stay held: {snap:?}");
+    assert!(!snap.limit_exceeded, "{snap:?}");
+    match env.mock_server.recv_timeout(Duration::from_millis(200)) {
+        Ok(None) => {}
+        _ => panic!("a second upstream call was made"),
+    }
+    common::join_within(h);
+    let out_a = read_all_bounded(&mut a, 64 * 1024);
+    assert!(out_a.starts_with("HTTP/1.1 200"), "{out_a}");
+}

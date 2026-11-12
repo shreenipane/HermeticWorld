@@ -64,3 +64,8 @@ Every change is marked `HERMETIC PATCH` in the source.
 12. `src/response.rs` `Response::raw_print`: the unknown-length identity path (HTTP/1.0 clients)
     buffers at most `MAX_IDENTITY_BUFFER_BYTES` (8 MiB); a longer body fails before anything is
     written and the connection closes without a response (upstream: `read_to_end`, no limit).
+13. `src/util/refined_tcp_stream.rs`, `src/client.rs`, `src/request.rs`, `src/connection.rs`,
+    `src/lib.rs`: absolute write deadlines. Each connection's write half holds a deadline cell;
+    before every socket write the send timeout is set to the time left, and a passed deadline
+    fails the write. `Request::write_deadline()` returns a `DeadlineHandle` the application
+    sets (and may renew while a stream is written).

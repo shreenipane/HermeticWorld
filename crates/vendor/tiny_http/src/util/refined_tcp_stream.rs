@@ -4,8 +4,33 @@ use std::net::{Shutdown, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// HERMETIC PATCH: shared absolute read deadline of one connection (None: no deadline).
+/// HERMETIC PATCH: shared absolute read or write deadline of one connection (None: none).
 pub(crate) type DeadlineCell = Arc<Mutex<Option<Instant>>>;
+
+/// HERMETIC PATCH: handle on a connection's write deadline (see `Request::write_deadline`).
+#[derive(Clone)]
+pub struct DeadlineHandle(pub(crate) DeadlineCell);
+
+impl DeadlineHandle {
+    /// Sets the absolute deadline for every later write on the connection (None: none).
+    pub fn set(&self, deadline: Option<Instant>) {
+        match self.0.lock() {
+            Ok(mut g) => *g = deadline,
+            Err(p) => *p.into_inner() = deadline,
+        }
+    }
+}
+
+fn current(cell: &DeadlineCell) -> Option<Instant> {
+    match cell.lock() {
+        Ok(g) => *g,
+        Err(p) => *p.into_inner(),
+    }
+}
+
+fn deadline_passed() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline passed")
+}
 
 use crate::connection::Connection;
 #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -58,6 +83,14 @@ impl Stream {
         }
     }
 
+    fn set_write_timeout(&self, t: Option<std::time::Duration>) -> IoResult<()> {
+        match self {
+            Stream::Http(tcp_stream) => tcp_stream.set_write_timeout(t),
+            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+            Stream::Https(_) => Ok(()),
+        }
+    }
+
     fn shutdown(&mut self, how: Shutdown) -> IoResult<()> {
         match self {
             Stream::Http(tcp_stream) => tcp_stream.shutdown(how),
@@ -101,6 +134,8 @@ pub struct RefinedTcpStream {
     close_write: bool,
     // HERMETIC PATCH: absolute read deadline applied before every read (read half only).
     read_deadline: Option<DeadlineCell>,
+    // HERMETIC PATCH: absolute write deadline applied before every write (write half only).
+    write_deadline: Option<DeadlineCell>,
 }
 
 impl RefinedTcpStream {
@@ -117,6 +152,7 @@ impl RefinedTcpStream {
             close_read: true,
             close_write: false,
             read_deadline: None,
+            write_deadline: None,
         };
 
         let write = RefinedTcpStream {
@@ -124,6 +160,7 @@ impl RefinedTcpStream {
             close_read: false,
             close_write: true,
             read_deadline: None,
+            write_deadline: None,
         };
 
         (read, write)
@@ -142,6 +179,11 @@ impl RefinedTcpStream {
     /// HERMETIC PATCH: every later read obeys the deadline held in `cell`.
     pub(crate) fn set_deadline_cell(&mut self, cell: DeadlineCell) {
         self.read_deadline = Some(cell);
+    }
+
+    /// HERMETIC PATCH: every later write obeys the deadline held in `cell`.
+    pub(crate) fn set_write_deadline_cell(&mut self, cell: DeadlineCell) {
+        self.write_deadline = Some(cell);
     }
 }
 
@@ -193,6 +235,28 @@ impl Read for RefinedTcpStream {
 
 impl Write for RefinedTcpStream {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        // HERMETIC PATCH: enforce the connection's absolute write deadline: before each write
+        // the socket send timeout is set to the time left, so a slow reader cannot stretch a
+        // response past it.
+        if let Some(cell) = self.write_deadline.as_ref() {
+            match current(cell) {
+                Some(t) => {
+                    let now = Instant::now();
+                    if now >= t {
+                        return Err(deadline_passed());
+                    }
+                    self.stream.set_write_timeout(Some(t - now))?;
+                }
+                None => self.stream.set_write_timeout(None)?,
+            }
+            return self.stream.write(buf).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    deadline_passed()
+                } else {
+                    e
+                }
+            });
+        }
         self.stream.write(buf)
     }
 

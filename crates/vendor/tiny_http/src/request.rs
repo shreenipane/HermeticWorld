@@ -79,6 +79,9 @@ pub struct Request {
 
     // HERMETIC PATCH: the connection's absolute read deadline (None for test requests).
     read_deadline: Option<crate::util::refined_tcp_stream::DeadlineCell>,
+
+    // HERMETIC PATCH: the connection's absolute write deadline (None for test requests).
+    write_deadline: Option<crate::util::refined_tcp_stream::DeadlineCell>,
 }
 
 struct NotifyOnDrop<R> {
@@ -245,6 +248,7 @@ where
         notify_when_responded: None,
         peer_probe: None,
         read_deadline: None,
+        write_deadline: None,
     })
 }
 
@@ -483,6 +487,22 @@ impl Request {
     pub(crate) fn with_peer_probe(mut self, probe: Option<Connection>) -> Self {
         self.peer_probe = probe;
         self
+    }
+
+    pub(crate) fn with_write_deadline_cell(
+        mut self,
+        cell: crate::util::refined_tcp_stream::DeadlineCell,
+    ) -> Self {
+        self.write_deadline = Some(cell);
+        self
+    }
+
+    /// HERMETIC PATCH: a handle on the connection's absolute write deadline, usable while the
+    /// response is being written (the handle outlives `respond`). `None` for test requests.
+    pub fn write_deadline(&self) -> Option<crate::util::refined_tcp_stream::DeadlineHandle> {
+        self.write_deadline
+            .as_ref()
+            .map(|c| crate::util::refined_tcp_stream::DeadlineHandle(c.clone()))
     }
 
     pub(crate) fn with_read_deadline_cell(

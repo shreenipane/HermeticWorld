@@ -82,12 +82,18 @@ pub struct DocumentSource {
 #[serde(untagged)]
 pub enum ToolResultContentBlock {
     Text(TextBlock),
-    Image {
-        r#type: ImageType,
-        source: ImageSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
-    },
+    Image(ToolResultImageBlock),
+}
+
+/// An image inside a tool result. A named struct so unknown fields are rejected (serde does
+/// not apply `deny_unknown_fields` to struct variants of an untagged enum).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultImageBlock {
+    pub r#type: ImageType,
+    pub source: ImageSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

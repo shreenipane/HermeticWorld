@@ -269,45 +269,90 @@ const TIMESTAMP_KEYS: [&str; 4] = ["created", "created_at", "updated_at", "expir
 /// arrays are always descended into, including ones held by a timestamp-named field.
 ///
 /// The one opaque subtree is the `input` of a `tool_use` content block (the tool arguments the
-/// model wrote, which the agent's tools must receive unchanged); `input` anywhere else is
-/// rewritten like any other field. Recursion depth is bounded by serde_json's parse limit.
+/// model wrote, which the agent's tools must receive unchanged), and only at the places the
+/// Messages API puts tool content:
+/// - an element of the `content` array of the message (the top-level object of a
+///   non-streaming response, or `message` of a `message_start` event);
+/// - the `content_block` of a `content_block_start` event.
+///
+/// A `{"type":"tool_use","input":...}` object anywhere else is rewritten like any other value.
+/// Recursion depth is bounded by serde_json's parse limit.
 pub fn rewrite_json_timestamps(val: &mut serde_json::Value, clock: &GuestClock) {
     let now = clock.now();
     let guest_unix = now.unix_timestamp();
     let now_secs = now.replace_nanosecond(0).unwrap_or(now);
     let guest_rfc3339 = now_secs.format(&Rfc3339).unwrap_or_default();
-    rewrite_inner(val, guest_unix, &guest_rfc3339);
+    let ts = (guest_unix, guest_rfc3339.as_str());
+    let Some(root) = val.as_object_mut() else {
+        rewrite_inner(val, ts, Place::Other);
+        return;
+    };
+    let is_block_start = root.get("type").and_then(|t| t.as_str()) == Some("content_block_start");
+    for (k, v) in root.iter_mut() {
+        let place = match k.as_str() {
+            "content" => Place::MessageContent,
+            "message" => Place::Message,
+            "content_block" if is_block_start => Place::ToolSlot,
+            _ => Place::Other,
+        };
+        rewrite_field(k, v, ts, place);
+    }
 }
 
-fn rewrite_inner(val: &mut serde_json::Value, guest_unix: i64, guest_rfc3339: &str) {
+/// Where a value sits, as far as the tool-input exemption is concerned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The `message` object of a `message_start` event.
+    Message,
+    /// The `content` array of a message.
+    MessageContent,
+    /// A content block position (element of a message's `content`, or `content_block`).
+    ToolSlot,
+    Other,
+}
+
+fn rewrite_field(k: &str, v: &mut serde_json::Value, ts: (i64, &str), place: Place) {
+    if TIMESTAMP_KEYS.contains(&k) {
+        match v {
+            serde_json::Value::Number(_) => {
+                *v = serde_json::Value::Number(ts.0.into());
+                return;
+            }
+            serde_json::Value::String(s) if OffsetDateTime::parse(s, &Rfc3339).is_ok() => {
+                *v = serde_json::Value::String(ts.1.to_string());
+                return;
+            }
+            _ => {}
+        }
+    }
+    rewrite_inner(v, ts, place);
+}
+
+fn rewrite_inner(val: &mut serde_json::Value, ts: (i64, &str), place: Place) {
     match val {
         serde_json::Value::Object(map) => {
-            let is_tool_use = map.get("type").and_then(|t| t.as_str()) == Some("tool_use");
+            let is_tool_use = place == Place::ToolSlot
+                && map.get("type").and_then(|t| t.as_str()) == Some("tool_use");
             for (k, v) in map.iter_mut() {
                 if is_tool_use && k == "input" {
                     continue;
                 }
-                if TIMESTAMP_KEYS.contains(&k.as_str()) {
-                    match v {
-                        serde_json::Value::Number(_) => {
-                            *v = serde_json::Value::Number(guest_unix.into());
-                            continue;
-                        }
-                        serde_json::Value::String(s)
-                            if OffsetDateTime::parse(s, &Rfc3339).is_ok() =>
-                        {
-                            *v = serde_json::Value::String(guest_rfc3339.to_string());
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                rewrite_inner(v, guest_unix, guest_rfc3339);
+                let child = if place == Place::Message && k == "content" {
+                    Place::MessageContent
+                } else {
+                    Place::Other
+                };
+                rewrite_field(k, v, ts, child);
             }
         }
         serde_json::Value::Array(arr) => {
+            let child = if place == Place::MessageContent {
+                Place::ToolSlot
+            } else {
+                Place::Other
+            };
             for v in arr {
-                rewrite_inner(v, guest_unix, guest_rfc3339);
+                rewrite_inner(v, ts, child);
             }
         }
         _ => {}
@@ -497,6 +542,8 @@ pub fn sanitize_json_body(body: &str, clock: &GuestClock) -> Option<(String, Str
 struct SlotState {
     released: bool,
     draining: bool,
+    /// Usage last reported to the quota's live sum.
+    live: (u64, u64),
 }
 
 /// Guard over one request's concurrency slot and token usage.
@@ -562,7 +609,7 @@ impl StreamSlotGuard {
         st.released = true;
         let u = self.current_usage();
         self.quota
-            .finish(u.input_tokens, u.output_tokens, st.draining)
+            .finish(u.input_tokens, u.output_tokens, st.draining, st.live)
     }
 
     /// The client closed its sending side (it may still be reading): mark the slot draining.
@@ -588,11 +635,18 @@ impl StreamSlotGuard {
         self.slot_state().released
     }
 
-    /// Checks the quotas with this request's usage so far (see `QuotaTracker::check_live`).
+    /// Reports this request's usage so far to the quota's shared live sum and checks the caps
+    /// against all running and completed usage (see `QuotaTracker::update_live`).
     pub fn check_live(&self, elapsed_secs: u64) -> Result<(), QuotaBreach> {
         let u = self.current_usage();
-        self.quota
-            .check_live(u.input_tokens, u.output_tokens, elapsed_secs)
+        let mut st = self.slot_state();
+        if st.released {
+            return self.quota.check_live(0, 0, elapsed_secs);
+        }
+        let now = (u.input_tokens, u.output_tokens);
+        let prev = st.live;
+        st.live = now;
+        self.quota.update_live(prev, now, elapsed_secs)
     }
 }
 
