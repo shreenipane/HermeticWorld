@@ -331,8 +331,15 @@ impl UnitSink for MatchSink<'_> {
         });
 
         if has_tier2_candidates {
-            let (unit_symbols, unit_anchor_tokens) =
-                crate::tier2::extract_unit_symbols_and_anchors(text);
+            let ctx = crate::tier2::extract_unit_tier2_context(text);
+            if ctx.truncated {
+                self.findings.push(crate::tier2::tier2_truncated_finding(
+                    "D2",
+                    path,
+                    self.opts.visibility,
+                ));
+            }
+            let (unit_symbols, unit_anchor_tokens) = (ctx.symbols, ctx.anchor_tokens);
             for hunk in &self.fp.hunks {
                 if unit_gate_hunks.contains(&hunk.hunk_index) {
                     continue;

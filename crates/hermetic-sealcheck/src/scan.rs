@@ -490,8 +490,15 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
     });
 
     if has_tier2_candidates {
-        let (unit_symbols, unit_anchor_tokens) =
-            crate::tier2::extract_unit_symbols_and_anchors(text);
+        let ctx = crate::tier2::extract_unit_tier2_context(text);
+        if ctx.truncated {
+            findings.push(crate::tier2::tier2_truncated_finding(
+                "D0",
+                problem_path,
+                opts.visibility,
+            ));
+        }
+        let (unit_symbols, unit_anchor_tokens) = (ctx.symbols, ctx.anchor_tokens);
         for hunk in &fp.hunks {
             if gate_hunks.contains(&hunk.hunk_index) {
                 continue;

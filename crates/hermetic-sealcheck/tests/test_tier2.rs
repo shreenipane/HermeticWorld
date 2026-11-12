@@ -823,3 +823,114 @@ fn test_idf_sample_excludes_binary_and_unreadable_files_and_both_paths_match() {
         }
     }
 }
+
+// =========================================================================
+// T1.12 final review, finding 1: bounded tier-2 context extraction
+// =========================================================================
+
+/// Re-runs the test `name` of this binary in a child process with an address-space limit
+/// (`ulimit -v`, in KiB) and a wall-clock timeout. The child runs the real work when
+/// `env_key` is set. Returns true only when the child finished in time and passed, so a
+/// regression that blows up memory or time fails the test instead of the host.
+fn passes_in_limited_child(name: &str, env_key: &str, mem_kib: u64, timeout_secs: u64) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = std::env::current_exe().expect("test binary");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v \"$1\" || exit 99; exec \"$0\" --exact \"$2\" --test-threads=1 --nocapture")
+        .arg(exe)
+        .arg(mem_kib.to_string())
+        .arg(name)
+        .env(env_key, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().expect("wait child") {
+            Some(status) => return status.success(),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("{name}: child exceeded {timeout_secs}s");
+                return false;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// 1.5 GiB of address space for a limited child.
+const CHILD_MEM_KIB: u64 = 1536 * 1024;
+
+fn dotted_chain(parts: usize) -> String {
+    (0..parts)
+        .map(|i| format!("p{i:04}"))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn context_bytes(ctx: &hermetic_sealcheck::tier2::Tier2UnitContext) -> usize {
+    ctx.symbols
+        .iter()
+        .chain(ctx.anchor_tokens.iter())
+        .map(String::len)
+        .sum()
+}
+
+const T2_CHILD: &str = "HERMETIC_T112_TIER2_CHILD";
+
+#[test]
+fn t112_final_finding1_long_dotted_chain_extraction_is_bounded() {
+    if std::env::var_os(T2_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_long_dotted_chain_extraction_is_bounded",
+            T2_CHILD,
+            CHILD_MEM_KIB,
+            120,
+        ));
+        return;
+    }
+    // A 12 KB `p0000.p0001.….p1999` unit used to produce ~2M sub-chains of ~4 KB each.
+    let text = dotted_chain(2000);
+    assert!(text.len() < 13 * 1024);
+    let ctx = hermetic_sealcheck::tier2::extract_unit_tier2_context(&text);
+    assert!(!ctx.truncated);
+    let bytes = context_bytes(&ctx);
+    assert!(
+        bytes < 16 * 1024 * 1024,
+        "12 KB unit must stay within a small memory bound, got {bytes} bytes"
+    );
+    // Short chains, single parts and the whole token are still recorded.
+    assert!(ctx.symbols.contains("p0007"));
+    assert!(ctx.symbols.contains("p0007.p0008.p0009"));
+    assert!(ctx.anchor_tokens.contains(&text));
+}
+
+#[test]
+fn t112_final_finding1_extraction_stops_at_budget_and_reports_truncation() {
+    if std::env::var_os(T2_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_extraction_stops_at_budget_and_reports_truncation",
+            T2_CHILD,
+            CHILD_MEM_KIB,
+            120,
+        ));
+        return;
+    }
+    let text = format!("{} trailing_symbol", dotted_chain(20_000));
+    let ctx = hermetic_sealcheck::tier2::extract_unit_tier2_context_with_limit(&text, 1024 * 1024);
+    assert!(
+        ctx.truncated,
+        "an oversized context must be reported as truncated"
+    );
+    let bytes = context_bytes(&ctx);
+    assert!(bytes <= 1024 * 1024, "stored {bytes} bytes past the limit");
+
+    let small = hermetic_sealcheck::tier2::extract_unit_tier2_context("call `obj.attr.method` now");
+    assert!(!small.truncated);
+    assert!(small.symbols.contains("obj.attr.method"));
+    assert!(small.symbols.contains("attr.method"));
+}

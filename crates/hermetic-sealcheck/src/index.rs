@@ -72,6 +72,11 @@
 //! `query` differ for such an oversized unit: `scan` scans the large unit in memory, whereas
 //! `query` reports the `index_skipped` Info finding alongside any D9 content findings.
 //!
+//! A text unit's tier-2 context (`tier2_context` binary record) is extracted within
+//! `tier2::MAX_TIER2_CONTEXT_BYTES`. When extraction stops at that bound, a `Fixed` record
+//! (detector "D2", channel "tier2_truncated", severity Info) reports the coverage gap and
+//! the partial context is still written.
+//!
 //! # Not covered by a query
 //!
 //! D1 (git stores), D3 (`.pyc` headers against source), D6 (OCI metadata), the D9
@@ -301,17 +306,33 @@ impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
             hashes: compute_unit_hashes(text),
         };
         (self.emit)(record);
-        let (symbols, anchors) = crate::tier2::extract_unit_symbols_and_anchors(text);
+        // Bounded extraction: a hostile unit cannot make indexing allocate more than
+        // `MAX_TIER2_CONTEXT_BYTES`; a truncated context is reported as a coverage gap.
+        let ctx = crate::tier2::extract_unit_tier2_context(text);
+        if ctx.truncated {
+            let gap_path = self.ipath(path);
+            (self.emit)(IndexRecord::Fixed(StoredFinding {
+                detector: "D2".to_string(),
+                channel: "tier2_truncated".to_string(),
+                path: gap_path,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![crate::tier2::tier2_truncated_evidence()],
+            }));
+        }
         let context_path = self.ipath(path);
         (self.emit)(IndexRecord::Binary {
             path: context_path,
             channel: TIER2_CONTEXT_CHANNEL.to_string(),
             strings: HashedBinaryStrings {
-                exact: anchors
+                exact: ctx
+                    .anchor_tokens
                     .iter()
                     .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
                     .collect(),
-                tokens: symbols
+                tokens: ctx
+                    .symbols
                     .iter()
                     .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
                     .collect(),

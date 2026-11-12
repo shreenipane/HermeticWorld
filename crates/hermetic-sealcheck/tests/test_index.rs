@@ -1897,3 +1897,115 @@ fn query_older_version_index_reports_not_covered() {
         "version 4 index query must report D3b:pyc_code_objects in not_covered: {not_covered_v4:#?}"
     );
 }
+
+// T1.12 final review, finding 1: indexing a hostile dotted-name text unit is bounded and
+// a truncated tier-2 context is recorded as a coverage gap.
+/// Re-runs the test `name` of this binary in a child process with an address-space limit
+/// (`ulimit -v`, in KiB) and a wall-clock timeout. The child runs the real work when
+/// `env_key` is set. Returns true only when the child finished in time and passed, so a
+/// regression that blows up memory or time fails the test instead of the host.
+fn passes_in_limited_child(name: &str, env_key: &str, mem_kib: u64, timeout_secs: u64) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = std::env::current_exe().expect("test binary");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v \"$1\" || exit 99; exec \"$0\" --exact \"$2\" --test-threads=1 --nocapture")
+        .arg(exe)
+        .arg(mem_kib.to_string())
+        .arg(name)
+        .env(env_key, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().expect("wait child") {
+            Some(status) => return status.success(),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("{name}: child exceeded {timeout_secs}s");
+                return false;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// 1.5 GiB of address space for a limited child.
+const CHILD_MEM_KIB: u64 = 1536 * 1024;
+
+fn dotted_chain_text(parts: usize) -> String {
+    (0..parts)
+        .map(|i| format!("p{i:04}"))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+const INDEX_CHILD: &str = "HERMETIC_T112_INDEX_CHILD";
+
+#[test]
+fn t112_final_finding1_index_of_long_dotted_chain_is_bounded() {
+    if std::env::var_os(INDEX_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_index_of_long_dotted_chain_is_bounded",
+            INDEX_CHILD,
+            CHILD_MEM_KIB,
+            120,
+        ));
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("chain.txt"), dotted_chain_text(2000)).unwrap();
+    let records = collect_records(dir.path());
+    let context_hashes: usize = records
+        .iter()
+        .filter_map(|r| match r {
+            IndexRecord::Binary {
+                channel, strings, ..
+            } if channel == "tier2_context" => Some(strings.exact.len() + strings.tokens.len()),
+            _ => None,
+        })
+        .sum();
+    assert!(context_hashes > 0);
+    // 2000 parts, sub-chains of at most 16 parts, in two sets.
+    assert!(
+        context_hashes < 2 * 2000 * 17 + 16,
+        "context size not linear: {context_hashes}"
+    );
+    assert!(!records.iter().any(|r| matches!(
+        r,
+        IndexRecord::Fixed(f) if f.channel == "tier2_truncated"
+    )));
+}
+
+#[test]
+fn t112_final_finding1_index_records_tier2_truncation_gap() {
+    if std::env::var_os(INDEX_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_index_records_tier2_truncation_gap",
+            INDEX_CHILD,
+            CHILD_MEM_KIB,
+            240,
+        ));
+        return;
+    }
+    let dir = tempdir().unwrap();
+    // ~1.5M sub-chains of ~50 bytes: far past the 32 MiB context budget.
+    fs::write(dir.path().join("chain.txt"), dotted_chain_text(100_000)).unwrap();
+    let records = collect_records(dir.path());
+    let gaps: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            IndexRecord::Fixed(f) if f.channel == "tier2_truncated" => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1, "truncation must be recorded once");
+    assert_eq!(gaps[0].severity, Severity::Info);
+    assert!(gaps[0].evidence[0].contains("truncated"));
+    let again = collect_records(dir.path());
+    assert_eq!(records, again, "index output must be deterministic");
+}

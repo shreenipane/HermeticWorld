@@ -72,7 +72,8 @@ enum MarshalValue {
     FrozenSet(Arc<[MarshalValue]>, usize),
     List,
     Dict,
-    Code,
+    /// A code object; the index of its entry in `MarshalParser::code_objects`.
+    Code(usize),
     Other,
 }
 
@@ -468,10 +469,7 @@ impl<'a> MarshalParser<'a> {
                 self.read_object()?;
                 MarshalValue::Other
             }
-            b'c' => {
-                self.read_code_object()?;
-                MarshalValue::Code
-            }
+            b'c' => MarshalValue::Code(self.read_code_object()?),
             unknown => return Err(MarshalError::UnknownType(unknown)),
         };
 
@@ -495,7 +493,8 @@ impl<'a> MarshalParser<'a> {
         Ok(val)
     }
 
-    fn read_code_object(&mut self) -> Result<(), MarshalError> {
+    /// Reads a code object and returns its index in `code_objects`.
+    fn read_code_object(&mut self) -> Result<usize, MarshalError> {
         let magic = self.magic;
         if magic < 3410 {
             // Python 3.6 - 3.7
@@ -585,7 +584,7 @@ impl<'a> MarshalParser<'a> {
         consts_obj: MarshalValue,
         names_obj: MarshalValue,
         var_tuples: impl IntoIterator<Item = MarshalValue>,
-    ) -> Result<(), MarshalError> {
+    ) -> Result<usize, MarshalError> {
         self.charge_work(1)?;
         self.charge_entries::<PycCodeObject>(1)?;
         let name = self.copy_value_string(&name_obj)?.unwrap_or_default();
@@ -595,6 +594,7 @@ impl<'a> MarshalParser<'a> {
             .transpose()?
             .flatten();
         let mut symbols = HashSet::new();
+        let mut folded: HashSet<usize> = HashSet::new();
 
         for value in std::iter::once(names_obj).chain(var_tuples) {
             if let MarshalValue::Tuple(items, _) = value {
@@ -626,17 +626,71 @@ impl<'a> MarshalParser<'a> {
                         self.charge_entries::<&MarshalValue>(children.len())?;
                         stack.extend(children.iter().rev());
                     }
+                    MarshalValue::Code(child) => {
+                        self.fold_expression_scope(*child, &mut folded, &mut symbols)?;
+                    }
                     _ => {}
                 }
             }
         }
+        let index = self.code_objects.len();
         self.code_objects.push(PycCodeObject {
             name,
             qualname,
             symbols,
         });
+        Ok(index)
+    }
+
+    /// Adds the symbols of the nested code object `child` to `symbols` when the child is an
+    /// expression scope (lambda, generator expression or, before CPython 3.12, a
+    /// comprehension). The source fingerprint attributes such expressions to the enclosing
+    /// function, so the bytecode side must too. Children are built before their parent, so
+    /// a child's own expression scopes are already folded into it. Every copied symbol is
+    /// charged to the aggregate budgets.
+    fn fold_expression_scope(
+        &mut self,
+        child: usize,
+        folded: &mut HashSet<usize>,
+        symbols: &mut HashSet<String>,
+    ) -> Result<(), MarshalError> {
+        // A child referenced more than once is folded once.
+        if !folded.insert(child) {
+            return Ok(());
+        }
+        let Some(child_obj) = self.code_objects.get(child) else {
+            return Ok(());
+        };
+        if !is_expression_scope_name(&child_obj.name) {
+            return Ok(());
+        }
+        let count = child_obj.symbols.len();
+        let bytes = child_obj
+            .symbols
+            .iter()
+            .fold(0usize, |acc, sym| acc.saturating_add(sym.len()));
+        // Charge before copying anything.
+        self.charge_work(count)?;
+        self.charge_bytes(bytes)?;
+        self.charge_allocation(bytes.saturating_add(count.saturating_mul(64)))?;
+        if let Some(child_obj) = self.code_objects.get(child) {
+            symbols.extend(child_obj.symbols.iter().cloned());
+        }
         Ok(())
     }
+}
+
+/// Names CPython gives the code objects of expression scopes nested in a function.
+const EXPRESSION_SCOPE_NAMES: &[&str] = &[
+    "<lambda>",
+    "<genexpr>",
+    "<listcomp>",
+    "<setcomp>",
+    "<dictcomp>",
+];
+
+fn is_expression_scope_name(name: &str) -> bool {
+    EXPRESSION_SCOPE_NAMES.contains(&name)
 }
 
 /// Parse all code objects from the marshal stream of a `.pyc` file.

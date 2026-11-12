@@ -386,35 +386,43 @@ fn is_py_keyword(s: &str) -> bool {
     )
 }
 
-fn is_statement_start(tokens: &[crate::winnow::Token], idx: usize) -> bool {
-    if idx == 0 {
-        return true;
-    }
-    let prev = &tokens[idx - 1];
-    if prev.text == ";" || prev.text == ":" {
-        return true;
-    }
-    if prev.line < tokens[idx].line {
-        let mut depth = 0usize;
-        for t in &tokens[..idx] {
-            match t.text.as_str() {
-                "(" | "[" | "{" => depth = depth.saturating_add(1),
-                ")" | "]" | "}" => depth = depth.saturating_sub(1),
-                _ => {}
-            }
+/// Marks, in one pass, which tokens start a statement: the first token, a token after a
+/// depth-0 `;` or `:`, or the first token of a new physical line at bracket depth 0.
+///
+/// Soft keywords (`type`, `match`, `case`) can only appear at a statement start, and a
+/// statement start never lies inside brackets, so the bracket depth is tracked
+/// incrementally and the whole computation is linear in the number of tokens.
+fn statement_starts(tokens: &[crate::winnow::Token]) -> Vec<bool> {
+    let mut starts = Vec::with_capacity(tokens.len());
+    let mut depth = 0usize;
+    let mut prev: Option<&crate::winnow::Token> = None;
+    for tok in tokens {
+        let start = match prev {
+            None => true,
+            Some(p) => depth == 0 && (p.text == ";" || p.text == ":" || p.line < tok.line),
+        };
+        starts.push(start);
+        match tok.text.as_str() {
+            "(" | "[" | "{" => depth = depth.saturating_add(1),
+            ")" | "]" | "}" => depth = depth.saturating_sub(1),
+            _ => {}
         }
-        if depth == 0 {
-            return true;
-        }
+        prev = Some(tok);
     }
-    false
+    starts
 }
 
-fn is_contextual_keyword(tokens: &[crate::winnow::Token], idx: usize) -> bool {
-    let tok = &tokens[idx];
-    if !is_statement_start(tokens, idx) {
+/// Whether the identifier at `idx` is used as a soft keyword. `is_start` is the token's
+/// entry from `statement_starts`. A forward scan runs only from a depth-0 statement start
+/// and stops at the next depth-0 `;`, `:` or newline, so the scans of different starts
+/// never overlap and their total cost is linear.
+fn is_contextual_keyword(tokens: &[crate::winnow::Token], idx: usize, is_start: bool) -> bool {
+    if !is_start {
         return false;
     }
+    let Some(tok) = tokens.get(idx) else {
+        return false;
+    };
     match tok.text.as_str() {
         "type" => {
             // PEP 695 type alias: `type Alias = ...` or `type Alias[T] = ...`
@@ -802,6 +810,7 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
     let tokens = pyc_literal_tokens(&text);
     let mut symbols = HashSet::new();
     let mut prev_is_dot = false;
+    let starts = statement_starts(&tokens);
 
     for (idx, tok) in tokens.iter().enumerate() {
         if let Some(content) = decode_py_string_literal(&tok.text) {
@@ -811,7 +820,10 @@ fn collect_symbol_set(lines: &[&str]) -> HashSet<String> {
             symbols.insert(normalize_py_numeric_literal(&tok.text));
             prev_is_dot = false;
         } else if crate::binary::is_identifier(&tok.text) {
-            if prev_is_dot || (!is_py_keyword(&tok.text) && !is_contextual_keyword(&tokens, idx)) {
+            let is_start = starts.get(idx).copied().unwrap_or(false);
+            if prev_is_dot
+                || (!is_py_keyword(&tok.text) && !is_contextual_keyword(&tokens, idx, is_start))
+            {
                 symbols.insert(tok.text.clone());
             }
             prev_is_dot = false;
@@ -928,21 +940,35 @@ struct ParsedDefHeader {
     inline_body: Option<String>,
 }
 
+/// Parses the `def`/`class` header starting at `def_line`.
+///
+/// The colon search covers only the header's logical line (`def_line` plus the following
+/// lines `is_cont` marks as continuations), and every scanned line is charged to `budget`.
+/// Logical lines never overlap and headers start only on non-continuation lines, so the
+/// total scan over all headers of a file is linear in its length.
 fn parse_def_or_class_header(
     lines: &[String],
     def_line: usize,
-    _is_cont: &[bool],
-) -> Option<ParsedDefHeader> {
+    is_cont: &[bool],
+    budget: &mut WorkBudget,
+) -> Result<Option<ParsedDefHeader>, FingerprintError> {
     if def_line >= lines.len() {
-        return None;
+        return Ok(None);
     }
-    let (name, is_class) = parse_def_or_class(&lines[def_line])?;
+    let Some((name, is_class)) = parse_def_or_class(&lines[def_line]) else {
+        return Ok(None);
+    };
 
     let mut depth = 0usize;
     let mut header_end = def_line;
     let mut colon_byte_idx = None;
 
     for (idx, line) in lines.iter().enumerate().skip(def_line) {
+        if idx > def_line && !is_cont.get(idx).copied().unwrap_or(false) {
+            // The logical line ended without a depth-0 colon.
+            break;
+        }
+        budget.charge(1)?;
         let bytes = line.as_bytes();
         let mut i = 0;
         let len = bytes.len();
@@ -1163,13 +1189,13 @@ fn parse_def_or_class_header(
         }
     }
 
-    Some(ParsedDefHeader {
+    Ok(Some(ParsedDefHeader {
         is_class,
         func_symbols,
         enclosing_symbols,
         header_end,
         inline_body,
-    })
+    }))
 }
 
 // Scope paths include the occurrence of each definition in source order, so
@@ -1499,7 +1525,8 @@ impl<'a> PycFileAnalysis<'a> {
     ) -> Result<Option<&ParsedDefHeader>, FingerprintError> {
         if !self.headers.contains_key(&def_pos) {
             budget.charge(1)?;
-            let parsed = parse_def_or_class_header(self.lines, def_pos, &self.continuation);
+            let parsed =
+                parse_def_or_class_header(self.lines, def_pos, &self.continuation, budget)?;
             self.headers.insert(def_pos, parsed);
         }
         Ok(self.headers.get(&def_pos).and_then(|opt| opt.as_ref()))
@@ -3197,4 +3224,76 @@ pub fn build_tier2_idf(
         weights.insert(sym.clone(), weight);
     }
     (weights, chosen_files)
+}
+
+#[cfg(test)]
+mod t112_final_review_tests {
+    use super::*;
+
+    fn run_bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(v) => v,
+            Err(e) => panic!("work did not finish within {secs}s: {e}"),
+        }
+    }
+
+    /// Finding 2: with no colon, a `def` header used to be scanned to EOF for every header
+    /// while charging one budget unit, so 100k colonless `def` lines took ~5e9 line scans.
+    #[test]
+    fn t112_final_finding2_colonless_def_headers_are_linear() {
+        let n = 100_000usize;
+        let mut lines: Vec<String> = (0..n).map(|i| format!("def f{i}()")).collect();
+        lines.push("Y = 1".to_string());
+        let (symbols, used) = run_bounded(60, move || {
+            let mut analysis = PycFileAnalysis::new(&lines);
+            let mut budget = WorkBudget::new(DEFAULT_MAX_FINGERPRINT_WORK);
+            let symbols = analysis.extract_symbols("<module>", 0, &mut budget);
+            (symbols, budget.used())
+        });
+        let symbols = symbols.expect("within the default budget");
+        assert!(symbols.contains("Y"));
+        assert!(symbols.contains("f99999"));
+        // Linear charging: a few units per line, never per header times file length.
+        assert!(used <= 5 * (n + 1), "charged {used} units");
+    }
+
+    /// Finding 2: every scanned header line is charged, so a header spanning many lines
+    /// costs its length.
+    #[test]
+    fn t112_final_finding2_header_scan_charges_per_line() {
+        let mut lines = vec!["def f(".to_string()];
+        lines.extend((0..1000).map(|i| format!("    a{i},")));
+        lines.push("):".to_string());
+        lines.push("    return 1".to_string());
+        let cont = compute_line_continuation(&lines);
+        let mut budget = WorkBudget::new(DEFAULT_MAX_FINGERPRINT_WORK);
+        let parsed = parse_def_or_class_header(&lines, 0, &cont, &mut budget)
+            .expect("within budget")
+            .expect("header");
+        assert_eq!(parsed.header_end, 1001);
+        assert!(budget.used() >= 1002, "charged {}", budget.used());
+        let mut tiny = WorkBudget::new(10);
+        assert!(matches!(
+            parse_def_or_class_header(&lines, 0, &cont, &mut tiny),
+            Err(FingerprintError::WorkBudgetExceeded)
+        ));
+    }
+
+    /// Finding 3: soft-keyword detection must be linear in a long bracketed span.
+    #[test]
+    fn t112_final_finding3_statement_starts_linear() {
+        let mut lines = vec!["X = (".to_string()];
+        lines.extend((0..200_000).map(|_| "    match,".to_string()));
+        lines.push(")".to_string());
+        let symbols = run_bounded(60, move || {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            collect_symbol_set(&refs)
+        });
+        assert!(symbols.contains("X"));
+        assert!(symbols.contains("match"));
+    }
 }

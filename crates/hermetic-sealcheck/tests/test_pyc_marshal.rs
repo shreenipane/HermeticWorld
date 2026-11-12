@@ -1613,3 +1613,162 @@ fn test_regression_defect4_work_budget_env_var_ignored_in_default_construction()
         "query stderr with env unset must match env=100000000"
     );
 }
+
+// =========================================================================
+// T1.12 final review fixes
+// =========================================================================
+
+/// Re-runs the test `name` of this binary in a child process with an address-space limit
+/// (`ulimit -v`, in KiB) and a wall-clock timeout. The child runs the real work when
+/// `env_key` is set. Returns true only when the child finished in time and passed, so a
+/// regression that blows up memory or time fails the test instead of the host.
+fn passes_in_limited_child(name: &str, env_key: &str, mem_kib: u64, timeout_secs: u64) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = std::env::current_exe().expect("test binary");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v \"$1\" || exit 99; exec \"$0\" --exact \"$2\" --test-threads=1 --nocapture")
+        .arg(exe)
+        .arg(mem_kib.to_string())
+        .arg(name)
+        .env(env_key, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().expect("wait child") {
+            Some(status) => return status.success(),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("{name}: child exceeded {timeout_secs}s");
+                return false;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// 1.5 GiB of address space for a limited child.
+const CHILD_MEM_KIB: u64 = 1536 * 1024;
+
+const PYC_CHILD: &str = "HERMETIC_T112_PYC_CHILD";
+
+/// Finding 3: soft-keyword detection must not rescan earlier tokens inside a long
+/// bracketed expression.
+#[test]
+fn t112_final_finding3_long_bracketed_expression_symbols_are_linear() {
+    if std::env::var_os(PYC_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding3_long_bracketed_expression_symbols_are_linear",
+            PYC_CHILD,
+            CHILD_MEM_KIB,
+            120,
+        ));
+        return;
+    }
+    let parent = tempdir().expect("tempdir");
+    let n = 100_000;
+    let mut base = String::from("X = (\n");
+    for _ in 0..n {
+        base.push_str("    a,\n");
+    }
+    base.push_str(")\nY = 1\n");
+    fs::write(parent.path().join("table.py"), &base).expect("base");
+    let line = n + 3;
+    let patch = format!(
+        "diff --git a/table.py b/table.py\n--- a/table.py\n+++ b/table.py\n@@ -{line},1 +{line},1 @@\n-Y = 1\n+Y = 2\n"
+    );
+    let fp = FingerprintSet::from_task(&patch, "", parent.path()).expect("fingerprints");
+    let pyc_fp = fp.hunks[0]
+        .pyc_fingerprints
+        .iter()
+        .find(|f| f.function_name == "<module>")
+        .expect("module fingerprint");
+    assert!(pyc_fp.added.contains("2"), "{pyc_fp:?}");
+}
+
+/// Finding 3 (semantics kept): soft keywords at a statement start are still skipped, and
+/// the same names inside brackets are still symbols.
+#[test]
+fn t112_final_finding3_soft_keywords_only_at_statement_start() {
+    let parent = tempdir().expect("tempdir");
+    let base = "def f(command):\n    return 0\n";
+    fs::write(parent.path().join("m.py"), base).expect("base");
+    let patch = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,5 @@\n def f(command):\n-    return 0\n+    match command:\n+        case 1:\n+            return {1: match_value(match), 2: [case]}\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let pyc_fp = fp.hunks[0]
+        .pyc_fingerprints
+        .iter()
+        .find(|f| f.function_name == "f")
+        .expect("f fingerprint");
+    assert!(pyc_fp.added.contains("match_value"), "{pyc_fp:?}");
+    assert!(pyc_fp.added.contains("match"), "{pyc_fp:?}");
+    assert!(pyc_fp.added.contains("case"), "{pyc_fp:?}");
+}
+
+fn raw_code_311(
+    name: &str,
+    consts: &[Vec<u8>],
+    names: &[&str],
+    localsplusnames: &[&str],
+) -> Vec<u8> {
+    build_pyc_311(name, name, consts, names, localsplusnames)[16..].to_vec()
+}
+
+/// Finding 4: a fix inside a comprehension lives in a nested `<listcomp>` code object on
+/// CPython 3.8-3.11 and must still gate the enclosing function.
+#[test]
+fn t112_final_finding4_comprehension_fix_gates_through_nested_code_object() {
+    let parent = tempdir().expect("tempdir");
+    let base = "def keep(items):\n    return [x for x in items]\n";
+    fs::write(parent.path().join("svc.py"), base).expect("base");
+    let patch = "diff --git a/svc.py b/svc.py\n--- a/svc.py\n+++ b/svc.py\n@@ -1,2 +1,2 @@\n def keep(items):\n-    return [x for x in items]\n+    return [x for x in items if x.valid]\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let pyc_fp = fp.hunks[0]
+        .pyc_fingerprints
+        .iter()
+        .find(|f| f.function_name == "keep")
+        .expect("keep fingerprint");
+    assert!(pyc_fp.added.contains("valid"), "{pyc_fp:?}");
+
+    // 3.11 layout: `valid` is only in `<listcomp>.co_names`.
+    let fixed_comp = raw_code_311("<listcomp>", &[], &["valid"], &[".0", "x"]);
+    let base_comp = raw_code_311("<listcomp>", &[], &[], &[".0", "x"]);
+    let fixed_311 = build_pyc_311("keep", "keep", &[fixed_comp], &[], &["items"]);
+    let base_311 = build_pyc_311("keep", "keep", &[base_comp], &[], &["items"]);
+    let keep = parse_pyc_code_objects(&fixed_311)
+        .into_iter()
+        .find(|c| c.name == "keep")
+        .expect("keep code object");
+    assert!(keep.symbols.contains("valid"), "{keep:?}");
+    assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
+
+    // 3.8 layout, through a nested genexpr inside the listcomp.
+    let fixed_gen = raw_code_38("<genexpr>", &[], &["valid"], &[".0"]);
+    let fixed_comp_38 = raw_code_38("<listcomp>", &[fixed_gen], &[], &[".0", "x"]);
+    let base_comp_38 = raw_code_38("<listcomp>", &[], &[], &[".0", "x"]);
+    let fixed_38 = build_pyc_38("keep", &[fixed_comp_38], &[], &["items"]);
+    let base_38 = build_pyc_38("keep", &[base_comp_38], &[], &["items"]);
+    assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+}
+
+/// Finding 4 (scope kept): a nested named function is its own scope and is not folded
+/// into the enclosing one.
+#[test]
+fn t112_final_finding4_nested_named_function_is_not_folded() {
+    let inner = raw_code_311("helper", &[], &["valid"], &[]);
+    let lam = raw_code_311("<lambda>", &[], &["checked"], &["y"]);
+    let outer = build_pyc_311("keep", "keep", &[inner, lam], &[], &["items"]);
+    let objects = parse_pyc_code_objects(&outer);
+    let keep = objects
+        .iter()
+        .find(|c| c.name == "keep")
+        .expect("keep code object");
+    assert!(keep.symbols.contains("checked"), "{keep:?}");
+    assert!(!keep.symbols.contains("valid"), "{keep:?}");
+    assert!(objects.iter().any(|c| c.name == "helper"));
+}
