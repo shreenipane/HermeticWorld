@@ -557,19 +557,26 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
             .map_err(|_| HttpError::InvalidHeaderValue)?
             .to_owned();
 
-        match name.as_str() {
-            "transfer-encoding" => {
-                return Err(HttpError::TransferEncodingForbidden);
-            }
+        headers.push(Header { name, value });
+    }
+
+    for h in &headers {
+        if h.name == "transfer-encoding" {
+            return Err(HttpError::TransferEncodingForbidden);
+        }
+    }
+
+    for h in &headers {
+        match h.name.as_str() {
             "content-length" => {
                 cl_count += 1;
                 if cl_count > 1 {
                     return Err(HttpError::DuplicateContentLength);
                 }
-                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                if h.value.is_empty() || !h.value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(HttpError::InvalidContentLength);
                 }
-                if value.bytes().any(|b| b != b'0') {
+                if h.value.bytes().any(|b| b != b'0') {
                     return Err(HttpError::NonZeroContentLength);
                 }
             }
@@ -578,7 +585,7 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
                 if host_count > 1 {
                     return Err(HttpError::DuplicateHost);
                 }
-                host_header_val = Some(value.clone());
+                host_header_val = Some(h.value.clone());
             }
             "expect" => {
                 return Err(HttpError::ExpectHeaderForbidden);
@@ -587,7 +594,7 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
                 return Err(HttpError::UpgradeForbidden);
             }
             "connection" => {
-                for tok in value.split(',') {
+                for tok in h.value.split(',') {
                     let t = tok.trim();
                     if t.eq_ignore_ascii_case("upgrade") {
                         return Err(HttpError::UpgradeForbidden);
@@ -596,8 +603,6 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
             }
             _ => {}
         }
-
-        headers.push(Header { name, value });
     }
 
     let raw_host = host_header_val.ok_or(HttpError::MissingHost)?;
