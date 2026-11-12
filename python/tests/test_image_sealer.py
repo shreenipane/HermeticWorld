@@ -202,6 +202,52 @@ def test_restore_modes_isolated_from_untrusted_subprocess_module(tmp_path: Path)
     assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o644"
 
 
+@pytest.mark.parametrize("limit_var,limit_val", [
+    ("HERMETIC_MAX_TREE_ENTRIES", "0"),
+    ("HERMETIC_MAX_TREE_BYTES", "10"),
+    ("HERMETIC_MAX_PATH_LENGTH", "5"),
+])
+def test_restore_modes_oversized_listing_bounded_rejection(tmp_path: Path, limit_var: str, limit_val: str) -> None:
+    """Regression Defect 5: use an offline oversized listing and assert bounded rejection before any chmod operation."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file whose mode is 100644 in git
+    f_tracked = repo_dir / "tracked_file.txt"
+    f_tracked.write_text("content\n", encoding="utf-8")
+    run_git(["add", "tracked_file.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Flip mode to 0o755
+    os.chmod(f_tracked, 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    env = dict(os.environ, **{limit_var: limit_val})
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True, env=env)
+
+    # Must reject with non-zero exit code
+    assert res.returncode != 0, f"Expected bounded rejection, but script succeeded: {res.stdout}"
+    assert "Refusing to restore modes" in res.stderr
+
+    # Assert bounded rejection before ANY chmod operation (mode remains 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
+
+
 def test_verification_problems() -> None:
     """Test verification_problems returns [] for clean after and identifies each flaw."""
     clean_after = {

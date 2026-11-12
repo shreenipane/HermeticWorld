@@ -959,11 +959,10 @@ def _is_target_issue_ref(item: Any, target_repo: str, target_numbers: set[int] |
     if t_type == "PullRequest":
         return False
     url = item.get("url") if isinstance(item.get("url"), str) else ""
-    num = item.get("number") if type(item.get("number")) is int else None
     parsed = _parse_github_item_url(url)
-    item_repo = parsed[0] if parsed else target_repo
-    item_kind = parsed[1] if parsed else "issues"
-    item_num = parsed[2] if parsed else num
+    if not parsed:
+        return False
+    item_repo, item_kind, item_num = parsed
     return item_repo == target_repo and item_kind == "issues" and item_num in target_numbers
 
 
@@ -982,21 +981,29 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
         for node in nodes:
             _validate_fields(node)
             if field == "comments":
-                if not node.get("databaseId") and not node.get("url"):
+                c_url = node.get("url")
+                c_db_id = node.get("databaseId")
+                c_id_ok = type(c_db_id) is int and c_db_id > 0
+                if not c_id_ok and isinstance(c_url, str):
+                    m = re.search(r"#issuecomment-(\d+)", c_url)
+                    if m and len(m.group(1)) <= 18:
+                        c_id_ok = True
+                c_url_ok = (c_url is None) or (isinstance(c_url, str) and bool(re.search(r"^https://github\.com/[^/]+/[^/]+/issues/\d+.*#issuecomment-\d+$", c_url)))
+                if not c_id_ok or not c_url_ok:
                     raise GraphQLResponseError("missing_comment_identity")
             elif field == "timelineItems":
                 if node.get("__typename") not in ("CrossReferencedEvent", "ConnectedEvent"):
                     raise GraphQLResponseError("invalid_timeline_node")
                 if node.get("__typename") == "CrossReferencedEvent":
                     src = node.get("source")
-                    if not isinstance(src, dict) or (not src.get("url") and not src.get("number")):
+                    if not isinstance(src, dict) or not src.get("url") or not _parse_github_item_url(src.get("url")):
                         raise GraphQLResponseError("missing_cross_reference_source")
                     _validate_fields(src)
                 elif node.get("__typename") == "ConnectedEvent":
                     src = node.get("source")
                     subj = node.get("subject")
-                    has_src = isinstance(src, dict) and bool(src.get("url") or src.get("number"))
-                    has_subj = isinstance(subj, dict) and bool(subj.get("url") or subj.get("number"))
+                    has_src = isinstance(src, dict) and bool(src.get("url")) and bool(_parse_github_item_url(src.get("url")))
+                    has_subj = isinstance(subj, dict) and bool(subj.get("url")) and bool(_parse_github_item_url(subj.get("url")))
                     target_repo_str = f"{owner}/{name}"
                     src_outside = has_src and not _is_target_issue_ref(src, target_repo_str, issue_number)
                     subj_outside = has_subj and not _is_target_issue_ref(subj, target_repo_str, issue_number)
@@ -1023,10 +1030,26 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
         for node in nodes:
             _validate_fields(node)
             if field == "comments":
-                if not node.get("databaseId") and not node.get("url"):
+                c_url = node.get("url")
+                c_db_id = node.get("databaseId")
+                c_id_ok = type(c_db_id) is int and c_db_id > 0
+                if not c_id_ok and isinstance(c_url, str):
+                    m = re.search(r"#issuecomment-(\d+)", c_url)
+                    if m and len(m.group(1)) <= 18:
+                        c_id_ok = True
+                c_url_ok = (c_url is None) or (isinstance(c_url, str) and bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#issuecomment-\d+$", c_url)))
+                if not c_id_ok or not c_url_ok:
                     raise GraphQLResponseError("missing_pr_comment_identity")
             elif field == "reviews":
-                if not node.get("databaseId") and not node.get("url"):
+                r_url = node.get("url")
+                r_db_id = node.get("databaseId")
+                r_id_ok = type(r_db_id) is int and r_db_id > 0
+                if not r_id_ok and isinstance(r_url, str):
+                    m = re.search(r"#pullrequestreview-(\d+)", r_url)
+                    if m and len(m.group(1)) <= 18:
+                        r_id_ok = True
+                r_url_ok = (r_url is None) or (isinstance(r_url, str) and bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#pullrequestreview-\d+$", r_url)))
+                if not r_id_ok or not r_url_ok:
                     raise GraphQLResponseError("missing_review_identity")
             elif field == "reviewThreads":
                 node["comments"]["nodes"] = _paginate(
@@ -1034,7 +1057,15 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
                     {"id": node.get("id")}, "PullRequestReviewThreadCommentsPage", ("node", "comments"))
                 for comment in node["comments"]["nodes"]:
                     _validate_fields(comment)
-                    if not comment.get("databaseId") and not comment.get("url"):
+                    rc_url = comment.get("url")
+                    rc_db_id = comment.get("databaseId")
+                    rc_id_ok = type(rc_db_id) is int and rc_db_id > 0
+                    if not rc_id_ok and isinstance(rc_url, str):
+                        m = re.search(r"#discussion_r(\d+)", rc_url)
+                        if m and len(m.group(1)) <= 18:
+                            rc_id_ok = True
+                    rc_url_ok = (rc_url is None) or (isinstance(rc_url, str) and bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#discussion_r\d+$", rc_url)))
+                    if not rc_id_ok or not rc_url_ok:
                         raise GraphQLResponseError("missing_review_comment_identity")
         pr[field]["nodes"] = nodes
     return pr
@@ -1062,7 +1093,11 @@ def get_solution_pr_scrub_entries(
     ]
     seen_shas: set[str] = set()
     for sha in commit_shas:
-        if not sha or sha in seen_shas:
+        if not isinstance(sha, str) or not sha:
+            raise GraphQLResponseError(f"malformed_commit_identifier; invalid {sha!r}")
+        if len(sha) > 64:
+            raise GraphQLResponseError(f"oversized_commit_identifier; length {len(sha)}")
+        if sha in seen_shas:
             continue
         seen_shas.add(sha)
         entries.extend([
@@ -1141,16 +1176,16 @@ def _add_timeline_scrub_entries(
         typename = item.get("__typename")
         if typename == "CrossReferencedEvent":
             src = item.get("source") if isinstance(item.get("source"), dict) else None
-            if src is None or (not src.get("url") and not src.get("number")):
+            if src is None:
                 deny_unresolved_scope(entries)
                 continue
             src_url = src.get("url") if isinstance(src.get("url"), str) else ""
-            src_num = src.get("number") if type(src.get("number")) is int else None
             src_type = src.get("__typename") if isinstance(src.get("__typename"), str) else None
             parsed = _parse_github_item_url(src_url)
-            src_repo = parsed[0] if parsed else repo
-            src_kind = parsed[1] if parsed else ("pull" if src_type == "PullRequest" else "issues")
-            src_number = parsed[2] if parsed else src_num
+            if not parsed:
+                deny_unresolved_scope(entries)
+                continue
+            src_repo, src_kind, src_number = parsed
 
             if src_kind == "pull" or src_type == "PullRequest":
                 if src_number:
@@ -1168,24 +1203,25 @@ def _add_timeline_scrub_entries(
         elif typename == "ConnectedEvent":
             conn_candidates = [conn for conn in (item.get("source"), item.get("subject")) if isinstance(conn, dict)]
             outside_candidates = []
+            has_unresolved_candidate = False
             for conn_item in conn_candidates:
                 c_url = conn_item.get("url") if isinstance(conn_item.get("url"), str) else ""
-                c_num = conn_item.get("number") if type(conn_item.get("number")) is int else None
                 c_type = conn_item.get("__typename") if isinstance(conn_item.get("__typename"), str) else None
                 parsed = _parse_github_item_url(c_url)
-                c_repo = parsed[0] if parsed else repo
-                c_kind = parsed[1] if parsed else ("pull" if c_type == "PullRequest" else "issues")
-                c_number = parsed[2] if parsed else c_num
+                if not parsed:
+                    has_unresolved_candidate = True
+                    continue
+                c_repo, c_kind, c_number = parsed
 
                 if c_repo == repo and c_number in target_issue_numbers and c_kind == "issues":
                     continue
 
-                if c_url or c_number:
-                    outside_candidates.append((conn_item, c_repo, c_kind, c_number, c_url, c_type))
+                outside_candidates.append((conn_item, c_repo, c_kind, c_number, c_url, c_type))
 
-            if not outside_candidates:
+            if has_unresolved_candidate or not outside_candidates:
                 deny_unresolved_scope(entries)
-                continue
+                if not outside_candidates:
+                    continue
 
             for conn_item, c_repo, c_kind, c_number, c_url, c_type in outside_candidates:
                 if c_kind == "pull" or c_type == "PullRequest":
@@ -1312,13 +1348,17 @@ def process_thread_scrub_and_revision(
     try:
         pr_data = fetch_pull_request_data(post_client, owner, name, pr_number)
         for review in (pr_data.get("reviews") or {}).get("nodes") or []:
-            rev_url = review.get("url")
-            rev_id = review.get("databaseId")
+            rev_url = review.get("url") if isinstance(review.get("url"), str) else None
+            rev_id = review.get("databaseId") if type(review.get("databaseId")) is int and review.get("databaseId") > 0 else None
             if not rev_id and rev_url:
                 m = re.search(r"#pullrequestreview-(\d+)", rev_url)
                 if m and len(m.group(1)) <= 18:
-                    rev_id = int(m.group(1))
-            if not rev_id and not rev_url:
+                    try:
+                        rev_id = int(m.group(1))
+                    except ValueError:
+                        rev_id = None
+            valid_url = (rev_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#pullrequestreview-\d+$", rev_url))
+            if not rev_id or not valid_url:
                 deny_unresolved_scope(pr_entries)
                 if unrev_warning not in warnings_list:
                     warnings_list.append(unrev_warning)
@@ -1335,13 +1375,17 @@ def process_thread_scrub_and_revision(
 
         for thread in (pr_data.get("reviewThreads") or {}).get("nodes") or []:
             for rc in (thread.get("comments") or {}).get("nodes") or []:
-                rc_url = rc.get("url")
-                rc_id = rc.get("databaseId")
+                rc_url = rc.get("url") if isinstance(rc.get("url"), str) else None
+                rc_id = rc.get("databaseId") if type(rc.get("databaseId")) is int and rc.get("databaseId") > 0 else None
                 if not rc_id and rc_url:
                     m = re.search(r"#discussion_r(\d+)", rc_url)
                     if m and len(m.group(1)) <= 18:
-                        rc_id = int(m.group(1))
-                if not rc_id and not rc_url:
+                        try:
+                            rc_id = int(m.group(1))
+                        except ValueError:
+                            rc_id = None
+                valid_url = (rc_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#discussion_r\d+$", rc_url))
+                if not rc_id or not valid_url:
                     deny_unresolved_scope(pr_entries)
                     if unrev_warning not in warnings_list:
                         warnings_list.append(unrev_warning)
@@ -1358,13 +1402,17 @@ def process_thread_scrub_and_revision(
 
         # Defect 9: PR conversation comments (IssueComments on PR)
         for c in (pr_data.get("comments") or {}).get("nodes") or []:
-            c_url = c.get("url")
-            c_id = c.get("databaseId")
+            c_url = c.get("url") if isinstance(c.get("url"), str) else None
+            c_id = c.get("databaseId") if type(c.get("databaseId")) is int and c.get("databaseId") > 0 else None
             if not c_id and c_url:
                 m = re.search(r"#issuecomment-(\d+)", c_url)
                 if m and len(m.group(1)) <= 18:
-                    c_id = int(m.group(1))
-            if not c_id and not c_url:
+                    try:
+                        c_id = int(m.group(1))
+                    except ValueError:
+                        c_id = None
+            valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#issuecomment-\d+$", c_url))
+            if not c_id or not valid_url:
                 deny_unresolved_scope(pr_entries)
                 if unrev_warning not in warnings_list:
                     warnings_list.append(unrev_warning)
@@ -1418,7 +1466,7 @@ def process_thread_scrub_and_revision(
                     continue
                 c_created = parse_iso(c.get("createdAt"))
                 c_url = c.get("url") if isinstance(c.get("url"), str) else None
-                c_id = c.get("databaseId") if type(c.get("databaseId")) is int else None
+                c_id = c.get("databaseId") if type(c.get("databaseId")) is int and c.get("databaseId") > 0 else None
                 if not c_id and c_url:
                     m = re.search(r"#issuecomment-(\d+)", c_url)
                     if m and len(m.group(1)) <= 18:
@@ -1426,7 +1474,8 @@ def process_thread_scrub_and_revision(
                             c_id = int(m.group(1))
                         except ValueError:
                             c_id = None
-                if not c_id and not c_url:
+                valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/issues/\d+.*#issuecomment-\d+$", c_url))
+                if not c_id or not valid_url:
                     deny_unresolved_scope(all_entries)
                     if unrev_warning not in warnings_list:
                         warnings_list.append(unrev_warning)
@@ -1434,8 +1483,6 @@ def process_thread_scrub_and_revision(
                 if c_created is None:
                     deny_unresolved_scope(all_entries)
                 if c_created and c_created > t_world:
-                    if not c_url and not c_id:
-                        deny_unresolved_scope(all_entries)
                     if c_url:
                         all_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="target issue comment created after T_world"))
                     if c_id:
@@ -1445,6 +1492,18 @@ def process_thread_scrub_and_revision(
                             url=f"https://api.github.com/repos/{repo}/issues/comments/{c_id}",
                             reason="target issue comment created after T_world",
                         ))
+                    all_entries.append(ScrubEntry(
+                        kind="comment",
+                        match="exact",
+                        url=f"https://github.com/{repo}/issues/{iss_num}",
+                        reason="target issue HTML page containing late comment created after T_world",
+                    ))
+                    all_entries.append(ScrubEntry(
+                        kind="comment",
+                        match="exact",
+                        url=f"https://api.github.com/repos/{repo}/issues/{iss_num}/comments",
+                        reason="target issue comments collection containing late comment created after T_world",
+                    ))
 
             _add_timeline_scrub_entries(all_entries, iss_data, repo, target_set)
             _add_linked_refs_scrub_entries(all_entries, iss_data, repo, target_set, warnings_list)
@@ -1519,7 +1578,7 @@ def process_thread_scrub_and_revision(
         c_created = parse_iso(comment.get("createdAt"))
         c_last_edited = parse_iso(comment.get("lastEditedAt"))
         c_url = comment.get("url") if isinstance(comment.get("url"), str) else None
-        c_db_id = comment.get("databaseId") if type(comment.get("databaseId")) is int else None
+        c_db_id = comment.get("databaseId") if type(comment.get("databaseId")) is int and comment.get("databaseId") > 0 else None
         if not c_db_id and c_url:
             m = re.search(r"#issuecomment-(\d+)", c_url)
             if m and len(m.group(1)) <= 18:
@@ -1529,7 +1588,8 @@ def process_thread_scrub_and_revision(
                     c_db_id = None
         c_comment_ident = str(c_db_id) if c_db_id is not None else "unknown"
 
-        if not c_url and not c_db_id:
+        valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/issues/\d+.*#issuecomment-\d+$", c_url))
+        if not c_db_id or not valid_url:
             deny_unresolved_scope(all_entries)
             if unrev_warning not in warnings_list:
                 warnings_list.append(unrev_warning)
@@ -1544,8 +1604,6 @@ def process_thread_scrub_and_revision(
 
         if c_created > t_world:
             # Drop from hints; add to thread_scrub list
-            if not c_url and not c_db_id:
-                deny_unresolved_scope(all_entries)
             if c_url:
                 all_entries.append(ScrubEntry(kind="comment", match="exact", url=c_url, reason="target issue comment created after T_world"))
             if c_db_id:
@@ -1555,6 +1613,18 @@ def process_thread_scrub_and_revision(
                     url=f"https://api.github.com/repos/{repo}/issues/comments/{c_db_id}",
                     reason="target issue comment created after T_world",
                 ))
+            all_entries.append(ScrubEntry(
+                kind="comment",
+                match="exact",
+                url=f"https://github.com/{repo}/issues/{single_issue_number}",
+                reason="target issue HTML page containing late comment created after T_world",
+            ))
+            all_entries.append(ScrubEntry(
+                kind="comment",
+                match="exact",
+                url=f"https://api.github.com/repos/{repo}/issues/{single_issue_number}/comments",
+                reason="target issue comments collection containing late comment created after T_world",
+            ))
             continue
 
         # Comment was created at or before T_world

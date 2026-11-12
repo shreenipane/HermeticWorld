@@ -28,6 +28,13 @@ class IntakeError(Exception):
     """Raised when task intake fails verification or fetching."""
 
 
+def validate_commit_sha(sha: Any, label: str = "commit") -> str:
+    """Validate a commit or merge identifier as a bounded hexadecimal string."""
+    if not isinstance(sha, str) or not (4 <= len(sha) <= 64) or not re.fullmatch(r"[0-9a-fA-F]{4,64}", sha):
+        raise IntakeError(f"malformed_{label}_identifier; expected bounded hexadecimal string, got {sha!r}")
+    return sha
+
+
 class InvalidReferenceError(ValueError):
     """Raised when an issue/ticket reference number exceeds bounds or parsing limits."""
 
@@ -374,7 +381,9 @@ def intake_task(
         if not commits_data:
             break
         for c in commits_data:
-            sha = c["sha"]
+            if not isinstance(c, dict) or "sha" not in c:
+                raise IntakeError("malformed_commit_data")
+            sha = validate_commit_sha(c["sha"], "commit")
             a_dt = ensure_utc(datetime.fromisoformat(c["commit"]["author"]["date"]), f"commit_{sha}_author")
             c_dt = ensure_utc(datetime.fromisoformat(c["commit"]["committer"]["date"]), f"commit_{sha}_committer")
             fix_commits.append(FixCommit(sha=sha, author_date=a_dt, committer_date=c_dt))
@@ -455,8 +464,10 @@ def intake_task(
 
     solution_commit_shas: list[str] = [fc.sha for fc in fix_commits]
     merge_sha = pr_data.get("merge_commit_sha")
-    if merge_sha and merge_sha not in solution_commit_shas:
-        solution_commit_shas.append(merge_sha)
+    if merge_sha is not None:
+        validate_commit_sha(merge_sha, "merge_commit")
+        if merge_sha not in solution_commit_shas:
+            solution_commit_shas.append(merge_sha)
 
     scrub_result = process_thread_scrub_and_revision(
         repo=repo,

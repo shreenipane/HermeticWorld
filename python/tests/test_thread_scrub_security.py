@@ -222,21 +222,84 @@ def test_repeated_cursor_terminates_without_certifying(tmp_path, document):
 def test_named_pagination_and_aggregate_caps_exclude(tmp_path, cap):
     node = issue()
     node["lastEditedAt"] = "2020-01-10T00:00:00Z"
-    node["userContentEdits"] = connection([{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}], more=True, cursor="start")
     calls = []
     def post(url, payload):
-        calls.append(payload["operationName"])
-        assert len(calls) < 8
-        if payload["operationName"] == "PullRequestData":
+        op = payload["operationName"]
+        calls.append(op)
+        if op == "PullRequestData":
             return response("pullRequest", pr())
-        result = response("issue", node)
-        result["data"]["repository"]["issue"]["userContentEdits"]["pageInfo"]["endCursor"] = str(len(calls))
-        return result
+        if op == "TargetIssueData":
+            result = response("issue", node)
+            result["data"]["repository"]["issue"]["userContentEdits"] = connection(
+                [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+                more=True,
+                cursor="page2",
+            )
+            return result
+        if op == "IssueEditsPage":
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "includesCreatedEdit": True,
+                            "userContentEdits": connection(
+                                [{"editedAt": "2020-01-01T00:00:00Z", "diff": "clean"}],
+                                more=False,
+                            ),
+                        }
+                    }
+                }
+            }
+        return response("issue", issue())
+
     with patch.object(thread_scrub, cap, 1):
         result = run_scrub(tmp_path, post=post)
+    assert len(calls) <= 3
     assert result.problem_statement_revision == "excluded"
     assert LATE not in result.problem_statement + result.hints_text
     assert_denied(result.scrub_entries)
+
+
+@pytest.mark.parametrize("cap", ["MAX_CONNECTION_PAGES", "MAX_CONNECTION_NODES", "MAX_GRAPHQL_PAGES", "MAX_GRAPHQL_NODES", "MAX_GRAPHQL_BYTES"])
+def test_named_caps_would_succeed_without_limit_check(tmp_path, cap):
+    """Regression Defect 6: verify finite responses complete successfully when the limit check is not tripped, so the test fails if limit check is removed."""
+    node = issue()
+    node["lastEditedAt"] = "2020-01-10T00:00:00Z"
+    calls = []
+    def post(url, payload):
+        op = payload["operationName"]
+        calls.append(op)
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
+        if op == "TargetIssueData":
+            result = response("issue", node)
+            result["data"]["repository"]["issue"]["userContentEdits"] = connection(
+                [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+                more=True,
+                cursor="page2",
+            )
+            return result
+        if op == "IssueEditsPage":
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "includesCreatedEdit": True,
+                            "userContentEdits": connection(
+                                [{"editedAt": "2020-01-01T00:00:00Z", "diff": "clean"}],
+                                more=False,
+                            ),
+                        }
+                    }
+                }
+            }
+        return response("issue", issue())
+
+    result = run_scrub(tmp_path, post=post)
+    assert len(calls) == 3
+    assert result.problem_statement_revision == "revision_at_t_world"
+    assert "clean" in result.problem_statement
+    assert not any(e["url"] == "https://github.com/" and e["match"] == "prefix" for e in result.scrub_entries)
 
 
 def test_supplied_production_client_gets_run_snapshot(tmp_path):
@@ -580,6 +643,164 @@ def test_defect2_unresolved_reference_lookup_denies_scope(tmp_path):
     assert (task / "staging/hints.txt").read_bytes() == b""
     urls = [e["url"] for e in scrub]
     assert f"https://github.com/{REPO}/issues/2" in urls
+
+
+def test_defect1_late_comment_blocks_containing_resources_and_query_variants(tmp_path):
+    """Regression Defect 1: Late comment scrub list blocks containing fragmentless HTML page and comments collection, including query variants."""
+    target_node = issue()
+    late_c = comment()
+    late_c["createdAt"] = "2020-01-20T00:00:00Z"
+    target_node["comments"] = connection([late_c])
+    result = run_scrub(tmp_path, node=target_node)
+    entries = result.scrub_entries
+
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://github.com/{REPO}/issues/1")
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://github.com/{REPO}/issues/1?tab=comments")
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://github.com/{REPO}/issues/1/?x=1")
+
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/1/comments")
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/1/comments?page=2")
+    assert thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/1/comments/?per_page=50")
+
+    assert not thread_scrub.matches_any_scrub_entry(entries, f"https://github.com/{REPO}/issues/2")
+    assert not thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/2/comments")
+
+
+def test_defect2_number_only_cross_reference_requires_rejection_or_scope_denial(tmp_path):
+    """Regression Defect 2: Number-only CrossReferencedEvent source denies scope and never assumes target repository."""
+    target_node = issue()
+    target_node["timelineItems"] = connection([{
+        "__typename": "CrossReferencedEvent",
+        "url": None,
+        "source": {
+            "__typename": "Issue",
+            "number": 88,
+            "url": None,
+        },
+    }])
+    result = run_scrub(tmp_path, node=target_node)
+    assert_denied(result.scrub_entries)
+    urls = [e["url"] for e in result.scrub_entries]
+    assert f"https://github.com/{REPO}/issues/88" not in urls
+    assert f"https://api.github.com/repos/{REPO}/issues/88" not in urls
+
+
+def test_defect2_number_only_connected_event_requires_rejection_or_scope_denial(tmp_path):
+    """Regression Defect 2: Number-only ConnectedEvent candidate denies scope and never assumes target repository."""
+    target_node = issue()
+    target_node["timelineItems"] = connection([{
+        "__typename": "ConnectedEvent",
+        "source": {
+            "__typename": "Issue",
+            "number": 88,
+            "url": None,
+        },
+        "subject": {
+            "__typename": "Issue",
+            "number": 1,
+            "url": f"https://github.com/{REPO}/issues/1",
+        },
+    }])
+    result = run_scrub(tmp_path, node=target_node)
+    assert_denied(result.scrub_entries)
+    urls = [e["url"] for e in result.scrub_entries]
+    assert f"https://github.com/{REPO}/issues/88" not in urls
+    assert f"https://api.github.com/repos/{REPO}/issues/88" not in urls
+
+
+@pytest.mark.parametrize("comment_type,url", [
+    ("review_comment", f"https://github.com/{REPO}/pull/50"),
+    ("review_comment", f"https://github.com/{REPO}/pull/50#discussion_r"),
+    ("review_comment", f"https://github.com/{REPO}/pull/50#discussion_rnotanumber"),
+    ("pr_comment", f"https://github.com/{REPO}/pull/50"),
+    ("pr_comment", f"https://github.com/{REPO}/pull/50#issuecomment-bad"),
+    ("issue_comment", f"https://github.com/{REPO}/issues/1"),
+    ("issue_comment", f"https://github.com/{REPO}/issues/1#issuecomment-xyz"),
+])
+def test_defect3_url_only_comments_with_missing_or_malformed_fragments_denied(tmp_path, comment_type, url):
+    """Regression Defect 3: Supply URL-only comments with missing or malformed fragments and assert mandatory scope denial."""
+    pr_node = pr()
+    issue_node = issue()
+    if comment_type == "review_comment":
+        pr_node["reviewThreads"] = connection([{
+            "id": "thread1",
+            "comments": connection([{"databaseId": None, "url": url}]),
+        }])
+    elif comment_type == "pr_comment":
+        pr_node["comments"] = connection([{"databaseId": None, "url": url}])
+    elif comment_type == "issue_comment":
+        issue_node["comments"] = connection([{"databaseId": None, "url": url, "createdAt": "2020-01-02T00:00:00Z"}])
+
+    def post(u, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr_node)
+        if op == "TargetIssueData":
+            return response("issue", issue_node)
+        raise OSError(f"unexpected op {op}")
+
+    result = run_scrub(tmp_path, node=issue_node, post=post)
+    assert_denied(result.scrub_entries)
+
+
+@pytest.mark.parametrize("bad_id", [
+    ["bad"],
+    {"bad": 1},
+    "a" * 65,
+    "not_hex_chars_123!",
+])
+@pytest.mark.parametrize("target_field", ["merge_commit_sha", "commit_sha"])
+def test_defect4_malformed_commit_identifiers_fail_without_artifacts(tmp_path, bad_id, target_field):
+    """Regression Defect 4: Exercise list-, object-, and oversized-string identifiers through intake_task; assert structured failure without artifacts."""
+    row = {
+        "repo": REPO,
+        "base_commit": "abc",
+        "problem_statement": "Statement",
+        "hints_text": "Hints",
+        "patch": "gold",
+        "test_patch": "tests",
+    }
+    def get(url):
+        if "/commits?" in url:
+            if target_field == "commit_sha":
+                return json.dumps([{
+                    "sha": bad_id,
+                    "commit": {
+                        "author": {"date": "2020-01-01T00:00:00Z"},
+                        "committer": {"date": "2020-01-01T00:00:00Z"},
+                    },
+                }]).encode()
+            return b"[]"
+        if "/issues/" in url:
+            return b'{"created_at":"2020-01-01T00:00:00Z"}'
+        data = {"created_at": "2020-02-01T00:00:00Z", "body": "Fixes #1"}
+        if target_field == "merge_commit_sha":
+            data["merge_commit_sha"] = bad_id
+        return json.dumps(data).encode()
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
+        if op == "TargetIssueData":
+            return response("issue", issue())
+        raise OSError(f"unexpected op: {op}")
+
+    out_dir = tmp_path / "out"
+    with patch("hermetic_slice.intake.repo_dates", return_value=(WORLD, WORLD)):
+        with pytest.raises(IntakeError):
+            intake_task(
+                "test-org__test-repo-50",
+                {"test-org__test-repo-50": row},
+                get,
+                tmp_path / "cache",
+                out_dir,
+                http_post_json=post,
+            )
+
+    task_dir = out_dir / "test-org__test-repo-50"
+    assert not (task_dir / "task.json").exists()
+    assert not (task_dir / "staging/thread_scrub.json").exists()
 
 
 @pytest.mark.parametrize("location", ["issue_body", "comment_body"])
