@@ -704,18 +704,41 @@ fn pyc_literal_tokens(text: &str) -> Vec<crate::winnow::Token> {
                     previous.text.as_str(),
                     "return"
                         | "yield"
+                        | "await"
+                        | "assert"
+                        | "if"
+                        | "elif"
+                        | "else"
+                        | "while"
+                        | "and"
+                        | "or"
+                        | "not"
+                        | "in"
+                        | "is"
+                        | "case"
+                        | "lambda"
                         | "="
+                        | "<"
+                        | ">"
+                        | "!"
                         | "("
                         | "["
                         | "{"
                         | ","
                         | ":"
+                        | ";"
                         | "+"
                         | "-"
                         | "*"
                         | "/"
                         | "%"
                         | "**"
+                        | "//"
+                        | "&"
+                        | "|"
+                        | "^"
+                        | "~"
+                        | "@"
                 )
             });
             if unary
@@ -1149,62 +1172,26 @@ fn parse_def_or_class_header(
     })
 }
 
-fn find_enclosing_function_for_pos(
-    lines: &[String],
-    pos: usize,
-    is_cont: &[bool],
-) -> (String, usize, usize) {
-    if lines.is_empty() {
-        return ("<module>".to_string(), 0, 0);
-    }
-    let target = pos.min(lines.len() - 1);
-    if !is_cont.get(target).copied().unwrap_or(false) {
-        if let Some(indent) = get_line_indent(&lines[target]) {
-            if let Some((name, _)) = parse_def_or_class(&lines[target]) {
-                return (name, indent, target);
-            }
-        }
-    }
-
-    let mut ref_indent = if !is_cont.get(target).copied().unwrap_or(false) {
-        get_line_indent(&lines[target]).unwrap_or(usize::MAX)
-    } else {
-        usize::MAX
-    };
-
-    for i in (0..target).rev() {
-        if is_cont.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        if let Some(indent) = get_line_indent(&lines[i]) {
-            if indent < ref_indent {
-                if let Some((name, _)) = parse_def_or_class(&lines[i]) {
-                    return (name, indent, i);
-                }
-                if indent == 0 {
-                    break;
-                }
-                ref_indent = indent;
-            }
-        }
-    }
-
-    ("<module>".to_string(), 0, 0)
-}
-
 // Scope paths include the occurrence of each definition in source order, so
 // repeated names in the same scope also have one-to-one identities.
 struct PycDefinition {
     name: String,
     pos: usize,
+    end_line: usize,
+    base_indent: usize,
     parent: Option<usize>,
     key: Vec<(String, usize)>,
 }
 
-fn pyc_definitions(lines: &[String], continuation: &[bool]) -> Vec<PycDefinition> {
+fn pyc_definitions(
+    lines: &[String],
+    continuation: &[bool],
+) -> (Vec<PycDefinition>, Vec<Option<usize>>) {
     let mut definitions: Vec<PycDefinition> = Vec::new();
     let mut scopes: Vec<(usize, usize)> = Vec::new();
     let mut occurrences = HashMap::new();
+    let mut active_stack: Vec<(usize, usize)> = Vec::new();
+
     for (pos, line) in lines.iter().enumerate() {
         if continuation.get(pos).copied().unwrap_or(false) {
             continue;
@@ -1212,6 +1199,16 @@ fn pyc_definitions(lines: &[String], continuation: &[bool]) -> Vec<PycDefinition
         let Some(indent) = get_line_indent(line) else {
             continue;
         };
+        while active_stack
+            .last()
+            .is_some_and(|(stack_indent, _)| indent <= *stack_indent)
+        {
+            if let Some((_, def_idx)) = active_stack.pop() {
+                if let Some(d) = definitions.get_mut(def_idx) {
+                    d.end_line = pos;
+                }
+            }
+        }
         while scopes.last().is_some_and(|(level, _)| *level >= indent) {
             scopes.pop();
         }
@@ -1224,107 +1221,246 @@ fn pyc_definitions(lines: &[String], continuation: &[bool]) -> Vec<PycDefinition
                 .or_insert(0usize);
             key.push((name.clone(), *ordinal));
             *ordinal = ordinal.saturating_add(1);
-            scopes.push((indent, definitions.len()));
+            let def_idx = definitions.len();
+            scopes.push((indent, def_idx));
+            active_stack.push((indent, def_idx));
             definitions.push(PycDefinition {
                 name,
                 pos,
+                end_line: lines.len(),
+                base_indent: indent,
                 parent: parent_pos,
                 key,
             });
         }
     }
-    definitions
+
+    let mut line_scopes = vec![None; lines.len()];
+    for (idx, def) in definitions.iter().enumerate() {
+        for l in def.pos..def.end_line.min(lines.len()) {
+            if let Some(slot) = line_scopes.get_mut(l) {
+                *slot = Some(idx);
+            }
+        }
+    }
+
+    (definitions, line_scopes)
 }
 
-// Project positions through context and replacement blocks. An insertion or
-// deletion with no opposite-side lines cannot supply a corresponding definition.
-fn pyc_patch_position(hunk: &crate::diff::Hunk, pos: usize, from_fixed: bool) -> Option<usize> {
-    let mut old = hunk.header.old_range.start.saturating_sub(1);
-    let mut new = hunk.header.new_range.start.saturating_sub(1);
-    let (source_start, destination_start) = if from_fixed { (new, old) } else { (old, new) };
-    if pos < source_start {
-        return Some(destination_start.saturating_sub(source_start.saturating_sub(pos)));
-    }
-    let mut lines = hunk.lines.iter().peekable();
-    while let Some(line) = lines.next() {
-        if line.line_type == DiffLineType::Context {
-            let (source, destination) = if from_fixed { (new, old) } else { (old, new) };
-            if pos == source {
-                return Some(destination);
-            }
-            old = old.saturating_add(1);
-            new = new.saturating_add(1);
-            continue;
-        }
-        let old_start = old;
-        let new_start = new;
-        if line.line_type == DiffLineType::Removed {
-            old = old.saturating_add(1);
-        } else {
-            new = new.saturating_add(1);
-        }
-        while lines
-            .peek()
-            .is_some_and(|line| line.line_type != DiffLineType::Context)
-        {
-            if let Some(line) = lines.next() {
-                if line.line_type == DiffLineType::Removed {
+#[derive(Clone, Copy, Debug)]
+enum HunkBlockKind {
+    Context,
+    Edit { dest_empty: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HunkBlock {
+    source_start: usize,
+    source_end: usize,
+    dest_start: usize,
+    dest_end: usize,
+    kind: HunkBlockKind,
+}
+
+struct HunkPositionMapper {
+    source_start: usize,
+    destination_start: usize,
+    source_end: usize,
+    destination_end: usize,
+    blocks: Vec<HunkBlock>,
+}
+
+impl HunkPositionMapper {
+    fn new(hunk: &crate::diff::Hunk, from_fixed: bool) -> Self {
+        let mut old = hunk.header.old_range.start.saturating_sub(1);
+        let mut new = hunk.header.new_range.start.saturating_sub(1);
+        let (source_start, destination_start) = if from_fixed { (new, old) } else { (old, new) };
+        let mut blocks = Vec::new();
+        let mut lines = hunk.lines.iter().peekable();
+
+        while let Some(line) = lines.next() {
+            if line.line_type == DiffLineType::Context {
+                let old_ctx_start = old;
+                let new_ctx_start = new;
+                old = old.saturating_add(1);
+                new = new.saturating_add(1);
+                while lines
+                    .peek()
+                    .is_some_and(|l| l.line_type == DiffLineType::Context)
+                {
+                    lines.next();
                     old = old.saturating_add(1);
-                } else {
                     new = new.saturating_add(1);
                 }
+                let (s_start, s_end, d_start, d_end) = if from_fixed {
+                    (new_ctx_start, new, old_ctx_start, old)
+                } else {
+                    (old_ctx_start, old, new_ctx_start, new)
+                };
+                blocks.push(HunkBlock {
+                    source_start: s_start,
+                    source_end: s_end,
+                    dest_start: d_start,
+                    dest_end: d_end,
+                    kind: HunkBlockKind::Context,
+                });
+                continue;
+            }
+
+            let old_start = old;
+            let new_start = new;
+            if line.line_type == DiffLineType::Removed {
+                old = old.saturating_add(1);
+            } else {
+                new = new.saturating_add(1);
+            }
+            while lines
+                .peek()
+                .is_some_and(|l| l.line_type != DiffLineType::Context)
+            {
+                if let Some(l) = lines.next() {
+                    if l.line_type == DiffLineType::Removed {
+                        old = old.saturating_add(1);
+                    } else {
+                        new = new.saturating_add(1);
+                    }
+                }
+            }
+            let (source, source_end, destination, destination_end) = if from_fixed {
+                (new_start, new, old_start, old)
+            } else {
+                (old_start, old, new_start, new)
+            };
+            if source < source_end {
+                blocks.push(HunkBlock {
+                    source_start: source,
+                    source_end,
+                    dest_start: destination,
+                    dest_end: destination_end,
+                    kind: HunkBlockKind::Edit {
+                        dest_empty: destination == destination_end,
+                    },
+                });
             }
         }
-        let (source, source_end, destination, destination_end) = if from_fixed {
-            (new_start, new, old_start, old)
-        } else {
-            (old_start, old, new_start, new)
-        };
-        if pos >= source && pos < source_end {
-            return if destination == destination_end {
-                None
-            } else {
-                Some(
-                    destination
-                        .saturating_add(pos.saturating_sub(source))
-                        .min(destination_end.saturating_sub(1)),
-                )
-            };
+
+        let (source_end, destination_end) = if from_fixed { (new, old) } else { (old, new) };
+        Self {
+            source_start,
+            destination_start,
+            source_end,
+            destination_end,
+            blocks,
         }
     }
-    let (source, destination) = if from_fixed { (new, old) } else { (old, new) };
-    Some(destination.saturating_add(pos.saturating_sub(source)))
+
+    fn map(&self, pos: usize) -> Option<usize> {
+        if pos < self.source_start {
+            return Some(
+                self.destination_start
+                    .saturating_sub(self.source_start.saturating_sub(pos)),
+            );
+        }
+        if pos >= self.source_end {
+            return Some(
+                self.destination_end
+                    .saturating_add(pos.saturating_sub(self.source_end)),
+            );
+        }
+        let idx = self.blocks.binary_search_by(|b| {
+            if pos < b.source_start {
+                std::cmp::Ordering::Greater
+            } else if pos >= b.source_end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        match idx {
+            Ok(i) => {
+                let block = self.blocks.get(i)?;
+                match block.kind {
+                    HunkBlockKind::Context => Some(
+                        block
+                            .dest_start
+                            .saturating_add(pos.saturating_sub(block.source_start)),
+                    ),
+                    HunkBlockKind::Edit { dest_empty } => {
+                        if dest_empty {
+                            None
+                        } else {
+                            Some(
+                                block
+                                    .dest_start
+                                    .saturating_add(pos.saturating_sub(block.source_start))
+                                    .min(block.dest_end.saturating_sub(1)),
+                            )
+                        }
+                    }
+                }
+            }
+            Err(_) => Some(
+                self.destination_end
+                    .saturating_add(pos.saturating_sub(self.source_end)),
+            ),
+        }
+    }
 }
 
 fn corresponding_pyc_definition(
     name: &str,
     pos: usize,
     hint: Option<usize>,
-    source: &[PycDefinition],
-    destination: &[PycDefinition],
+    source: &PycFileAnalysis<'_>,
+    destination: &PycFileAnalysis<'_>,
     used: &HashSet<usize>,
-) -> Option<usize> {
+    budget: &mut WorkBudget,
+) -> Result<Option<usize>, FingerprintError> {
     if name == "<module>" {
-        return Some(0);
+        return Ok(Some(0));
     }
-    let hint = hint?;
-    let key = &source.iter().find(|d| d.pos == pos && d.name == name)?.key;
-    let parent_key = key.get(..key.len().saturating_sub(1))?;
-    destination
+    let Some(hint) = hint else {
+        return Ok(None);
+    };
+    let source_def = source
+        .definition_by_pos
+        .get(&pos)
+        .and_then(|&idx| source.definitions.get(idx))
+        .filter(|d| d.name == name);
+    let Some(source_def) = source_def else {
+        return Ok(None);
+    };
+    let key = &source_def.key;
+    let parent_key = match key.get(..key.len().saturating_sub(1)) {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+
+    let candidates = match destination.definitions_by_name.get(name) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    budget.charge(candidates.len())?;
+
+    let best = candidates
         .iter()
+        .filter_map(|&idx| destination.definitions.get(idx))
         .filter(|d| {
-            d.name == name
-                && !used.contains(&d.pos)
-                && d.key.get(..d.key.len().saturating_sub(1)) == Some(parent_key)
+            !used.contains(&d.pos) && d.key.get(..d.key.len().saturating_sub(1)) == Some(parent_key)
         })
         .min_by_key(|d| (d.pos.abs_diff(hint), d.pos))
-        .map(|d| d.pos)
+        .map(|d| d.pos);
+
+    Ok(best)
 }
 
 struct PycFileAnalysis<'a> {
     lines: &'a [String],
     continuation: Vec<bool>,
     definitions: Vec<PycDefinition>,
+    definition_by_pos: HashMap<usize, usize>,
+    definitions_by_name: HashMap<String, Vec<usize>>,
+    line_scopes: Vec<Option<usize>>,
     headers: HashMap<usize, Option<ParsedDefHeader>>,
     scope_membership: HashMap<usize, (String, usize)>,
     symbols: HashMap<(String, usize), HashSet<String>>,
@@ -1333,11 +1469,23 @@ struct PycFileAnalysis<'a> {
 impl<'a> PycFileAnalysis<'a> {
     fn new(lines: &'a [String]) -> Self {
         let continuation = compute_line_continuation(lines);
-        let definitions = pyc_definitions(lines, &continuation);
+        let (definitions, line_scopes) = pyc_definitions(lines, &continuation);
+        let mut definition_by_pos = HashMap::with_capacity(definitions.len());
+        let mut definitions_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, def) in definitions.iter().enumerate() {
+            definition_by_pos.insert(def.pos, idx);
+            definitions_by_name
+                .entry(def.name.clone())
+                .or_default()
+                .push(idx);
+        }
         Self {
             lines,
             continuation,
             definitions,
+            definition_by_pos,
+            definitions_by_name,
+            line_scopes,
             headers: HashMap::new(),
             scope_membership: HashMap::new(),
             symbols: HashMap::new(),
@@ -1366,9 +1514,15 @@ impl<'a> PycFileAnalysis<'a> {
             return Ok(scope.clone());
         }
         budget.charge(1)?;
-        let (name, _, def_pos) =
-            find_enclosing_function_for_pos(self.lines, pos, &self.continuation);
-        let scope = (name, def_pos);
+        let scope = if let Some(&Some(def_idx)) = self.line_scopes.get(pos) {
+            if let Some(def) = self.definitions.get(def_idx) {
+                (def.name.clone(), def.pos)
+            } else {
+                ("<module>".to_string(), 0)
+            }
+        } else {
+            ("<module>".to_string(), 0)
+        };
         self.scope_membership.insert(pos, scope.clone());
         Ok(scope)
     }
@@ -1379,25 +1533,31 @@ impl<'a> PycFileAnalysis<'a> {
         budget: &mut WorkBudget,
     ) -> Result<Vec<(String, usize)>, FingerprintError> {
         let mut result = Vec::new();
+        let mut seen = HashSet::new();
         for &pos in positions {
+            budget.charge(1)?;
             let enclosing = self.get_scope_for_pos(pos, budget)?;
-            if !result.contains(&enclosing) {
+            if seen.insert(enclosing.clone()) {
                 result.push(enclosing);
             }
             let idx = self.definitions.partition_point(|d| d.pos <= pos);
             if idx > 0 {
-                let def = &self.definitions[idx - 1];
-                let def_pos = def.pos;
-                let parent_pos = def.parent;
-                if let Some(header) = self.get_or_parse_header(def_pos, budget)? {
-                    if pos <= header.header_end {
-                        let parent =
-                            parent_pos.and_then(|p| self.definitions.iter().find(|d| d.pos == p));
-                        let enclosing_header_parent = parent
-                            .map(|d| (d.name.clone(), d.pos))
-                            .unwrap_or_else(|| ("<module>".to_string(), 0));
-                        if !result.contains(&enclosing_header_parent) {
-                            result.push(enclosing_header_parent);
+                if let Some(def) = self.definitions.get(idx - 1) {
+                    let def_pos = def.pos;
+                    let parent_pos = def.parent;
+                    if let Some(header) = self.get_or_parse_header(def_pos, budget)? {
+                        if pos <= header.header_end {
+                            let parent = parent_pos.and_then(|p| {
+                                self.definition_by_pos
+                                    .get(&p)
+                                    .and_then(|&i| self.definitions.get(i))
+                            });
+                            let enclosing_header_parent = parent
+                                .map(|d| (d.name.clone(), d.pos))
+                                .unwrap_or_else(|| ("<module>".to_string(), 0));
+                            if seen.insert(enclosing_header_parent.clone()) {
+                                result.push(enclosing_header_parent);
+                            }
                         }
                     }
                 }
@@ -1437,46 +1597,56 @@ impl<'a> PycFileAnalysis<'a> {
             let mut line_idx = 0;
 
             while line_idx < self.lines.len() {
-                let line = &self.lines[line_idx];
+                budget.charge(1)?;
+                let Some(line) = self.lines.get(line_idx) else {
+                    break;
+                };
 
                 if let Some(skip_indent) = skip_until_indent {
-                    if self.continuation[line_idx] {
-                        line_idx += 1;
+                    if self.continuation.get(line_idx).copied().unwrap_or(false) {
+                        line_idx = line_idx.saturating_add(1);
                         continue;
                     }
                     if let Some(indent) = get_line_indent(line) {
                         if indent > skip_indent {
-                            line_idx += 1;
+                            line_idx = line_idx.saturating_add(1);
                             continue;
                         } else {
                             skip_until_indent = None;
                         }
                     } else {
-                        line_idx += 1;
+                        line_idx = line_idx.saturating_add(1);
                         continue;
                     }
                 }
 
-                if !self.continuation[line_idx] && parse_def_or_class(line).is_some() {
+                if !self.continuation.get(line_idx).copied().unwrap_or(false)
+                    && parse_def_or_class(line).is_some()
+                {
                     let def_indent = get_line_indent(line).unwrap_or(0);
                     if let Some(parsed) = self.get_or_parse_header(line_idx, budget)? {
                         let header_end = parsed.header_end;
                         let enclosing_syms = parsed.enclosing_symbols.clone();
                         module_symbols.extend(enclosing_syms);
                         skip_until_indent = Some(def_indent);
-                        line_idx = header_end + 1;
+                        line_idx = header_end.saturating_add(1);
                         continue;
                     }
                 }
 
-                let mut span_end = line_idx + 1;
-                while span_end < self.lines.len() && self.continuation[span_end] {
-                    span_end += 1;
+                let mut span_end = line_idx.saturating_add(1);
+                while span_end < self.lines.len()
+                    && self.continuation.get(span_end).copied().unwrap_or(false)
+                {
+                    span_end = span_end.saturating_add(1);
                 }
-                let span_lines: Vec<&str> = self.lines[line_idx..span_end]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
+                let mut span_lines: Vec<&str> =
+                    Vec::with_capacity(span_end.saturating_sub(line_idx));
+                if let Some(slice) = self.lines.get(line_idx..span_end) {
+                    for s in slice {
+                        span_lines.push(s.as_str());
+                    }
+                }
                 budget.charge(span_lines.len())?;
                 let syms = collect_symbol_set(&span_lines);
                 module_symbols.extend(syms);
@@ -1486,30 +1656,43 @@ impl<'a> PycFileAnalysis<'a> {
             return Ok(module_symbols);
         }
 
-        let candidate = self
-            .definitions
-            .iter()
-            .filter(|d| d.name == function_name)
-            .min_by_key(|d| d.pos.abs_diff(hint_pos));
+        let candidate_idx = if let Some(&idx) = self.definition_by_pos.get(&hint_pos) {
+            if self.definitions.get(idx).map(|d| d.name.as_str()) == Some(function_name) {
+                budget.charge(1)?;
+                Some(idx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        let Some(def) = candidate else {
+        let candidate_idx = match candidate_idx {
+            Some(idx) => Some(idx),
+            None => {
+                if let Some(indices) = self.definitions_by_name.get(function_name) {
+                    budget.charge(indices.len())?;
+                    indices.iter().copied().min_by_key(|&idx| {
+                        self.definitions
+                            .get(idx)
+                            .map(|d| d.pos.abs_diff(hint_pos))
+                            .unwrap_or(usize::MAX)
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(def_idx) = candidate_idx else {
+            return Ok(HashSet::new());
+        };
+        let Some(def) = self.definitions.get(def_idx) else {
             return Ok(HashSet::new());
         };
         let def_line = def.pos;
-        let base_indent = get_line_indent(&self.lines[def_line]).unwrap_or(0);
-
-        let mut end_line = self.lines.len();
-        for (j, line) in self.lines.iter().enumerate().skip(def_line + 1) {
-            if self.continuation[j] {
-                continue;
-            }
-            if let Some(indent) = get_line_indent(line) {
-                if indent <= base_indent {
-                    end_line = j;
-                    break;
-                }
-            }
-        }
+        let base_indent = def.base_indent;
+        let end_line = def.end_line;
 
         let mut symbols = HashSet::new();
         let parsed_header = self.get_or_parse_header(def_line, budget)?;
@@ -1522,55 +1705,75 @@ impl<'a> PycFileAnalysis<'a> {
             (def_line, None)
         };
 
+        let mut line_idx = header_end.saturating_add(1);
         if let Some(body_text) = inline_body {
-            budget.charge(1)?;
-            let syms = collect_symbol_set(&[&body_text]);
+            let mut span_end = line_idx;
+            while span_end < end_line && self.continuation.get(span_end).copied().unwrap_or(false) {
+                span_end = span_end.saturating_add(1);
+            }
+            let cont_count = span_end.saturating_sub(line_idx);
+            let mut span_lines = Vec::with_capacity(cont_count.saturating_add(1));
+            span_lines.push(body_text.as_str());
+            if let Some(cont_slice) = self.lines.get(line_idx..span_end) {
+                for line in cont_slice {
+                    span_lines.push(line.as_str());
+                }
+            }
+            budget.charge(span_lines.len())?;
+            let syms = collect_symbol_set(&span_lines);
             symbols.extend(syms);
+            line_idx = span_end;
         }
 
         let mut skip_until_indent: Option<usize> = None;
-        let mut line_idx = header_end + 1;
         while line_idx < end_line {
-            let line = &self.lines[line_idx];
+            budget.charge(1)?;
+            let Some(line) = self.lines.get(line_idx) else {
+                break;
+            };
 
             if let Some(skip_indent) = skip_until_indent {
-                if self.continuation[line_idx] {
-                    line_idx += 1;
+                if self.continuation.get(line_idx).copied().unwrap_or(false) {
+                    line_idx = line_idx.saturating_add(1);
                     continue;
                 }
                 if let Some(indent) = get_line_indent(line) {
                     if indent > skip_indent {
-                        line_idx += 1;
+                        line_idx = line_idx.saturating_add(1);
                         continue;
                     } else {
                         skip_until_indent = None;
                     }
                 } else {
-                    line_idx += 1;
+                    line_idx = line_idx.saturating_add(1);
                     continue;
                 }
             }
 
-            if !self.continuation[line_idx] && parse_def_or_class(line).is_some() {
-                let nested_indent = get_line_indent(line).unwrap_or(base_indent + 1);
+            if !self.continuation.get(line_idx).copied().unwrap_or(false)
+                && parse_def_or_class(line).is_some()
+            {
+                let nested_indent = get_line_indent(line).unwrap_or(base_indent.saturating_add(1));
                 if let Some(parsed) = self.get_or_parse_header(line_idx, budget)? {
                     let header_end = parsed.header_end;
                     let enclosing_syms = parsed.enclosing_symbols.clone();
                     symbols.extend(enclosing_syms);
                     skip_until_indent = Some(nested_indent);
-                    line_idx = header_end + 1;
+                    line_idx = header_end.saturating_add(1);
                     continue;
                 }
             }
 
-            let mut span_end = line_idx + 1;
-            while span_end < end_line && self.continuation[span_end] {
-                span_end += 1;
+            let mut span_end = line_idx.saturating_add(1);
+            while span_end < end_line && self.continuation.get(span_end).copied().unwrap_or(false) {
+                span_end = span_end.saturating_add(1);
             }
-            let span_lines: Vec<&str> = self.lines[line_idx..span_end]
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
+            let mut span_lines: Vec<&str> = Vec::with_capacity(span_end.saturating_sub(line_idx));
+            if let Some(slice) = self.lines.get(line_idx..span_end) {
+                for s in slice {
+                    span_lines.push(s.as_str());
+                }
+            }
             budget.charge(span_lines.len())?;
             let syms = collect_symbol_set(&span_lines);
             symbols.extend(syms);
@@ -1622,16 +1825,23 @@ fn compute_pyc_function_fingerprints(
     let mut targets: Vec<(String, Option<usize>, Option<usize>)> = Vec::new();
     let mut used_base = HashSet::new();
     let mut used_fixed = HashSet::new();
+    let mut seen_fixed_targets = HashSet::new();
+    let mut seen_base_targets = HashSet::new();
+
+    let fixed_mapper = HunkPositionMapper::new(hunk, true);
+    let base_mapper = HunkPositionMapper::new(hunk, false);
+
     for (name, pos) in fixed_defs {
-        let base_pos = if let Some(ref base_ana) = base_analysis {
+        let base_pos = if let Some(ref mut base_ana) = base_analysis {
             corresponding_pyc_definition(
                 &name,
                 pos,
-                pyc_patch_position(hunk, pos, true),
-                &fixed_analysis.definitions,
-                &base_ana.definitions,
+                fixed_mapper.map(pos),
+                fixed_analysis,
+                base_ana,
                 &used_base,
-            )
+                budget,
+            )?
         } else {
             None
         };
@@ -1641,24 +1851,27 @@ fn compute_pyc_function_fingerprints(
             }
             used_fixed.insert(pos);
         }
+        seen_fixed_targets.insert((name.clone(), pos));
+        if let Some(bp) = base_pos {
+            seen_base_targets.insert((name.clone(), bp));
+        }
         targets.push((name, Some(pos), base_pos));
     }
+
     for (name, pos) in base_defs {
-        if targets
-            .iter()
-            .any(|(n, _, p)| n == &name && *p == Some(pos))
-        {
+        if seen_base_targets.contains(&(name.clone(), pos)) {
             continue;
         }
-        let fixed_pos = if let Some(ref base_ana) = base_analysis {
+        let fixed_pos = if let Some(ref mut base_ana) = base_analysis {
             corresponding_pyc_definition(
                 &name,
                 pos,
-                pyc_patch_position(hunk, pos, false),
-                &base_ana.definitions,
-                &fixed_analysis.definitions,
+                base_mapper.map(pos),
+                base_ana,
+                fixed_analysis,
                 &used_fixed,
-            )
+                budget,
+            )?
         } else {
             None
         };
@@ -1667,14 +1880,13 @@ fn compute_pyc_function_fingerprints(
                 used_fixed.insert(fixed_pos);
             }
         }
-        // A fixed definition can be paired only once, including removed definitions.
-        if fixed_pos.is_some()
-            && targets
-                .iter()
-                .any(|(n, p, _)| n == &name && *p == fixed_pos)
-        {
-            continue;
+        if let Some(fp) = fixed_pos {
+            if seen_fixed_targets.contains(&(name.clone(), fp)) {
+                continue;
+            }
+            seen_fixed_targets.insert((name.clone(), fp));
         }
+        seen_base_targets.insert((name.clone(), pos));
         targets.push((name, fixed_pos, Some(pos)));
     }
 
@@ -1685,6 +1897,7 @@ fn compute_pyc_function_fingerprints(
     let mut result = Vec::new();
 
     for (function_name, f_hint, b_hint) in targets {
+        budget.charge(1)?;
         let fixed_symbols = if let Some(f_pos) = f_hint {
             fixed_analysis.get_or_extract_symbols(&function_name, f_pos, budget)?
         } else if function_name == "<module>" {
@@ -1798,13 +2011,7 @@ impl FingerprintSet {
         tier2_max_bytes: u64,
         work_budget: Option<usize>,
     ) -> Result<Self, FingerprintError> {
-        let budget_limit = work_budget
-            .or_else(|| {
-                std::env::var("HERMETIC_FINGERPRINT_WORK_BUDGET")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-            })
-            .unwrap_or(DEFAULT_MAX_FINGERPRINT_WORK);
+        let budget_limit = work_budget.unwrap_or(DEFAULT_MAX_FINGERPRINT_WORK);
         let mut budget = WorkBudget::new(budget_limit);
         let gold_patch = parse_patch(gold_patch_str)?;
         let test_patch = parse_patch(test_patch_str)?;

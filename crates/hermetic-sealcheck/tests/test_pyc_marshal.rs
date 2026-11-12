@@ -1306,3 +1306,310 @@ fn test_regression_defect5_frozenset_constants_38_and_311() {
 
     assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
 }
+
+#[test]
+fn test_regression_defect1_all_20000_functions_added_and_changed_bounded_ops() {
+    let parent = tempdir().expect("tempdir");
+    let mut base = String::new();
+    let n = 20_000;
+    for i in 0..n {
+        base.push_str(&format!("def f{i}():\n    return {i}\n"));
+    }
+    fs::write(parent.path().join("large.py"), &base).expect("base");
+
+    // 1. Change all 20,000 functions - assert deterministic budget rejection
+    let mut change_patch = String::from(
+        "diff --git a/large.py b/large.py\n--- a/large.py\n+++ b/large.py\n@@ -1,40000 +1,40000 @@\n",
+    );
+    for i in 0..n {
+        change_patch.push_str(&format!(
+            " def f{i}():\n-    return {i}\n+    return {}\n",
+            i + 1_000_000
+        ));
+    }
+
+    use hermetic_sealcheck::fingerprint::FingerprintError;
+    let constrained_change =
+        FingerprintSet::from_task_with_budget(&change_patch, "", parent.path(), Some(1_000));
+    assert!(
+        matches!(constrained_change, Err(FingerprintError::WorkBudgetExceeded)),
+        "changing 20000 functions must yield deterministic budget rejection: {constrained_change:?}"
+    );
+
+    // 2. Add all 20,000 functions - assert deterministic budget rejection
+    let mut add_patch = String::from(
+        "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,40000 @@\n",
+    );
+    for i in 0..n {
+        add_patch.push_str(&format!("+def g{i}():\n+    return {i}\n"));
+    }
+    let constrained_add =
+        FingerprintSet::from_task_with_budget(&add_patch, "", parent.path(), Some(1_000));
+    assert!(
+        matches!(constrained_add, Err(FingerprintError::WorkBudgetExceeded)),
+        "adding 20000 functions must yield deterministic budget rejection: {constrained_add:?}"
+    );
+}
+
+#[test]
+fn test_regression_defect2_inline_multiline_string_complete_span() {
+    let parent = tempdir().expect("tempdir");
+    let base = "def f(): return \"\"\"a\nb\"\"\"\n";
+    fs::write(parent.path().join("inline.py"), base).expect("base");
+
+    let patch = "diff --git a/inline.py b/inline.py\n--- a/inline.py\n+++ b/inline.py\n@@ -1,2 +1,2 @@\n-def f(): return \"\"\"a\n+def f(): return \"\"\"c\n b\"\"\"\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let f_fp = &fp.hunks[0].pyc_fingerprints[0];
+    assert_eq!(f_fp.function_name, "f");
+    assert!(
+        f_fp.added.contains("c\nb"),
+        "added symbols must contain complete constant 'c\\nb': {:?}",
+        f_fp.added
+    );
+    assert!(
+        f_fp.removed.contains("a\nb"),
+        "removed symbols must contain complete constant 'a\\nb': {:?}",
+        f_fp.removed
+    );
+    assert!(
+        !f_fp.added.contains("c"),
+        "added symbols must not fragment inline multiline string into 'c': {:?}",
+        f_fp.added
+    );
+
+    // Both Python 3.8 and Python 3.11 matchers gate on fixed and non-gate on base
+    let fixed_38 = build_pyc_38("f", &[marshal_short_ascii("c\nb")], &[], &[]);
+    let base_38 = build_pyc_38("f", &[marshal_short_ascii("a\nb")], &[], &[]);
+    assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+
+    let fixed_311 = build_pyc_311("f", "f", &[marshal_short_ascii("c\nb")], &[], &[]);
+    let base_311 = build_pyc_311("f", "f", &[marshal_short_ascii("a\nb")], &[], &[]);
+    assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
+}
+
+#[test]
+fn test_regression_defect3_unary_sign_comparison_operators_and_binary_subtraction() {
+    let parent = tempdir().expect("tempdir");
+
+    // 1. Comparison with negative constants
+    let base = "def f(x):\n    return x < -3\n";
+    fs::write(parent.path().join("cmp.py"), base).expect("base");
+
+    let patch = "diff --git a/cmp.py b/cmp.py\n--- a/cmp.py\n+++ b/cmp.py\n@@ -1,2 +1,2 @@\n def f(x):\n-    return x < -3\n+    return x < -4\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let f_fp = &fp.hunks[0].pyc_fingerprints[0];
+    assert!(
+        f_fp.added.contains("-4"),
+        "canonical signed fingerprint must contain '-4': {:?}",
+        f_fp.added
+    );
+    assert!(
+        f_fp.removed.contains("-3"),
+        "canonical signed fingerprint must contain '-3': {:?}",
+        f_fp.removed
+    );
+    assert!(
+        !f_fp.added.contains("4"),
+        "fingerprint must not drop unary sign on comparison operand: {:?}",
+        f_fp.added
+    );
+
+    // Hand-marshal negative comparison constants for both supported test layouts (3.8 and 3.11)
+    let fixed_38 = build_pyc_38("f", &[marshal_int(-4)], &[], &["x"]);
+    let base_38 = build_pyc_38("f", &[marshal_int(-3)], &[], &["x"]);
+    assert_both_pyc_matchers(&fp, &fixed_38, &base_38);
+
+    let fixed_311 = build_pyc_311("f", "f", &[marshal_int(-4)], &[], &["x"]);
+    let base_311 = build_pyc_311("f", "f", &[marshal_int(-3)], &[], &["x"]);
+    assert_both_pyc_matchers(&fp, &fixed_311, &base_311);
+
+    // 2. Binary subtraction preservation
+    let sub_base = "def g(x):\n    return x - 3\n";
+    fs::write(parent.path().join("sub.py"), sub_base).expect("sub base");
+    let sub_patch = "diff --git a/sub.py b/sub.py\n--- a/sub.py\n+++ b/sub.py\n@@ -1,2 +1,2 @@\n def g(x):\n-    return x - 3\n+    return x - 4\n";
+    let fp_sub = FingerprintSet::from_task(sub_patch, "", parent.path()).expect("fingerprints");
+    let g_fp = &fp_sub.hunks[0].pyc_fingerprints[0];
+    assert!(
+        g_fp.added.contains("4"),
+        "binary subtraction must produce positive constant 4: {:?}",
+        g_fp.added
+    );
+    assert!(
+        !g_fp.added.contains("-4"),
+        "binary subtraction must not be converted into unary negative: {:?}",
+        g_fp.added
+    );
+}
+
+#[test]
+fn test_regression_defect4_work_budget_env_var_ignored_in_default_construction() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let parent_dir = tempdir().expect("tempdir");
+    let parent = parent_dir.path();
+
+    let base_tree = parent.join("repo");
+    fs::create_dir_all(&base_tree).expect("mkdir repo");
+    fs::write(base_tree.join("main.py"), "def main():\n    return 1\n").expect("write base");
+
+    let task = parent.join("task");
+    fs::create_dir_all(task.join("staging")).expect("mkdir staging");
+    fs::create_dir_all(task.join("agent")).expect("mkdir agent");
+    let task_json = r#"{
+        "schema": "hermetic-slice-task/v1",
+        "instance_id": "test__budget_env-1",
+        "repo": "test/repo",
+        "base_commit": "1234567890abcdef1234567890abcdef12345678",
+        "cutoffs": {
+            "t_world": "2024-01-01T00:00:00Z",
+            "t_clock": "2024-01-02T00:00:00Z"
+        }
+    }"#;
+    fs::write(task.join("task.json"), task_json).expect("write task.json");
+    let gold_patch = "diff --git a/main.py b/main.py\n--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,2 @@\n def main():\n-    return 1\n+    return 2\n";
+    fs::write(task.join("staging/gold.patch"), gold_patch).expect("write gold.patch");
+    fs::write(task.join("staging/test.patch"), "").expect("write test.patch");
+    fs::write(
+        task.join("agent/problem_statement.md"),
+        "A statement of the problem.\n",
+    )
+    .expect("write problem");
+
+    fn backdate_tree(root: &std::path::Path) {
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    backdate_tree(&path);
+                }
+                if let Ok(f) = fs::File::open(&path) {
+                    let _ = f.set_modified(t);
+                }
+            }
+        }
+        if let Ok(f) = fs::File::open(root) {
+            let _ = f.set_modified(t);
+        }
+    }
+    backdate_tree(parent);
+
+    let run_scan = |env_val: Option<&str>| {
+        let mut cmd = std::process::Command::new(bin_path);
+        cmd.arg("scan")
+            .arg("--task")
+            .arg(&task)
+            .arg("--base-tree")
+            .arg(&base_tree)
+            .arg("--root")
+            .arg(&base_tree)
+            .arg("--format")
+            .arg("json");
+        match env_val {
+            Some(v) => {
+                cmd.env("HERMETIC_FINGERPRINT_WORK_BUDGET", v);
+            }
+            None => {
+                cmd.env_remove("HERMETIC_FINGERPRINT_WORK_BUDGET");
+            }
+        }
+        cmd.output().expect("execute scan")
+    };
+
+    let out_unset = run_scan(None);
+    let out_zero = run_scan(Some("0"));
+    let out_large = run_scan(Some("100000000"));
+
+    assert_eq!(out_unset.status.code(), Some(0));
+    assert_eq!(
+        out_unset.status.code(),
+        out_zero.status.code(),
+        "exit status with env unset must match env=0"
+    );
+    assert_eq!(
+        out_unset.status.code(),
+        out_large.status.code(),
+        "exit status with env unset must match env=100000000"
+    );
+    assert_eq!(
+        out_unset.stdout, out_zero.stdout,
+        "stdout with env unset must match env=0"
+    );
+    assert_eq!(
+        out_unset.stdout, out_large.stdout,
+        "stdout with env unset must match env=100000000"
+    );
+    assert_eq!(
+        out_unset.stderr, out_zero.stderr,
+        "stderr with env unset must match env=0"
+    );
+    assert_eq!(
+        out_unset.stderr, out_large.stderr,
+        "stderr with env unset must match env=100000000"
+    );
+
+    // Also test CLI query command
+    let index_file = parent.join("index.bin");
+    let idx_status = std::process::Command::new(bin_path)
+        .arg("index")
+        .arg("--root")
+        .arg(&base_tree)
+        .arg("--out")
+        .arg(&index_file)
+        .status()
+        .expect("execute index");
+    assert!(idx_status.success(), "index creation must succeed");
+
+    let run_query = |env_val: Option<&str>| {
+        let mut cmd = std::process::Command::new(bin_path);
+        cmd.arg("query")
+            .arg("--task")
+            .arg(&task)
+            .arg("--base-tree")
+            .arg(&base_tree)
+            .arg("--index")
+            .arg(&index_file)
+            .arg("--format")
+            .arg("json");
+        match env_val {
+            Some(v) => {
+                cmd.env("HERMETIC_FINGERPRINT_WORK_BUDGET", v);
+            }
+            None => {
+                cmd.env_remove("HERMETIC_FINGERPRINT_WORK_BUDGET");
+            }
+        }
+        cmd.output().expect("execute query")
+    };
+
+    let q_unset = run_query(None);
+    let q_zero = run_query(Some("0"));
+    let q_large = run_query(Some("100000000"));
+
+    assert_eq!(q_unset.status.code(), Some(0));
+    assert_eq!(
+        q_unset.status.code(),
+        q_zero.status.code(),
+        "query exit status with env unset must match env=0"
+    );
+    assert_eq!(
+        q_unset.status.code(),
+        q_large.status.code(),
+        "query exit status with env unset must match env=100000000"
+    );
+    assert_eq!(
+        q_unset.stdout, q_zero.stdout,
+        "query stdout with env unset must match env=0"
+    );
+    assert_eq!(
+        q_unset.stdout, q_large.stdout,
+        "query stdout with env unset must match env=100000000"
+    );
+    assert_eq!(
+        q_unset.stderr, q_zero.stderr,
+        "query stderr with env unset must match env=0"
+    );
+    assert_eq!(
+        q_unset.stderr, q_large.stderr,
+        "query stderr with env unset must match env=100000000"
+    );
+}
