@@ -914,3 +914,99 @@ fn test_pyc_strings_read_length_prefixed_records() {
     let strings = hermetic_sealcheck::binary::extract_pyc_strings(&body);
     assert!(strings.contains("effective_hours"), "{strings:?}");
 }
+
+/// Coverage depends only on explicit channels: real repositories with binary assets and
+/// content mentioning "skipped" are fully covered, while real gaps still report not_covered.
+#[test]
+fn test_coverage_gaps_explicit_channels_only() {
+    use hermetic_sealcheck::coverage_gaps;
+
+    let base_dir = tempdir().expect("tempdir");
+    let gold_patch = r#"diff --git a/foo.py b/foo.py
+--- a/foo.py
++++ b/foo.py
+@@ -1,1 +1,3 @@
+ def foo():
++    opaque_leaked_func_one()
++    opaque_leaked_func_two()
+"#;
+    let fp = FingerprintSet::from_task(gold_patch, "", base_dir.path()).expect("fp");
+    let opts = ScanOptions::default();
+
+    // A typical repository: a PNG-like asset, a gettext catalogue and text that says "skipped".
+    let repo = tempdir().expect("tempdir");
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend_from_slice(&[0u8, 1, 2, 3, 255, 254, 0, 0]);
+    fs::write(repo.path().join("logo.png"), &png).expect("write png");
+    fs::write(
+        repo.path().join("messages.mo"),
+        b"\xde\x12\x04\x95\0\0\0\0translated message text\0",
+    )
+    .expect("write mo");
+    fs::write(
+        repo.path().join("test_skip.py"),
+        "import pytest\n\n@pytest.mark.skip(reason=\"skipped on this platform\")\ndef test_x():\n    pass\n",
+    )
+    .expect("write py");
+    let findings = scan_tree(repo.path(), &fp, &opts);
+    assert!(
+        coverage_gaps(&findings).is_empty(),
+        "binary assets and 'skipped' text are not coverage gaps: {findings:#?}"
+    );
+
+    // The binary is covered: its printable strings are matched against the fingerprints.
+    let leaky = tempdir().expect("tempdir");
+    let mut blob = vec![0u8, 1, 2, 3];
+    blob.extend_from_slice(b"opaque_leaked_func_one\0opaque_leaked_func_two\0");
+    fs::write(leaky.path().join("data.bin"), &blob).expect("write blob");
+    let findings = scan_tree(leaky.path(), &fp, &opts);
+    assert!(
+        findings.iter().any(|f| f.detector == "D3b"
+            && f.channel == "binary_opaque"
+            && f.severity == Severity::Gate),
+        "leak inside a binary must be found: {findings:#?}"
+    );
+    assert!(coverage_gaps(&findings).is_empty());
+
+    // UTF-16 text cannot be scanned as printable runs: a real gap, fails closed.
+    let utf16 = tempdir().expect("tempdir");
+    let mut wide = vec![0xFFu8, 0xFE];
+    for unit in "opaque_leaked_func_one()\n".encode_utf16() {
+        wide.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(utf16.path().join("notes.txt"), &wide).expect("write utf16");
+    let findings = scan_tree(utf16.path(), &fp, &opts);
+    assert_eq!(coverage_gaps(&findings), vec!["D2".to_string()]);
+    let mut wide_no_bom = Vec::new();
+    for unit in "plain wide text without a byte order mark\n".encode_utf16() {
+        wide_no_bom.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert!(hermetic_sealcheck::looks_like_utf16(&wide_no_bom));
+    assert!(!hermetic_sealcheck::looks_like_utf16(&png));
+
+    // An oversized file is skipped: a real gap, reported through its own channel.
+    let big = tempdir().expect("tempdir");
+    fs::write(big.path().join("big.py"), "x = 1\n".repeat(64)).expect("write big");
+    let small_opts = ScanOptions {
+        max_file_bytes: 16,
+        ..ScanOptions::default()
+    };
+    let findings = scan_tree(big.path(), &fp, &small_opts);
+    assert!(findings
+        .iter()
+        .any(|f| f.channel == "file_oversize_skipped"));
+    assert_eq!(coverage_gaps(&findings), vec!["D2".to_string()]);
+
+    // Evidence wording alone never creates a gap.
+    let worded = vec![hermetic_sealcheck::Finding {
+        detector: "D9".into(),
+        channel: "dataset_path".into(),
+        path: "x".into(),
+        visibility: hermetic_sealcheck::Visibility::AgentVisible,
+        severity: Severity::Info,
+        confidence: 0.0,
+        hunk: None,
+        evidence: vec!["skipped incomplete bomb".into()],
+    }];
+    assert!(coverage_gaps(&worded).is_empty());
+}

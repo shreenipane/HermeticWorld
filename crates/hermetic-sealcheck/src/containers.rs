@@ -512,19 +512,53 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                 return;
             }
 
-            // Check binary (NUL byte in first 8 KiB)
-            let check_len = bytes.len().min(8192);
-            if bytes[..check_len].contains(&0) {
+            // Binary (NUL byte in first 8 KiB): matched as text and its printable strings for
+            // D3b, so the file is covered. UTF-16 text matches neither; it stays a coverage gap.
+            let head = bytes.get(..8192).unwrap_or(bytes);
+            if head.contains(&0) {
+                if crate::binary::looks_like_utf16(head) {
+                    self.push(Finding {
+                        detector: "D2".into(),
+                        channel: "binary_skipped".into(),
+                        path: path.to_string(),
+                        visibility: self.opts.visibility,
+                        severity: Severity::Info,
+                        confidence: 0.0,
+                        hunk: None,
+                        evidence: vec!["skipped binary file (UTF-16 text)".into()],
+                    });
+                    return;
+                }
                 self.push(Finding {
                     detector: "D2".into(),
-                    channel: "binary_skipped".into(),
+                    channel: "binary_strings".into(),
                     path: path.to_string(),
                     visibility: self.opts.visibility,
                     severity: Severity::Info,
                     confidence: 0.0,
                     hunk: None,
-                    evidence: vec!["skipped binary file (contains NUL byte)".into()],
+                    evidence: vec![
+                        "binary file (contains NUL byte): text and printable strings scanned"
+                            .into(),
+                    ],
                 });
+                self.sink.binary(
+                    path,
+                    "binary_opaque",
+                    crate::binary::malformed_fallback_strings(bytes),
+                );
+                // Control bytes separate lines, so text next to a NUL still matches line by line
+                let separated: Vec<u8> = bytes
+                    .iter()
+                    .map(|&b| {
+                        if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                            b'\n'
+                        } else {
+                            b
+                        }
+                    })
+                    .collect();
+                self.sink.text(path, &String::from_utf8_lossy(&separated));
                 return;
             }
 

@@ -49,7 +49,14 @@ MIN_REMAINING_CHARS: int = 20
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_STATEMENT_BYTES = 1024 * 1024
 MAX_PATCH_BYTES = 4 * 1024 * 1024
-MAX_TASKS = 128
+# Covers a full SWE-bench run (2,294 tasks; Verified has 500) with headroom, still bounded.
+MAX_TASKS = 10_000
+# Whole-run caps across all tasks; each report keeps the per-report caps above.
+MAX_TOTAL_REPORT_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_JSON_NODES = 10_000_000
+# Descriptors held per task (task directory and agent directory) plus a fixed reserve.
+FDS_PER_TASK = 2
+FD_RESERVE = 64
 MAX_FINDINGS = 4096
 MAX_SPANS = 4096
 MAX_JSON_DEPTH = 32
@@ -59,7 +66,7 @@ MAX_PROCESS_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_PROCESS_READ_BYTES = 64 * 1024
 PROCESS_TIMEOUT_SECONDS = 30.0
 MAX_SCAN_ROOTS = 32
-MAX_TOTAL_TASK_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_TASK_BYTES = 512 * 1024 * 1024
 MAX_TASK_ID_BYTES = 128
 MAX_EVIDENCE_BYTES = 1024 * 1024
 MAX_FINDING_PATH_BYTES = 4096
@@ -250,30 +257,33 @@ class SafeDirectory:
                 pass
 
 
-def bounded_structure(data: Any) -> None:
+def bounded_structure(data: Any, max_nodes: int | None = None, max_string_bytes: int | None = None) -> None:
+    max_nodes = MAX_JSON_NODES if max_nodes is None else max_nodes
+    max_string_bytes = MAX_REPORT_BYTES if max_string_bytes is None else max_string_bytes
     pending = [(data, 0)]
     count = 0
     string_bytes = 0
     while pending:
         value, depth = pending.pop()
         count += 1
-        if count > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+        if count > max_nodes or depth > MAX_JSON_DEPTH:
             raise MalformedGateOutputError("JSON structure cap exceeded")
         if isinstance(value, (dict, list, tuple)):
-            if len(value) > MAX_JSON_NODES:
+            if len(value) > max_nodes:
                 raise MalformedGateOutputError("JSON item cap exceeded")
             children = list(value.items()) if isinstance(value, dict) else value
             pending.extend((item, depth + 1) for item in children)
         elif isinstance(value, str):
             string_bytes += len(value.encode("utf-8"))
-            if string_bytes > MAX_REPORT_BYTES:
+            if string_bytes > max_string_bytes:
                 raise MalformedGateOutputError("JSON string cap exceeded")
         elif value is not None and type(value) not in (bool, int, float):
             raise MalformedGateOutputError("Invalid JSON value")
 
 
-def parse_json(content: str) -> Any:
-    if len(content.encode("utf-8")) > MAX_REPORT_BYTES:
+def parse_json(content: str, max_bytes: int | None = None, max_nodes: int | None = None) -> Any:
+    max_bytes = MAX_REPORT_BYTES if max_bytes is None else max_bytes
+    if len(content.encode("utf-8")) > max_bytes:
         raise MalformedGateOutputError("JSON byte cap exceeded")
     # Bound nesting before the recursive decoder runs; braces in strings are ignored.
     depth = 0
@@ -294,7 +304,7 @@ def parse_json(content: str) -> Any:
                 depth -= 1
     try:
         result = json.loads(content)
-        bounded_structure(result)
+        bounded_structure(result, max_nodes, max_bytes)
         return result
     except (ValueError, RecursionError, UnicodeError):
         raise MalformedGateOutputError("Invalid JSON") from None
@@ -929,6 +939,10 @@ def validate_findings(findings: Any) -> list[dict[str, Any]]:
     return [f for f in findings if f["severity"] == "gate" and f.get("visibility", "agent_visible") == "agent_visible"]
 
 
+# Finding channels that mean part of the world was not scanned (sealcheck's
+# COVERAGE_GAP_CHANNELS). Coverage depends on these explicit signals only: finding evidence
+# is repository content and is never searched for words such as "skipped", and a binary
+# file whose printable strings were scanned (channel binary_strings) is covered.
 INCOMPLETE_COVERAGE_CHANNELS = frozenset({
     "scan_error",
     "container_error",
@@ -936,6 +950,7 @@ INCOMPLETE_COVERAGE_CHANNELS = frozenset({
     "container_depth",
     "container_bomb",
     "binary_skipped",
+    "file_oversize_skipped",
     "large_archive_skipped",
     "index_skipped",
     "baseline_incomplete",
@@ -948,36 +963,13 @@ INCOMPLETE_COVERAGE_CHANNELS = frozenset({
 def has_incomplete_coverage(report: dict[str, Any]) -> list[str]:
     incomplete = list(report.get("not_covered", []))
     for f in report.get("findings", []):
-        if not isinstance(f, dict):
+        if not isinstance(f, dict) or f.get("channel") not in INCOMPLETE_COVERAGE_CHANNELS:
             continue
-        channel = f.get("channel", "")
-        evidence = f.get("evidence", [])
-        evidence_str = " ".join(evidence) if isinstance(evidence, list) else str(evidence)
-        severity = f.get("severity", "")
-        is_inc = (
-            channel in INCOMPLETE_COVERAGE_CHANNELS
-            or "skipped binary file" in evidence_str
-            or "contains NUL byte" in evidence_str
-            or "skipped file exceeding max size" in evidence_str
-            or "file over 64 MiB skipped" in evidence_str
-            or "read error" in evidence_str
-            or "walk error" in evidence_str
-            or "metadata error" in evidence_str
-            or "broken symlink" in evidence_str
-            or "skipped oversized" in evidence_str
-            or "baseline incomplete" in evidence_str
-            or "skipped task files" in evidence_str
-            or "decompression error" in evidence_str
-            or "error reading zip" in evidence_str
-            or "error reading tar" in evidence_str
-            or (severity in ("info", "review") and any(w in evidence_str.lower() for w in ("skip", "skipped", "bomb", "incomplete", "unreadable", "decompression error")))
-        )
-        if is_inc:
-            det = f.get("detector")
-            if det and det not in incomplete:
-                incomplete.append(det)
-            elif not det and "incomplete_coverage" not in incomplete:
-                incomplete.append("incomplete_coverage")
+        det = f.get("detector")
+        if det and det not in incomplete:
+            incomplete.append(det)
+        elif not det and "incomplete_coverage" not in incomplete:
+            incomplete.append("incomplete_coverage")
     return incomplete
 
 
@@ -1194,11 +1186,8 @@ def decide_task_disposition(
     if manifest is None:
         raise DispositionsError("Complete manifest required for repair")
     spans_payload = [span.to_dict() for span in redacted_spans]
-    append_manifest_disposition(manifest, {
-        "kind": "repaired", "detector": "D0",
-        "detail": json.dumps({"problem_statement_redacted": spans_payload,
-                              "statement_sha256": hashlib.sha256(redacted_text.encode("utf-8")).hexdigest()}, sort_keys=True),
-    })
+    append_manifest_disposition(manifest, repair_manifest_entry(
+        spans_payload, hashlib.sha256(redacted_text.encode("utf-8")).hexdigest()))
     new_version = compute_real_world_version(manifest, manifest_bin=manifest_bin)
 
     return TaskDispositionResult(
@@ -1214,7 +1203,7 @@ def decide_task_disposition(
 
 def validate_gate_input_strictly(data: Any) -> list[dict[str, Any]]:
     """Validate every report and inline input before accessing task files."""
-    bounded_structure(data)
+    bounded_structure(data, MAX_TOTAL_JSON_NODES, MAX_TOTAL_REPORT_BYTES)
     if isinstance(data, dict):
         if "tasks" in data:
             data = data["tasks"]
@@ -1270,7 +1259,7 @@ def load_gate_output(gate_source: str | Path) -> list[dict[str, Any]]:
             except OSError:
                 raise DispositionsError("Gate input file unavailable") from None
             if stat.S_ISREG(info.st_mode):
-                return validate_gate_input_strictly(parse_json(parent.read(path.name, MAX_REPORT_BYTES)))
+                return validate_gate_input_strictly(parse_json(parent.read(path.name, MAX_REPORT_BYTES), MAX_REPORT_BYTES, MAX_TOTAL_JSON_NODES))
             if not stat.S_ISDIR(info.st_mode):
                 raise DispositionsError("Symlink rejected or unsupported gate path")
             with parent.child(path.name) as directory:
@@ -1280,9 +1269,9 @@ def load_gate_output(gate_source: str | Path) -> list[dict[str, Any]]:
                     if name.endswith(".json"):
                         text = directory.read(name, MAX_REPORT_BYTES)
                         total += len(text.encode("utf-8"))
-                        if total > MAX_REPORT_BYTES:
+                        if total > MAX_TOTAL_REPORT_BYTES:
                             raise DispositionsError("Report directory byte cap exceeded")
-                        reports.extend(validate_gate_input_strictly(parse_json(text)))
+                        reports.extend(validate_gate_input_strictly(parse_json(text, MAX_REPORT_BYTES, MAX_TOTAL_JSON_NODES)))
                         if len(reports) > MAX_TASKS:
                             raise DispositionsError("Task count cap exceeded")
                 return validate_gate_input_strictly(reports)
@@ -1325,7 +1314,40 @@ def staged_rescan(tid: str, statement: str, task: dict[str, Any], gold: str, tes
         return run_real_sealcheck(staging, binary, scan_config=config)
 
 
-def verify_repair_metadata(metadata: Any, statement: str, manifest: Any) -> list[RedactedSpan]:
+def repair_manifest_entry(spans_payload: list[dict[str, Any]], statement_sha256: str) -> dict[str, Any]:
+    """The manifest disposition entry recording a D0 repair."""
+    detail = {"problem_statement_redacted": spans_payload, "statement_sha256": statement_sha256}
+    return {"kind": "repaired", "detector": "D0", "detail": json.dumps(detail, sort_keys=True)}
+
+
+def recover_partial_repair(metadata: Any, statement: str) -> tuple[str, bool]:
+    """Return the repaired statement the sidecar describes and whether it is still unpublished.
+
+    Publication writes the sidecar and the manifest before the statement, so an interrupted
+    run can leave the original statement on disk next to a complete sidecar. The sidecar is
+    accepted for it only when redacting that statement with the recorded spans reproduces
+    every recorded span hash and the recorded statement digest exactly.
+    """
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("spans"), list) or not 1 <= len(metadata["spans"]) <= MAX_SPANS:
+        raise DispositionsError("Invalid persisted repair metadata")
+    digest = metadata.get("statement_sha256")
+    if hashlib.sha256(statement.encode("utf-8")).hexdigest() == digest:
+        return statement, False
+    pairs = []
+    for item in metadata["spans"]:
+        if not isinstance(item, dict) or type(item.get("start")) is not int or type(item.get("end")) is not int:
+            raise DispositionsError("Invalid persisted repair span")
+        pairs.append((item["start"], item["end"]))
+    try:
+        redacted, records = redact_problem_statement(statement, pairs)
+    except DispositionsError:
+        raise DispositionsError("Persisted repair content mismatch") from None
+    if hashlib.sha256(redacted.encode("utf-8")).hexdigest() != digest or [r.to_dict() for r in records] != metadata["spans"]:
+        raise DispositionsError("Persisted repair content mismatch")
+    return redacted, True
+
+
+def verify_repair_metadata(metadata: Any, statement: str, manifest: Any, *, require_manifest_entry: bool = True) -> list[RedactedSpan]:
     if not isinstance(metadata, dict) or not isinstance(metadata.get("spans"), list) or not 1 <= len(metadata["spans"]) <= MAX_SPANS:
         raise DispositionsError("Invalid persisted repair metadata")
     digest = hashlib.sha256(statement.encode("utf-8")).hexdigest()
@@ -1349,10 +1371,13 @@ def verify_repair_metadata(metadata: Any, statement: str, manifest: Any) -> list
         spans.append(RedactedSpan(**item))
     if not last_end <= len(statement_bytes) - shift <= MAX_STATEMENT_BYTES:
         raise DispositionsError("Persisted repair length mismatch")
-    detail = {"problem_statement_redacted": metadata["spans"], "statement_sha256": digest}
-    expected = {"kind": "repaired", "detector": "D0", "detail": json.dumps(detail, sort_keys=True)}
-    if expected not in manifest.get("dispositions", []):
-        raise DispositionsError("Persisted repair manifest mismatch")
+    expected = repair_manifest_entry(metadata["spans"], digest)
+    dispositions = manifest.get("dispositions", [])
+    if expected not in dispositions:
+        if require_manifest_entry or any(isinstance(e, dict) and e.get("kind") == "repaired" for e in dispositions):
+            raise DispositionsError("Persisted repair manifest mismatch")
+        # Publication stopped before the manifest was replaced: finish recording the repair.
+        append_manifest_disposition(manifest, expected)
     return spans
 
 
@@ -1410,6 +1435,23 @@ def is_exclusion_only(report: dict[str, Any], stmt: str | None = None, is_persis
     return False
 
 
+def ensure_descriptor_budget(task_count: int) -> None:
+    """Fail closed before any work when the descriptor limit cannot hold every task's directories."""
+    needed = task_count * FDS_PER_TASK + FD_RESERVE
+    try:
+        import resource
+    except ImportError:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and soft < needed:
+            if hard != resource.RLIM_INFINITY and hard < needed:
+                raise DispositionsError("Open file limit too low for task count")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    except (OSError, ValueError):
+        raise DispositionsError("Open file limit too low for task count") from None
+
+
 def process_dispositions(
     gate_source: str | Path | list[dict[str, Any]] | dict[str, Any],
     out_path: str | Path | None = None,
@@ -1420,6 +1462,8 @@ def process_dispositions(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     reports = load_gate_output(gate_source) if isinstance(gate_source, (str, Path)) else validate_gate_input_strictly(gate_source)
     reports = copy.deepcopy(reports)
+    if tasks_dir:
+        ensure_descriptor_budget(len(reports))
     with ExitStack() as stack:
         tasks = stack.enter_context(SafeDirectory(Path(tasks_dir))) if tasks_dir else None
         if tasks:
@@ -1472,6 +1516,7 @@ def process_dispositions(
             task = report.get("task_json")
             gold, test = report.get("gold_patch"), report.get("test_patch")
             metadata = None
+            unpublished_repair = False
             needs_rescan = rescan_fn is None and not is_exclusion_only(report, stmt, is_persisted_repair=(metadata is not None)) and (report["gate"] or metadata is not None)
             if task_dir:
                 for name in ("manifest.json", "problem_statement_redacted.json"):
@@ -1479,6 +1524,9 @@ def process_dispositions(
                 raw_metadata = task_dir.read("problem_statement_redacted.json", MAX_REPORT_BYTES, optional=True)
                 metadata = parse_json(raw_metadata) if raw_metadata is not None else None
                 disk_statement = agent.read("problem_statement.md", MAX_STATEMENT_BYTES)
+                unpublished_repair = False
+                if metadata is not None:
+                    disk_statement, unpublished_repair = recover_partial_repair(metadata, disk_statement)
                 if stmt is not None and metadata is None and stmt != disk_statement:
                     raise DispositionsError("Conflicting inline problem_statement and on-disk statement")
                 stmt = disk_statement if stmt is None else stmt
@@ -1519,7 +1567,8 @@ def process_dispositions(
                 config = validate_scan_config(report.get("scan_config"))
                 validate_task_inputs(tid, task, gold, test)
             if metadata is not None:
-                spans = verify_repair_metadata(metadata, disk_statement, manifest)
+                spans = verify_repair_metadata(metadata, disk_statement, manifest,
+                                               require_manifest_entry=not unpublished_repair)
                 source_spans = [(span.start, span.end) for span in spans]
                 if stmt != disk_statement:
                     recovered, records = redact_problem_statement(stmt, source_spans)
@@ -1595,46 +1644,58 @@ def process_dispositions(
         summary = {"total_tasks": len(results), "dispositions": counts,
                    "detectors": {detector: sum(detector in result.detectors for result in results) for detector in detectors}}
         # All validation and staged scans completed before the first atomic replacement.
+        def verify_published_identity(task_dir: SafeDirectory | None, tid: str, task_dir_stat: os.stat_result | None) -> None:
+            if not (task_dir and tasks):
+                return
+            try:
+                current_pub_stat = os.stat(tid, dir_fd=tasks.fd, follow_symlinks=False)
+            except OSError:
+                raise DispositionsError("Published task directory missing or unavailable") from None
+            if not stat.S_ISDIR(current_pub_stat.st_mode) or (current_pub_stat.st_dev, current_pub_stat.st_ino) != (task_dir_stat.st_dev, task_dir_stat.st_ino):
+                raise DispositionsError("Task directory modified or replaced between validation and publication")
+
         for task_dir, agent, result, manifest, task_dir_stat in updates:
-            if task_dir:
-                tid = result.task_id
-                if tasks:
-                    try:
-                        current_pub_stat = os.stat(tid, dir_fd=tasks.fd, follow_symlinks=False)
-                    except OSError:
-                        raise DispositionsError("Published task directory missing or unavailable")
-                    if not stat.S_ISDIR(current_pub_stat.st_mode) or (current_pub_stat.st_dev, current_pub_stat.st_ino) != (task_dir_stat.st_dev, task_dir_stat.st_ino):
-                        raise DispositionsError("Task directory modified or replaced between validation and publication")
-                if result.disposition == "repaired":
-                    agent.write("problem_statement.md", result.redacted_statement)
-                    task_dir.write("problem_statement_redacted.json", json.dumps({
-                        "spans": [span.to_dict() for span in result.redacted_spans],
-                        "statement_sha256": hashlib.sha256(result.redacted_statement.encode("utf-8")).hexdigest(),
-                    }, sort_keys=True, indent=2) + "\n")
-                    agent_stat = os.fstat(agent.fd)
-                    try:
-                        pub_stat = os.stat("agent", dir_fd=task_dir.fd, follow_symlinks=False)
-                    except OSError:
-                        pub_stat = None
-                    if pub_stat is None or not stat.S_ISDIR(pub_stat.st_mode) or (pub_stat.st_dev, pub_stat.st_ino) != (agent_stat.st_dev, agent_stat.st_ino):
-                        if pub_stat is not None and stat.S_ISLNK(pub_stat.st_mode):
-                            os.unlink("agent", dir_fd=task_dir.fd)
-                            os.mkdir("agent", mode=0o755, dir_fd=task_dir.fd)
-                        with task_dir.child("agent") as pub_agent:
-                            pub_agent.write("problem_statement.md", result.redacted_statement)
-                    verify_dir = tasks.child(tid) if tasks else task_dir
-                    try:
-                        with verify_dir.child("agent") as verify_agent:
-                            published_text = verify_agent.read("problem_statement.md", MAX_STATEMENT_BYTES)
-                            if published_text != result.redacted_statement:
-                                raise DispositionsError("Published task path repair verification failed")
-                    finally:
-                        if verify_dir is not task_dir:
-                            verify_dir.close()
-                if manifest is not None:
-                    task_dir.write("manifest.json", json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+            verify_published_identity(task_dir, result.task_id, task_dir_stat)
+        # Publication order makes every interruption recoverable by an identical rerun:
+        # dispositions.json first, then per task the sidecar and manifest, and the statement
+        # last. A rerun recognises a sidecar whose statement is not yet replaced
+        # (recover_partial_repair) and finishes it; every write is an idempotent replacement.
         if output:
-            output.write(Path(out_path).name, json.dumps(entries, indent=2) + "\n")
+            output.write(Path(out_path).name, json.dumps(entries, indent=2, sort_keys=True) + "\n")
+        for task_dir, agent, result, manifest, task_dir_stat in updates:
+            if not task_dir:
+                continue
+            tid = result.task_id
+            verify_published_identity(task_dir, tid, task_dir_stat)
+            if result.disposition == "repaired":
+                task_dir.write("problem_statement_redacted.json", json.dumps({
+                    "spans": [span.to_dict() for span in result.redacted_spans],
+                    "statement_sha256": hashlib.sha256(result.redacted_statement.encode("utf-8")).hexdigest(),
+                }, sort_keys=True, indent=2) + "\n")
+            if manifest is not None:
+                task_dir.write("manifest.json", json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+            if result.disposition == "repaired":
+                agent.write("problem_statement.md", result.redacted_statement)
+                agent_stat = os.fstat(agent.fd)
+                try:
+                    pub_stat = os.stat("agent", dir_fd=task_dir.fd, follow_symlinks=False)
+                except OSError:
+                    pub_stat = None
+                if pub_stat is None or not stat.S_ISDIR(pub_stat.st_mode) or (pub_stat.st_dev, pub_stat.st_ino) != (agent_stat.st_dev, agent_stat.st_ino):
+                    if pub_stat is not None and stat.S_ISLNK(pub_stat.st_mode):
+                        os.unlink("agent", dir_fd=task_dir.fd)
+                        os.mkdir("agent", mode=0o755, dir_fd=task_dir.fd)
+                    with task_dir.child("agent") as pub_agent:
+                        pub_agent.write("problem_statement.md", result.redacted_statement)
+                verify_dir = tasks.child(tid) if tasks else task_dir
+                try:
+                    with verify_dir.child("agent") as verify_agent:
+                        published_text = verify_agent.read("problem_statement.md", MAX_STATEMENT_BYTES)
+                        if published_text != result.redacted_statement:
+                            raise DispositionsError("Published task path repair verification failed")
+                finally:
+                    if verify_dir is not task_dir:
+                        verify_dir.close()
         return entries, summary
 
 

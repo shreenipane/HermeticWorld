@@ -612,24 +612,40 @@ def test_regression_defect9_secret_bearing_missing_paths_never_leak(tmp_path, ca
 
 
 def test_regression_defect1_nul_byte_leak_refuses_clean_and_repair(task_world, tmp_path):
-    """Defect 1: unrecognized NUL-containing files must be rejected for both clean and repair paths."""
+    """Defect 1: a leak inside an unrecognized NUL-containing file can never yield clean or repaired.
+
+    NUL-containing files are scanned (as text and for printable strings), so the leak is a
+    gate finding rather than a coverage gap; the task is excluded and left untouched.
+    """
     tasks, task, root, initial, binary = task_world
     nul_file = root / "nul_leak.txt"
     nul_file.write_bytes(b"\x00" + LEAK.encode("utf-8"))
-    os.utime(nul_file, (STAMP, STAMP))
+    backdate(root)
 
-    # Clean path: clean statement, real sealcheck / dispositions must reject incomplete scan
+    # Clean path: a clean statement still gates on the leak inside the binary file
     clean_statement = "Clean problem statement without leak.\n"
     (task / "agent/problem_statement.md").write_text(clean_statement, encoding="utf-8")
     os.utime(task / "agent/problem_statement.md", (STAMP, STAMP))
-    with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
-        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    scanned = d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    assert scanned["gate"]
+    assert any(f["severity"] == "gate" and f["path"].endswith("nul_leak.txt") for f in scanned["findings"]), [(f["detector"], f["channel"], f["path"], f["severity"]) for f in scanned["findings"]]
 
-    # Repair path: D0 leak in statement, repair re-scan with NUL file must reject / refuse repair
+    # Repair path: the re-scan stays dirty, so the task is excluded and never repaired
     (task / "agent/problem_statement.md").write_text(STATEMENT, encoding="utf-8")
     os.utime(task / "agent/problem_statement.md", (STAMP, STAMP))
+    entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert entries[0]["disposition"] == "excluded"
+    assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
+    assert not (task / "problem_statement_redacted.json").exists()
+
+    # UTF-16 text cannot be matched: a real coverage gap still fails closed
+    nul_file.unlink()
+    wide = root / "wide_leak.txt"
+    wide.write_bytes(b"\xff\xfe" + LEAK.encode("utf-16-le"))
+    backdate(root)
     with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
         d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
 
 
 def test_regression_defect2_replace_ancestor_at_subprocess_launch_no_outside_reads(task_world, monkeypatch, tmp_path):
@@ -1226,3 +1242,169 @@ def test_regression_symlink_destination_utime_failure_fails_closed(task_world, m
     assert (task / "agent/problem_statement.md").read_bytes() == statement_before
     assert (task / "manifest.json").read_bytes() == manifest_before
 
+
+
+# Final review, BLOCKING finding 1: publication order and recovery after an interruption.
+def published_under(directory, root):
+    """Whether a SafeDirectory is inside root (staged scan copies live elsewhere)."""
+    return os.readlink(f"/proc/self/fd/{directory.fd}").startswith(str(root))
+
+
+PUBLICATION_STEPS = ["dispositions.json", "problem_statement_redacted.json", "manifest.json", "problem_statement.md"]
+
+
+@pytest.mark.parametrize("failing_step", PUBLICATION_STEPS)
+def test_final_review_publication_interrupted_at_each_write_recovers_on_rerun(task_world, tmp_path, monkeypatch, failing_step):
+    """dispositions.json is written first; an interruption at any later write is finished by a rerun."""
+    tasks, task, _, initial, binary = task_world
+    out = tmp_path / "dispositions.json"
+    written: list[str] = []
+    real_write = d.SafeDirectory.write
+
+    def failing_write(self, name, content):
+        if not published_under(self, tmp_path):
+            return real_write(self, name, content)
+        if name == failing_step:
+            raise OSError("injected write failure")
+        real_write(self, name, content)
+        written.append(name)
+
+    monkeypatch.setattr(d.SafeDirectory, "write", failing_write)
+    with pytest.raises(OSError, match="injected"):
+        d.process_dispositions([copy.deepcopy(initial)], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    monkeypatch.setattr(d.SafeDirectory, "write", real_write)
+    # Order: dispositions.json, then the sidecar and manifest, then the statement.
+    assert written == PUBLICATION_STEPS[:PUBLICATION_STEPS.index(failing_step)]
+    assert out.exists() == (failing_step != "dispositions.json")
+    first_output = out.read_text(encoding="utf-8") if out.exists() else None
+
+    entries, _ = d.process_dispositions([copy.deepcopy(initial)], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    assert entries[0]["disposition"] == "repaired"
+    statement = (task / "agent/problem_statement.md").read_text(encoding="utf-8")
+    assert LEAK not in statement and statement == entries[0]["redacted_statement"]
+    sidecar = json.loads((task / "problem_statement_redacted.json").read_text(encoding="utf-8"))
+    assert sidecar == entries[0]["problem_statement_redacted"]
+    manifest = json.loads((task / "manifest.json").read_text(encoding="utf-8"))
+    assert [e["kind"] for e in manifest["dispositions"]] == ["repaired"]
+    assert d.compute_real_world_version(manifest) == entries[0]["world_version"]
+    final_output = out.read_text(encoding="utf-8")
+    assert json.loads(final_output) == entries
+    if first_output is not None:
+        assert first_output == final_output
+
+    # A further rerun is idempotent: identical output and identical files.
+    files = {p: (task / p).read_bytes() for p in ("agent/problem_statement.md", "problem_statement_redacted.json", "manifest.json")}
+    again, _ = d.process_dispositions([copy.deepcopy(initial)], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    assert again == entries
+    assert out.read_text(encoding="utf-8") == final_output
+    assert {p: (task / p).read_bytes() for p in files} == files
+
+
+def test_final_review_partial_sidecar_with_tampered_statement_rejected(task_world, tmp_path, monkeypatch):
+    """A sidecar is accepted for an unreplaced statement only when it reproduces it exactly."""
+    tasks, task, _, initial, binary = task_world
+    real_write = d.SafeDirectory.write
+
+    def failing_write(self, name, content):
+        if name == "manifest.json" and published_under(self, tmp_path):
+            raise OSError("injected write failure")
+        real_write(self, name, content)
+
+    monkeypatch.setattr(d.SafeDirectory, "write", failing_write)
+    with pytest.raises(OSError):
+        d.process_dispositions([copy.deepcopy(initial)], tasks_dir=tasks, sealcheck_bin=binary)
+    monkeypatch.setattr(d.SafeDirectory, "write", real_write)
+    (task / "agent/problem_statement.md").write_text(STATEMENT.replace("concurrent", "parallel"), encoding="utf-8")
+    with pytest.raises(d.DispositionsError, match="Persisted repair"):
+        d.process_dispositions([copy.deepcopy(initial)], tasks_dir=tasks, sealcheck_bin=binary)
+
+
+def test_final_review_second_task_failure_leaves_first_recoverable(task_world, tmp_path, monkeypatch):
+    """With two tasks, an interruption while publishing the second task is finished by a rerun."""
+    tasks, task, _, initial, binary = task_world
+    other = tasks / "task_two"
+    shutil.copytree(task, other)
+    manifest_two = complete_manifest("task_two")
+    (other / "manifest.json").write_text(json.dumps(manifest_two), encoding="utf-8")
+    (other / "task.json").write_text(json.dumps(complete_task("task_two")), encoding="utf-8")
+    backdate(other)
+    second = copy.deepcopy(initial)
+    second["task_id"] = "task_two"
+    second.pop("instance_id", None)
+    out = tmp_path / "dispositions.json"
+    real_write = d.SafeDirectory.write
+    seen = {"manifest.json": 0}
+
+    def failing_write(self, name, content):
+        if name == "manifest.json" and published_under(self, tmp_path):
+            seen[name] += 1
+            if seen[name] == 2:
+                raise OSError("injected write failure")
+        real_write(self, name, content)
+
+    monkeypatch.setattr(d.SafeDirectory, "write", failing_write)
+    with pytest.raises(OSError):
+        d.process_dispositions([copy.deepcopy(initial), copy.deepcopy(second)], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    monkeypatch.setattr(d.SafeDirectory, "write", real_write)
+    assert out.exists()
+    entries, _ = d.process_dispositions([copy.deepcopy(initial), copy.deepcopy(second)], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    assert [e["disposition"] for e in entries] == ["repaired", "repaired"]
+    for directory in (task, other):
+        assert LEAK not in (directory / "agent/problem_statement.md").read_text(encoding="utf-8")
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        assert [e["kind"] for e in manifest["dispositions"]] == ["repaired"]
+
+
+# Final review, promoted finding 10: a full SWE-bench Verified run (500 tasks) is accepted.
+def test_final_review_task_cap_covers_swe_bench_verified(tmp_path):
+    import resource
+
+    count = 600
+    assert d.MAX_TASKS >= 10 * 500
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    tasks = tmp_path / "tasks"
+    for index in range(count):
+        tid = f"org__repo-{index:05d}"
+        (gate_dir / f"{tid}.json").write_text(json.dumps(report(tid)), encoding="utf-8")
+        agent = tasks / tid / "agent"
+        agent.mkdir(parents=True)
+        (agent / "problem_statement.md").write_text("Statement.\n", encoding="utf-8")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    low = 256 if hard == resource.RLIM_INFINITY else min(256, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (low, hard))
+    try:
+        entries, summary = d.process_dispositions(gate_dir, out_path=tmp_path / "out.json", tasks_dir=tasks)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert summary["total_tasks"] == count
+    assert {e["disposition"] for e in entries} == {"clean"}
+    with pytest.raises(d.DispositionsError):
+        d.process_dispositions([report(f"t{i}") for i in range(d.MAX_TASKS + 1)])
+
+
+# Final review, promoted finding 7: coverage depends on explicit channels only.
+def test_final_review_real_repository_binaries_and_skipped_text_are_covered(task_world):
+    tasks, task, root, initial, binary = task_world
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x01\x02\x03")
+    (root / "messages.mo").write_bytes(b"\xde\x12\x04\x95\x00\x00\x00\x00translated text\x00")
+    (root / "test_skip.py").write_text(
+        "import pytest\n\n@pytest.mark.skip(reason='skipped: incomplete bomb fixture')\ndef test_x():\n    pass\n",
+        encoding="utf-8")
+    backdate(root)
+    entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert entries[0]["disposition"] == "repaired"
+    assert LEAK not in (task / "agent/problem_statement.md").read_text(encoding="utf-8")
+
+
+def test_final_review_coverage_signal_is_channel_not_evidence_wording():
+    def info(channel, evidence):
+        return {"detector": "D2", "channel": channel, "path": "x", "visibility": "agent_visible",
+                "severity": "info", "confidence": 0.0, "evidence": [evidence]}
+
+    for channel, evidence in (("file", "skipped incomplete bomb unreadable"), ("binary_strings", "binary file"),
+                              ("dataset_path", "decompression error skipped")):
+        d.validate_report(report(findings=[info(channel, evidence)], gate=False))
+    for channel in ("scan_error", "binary_skipped", "file_oversize_skipped", "container_error", "baseline_incomplete"):
+        with pytest.raises(d.MalformedGateOutputError, match="not_covered"):
+            d.validate_report(report(findings=[info(channel, "")], gate=False))
