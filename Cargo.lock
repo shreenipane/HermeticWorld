@@ -524,6 +524,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-execd"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hermetic-gateway"
 version = "0.1.0"
 dependencies = [
