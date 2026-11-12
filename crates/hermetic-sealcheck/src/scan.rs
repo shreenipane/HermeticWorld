@@ -49,6 +49,8 @@ pub struct ScanOptions {
     pub hunk_threshold: f64,
     pub winnow_threshold: f64,
     pub binary_threshold: f64,
+    /// Tier 2 symbol weight fraction threshold (TR-SC-3, TRD.md §4.2; default 0.35, to be calibrated in E3)
+    pub tier2_threshold: f64,
     pub visibility: Visibility,
     pub max_depth: usize,
     pub max_member_bytes: u64,
@@ -62,6 +64,7 @@ pub struct ScanOptions {
     pub max_delta_depth: usize,
     pub target_packages: Vec<String>,
     pub task_version: Option<String>,
+    pub undated: bool,
 }
 
 impl Default for ScanOptions {
@@ -71,6 +74,7 @@ impl Default for ScanOptions {
             hunk_threshold: 0.60,
             winnow_threshold: 0.60,
             binary_threshold: 0.60,
+            tier2_threshold: 0.35,
             visibility: Visibility::AgentVisible,
             max_depth: 4,
             max_member_bytes: 256 * 1024 * 1024, // 256 MiB
@@ -83,6 +87,7 @@ impl Default for ScanOptions {
             max_delta_depth: 4096,
             target_packages: Vec::new(),
             task_version: None,
+            undated: false,
         }
     }
 }
@@ -470,6 +475,39 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
         }
     }
 
+    // Tier 2 problem statement matching (D0 review flag, TR-SC-3)
+    let gate_hunks: HashSet<usize> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .filter_map(|f| f.hunk)
+        .collect();
+
+    let has_tier2_candidates = fp.hunks.iter().any(|h| {
+        !gate_hunks.contains(&h.hunk_index)
+            && h.tier2_total_weight > 0.0
+            && h.tier2_symbols.len() >= 2
+            && !h.tier2_anchors.is_empty()
+    });
+
+    if has_tier2_candidates {
+        let (unit_symbols, unit_anchor_tokens) =
+            crate::tier2::extract_unit_symbols_and_anchors(text);
+        for hunk in &fp.hunks {
+            if gate_hunks.contains(&hunk.hunk_index) {
+                continue;
+            }
+            if let Some(t2_finding) = hunk.match_tier2_with_context(
+                &unit_symbols,
+                &unit_anchor_tokens,
+                opts,
+                "D0",
+                problem_path,
+            ) {
+                findings.push(t2_finding);
+            }
+        }
+    }
+
     findings
 }
 
@@ -484,11 +522,16 @@ pub trait TreeSink: UnitSink {
     fn pyc_file(&mut self, path: &Path, display_path: &str);
     /// A loose file the walk is about to read, with its metadata.
     fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata);
+    /// A directory reached by the walk, with its metadata.
+    fn directory(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
+    /// A symlink reached by the walk, with its metadata (via symlink_metadata).
+    fn symlink(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
 }
 
 /// The sink `scan_tree` uses: `MatchSink` plus the D1 and D3 checks.
 struct TreeMatchSink<'a> {
     inner: MatchSink<'a>,
+    d4_paths: HashSet<String>,
 }
 
 impl UnitSink for TreeMatchSink<'_> {
@@ -507,17 +550,29 @@ impl UnitSink for TreeMatchSink<'_> {
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]) {
         self.inner.pkg_metadata(path, bytes);
     }
+    fn member_time(&mut self, path: &str, unix_secs: i64) {
+        self.inner.member_time(path, unix_secs);
+    }
 }
 
 impl TreeSink for TreeMatchSink<'_> {
     fn git_repo(&mut self, dir: &Path) {
+        if self.inner.opts.undated {
+            return;
+        }
         let found = crate::d1::scan_git_repo(dir, self.inner.fp, self.inner.opts);
         self.inner.findings.extend(found);
     }
     fn d1_finding(&mut self, finding: Finding) {
+        if self.inner.opts.undated {
+            return;
+        }
         self.inner.findings.push(finding);
     }
     fn pyc_file(&mut self, path: &Path, display_path: &str) {
+        if self.inner.opts.undated {
+            return;
+        }
         match check_pyc_bytecode(path, self.inner.opts.visibility) {
             Ok(d3_findings) => self.inner.findings.extend(d3_findings),
             Err(e) => self.inner.findings.push(Finding {
@@ -532,13 +587,111 @@ impl TreeSink for TreeMatchSink<'_> {
             }),
         }
     }
-    fn loose_file(&mut self, _display_path: &str, _metadata: &std::fs::Metadata) {}
+    fn loose_file(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+    fn directory(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+    fn symlink(&mut self, display_path: &str, metadata: &std::fs::Metadata) {
+        check_live_mtime(
+            display_path,
+            metadata,
+            self.inner.opts.t_clock,
+            self.inner.opts.visibility,
+            &mut self.d4_paths,
+            &mut self.inner.findings,
+        );
+    }
+}
+
+pub fn format_rfc3339(dt: time::OffsetDateTime) -> String {
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| dt.to_string())
+}
+
+pub fn format_mtime(secs: i64, nanos: u32) -> String {
+    let total_nanos = (secs as i128) * 1_000_000_000 + (nanos as i128);
+    match time::OffsetDateTime::from_unix_timestamp_nanos(total_nanos) {
+        Ok(dt) => format_rfc3339(dt),
+        Err(_) => format!("{secs}s"),
+    }
+}
+
+/// Check loose file, directory, or symlink mtime against `T_clock` (D4).
+///
+/// Note: On a live tree, we do NOT check ctime or atime because the host sets
+/// them on extraction or archive unpacking, so they always appear new.
+fn check_live_mtime(
+    display_path: &str,
+    metadata: &std::fs::Metadata,
+    t_clock: Option<time::OffsetDateTime>,
+    visibility: Visibility,
+    d4_paths: &mut HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(tc) = t_clock else { return };
+    if d4_paths.contains(display_path) {
+        return;
+    }
+    let mtime = match metadata.modified() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let (mtime_secs, mtime_nanos) = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            if d.subsec_nanos() == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
+    };
+    let t_secs = tc.unix_timestamp();
+    let t_nanos = tc.nanosecond();
+    let is_later = (mtime_secs > t_secs) || (mtime_secs == t_secs && mtime_nanos > t_nanos);
+    if is_later {
+        let mtime_str = format_mtime(mtime_secs, mtime_nanos);
+        let t_clock_str = format_rfc3339(tc);
+        findings.push(Finding {
+            detector: "D4".into(),
+            channel: "mtime".into(),
+            path: display_path.to_string(),
+            visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec![format!("mtime {mtime_str} > T_clock {t_clock_str}")],
+        });
+        d4_paths.insert(display_path.to_string());
+    }
 }
 
 /// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
     let sink = TreeMatchSink {
         inner: MatchSink::new(fp, &opts.signatures, opts),
+        d4_paths: HashSet::new(),
     };
     walk_tree(root, opts, sink).inner.findings
 }
@@ -604,17 +757,22 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         let file_path = entry.path();
         let display_path = file_path.display().to_string();
 
-        if entry.path_is_symlink() && entry.file_name() == ".git" {
-            sink.d1_finding(Finding {
-                detector: "D1".into(),
-                channel: "git_pointer".into(),
-                path: display_path.clone(),
-                visibility: opts.visibility,
-                severity: Severity::Gate,
-                confidence: 1.0,
-                hunk: None,
-                evidence: vec!["symlink named .git".into()],
-            });
+        if entry.path_is_symlink() {
+            if let Ok(sym_meta) = std::fs::symlink_metadata(file_path) {
+                sink.symlink(&display_path, &sym_meta);
+            }
+            if entry.file_name() == ".git" {
+                sink.d1_finding(Finding {
+                    detector: "D1".into(),
+                    channel: "git_pointer".into(),
+                    path: display_path.clone(),
+                    visibility: opts.visibility,
+                    severity: Severity::Gate,
+                    confidence: 1.0,
+                    hunk: None,
+                    evidence: vec!["symlink named .git".into()],
+                });
+            }
         }
 
         let metadata = if entry.path_is_symlink() {
@@ -653,6 +811,9 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
                 }
             }
         } else if entry.file_type().is_dir() {
+            if let Ok(dir_meta) = entry.metadata() {
+                sink.directory(&display_path, &dir_meta);
+            }
             if file_path != root && is_git_dir(file_path) {
                 sink.git_repo(file_path);
             }
@@ -660,6 +821,8 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         } else {
             continue;
         };
+
+        sink.loose_file(&display_path, &metadata);
 
         // Size check for loose file
         if metadata.len() > opts.max_file_bytes {
@@ -722,7 +885,6 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
             }
         };
 
-        sink.loose_file(&display_path, &metadata);
         let mut scanner = ContainerScanner::new(opts, sink, root_prefix_len);
         scanner.scan(&display_path, &bytes, 0);
         sink = scanner.sink;
