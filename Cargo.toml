@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/hermetic-common",
+    "crates/hermetic-gateway",
     "crates/hermetic-sealcheck",
+    "crates/vendor/tiny_http",
     "crates/hermetic-trust",
     "crates/hermetic-world-server",
 ]
