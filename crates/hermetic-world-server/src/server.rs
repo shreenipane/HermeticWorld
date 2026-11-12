@@ -379,7 +379,8 @@ pub struct WorldServer {
     elapsed_offset_ms: u64,
     socket_directory: Directory,
     socket_name: PathBuf,
-    owned_endpoint: Option<(u64, u64)>,
+    owned_endpoint: Option<EntryId>,
+    owned_lock: Option<EntryId>,
 }
 
 enum ReadFrameResult {
@@ -537,23 +538,47 @@ impl<'a> Write for DeadlineWriter<'a> {
     }
 }
 
+/// Identity (device, inode) of a filesystem entry.
+type EntryId = (u64, u64);
+
+/// Identity of `entry` if it is a Unix socket (never following symlinks).
+fn socket_identity(entry: &Path) -> Option<(EntryId, u32)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::symlink_metadata(entry).ok()?;
+    if meta.file_type().is_socket() {
+        Some(((meta.dev(), meta.ino()), meta.uid()))
+    } else {
+        None
+    }
+}
+
+/// Unlink `entry` only if it is still the socket identified by `id`.
+fn remove_owned_socket(entry: &Path, id: EntryId) -> std::io::Result<()> {
+    match socket_identity(entry) {
+        Some((current, _)) if current == id => std::fs::remove_file(entry),
+        _ => Err(std::io::Error::other(
+            "endpoint entry is not the owned socket",
+        )),
+    }
+}
+
+fn lock_name_for(socket_name: &Path) -> PathBuf {
+    PathBuf::from(format!(".{}.lock", socket_name.to_string_lossy()))
+}
+
 impl Drop for WorldServer {
     fn drop(&mut self) {
-        if let Some((bound_dev, bound_ino)) = self.owned_endpoint {
+        if let Some(id) = self.owned_endpoint {
             if let Ok(entry) = self.socket_directory.path(&self.socket_name) {
-                if let Ok(meta) = std::fs::symlink_metadata(&entry) {
-                    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                    if meta.file_type().is_socket()
-                        && meta.dev() == bound_dev
-                        && meta.ino() == bound_ino
-                    {
-                        let _ = std::fs::remove_file(entry);
-                    }
-                }
+                let _ = remove_owned_socket(&entry, id);
             }
-            let lock_name = PathBuf::from(format!(".{}.lock", self.socket_name.to_string_lossy()));
-            if let Ok(lock_entry) = self.socket_directory.path(&lock_name) {
-                let _ = std::fs::remove_file(lock_entry);
+        }
+        if let Some(id) = self.owned_lock {
+            if let Ok(entry) = self
+                .socket_directory
+                .path(&lock_name_for(&self.socket_name))
+            {
+                let _ = remove_owned_socket(&entry, id);
             }
         }
     }
@@ -601,7 +626,7 @@ impl WorldServer {
         if socket_name.as_os_str().len() > MAX_SOCKET_NAME_BYTES {
             return Err(ServerExit::StartupFailed);
         }
-        let lock_name = PathBuf::from(format!(".{}.lock", socket_name.to_string_lossy()));
+        let lock_name = lock_name_for(&socket_name);
         let socket_entry = socket_directory
             .path(&socket_name)
             .map_err(|_| ServerExit::StartupFailed)?;
@@ -624,17 +649,17 @@ impl WorldServer {
                 let lock_entry = socket_directory
                     .path(&lock_name)
                     .map_err(|_| ServerExit::StartupFailed)?;
+                // Only an unreachable lock socket proves the endpoint is stale. A
+                // missing lock or any non-socket entry at the lock path is refused.
+                let lock_id = match socket_identity(&lock_entry) {
+                    Some((id, uid)) if uid == parent_meta.uid() => id,
+                    _ => return Err(ServerExit::StartupFailed),
+                };
                 match UnixStream::connect(&lock_entry) {
-                    Ok(_) => {
-                        return Err(ServerExit::StartupFailed);
+                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        Some((lock_entry, lock_id, socket_entry, (meta.dev(), meta.ino())))
                     }
-                    Err(e)
-                        if e.kind() == ErrorKind::ConnectionRefused
-                            || e.kind() == ErrorKind::NotFound =>
-                    {
-                        Some((lock_entry, socket_entry))
-                    }
-                    Err(_) => return Err(ServerExit::StartupFailed),
+                    _ => return Err(ServerExit::StartupFailed),
                 }
             }
             _ => return Err(ServerExit::StartupFailed),
@@ -645,9 +670,9 @@ impl WorldServer {
             .into_directory()
             .map_err(|_| ServerExit::StartupFailed)?;
 
-        if let Some((lock_entry, socket_entry)) = stale_cleanup {
-            let _ = std::fs::remove_file(&lock_entry);
-            std::fs::remove_file(&socket_entry).map_err(|_| ServerExit::StartupFailed)?;
+        if let Some((lock_entry, lock_id, socket_entry, socket_id)) = stale_cleanup {
+            remove_owned_socket(&lock_entry, lock_id).map_err(|_| ServerExit::StartupFailed)?;
+            remove_owned_socket(&socket_entry, socket_id).map_err(|_| ServerExit::StartupFailed)?;
         }
         // Bind the run to its supplied clock, resource policy, store and sandbox policy.
         let binding_data = serde_json::to_vec(&(
@@ -706,6 +731,7 @@ impl WorldServer {
             socket_directory,
             socket_name,
             owned_endpoint: None,
+            owned_lock: None,
         })
     }
 
@@ -739,30 +765,58 @@ impl WorldServer {
             .map_err(|_| ServerExit::LogFailed)
     }
 
+    /// Record a terminal event and finalize the audit evidence. Any failure to
+    /// write the event or to finalize maps to `LogFailed`, never to `exit`.
+    fn terminate(&mut self, params: &LogEventParams<'_>, exit: ServerExit) -> ServerExit {
+        if let Err(e) = self.log.log_event(params) {
+            eprintln!("log_failed: {e}");
+            let _ = self.log.finish();
+            return ServerExit::LogFailed;
+        }
+        if let Err(e) = self.log.finish() {
+            eprintln!("log_failed: {e}");
+            return ServerExit::LogFailed;
+        }
+        exit
+    }
+
     /// Run the server loop.
     pub fn run(mut self) -> Result<(), ServerExit> {
         // Existing endpoints, including stale sockets, are refused without unlinking.
         // The pinned parent prevents ancestor replacement from redirecting the bind.
-        let lock_name = PathBuf::from(format!(".{}.lock", self.socket_name.to_string_lossy()));
         let lock_entry = self
             .socket_directory
-            .path(&lock_name)
+            .path(&lock_name_for(&self.socket_name))
             .map_err(|_| ServerExit::StartupFailed)?;
         let _lock_listener = match UnixListener::bind(&lock_entry) {
             Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::AddrInUse => match UnixStream::connect(&lock_entry) {
-                Ok(_) => return Err(ServerExit::StartupFailed),
-                Err(ce)
-                    if ce.kind() == ErrorKind::ConnectionRefused
-                        || ce.kind() == ErrorKind::NotFound =>
-                {
-                    let _ = std::fs::remove_file(&lock_entry);
-                    UnixListener::bind(&lock_entry).map_err(|_| ServerExit::StartupFailed)?
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                // Only an unreachable lock socket owned by the directory owner is
+                // replaced; any other entry at the lock path is left untouched.
+                let parent_uid = {
+                    use std::os::unix::fs::MetadataExt;
+                    self.socket_directory
+                        .metadata()
+                        .map_err(|_| ServerExit::StartupFailed)?
+                        .uid()
+                };
+                let stale_id = match socket_identity(&lock_entry) {
+                    Some((id, uid)) if uid == parent_uid => id,
+                    _ => return Err(ServerExit::StartupFailed),
+                };
+                match UnixStream::connect(&lock_entry) {
+                    Err(ce) if ce.kind() == ErrorKind::ConnectionRefused => {
+                        remove_owned_socket(&lock_entry, stale_id)
+                            .map_err(|_| ServerExit::StartupFailed)?;
+                        UnixListener::bind(&lock_entry).map_err(|_| ServerExit::StartupFailed)?
+                    }
+                    _ => return Err(ServerExit::StartupFailed),
                 }
-                Err(_) => return Err(ServerExit::StartupFailed),
-            },
+            }
             Err(_) => return Err(ServerExit::StartupFailed),
         };
+        let (lock_id, _) = socket_identity(&lock_entry).ok_or(ServerExit::StartupFailed)?;
+        self.owned_lock = Some(lock_id);
 
         // Existing endpoints, including stale sockets, are refused without unlinking.
         // The pinned parent prevents ancestor replacement from redirecting the bind.
@@ -803,18 +857,19 @@ impl WorldServer {
         loop {
             let elapsed = self.elapsed_ms();
             if elapsed >= MAX_RUN_ELAPSED_MS {
-                let _ = self.log.log_event(&LogEventParams {
-                    elapsed_ms: elapsed,
-                    request_id: 0,
-                    method: "",
-                    authority: "",
-                    path_and_query: "",
-                    range: None,
-                    status: "clock_exhausted",
-                    bytes: 0,
-                });
-                let _ = self.log.finish();
-                return Err(ServerExit::LimitExceeded);
+                return Err(self.terminate(
+                    &LogEventParams {
+                        elapsed_ms: elapsed,
+                        request_id: 0,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    },
+                    ServerExit::LimitExceeded,
+                ));
             }
 
             match listener.accept() {
@@ -884,18 +939,19 @@ impl WorldServer {
                 }
                 ReadFrameResult::RunTimeout => {
                     let elapsed_ms = self.elapsed_ms();
-                    let _ = self.log.log_event(&LogEventParams {
-                        elapsed_ms,
-                        request_id: 0,
-                        method: "",
-                        authority: "",
-                        path_and_query: "",
-                        range: None,
-                        status: "clock_exhausted",
-                        bytes: 0,
-                    });
-                    let _ = self.log.finish();
-                    return ServerExit::LimitExceeded;
+                    return self.terminate(
+                        &LogEventParams {
+                            elapsed_ms,
+                            request_id: 0,
+                            method: "",
+                            authority: "",
+                            path_and_query: "",
+                            range: None,
+                            status: "clock_exhausted",
+                            bytes: 0,
+                        },
+                        ServerExit::LimitExceeded,
+                    );
                 }
                 ReadFrameResult::Malformed(reason) => {
                     let elapsed_ms = self.elapsed_ms();
@@ -990,36 +1046,38 @@ impl WorldServer {
             // 2. Token bucket delay with absolute run deadline
             let remaining_run_ms = MAX_RUN_ELAPSED_MS.saturating_sub(self.elapsed_ms());
             if remaining_run_ms == 0 {
-                let _ = self.log.log_event(&LogEventParams {
-                    elapsed_ms: self.elapsed_ms(),
-                    request_id: frame.request_id,
-                    method: "",
-                    authority: "",
-                    path_and_query: "",
-                    range: None,
-                    status: "clock_exhausted",
-                    bytes: 0,
-                });
-                let _ = self.log.finish();
-                return ServerExit::LimitExceeded;
+                return self.terminate(
+                    &LogEventParams {
+                        elapsed_ms: self.elapsed_ms(),
+                        request_id: frame.request_id,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    },
+                    ServerExit::LimitExceeded,
+                );
             }
             if self
                 .limits
                 .acquire_token_deadline(Duration::from_millis(remaining_run_ms))
                 .is_err()
             {
-                let _ = self.log.log_event(&LogEventParams {
-                    elapsed_ms: self.elapsed_ms(),
-                    request_id: frame.request_id,
-                    method: "",
-                    authority: "",
-                    path_and_query: "",
-                    range: None,
-                    status: "clock_exhausted",
-                    bytes: 0,
-                });
-                let _ = self.log.finish();
-                return ServerExit::LimitExceeded;
+                return self.terminate(
+                    &LogEventParams {
+                        elapsed_ms: self.elapsed_ms(),
+                        request_id: frame.request_id,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    },
+                    ServerExit::LimitExceeded,
+                );
             }
 
             // 3. Process request
@@ -1027,35 +1085,37 @@ impl WorldServer {
             let current_clock = match guest_clock(self.config.t_clock, elapsed_ms) {
                 Ok(clock) => clock,
                 Err(exit) => {
-                    let _ = self.log.log_event(&LogEventParams {
-                        elapsed_ms,
-                        request_id: frame.request_id,
-                        method: "",
-                        authority: "",
-                        path_and_query: "",
-                        range: None,
-                        status: "clock_exhausted",
-                        bytes: 0,
-                    });
-                    let _ = self.log.finish();
-                    return exit;
+                    return self.terminate(
+                        &LogEventParams {
+                            elapsed_ms,
+                            request_id: frame.request_id,
+                            method: "",
+                            authority: "",
+                            path_and_query: "",
+                            range: None,
+                            status: "clock_exhausted",
+                            bytes: 0,
+                        },
+                        exit,
+                    );
                 }
             };
             let date_str = match format_imf_fixdate(current_clock) {
                 Ok(s) => s,
                 Err(exit) => {
-                    let _ = self.log.log_event(&LogEventParams {
-                        elapsed_ms,
-                        request_id: frame.request_id,
-                        method: "",
-                        authority: "",
-                        path_and_query: "",
-                        range: None,
-                        status: "clock_exhausted",
-                        bytes: 0,
-                    });
-                    let _ = self.log.finish();
-                    return exit;
+                    return self.terminate(
+                        &LogEventParams {
+                            elapsed_ms,
+                            request_id: frame.request_id,
+                            method: "",
+                            authority: "",
+                            path_and_query: "",
+                            range: None,
+                            status: "clock_exhausted",
+                            bytes: 0,
+                        },
+                        exit,
+                    );
                 }
             };
 
@@ -1225,18 +1285,19 @@ impl WorldServer {
             if let Err(e) = send_result {
                 eprintln!("Error writing response frame: {e}");
                 if Instant::now() >= run_deadline {
-                    let _ = self.log.log_event(&LogEventParams {
-                        elapsed_ms: self.elapsed_ms(),
-                        request_id: frame.request_id,
-                        method: "",
-                        authority: "",
-                        path_and_query: "",
-                        range: None,
-                        status: "clock_exhausted",
-                        bytes: 0,
-                    });
-                    let _ = self.log.finish();
-                    return ServerExit::LimitExceeded;
+                    return self.terminate(
+                        &LogEventParams {
+                            elapsed_ms: self.elapsed_ms(),
+                            request_id: frame.request_id,
+                            method: "",
+                            authority: "",
+                            path_and_query: "",
+                            range: None,
+                            status: "clock_exhausted",
+                            bytes: 0,
+                        },
+                        ServerExit::LimitExceeded,
+                    );
                 }
                 if let Err(log_err) = self.log.log_event(&LogEventParams {
                     elapsed_ms,
@@ -1339,6 +1400,19 @@ mod review_tests {
             range: None,
         }
     }
+    /// Join a test thread, failing the test instead of hanging past `TEST_TIMEOUT`.
+    fn join_bounded<T>(handle: thread::JoinHandle<T>) -> thread::Result<T> {
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test thread did not finish within {TEST_TIMEOUT:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.join()
+    }
+
     fn exchange(
         mut server: WorldServer,
         request: RequestFrame,
@@ -1357,7 +1431,7 @@ mod review_tests {
                 .unwrap();
         });
         let response = receiver.recv_timeout(TEST_TIMEOUT).unwrap();
-        let (server, exit) = worker.join().unwrap();
+        let (server, exit) = join_bounded(worker).unwrap();
         (server, response, exit)
     }
 
@@ -1587,7 +1661,7 @@ mod review_tests {
                 sender.send(delivered).unwrap();
             });
             let delivered = receiver.recv_timeout(TEST_TIMEOUT).unwrap();
-            assert!(worker.join().is_err());
+            assert!(join_bounded(worker).is_err());
             let recovered =
                 LogManager::new_opts_recover(temp.path().join("log"), true, true).unwrap();
             let sent = boundary == "after_send" || boundary == "after_completion";
@@ -1685,5 +1759,182 @@ mod review_tests {
         let (_, response, exit) = exchange(server, req);
         assert_eq!(exit, ServerExit::Normal);
         assert_eq!(response.unwrap().status, 404);
+    }
+
+    /// Break `finish()`: atomic dedupe publication rejects a dangling symlink temp.
+    fn break_finalisation(temp: &TempDir) {
+        std::os::unix::fs::symlink(
+            temp.path().join("missing-target"),
+            temp.path().join("log/.dedupe.json.tmp"),
+        )
+        .unwrap();
+    }
+
+    fn finished_log(temp: &TempDir) {
+        let server = WorldServer::new(config(temp)).unwrap();
+        server.finish().unwrap();
+    }
+
+    fn recover_config(temp: &TempDir) -> ServerConfig {
+        let mut cfg = config(temp);
+        cfg.resume_log = true;
+        cfg.recover = true;
+        cfg
+    }
+
+    fn run_bounded(server: WorldServer) -> Result<(), ServerExit> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(server.run());
+        });
+        receiver.recv_timeout(TEST_TIMEOUT).unwrap()
+    }
+
+    #[test]
+    fn final_review_1_run_timeout_finalisation_failure_exits_log_failed() {
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        server.elapsed_offset_ms = MAX_RUN_ELAPSED_MS + 1;
+        break_finalisation(&temp);
+        let (_, response, exit) = exchange(server, request());
+        assert!(response.is_err());
+        assert_eq!(exit, ServerExit::LogFailed);
+        assert!(!temp.path().join("log/requests.log.head").exists());
+    }
+
+    #[test]
+    fn final_review_1_idle_deadline_finalisation_failure_exits_log_failed() {
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        server.elapsed_offset_ms = MAX_RUN_ELAPSED_MS + 1;
+        break_finalisation(&temp);
+        assert_eq!(run_bounded(server), Err(ServerExit::LogFailed));
+        assert!(!temp.path().join("log/requests.log.head").exists());
+        // The owned endpoint is still removed on exit.
+        assert!(fs::symlink_metadata(temp.path().join("socket")).is_err());
+        assert!(fs::symlink_metadata(temp.path().join(".socket.lock")).is_err());
+    }
+
+    #[test]
+    fn final_review_1_idle_deadline_with_working_audit_exits_limit_exceeded() {
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        server.elapsed_offset_ms = MAX_RUN_ELAPSED_MS + 1;
+        assert_eq!(run_bounded(server), Err(ServerExit::LimitExceeded));
+        assert!(temp.path().join("log/requests.log.head").exists());
+        let path = temp.path().join("log/requests.log");
+        assert_eq!(crate::log::verify_log(&path).unwrap(), 3);
+    }
+
+    #[test]
+    fn final_review_1_token_deadline_finalisation_failure_exits_log_failed() {
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        server.limits = Limits::new(Some(0.001), Some(1.0), None, None);
+        server
+            .limits
+            .acquire_token_deadline(Duration::from_millis(0))
+            .unwrap();
+        server.elapsed_offset_ms = MAX_RUN_ELAPSED_MS - 200;
+        break_finalisation(&temp);
+        let (_, response, exit) = exchange(server, request());
+        assert!(response.is_err());
+        assert_eq!(exit, ServerExit::LogFailed);
+    }
+
+    #[test]
+    fn final_review_1_terminal_event_write_failure_exits_log_failed() {
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let file = File::create(temp.path().join("log/requests.log")).unwrap();
+        server.log = LogManager::new_with_writer(
+            temp.path().join("log"),
+            FailSync {
+                file,
+                successful_syncs: 0,
+                calls,
+            },
+        );
+        server.elapsed_offset_ms = MAX_RUN_ELAPSED_MS + 1;
+        let (_, response, exit) = exchange(server, request());
+        assert!(response.is_err());
+        assert_eq!(exit, ServerExit::LogFailed);
+    }
+
+    #[test]
+    fn final_review_2_recovery_never_unlinks_live_listener_without_lock() {
+        let temp = fixture();
+        finished_log(&temp);
+        let socket = temp.path().join("socket");
+        let live = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(WorldServer::new(recover_config(&temp)).is_err());
+        assert!(fs::symlink_metadata(&socket).is_ok());
+        let _client = UnixStream::connect(&socket).unwrap();
+        drop(live);
+    }
+
+    #[test]
+    fn final_review_2_recovery_never_deletes_regular_file_at_lock_path() {
+        let temp = fixture();
+        finished_log(&temp);
+        let socket = temp.path().join("socket");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let lock = temp.path().join(".socket.lock");
+        fs::write(&lock, b"not a socket").unwrap();
+        assert!(WorldServer::new(recover_config(&temp)).is_err());
+        assert_eq!(fs::read(&lock).unwrap(), b"not a socket");
+        assert!(fs::symlink_metadata(&socket).is_ok());
+    }
+
+    #[test]
+    fn final_review_2_recovery_replaces_verified_stale_endpoint() {
+        let temp = fixture();
+        finished_log(&temp);
+        let socket = temp.path().join("socket");
+        let lock = temp.path().join(".socket.lock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(&lock).unwrap());
+        let server = WorldServer::new(recover_config(&temp)).unwrap();
+        assert!(fs::symlink_metadata(&socket).is_err());
+        assert!(fs::symlink_metadata(&lock).is_err());
+        drop(server);
+    }
+
+    #[test]
+    fn final_review_2_run_never_deletes_regular_file_at_lock_path() {
+        let temp = fixture();
+        let server = WorldServer::new(config(&temp)).unwrap();
+        let lock = temp.path().join(".socket.lock");
+        fs::write(&lock, b"not a socket").unwrap();
+        assert_eq!(run_bounded(server), Err(ServerExit::StartupFailed));
+        assert_eq!(fs::read(&lock).unwrap(), b"not a socket");
+        assert!(fs::symlink_metadata(temp.path().join("socket")).is_err());
+    }
+
+    #[test]
+    fn final_review_2_drop_never_unlinks_replaced_endpoint_entries() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = fixture();
+        let mut server = WorldServer::new(config(&temp)).unwrap();
+        let socket = temp.path().join("socket");
+        let lock = temp.path().join(".socket.lock");
+        let mut owned = Vec::new();
+        let mut keep = Vec::new();
+        for (index, entry) in [&socket, &lock].into_iter().enumerate() {
+            keep.push(std::os::unix::net::UnixListener::bind(entry).unwrap());
+            let meta = fs::symlink_metadata(entry).unwrap();
+            owned.push((meta.dev(), meta.ino()));
+            // Move the owned entry aside so its inode stays allocated, then
+            // install a different socket at the same pathname.
+            fs::rename(entry, temp.path().join(format!("moved-{index}"))).unwrap();
+            keep.push(std::os::unix::net::UnixListener::bind(entry).unwrap());
+        }
+        server.owned_endpoint = Some(owned[0]);
+        server.owned_lock = Some(owned[1]);
+        drop(server);
+        assert!(fs::symlink_metadata(&socket).is_ok());
+        assert!(fs::symlink_metadata(&lock).is_ok());
+        let _client = UnixStream::connect(&lock).unwrap();
     }
 }

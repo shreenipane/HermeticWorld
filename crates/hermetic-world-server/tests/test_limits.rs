@@ -1,19 +1,21 @@
 #![forbid(unsafe_code)]
 
+mod support;
+
 use hermetic_common::{Method, RequestFrame, ResponseFrame};
 use hermetic_world_server::{ServerConfig, WorldServer};
 use std::fs;
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+use support::BoundedChild;
 use tempfile::tempdir;
 use time::macros::datetime;
 
 fn send_req(socket: &Path, req: &RequestFrame) -> ResponseFrame {
-    let mut stream = UnixStream::connect(socket).expect("connect to socket");
+    let mut stream = support::connect(socket).expect("connect to socket");
     let encoded = req.encode().expect("encode req");
     stream.write_all(&encoded).expect("write req");
     ResponseFrame::read_from(&mut stream, 10 * 1024 * 1024).expect("read response")
@@ -119,20 +121,22 @@ fn test_request_cap_exceeded_exit_code_4() {
     fs::write(store_dir.join("pypi.org").join("test.txt"), b"ok").expect("write test file");
 
     let bin = bin_path();
-    let mut child = Command::new(&bin)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--max-requests")
-        .arg("2")
-        .arg("--no-sandbox")
-        .spawn()
-        .expect("spawn server");
+    let mut child = BoundedChild(
+        Command::new(&bin)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--max-requests")
+            .arg("2")
+            .arg("--no-sandbox")
+            .spawn()
+            .expect("spawn server"),
+    );
 
     for _ in 0..100 {
         if socket_path.exists() {
@@ -159,11 +163,11 @@ fn test_request_cap_exceeded_exit_code_4() {
     assert_eq!(resp2.status, 200);
 
     // Request 3: Exceeds max-requests (2)!
-    let mut stream = UnixStream::connect(&socket_path).expect("connect for req 3");
+    let mut stream = support::connect(&socket_path).expect("connect for req 3");
     let encoded = req.encode().expect("encode");
     let _ = stream.write_all(&encoded);
 
-    let status = child.wait().expect("child wait");
+    let status = child.wait_status();
     assert_eq!(
         status.code(),
         Some(4),
@@ -188,20 +192,22 @@ fn test_byte_cap_exceeded_exit_code_4() {
     fs::write(store_dir.join("pypi.org").join("test.txt"), &data).expect("write file");
 
     let bin = bin_path();
-    let mut child = Command::new(&bin)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--max-bytes")
-        .arg("80") // First request serves 50 bytes, second would exceed (100 > 80)
-        .arg("--no-sandbox")
-        .spawn()
-        .expect("spawn server");
+    let mut child = BoundedChild(
+        Command::new(&bin)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--max-bytes")
+            .arg("80") // First request serves 50 bytes, second would exceed (100 > 80)
+            .arg("--no-sandbox")
+            .spawn()
+            .expect("spawn server"),
+    );
 
     for _ in 0..100 {
         if socket_path.exists() {
@@ -224,11 +230,11 @@ fn test_byte_cap_exceeded_exit_code_4() {
     assert_eq!(resp1.status, 200);
 
     // Request 2: would be 100 bytes > 80 -> Limit exceeded!
-    let mut stream = UnixStream::connect(&socket_path).expect("connect for req 2");
+    let mut stream = support::connect(&socket_path).expect("connect for req 2");
     let encoded = req.encode().expect("encode");
     let _ = stream.write_all(&encoded);
 
-    let status = child.wait().expect("child wait");
+    let status = child.wait_status();
     assert_eq!(
         status.code(),
         Some(4),
@@ -249,18 +255,20 @@ fn test_malformed_frame_exit_code_3() {
     fs::create_dir_all(store_dir.join("pypi.org")).expect("create store");
 
     let bin = bin_path();
-    let mut child = Command::new(&bin)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--no-sandbox")
-        .spawn()
-        .expect("spawn server");
+    let mut child = BoundedChild(
+        Command::new(&bin)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--no-sandbox")
+            .spawn()
+            .expect("spawn server"),
+    );
 
     for _ in 0..100 {
         if socket_path.exists() {
@@ -271,11 +279,11 @@ fn test_malformed_frame_exit_code_3() {
     }
 
     // Send malformed bytes (bad magic and corrupted header)
-    let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    let mut stream = support::connect(&socket_path).expect("connect");
     let bad_bytes = b"BAD_MAGIC_BYTES_AND_CORRUPTED_FRAME_PAYLOAD_HERE!!";
     let _ = stream.write_all(bad_bytes);
 
-    let status = child.wait().expect("child wait");
+    let status = child.wait_status();
     assert_eq!(
         status.code(),
         Some(3),
@@ -299,18 +307,21 @@ fn test_fix2_startup_failed_socket_nonexistent_dir() {
 
     let bad_socket = temp.path().join("nonexistent_subdir").join("server.sock");
     let bin = bin_path();
-    let status = Command::new(&bin)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&bad_socket)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--no-sandbox")
-        .status()
-        .expect("run binary");
+    let status = BoundedChild(
+        Command::new(&bin)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&bad_socket)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--no-sandbox")
+            .spawn()
+            .expect("run binary"),
+    )
+    .wait_status();
 
     // FIX 2: bind failure exits code 1 (ServerExit::StartupFailed)
     assert_eq!(
@@ -334,20 +345,22 @@ fn test_fix5_client_early_close_logs_write_error_and_chain_verifies() {
     fs::write(auth_dir.join("large.dat"), &big_body).expect("write large file");
 
     let bin = bin_path();
-    let mut child = Command::new(&bin)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--max-requests")
-        .arg("1")
-        .arg("--no-sandbox")
-        .spawn()
-        .expect("spawn server");
+    let mut child = BoundedChild(
+        Command::new(&bin)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--max-requests")
+            .arg("1")
+            .arg("--no-sandbox")
+            .spawn()
+            .expect("spawn server"),
+    );
 
     for _ in 0..100 {
         if socket_path.exists() {
@@ -367,7 +380,7 @@ fn test_fix5_client_early_close_logs_write_error_and_chain_verifies() {
     let encoded = req.encode().expect("encode");
 
     // Connect, send frame, immediately drop stream
-    let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    let mut stream = support::connect(&socket_path).expect("connect");
     stream.write_all(&encoded).expect("write request");
     drop(stream);
 
@@ -381,11 +394,11 @@ fn test_fix5_client_early_close_logs_write_error_and_chain_verifies() {
         path_and_query: "/large.dat".into(),
         range: None,
     };
-    if let Ok(mut s2) = UnixStream::connect(&socket_path) {
+    if let Ok(mut s2) = support::connect(&socket_path) {
         let _ = s2.write_all(&req2.encode().expect("encode req2"));
     }
 
-    let status = child.wait().expect("child wait");
+    let status = child.wait_status();
     assert_eq!(status.code(), Some(4));
 
     let log_file = log_dir.join("requests.log");

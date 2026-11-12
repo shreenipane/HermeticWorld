@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::tempdir;
@@ -29,12 +31,12 @@ fn test_sandbox_child_process() {
     std::fs::create_dir_all(&log_dir).expect("create log");
 
     let bin = bin_path();
-    let output = Command::new(&bin)
-        .env("HERMETIC_CHILD_ROLE", "sandbox")
-        .env("HERMETIC_TEST_STORE", &store_dir)
-        .env("HERMETIC_TEST_LOG", &log_dir)
-        .output()
-        .expect("spawn child process");
+    let output = support::output_bounded(
+        Command::new(&bin)
+            .env("HERMETIC_CHILD_ROLE", "sandbox")
+            .env("HERMETIC_TEST_STORE", &store_dir)
+            .env("HERMETIC_TEST_LOG", &log_dir),
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -98,13 +100,13 @@ fn test_fix7_sandbox_child_outside_fixture_failure() {
     let bin = bin_path();
     let invalid_outside = temp.path().join("nonexistent_dir").join("outside.txt");
 
-    let output = Command::new(&bin)
-        .env("HERMETIC_CHILD_ROLE", "sandbox")
-        .env("HERMETIC_TEST_STORE", &store_dir)
-        .env("HERMETIC_TEST_LOG", &log_dir)
-        .env("HERMETIC_TEST_OUTSIDE", &invalid_outside)
-        .output()
-        .expect("spawn child process");
+    let output = support::output_bounded(
+        Command::new(&bin)
+            .env("HERMETIC_CHILD_ROLE", "sandbox")
+            .env("HERMETIC_TEST_STORE", &store_dir)
+            .env("HERMETIC_TEST_LOG", &log_dir)
+            .env("HERMETIC_TEST_OUTSIDE", &invalid_outside),
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(

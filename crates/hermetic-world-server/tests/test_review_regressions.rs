@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod support;
+
 use hermetic_common::{Method, RequestFrame, ResponseFrame};
 use hermetic_world_server::log::{MAX_CHECKPOINT_BYTES, MAX_DEDUPE_ENTRIES, MAX_LOG_LINE_BYTES};
 use hermetic_world_server::{
@@ -11,6 +13,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use support::BoundedChild as AuditChild;
 use tempfile::tempdir;
 use time::macros::datetime;
 
@@ -145,11 +148,11 @@ fn audit_symlinks_fifos_and_temporary_entries_are_rejected() {
                 Some(LogManager::new(&dir).unwrap())
             };
             if fifo {
-                assert!(std::process::Command::new("mkfifo")
-                    .arg(&target)
-                    .status()
-                    .unwrap()
-                    .success());
+                assert!(
+                    AuditChild::spawn(std::process::Command::new("mkfifo").arg(&target))
+                        .wait_status()
+                        .success()
+                );
             } else {
                 symlink(&outside, &target).unwrap();
             }
@@ -385,7 +388,7 @@ fn defect2_sidecar_internal_metadata_retrieval_rejected() {
     cfg.socket_path = socket_path.clone();
 
     let server = WorldServer::new(cfg).unwrap();
-    let thread_handle = std::thread::spawn(move || {
+    let thread_handle = support::spawn_bounded(move || {
         let _ = server.run();
     });
 
@@ -397,7 +400,7 @@ fn defect2_sidecar_internal_metadata_retrieval_rejected() {
     }
 
     let send_req = |path_and_query: &str| -> ResponseFrame {
-        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let mut client = support::connect(&socket_path).unwrap();
         let req = RequestFrame {
             method: Method::Get,
             request_id: 1,
@@ -527,24 +530,24 @@ fn defect5_crash_recovery_endpoint_reuse() {
 
     let exe = env!("CARGO_BIN_EXE_hermetic-world-server");
 
-    let mut child = Command::new(exe)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--no-sandbox")
-        .spawn()
-        .unwrap();
+    let mut child = AuditChild::spawn(
+        Command::new(exe)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--no-sandbox"),
+    );
 
     let mut connected = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if socket_path.exists() {
-            if let Ok(mut s) = UnixStream::connect(&socket_path) {
+            if let Ok(mut s) = support::connect(&socket_path) {
                 let req = RequestFrame {
                     method: Method::Get,
                     request_id: 1,
@@ -563,52 +566,51 @@ fn defect5_crash_recovery_endpoint_reuse() {
     }
     assert!(connected, "Server should have answered request");
 
-    let live_conflict = Command::new(exe)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(temp.path().join("other_log"))
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--no-sandbox")
-        .arg("--recover")
-        .output()
-        .unwrap();
+    let live_conflict = support::output_bounded(
+        Command::new(exe)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(temp.path().join("other_log"))
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--no-sandbox")
+            .arg("--recover"),
+    );
     assert_eq!(
         live_conflict.status.code(),
         Some(1),
         "Live endpoint must be protected"
     );
 
-    child.kill().unwrap();
-    let _ = child.wait();
+    child.kill();
 
     assert!(
         socket_path.exists(),
         "Socket file should remain after SIGKILL"
     );
 
-    let mut resumed = Command::new(exe)
-        .arg("--store")
-        .arg(&store_dir)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--log")
-        .arg(&log_dir)
-        .arg("--t-clock")
-        .arg("2024-03-01T12:00:00Z")
-        .arg("--no-sandbox")
-        .arg("--resume-log")
-        .arg("--recover")
-        .spawn()
-        .unwrap();
+    let mut resumed = AuditChild::spawn(
+        Command::new(exe)
+            .arg("--store")
+            .arg(&store_dir)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--log")
+            .arg(&log_dir)
+            .arg("--t-clock")
+            .arg("2024-03-01T12:00:00Z")
+            .arg("--no-sandbox")
+            .arg("--resume-log")
+            .arg("--recover"),
+    );
 
     let mut resumed_connected = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        if let Ok(mut s) = UnixStream::connect(&socket_path) {
+        if let Ok(mut s) = support::connect(&socket_path) {
             let req = RequestFrame {
                 method: Method::Get,
                 request_id: 2,
@@ -630,8 +632,7 @@ fn defect5_crash_recovery_endpoint_reuse() {
         resumed_connected,
         "Resumed server should reuse endpoint and serve requests"
     );
-    resumed.kill().unwrap();
-    let _ = resumed.wait();
+    resumed.kill();
 }
 
 #[test]
@@ -655,7 +656,7 @@ fn defect6_socket_deadlines_terminate_stalled_reader_and_writer() {
     cfg.transmission_deadline = Some(std::time::Duration::from_millis(100));
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || {
+    let handle = support::spawn_bounded(move || {
         let _ = server.run();
     });
 
@@ -667,7 +668,7 @@ fn defect6_socket_deadlines_terminate_stalled_reader_and_writer() {
     }
 
     {
-        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let mut client = support::connect(&socket_path).unwrap();
         client.write_all(b"HW").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(250));
         let mut buf = [0u8; 16];
@@ -676,7 +677,7 @@ fn defect6_socket_deadlines_terminate_stalled_reader_and_writer() {
     }
 
     {
-        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let mut client = support::connect(&socket_path).unwrap();
         let req = RequestFrame {
             method: Method::Get,
             request_id: 10,
@@ -719,7 +720,7 @@ fn defect7_audit_capacity_and_terminal_reservation() {
     cfg.max_requests = Some(2050);
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -728,7 +729,7 @@ fn defect7_audit_capacity_and_terminal_reservation() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path).unwrap();
+    let mut client = support::connect(&socket_path).unwrap();
     for i in 0..2050 {
         let req = RequestFrame {
             method: Method::Get,
@@ -787,7 +788,7 @@ fn defect8_stream_object_larger_than_16mib() {
     cfg.max_bytes = Some(50 * 1024 * 1024);
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || {
+    let handle = support::spawn_bounded(move || {
         let _ = server.run();
     });
 
@@ -798,7 +799,7 @@ fn defect8_stream_object_larger_than_16mib() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path).unwrap();
+    let mut client = support::connect(&socket_path).unwrap();
     let req = RequestFrame {
         method: Method::Get,
         request_id: 1,
@@ -850,7 +851,7 @@ fn defect9_sidecar_conflicting_headers_excluded() {
     cfg.socket_path = socket_path.clone();
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || {
+    let handle = support::spawn_bounded(move || {
         let _ = server.run();
     });
 
@@ -862,7 +863,7 @@ fn defect9_sidecar_conflicting_headers_excluded() {
     }
 
     let send = |method, range| -> ResponseFrame {
-        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let mut client = support::connect(&socket_path).unwrap();
         let req = RequestFrame {
             method,
             request_id: 1,
@@ -1030,7 +1031,7 @@ fn defect11_unavailable_landlock_startup_regression() {
     cfg.allow_no_landlock = true;
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -1040,7 +1041,7 @@ fn defect11_unavailable_landlock_startup_regression() {
     }
 
     {
-        let client = UnixStream::connect(&socket_path).unwrap();
+        let client = support::connect(&socket_path).unwrap();
         client.shutdown(std::net::Shutdown::Both).unwrap();
     }
 
@@ -1080,7 +1081,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     cfg.socket_path = socket_path.clone();
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -1089,10 +1090,17 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path).unwrap();
-    // Path of length exactly 8192 bytes
+    let mut client = support::connect(&socket_path).unwrap();
+    // Path of length exactly 8192 bytes. The flood runs until the server ends
+    // the run itself; its own count and wall-clock bounds keep the test from
+    // depending on where exactly the audit capacity is exhausted.
     let pad = "a".repeat(8178);
-    for i in 0..600 {
+    let flood_deadline = std::time::Instant::now() + support::WAIT_TIMEOUT;
+    let mut capacity_reached = false;
+    for i in 0..99_999u64 {
+        if std::time::Instant::now() >= flood_deadline {
+            break;
+        }
         let pq = format!("/item?q={i:0>5}_{pad}");
         assert_eq!(pq.len(), 8192);
         let req = RequestFrame {
@@ -1103,6 +1111,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
             range: None,
         };
         if client.write_all(&req.encode().unwrap()).is_err() {
+            capacity_reached = true;
             break;
         }
         match ResponseFrame::read_from(&mut client, 1024 * 1024) {
@@ -1110,10 +1119,16 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
                 assert_eq!(resp.status, 404);
             }
             Err(_) => {
+                capacity_reached = true;
                 break;
             }
         }
     }
+    drop(client);
+    assert!(
+        capacity_reached,
+        "distinct-path flood must exhaust audit capacity and end the run"
+    );
 
     let run_res = handle.join().unwrap();
     assert_eq!(run_res, Err(ServerExit::LimitExceeded));
@@ -1139,7 +1154,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     cfg2.max_requests = Some(20);
 
     let server2 = WorldServer::new(cfg2).unwrap();
-    let handle2 = std::thread::spawn(move || server2.run());
+    let handle2 = support::spawn_bounded(move || server2.run());
 
     for _ in 0..50 {
         if socket_path2.exists() {
@@ -1148,7 +1163,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client2 = UnixStream::connect(&socket_path2).unwrap();
+    let mut client2 = support::connect(&socket_path2).unwrap();
     let escaped_query = "/item?q=\\\"escaped\\\\string\\\"";
     for i in 0..20 {
         let req = RequestFrame {
@@ -1191,7 +1206,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     cfg3.socket_path = socket_path3.clone();
 
     let server3 = WorldServer::new(cfg3).unwrap();
-    let handle3 = std::thread::spawn(move || server3.run());
+    let handle3 = support::spawn_bounded(move || server3.run());
 
     for _ in 0..50 {
         if socket_path3.exists() {
@@ -1200,7 +1215,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client3 = UnixStream::connect(&socket_path3).unwrap();
+    let mut client3 = support::connect(&socket_path3).unwrap();
     client3
         .write_all(b"INVALID_HEADER_GARBAGE_BYTES_1234")
         .unwrap();
@@ -1309,7 +1324,7 @@ fn review_defect3_root_separation_ancestor_replacement_retained_descriptors() {
     // Recreate log_parent as symlink to store_dir
     symlink(&store_dir, &log_parent).unwrap();
 
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -1318,7 +1333,7 @@ fn review_defect3_root_separation_ancestor_replacement_retained_descriptors() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path).unwrap();
+    let mut client = support::connect(&socket_path).unwrap();
     // Attempt to retrieve /requests.log from store
     let req = RequestFrame {
         method: Method::Get,
@@ -1373,7 +1388,7 @@ fn review_defect4_live_sandboxed_server_survives_recovery_attempt() {
     cfg.allow_no_landlock = true;
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -1400,7 +1415,7 @@ fn review_defect4_live_sandboxed_server_survives_recovery_attempt() {
     );
 
     // Verify original sandboxed server is still alive and serves requests
-    let mut client = UnixStream::connect(&socket_path).unwrap();
+    let mut client = support::connect(&socket_path).unwrap();
     let req = RequestFrame {
         method: Method::Get,
         request_id: 1,
@@ -1564,7 +1579,7 @@ fn review_defect6_absolute_run_deadline_idle_listener_and_token_exhaustion() {
     cfg2.recover = true;
 
     let server2 = WorldServer::new(cfg2).unwrap();
-    let handle2 = std::thread::spawn(move || server2.run());
+    let handle2 = support::spawn_bounded(move || server2.run());
 
     for _ in 0..50 {
         if socket_path2.exists() {
@@ -1573,7 +1588,7 @@ fn review_defect6_absolute_run_deadline_idle_listener_and_token_exhaustion() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path2).unwrap();
+    let mut client = support::connect(&socket_path2).unwrap();
     // First request consumes token
     let req1 = RequestFrame {
         method: Method::Get,
@@ -1676,7 +1691,7 @@ fn review_defect8_missing_query_specific_object_returns_404() {
     cfg.no_sandbox = false;
 
     let server = WorldServer::new(cfg).unwrap();
-    let handle = std::thread::spawn(move || server.run());
+    let handle = support::spawn_bounded(move || server.run());
 
     for _ in 0..50 {
         if socket_path.exists() {
@@ -1685,7 +1700,7 @@ fn review_defect8_missing_query_specific_object_returns_404() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut client = UnixStream::connect(&socket_path).unwrap();
+    let mut client = support::connect(&socket_path).unwrap();
 
     // 1. Queryless request returns queryless body
     let req1 = RequestFrame {
@@ -1773,29 +1788,6 @@ fn review_defect9_empty_and_partial_first_record_recovery_rejected() {
 
 const AUDIT_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-struct AuditChild(std::process::Child);
-impl Drop for AuditChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-impl AuditChild {
-    fn wait_code(&mut self) -> i32 {
-        let deadline = std::time::Instant::now() + AUDIT_CHILD_TIMEOUT;
-        loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                return status.code().unwrap();
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "audit child exit timeout"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-}
-
 fn audit_command(root: &Path, socket: &str) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-world-server"));
     command
@@ -1824,7 +1816,7 @@ fn audit_connect(root: &Path, child: &mut AuditChild) -> UnixStream {
             child.0.try_wait().unwrap().is_none(),
             "audit server exited before connect"
         );
-        if let Ok(stream) = UnixStream::connect(root.join("socket")) {
+        if let Ok(stream) = support::connect(root.join("socket")) {
             stream.set_read_timeout(Some(AUDIT_CHILD_TIMEOUT)).unwrap();
             stream.set_write_timeout(Some(AUDIT_CHILD_TIMEOUT)).unwrap();
             return stream;
@@ -2181,7 +2173,7 @@ fn review_2_competing_processes_cannot_recover_or_spend_restored_quota() {
         );
         assert!(!temp.path().join("different_socket").exists());
     }
-    let mut stream = UnixStream::connect(temp.path().join("resumed_socket")).unwrap();
+    let mut stream = support::connect(temp.path().join("resumed_socket")).unwrap();
     stream.set_write_timeout(Some(AUDIT_CHILD_TIMEOUT)).unwrap();
     stream
         .write_all(b"INVALID_HEADER_GARBAGE_BYTES_1234")

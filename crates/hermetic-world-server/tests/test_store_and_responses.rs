@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod support;
+
 use hermetic_common::{Method, RequestFrame, ResponseFrame, ResponseHeader};
 use hermetic_world_server::{format_imf_fixdate, DirStore, ServerConfig, Store, WorldServer};
 use std::fs;
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -42,7 +43,7 @@ fn start_test_server(
     });
 
     for _ in 0..100 {
-        if socket.exists() && UnixStream::connect(&socket).is_ok() {
+        if socket.exists() && support::connect(&socket).is_ok() {
             return socket;
         }
         thread::sleep(Duration::from_millis(10));
@@ -51,7 +52,7 @@ fn start_test_server(
 }
 
 fn send_req(socket: &Path, req: &RequestFrame) -> ResponseFrame {
-    let mut stream = UnixStream::connect(socket).expect("connect to socket");
+    let mut stream = support::connect(socket).expect("connect to socket");
     let encoded = req.encode().expect("encode req");
     stream.write_all(&encoded).expect("write req");
     ResponseFrame::read_from(&mut stream, 10 * 1024 * 1024).expect("read response")
