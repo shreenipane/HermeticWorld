@@ -554,25 +554,24 @@ fn decode_py_string_literal(tok_text: &str) -> Option<String> {
     Some(decode_py_escapes(content))
 }
 
-/// Prefix that marks a string skeleton symbol (see `pyc_string_skeleton`).
-pub(crate) const PYC_SKELETON_PREFIX: &str = "\u{1}pyc-skeleton:";
+/// Delimits a `\N{...}` escape whose name the Unicode name table does not know. The
+/// source-side symbol keeps the name between two of these marks, so different unknown
+/// names stay distinct, and `FingerprintSet::coverage_gap_findings` reports them.
+pub(crate) const UNRESOLVED_NAME_MARK: char = '\u{FFFF}';
 
-/// The skeleton of a string: every non-ASCII character replaced by U+FFFD, behind
-/// `PYC_SKELETON_PREFIX`. A source literal with a `\N{...}` escape whose name is not in the
-/// built-in table can only be matched through its skeleton; the marshal side adds the
-/// skeleton of every non-ASCII string constant.
-pub(crate) fn pyc_string_skeleton(s: &str) -> String {
-    let mut out = String::with_capacity(PYC_SKELETON_PREFIX.len().saturating_add(s.len()));
-    out.push_str(PYC_SKELETON_PREFIX);
-    out.extend(s.chars().map(|c| if c.is_ascii() { c } else { '\u{FFFD}' }));
-    out
+/// The unresolved `\N{...}` names recorded in a symbol by `decode_py_escapes`.
+fn unresolved_unicode_names(symbol: &str) -> impl Iterator<Item = &str> {
+    symbol
+        .split(UNRESOLVED_NAME_MARK)
+        .skip(1)
+        .step_by(2)
+        .filter_map(|piece| piece.strip_prefix("\\N{")?.strip_suffix('}'))
 }
 
-/// Decodes the backslash escapes of a non-raw string body as the compiler does. When a
-/// `\N{...}` name is unknown, the result is the skeleton of the string, with that character
-/// standing for any non-ASCII character.
+/// Decodes the backslash escapes of a non-raw string body as the compiler does. A
+/// `\N{...}` name missing from the Unicode name table is kept, upper-cased, between two
+/// `UNRESOLVED_NAME_MARK`s.
 fn decode_py_escapes(content: &str) -> String {
-    let mut unknown_name = false;
     let mut out = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
     while let Some(c) = chars.next() {
@@ -704,22 +703,25 @@ fn decode_py_escapes(content: &str) -> String {
                 Some('N') if chars.peek() == Some(&'{') => {
                     chars.next();
                     let mut name = String::new();
-                    let mut closed = false;
+                    let mut overlong = false;
                     for n in chars.by_ref() {
                         if n == '}' {
-                            closed = true;
                             break;
                         }
-                        if name.len() >= 128 {
-                            break;
+                        if name.len() < crate::unicode_names::MAX_UNICODE_NAME_LEN {
+                            name.push(n);
+                        } else {
+                            overlong = true;
                         }
-                        name.push(n);
                     }
-                    match lookup_unicode_name(&name).filter(|_| closed) {
+                    match crate::unicode_names::lookup(&name).filter(|_| !overlong) {
                         Some(ch) => out.push(ch),
                         None => {
-                            unknown_name = true;
-                            out.push('\u{FFFD}');
+                            out.push(UNRESOLVED_NAME_MARK);
+                            out.push_str("\\N{");
+                            out.push_str(&name.to_uppercase());
+                            out.push('}');
+                            out.push(UNRESOLVED_NAME_MARK);
                         }
                     }
                 }
@@ -735,194 +737,7 @@ fn decode_py_escapes(content: &str) -> String {
             out.push(c);
         }
     }
-    if unknown_name {
-        pyc_string_skeleton(&out)
-    } else {
-        out
-    }
-}
-
-/// Characters for common `\N{...}` names and aliases (matched case-insensitively), plus the
-/// algorithmic ASCII letter, digit, Greek letter and CJK ideograph names. Other names fall
-/// back to skeleton matching.
-fn lookup_unicode_name(name: &str) -> Option<char> {
-    let upper = name.trim().to_ascii_uppercase();
-    if let Some(l) = upper.strip_prefix("LATIN CAPITAL LETTER ") {
-        let mut it = l.chars();
-        return match (it.next(), it.next()) {
-            (Some(c), None) if c.is_ascii_uppercase() => Some(c),
-            _ => None,
-        };
-    }
-    if let Some(l) = upper.strip_prefix("LATIN SMALL LETTER ") {
-        let mut it = l.chars();
-        return match (it.next(), it.next()) {
-            (Some(c), None) if c.is_ascii_uppercase() => Some(c.to_ascii_lowercase()),
-            _ => None,
-        };
-    }
-    if let Some(hex) = upper.strip_prefix("CJK UNIFIED IDEOGRAPH-") {
-        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
-    }
-    const DIGITS: &[&str] = &[
-        "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE",
-    ];
-    if let Some(d) = upper.strip_prefix("DIGIT ") {
-        let idx = DIGITS.iter().position(|n| *n == d)?;
-        return char::from_digit(u32::try_from(idx).ok()?, 10);
-    }
-    // Greek letters in code-point order from U+03B1 (small) / U+0391 (capital); the
-    // capital block has an unassigned slot where final sigma sits in the small block.
-    const GREEK: &[&str] = &[
-        "ALPHA",
-        "BETA",
-        "GAMMA",
-        "DELTA",
-        "EPSILON",
-        "ZETA",
-        "ETA",
-        "THETA",
-        "IOTA",
-        "KAPPA",
-        "LAMDA",
-        "MU",
-        "NU",
-        "XI",
-        "OMICRON",
-        "PI",
-        "RHO",
-        "FINAL SIGMA",
-        "SIGMA",
-        "TAU",
-        "UPSILON",
-        "PHI",
-        "CHI",
-        "PSI",
-        "OMEGA",
-    ];
-    for (base, prefix) in [
-        (0x03B1u32, "GREEK SMALL LETTER "),
-        (0x0391u32, "GREEK CAPITAL LETTER "),
-    ] {
-        if let Some(g) = upper.strip_prefix(prefix) {
-            if base == 0x0391 && g == "FINAL SIGMA" {
-                return None;
-            }
-            let idx = GREEK.iter().position(|n| *n == g)?;
-            return char::from_u32(base.checked_add(u32::try_from(idx).ok()?)?);
-        }
-    }
-    const TABLE: &[(&str, char)] = &[
-        ("NULL", '\0'),
-        ("NUL", '\0'),
-        ("CHARACTER TABULATION", '\t'),
-        ("HORIZONTAL TABULATION", '\t'),
-        ("TAB", '\t'),
-        ("LINE FEED", '\n'),
-        ("NEW LINE", '\n'),
-        ("END OF LINE", '\n'),
-        ("LF", '\n'),
-        ("NL", '\n'),
-        ("EOL", '\n'),
-        ("LINE TABULATION", '\u{0B}'),
-        ("FORM FEED", '\u{0C}'),
-        ("FF", '\u{0C}'),
-        ("CARRIAGE RETURN", '\r'),
-        ("CR", '\r'),
-        ("ESCAPE", '\u{1B}'),
-        ("ESC", '\u{1B}'),
-        ("DELETE", '\u{7F}'),
-        ("DEL", '\u{7F}'),
-        ("SPACE", ' '),
-        ("SP", ' '),
-        ("EXCLAMATION MARK", '!'),
-        ("QUOTATION MARK", '"'),
-        ("NUMBER SIGN", '#'),
-        ("DOLLAR SIGN", '$'),
-        ("PERCENT SIGN", '%'),
-        ("AMPERSAND", '&'),
-        ("APOSTROPHE", '\''),
-        ("LEFT PARENTHESIS", '('),
-        ("RIGHT PARENTHESIS", ')'),
-        ("ASTERISK", '*'),
-        ("PLUS SIGN", '+'),
-        ("COMMA", ','),
-        ("HYPHEN-MINUS", '-'),
-        ("FULL STOP", '.'),
-        ("SOLIDUS", '/'),
-        ("COLON", ':'),
-        ("SEMICOLON", ';'),
-        ("LESS-THAN SIGN", '<'),
-        ("EQUALS SIGN", '='),
-        ("GREATER-THAN SIGN", '>'),
-        ("QUESTION MARK", '?'),
-        ("COMMERCIAL AT", '@'),
-        ("LEFT SQUARE BRACKET", '['),
-        ("REVERSE SOLIDUS", '\\'),
-        ("RIGHT SQUARE BRACKET", ']'),
-        ("CIRCUMFLEX ACCENT", '^'),
-        ("LOW LINE", '_'),
-        ("GRAVE ACCENT", '`'),
-        ("LEFT CURLY BRACKET", '{'),
-        ("VERTICAL LINE", '|'),
-        ("RIGHT CURLY BRACKET", '}'),
-        ("TILDE", '~'),
-        ("NO-BREAK SPACE", '\u{A0}'),
-        ("NBSP", '\u{A0}'),
-        ("INVERTED EXCLAMATION MARK", '\u{A1}'),
-        ("CENT SIGN", '\u{A2}'),
-        ("POUND SIGN", '\u{A3}'),
-        ("YEN SIGN", '\u{A5}'),
-        ("SECTION SIGN", '\u{A7}'),
-        ("COPYRIGHT SIGN", '\u{A9}'),
-        ("LEFT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{AB}'),
-        ("NOT SIGN", '\u{AC}'),
-        ("SOFT HYPHEN", '\u{AD}'),
-        ("SHY", '\u{AD}'),
-        ("REGISTERED SIGN", '\u{AE}'),
-        ("DEGREE SIGN", '\u{B0}'),
-        ("PLUS-MINUS SIGN", '\u{B1}'),
-        ("MICRO SIGN", '\u{B5}'),
-        ("PILCROW SIGN", '\u{B6}'),
-        ("MIDDLE DOT", '\u{B7}'),
-        ("RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{BB}'),
-        ("INVERTED QUESTION MARK", '\u{BF}'),
-        ("MULTIPLICATION SIGN", '\u{D7}'),
-        ("DIVISION SIGN", '\u{F7}'),
-        ("EN DASH", '\u{2013}'),
-        ("EM DASH", '\u{2014}'),
-        ("LEFT SINGLE QUOTATION MARK", '\u{2018}'),
-        ("RIGHT SINGLE QUOTATION MARK", '\u{2019}'),
-        ("LEFT DOUBLE QUOTATION MARK", '\u{201C}'),
-        ("RIGHT DOUBLE QUOTATION MARK", '\u{201D}'),
-        ("DAGGER", '\u{2020}'),
-        ("BULLET", '\u{2022}'),
-        ("HORIZONTAL ELLIPSIS", '\u{2026}'),
-        ("ZERO WIDTH SPACE", '\u{200B}'),
-        ("ZWSP", '\u{200B}'),
-        ("ZERO WIDTH NON-JOINER", '\u{200C}'),
-        ("ZWNJ", '\u{200C}'),
-        ("ZERO WIDTH JOINER", '\u{200D}'),
-        ("ZWJ", '\u{200D}'),
-        ("EURO SIGN", '\u{20AC}'),
-        ("TRADE MARK SIGN", '\u{2122}'),
-        ("LEFTWARDS ARROW", '\u{2190}'),
-        ("UPWARDS ARROW", '\u{2191}'),
-        ("RIGHTWARDS ARROW", '\u{2192}'),
-        ("DOWNWARDS ARROW", '\u{2193}'),
-        ("INFINITY", '\u{221E}'),
-        ("SNOWMAN", '\u{2603}'),
-        ("BLACK STAR", '\u{2605}'),
-        ("WHITE STAR", '\u{2606}'),
-        ("CHECK MARK", '\u{2713}'),
-        ("HEAVY CHECK MARK", '\u{2714}'),
-        ("BALLOT X", '\u{2717}'),
-        ("ZERO WIDTH NO-BREAK SPACE", '\u{FEFF}'),
-        ("BYTE ORDER MARK", '\u{FEFF}'),
-        ("BOM", '\u{FEFF}'),
-        ("REPLACEMENT CHARACTER", '\u{FFFD}'),
-    ];
-    TABLE.iter().find(|(n, _)| *n == upper).map(|(_, c)| *c)
+    out
 }
 
 /// Nesting limit for f-strings inside f-string replacement fields.
@@ -2567,6 +2382,44 @@ fn compute_pyc_function_fingerprints(
 }
 
 impl FingerprintSet {
+    /// Info findings for fingerprint coverage gaps found while fingerprinting. Today: a
+    /// changed string literal uses a `\N{...}` name missing from the Unicode name table
+    /// (newer than Unicode 16.0), so its compiled constant cannot be reproduced and the
+    /// `.pyc` function check cannot match that literal. `path` names the task.
+    pub fn coverage_gap_findings(&self, path: &str) -> Vec<crate::scan::Finding> {
+        let mut names = std::collections::BTreeSet::new();
+        for fp in self
+            .hunks
+            .iter()
+            .flat_map(|h| h.pyc_fingerprints.iter().chain(h.pyc_fingerprint.iter()))
+        {
+            for symbol in fp.added.iter().chain(fp.removed.iter()) {
+                if symbol.contains(UNRESOLVED_NAME_MARK) {
+                    names.extend(unresolved_unicode_names(symbol).map(str::to_string));
+                }
+            }
+        }
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let mut evidence = vec![format!(
+            "{} \\N{{...}} name(s) unknown to the Unicode {} name table; .pyc constants with them are not matched",
+            names.len(),
+            "16.0.0"
+        )];
+        evidence.extend(names.into_iter().take(5));
+        vec![crate::scan::Finding {
+            detector: "D3b".into(),
+            channel: "pyc_unknown_unicode_name".into(),
+            path: path.to_string(),
+            visibility: crate::scan::Visibility::AgentVisible,
+            severity: crate::scan::Severity::Info,
+            confidence: 0.0,
+            hunk: None,
+            evidence,
+        }]
+    }
+
     pub const DEFAULT_TIER2_MAX_FILES: usize = 20_000;
     pub const DEFAULT_TIER2_MAX_BYTES: u64 = 200 * 1024 * 1024;
 

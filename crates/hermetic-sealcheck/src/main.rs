@@ -240,6 +240,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             });
         }
 
+        all_findings.extend(fp.coverage_gap_findings(&args.task.display().to_string()));
+
         if fp.baseline_incomplete {
             all_findings.push(Finding {
                 detector: "D2".into(),
@@ -512,6 +514,8 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 )],
             });
         }
+
+        all_findings.extend(fp.coverage_gap_findings(&args.task.display().to_string()));
 
         if fp.baseline_incomplete {
             all_findings.push(Finding {

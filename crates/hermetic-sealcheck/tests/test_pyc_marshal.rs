@@ -1991,7 +1991,7 @@ fn t112_rereview_finding4_literals_match_compiled_constants() {
             vec![],
         ),
         (
-            // Not in the built-in name table: matched through the string skeleton.
+            // Decoded from the checked-in Unicode name table.
             "def f(x):\n    return \"\\N{HEAVY BLACK HEART} one\"\n".into(),
             "def f(x):\n    return \"\\N{HEAVY BLACK HEART} two\"\n".into(),
             vec![marshal_unicode("\u{2764} one")],
@@ -2109,4 +2109,90 @@ fn t112_rereview_finding5_large_constant_tables_and_explicit_limit_gap() {
     assert_eq!(gaps.len(), 1, "{findings:?}");
     assert!(gaps[0].path.ends_with("deep.pyc"));
     assert_eq!(gaps[0].severity, Severity::Info);
+}
+
+/// Prior-check 4: `\N{...}` names decode exactly, so a change of only the named character
+/// is a fingerprint and the fixed bytecode gates.
+#[test]
+fn t112_priorcheck_finding4_named_escape_character_only_changes() {
+    let cases = [
+        // Reviewer's example: two names outside the old built-in table.
+        (
+            "HEAVY BLACK HEART",
+            '\u{2764}',
+            "BLACK CHESS KING",
+            '\u{265A}',
+        ),
+        // Formal aliases (correction aliases for U+01A2 / U+01A3).
+        (
+            "LATIN CAPITAL LETTER GHA",
+            '\u{01A2}',
+            "latin small letter gha",
+            '\u{01A3}',
+        ),
+        // Algorithmic names.
+        (
+            "HANGUL SYLLABLE GA",
+            '\u{AC00}',
+            "HANGUL SYLLABLE GAG",
+            '\u{AC01}',
+        ),
+        (
+            "TANGUT IDEOGRAPH-17000",
+            '\u{17000}',
+            "TANGUT IDEOGRAPH-17001",
+            '\u{17001}',
+        ),
+    ];
+    for (base_name, base_char, fixed_name, fixed_char) in cases {
+        let base = format!("def f():\n    return \"\\N{{{base_name}}}\"\n");
+        let fixed = format!("def f():\n    return \"\\N{{{fixed_name}}}\"\n");
+        let (_dir, fp) = task_fp("m.py", &base, &fixed);
+        let f = fp_for(&fp, "f");
+        assert!(
+            f.added.contains(&fixed_char.to_string()),
+            "{fixed_name}: {f:?}"
+        );
+        assert!(
+            f.removed.contains(&base_char.to_string()),
+            "{base_name}: {f:?}"
+        );
+        assert!(fp.coverage_gap_findings("task").is_empty());
+        let fixed_const = [marshal_unicode(&fixed_char.to_string())];
+        let base_const = [marshal_unicode(&base_char.to_string())];
+        assert_both_pyc_matchers(
+            &fp,
+            &build_pyc_38("f", &fixed_const, &[], &[]),
+            &build_pyc_38("f", &base_const, &[], &[]),
+        );
+        assert_both_pyc_matchers(
+            &fp,
+            &build_pyc_311("f", "f", &fixed_const, &[], &[]),
+            &build_pyc_311("f", "f", &base_const, &[], &[]),
+        );
+    }
+}
+
+/// Prior-check 4: a name the table does not know keeps base and fixed distinct and is
+/// reported as a coverage gap instead of being silently collapsed.
+#[test]
+fn t112_priorcheck_finding4_unknown_name_is_a_reported_gap() {
+    let (_dir, fp) = task_fp(
+        "m.py",
+        "def f():\n    return \"\\N{NOT A REAL CHARACTER NAME}\"\n",
+        "def f():\n    return \"\\N{ANOTHER MADE UP NAME}\"\n",
+    );
+    let f = fp_for(&fp, "f");
+    assert_eq!(f.added.len(), 1, "{f:?}");
+    assert_eq!(f.removed.len(), 1, "{f:?}");
+    assert_ne!(f.added, f.removed);
+    let gaps = fp.coverage_gap_findings("task.json");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].channel, "pyc_unknown_unicode_name");
+    assert_eq!(gaps[0].severity, Severity::Info);
+    assert!(gaps[0].evidence.iter().any(|e| e == "ANOTHER MADE UP NAME"));
+    assert!(gaps[0]
+        .evidence
+        .iter()
+        .any(|e| e == "NOT A REAL CHARACTER NAME"));
 }

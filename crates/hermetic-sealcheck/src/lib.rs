@@ -21,6 +21,7 @@ pub mod sarif;
 pub mod scan;
 pub mod tier2;
 pub mod undated;
+pub mod unicode_names;
 pub mod winnow;
 
 use serde::{Deserialize, Serialize};

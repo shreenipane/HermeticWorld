@@ -635,22 +635,6 @@ impl<'a> MarshalParser<'a> {
                 }
             }
         }
-        // Skeletons let a source literal with an unknown `\N{...}` name match the constant.
-        let non_ascii: Vec<&String> = symbols.iter().filter(|s| !s.is_ascii()).collect();
-        let skeleton_bytes = non_ascii.iter().fold(0usize, |acc, s| {
-            // U+FFFD may be longer than the character it replaces.
-            acc.saturating_add(s.len().saturating_mul(2))
-                .saturating_add(crate::fingerprint::PYC_SKELETON_PREFIX.len())
-        });
-        let skeleton_count = non_ascii.len();
-        self.charge_work(skeleton_count)?;
-        self.charge_bytes(skeleton_bytes)?;
-        self.charge_allocation(skeleton_bytes.saturating_add(skeleton_count.saturating_mul(64)))?;
-        let skeletons: Vec<String> = non_ascii
-            .into_iter()
-            .map(|s| crate::fingerprint::pyc_string_skeleton(s))
-            .collect();
-        symbols.extend(skeletons);
         let index = self.code_objects.len();
         self.code_objects.push(PycCodeObject {
             name,
