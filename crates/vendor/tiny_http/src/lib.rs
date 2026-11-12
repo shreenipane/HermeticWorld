@@ -115,7 +115,7 @@ use util::MessagesQueue;
 pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
 pub use connection::{ConfigListenAddr, ListenAddr, Listener};
 pub use request::{ReadWrite, Request};
-pub use response::{Response, ResponseBox};
+pub use response::{Response, ResponseBox, MAX_IDENTITY_BUFFER_BYTES};
 pub use test::TestRequest;
 
 mod client;
@@ -131,6 +131,18 @@ mod util;
 /// this is closed immediately without any response, so the number of connection threads
 /// (and their buffers) is bounded.
 pub const MAX_CONNECTIONS: usize = 256;
+
+/// HERMETIC PATCH: absolute read deadlines applied to every connection.
+///
+/// `head`: from the moment the server starts waiting for a request (including the idle wait on
+/// a kept-alive connection) until its headers are complete; past it the connection is closed
+/// without a response. `body`: from the end of the headers until the body has been read (or,
+/// if the application does not read it, discarded). `None` means no deadline (the default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestDeadlines {
+    pub head: Option<Duration>,
+    pub body: Option<Duration>,
+}
 
 /// HERMETIC PATCH: decrements the open-connection count when a connection task ends.
 struct ConnectionSlot(Arc<AtomicUsize>);
@@ -156,6 +168,9 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: ListenAddr,
+
+    // HERMETIC PATCH: read deadlines shared with the connections
+    deadlines: Arc<std::sync::Mutex<RequestDeadlines>>,
 }
 
 enum Message {
@@ -301,9 +316,13 @@ impl Server {
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
+        let deadlines = Arc::new(std::sync::Mutex::new(RequestDeadlines::default()));
+        let inside_deadlines = deadlines.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = util::TaskPool::new();
+            // HERMETIC PATCH: deadlines shared with every connection
+            let deadlines = inside_deadlines;
             // HERMETIC PATCH: open-connection count (see `MAX_CONNECTIONS`)
             let open_connections = Arc::new(AtomicUsize::new(0));
 
@@ -341,7 +360,15 @@ impl Server {
                             Some(ref _ssl) => unreachable!(),
                         };
 
-                        Ok((ClientConnection::new(write_closable, read_closable, probe), slot))
+                        Ok((
+                            ClientConnection::new(
+                                write_closable,
+                                read_closable,
+                                probe,
+                                deadlines.clone(),
+                            ),
+                            slot,
+                        ))
                     }
                     Err(e) => Err(e),
                 };
@@ -383,6 +410,7 @@ impl Server {
             messages,
             close: close_trigger,
             listening_addr: local_addr,
+            deadlines,
         })
     }
 
@@ -392,6 +420,15 @@ impl Server {
     #[inline]
     pub fn incoming_requests(&self) -> IncomingRequests<'_> {
         IncomingRequests { server: self }
+    }
+
+    /// HERMETIC PATCH: sets the read deadlines for requests read from now on (see
+    /// `RequestDeadlines`).
+    pub fn set_request_deadlines(&self, deadlines: RequestDeadlines) {
+        match self.deadlines.lock() {
+            Ok(mut g) => *g = deadlines,
+            Err(p) => *p.into_inner() = deadlines,
+        }
     }
 
     /// Returns the address the server is listening to.

@@ -169,6 +169,22 @@ data: {}\n\n";
 
     common::join_within(mock_handle);
 
-    // Verify server survived and stream completed without panic
-    assert!(body_out.contains("event: message_stop"));
+    // The server survives and fails closed: the unverifiable event ends the stream with a
+    // standard error event, and none of the malformed upstream text reaches the agent.
+    assert!(body_out.contains("event: error"), "{body_out}");
+    assert!(body_out.contains("\"api_error\""), "{body_out}");
+    for leaked in [
+        "garbage",
+        "unknown_event",
+        "not a valid json",
+        "sse comment",
+        "broken json",
+    ] {
+        assert!(!body_out.contains(leaked), "{leaked} leaked: {body_out}");
+    }
+    let err = common::test_client()
+        .post(&format!("{}/v1/nope", env.gateway_url))
+        .send_string("{}")
+        .unwrap_err();
+    assert!(matches!(err, ureq::Error::Status(404, _)), "{err:?}");
 }

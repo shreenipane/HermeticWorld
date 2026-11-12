@@ -7,16 +7,49 @@ use serde::{Deserialize, Serialize};
 pub const ANTHROPIC_ADAPTER_VERSION: &str = "2026-11-1";
 pub const MAX_JSON_DEPTH: usize = 64;
 
+/// Literal `"type"` discriminators (default-deny: any other value fails to parse).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CacheControlType {
+    #[serde(rename = "ephemeral")]
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TextType {
+    #[serde(rename = "text")]
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ImageType {
+    #[serde(rename = "image")]
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Base64SourceType {
+    #[serde(rename = "base64")]
+    Base64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Role {
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "assistant")]
+    Assistant,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CacheControl {
-    pub r#type: String,
+    pub r#type: CacheControlType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TextBlock {
-    pub r#type: String,
+    pub r#type: TextType,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -32,7 +65,7 @@ pub enum SystemPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImageSource {
-    pub r#type: String,
+    pub r#type: Base64SourceType,
     pub media_type: String,
     pub data: String,
 }
@@ -40,7 +73,7 @@ pub struct ImageSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentSource {
-    pub r#type: String,
+    pub r#type: Base64SourceType,
     pub media_type: String,
     pub data: String,
 }
@@ -50,7 +83,7 @@ pub struct DocumentSource {
 pub enum ToolResultContentBlock {
     Text(TextBlock),
     Image {
-        r#type: String,
+        r#type: ImageType,
         source: ImageSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -132,7 +165,7 @@ pub enum MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Message {
-    pub role: String,
+    pub role: Role,
     pub content: MessageContent,
 }
 
@@ -231,7 +264,7 @@ impl AnthropicRequest {
                 blocks.insert(
                     0,
                     TextBlock {
-                        r#type: "text".to_string(),
+                        r#type: TextType::Text,
                         text: prefix,
                         cache_control: None,
                     },

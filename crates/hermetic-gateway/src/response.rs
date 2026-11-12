@@ -13,7 +13,7 @@ use crate::error::{
     AUTHENTICATION_ERROR, INVALID_REQUEST_ERROR, NOT_FOUND_ERROR, OVERLOADED_ERROR,
     PERMISSION_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
 };
-use crate::quota::QuotaTracker;
+use crate::quota::{QuotaBreach, QuotaTracker};
 
 #[derive(Debug, Clone)]
 pub struct GuestClock {
@@ -262,41 +262,52 @@ pub fn filter_response_headers(
     })
 }
 
-/// Recursively rewrite any field named created, created_at, updated_at, expires_at
-/// holding a number (Unix seconds) or an RFC 3339 string to guest time in the same format.
+const TIMESTAMP_KEYS: [&str; 4] = ["created", "created_at", "updated_at", "expires_at"];
+
+/// Recursively rewrite any field named created, created_at, updated_at, expires_at holding a
+/// number (Unix seconds) or an RFC 3339 string to guest time in the same format. Objects and
+/// arrays are always descended into, including ones held by a timestamp-named field.
+///
+/// The one opaque subtree is the `input` of a `tool_use` content block (the tool arguments the
+/// model wrote, which the agent's tools must receive unchanged); `input` anywhere else is
+/// rewritten like any other field. Recursion depth is bounded by serde_json's parse limit.
 pub fn rewrite_json_timestamps(val: &mut serde_json::Value, clock: &GuestClock) {
     let now = clock.now();
     let guest_unix = now.unix_timestamp();
     let now_secs = now.replace_nanosecond(0).unwrap_or(now);
     let guest_rfc3339 = now_secs.format(&Rfc3339).unwrap_or_default();
+    rewrite_inner(val, guest_unix, &guest_rfc3339);
+}
 
+fn rewrite_inner(val: &mut serde_json::Value, guest_unix: i64, guest_rfc3339: &str) {
     match val {
         serde_json::Value::Object(map) => {
+            let is_tool_use = map.get("type").and_then(|t| t.as_str()) == Some("tool_use");
             for (k, v) in map.iter_mut() {
-                // Do not descend into any content block's "input" object or into "partial_json" strings
-                if k == "input" || k == "partial_json" {
+                if is_tool_use && k == "input" {
                     continue;
                 }
-                if k == "created" || k == "created_at" || k == "updated_at" || k == "expires_at" {
+                if TIMESTAMP_KEYS.contains(&k.as_str()) {
                     match v {
                         serde_json::Value::Number(_) => {
                             *v = serde_json::Value::Number(guest_unix.into());
+                            continue;
                         }
                         serde_json::Value::String(s)
                             if OffsetDateTime::parse(s, &Rfc3339).is_ok() =>
                         {
-                            *v = serde_json::Value::String(guest_rfc3339.clone());
+                            *v = serde_json::Value::String(guest_rfc3339.to_string());
+                            continue;
                         }
                         _ => {}
                     }
-                } else {
-                    rewrite_json_timestamps(v, clock);
                 }
+                rewrite_inner(v, guest_unix, guest_rfc3339);
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                rewrite_json_timestamps(v, clock);
+                rewrite_inner(v, guest_unix, guest_rfc3339);
             }
         }
         _ => {}
@@ -353,59 +364,106 @@ pub struct StreamUsage {
     pub output_tokens: u64,
 }
 
-/// Sanitizes an SSE event string (e.g. `event: ...\ndata: ...\n\n`).
-/// Rewrites timestamps in JSON data.
-/// Replaces `event: error` with standard error.
-/// Extracts token usage from `message_start` / `message_delta`.
-pub fn sanitize_sse_event(event_block: &str, clock: &GuestClock) -> (String, StreamUsage) {
+/// SSE event names forwarded to the agent; any other event is dropped.
+pub const ALLOWED_SSE_EVENTS: [&str; 8] = [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+    "ping",
+    "error",
+];
+
+/// What to do with one upstream SSE event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseOutcome {
+    /// Forward this sanitised event text.
+    Forward(String, StreamUsage),
+    /// Drop the event (unknown event name, or no data).
+    Drop,
+    /// The event cannot be verified (its data is not a JSON object): end the stream with a
+    /// standard error event instead.
+    Reject,
+}
+
+/// A complete standard SSE error event (`event: error` + standard error body).
+pub fn standard_error_event(error_type: &str) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        AnthropicErrorResponse::standard(error_type).to_json_string()
+    )
+}
+
+fn usage_from(json_val: &serde_json::Value, usage: &mut StreamUsage) {
+    let mut take = |obj: &serde_json::Map<String, serde_json::Value>| {
+        if let Some(n) = obj.get("input_tokens").and_then(|t| t.as_u64()) {
+            usage.input_tokens = n;
+        }
+        if let Some(n) = obj.get("output_tokens").and_then(|t| t.as_u64()) {
+            usage.output_tokens = n;
+        }
+    };
+    if let Some(u) = json_val.get("usage").and_then(|u| u.as_object()) {
+        take(u);
+    }
+    if let Some(u) = json_val
+        .get("message")
+        .and_then(|m| m.get("usage"))
+        .and_then(|u| u.as_object())
+    {
+        take(u);
+    }
+}
+
+/// Sanitizes one SSE event (e.g. `event: ...\ndata: ...\n\n`), fail-closed:
+/// - only the `event` and `data` fields are kept; comments, `id`, `retry` and any other line
+///   are dropped;
+/// - an event whose name is not in `ALLOWED_SSE_EVENTS`, or that has no data, is dropped;
+/// - `event: error` is replaced with the standard error body;
+/// - any other data must be one JSON object (else `Reject`); its timestamps are rewritten and
+///   it is re-serialised, so nothing of the original text survives unparsed.
+pub fn sanitize_sse_event(event_block: &str, clock: &GuestClock) -> SseOutcome {
     let mut event_name: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-    let mut other_lines: Vec<String> = Vec::new();
-    let mut usage = StreamUsage::default();
+    let mut data_lines: Vec<&str> = Vec::new();
 
     for line in event_block.lines() {
         if let Some(ev) = line.strip_prefix("event:") {
             event_name = Some(ev.trim().to_string());
         } else if let Some(dt) = line.strip_prefix("data:") {
-            data_lines.push(dt.trim().to_string());
-        } else if !line.is_empty() {
-            other_lines.push(line.to_string());
+            data_lines.push(dt.strip_prefix(' ').unwrap_or(dt));
         }
     }
 
+    if let Some(ref ev) = event_name {
+        if !ALLOWED_SSE_EVENTS.contains(&ev.as_str()) {
+            return SseOutcome::Drop;
+        }
+    }
+    if data_lines.is_empty() {
+        return SseOutcome::Drop;
+    }
     let raw_data = data_lines.join("\n");
 
-    let is_error_event = event_name.as_deref() == Some("error");
-
-    let sanitized_data = if is_error_event {
+    if event_name.as_deref() == Some("error") {
         let (sanitized_err_json, _) = sanitize_error_body(500, &raw_data);
-        sanitized_err_json
-    } else if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&raw_data) {
-        rewrite_json_timestamps(&mut json_val, clock);
+        return SseOutcome::Forward(
+            format!("event: error\ndata: {sanitized_err_json}\n\n"),
+            StreamUsage::default(),
+        );
+    }
 
-        // Check for token usage in message_start or message_delta
-        if let Some(usage_obj) = json_val.get("usage").and_then(|u| u.as_object()) {
-            if let Some(in_toks) = usage_obj.get("input_tokens").and_then(|t| t.as_u64()) {
-                usage.input_tokens = in_toks;
-            }
-            if let Some(out_toks) = usage_obj.get("output_tokens").and_then(|t| t.as_u64()) {
-                usage.output_tokens = out_toks;
-            }
-        }
-        if let Some(msg_obj) = json_val.get("message").and_then(|m| m.as_object()) {
-            if let Some(usage_obj) = msg_obj.get("usage").and_then(|u| u.as_object()) {
-                if let Some(in_toks) = usage_obj.get("input_tokens").and_then(|t| t.as_u64()) {
-                    usage.input_tokens = in_toks;
-                }
-                if let Some(out_toks) = usage_obj.get("output_tokens").and_then(|t| t.as_u64()) {
-                    usage.output_tokens = out_toks;
-                }
-            }
-        }
-
-        serde_json::to_string(&json_val).unwrap_or(raw_data)
-    } else {
-        raw_data
+    let mut json_val = match serde_json::from_str::<serde_json::Value>(&raw_data) {
+        Ok(v) if v.is_object() => v,
+        _ => return SseOutcome::Reject,
+    };
+    rewrite_json_timestamps(&mut json_val, clock);
+    let mut usage = StreamUsage::default();
+    usage_from(&json_val, &mut usage);
+    let data = match serde_json::to_string(&json_val) {
+        Ok(d) => d,
+        Err(_) => return SseOutcome::Reject,
     };
 
     let mut out = String::new();
@@ -414,31 +472,44 @@ pub fn sanitize_sse_event(event_block: &str, clock: &GuestClock) -> (String, Str
         out.push_str(ev);
         out.push('\n');
     }
-    if !sanitized_data.is_empty() {
-        out.push_str("data: ");
-        out.push_str(&sanitized_data);
-        out.push('\n');
-    }
-    for ol in other_lines {
-        out.push_str(&ol);
-        out.push('\n');
-    }
-    out.push('\n');
+    out.push_str("data: ");
+    out.push_str(&data);
+    out.push_str("\n\n");
+    SseOutcome::Forward(out, usage)
+}
 
-    (out, usage)
+/// Sanitizes a 2xx JSON body, fail-closed: returns the rewritten body and its usage, or
+/// `None` if the body is not one JSON object serde accepts (invalid, or nested deeper than
+/// serde_json's limit). The caller must then send a standard error instead.
+pub fn sanitize_json_body(body: &str, clock: &GuestClock) -> Option<(String, StreamUsage)> {
+    let mut json_val = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.is_object() => v,
+        _ => return None,
+    };
+    rewrite_json_timestamps(&mut json_val, clock);
+    let mut usage = StreamUsage::default();
+    usage_from(&json_val, &mut usage);
+    let out = serde_json::to_string(&json_val).ok()?;
+    Some((out, usage))
+}
+
+#[derive(Debug, Default)]
+struct SlotState {
+    released: bool,
+    draining: bool,
 }
 
 /// Guard over one request's concurrency slot and token usage.
 ///
-/// The slot is released exactly once: either when the request finishes (`record_and_release`,
-/// also run on drop) or earlier, when the client disconnects (`cancel`). Token usage is
-/// recorded exactly once, when the request finishes, even if the slot was released earlier,
-/// so a cancelled request still counts the tokens upstream reported for it.
+/// The slot is released exactly once, when the request's upstream work has really ended
+/// (`record_and_release`, also run on drop), so upstream concurrency never exceeds the limit.
+/// When the client closes its side first, `mark_client_closed` marks the slot draining: a
+/// waiting request then waits for it instead of counting a concurrency breach. On a reset
+/// (the client is certainly gone) `cancel` also stops a stream at its next upstream event.
 pub struct StreamSlotGuard {
     quota: Arc<QuotaTracker>,
     usage: Arc<Mutex<StreamUsage>>,
-    slot_released: AtomicBool,
-    usage_recorded: AtomicBool,
+    slot: Mutex<SlotState>,
     cancelled: AtomicBool,
 }
 
@@ -447,15 +518,28 @@ impl StreamSlotGuard {
         Self {
             quota,
             usage,
-            slot_released: AtomicBool::new(false),
-            usage_recorded: AtomicBool::new(false),
+            slot: Mutex::new(SlotState::default()),
             cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn slot_state(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        match self.slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         }
     }
 
     /// The usage cell this guard records from (shared with a `SanitizingSseReader`).
     pub fn usage_handle(&self) -> Arc<Mutex<StreamUsage>> {
         self.usage.clone()
+    }
+
+    fn current_usage(&self) -> StreamUsage {
+        match self.usage.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
     }
 
     /// Sets the usage to record when the request finishes (non-streaming responses).
@@ -468,30 +552,32 @@ impl StreamSlotGuard {
         u.output_tokens = output_tokens;
     }
 
-    /// Records the usage seen so far and releases the slot (if `cancel` has not already).
-    pub fn record_and_release(&self) {
-        if !self.usage_recorded.swap(true, Ordering::SeqCst) {
-            let u = match self.usage.lock() {
-                Ok(g) => *g,
-                Err(p) => *p.into_inner(),
-            };
-            if self.slot_released.swap(true, Ordering::SeqCst) {
-                let _ = self.quota.record_usage(u.input_tokens, u.output_tokens);
-            } else {
-                let _ = self
-                    .quota
-                    .record_usage_and_release(u.input_tokens, u.output_tokens);
-            }
+    /// Records the usage and releases the slot, once. Returns a token-cap breach caused by
+    /// this usage (Ok if there was none or the slot was already released).
+    pub fn record_and_release(&self) -> Result<(), QuotaBreach> {
+        let mut st = self.slot_state();
+        if st.released {
+            return Ok(());
+        }
+        st.released = true;
+        let u = self.current_usage();
+        self.quota
+            .finish(u.input_tokens, u.output_tokens, st.draining)
+    }
+
+    /// The client closed its sending side (it may still be reading): mark the slot draining.
+    pub fn mark_client_closed(&self) {
+        let mut st = self.slot_state();
+        if !st.released && !st.draining {
+            st.draining = true;
+            self.quota.mark_draining();
         }
     }
 
-    /// The client went away: release the slot now (never counted as a breach) and make any
-    /// `SanitizingSseReader` holding this guard stop at its next read.
+    /// The client is certainly gone (reset): mark draining and stop a stream at its next read.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        if !self.slot_released.swap(true, Ordering::SeqCst) {
-            self.quota.release_concurrent();
-        }
+        self.mark_client_closed();
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -499,18 +585,39 @@ impl StreamSlotGuard {
     }
 
     pub fn is_slot_released(&self) -> bool {
-        self.slot_released.load(Ordering::SeqCst)
+        self.slot_state().released
+    }
+
+    /// Checks the quotas with this request's usage so far (see `QuotaTracker::check_live`).
+    pub fn check_live(&self, elapsed_secs: u64) -> Result<(), QuotaBreach> {
+        let u = self.current_usage();
+        self.quota
+            .check_live(u.input_tokens, u.output_tokens, elapsed_secs)
     }
 }
 
 impl Drop for StreamSlotGuard {
     fn drop(&mut self) {
-        self.record_and_release();
+        let _ = self.record_and_release();
     }
 }
 
-/// A reader wrapper that consumes an incoming SSE stream, sanitises each event,
-/// and produces sanitized SSE byte stream.
+/// Why reading the next upstream event stopped.
+enum FetchError {
+    /// A line longer than `MAX_LINE_BYTES` or an event longer than `MAX_EVENT_BYTES`.
+    Oversized,
+    /// Not UTF-8.
+    Invalid,
+    Io,
+}
+
+/// A reader that consumes an upstream SSE stream and produces the sanitised stream.
+///
+/// Fail-closed: an oversized line or event, invalid UTF-8, an unverifiable event or an upstream
+/// read error ends the stream with a standard error event (nothing of the offending event is
+/// emitted). With a slot guard it also enforces the quotas while the stream runs: after every
+/// event the usage so far and the elapsed wall time are checked, and a breach ends the stream
+/// with a standard `rate_limit_error` event instead of forwarding that event.
 pub struct SanitizingSseReader<R: Read> {
     reader: BufReader<R>,
     clock: GuestClock,
@@ -558,40 +665,94 @@ impl<R: Read> SanitizingSseReader<R> {
         }
     }
 
-    /// Read next event block from reader.
-    fn fetch_next_event(&mut self) -> Result<Option<String>, std::io::Error> {
-        let mut event_str = String::new();
-        let mut line = String::new();
-
-        while !self.eof {
+    /// Reads the next event block. `Ok(None)` at a clean end of stream.
+    fn fetch_next_event(&mut self) -> Result<Option<String>, FetchError> {
+        let mut event: Vec<u8> = Vec::new();
+        let mut line: Vec<u8> = Vec::new();
+        loop {
             line.clear();
-            let bytes_read = (&mut self.reader)
-                .take(Self::MAX_LINE_BYTES as u64)
-                .read_line(&mut line)?;
-
-            if bytes_read == 0 {
-                self.eof = true;
+            let n = (&mut self.reader)
+                .take(Self::MAX_LINE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|_| FetchError::Io)?;
+            if n == 0 {
                 break;
             }
-
-            event_str.push_str(&line);
-            if event_str.len() > Self::MAX_EVENT_BYTES {
-                // Event exceeded maximum allowed size, break and sanitize what we have
-                break;
+            if line.len() > Self::MAX_LINE_BYTES {
+                return Err(FetchError::Oversized);
             }
-
-            if line == "\n" || line == "\r\n" {
-                if !event_str.trim().is_empty() {
-                    return Ok(Some(event_str));
+            let blank = line == b"\n" || line == b"\r\n";
+            if blank {
+                if event.iter().any(|b| !b.is_ascii_whitespace()) {
+                    break;
                 }
-                event_str.clear();
+                event.clear();
+                continue;
             }
+            if event.len() + line.len() > Self::MAX_EVENT_BYTES {
+                return Err(FetchError::Oversized);
+            }
+            event.extend_from_slice(&line);
         }
+        if event.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(None);
+        }
+        String::from_utf8(event)
+            .map(Some)
+            .map_err(|_| FetchError::Invalid)
+    }
 
-        if !event_str.trim().is_empty() {
-            Ok(Some(event_str))
-        } else {
-            Ok(None)
+    fn is_cancelled(&self) -> bool {
+        self.slot_guard
+            .as_ref()
+            .map(|g| g.is_cancelled())
+            .unwrap_or(false)
+    }
+
+    /// Ends the stream after `event`.
+    fn finish_with(&mut self, event: String) {
+        self.buffer.extend_from_slice(event.as_bytes());
+        self.eof = true;
+    }
+
+    fn live_breach(&self) -> Option<QuotaBreach> {
+        let guard = self.slot_guard.as_ref()?;
+        guard.check_live(self.clock.elapsed_secs()).err()
+    }
+
+    fn pump(&mut self) {
+        match self.fetch_next_event() {
+            Ok(Some(block)) => match sanitize_sse_event(&block, &self.clock) {
+                SseOutcome::Forward(text, ev_usage) => {
+                    if let Ok(mut u) = self.usage.lock() {
+                        u.input_tokens = u.input_tokens.max(ev_usage.input_tokens);
+                        u.output_tokens = u.output_tokens.max(ev_usage.output_tokens);
+                    }
+                    if self.live_breach().is_some() {
+                        self.finish_with(standard_error_event(RATE_LIMIT_ERROR));
+                    } else {
+                        self.buffer.extend_from_slice(text.as_bytes());
+                    }
+                }
+                SseOutcome::Drop => {
+                    if self.live_breach().is_some() {
+                        self.finish_with(standard_error_event(RATE_LIMIT_ERROR));
+                    }
+                }
+                SseOutcome::Reject => self.finish_with(standard_error_event(API_ERROR)),
+            },
+            Ok(None) => self.eof = true,
+            Err(FetchError::Oversized) | Err(FetchError::Invalid) => {
+                self.finish_with(standard_error_event(API_ERROR))
+            }
+            Err(FetchError::Io) => {
+                let kind = if self.live_breach().is_some() {
+                    RATE_LIMIT_ERROR
+                } else {
+                    API_ERROR
+                };
+                self.finish_with(standard_error_event(kind));
+            }
         }
     }
 }
@@ -602,16 +763,7 @@ impl<R: Read> Read for SanitizingSseReader<R> {
             return Err(client_gone());
         }
         while self.buffer.is_empty() && !self.eof {
-            if let Some(event_block) = self.fetch_next_event()? {
-                let (sanitized_event, ev_usage) = sanitize_sse_event(&event_block, &self.clock);
-                if let Ok(mut u) = self.usage.lock() {
-                    u.input_tokens = u.input_tokens.max(ev_usage.input_tokens);
-                    u.output_tokens = u.output_tokens.max(ev_usage.output_tokens);
-                }
-                self.buffer.extend_from_slice(sanitized_event.as_bytes());
-            } else {
-                break;
-            }
+            self.pump();
             // The upstream read may have blocked for a long time; stop if the client left.
             if self.is_cancelled() {
                 return Err(client_gone());
@@ -619,9 +771,6 @@ impl<R: Read> Read for SanitizingSseReader<R> {
         }
 
         if self.buffer.is_empty() {
-            if let Some(guard) = &self.slot_guard {
-                guard.record_and_release();
-            }
             return Ok(0);
         }
 
@@ -637,21 +786,4 @@ fn client_gone() -> std::io::Error {
         std::io::ErrorKind::ConnectionAborted,
         "client disconnected; stream cancelled",
     )
-}
-
-impl<R: Read> SanitizingSseReader<R> {
-    fn is_cancelled(&self) -> bool {
-        self.slot_guard
-            .as_ref()
-            .map(|g| g.is_cancelled())
-            .unwrap_or(false)
-    }
-}
-
-impl<R: Read> Drop for SanitizingSseReader<R> {
-    fn drop(&mut self) {
-        if let Some(guard) = &self.slot_guard {
-            guard.record_and_release();
-        }
-    }
 }

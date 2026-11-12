@@ -51,3 +51,16 @@ Every change is marked `HERMETIC PATCH` in the source.
 9. `src/util/equal_reader.rs` `Drop for EqualReader`: discards the unread rest of a body through a
    fixed 8 KiB buffer and at most 1 MiB (upstream allocated a buffer as large as the declared
    `Content-Length`, which aborts the process for a huge value).
+10. `src/util/refined_tcp_stream.rs`, `src/client.rs`, `src/request.rs`, `src/lib.rs`,
+    `src/connection.rs`: absolute read deadlines. `Server::set_request_deadlines` sets
+    `RequestDeadlines { head, body }` (default: none). Before every socket read the read half
+    sets the socket timeout to the time left until the connection's current deadline, so slow
+    reads cannot outlast it: `head` covers the wait for a request line and headers (a timeout
+    closes the connection without a response), `body` covers reading or discarding the body.
+    `Request::set_read_deadline` lets the application lift or move the body deadline.
+11. `src/response.rs` `choose_transfer_encoding`: a client's `TE: identity` is ignored when the
+    response length is unknown (chunked is always acceptable to an HTTP/1.1 client); upstream
+    honoured it and then buffered the whole, possibly endless, body.
+12. `src/response.rs` `Response::raw_print`: the unknown-length identity path (HTTP/1.0 clients)
+    buffers at most `MAX_IDENTITY_BUFFER_BYTES` (8 MiB); a longer body fails before anything is
+    written and the connection closes without a response (upstream: `read_to_end`, no limit).

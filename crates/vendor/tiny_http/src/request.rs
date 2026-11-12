@@ -76,6 +76,9 @@ pub struct Request {
 
     // HERMETIC PATCH: duplicate handle on the client socket (None for test requests).
     peer_probe: Option<Connection>,
+
+    // HERMETIC PATCH: the connection's absolute read deadline (None for test requests).
+    read_deadline: Option<crate::util::refined_tcp_stream::DeadlineCell>,
 }
 
 struct NotifyOnDrop<R> {
@@ -241,6 +244,7 @@ where
         must_send_continue: expects_continue,
         notify_when_responded: None,
         peer_probe: None,
+        read_deadline: None,
     })
 }
 
@@ -479,6 +483,26 @@ impl Request {
     pub(crate) fn with_peer_probe(mut self, probe: Option<Connection>) -> Self {
         self.peer_probe = probe;
         self
+    }
+
+    pub(crate) fn with_read_deadline_cell(
+        mut self,
+        cell: crate::util::refined_tcp_stream::DeadlineCell,
+    ) -> Self {
+        self.read_deadline = Some(cell);
+        self
+    }
+
+    /// HERMETIC PATCH: replaces the absolute deadline for reading this request's body (and for
+    /// discarding an unread body). `None` removes it. Set by the server from
+    /// `Server::set_request_deadlines` when the headers arrive.
+    pub fn set_read_deadline(&self, deadline: Option<std::time::Instant>) {
+        if let Some(cell) = self.read_deadline.as_ref() {
+            match cell.lock() {
+                Ok(mut g) => *g = deadline,
+                Err(p) => *p.into_inner() = deadline,
+            }
+        }
     }
 
     /// HERMETIC PATCH: returns a new handle on the client's TCP socket, or `None` for

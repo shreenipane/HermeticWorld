@@ -9,7 +9,11 @@ use std::str::FromStr;
 
 use crate::common::{HTTPVersion, Method};
 use crate::connection::Connection;
+use crate::util::refined_tcp_stream::DeadlineCell;
 use crate::util::RefinedTcpStream;
+use crate::RequestDeadlines;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 use crate::Request;
 
@@ -40,6 +44,10 @@ pub struct ClientConnection {
     // the application can watch for a client disconnect and so an unanswered request can
     // close the connection instead of writing a self-generated reply.
     probe: Option<Connection>,
+
+    // HERMETIC PATCH: the connection's absolute read deadline, and where its values come from.
+    read_deadline: DeadlineCell,
+    deadlines: Arc<Mutex<RequestDeadlines>>,
 }
 
 /// HERMETIC PATCH: longest request line or header line accepted (bytes, without CRLF).
@@ -65,9 +73,12 @@ impl ClientConnection {
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
         probe: Option<Connection>,
+        deadlines: Arc<Mutex<RequestDeadlines>>,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         let secure = read_socket.secure();
+        let read_deadline: DeadlineCell = Arc::new(Mutex::new(None));
+        read_socket.set_deadline_cell(read_deadline.clone());
 
         let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
         let first_header = source.next().unwrap();
@@ -80,6 +91,8 @@ impl ClientConnection {
             no_more_requests: false,
             secure,
             probe,
+            read_deadline,
+            deadlines,
         }
     }
 
@@ -123,7 +136,26 @@ impl ClientConnection {
 
     /// Reads a request from the stream.
     /// Blocks until the header has been read.
+    fn current_deadlines(&self) -> RequestDeadlines {
+        match self.deadlines.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    fn set_read_deadline(&self, after: Option<std::time::Duration>) {
+        let value = after.map(|d| Instant::now() + d);
+        match self.read_deadline.lock() {
+            Ok(mut g) => *g = value,
+            Err(p) => *p.into_inner() = value,
+        }
+    }
+
     fn read(&mut self) -> Result<Request, ReadError> {
+        // HERMETIC PATCH: the request line and headers (including any idle wait before them)
+        // must arrive within `head`.
+        let deadlines = self.current_deadlines();
+        self.set_read_deadline(deadlines.head);
         let (method, path, version, headers) = {
             // reading the request line
             let (method, path, version) = {
@@ -160,6 +192,9 @@ impl ClientConnection {
             (method, path, version, headers)
         };
 
+        // HERMETIC PATCH: the body (and any discarding of an unread body) within `body`.
+        self.set_read_deadline(deadlines.body);
+
         // building the writer for the request
         let writer = self.sink.next().unwrap();
 
@@ -191,7 +226,9 @@ impl ClientConnection {
         })?;
 
         // HERMETIC PATCH: attach a duplicate socket handle (see `probe`).
-        let request = request.with_peer_probe(self.probe.as_ref().and_then(|c| c.try_clone().ok()));
+        let request = request
+            .with_peer_probe(self.probe.as_ref().and_then(|c| c.try_clone().ok()))
+            .with_read_deadline_cell(self.read_deadline.clone());
 
         // return the request
         Ok(request)

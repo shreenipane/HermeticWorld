@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 /// Compute SHA-256 hash of a byte slice and return raw 32 bytes.
@@ -16,13 +16,42 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha256_bytes(data))
 }
 
+/// Default most conversation tips remembered. When full, the oldest tip is forgotten; a later
+/// request extending a forgotten conversation is then counted as a history rewrite. This bounds
+/// the history state even when no request quota is configured.
+pub const MAX_HISTORY_TIPS: usize = 4096;
+
 pub struct HistoryLog {
     inner: Mutex<HistoryState>,
+    capacity: usize,
 }
 
 struct HistoryState {
     seen_tips: HashSet<String>,
+    /// Insertion order of `seen_tips` (may hold stale entries already removed from the set).
+    order: VecDeque<String>,
     rewrites_count: u64,
+}
+
+impl HistoryState {
+    fn insert(&mut self, tip: String, capacity: usize) {
+        if self.seen_tips.insert(tip.clone()) {
+            self.order.push_back(tip);
+        }
+        while self.seen_tips.len() > capacity {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.seen_tips.remove(&old);
+                }
+                None => break,
+            }
+        }
+        // Drop stale order entries so `order` stays bounded too.
+        if self.order.len() > capacity.saturating_mul(2).max(16) {
+            let seen = &self.seen_tips;
+            self.order.retain(|t| seen.contains(t));
+        }
+    }
 }
 
 impl Default for HistoryLog {
@@ -33,11 +62,26 @@ impl Default for HistoryLog {
 
 impl HistoryLog {
     pub fn new() -> Self {
+        Self::with_capacity(MAX_HISTORY_TIPS)
+    }
+
+    /// History that remembers at most `capacity` conversation tips (at least 1).
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(HistoryState {
                 seen_tips: HashSet::new(),
+                order: VecDeque::new(),
                 rewrites_count: 0,
             }),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Number of conversation tips currently remembered.
+    pub fn tip_count(&self) -> usize {
+        match self.inner.lock() {
+            Ok(g) => g.seen_tips.len(),
+            Err(p) => p.into_inner().seen_tips.len(),
         }
     }
 
@@ -91,7 +135,7 @@ impl HistoryLog {
 
         if msg_count <= 1 {
             // Starts a new conversation (first message only, or empty)
-            state.seen_tips.insert(full_tip);
+            state.insert(full_tip, self.capacity);
             (false, state.rewrites_count)
         } else {
             // Check if any proper prefix H_1 .. H_{msg_count - 1} matches an active tip
@@ -106,12 +150,12 @@ impl HistoryLog {
             if let Some(old_tip) = matched_tip {
                 // Extends a conversation already seen
                 state.seen_tips.remove(&old_tip);
-                state.seen_tips.insert(full_tip);
+                state.insert(full_tip, self.capacity);
                 (false, state.rewrites_count)
             } else {
                 // History rewrite detected
                 state.rewrites_count += 1;
-                state.seen_tips.insert(full_tip);
+                state.insert(full_tip, self.capacity);
                 (true, state.rewrites_count)
             }
         }

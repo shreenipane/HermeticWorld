@@ -448,14 +448,15 @@ impl std::io::Read for PausingStreamReader {
             self.paused_flag
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             // Upstream goes idle mid-stream (well under the gateway's 120 s read timeout).
-            std::thread::sleep(std::time::Duration::from_secs(8));
+            std::thread::sleep(std::time::Duration::from_secs(3));
             Ok(0)
         }
     }
 }
 
-/// Defect (c): a client that cancels a stream while upstream is idle must get its slot back
-/// promptly, and its next request must not be a (terminal) concurrency breach.
+/// Defect (c) / re-review 10: a client that cancels a stream while upstream is idle must not
+/// have its next request counted as a (terminal) concurrency breach, and the slot is released
+/// only when the cancelled upstream work has really ended (upstream concurrency stays <= 1).
 #[test]
 fn test_stream_client_disconnect_during_upstream_pause_releases_slot_within_bound() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -481,10 +482,14 @@ fn test_stream_client_disconnect_during_upstream_pause_releases_slot_within_boun
 
     let paused_flag = Arc::new(AtomicBool::new(false));
     let paused_flag_clone = paused_flag.clone();
+    let upstream_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream_active_2 = upstream_active.clone();
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
         // First request: a stream that pauses after its first event.
         let req1 = common::recv_upstream(&mock);
+        upstream_active_2.fetch_add(1, Ordering::SeqCst);
+        let active_1 = upstream_active_2.clone();
         let h1 = thread::spawn(move || {
             let mut event = String::from(
                 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
@@ -503,14 +508,18 @@ fn test_stream_client_disconnect_during_upstream_pause_releases_slot_within_boun
                 None,
             );
             let _ = req1.respond(resp);
+            active_1.fetch_sub(1, Ordering::SeqCst);
         });
-        // Second request (sent right after the cancel): a normal reply.
+        // Second request (sent right after the cancel): a normal reply. It may only reach
+        // upstream once the first upstream exchange has ended.
         let req2 = common::recv_upstream(&mock);
+        let overlap = upstream_active_2.load(Ordering::SeqCst);
         req2.respond(Response::from_string(
             r#"{"id":"msg_2","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
         ))
         .unwrap();
         common::join_within(h1);
+        overlap
     });
 
     let client = common::test_client();
@@ -549,12 +558,13 @@ fn test_stream_client_disconnect_during_upstream_pause_releases_slot_within_boun
     assert_eq!(res2.status(), 200);
     let _ = res2.into_string();
     assert!(
-        cancelled_at.elapsed() < Duration::from_secs(5),
-        "slot must be released well before the 8 s upstream pause ends, took {:?}",
+        cancelled_at.elapsed() < Duration::from_secs(20),
+        "second request must be served once the cancelled stream drains, took {:?}",
         cancelled_at.elapsed()
     );
     let snap = env.gateway_server.quota().snapshot();
     assert!(!snap.limit_exceeded, "cancel counted as breach: {snap:?}");
 
-    common::join_within(mock_handle);
+    let overlap = common::join_within(mock_handle);
+    assert_eq!(overlap, 0, "second upstream request overlapped the first");
 }

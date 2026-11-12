@@ -85,6 +85,18 @@ impl TestEnv {
         max_in_flight: usize,
         max_buffered_body_bytes: usize,
     ) -> Self {
+        Self::new_with_setup(quotas, t_clock, None, move |g| {
+            g.with_request_limits(max_in_flight, max_buffered_body_bytes)
+        })
+    }
+
+    /// Default options; `setup` adjusts the gateway before it serves (caps, deadlines, ...).
+    pub fn new_with_setup(
+        quotas: QuotasConfig,
+        t_clock: OffsetDateTime,
+        upstream_read_timeout_s: Option<u64>,
+        setup: impl FnOnce(GatewayServer) -> GatewayServer + 'static,
+    ) -> Self {
         let mock_server =
             Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("Failed to bind mock upstream"));
         let mock_addr = mock_server.server_addr().to_ip().expect("mock ip");
@@ -95,8 +107,8 @@ impl TestEnv {
             vec![],
             quotas,
             t_clock,
-            None,
-            Some((max_in_flight, max_buffered_body_bytes)),
+            upstream_read_timeout_s,
+            Some(Box::new(setup)),
         )
     }
 
@@ -109,7 +121,7 @@ impl TestEnv {
         quotas: QuotasConfig,
         t_clock: OffsetDateTime,
         upstream_read_timeout_s: Option<u64>,
-        request_limits: Option<(usize, usize)>,
+        setup: Option<Box<dyn FnOnce(GatewayServer) -> GatewayServer>>,
     ) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create tempdir");
         let key_path = temp_dir.path().join("upstream_api_key.txt");
@@ -137,8 +149,8 @@ impl TestEnv {
 
         let mut gateway_inner =
             GatewayServer::new(config, t_clock).expect("Failed to create GatewayServer");
-        if let Some((max_in_flight, max_body)) = request_limits {
-            gateway_inner = gateway_inner.with_request_limits(max_in_flight, max_body);
+        if let Some(setup) = setup {
+            gateway_inner = setup(gateway_inner);
         }
         let gateway = Arc::new(gateway_inner);
 

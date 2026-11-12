@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod config;
 pub mod error;
+pub mod fsutil;
 pub mod history;
 pub mod log;
 pub mod nonce;

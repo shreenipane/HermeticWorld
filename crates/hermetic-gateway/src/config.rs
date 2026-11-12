@@ -70,15 +70,30 @@ impl std::fmt::Debug for GatewayConfig {
 impl GatewayConfig {
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, String> {
         let path_ref = path.as_ref();
-        let file_contents = std::fs::read_to_string(path_ref)
-            .map_err(|e| format!("Failed to read config file {}: {e}", path_ref.display()))?;
+        // Regular file only (no symlink, device or FIFO), at most MAX_CONFIG_FILE_BYTES.
+        let raw =
+            crate::fsutil::read_regular_file_capped(path_ref, crate::fsutil::MAX_CONFIG_FILE_BYTES)
+                .map_err(|e| format!("Failed to read config file {}: {e}", path_ref.display()))?;
+        let file_contents = String::from_utf8(raw)
+            .map_err(|_| format!("Config file {} is not UTF-8", path_ref.display()))?;
         let parsed: GatewayConfigFile = serde_json::from_str(&file_contents)
             .map_err(|e| format!("Failed to parse config JSON {}: {e}", path_ref.display()))?;
 
-        let api_key = std::fs::read_to_string(&parsed.api_key_file)
-            .map_err(|e| {
+        // Regular file only (no symlink, device or FIFO), at most MAX_API_KEY_FILE_BYTES.
+        let raw_key = crate::fsutil::read_regular_file_capped(
+            &parsed.api_key_file,
+            crate::fsutil::MAX_API_KEY_FILE_BYTES,
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to read API key file {}: {e}",
+                parsed.api_key_file.display()
+            )
+        })?;
+        let api_key = String::from_utf8(raw_key)
+            .map_err(|_| {
                 format!(
-                    "Failed to read API key file {}: {e}",
+                    "API key file {} is not UTF-8",
                     parsed.api_key_file.display()
                 )
             })?

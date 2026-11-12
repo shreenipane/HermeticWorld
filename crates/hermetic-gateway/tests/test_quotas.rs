@@ -93,13 +93,21 @@ fn test_output_token_quota_triggers_limit_exceeded() {
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
-    let res1 = client
+    // The breaching response itself is not delivered: a standard 429 replaces it.
+    let err1 = client
         .post(&format!("{}/v1/messages", env.gateway_url))
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
         .send_string(body)
-        .expect("first request ok");
-    assert_eq!(res1.status(), 200);
+        .unwrap_err();
+    match err1 {
+        ureq::Error::Status(429, resp) => {
+            let b = resp.into_string().unwrap();
+            assert!(b.contains("rate_limit_error"), "{b}");
+            assert!(!b.contains("\"usage\""), "breaching body leaked: {b}");
+        }
+        other => panic!("Expected 429 for the breaching response, got {other:?}"),
+    }
     common::join_within(mock_handle);
 
     // Now gateway is in limit_exceeded state
@@ -143,13 +151,21 @@ fn test_input_token_quota_triggers_limit_exceeded() {
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
-    let res1 = client
+    // The breaching response itself is not delivered: a standard 429 replaces it.
+    let err1 = client
         .post(&format!("{}/v1/messages", env.gateway_url))
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
         .send_string(body)
-        .expect("first request ok");
-    assert_eq!(res1.status(), 200);
+        .unwrap_err();
+    match err1 {
+        ureq::Error::Status(429, resp) => {
+            let b = resp.into_string().unwrap();
+            assert!(b.contains("rate_limit_error"), "{b}");
+            assert!(!b.contains("\"usage\""), "breaching body leaked: {b}");
+        }
+        other => panic!("Expected 429 for the breaching response, got {other:?}"),
+    }
     common::join_within(mock_handle);
 
     assert!(env.gateway_server.quota().snapshot().limit_exceeded);

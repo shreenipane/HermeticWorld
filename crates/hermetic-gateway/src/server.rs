@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, RequestDeadlines, Response, Server};
 
 use crate::anthropic::{parse_and_validate_request, ANTHROPIC_ADAPTER_VERSION};
 use crate::config::GatewayConfig;
@@ -15,11 +15,11 @@ use crate::error::{
     NOT_FOUND_ERROR, OVERLOADED_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
 };
 use crate::history::HistoryLog;
-use crate::log::{HostLogEntry, HostLogger};
+use crate::log::{HostLogEntry, HostLogger, MAX_HOST_LOG_BYTES};
 use crate::nonce::RunNonce;
-use crate::quota::QuotaTracker;
+use crate::quota::{QuotaBreach, QuotaTracker};
 use crate::response::{
-    filter_response_headers, format_imf_fixdate, rewrite_json_timestamps, sanitize_error_body,
+    filter_response_headers, format_imf_fixdate, sanitize_error_body, sanitize_json_body,
     GuestClock, SanitizingSseReader, StreamSlotGuard, StreamUsage,
 };
 use crate::upstream::{UpstreamClient, UpstreamResponse};
@@ -34,6 +34,20 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// body would push the total over this gets a 529 `overloaded_error` (not a quota breach).
 /// Together with `MAX_IN_FLIGHT_REQUESTS` this bounds the memory agent requests can pin.
 pub const MAX_BUFFERED_BODY_BYTES: usize = 3 * MAX_REQUEST_BODY_BYTES;
+
+/// Absolute deadline for a request's line and headers, counted from when the gateway starts
+/// waiting for it (so it also bounds the idle time of a kept-alive connection). Past it the
+/// connection is closed without a response.
+pub const REQUEST_HEAD_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Absolute deadline for a request body, counted from the end of its headers; it also bounds
+/// discarding the unread body of a refused request. Past it the request gets a 400.
+pub const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Longest a single write of a response to the agent may block (the agent stopped reading).
+/// A stream is long-lived, so this is a per-write stall limit; the stream's total duration is
+/// bounded by the wall-time quota and the upstream timeouts.
+pub const RESPONSE_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Body bytes read (and reserved from the budget) per step.
 const BODY_READ_CHUNK: usize = 64 * 1024;
@@ -123,6 +137,7 @@ pub struct GatewayServer {
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
     body_budget: Arc<BodyBudget>,
+    client_deadlines: RequestDeadlines,
 }
 
 impl GatewayServer {
@@ -158,11 +173,21 @@ impl GatewayServer {
 
         let config_arc = Arc::new(config);
         let nonce = RunNonce::generate()?;
-        let quota = Arc::new(QuotaTracker::new(config_arc.quotas.clone()));
+        // A slot held by a request whose client left is released only when its upstream work
+        // ends, which takes at most about the upstream read timeout; wait that long for it.
+        let drain_wait = Duration::from_secs(config_arc.upstream_read_timeout_s.saturating_add(10));
+        let quota = Arc::new(QuotaTracker::with_drain_wait(
+            config_arc.quotas.clone(),
+            drain_wait,
+        ));
         let history = Arc::new(HistoryLog::new());
         let logger = Arc::new(
-            HostLogger::new(&config_arc.log_dir)
-                .map_err(|e| format!("Failed to create host logger: {e}"))?,
+            HostLogger::open(
+                &config_arc.log_dir,
+                vec![config_arc.api_key().to_string()],
+                MAX_HOST_LOG_BYTES,
+            )
+            .map_err(|e| format!("Failed to create host logger: {e}"))?,
         );
         let upstream = Arc::new(UpstreamClient::new(config_arc.clone()));
         let running = Arc::new(AtomicBool::new(true));
@@ -183,7 +208,50 @@ impl GatewayServer {
                 used: Mutex::new(0),
                 limit: MAX_BUFFERED_BODY_BYTES,
             }),
+            client_deadlines: RequestDeadlines {
+                head: Some(REQUEST_HEAD_DEADLINE),
+                body: Some(REQUEST_BODY_DEADLINE),
+            },
         })
+    }
+
+    /// Overrides `REQUEST_HEAD_DEADLINE` and `REQUEST_BODY_DEADLINE` (tests use short ones).
+    pub fn with_client_deadlines(mut self, head: Duration, body: Duration) -> Self {
+        self.client_deadlines = RequestDeadlines {
+            head: Some(head),
+            body: Some(body),
+        };
+        self
+    }
+
+    /// Reopens the host log with a budget of `bytes` instead of `MAX_HOST_LOG_BYTES`.
+    pub fn with_host_log_budget(mut self, bytes: u64) -> Result<Self, String> {
+        self.logger = Arc::new(
+            HostLogger::open(
+                &self.config.log_dir,
+                vec![self.config.api_key().to_string()],
+                bytes,
+            )
+            .map_err(|e| format!("Failed to create host logger: {e}"))?,
+        );
+        Ok(self)
+    }
+
+    /// Writes a host-log entry. When the log can no longer be written (its budget is used up
+    /// or the file failed), the gateway enters the terminal limit_exceeded state: it must not
+    /// keep serving requests it can no longer record.
+    fn log_entry(&self, entry: &HostLogEntry) {
+        if !self.logger.log(entry) {
+            self.quota
+                .trigger_limit_exceeded("host log cannot be written".to_string());
+        }
+    }
+
+    /// Time left under the wall-time quota, if one is configured.
+    fn wall_time_left(&self) -> Option<Duration> {
+        let limit = self.config.quotas.max_wall_time_seconds?;
+        let elapsed = self.clock.elapsed_secs();
+        Some(Duration::from_secs(limit.saturating_sub(elapsed).max(1)))
     }
 
     /// Makes sure `headers` carries exactly one `Date`, holding guest time. The HTTP layer
@@ -253,6 +321,7 @@ impl GatewayServer {
     }
 
     pub fn run_loop(&self, server: Server) {
+        server.set_request_deadlines(self.client_deadlines);
         while self.running.load(Ordering::SeqCst) {
             // Use recv_timeout so the loop can check running flag
             match server.recv_timeout(Duration::from_millis(200)) {
@@ -316,7 +385,7 @@ impl GatewayServer {
             None,
         );
 
-        self.logger.log(&HostLogEntry {
+        self.log_entry(&HostLogEntry {
             timestamp: self
                 .clock
                 .now()
@@ -339,6 +408,11 @@ impl GatewayServer {
     }
 
     pub fn handle_agent_request(&self, mut request: Request) {
+        // A response write may block at most RESPONSE_WRITE_STALL_TIMEOUT per write.
+        let peer = request.try_clone_peer_tcp_stream();
+        if let Some(p) = peer.as_ref() {
+            let _ = p.set_write_timeout(Some(RESPONSE_WRITE_STALL_TIMEOUT));
+        }
         let method = request.method().clone();
         let url = request.url().to_string();
 
@@ -474,7 +548,17 @@ impl GatewayServer {
             budget: self.body_budget.clone(),
             bytes: 0,
         };
-        let body_bytes = match read_body_bounded(request.as_reader(), &mut reservation) {
+        // The vendored tiny_http enforces REQUEST_BODY_DEADLINE on these reads.
+        let body_result = read_body_bounded(request.as_reader(), &mut reservation);
+        if body_result.is_ok() {
+            // Body complete: lift the read deadline and clear the socket's read timeout so the
+            // disconnect watcher's peek is not cut short.
+            request.set_read_deadline(None);
+            if let Some(p) = peer.as_ref() {
+                let _ = p.set_read_timeout(None);
+            }
+        }
+        let body_bytes = match body_result {
             Ok(b) => b,
             Err(BodyReadError::TooLarge) => {
                 self.respond_with_error(
@@ -541,23 +625,34 @@ impl GatewayServer {
 
         // 6. Check quotas before request
         if let Err(breach) = self.quota.check_and_acquire(self.clock.elapsed_secs()) {
-            self.respond_with_error(
-                request,
-                429,
-                RATE_LIMIT_ERROR,
-                &format!("Limit exceeded: {}", breach.reason()),
-                &endpoint,
-            );
+            if breach == QuotaBreach::Busy {
+                self.respond_with_error(
+                    request,
+                    529,
+                    OVERLOADED_ERROR,
+                    standard_message_for_type(OVERLOADED_ERROR),
+                    &endpoint,
+                );
+            } else {
+                self.respond_with_error(
+                    request,
+                    429,
+                    RATE_LIMIT_ERROR,
+                    &format!("Limit exceeded: {}", breach.reason()),
+                    &endpoint,
+                );
+            }
             return;
         }
 
         // The slot is now held. Every path below releases it through `slot` (exactly once,
-        // also on drop), and a client disconnect releases it early (see `watch_disconnect`).
+        // also on drop) when the upstream work has ended; a client that closes its side first
+        // only marks it draining (see `watch_disconnect`).
         let slot = Arc::new(StreamSlotGuard::new(
             self.quota.clone(),
             Arc::new(Mutex::new(StreamUsage::default())),
         ));
-        spawn_disconnect_watcher(request.try_clone_peer_tcp_stream(), &slot);
+        spawn_disconnect_watcher(peer, &slot);
 
         // 7. Inject Run Nonce into system prompt
         parsed_req.inject_nonce(&self.nonce);
@@ -566,7 +661,7 @@ impl GatewayServer {
         let rebuilt_json = match parsed_req.rebuild_json() {
             Ok(j) => j,
             Err(e) => {
-                slot.record_and_release();
+                let _ = slot.record_and_release();
                 self.respond_with_error(
                     request,
                     400,
@@ -600,6 +695,7 @@ impl GatewayServer {
             &rebuilt_json,
             client_anthropic_beta.as_deref(),
             is_stream,
+            self.wall_time_left(),
         );
 
         match upstream_res {
@@ -611,7 +707,7 @@ impl GatewayServer {
                 let filtered = match filter_response_headers(&headers, &self.clock) {
                     Ok(f) => f,
                     Err(e) => {
-                        slot.record_and_release();
+                        let _ = slot.record_and_release();
                         self.respond_with_error(
                             request,
                             e.status_code(),
@@ -624,8 +720,10 @@ impl GatewayServer {
                 };
 
                 if !(200..300).contains(&status) {
-                    // Non-2xx upstream error: sanitize body, preserve status
-                    slot.record_and_release();
+                    // Non-2xx upstream error: sanitize body, preserve an error status (a 1xx
+                    // or 3xx, which is no error the agent could act on, becomes 502).
+                    let _ = slot.record_and_release();
+                    let status = if status < 400 { 502 } else { status };
                     let (sanitized_body, _) = sanitize_error_body(status, &upstream_body);
                     let body_bytes = sanitized_body.into_bytes();
                     let body_len = body_bytes.len();
@@ -659,7 +757,7 @@ impl GatewayServer {
                         None,
                     );
 
-                    self.logger.log(&HostLogEntry {
+                    self.log_entry(&HostLogEntry {
                         timestamp: self
                             .clock
                             .now()
@@ -680,33 +778,33 @@ impl GatewayServer {
 
                     let _ = request.respond(resp);
                 } else {
-                    // 2xx upstream response: rewrite body timestamps
-                    let mut input_tokens = 0u64;
-                    let mut output_tokens = 0u64;
-
-                    let final_body = if let Ok(mut json_val) =
-                        serde_json::from_str::<serde_json::Value>(&upstream_body)
-                    {
-                        rewrite_json_timestamps(&mut json_val, &self.clock);
-                        if let Some(usage_obj) = json_val.get("usage").and_then(|u| u.as_object()) {
-                            if let Some(in_t) =
-                                usage_obj.get("input_tokens").and_then(|t| t.as_u64())
-                            {
-                                input_tokens = in_t;
-                            }
-                            if let Some(out_t) =
-                                usage_obj.get("output_tokens").and_then(|t| t.as_u64())
-                            {
-                                output_tokens = out_t;
-                            }
-                        }
-                        serde_json::to_string(&json_val).unwrap_or(upstream_body)
-                    } else {
-                        upstream_body
+                    // 2xx upstream response: fail-closed sanitisation. A body that is not one
+                    // JSON object serde accepts is never forwarded.
+                    let Some((final_body, usage)) = sanitize_json_body(&upstream_body, &self.clock)
+                    else {
+                        let _ = slot.record_and_release();
+                        self.respond_with_error(
+                            request,
+                            502,
+                            API_ERROR,
+                            "Upstream 2xx body is not a JSON object",
+                            &endpoint,
+                        );
+                        return;
                     };
 
-                    slot.set_usage(input_tokens, output_tokens);
-                    slot.record_and_release();
+                    slot.set_usage(usage.input_tokens, usage.output_tokens);
+                    if let Err(breach) = slot.record_and_release() {
+                        // This response crossed a hard token cap: it is not delivered.
+                        self.respond_with_error(
+                            request,
+                            429,
+                            RATE_LIMIT_ERROR,
+                            &format!("Limit exceeded: {}", breach.reason()),
+                            &endpoint,
+                        );
+                        return;
+                    }
 
                     let body_bytes = final_body.into_bytes();
                     let body_len = body_bytes.len();
@@ -729,7 +827,7 @@ impl GatewayServer {
                         None,
                     );
 
-                    self.logger.log(&HostLogEntry {
+                    self.log_entry(&HostLogEntry {
                         timestamp: self
                             .clock
                             .now()
@@ -759,7 +857,7 @@ impl GatewayServer {
                 let filtered = match filter_response_headers(&headers, &self.clock) {
                     Ok(f) => f,
                     Err(e) => {
-                        slot.record_and_release();
+                        let _ = slot.record_and_release();
                         self.respond_with_error(
                             request,
                             e.status_code(),
@@ -794,9 +892,9 @@ impl GatewayServer {
                     Response::new(status.into(), resp_headers, sse_reader, None, None);
 
                 let _ = request.respond(tiny_response);
-                slot.record_and_release();
+                let _ = slot.record_and_release();
 
-                self.logger.log(&HostLogEntry {
+                self.log_entry(&HostLogEntry {
                     timestamp: self
                         .clock
                         .now()
@@ -816,7 +914,19 @@ impl GatewayServer {
                 });
             }
             Err(e) => {
-                slot.record_and_release();
+                let _ = slot.record_and_release();
+                // The upstream deadline is the time left under the wall-time quota: if that is
+                // what ended the call, this is the wall-time breach, not an upstream failure.
+                if let Err(breach) = self.quota.check_live(0, 0, self.clock.elapsed_secs()) {
+                    self.respond_with_error(
+                        request,
+                        429,
+                        RATE_LIMIT_ERROR,
+                        &format!("Limit exceeded: {}", breach.reason()),
+                        &endpoint,
+                    );
+                    return;
+                }
                 self.respond_with_error(
                     request,
                     e.status_code(),
@@ -860,27 +970,29 @@ fn read_body_bounded(
     }
 }
 
-/// Starts a thread that releases `slot` as soon as the agent's connection closes.
+/// Starts a thread that watches the agent's connection while its request is in flight.
 ///
-/// While a request waits on upstream (before or during a stream), the gateway does not read
-/// or write the agent's socket, so a cancelled request would otherwise hold its concurrency
-/// slot until upstream next sends data or times out (up to `upstream_read_timeout_s`, or
-/// forever for a slow drip), and the agent's next request would be a terminal concurrency
-/// breach. The watcher blocks in `TcpStream::peek`, which consumes nothing:
+/// While a request waits on upstream (before or during a stream), the gateway neither reads
+/// nor writes the agent's socket. The watcher blocks in `TcpStream::peek`, which consumes
+/// nothing:
 ///
-/// - `Ok(0)` (the client closed its side) or a reset: `slot.cancel()` releases the slot at
-///   once and makes the stream stop at its next read. A client that half-closes its sending
-///   side while still reading the response is treated as gone too.
-/// - data (`Ok(n > 0)`, e.g. the next request on a keep-alive connection) or any other error:
-///   the watcher stops; this request has finished or will finish normally.
+/// - `Ok(0)`: the client closed its sending side. That is either a half-close (it may still be
+///   reading the response) or the first half of an abandonment; the two look the same until a
+///   write fails. The slot is only marked *draining* (`mark_client_closed`): it stays held, so
+///   upstream concurrency never exceeds the limit, but a request waiting for a slot now waits
+///   for it to be released instead of counting a concurrency breach. The watcher keeps
+///   watching for a reset.
+/// - a reset (`ConnectionReset`, `BrokenPipe`, ...): the client is certainly gone.
+///   `slot.cancel()` also makes a stream stop at its next upstream event, which drops the
+///   upstream connection and then releases the slot.
+/// - data (`Ok(n > 0)`, e.g. the next request on a keep-alive connection): the watcher stops.
+/// - a read timeout (set on the shared socket once tiny_http waits for the next request, which
+///   only happens after this request has ended): the watcher stops once the slot is released.
 ///
-/// The release is therefore prompt (bounded by the kernel delivering the FIN or RST), and
-/// `QuotaTracker::check_and_acquire` additionally waits up to `CONCURRENCY_RELEASE_GRACE` for
-/// a slot, covering the race between a cancel and the agent's next request. The watcher holds
-/// only a weak reference, and lives at most until the client sends again or closes, so there
-/// is at most one idle watcher per open connection (connections are capped by tiny_http's
-/// `MAX_CONNECTIONS`). If no socket handle or thread is available, no watcher runs and the
-/// slot is released when the request ends, as before.
+/// The slot itself is always released by the request's own thread when its upstream work ends
+/// (`StreamSlotGuard::record_and_release`). The watcher holds only a weak reference and ends
+/// when the connection does or the next request starts; connections are capped by tiny_http's
+/// `MAX_CONNECTIONS`. If no socket handle or thread is available, no watcher runs.
 fn spawn_disconnect_watcher(stream: Option<TcpStream>, slot: &Arc<StreamSlotGuard>) {
     let Some(stream) = stream else {
         return;
@@ -893,24 +1005,45 @@ fn spawn_disconnect_watcher(stream: Option<TcpStream>, slot: &Arc<StreamSlotGuar
 
 fn watch_disconnect(stream: TcpStream, slot: Weak<StreamSlotGuard>) {
     let mut probe = [0u8; 1];
+    let mut closed_seen = false;
     loop {
-        let gone = match stream.peek(&mut probe) {
-            Ok(0) => true,
-            Ok(_) => false,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => matches!(
-                e.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::NotConnected
-            ),
-        };
-        if gone {
-            if let Some(slot) = slot.upgrade() {
-                slot.cancel();
+        match stream.peek(&mut probe) {
+            Ok(0) => {
+                let Some(s) = slot.upgrade() else { return };
+                if s.is_slot_released() {
+                    return;
+                }
+                if !closed_seen {
+                    closed_seen = true;
+                    s.mark_client_closed();
+                }
+                // After a FIN, peek returns 0 at once; poll gently for a reset or the end.
+                drop(s);
+                std::thread::sleep(Duration::from_millis(100));
             }
+            Ok(_) => return,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::NotConnected
+                ) =>
+            {
+                if let Some(s) = slot.upgrade() {
+                    s.cancel();
+                }
+                return;
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                match slot.upgrade() {
+                    Some(s) if !s.is_slot_released() => continue,
+                    _ => return,
+                }
+            }
+            Err(_) => return,
         }
-        return;
     }
 }

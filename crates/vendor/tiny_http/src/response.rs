@@ -43,6 +43,10 @@ pub struct Response<R> {
     chunked_threshold: Option<usize>,
 }
 
+/// HERMETIC PATCH: most bytes of an unknown-length response buffered to send it with a
+/// `Content-Length` (only needed for HTTP/1.0 clients).
+pub const MAX_IDENTITY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
 /// A `Response` without a template parameter.
 pub type ResponseBox = Response<Box<dyn Read + Send>>;
 
@@ -154,8 +158,15 @@ fn choose_transfer_encoding(
             None
         });
 
+    // HERMETIC PATCH: a client's `TE: identity` used to be honoured even when the length is
+    // unknown, which made `raw_print` buffer the whole (possibly endless) body in memory.
+    // Chunked is always acceptable to an HTTP/1.1 client, so identity is honoured only when
+    // the length is known.
     if let Some(user_request) = user_request {
-        return user_request;
+        match user_request {
+            TransferEncoding::Identity if entity_length.is_none() => {}
+            other => return other,
+        }
     }
 
     // if we have additional headers, using chunked
@@ -364,8 +375,19 @@ where
             match (self.data_length, transfer_encoding) {
                 (Some(l), _) => (Box::new(self.reader), Some(l)),
                 (None, Some(TransferEncoding::Identity)) => {
+                    // HERMETIC PATCH: buffer at most MAX_IDENTITY_BUFFER_BYTES (upstream read
+                    // an unknown-length body to the end, without limit). A longer body fails
+                    // before anything is written; the connection then closes with no response.
                     let mut buf = Vec::new();
-                    self.reader.read_to_end(&mut buf)?;
+                    (&mut self.reader)
+                        .take(MAX_IDENTITY_BUFFER_BYTES as u64 + 1)
+                        .read_to_end(&mut buf)?;
+                    if buf.len() > MAX_IDENTITY_BUFFER_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "response too long to buffer for an HTTP/1.0 client",
+                        ));
+                    }
                     let l = buf.len();
                     (Box::new(Cursor::new(buf)), Some(l))
                 }

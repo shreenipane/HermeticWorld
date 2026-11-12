@@ -73,7 +73,7 @@ fn test_nonce_injection_shapes() {
     // 3. System is an array of blocks -> inserted as new first text block
     let mut req3 = req1.clone();
     req3.system = Some(SystemPrompt::Blocks(vec![TextBlock {
-        r#type: "text".to_string(),
+        r#type: hermetic_gateway::anthropic::TextType::Text,
         text: "Existing block".to_string(),
         cache_control: None,
     }]));
