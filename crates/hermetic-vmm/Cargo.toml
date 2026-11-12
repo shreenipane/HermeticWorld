@@ -12,7 +12,7 @@ dev-unjailed = []
 hermetic-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event"] }
+rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event", "mount", "thread"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]

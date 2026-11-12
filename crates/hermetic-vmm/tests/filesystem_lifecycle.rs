@@ -4,6 +4,7 @@ use std::{
     fs,
     io::Read,
     os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+    process::Command,
     time::{Duration, Instant},
 };
 use support::Fixture;
@@ -438,4 +439,130 @@ fn prepare_refuses_existing_vm_and_depth_cleanup_is_bounded() {
         jail.destroy(deadline(TIMEOUT).unwrap()),
         Err(Error::Validation("cleanup depth cap"))
     );
+}
+
+#[test]
+fn ancestor_ownership_validation_rejects_untrusted_parents() {
+    let f = Fixture::new();
+    let untrusted = f.temp.path().join("untrusted");
+    fs::create_dir(&untrusted).unwrap();
+    let target = untrusted.join("jail");
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // World-writable ancestor without sticky bit is rejected
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(Directory::open(target.to_str().unwrap()).is_err());
+
+    // Non-root world-writable ancestor with sticky bit is also rejected
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o1777)).unwrap();
+    assert!(Directory::open(target.to_str().unwrap()).is_err());
+
+    // When restored to private permissions, open succeeds
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Directory::open(target.to_str().unwrap()).is_ok());
+
+    // Preparing a jail where base has an untrusted ancestor is rejected before any artifacts are created
+    let mut spec = f.spec.clone();
+    spec.jail.base = target.to_str().unwrap().into();
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(PreparedJail::prepare(
+        &spec.clone().validate().unwrap(),
+        deadline(TIMEOUT).unwrap()
+    )
+    .is_err());
+    assert!(!target.join("firecracker").exists());
+
+    // When restored to trusted permissions, prepare succeeds
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o700)).unwrap();
+    let jail =
+        PreparedJail::prepare(&spec.validate().unwrap(), deadline(TIMEOUT).unwrap()).unwrap();
+    jail.destroy(deadline(TIMEOUT).unwrap()).unwrap();
+}
+
+const BIND_MOUNT_CHILD: &str = "HERMETIC_BIND_MOUNT_CHILD";
+
+#[test]
+fn bind_mount_child() {
+    if std::env::var_os(BIND_MOUNT_CHILD).is_none() {
+        return;
+    }
+    let f = Fixture::new();
+    let jail = PreparedJail::prepare(
+        &f.spec.clone().validate().unwrap(),
+        deadline(TIMEOUT).unwrap(),
+    )
+    .unwrap();
+    let outside = f.temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    fs::write(&sentinel, b"preserve-me").unwrap();
+
+    let mountpoint = f.root().join("bindmount");
+    fs::create_dir(&mountpoint).unwrap();
+
+    // In an isolated user and mount namespace, bind-mount outside to mountpoint
+    let unshared = unsafe {
+        rustix::thread::unshare_unsafe(
+            rustix::thread::UnshareFlags::NEWUSER | rustix::thread::UnshareFlags::NEWNS,
+        )
+    };
+    if let Err(e) = unshared {
+        eprintln!("unshare not supported in environment: {e}");
+        std::process::exit(0);
+    }
+    let _ = fs::write("/proc/self/setgroups", b"deny");
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    let _ = fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"));
+    let _ = fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"));
+
+    if let Err(e) = rustix::mount::mount_bind(&outside, &mountpoint) {
+        eprintln!("mount_bind failed: {e}");
+        std::process::exit(0);
+    }
+
+    // Destruction must refuse traversal over same-filesystem mount boundary
+    let res = jail.destroy(deadline(TIMEOUT).unwrap());
+    assert_eq!(
+        res,
+        Err(Error::Validation("cleanup mount boundary")),
+        "destroy must refuse mount crossing"
+    );
+    // Sentinel file must be preserved
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"preserve-me",
+        "sentinel file must be preserved"
+    );
+    std::process::exit(0);
+}
+
+#[test]
+fn destruction_refuses_same_filesystem_bind_mount_and_preserves_sentinel() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "bind_mount_child", "--nocapture"])
+        .env(BIND_MOUNT_CHILD, "1")
+        .output()
+        .expect("spawn bind mount child");
+    assert!(
+        output.status.success(),
+        "child failed: stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rejected_specifications_create_no_artifacts() {
+    for bad_id in ["--exec-file", "--netns", "--id", "--chroot-base-dir", "-vm"] {
+        let f = Fixture::new();
+        let mut spec = f.spec.clone();
+        spec.id = bad_id.into();
+        assert!(spec.validate().is_err());
+
+        // If an unvalidated spec is somehow used or before preparation, no artifacts exist
+        assert!(!f.temp.path().join(format!("firecracker/{bad_id}")).exists());
+        assert!(!f.temp.path().join("firecracker").exists());
+    }
 }

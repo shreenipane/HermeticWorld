@@ -69,12 +69,25 @@ impl Runner for JailerRunner {
         let namespace = open_image(&format!("/run/netns/{}", spec.spec().jail.netns))?;
         let mut args = jail.pinned_jailer_args(plan);
         let namespace_path = format!("/proc/{}/fd/{}", std::process::id(), namespace.as_raw_fd());
-        for i in 0..args.len().saturating_sub(1) {
-            if args.get(i).map(String::as_str) == Some("--netns") {
-                if let Some(arg) = args.get_mut(i + 1) {
-                    *arg = namespace_path.clone();
-                }
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--" {
+                break;
             }
+            if args[i] == "--netns" {
+                if i + 1 < args.len() {
+                    args[i + 1] = namespace_path.clone();
+                    i += 2;
+                    continue;
+                }
+            } else if args[i] == "--new-pid-ns" {
+                i += 1;
+                continue;
+            } else {
+                i += 2;
+                continue;
+            }
+            i += 1;
         }
         self.namespace = Some(namespace);
         self.process = Some(OwnedProcess::spawn(
@@ -197,6 +210,8 @@ struct OwnedProcess {
     _binary: File,
     output: OutputCapture,
     reaped: bool,
+    pid: rustix::process::Pid,
+    launcher_exited: bool,
 }
 #[derive(Default)]
 struct CaptureData {
@@ -323,11 +338,15 @@ impl OwnedProcess {
                 return Err(error);
             }
         };
+        let pid = rustix::process::Pid::from_raw(child.id().try_into().map_err(|_| Error::Io)?)
+            .ok_or(Error::Io)?;
         let mut process = Self {
             child,
             _binary: binary,
             output,
             reaped: false,
+            pid,
+            launcher_exited: false,
         };
         if let Err(e) = remaining(end, "spawn") {
             let _ = process.kill(end);
@@ -340,17 +359,32 @@ impl OwnedProcess {
         if self.reaped {
             return Ok(true);
         }
-        // Observe exit without reaping: keep the group leader's pid reserved
-        // until its remaining descendants have been signalled as well.
-        let pid =
-            rustix::process::Pid::from_raw(self.child.id().try_into().map_err(|_| Error::Io)?)
-                .ok_or(Error::Io)?;
-        let options = rustix::process::WaitIdOptions::NOHANG
-            | rustix::process::WaitIdOptions::NOWAIT
-            | rustix::process::WaitIdOptions::EXITED;
-        if rustix::process::waitid(rustix::process::WaitId::Pid(pid), options)?.is_some() {
-            self.kill(end)?;
-            Ok(true)
+        let pid = self.pid;
+        if !self.launcher_exited {
+            let options = rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT
+                | rustix::process::WaitIdOptions::EXITED;
+            if let Some(status) =
+                rustix::process::waitid(rustix::process::WaitId::Pid(pid), options)?
+            {
+                if status.exit_status() == Some(0) {
+                    let _ = self.child.try_wait();
+                    self.launcher_exited = true;
+                } else {
+                    self.kill(end)?;
+                    return Ok(true);
+                }
+            }
+        }
+        if self.launcher_exited {
+            match rustix::process::test_kill_process_group(pid) {
+                Ok(()) => Ok(false),
+                Err(rustix::io::Errno::SRCH) => {
+                    self.kill(end)?;
+                    Ok(true)
+                }
+                Err(e) => Err(e.into()),
+            }
         } else {
             Ok(false)
         }
@@ -375,7 +409,13 @@ fn kill_child_group(child: &mut Child, end: Instant) -> Result<()> {
     }
     let _ = child.kill();
     loop {
-        if child.try_wait()?.is_some() {
+        let child_done = child.try_wait()?.is_some();
+        let group_done = match rustix::process::test_kill_process_group(pid) {
+            Err(rustix::io::Errno::SRCH) => true,
+            Ok(()) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if child_done && group_done {
             return Ok(());
         }
         std::thread::sleep(remaining(end, "hard-kill")?.min(Duration::from_millis(2)));
@@ -540,12 +580,10 @@ mod tests {
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
     #[test]
-    fn exited_leader_cannot_leave_a_running_descendant() {
+    fn launcher_exit_keeps_surviving_vm_child_alive_until_stop_or_drop() {
         let end = crate::deadline(Duration::from_secs(3)).unwrap();
-        let code = concat!(
-            "import os,time; pid=os.fork(); ",
-            "os.write(1,str(pid).encode()) if pid else time.sleep(60)"
-        );
+        // Model jailer --new-pid-ns: launcher forks a surviving VM child and exits 0.
+        let code = "import os, time\npid = os.fork()\nif pid:\n    os.write(1, str(pid).encode())\n    os._exit(0)\nelse:\n    time.sleep(60)\n";
         let args = vec!["-I".into(), "-S".into(), "-c".into(), code.into()];
         let mut child = OwnedProcess::spawn(
             binary(),
@@ -557,17 +595,40 @@ mod tests {
             end,
         )
         .unwrap();
-        while !child.exited(end).unwrap() {
+        // Wait for the launcher process to exit 0 and write child pid.
+        let mut pid = None;
+        while Instant::now() < end {
+            let data = child.output._data.lock().unwrap();
+            if let Ok(s) = std::str::from_utf8(&data.stdout) {
+                if let Ok(parsed) = s.trim().parse::<u32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            drop(data);
             std::thread::sleep(Duration::from_millis(2));
         }
-        let data = child.output._data.lock().unwrap();
-        let pid = std::str::from_utf8(&data.stdout)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        drop(data);
+        let pid = pid.expect("launcher must write surviving child pid");
+        // Readiness check: exited() must NOT report true and must NOT kill the surviving child!
+        for _ in 0..10 {
+            assert!(!child.exited(end).unwrap());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Verify child is alive.
+        let live = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .is_some_and(|s| {
+                s.split_once(") ")
+                    .is_some_and(|(_, tail)| !tail.starts_with('Z'))
+            });
+        assert!(live, "surviving VM child must be running");
+
+        // Stop/drop must terminate the surviving child.
+        child.kill(end).unwrap();
+        assert!(child.exited(end).unwrap());
+
+        // Verify child was terminated.
         loop {
-            // A grandchild may briefly remain as a zombie for the host's PID 1.
             let live = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
                 .is_some_and(|s| {
@@ -578,13 +639,12 @@ mod tests {
                 break;
             }
             if Instant::now() >= end {
-                // Keep the test itself from leaking a process on regression.
                 rustix::process::kill_process(
                     rustix::process::Pid::from_raw(pid as i32).unwrap(),
                     rustix::process::Signal::KILL,
                 )
                 .unwrap();
-                panic!("descendant survived its group leader");
+                panic!("surviving VM child was not terminated by kill/stop");
             }
             std::thread::sleep(Duration::from_millis(2));
         }

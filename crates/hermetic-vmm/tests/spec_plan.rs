@@ -123,6 +123,12 @@ fn every_boot_argument_rule() {
         "clocksource=tsc tsc=reliable ro",
         "clocksource=tsc tsc=reliable hermetic.t=1",
         "clocksource=kvm-clock tsc=reliable hermetic.t=1 ro",
+        "-- clocksource=tsc tsc=reliable hermetic.t=1 ro",
+        "clocksource=tsc -- tsc=reliable hermetic.t=1 ro",
+        "clocksource=tsc tsc=reliable -- hermetic.t=1 ro",
+        "clocksource=tsc tsc=reliable hermetic.t=1 -- ro",
+        "clocksource=tsc tsc=reliable hermetic.t=1 ro --",
+        "root=/dev/vda init=/sbin/hermetic-execd -- clocksource=tsc tsc=reliable hermetic.t=1 ro",
     ] {
         assert!(validate_boot_args(bad).is_err(), "{bad}");
     }
@@ -167,9 +173,40 @@ fn release_lock_matches_owner_supplied_archive_pin() {
         lock["archive_sha256"],
         "1ac8eec866dd5eea14efecf6323e22b23eea24054545338a5b34bc5bca6623cd"
     );
-    // Extracted executable hashes have not been supplied or measured.
-    assert_eq!(lock["firecracker_sha256"], "TO-BE-FILLED-BY-OWNER");
-    assert_eq!(lock["jailer_sha256"], "TO-BE-FILLED-BY-OWNER");
+    // Verified binary hashes
+    assert_eq!(
+        lock["firecracker_sha256"],
+        "b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba"
+    );
+    assert_eq!(
+        lock["jailer_sha256"],
+        "ddadbaa15b5c942271a83b7040ca7259c8ccf92a9e08d44cce0b86fa407ba460"
+    );
+    assert_ne!(lock["firecracker_sha256"], "TO-BE-FILLED-BY-OWNER");
+    assert_ne!(lock["jailer_sha256"], "TO-BE-FILLED-BY-OWNER");
+}
+#[test]
+fn phase3_task_briefs_integrity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let briefs = [
+        "agy-tasks/T3.1-execd.md",
+        "agy-tasks/T3.2-guest-kernel.md",
+        "agy-tasks/T3.3-vmm.md",
+        "agy-tasks/T3.4-attest.md",
+        "agy-tasks/T3.5-extract-validator.md",
+        "agy-tasks/T3.6-classifier.md",
+        "agy-tasks/T3.7-mutants-variants.md",
+    ];
+    for brief in briefs {
+        let p = root.join(brief);
+        assert!(p.is_file(), "missing Phase 3 brief: {brief}");
+        let meta = std::fs::metadata(&p).unwrap();
+        assert!(meta.len() > 100, "empty or truncated brief: {brief}");
+    }
 }
 #[test]
 fn project_mac_known_answers_are_independent_of_host_identity() {
@@ -190,6 +227,11 @@ fn validates_roles_devices_identifiers_paths_and_caps() {
         Box::new(|s| s.id = "../escape".into()),
         Box::new(|s| s.id = "A".into()),
         Box::new(|s| s.id = "x".repeat(49)),
+        Box::new(|s| s.id = "--exec-file".into()),
+        Box::new(|s| s.id = "--netns".into()),
+        Box::new(|s| s.id = "-bad".into()),
+        Box::new(|s| s.jail.netns = "--netns".into()),
+        Box::new(|s| s.jail.netns = "-ns".into()),
         Box::new(|s| s.index = 4096),
         Box::new(|s| s.vcpus = 0),
         Box::new(|s| s.vcpus = 33),

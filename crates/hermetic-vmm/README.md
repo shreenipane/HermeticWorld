@@ -166,11 +166,11 @@ an outer supervisor deadline for storage failures.
 `vmm/firecracker.lock.json` pins stock x86_64 Firecracker **v1.18.0**, published
 2026-11-09, with the owner-supplied release URL and archive SHA-256
 `1ac8eec866dd5eea14efecf6323e22b23eea24054545338a5b34bc5bca6623cd`.
-No release was downloaded or hash guessed. On a trusted connected staging
-machine, verify that archive hash before extraction, then record the extracted
-Firecracker/jailer SHA-256 values, replacing those two
-`TO-BE-FILLED-BY-OWNER` literals. Install the verified
-executables under safe paths, with Firecracker's basename exactly `firecracker`.
+The verified binary hashes recorded are:
+- `firecracker_sha256`: `b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba`
+- `jailer_sha256`: `ddadbaa15b5c942271a83b7040ca7259c8ccf92a9e08d44cce0b86fa407ba460`
+
+Install the verified executables under safe paths, with Firecracker's basename exactly `firecracker`.
 Use those paths in the spec. The lock is provenance for installation; the library
 does not download or install executables. Recheck VMClock's contents and run the
 clock probes on every upgrade. Filling this lock does not satisfy TR-VMM-3.

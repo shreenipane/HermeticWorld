@@ -30,20 +30,42 @@ fn regular(stat: &fs::Stat) -> Result<()> {
     }
     Ok(())
 }
+fn validate_ancestor(dir: &Directory) -> Result<()> {
+    let s = fs::fstat(&dir.0)?;
+    let owner = rustix::process::geteuid().as_raw();
+    let caller_gid = rustix::process::getegid().as_raw();
+    if s.st_uid != 0 && s.st_uid != owner {
+        return Err(Error::Validation("unsafe ancestor ownership"));
+    }
+    if s.st_mode & 0o002 != 0 && !(s.st_uid == 0 && s.st_mode & 0o1000 != 0) {
+        return Err(Error::Validation("unsafe ancestor mode: world writable"));
+    }
+    if s.st_mode & 0o020 != 0
+        && !(s.st_mode & 0o1000 != 0)
+        && s.st_gid != 0
+        && s.st_gid != caller_gid
+    {
+        return Err(Error::Validation("unsafe ancestor mode: group writable"));
+    }
+    Ok(())
+}
 pub struct Directory(pub(crate) File);
 impl Directory {
     pub fn open(path: &str) -> Result<Self> {
         if !absolute_path(path) {
             return Err(Error::Validation("directory path"));
         }
-        let mut dir = Self(File::from(fs::open(
+        let root = Self(File::from(fs::open(
             "/",
             flags() | OFlags::DIRECTORY,
             Mode::empty(),
         )?));
+        validate_ancestor(&root)?;
+        let mut dir = root;
         for part in Path::new(path).components() {
             if let Component::Normal(name) = part {
                 dir = dir.child(name)?;
+                validate_ancestor(&dir)?;
             }
         }
         Ok(dir)
@@ -177,11 +199,13 @@ pub fn open_image(path: &str) -> Result<File> {
     let p = Path::new(path);
     let parent = p.parent().and_then(|p| p.to_str()).ok_or(Error::Io)?;
     let dir = if parent == "/" {
-        Directory(File::from(fs::open(
+        let d = Directory(File::from(fs::open(
             "/",
             flags() | OFlags::DIRECTORY,
             Mode::empty(),
-        )?))
+        )?));
+        validate_ancestor(&d)?;
+        d
     } else {
         Directory::open(parent)?
     };
@@ -303,17 +327,31 @@ impl PreparedJail {
             path.replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1)
         };
         let mut args = plan.args.clone();
-        for i in 0..args.len().saturating_sub(1) {
-            let replacement = match args.get(i).map(String::as_str) {
-                Some("--exec-file") => Some(parent_path(self.vm.descriptor_path("firecracker"))),
-                Some("--chroot-base-dir") => Some(parent_path(self.base.descriptor_path(""))),
-                _ => None,
-            };
-            if let Some(value) = replacement {
-                if let Some(arg) = args.get_mut(i + 1) {
-                    *arg = value;
-                }
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--" {
+                break;
             }
+            if args[i] == "--exec-file" {
+                if i + 1 < args.len() {
+                    args[i + 1] = parent_path(self.vm.descriptor_path("firecracker"));
+                    i += 2;
+                    continue;
+                }
+            } else if args[i] == "--chroot-base-dir" {
+                if i + 1 < args.len() {
+                    args[i + 1] = parent_path(self.base.descriptor_path(""));
+                    i += 2;
+                    continue;
+                }
+            } else if args[i] == "--new-pid-ns" {
+                i += 1;
+                continue;
+            } else {
+                i += 2;
+                continue;
+            }
+            i += 1;
         }
         args
     }
@@ -392,10 +430,36 @@ fn remove_contents(
         }
         let s = fs::statat(&dir.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if FileType::from_raw_mode(s.st_mode) == FileType::Directory {
-            let child = dir.child(std::ffi::OsStr::new(
-                name.to_str()
-                    .map_err(|_| Error::Validation("cleanup name"))?,
-            ))?;
+            if let (Ok(p_sx), Ok(c_sx)) = (
+                fs::statx(&dir.0, "", AtFlags::EMPTY_PATH, fs::StatxFlags::MNT_ID),
+                fs::statx(
+                    &dir.0,
+                    name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                    fs::StatxFlags::MNT_ID,
+                ),
+            ) {
+                let mask = fs::StatxFlags::MNT_ID.bits();
+                if (p_sx.stx_mask & mask != 0)
+                    && (c_sx.stx_mask & mask != 0)
+                    && p_sx.stx_mnt_id != c_sx.stx_mnt_id
+                {
+                    return Err(Error::Validation("cleanup mount boundary"));
+                }
+            }
+            let child = match fs::openat2(
+                &dir.0,
+                name,
+                flags() | OFlags::DIRECTORY,
+                Mode::empty(),
+                fs::ResolveFlags::NO_XDEV,
+            ) {
+                Ok(fd) => Directory(File::from(fd)),
+                Err(rustix::io::Errno::XDEV) => {
+                    return Err(Error::Validation("cleanup mount boundary"));
+                }
+                Err(e) => return Err(e.into()),
+            };
             if child.identity()?.0 != dir.identity()?.0 {
                 return Err(Error::Validation("cleanup mount boundary"));
             }

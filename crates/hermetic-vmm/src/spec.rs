@@ -101,6 +101,7 @@ impl ValidatedSpec {
 pub fn identifier(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
+        && !s.starts_with('-')
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
@@ -142,6 +143,11 @@ pub fn validate_boot_args(args: &str) -> Result<()> {
     let mut required = [false; 4];
     let mut keys = BTreeSet::new();
     for arg in args.split_ascii_whitespace() {
+        if arg == "--" {
+            return Err(Error::Validation(
+                "standalone -- separator forbidden in boot arguments",
+            ));
+        }
         let key = arg
             .split('=')
             .next()
