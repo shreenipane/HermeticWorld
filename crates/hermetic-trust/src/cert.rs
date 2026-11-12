@@ -8,7 +8,7 @@ use rsa::pkcs8::EncodePrivateKey;
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::RsaPrivateKey;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 use crate::asn1::*;
@@ -670,7 +670,97 @@ pub fn validate_output_path(path: &Path) -> Result<(), TrustError> {
     Ok(())
 }
 
+type DestinationIdentity = (Option<(u64, u64)>, std::ffi::OsString, PathBuf);
+
+/// Helper to resolve parent directory identity and destination file name.
+/// Returns (parent_dev_ino, normalized_file_name, canon_parent_path).
+fn resolve_destination_identity(path: &Path) -> Result<DestinationIdentity, TrustError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            TrustError::Cert(format!(
+                "invalid path has no file name: '{}'",
+                path.display()
+            ))
+        })?
+        .to_os_string();
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+
+    // If parent exists, canonicalize it and get (dev, ino)
+    if let Ok(canon) = parent.canonicalize() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&canon) {
+                return Ok((Some((meta.dev(), meta.ino())), file_name, canon));
+            }
+        }
+        return Ok((None, file_name, canon));
+    }
+
+    // If parent does not exist, walk up ancestors until an existing ancestor is found
+    let mut missing_suffix = Vec::new();
+    let mut cur = parent;
+    let mut resolved_parent = None;
+
+    while !cur.as_os_str().is_empty() {
+        if let Ok(canon) = cur.canonicalize() {
+            let mut assembled = canon;
+            for part in missing_suffix.into_iter().rev() {
+                assembled.push(part);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = std::fs::metadata(&assembled) {
+                    resolved_parent =
+                        Some((Some((meta.dev(), meta.ino())), file_name.clone(), assembled));
+                    break;
+                }
+            }
+            resolved_parent = Some((None, file_name.clone(), assembled));
+            break;
+        }
+        if let Some(comp) = cur.file_name() {
+            missing_suffix.push(comp.to_os_string());
+        }
+        cur = cur.parent().unwrap_or_else(|| Path::new(""));
+    }
+
+    if let Some(res) = resolved_parent {
+        Ok(res)
+    } else {
+        let mut norm = PathBuf::new();
+        for comp in parent.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    norm.pop();
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(c) => {
+                    norm.push(c);
+                }
+                std::path::Component::RootDir => {
+                    norm.push("/");
+                }
+                std::path::Component::Prefix(p) => {
+                    norm.push(p.as_os_str());
+                }
+            }
+        }
+        Ok((None, file_name, norm))
+    }
+}
+
 /// Check that two output paths do not alias the same filesystem location or inode.
+/// Compares resolved parent-directory identities and destination names before writing,
+/// including nonexistent destinations.
 pub fn check_not_alias(
     path1: &Path,
     path2: &Path,
@@ -703,6 +793,28 @@ pub fn check_not_alias(
             }
         }
     }
+
+    // Compare resolved parent-directory identities and destination names before writing
+    let (parent_id1, fname1, canon1) = resolve_destination_identity(path1)?;
+    let (parent_id2, fname2, canon2) = resolve_destination_identity(path2)?;
+
+    if fname1 == fname2 {
+        let same_parent = match (parent_id1, parent_id2) {
+            (Some(id1), Some(id2)) => id1 == id2,
+            _ => canon1 == canon2,
+        };
+        if same_parent {
+            return Err(TrustError::Cert(format!(
+                "{} ('{}') and {} ('{}') alias the same destination in directory '{}'",
+                desc1,
+                path1.display(),
+                desc2,
+                path2.display(),
+                canon1.display()
+            )));
+        }
+    }
+
     Ok(())
 }
 

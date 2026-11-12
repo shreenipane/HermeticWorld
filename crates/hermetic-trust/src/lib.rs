@@ -22,11 +22,14 @@ pub use cert::{
 pub use error::TrustError;
 pub use install::{
     append_pem_bundle_idempotent, atomic_write_preserving, atomic_write_preserving_handle,
-    bundle_contains_cert, ensure_parent_dirs_in_rootfs, install_ca, open_child_dir,
-    open_dir_handle, open_parent_dir_handle, read_file_capped_from_parent, resolve_in_rootfs,
-    safe_join_rootfs, safe_join_rootfs_from, InstallReport, SkippedPath, BEFORE_USE_HOOK,
-    FORCE_CHOWN_FAILURE, MAX_AGGREGATE_BYTES, MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES,
-    MAX_PEM_BUNDLE_BYTES, MAX_REPORT_ENTRIES, MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
+    bundle_contains_cert, check_report_target_collision, encode_path_lossless,
+    ensure_parent_dirs_in_rootfs, install_ca, open_child_dir, open_dir_handle,
+    open_parent_dir_handle, read_file_capped_from_parent, resolve_in_rootfs, safe_join_rootfs,
+    safe_join_rootfs_from, set_before_dir_enum_hook_guard, set_before_use_hook_guard,
+    set_chown_failure_guard, BeforeDirEnumHookGuard, BeforeUseHookGuard, ChownFailureGuard,
+    InstallReport, SkippedPath, BEFORE_USE_HOOK, FORCE_CHOWN_FAILURE, MAX_AGGREGATE_BYTES,
+    MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES, MAX_REPORT_ENTRIES,
+    MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
 };
 pub use jks::{
     compute_jks_integrity_hash, create_empty_jks, inject_ca_into_jks, is_pkcs12, parse_jks,

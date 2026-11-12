@@ -6,8 +6,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use hermetic_trust::{
-    atomic_write_file, check_not_alias, install_ca, mint_ca, read_cert_file_bounded,
-    read_seed_file, validate_output_path, write_private_key_file, TrustError,
+    atomic_write_file, check_not_alias, check_report_target_collision, install_ca, mint_ca,
+    read_cert_file_bounded, read_seed_file, validate_output_path, write_private_key_file,
+    TrustError,
 };
 
 #[derive(Parser, Debug)]
@@ -91,6 +92,7 @@ fn run() -> Result<(), TrustError> {
             if let Some(ref report_path) = report {
                 check_not_alias(report_path, &ca_cert, "report", "ca_cert")?;
                 validate_output_path(report_path)?;
+                check_report_target_collision(&rootfs, report_path)?;
             }
 
             let ca_pem = read_cert_file_bounded(&ca_cert)?;

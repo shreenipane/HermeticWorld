@@ -266,6 +266,92 @@ pub fn parse_sequence_items(mut input: &[u8]) -> Result<Vec<Tlv<'_>>, TrustError
     Ok(items)
 }
 
+/// Parse an ASN.1 Time (UTCTime tag 0x17 or GeneralizedTime tag 0x18) into OffsetDateTime.
+pub fn parse_asn1_time(tlv: &Tlv<'_>) -> Result<time::OffsetDateTime, TrustError> {
+    let s = std::str::from_utf8(tlv.value)
+        .map_err(|_| TrustError::Cert("ASN.1 time is not valid UTF-8/ASCII".to_string()))?;
+    if !s.ends_with('Z') {
+        return Err(TrustError::Cert("ASN.1 time must end with 'Z'".to_string()));
+    }
+    match tlv.tag {
+        0x17 => {
+            // UTCTime: YYMMDDHHMMSSZ (13 chars)
+            if s.len() != 13 {
+                return Err(TrustError::Cert(format!(
+                    "invalid UTCTime length {}, expected 13 (YYMMDDHHMMSSZ)",
+                    s.len()
+                )));
+            }
+            let yy: i32 = s[0..2]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime year".to_string()))?;
+            let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
+            let month_num: u8 = s[2..4]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime month".to_string()))?;
+            let month = time::Month::try_from(month_num)
+                .map_err(|_| TrustError::Cert("invalid UTCTime month number".to_string()))?;
+            let day: u8 = s[4..6]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime day".to_string()))?;
+            let hour: u8 = s[6..8]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime hour".to_string()))?;
+            let minute: u8 = s[8..10]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime minute".to_string()))?;
+            let second: u8 = s[10..12]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid UTCTime second".to_string()))?;
+
+            let date = time::Date::from_calendar_date(year, month, day).map_err(|e| {
+                TrustError::Cert(format!("invalid calendar date in UTCTime: {}", e))
+            })?;
+            let time = time::Time::from_hms(hour, minute, second)
+                .map_err(|e| TrustError::Cert(format!("invalid time in UTCTime: {}", e)))?;
+            Ok(time::OffsetDateTime::new_utc(date, time))
+        }
+        0x18 => {
+            // GeneralizedTime: YYYYMMDDHHMMSSZ (15 chars)
+            if s.len() != 15 {
+                return Err(TrustError::Cert(format!(
+                    "invalid GeneralizedTime length {}, expected 15 (YYYYMMDDHHMMSSZ)",
+                    s.len()
+                )));
+            }
+            let year: i32 = s[0..4]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime year".to_string()))?;
+            let month_num: u8 = s[4..6]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime month".to_string()))?;
+            let month = time::Month::try_from(month_num).map_err(|_| {
+                TrustError::Cert("invalid GeneralizedTime month number".to_string())
+            })?;
+            let day: u8 = s[6..8]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime day".to_string()))?;
+            let hour: u8 = s[8..10]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime hour".to_string()))?;
+            let minute: u8 = s[10..12]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime minute".to_string()))?;
+            let second: u8 = s[12..14]
+                .parse()
+                .map_err(|_| TrustError::Cert("invalid GeneralizedTime second".to_string()))?;
+
+            let date = time::Date::from_calendar_date(year, month, day).map_err(|e| {
+                TrustError::Cert(format!("invalid calendar date in GeneralizedTime: {}", e))
+            })?;
+            let time = time::Time::from_hms(hour, minute, second)
+                .map_err(|e| TrustError::Cert(format!("invalid time in GeneralizedTime: {}", e)))?;
+            Ok(time::OffsetDateTime::new_utc(date, time))
+        }
+        _ => Err(TrustError::Cert("invalid time tag in validity".to_string())),
+    }
+}
+
 /// Validate a complete X.509 CA certificate, including basicConstraints (CA:true)
 /// and cryptographic signature before any mutation.
 pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
@@ -308,6 +394,13 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         ));
     }
 
+    let expected_sig_alg = encode_sha256_with_rsa_algorithm();
+    if sig_alg_tlv.raw != expected_sig_alg.as_slice() {
+        return Err(TrustError::Cert(
+            "unsupported signature algorithm: expected sha256WithRSAEncryption with NULL parameters".to_string(),
+        ));
+    }
+
     let tbs_items = parse_sequence_items(tbs_tlv.value)?;
     if tbs_items.len() < 6 {
         return Err(TrustError::Cert(
@@ -336,6 +429,12 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
             "missing or invalid signature in TBSCertificate".to_string(),
         ));
     }
+    let tbs_sig_alg = &tbs_items[idx];
+    if sig_alg_tlv.raw != tbs_sig_alg.raw {
+        return Err(TrustError::Cert(
+            "certificate signatureAlgorithm does not match tbsCertificate.signature".to_string(),
+        ));
+    }
     idx += 1;
     if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
         return Err(TrustError::Cert(
@@ -349,6 +448,20 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
             "missing or invalid validity in TBSCertificate".to_string(),
         ));
     }
+    let validity_tlv = &tbs_items[idx];
+    let validity_items = parse_sequence_items(validity_tlv.value)?;
+    if validity_items.len() != 2 {
+        return Err(TrustError::Cert(
+            "validity must contain exactly notBefore and notAfter".to_string(),
+        ));
+    }
+    let not_before = parse_asn1_time(&validity_items[0])?;
+    let not_after = parse_asn1_time(&validity_items[1])?;
+    if not_before > not_after {
+        return Err(TrustError::Cert(
+            "validity notBefore is after notAfter".to_string(),
+        ));
+    }
     idx += 1;
     if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
         return Err(TrustError::Cert(
@@ -356,6 +469,14 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         ));
     }
     let subject_tlv = &tbs_items[idx];
+
+    // Require and verify self-signed CA format: issuer must match subject
+    if issuer_tlv.raw != subject_tlv.raw {
+        return Err(TrustError::Cert(
+            "CA certificate is not self-signed: issuer does not match subject".to_string(),
+        ));
+    }
+
     idx += 1;
     if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
         return Err(TrustError::Cert(
@@ -427,6 +548,14 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
             "invalid SPKI algorithm or public key tag".to_string(),
         ));
     }
+
+    let expected_spki_alg = encode_rsa_algorithm();
+    if alg_tlv.raw != expected_spki_alg.as_slice() {
+        return Err(TrustError::Cert(
+            "unsupported SPKI algorithm: expected rsaEncryption".to_string(),
+        ));
+    }
+
     if spk_bit_string.value.is_empty() || spk_bit_string.value[0] != 0 {
         return Err(TrustError::Cert("invalid BIT STRING in SPKI".to_string()));
     }
@@ -436,24 +565,22 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         TrustError::Cert(format!("failed to parse RSA public key from SPKI: {}", e))
     })?;
 
-    // Verify self-signed signature if issuer == subject
+    // Verify self-signed signature
     if sig_val_tlv.value.is_empty() || sig_val_tlv.value[0] != 0 {
         return Err(TrustError::Cert("invalid signature BIT STRING".to_string()));
     }
     let sig_bytes = &sig_val_tlv.value[1..];
 
-    if issuer_tlv.raw == subject_tlv.raw {
-        use rsa::pkcs1v15::{Signature, VerifyingKey};
-        use rsa::signature::Verifier;
-        use sha2::Sha256;
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use sha2::Sha256;
 
-        let signature = Signature::try_from(sig_bytes)
-            .map_err(|e| TrustError::Cert(format!("invalid RSA signature length: {}", e)))?;
-        let verifying_key = VerifyingKey::<Sha256>::new(public_key);
-        verifying_key.verify(tbs_tlv.raw, &signature).map_err(|e| {
-            TrustError::Cert(format!("CA self-signature verification failed: {}", e))
-        })?;
-    }
+    let signature = Signature::try_from(sig_bytes)
+        .map_err(|e| TrustError::Cert(format!("invalid RSA signature length: {}", e)))?;
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+    verifying_key
+        .verify(tbs_tlv.raw, &signature)
+        .map_err(|e| TrustError::Cert(format!("CA self-signature verification failed: {}", e)))?;
 
     Ok(())
 }

@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::TrustError;
@@ -58,10 +59,13 @@ pub fn safe_join_rootfs_from(rootfs: &Path, base_dir: &Path, target: &Path) -> P
 
 /// Resolves symlinks strictly within the rootfs as if rootfs were `/`.
 /// Absolute symlink targets are interpreted relative to rootfs.
+/// Retains a root directory handle and resolves each component through validated directory handles.
 /// Detects symlink loops and limits hop depth to 40.
 pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustError> {
     use std::collections::VecDeque;
+    use std::os::unix::io::AsRawFd;
 
+    let root_handle = open_dir_handle(rootfs)?;
     let rootfs_canon = rootfs
         .canonicalize()
         .unwrap_or_else(|_| rootfs.to_path_buf());
@@ -85,33 +89,35 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
         }
     }
 
-    let mut current = rootfs.to_path_buf();
+    // Stack of open directory handles: (File, rel_path)
+    let mut handle_stack: Vec<(fs::File, PathBuf)> = vec![(root_handle, PathBuf::new())];
     let mut hops = 0;
     const MAX_HOPS: usize = 40;
 
     while let Some(comp) = queue.pop_front() {
         if comp == Path::new("..") {
-            let at_root = current == rootfs
-                || current == rootfs_canon
-                || match current.strip_prefix(rootfs) {
-                    Ok(p) => p.as_os_str().is_empty(),
-                    Err(_) => match current.strip_prefix(&rootfs_canon) {
-                        Ok(p) => p.as_os_str().is_empty(),
-                        Err(_) => false,
-                    },
-                };
-            if !at_root {
-                current.pop();
+            if handle_stack.len() > 1 {
+                handle_stack.pop();
             }
             continue;
         }
 
-        let candidate = current.join(&comp);
-        let meta = match fs::symlink_metadata(&candidate) {
+        let current_fd = handle_stack.last().unwrap().0.as_raw_fd();
+        let child_proc = PathBuf::from(format!("/proc/self/fd/{}", current_fd)).join(&comp);
+
+        let meta = match fs::symlink_metadata(&child_proc) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                current = candidate;
-                continue;
+                let mut current_rel = handle_stack.last().unwrap().1.clone();
+                current_rel.push(&comp);
+                for rem in queue {
+                    if rem == Path::new("..") {
+                        current_rel.pop();
+                    } else {
+                        current_rel.push(rem);
+                    }
+                }
+                return Ok(rootfs.join(current_rel));
             }
             Err(e) => {
                 return Err(TrustError::Symlink(format!(
@@ -128,11 +134,11 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
                 return Err(TrustError::Symlink("symlink loop detected".to_string()));
             }
 
-            let target = fs::read_link(&candidate)
+            let target = fs::read_link(&child_proc)
                 .map_err(|e| TrustError::Symlink(format!("read_link {}: {}", comp.display(), e)))?;
 
             if target.is_absolute() {
-                current = rootfs.to_path_buf();
+                handle_stack.truncate(1);
                 let rel_target = target.strip_prefix("/").unwrap_or(&target);
                 let target_comps: Vec<PathBuf> = rel_target
                     .components()
@@ -160,12 +166,25 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
                     queue.push_front(c);
                 }
             }
+        } else if meta.is_dir() {
+            let next_dir = open_child_dir(current_fd, comp.as_os_str())?;
+            let next_rel = handle_stack.last().unwrap().1.join(&comp);
+            handle_stack.push((next_dir, next_rel));
         } else {
-            current = candidate;
+            let mut current_rel = handle_stack.last().unwrap().1.clone();
+            current_rel.push(&comp);
+            if !queue.is_empty() {
+                return Err(TrustError::Symlink(format!(
+                    "not a directory in path: {}",
+                    comp.display()
+                )));
+            }
+            return Ok(rootfs.join(current_rel));
         }
     }
 
-    Ok(current)
+    let final_rel = &handle_stack.last().unwrap().1;
+    Ok(rootfs.join(final_rel))
 }
 
 /// Named cap for CA certificate input (1 MiB)
@@ -201,6 +220,99 @@ pub static FORCE_CHOWN_FAILURE: std::sync::atomic::AtomicBool =
 pub static BEFORE_USE_HOOK: std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::RwLock::new(None);
 
+thread_local! {
+    static THREAD_CHOWN_FAILURE: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
+    static THREAD_BEFORE_USE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static THREAD_BEFORE_DIR_ENUM_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub struct ChownFailureGuard;
+impl Drop for ChownFailureGuard {
+    fn drop(&mut self) {
+        THREAD_CHOWN_FAILURE.with(|c| *c.borrow_mut() = false);
+    }
+}
+
+pub fn set_chown_failure_guard() -> ChownFailureGuard {
+    THREAD_CHOWN_FAILURE.with(|c| *c.borrow_mut() = true);
+    ChownFailureGuard
+}
+
+pub struct BeforeUseHookGuard;
+impl Drop for BeforeUseHookGuard {
+    fn drop(&mut self) {
+        THREAD_BEFORE_USE_HOOK.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub fn set_before_use_hook_guard<F: Fn() + 'static>(f: F) -> BeforeUseHookGuard {
+    THREAD_BEFORE_USE_HOOK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    BeforeUseHookGuard
+}
+
+pub struct BeforeDirEnumHookGuard;
+impl Drop for BeforeDirEnumHookGuard {
+    fn drop(&mut self) {
+        THREAD_BEFORE_DIR_ENUM_HOOK.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub fn set_before_dir_enum_hook_guard<F: Fn() + 'static>(f: F) -> BeforeDirEnumHookGuard {
+    THREAD_BEFORE_DIR_ENUM_HOOK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    BeforeDirEnumHookGuard
+}
+
+/// Losslessly encode a filesystem path into a valid UTF-8 String for reporting.
+pub fn encode_path_lossless(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                let mut out = String::with_capacity(bytes.len() * 4);
+                let mut i = 0;
+                while i < bytes.len() {
+                    match std::str::from_utf8(&bytes[i..]) {
+                        Ok(valid) => {
+                            out.push_str(valid);
+                            break;
+                        }
+                        Err(err) => {
+                            let valid_len = err.valid_up_to();
+                            if valid_len > 0 {
+                                if let Ok(s) = std::str::from_utf8(&bytes[i..i + valid_len]) {
+                                    out.push_str(s);
+                                }
+                                i += valid_len;
+                            }
+                            if let Some(error_len) = err.error_len() {
+                                for &b in &bytes[i..i + error_len] {
+                                    use std::fmt::Write;
+                                    let _ = write!(out, "\\x{:02x}", b);
+                                }
+                                i += error_len;
+                            } else {
+                                for &b in &bytes[i..] {
+                                    use std::fmt::Write;
+                                    let _ = write!(out, "\\x{:02x}", b);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().to_string()
+    }
+}
+
 /// Open a directory handle safely without following symlinks.
 pub fn open_dir_handle(path: &Path) -> Result<fs::File, TrustError> {
     let mut options = fs::OpenOptions::new();
@@ -214,11 +326,12 @@ pub fn open_dir_handle(path: &Path) -> Result<fs::File, TrustError> {
 }
 
 /// Open a child directory through an existing directory handle without following symlinks.
-pub fn open_child_dir(
+pub fn open_child_dir<P: AsRef<std::ffi::OsStr> + ?Sized>(
     parent_fd: std::os::unix::io::RawFd,
-    comp: &str,
+    comp: &P,
 ) -> Result<fs::File, TrustError> {
-    let proc_path = format!("/proc/self/fd/{}/{}", parent_fd, comp);
+    let comp = comp.as_ref();
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd)).join(comp);
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -238,14 +351,14 @@ pub fn open_child_dir(
 pub fn open_parent_dir_handle(
     rootfs: &Path,
     rel_path: &Path,
-) -> Result<(fs::File, String), TrustError> {
+) -> Result<(fs::File, std::ffi::OsString), TrustError> {
     use std::os::unix::io::AsRawFd;
 
     let mut current_dir = open_dir_handle(rootfs)?;
-    let mut comps: Vec<String> = Vec::new();
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
     for comp in rel_path.components() {
         if let Component::Normal(c) = comp {
-            comps.push(c.to_string_lossy().to_string());
+            comps.push(c.to_os_string());
         }
     }
     if comps.is_empty() {
@@ -254,7 +367,7 @@ pub fn open_parent_dir_handle(
     let file_name = comps.pop().unwrap();
 
     for comp in &comps {
-        let next_dir = open_child_dir(current_dir.as_raw_fd(), comp)?;
+        let next_dir = open_child_dir(current_dir.as_raw_fd(), comp.as_os_str())?;
         current_dir = next_dir;
     }
 
@@ -265,14 +378,14 @@ pub fn open_parent_dir_handle(
 pub fn ensure_parent_dirs_in_rootfs(
     rootfs: &Path,
     rel_path: &Path,
-) -> Result<(fs::File, String), TrustError> {
+) -> Result<(fs::File, std::ffi::OsString), TrustError> {
     use std::os::unix::io::AsRawFd;
 
     let mut current_dir = open_dir_handle(rootfs)?;
-    let mut comps: Vec<String> = Vec::new();
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
     for comp in rel_path.components() {
         if let Component::Normal(c) = comp {
-            comps.push(c.to_string_lossy().to_string());
+            comps.push(c.to_os_string());
         }
     }
     if comps.is_empty() {
@@ -282,12 +395,12 @@ pub fn ensure_parent_dirs_in_rootfs(
 
     for comp in &comps {
         let fd = current_dir.as_raw_fd();
-        let child_proc = format!("/proc/self/fd/{}/{}", fd, comp);
-        match open_child_dir(fd, comp) {
+        let child_proc = PathBuf::from(format!("/proc/self/fd/{}", fd)).join(comp);
+        match open_child_dir(fd, comp.as_os_str()) {
             Ok(d) => current_dir = d,
             Err(_) => {
                 let _ = fs::create_dir(&child_proc);
-                let next_dir = open_child_dir(fd, comp)?;
+                let next_dir = open_child_dir(fd, comp.as_os_str())?;
                 current_dir = next_dir;
             }
         }
@@ -298,21 +411,28 @@ pub fn ensure_parent_dirs_in_rootfs(
 
 /// Read a file up to `cap` bytes through a parent directory handle.
 /// Prevents symlink following and FIFO blocking, validating the opened descriptor.
-pub fn read_file_capped_from_parent(
+pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
     parent_dir: &fs::File,
-    file_name: &str,
+    file_name: &P,
     cap: u64,
 ) -> Result<Vec<u8>, TrustError> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let proc_path = format!("/proc/self/fd/{}/{}", parent_dir.as_raw_fd(), file_name);
+    let file_name = file_name.as_ref();
+    let proc_path =
+        PathBuf::from(format!("/proc/self/fd/{}", parent_dir.as_raw_fd())).join(file_name);
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 
+    THREAD_BEFORE_USE_HOOK.with(|cell| {
+        if let Some(ref hook) = *cell.borrow() {
+            hook();
+        }
+    });
     if let Ok(guard) = BEFORE_USE_HOOK.read() {
         if let Some(ref hook) = *guard {
             hook();
@@ -356,17 +476,16 @@ fn read_file_capped(path: &Path, cap: u64) -> Result<Vec<u8>, TrustError> {
     let parent_file = open_dir_handle(parent)?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| TrustError::Cert("invalid path has no file name".to_string()))?
-        .to_string_lossy();
-    read_file_capped_from_parent(&parent_file, &file_name, cap)
+        .ok_or_else(|| TrustError::Cert("invalid path has no file name".to_string()))?;
+    read_file_capped_from_parent(&parent_file, file_name, cap)
 }
 
 /// Write data atomically into parent directory handle: writes to a temporary file
 /// anchored to the directory handle, sets permissions and ownership through descriptors,
 /// flushes, and replaces atomically through the handle.
-pub fn atomic_write_preserving_handle(
+pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
     parent_dir: &fs::File,
-    file_name: &str,
+    file_name: &P,
     data: &[u8],
     new_file_mode: Option<u32>,
 ) -> Result<(), TrustError> {
@@ -375,8 +494,9 @@ pub fn atomic_write_preserving_handle(
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
 
+    let file_name = file_name.as_ref();
     let parent_fd = parent_dir.as_raw_fd();
-    let target_proc_path = format!("/proc/self/fd/{}/{}", parent_fd, file_name);
+    let target_proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd)).join(file_name);
 
     // Validate target through handle with O_NOFOLLOW | O_NONBLOCK
     let mut check_opts = fs::OpenOptions::new();
@@ -390,13 +510,13 @@ pub fn atomic_write_preserving_handle(
             if meta.file_type().is_symlink() {
                 return Err(TrustError::Symlink(format!(
                     "target '{}' is a symlink",
-                    file_name
+                    file_name.to_string_lossy()
                 )));
             }
             if !meta.file_type().is_file() {
                 return Err(TrustError::Symlink(format!(
                     "target '{}' is not a regular file",
-                    file_name
+                    file_name.to_string_lossy()
                 )));
             }
             Some(meta)
@@ -405,13 +525,18 @@ pub fn atomic_write_preserving_handle(
         Err(e) if e.raw_os_error() == Some(ELOOP) => {
             return Err(TrustError::Symlink(format!(
                 "target '{}' is a symlink",
-                file_name
+                file_name.to_string_lossy()
             )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(TrustError::Io(e)),
     };
 
+    THREAD_BEFORE_USE_HOOK.with(|cell| {
+        if let Some(ref hook) = *cell.borrow() {
+            hook();
+        }
+    });
     if let Ok(guard) = BEFORE_USE_HOOK.read() {
         if let Some(ref hook) = *guard {
             hook();
@@ -431,7 +556,7 @@ pub fn atomic_write_preserving_handle(
                 .unwrap_or(0),
             attempt
         );
-        let tmp_proc_path = format!("/proc/self/fd/{}/{}", parent_fd, tmp_name);
+        let tmp_proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd)).join(&tmp_name);
 
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -447,31 +572,40 @@ pub fn atomic_write_preserving_handle(
                     temp_file.write_all(data)?;
                     temp_file.sync_all()?;
 
-                    // Permissions change through descriptor handle (fchmod)
                     #[cfg(unix)]
                     {
                         if let Some(ref meta) = existing_meta {
-                            let perms = meta.permissions();
-                            temp_file.set_permissions(perms)?;
-
-                            // Ownership change through descriptor handle (fchown via /proc/self/fd)
                             let target_uid = meta.uid();
                             let target_gid = meta.gid();
-                            let current_uid = crate::cert::get_current_uid()?;
-                            if FORCE_CHOWN_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
-                                return Err(TrustError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    "forced chown failure for test: Operation not permitted",
-                                )));
-                            }
-                            if target_uid != current_uid {
+                            let temp_meta = temp_file.metadata()?;
+                            let temp_uid = temp_meta.uid();
+                            let temp_gid = temp_meta.gid();
+
+                            let is_injected = THREAD_CHOWN_FAILURE.with(|c| *c.borrow())
+                                || FORCE_CHOWN_FAILURE.load(std::sync::atomic::Ordering::SeqCst);
+
+                            // Defects 8 & 10: Change ownership if either UID or GID differs,
+                            // or inject failure at the ownership operation, through normal execution path
+                            if is_injected || target_uid != temp_uid || target_gid != temp_gid {
                                 let temp_proc = format!("/proc/self/fd/{}", temp_file.as_raw_fd());
-                                std::os::unix::fs::chown(
-                                    &temp_proc,
-                                    Some(target_uid),
-                                    Some(target_gid),
-                                )?;
+                                let chown_res = if is_injected {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "forced chown failure for test: Operation not permitted",
+                                    ))
+                                } else {
+                                    std::os::unix::fs::chown(
+                                        &temp_proc,
+                                        Some(target_uid),
+                                        Some(target_gid),
+                                    )
+                                };
+                                chown_res.map_err(TrustError::Io)?;
                             }
+
+                            // Defect 8: Restore permissions AFTER ownership changes so special mode bits are preserved
+                            let perms = meta.permissions();
+                            temp_file.set_permissions(perms)?;
                         } else if let Some(mode) = new_file_mode {
                             let perms = fs::Permissions::from_mode(mode);
                             temp_file.set_permissions(perms)?;
@@ -485,7 +619,7 @@ pub fn atomic_write_preserving_handle(
                         if m.file_type().is_symlink() {
                             return Err(TrustError::Symlink(format!(
                                 "target '{}' is a symlink",
-                                file_name
+                                file_name.to_string_lossy()
                             )));
                         }
                     }
@@ -539,9 +673,8 @@ pub fn atomic_write_preserving(
     let parent_file = open_dir_handle(parent)?;
     let file_name = target_path
         .file_name()
-        .ok_or_else(|| TrustError::Cert("invalid target path has no file name".to_string()))?
-        .to_string_lossy();
-    atomic_write_preserving_handle(&parent_file, &file_name, data, new_file_mode)
+        .ok_or_else(|| TrustError::Cert("invalid target path has no file name".to_string()))?;
+    atomic_write_preserving_handle(&parent_file, file_name, data, new_file_mode)
 }
 
 /// Check if a PEM bundle already contains the given certificate DER.
@@ -645,8 +778,8 @@ enum CandidateFormat {
 
 #[derive(Debug, Clone)]
 struct Candidate {
-    rel_path: String,
-    target_rel: String,
+    rel_path: PathBuf,
+    target_rel: PathBuf,
     format: CandidateFormat,
 }
 
@@ -717,18 +850,20 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
         .canonicalize()
         .unwrap_or_else(|_| rootfs.to_path_buf());
 
-    // Helper to turn absolute path inside rootfs into a rootfs-relative string without host prefix
-    let make_rel = |p: &Path| -> String {
+    // Helper to turn absolute path inside rootfs into a rootfs-relative PathBuf
+    let make_rel_path = |p: &Path| -> PathBuf {
         p.strip_prefix(rootfs)
             .or_else(|_| p.strip_prefix(&rootfs_canon))
-            .map(|r| r.to_string_lossy().to_string())
-            .unwrap_or_else(|_| p.to_string_lossy().to_string())
+            .map(|r| r.to_path_buf())
+            .unwrap_or_else(|_| p.to_path_buf())
     };
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut skipped_paths: Vec<SkippedPath> = Vec::new();
     let mut total_tree_entries: usize = 0;
     let mut aggregate_bytes: u64 = 0;
+
+    let root_handle = open_dir_handle(rootfs)?;
 
     // 1. Discover Known System Bundles
     let known_system_bundles = [
@@ -747,31 +882,31 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(_) => {
                         skipped_paths.push(SkippedPath {
-                            path: make_rel(&bundle_path),
+                            path: rel_str.to_string(),
                             reason: "cannot stat target".to_string(),
                         });
                         continue;
                     }
                 };
 
-                let rel_target = make_rel(&target);
+                let rel_target = make_rel_path(&target);
                 if target_meta.is_dir() {
                     skipped_paths.push(SkippedPath {
-                        path: make_rel(&bundle_path),
+                        path: rel_str.to_string(),
                         reason: "bundle_is_directory".to_string(),
                     });
                     continue;
                 }
                 if !target_meta.file_type().is_file() {
                     skipped_paths.push(SkippedPath {
-                        path: make_rel(&bundle_path),
+                        path: rel_str.to_string(),
                         reason: "not a regular file".to_string(),
                     });
                     continue;
                 }
                 if target_meta.len() > MAX_PEM_BUNDLE_BYTES {
                     skipped_paths.push(SkippedPath {
-                        path: rel_target,
+                        path: encode_path_lossless(&rel_target),
                         reason: format!("file exceeds size cap of {} bytes", MAX_PEM_BUNDLE_BYTES),
                     });
                     continue;
@@ -783,7 +918,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 }
 
                 candidates.push(Candidate {
-                    rel_path: rel_str.to_string(),
+                    rel_path: PathBuf::from(rel_str),
                     target_rel: rel_target,
                     format: CandidateFormat::Pem,
                 });
@@ -827,25 +962,25 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             let file_path = rootfs.join(file_rel);
             match resolve_in_rootfs(rootfs, &file_path) {
                 Ok(target) => {
-                    let rel_target = make_rel(&target);
+                    let rel_target = make_rel_path(&target);
                     if let Ok(m) = fs::symlink_metadata(&target) {
                         if m.is_dir() {
                             skipped_paths.push(SkippedPath {
-                                path: rel_target,
+                                path: encode_path_lossless(&rel_target),
                                 reason: "bundle_is_directory".to_string(),
                             });
                             continue;
                         }
                         if !m.file_type().is_file() {
                             skipped_paths.push(SkippedPath {
-                                path: rel_target,
+                                path: encode_path_lossless(&rel_target),
                                 reason: "not a regular file".to_string(),
                             });
                             continue;
                         }
                         if m.len() > MAX_PEM_BUNDLE_BYTES {
                             skipped_paths.push(SkippedPath {
-                                path: rel_target,
+                                path: encode_path_lossless(&rel_target),
                                 reason: format!(
                                     "file exceeds size cap of {} bytes",
                                     MAX_PEM_BUNDLE_BYTES
@@ -862,7 +997,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     }
 
                     candidates.push(Candidate {
-                        rel_path: file_rel.to_string(),
+                        rel_path: PathBuf::from(file_rel),
                         target_rel: rel_target,
                         format: CandidateFormat::Pem,
                     });
@@ -881,34 +1016,49 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
         }
     }
 
-    // 3. Tree Walk (Bounded Discovery)
-    let mut dirs_to_visit = vec![(rootfs.to_path_buf(), 0usize)];
+    // 3. Tree Walk (Bounded Discovery using validated directory handles)
+    let mut dirs_to_visit = vec![(root_handle.try_clone()?, PathBuf::new(), 0usize)];
 
-    while let Some((current_dir, depth)) = dirs_to_visit.pop() {
+    while let Some((current_dir_handle, current_rel, depth)) = dirs_to_visit.pop() {
         if depth > MAX_TREE_DEPTH {
             return Err(TrustError::Cert(
                 "rootfs directory depth exceeds limit".to_string(),
             ));
         }
 
-        let dir_entries = match fs::read_dir(&current_dir) {
+        THREAD_BEFORE_DIR_ENUM_HOOK.with(|cell| {
+            if let Some(ref hook) = *cell.borrow() {
+                hook();
+            }
+        });
+
+        let current_proc_path = format!("/proc/self/fd/{}", current_dir_handle.as_raw_fd());
+        let dir_entries = match fs::read_dir(&current_proc_path) {
             Ok(e) => e,
             Err(_) => {
                 skipped_paths.push(SkippedPath {
-                    path: make_rel(&current_dir),
+                    path: encode_path_lossless(&current_rel),
                     reason: "read_dir error".to_string(),
                 });
                 continue;
             }
         };
 
+        // Defect 3: Enforce entry budget WHILE enumerating, before retaining each entry
         let mut sorted_entries = Vec::new();
         for entry in dir_entries {
+            total_tree_entries += 1;
+            if total_tree_entries > MAX_TREE_ENTRIES {
+                return Err(TrustError::Cert(
+                    "rootfs entry count exceeds limit".to_string(),
+                ));
+            }
+
             match entry {
                 Ok(e) => sorted_entries.push(e),
                 Err(_) => {
                     skipped_paths.push(SkippedPath {
-                        path: make_rel(&current_dir),
+                        path: encode_path_lossless(&current_rel),
                         reason: "read_dir error".to_string(),
                     });
                 }
@@ -917,59 +1067,58 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
         sorted_entries.sort_by_key(|e| e.file_name());
 
         for entry in sorted_entries {
-            total_tree_entries += 1;
-            if total_tree_entries > MAX_TREE_ENTRIES {
-                return Err(TrustError::Cert(
-                    "rootfs entry count exceeds limit".to_string(),
-                ));
-            }
-
-            let entry_path = entry.path();
+            let file_name = entry.file_name();
+            let entry_rel = current_rel.join(&file_name);
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => {
                     skipped_paths.push(SkippedPath {
-                        path: make_rel(&entry_path),
+                        path: encode_path_lossless(&entry_rel),
                         reason: "file_type error".to_string(),
                     });
                     continue;
                 }
             };
 
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
-
             if file_type.is_dir() {
-                if file_name_str == "cacert.pem" {
-                    let parent_name = entry_path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy())
+                if file_name == "cacert.pem" {
+                    let parent_name = current_rel
+                        .file_name()
+                        .and_then(|n| n.to_str())
                         .unwrap_or_default();
                     if parent_name == "certifi" || parent_name == "ssl" {
                         skipped_paths.push(SkippedPath {
-                            path: make_rel(&entry_path),
+                            path: encode_path_lossless(&entry_rel),
                             reason: "bundle_is_directory".to_string(),
                         });
                         continue;
                     }
-                } else if file_name_str == "cacerts" {
+                } else if file_name == "cacerts" {
                     skipped_paths.push(SkippedPath {
-                        path: make_rel(&entry_path),
+                        path: encode_path_lossless(&entry_rel),
                         reason: "bundle_is_directory".to_string(),
                     });
                     continue;
                 }
 
-                dirs_to_visit.push((entry_path, depth + 1));
+                // Defect 1: Open child directory handle safely with O_DIRECTORY | O_NOFOLLOW
+                match open_child_dir(current_dir_handle.as_raw_fd(), comp_as_os_str(&file_name)) {
+                    Ok(child_handle) => {
+                        dirs_to_visit.push((child_handle, entry_rel, depth + 1));
+                    }
+                    Err(_) => {
+                        continue;
+                    }
+                }
                 continue;
             }
 
-            if file_name_str == "cacert.pem" {
-                let parent_name = entry_path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy())
+            let entry_path = rootfs.join(&entry_rel);
+
+            if file_name == "cacert.pem" {
+                let parent_name = current_rel
+                    .file_name()
+                    .and_then(|n| n.to_str())
                     .unwrap_or_default();
 
                 if parent_name == "certifi" || parent_name == "ssl" {
@@ -979,31 +1128,31 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 Ok(m) => m,
                                 Err(_) => {
                                     skipped_paths.push(SkippedPath {
-                                        path: make_rel(&entry_path),
+                                        path: encode_path_lossless(&entry_rel),
                                         reason: "cannot stat target".to_string(),
                                     });
                                     continue;
                                 }
                             };
 
-                            let rel_target = make_rel(&target);
+                            let rel_target = make_rel_path(&target);
                             if target_meta.is_dir() {
                                 skipped_paths.push(SkippedPath {
-                                    path: make_rel(&entry_path),
+                                    path: encode_path_lossless(&entry_rel),
                                     reason: "bundle_is_directory".to_string(),
                                 });
                                 continue;
                             }
                             if !target_meta.file_type().is_file() {
                                 skipped_paths.push(SkippedPath {
-                                    path: make_rel(&entry_path),
+                                    path: encode_path_lossless(&entry_rel),
                                     reason: "not a regular file".to_string(),
                                 });
                                 continue;
                             }
                             if target_meta.len() > MAX_PEM_BUNDLE_BYTES {
                                 skipped_paths.push(SkippedPath {
-                                    path: rel_target,
+                                    path: encode_path_lossless(&rel_target),
                                     reason: format!(
                                         "file exceeds size cap of {} bytes",
                                         MAX_PEM_BUNDLE_BYTES
@@ -1020,7 +1169,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             }
 
                             candidates.push(Candidate {
-                                rel_path: make_rel(&entry_path),
+                                rel_path: entry_rel,
                                 target_rel: rel_target,
                                 format: CandidateFormat::Pem,
                             });
@@ -1031,44 +1180,44 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 _ => "cannot stat target".to_string(),
                             };
                             skipped_paths.push(SkippedPath {
-                                path: make_rel(&entry_path),
+                                path: encode_path_lossless(&entry_rel),
                                 reason,
                             });
                         }
                     }
                 }
-            } else if file_name_str == "cacerts" {
+            } else if file_name == "cacerts" {
                 match resolve_in_rootfs(rootfs, &entry_path) {
                     Ok(target) => {
                         let target_meta = match fs::symlink_metadata(&target) {
                             Ok(m) => m,
                             Err(_) => {
                                 skipped_paths.push(SkippedPath {
-                                    path: make_rel(&entry_path),
+                                    path: encode_path_lossless(&entry_rel),
                                     reason: "cannot stat target".to_string(),
                                 });
                                 continue;
                             }
                         };
 
-                        let rel_target = make_rel(&target);
+                        let rel_target = make_rel_path(&target);
                         if target_meta.is_dir() {
                             skipped_paths.push(SkippedPath {
-                                path: make_rel(&entry_path),
+                                path: encode_path_lossless(&entry_rel),
                                 reason: "bundle_is_directory".to_string(),
                             });
                             continue;
                         }
                         if !target_meta.file_type().is_file() {
                             skipped_paths.push(SkippedPath {
-                                path: make_rel(&entry_path),
+                                path: encode_path_lossless(&entry_rel),
                                 reason: "not a regular file".to_string(),
                             });
                             continue;
                         }
                         if target_meta.len() > MAX_JKS_BYTES {
                             skipped_paths.push(SkippedPath {
-                                path: rel_target,
+                                path: encode_path_lossless(&rel_target),
                                 reason: format!("file exceeds size cap of {} bytes", MAX_JKS_BYTES),
                             });
                             continue;
@@ -1082,7 +1231,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         }
 
                         candidates.push(Candidate {
-                            rel_path: make_rel(&entry_path),
+                            rel_path: entry_rel,
                             target_rel: rel_target,
                             format: CandidateFormat::Jks,
                         });
@@ -1093,7 +1242,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             _ => "cannot stat target".to_string(),
                         };
                         skipped_paths.push(SkippedPath {
-                            path: make_rel(&entry_path),
+                            path: encode_path_lossless(&entry_rel),
                             reason,
                         });
                     }
@@ -1107,8 +1256,8 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     }
 
     // 4. Deterministic Discovery & Target Conflict Detection
-    let mut candidate_targets: BTreeMap<String, (CandidateFormat, String)> = BTreeMap::new();
-    let mut conflicted_targets: HashSet<String> = HashSet::new();
+    let mut candidate_targets: BTreeMap<PathBuf, (CandidateFormat, PathBuf)> = BTreeMap::new();
+    let mut conflicted_targets: HashSet<PathBuf> = HashSet::new();
 
     for cand in &candidates {
         if let Some(&(existing_fmt, _)) = candidate_targets.get(&cand.target_rel) {
@@ -1127,7 +1276,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     for cand in &candidates {
         if conflicted_targets.contains(&cand.target_rel) {
             skipped_paths.push(SkippedPath {
-                path: cand.rel_path.clone(),
+                path: encode_path_lossless(&cand.rel_path),
                 reason: "conflicting_target_format".to_string(),
             });
         }
@@ -1143,22 +1292,24 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
             .then_with(|| a.target_rel.cmp(&b.target_rel))
     });
 
-    let mut modified_paths = HashSet::new();
-    let mut processed_targets = HashSet::new();
-    let mut successful_system_bundle_targets: HashSet<String> = HashSet::new();
+    let mut modified_paths: HashSet<PathBuf> = HashSet::new();
+    let mut processed_targets: HashSet<PathBuf> = HashSet::new();
+    let mut successful_system_bundle_targets: HashSet<PathBuf> = HashSet::new();
     let mut first_existing_system_bundle: Option<String> = None;
 
     // 5. PHASE 2: Execution (Handle-Anchored Mutations)
     for cand in candidates {
-        let is_system_bundle = known_system_bundles.contains(&cand.rel_path.as_str());
+        let is_system_bundle = known_system_bundles
+            .iter()
+            .any(|&k| Path::new(k) == cand.rel_path);
 
         if processed_targets.insert(cand.target_rel.clone()) {
-            let parent_res = open_parent_dir_handle(rootfs, Path::new(&cand.target_rel));
+            let parent_res = open_parent_dir_handle(rootfs, &cand.target_rel);
             let (parent_dir, file_name) = match parent_res {
                 Ok(p) => p,
                 Err(e) => {
                     skipped_paths.push(SkippedPath {
-                        path: cand.target_rel.clone(),
+                        path: encode_path_lossless(&cand.target_rel),
                         reason: e.to_string(),
                     });
                     continue;
@@ -1178,7 +1329,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         }
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
-                                path: cand.target_rel.clone(),
+                                path: encode_path_lossless(&cand.target_rel),
                                 reason: e.to_string(),
                             });
                             continue;
@@ -1188,14 +1339,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     // Reject if file appears to be a JKS or PKCS#12 keystore
                     if content.len() >= 4 && content[0..4] == [0xFE, 0xED, 0xFE, 0xED] {
                         skipped_paths.push(SkippedPath {
-                            path: cand.target_rel.clone(),
+                            path: encode_path_lossless(&cand.target_rel),
                             reason: "conflicting_target_format".to_string(),
                         });
                         continue;
                     }
                     if is_pkcs12(&content) {
                         skipped_paths.push(SkippedPath {
-                            path: cand.target_rel.clone(),
+                            path: encode_path_lossless(&cand.target_rel),
                             reason: "conflicting_target_format".to_string(),
                         });
                         continue;
@@ -1233,7 +1384,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         }
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
-                                path: cand.target_rel.clone(),
+                                path: encode_path_lossless(&cand.target_rel),
                                 reason: e.to_string(),
                             });
                         }
@@ -1248,7 +1399,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         Ok(c) => c,
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
-                                path: cand.target_rel.clone(),
+                                path: encode_path_lossless(&cand.target_rel),
                                 reason: e.to_string(),
                             });
                             continue;
@@ -1257,7 +1408,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
 
                     if is_pkcs12(&content) {
                         skipped_paths.push(SkippedPath {
-                            path: cand.target_rel.clone(),
+                            path: encode_path_lossless(&cand.target_rel),
                             reason: "unsupported_pkcs12".to_string(),
                         });
                         continue;
@@ -1276,7 +1427,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                                 }
                                 Err(e) => {
                                     skipped_paths.push(SkippedPath {
-                                        path: cand.target_rel.clone(),
+                                        path: encode_path_lossless(&cand.target_rel),
                                         reason: e.to_string(),
                                     });
                                 }
@@ -1287,7 +1438,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         }
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
-                                path: cand.target_rel.clone(),
+                                path: encode_path_lossless(&cand.target_rel),
                                 reason: e.to_string(),
                             });
                         }
@@ -1303,7 +1454,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     for rel_str in &known_system_bundles {
         let bundle_path = rootfs.join(rel_str);
         if let Ok(target) = resolve_in_rootfs(rootfs, &bundle_path) {
-            let rel_target = make_rel(&target);
+            let rel_target = make_rel_path(&target);
             if successful_system_bundle_targets.contains(&rel_target) {
                 first_existing_system_bundle = Some(format!("/{}", rel_str));
                 break;
@@ -1315,125 +1466,105 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     let mut established_system_bundle = first_existing_system_bundle;
 
     if established_system_bundle.is_none() {
-        let fallback_rel = "etc/ssl/certs/ca-certificates.crt";
-        let fallback_path = rootfs.join(fallback_rel);
+        let fallback_rel = PathBuf::from("etc/ssl/certs/ca-certificates.crt");
+        let fallback_path = rootfs.join(&fallback_rel);
         let target = resolve_in_rootfs(rootfs, &fallback_path)?;
-        let rel_target = make_rel(&target);
+        let rel_target = make_rel_path(&target);
+
+        // Defect 4: Fallback processing must apply format-conflict exclusions and candidate plan
+        if conflicted_targets.contains(&rel_target) {
+            skipped_paths.push(SkippedPath {
+                path: encode_path_lossless(&rel_target),
+                reason: "conflicting_target_format".to_string(),
+            });
+            return Err(TrustError::Cert(
+                "failed to establish a usable system trust bundle containing CA: fallback target has format conflict".to_string(),
+            ));
+        }
 
         match fs::symlink_metadata(&target) {
             Ok(meta) => {
                 if meta.is_dir() {
                     skipped_paths.push(SkippedPath {
-                        path: rel_target,
+                        path: encode_path_lossless(&rel_target),
                         reason: "bundle_is_directory".to_string(),
                     });
                 } else if !meta.file_type().is_file() {
                     skipped_paths.push(SkippedPath {
-                        path: rel_target,
+                        path: encode_path_lossless(&rel_target),
                         reason: "not a regular file".to_string(),
                     });
                 } else if meta.len() > MAX_PEM_BUNDLE_BYTES {
                     skipped_paths.push(SkippedPath {
-                        path: rel_target,
+                        path: encode_path_lossless(&rel_target),
                         reason: format!("file exceeds size cap of {} bytes", MAX_PEM_BUNDLE_BYTES),
                     });
                 } else {
-                    match open_parent_dir_handle(rootfs, Path::new(&rel_target)) {
-                        Ok((parent_dir, file_name)) => {
-                            let content = match read_file_capped_from_parent(
-                                &parent_dir,
-                                &file_name,
-                                MAX_PEM_BUNDLE_BYTES,
-                            ) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    skipped_paths.push(SkippedPath {
-                                        path: rel_target.clone(),
-                                        reason: e.to_string(),
-                                    });
-                                    Vec::new()
-                                }
-                            };
+                    let (parent_dir, file_name) = open_parent_dir_handle(rootfs, &rel_target)?;
+                    let content = read_file_capped_from_parent(
+                        &parent_dir,
+                        &file_name,
+                        MAX_PEM_BUNDLE_BYTES,
+                    )?;
 
-                            let contains = !content.is_empty()
-                                && bundle_contains_cert(&content, &canonical_ca_pem, ca_cert_der);
-                            if contains {
-                                established_system_bundle =
-                                    Some("/etc/ssl/certs/ca-certificates.crt".to_string());
-                            } else {
-                                let mut new_content = content;
-                                if !new_content.is_empty() && !new_content.ends_with(b"\n") {
-                                    new_content.push(b'\n');
-                                }
-                                new_content.extend_from_slice(canonical_ca_pem.as_bytes());
-                                if !new_content.ends_with(b"\n") {
-                                    new_content.push(b'\n');
-                                }
+                    // Defect 4: Exclude JKS and PKCS#12 targets, preserve rejected targets byte-for-byte
+                    if (content.len() >= 4 && content[0..4] == [0xFE, 0xED, 0xFE, 0xED])
+                        || is_pkcs12(&content)
+                    {
+                        let reason = if is_pkcs12(&content) {
+                            "unsupported_pkcs12"
+                        } else {
+                            "conflicting_target_format"
+                        };
+                        skipped_paths.push(SkippedPath {
+                            path: encode_path_lossless(&rel_target),
+                            reason: reason.to_string(),
+                        });
+                        return Err(TrustError::Cert(
+                            "failed to establish a usable system trust bundle containing CA: fallback target format rejected".to_string(),
+                        ));
+                    }
 
-                                match atomic_write_preserving_handle(
-                                    &parent_dir,
-                                    &file_name,
-                                    &new_content,
-                                    Some(0o644),
-                                ) {
-                                    Ok(()) => {
-                                        modified_paths.insert(rel_target);
-                                        established_system_bundle =
-                                            Some("/etc/ssl/certs/ca-certificates.crt".to_string());
-                                    }
-                                    Err(e) => {
-                                        skipped_paths.push(SkippedPath {
-                                            path: rel_target,
-                                            reason: e.to_string(),
-                                        });
-                                    }
-                                }
-                            }
+                    let contains = !content.is_empty()
+                        && bundle_contains_cert(&content, &canonical_ca_pem, ca_cert_der);
+                    if contains {
+                        established_system_bundle =
+                            Some("/etc/ssl/certs/ca-certificates.crt".to_string());
+                    } else {
+                        let mut new_content = content;
+                        if !new_content.is_empty() && !new_content.ends_with(b"\n") {
+                            new_content.push(b'\n');
                         }
-                        Err(e) => {
-                            skipped_paths.push(SkippedPath {
-                                path: rel_target,
-                                reason: e.to_string(),
-                            });
+                        new_content.extend_from_slice(canonical_ca_pem.as_bytes());
+                        if !new_content.ends_with(b"\n") {
+                            new_content.push(b'\n');
                         }
+
+                        atomic_write_preserving_handle(
+                            &parent_dir,
+                            &file_name,
+                            &new_content,
+                            Some(0o644),
+                        )?;
+                        modified_paths.insert(rel_target);
+                        established_system_bundle =
+                            Some("/etc/ssl/certs/ca-certificates.crt".to_string());
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match ensure_parent_dirs_in_rootfs(rootfs, Path::new(&rel_target)) {
-                    Ok((parent_dir, file_name)) => {
-                        match atomic_write_preserving_handle(
-                            &parent_dir,
-                            &file_name,
-                            canonical_ca_pem.as_bytes(),
-                            Some(0o644),
-                        ) {
-                            Ok(()) => {
-                                modified_paths.insert(rel_target);
-                                established_system_bundle =
-                                    Some("/etc/ssl/certs/ca-certificates.crt".to_string());
-                            }
-                            Err(e) => {
-                                skipped_paths.push(SkippedPath {
-                                    path: rel_target,
-                                    reason: e.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        skipped_paths.push(SkippedPath {
-                            path: rel_target,
-                            reason: e.to_string(),
-                        });
-                    }
-                }
+                let (parent_dir, file_name) = ensure_parent_dirs_in_rootfs(rootfs, &rel_target)?;
+                atomic_write_preserving_handle(
+                    &parent_dir,
+                    &file_name,
+                    canonical_ca_pem.as_bytes(),
+                    Some(0o644),
+                )?;
+                modified_paths.insert(rel_target);
+                established_system_bundle = Some("/etc/ssl/certs/ca-certificates.crt".to_string());
             }
             Err(e) => {
-                skipped_paths.push(SkippedPath {
-                    path: rel_target,
-                    reason: format!("cannot stat target: {}", e.kind()),
-                });
+                return Err(TrustError::Io(e));
             }
         }
     }
@@ -1456,16 +1587,116 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
     env_defaults.insert("GIT_SSL_CAINFO".to_string(), chosen_bundle.clone());
     env_defaults.insert("CARGO_HTTP_CAINFO".to_string(), chosen_bundle);
 
-    let mut modified_vec: Vec<String> = modified_paths.into_iter().collect();
+    let mut modified_vec: Vec<PathBuf> = modified_paths.into_iter().collect();
     modified_vec.sort();
+    let modified_strings: Vec<String> = modified_vec
+        .iter()
+        .map(|p| encode_path_lossless(p))
+        .collect();
 
     skipped_paths.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.reason.cmp(&b.reason)));
     skipped_paths.dedup();
 
     Ok(InstallReport {
         ca_cert_sha256,
-        modified_paths: modified_vec,
+        modified_paths: modified_strings,
         skipped_paths,
         env_defaults,
     })
+}
+
+fn comp_as_os_str(name: &std::ffi::OsStr) -> &std::ffi::OsStr {
+    name
+}
+
+/// Check if report destination collides with any existing or planned trust store target in rootfs.
+pub fn check_report_target_collision(rootfs: &Path, report_path: &Path) -> Result<(), TrustError> {
+    use std::os::unix::io::AsRawFd;
+
+    let known_system_bundles = [
+        "etc/ssl/certs/ca-certificates.crt",
+        "etc/pki/tls/certs/ca-bundle.crt",
+        "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "etc/ssl/cert.pem",
+    ];
+
+    for rel_str in &known_system_bundles {
+        let p = safe_join_rootfs(rootfs, Path::new(rel_str));
+        crate::cert::check_not_alias(report_path, &p, "report", "planned trust store target")?;
+        if let Ok(target) = resolve_in_rootfs(rootfs, &p) {
+            crate::cert::check_not_alias(
+                report_path,
+                &target,
+                "report",
+                "resolved trust store target",
+            )?;
+        }
+    }
+
+    let anchor_targets = [
+        "usr/local/share/ca-certificates/hermetic-world-ca.crt",
+        "etc/pki/ca-trust/source/anchors/hermetic-world-ca.pem",
+    ];
+
+    for rel_str in &anchor_targets {
+        let p = safe_join_rootfs(rootfs, Path::new(rel_str));
+        crate::cert::check_not_alias(report_path, &p, "report", "planned anchor target")?;
+        if let Ok(target) = resolve_in_rootfs(rootfs, &p) {
+            crate::cert::check_not_alias(report_path, &target, "report", "resolved anchor target")?;
+        }
+    }
+
+    // Planned fallback bundle target:
+    let fallback_p = safe_join_rootfs(rootfs, Path::new("etc/ssl/certs/ca-certificates.crt"));
+    crate::cert::check_not_alias(
+        report_path,
+        &fallback_p,
+        "report",
+        "planned fallback target",
+    )?;
+    if let Ok(target) = resolve_in_rootfs(rootfs, &fallback_p) {
+        crate::cert::check_not_alias(report_path, &target, "report", "resolved fallback target")?;
+    }
+
+    // Also check discovered files in rootfs if rootfs exists
+    if let Ok(root_handle) = open_dir_handle(rootfs) {
+        let mut dirs = vec![(root_handle, PathBuf::new(), 0usize)];
+        while let Some((h, rel, d)) = dirs.pop() {
+            if d > 16 {
+                continue;
+            }
+            let p_path = format!("/proc/self/fd/{}", h.as_raw_fd());
+            if let Ok(rd) = fs::read_dir(&p_path) {
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    let child_rel = rel.join(&name);
+                    if let Ok(ft) = ent.file_type() {
+                        if ft.is_dir() {
+                            if let Ok(ch) = open_child_dir(h.as_raw_fd(), &name) {
+                                dirs.push((ch, child_rel, d + 1));
+                            }
+                        } else if name == "cacert.pem" || name == "cacerts" {
+                            let abs = safe_join_rootfs(rootfs, &child_rel);
+                            crate::cert::check_not_alias(
+                                report_path,
+                                &abs,
+                                "report",
+                                "discovered trust store target",
+                            )?;
+                            if let Ok(target) = resolve_in_rootfs(rootfs, &abs) {
+                                crate::cert::check_not_alias(
+                                    report_path,
+                                    &target,
+                                    "report",
+                                    "resolved discovered target",
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
