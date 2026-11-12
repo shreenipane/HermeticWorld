@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 pub use benchmark::{BenchmarkSignatures, ExternalSignature};
 pub use binary::{
     is_minified_bundle, parse_class, parse_elf, parse_minified, parse_wasm,
-    scan_binary_if_recognized, scan_minified_bundle,
+    scan_binary_if_recognized, scan_minified_bundle, utf16_text_views,
 };
 pub use bytecode::{check_pyc_bytecode, locate_pyc_source, pyc_header_len, pyc_magic};
 pub use containers::{
@@ -100,4 +100,33 @@ pub struct SealcheckReport {
     /// Detectors a query report could not answer from its indexes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_covered: Vec<String>,
+}
+
+/// Finding channels that mean part of the world was not scanned. These are the only
+/// coverage signals: evidence text is repository content and is never searched for words
+/// such as "skipped", and a binary file whose printable strings were scanned is covered.
+pub const COVERAGE_GAP_CHANNELS: &[&str] = &[
+    "scan_error",
+    "container_error",
+    "container_skipped",
+    "container_depth",
+    "container_bomb",
+    "binary_skipped",
+    "file_oversize_skipped",
+    "index_skipped",
+    "baseline_incomplete",
+    "task_file_skipped",
+    "skipped_symlink",
+    "d8_error",
+];
+
+/// Detectors with a coverage gap in `findings`, in first-seen order, each listed once.
+pub fn coverage_gaps(findings: &[Finding]) -> Vec<String> {
+    let mut gaps: Vec<String> = Vec::new();
+    for f in findings {
+        if COVERAGE_GAP_CHANNELS.contains(&f.channel.as_str()) && !gaps.contains(&f.detector) {
+            gaps.push(f.detector.clone());
+        }
+    }
+    gaps
 }

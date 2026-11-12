@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use hermetic_common::TaskInput;
 use hermetic_sealcheck::{
-    check_d11, check_d12, generate_sarif, generate_sarif_with_options,
+    check_d11, check_d12, coverage_gaps, generate_sarif, generate_sarif_with_options,
     generate_sarif_with_properties, load_undated_task, query_index, scan_problem_statement,
     scan_tree, write_index, BenchmarkSignatures, D11Options, D12Options, Finding, FingerprintSet,
     FingerprintSummary, SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility,
@@ -370,6 +370,8 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             all_findings.extend(oci_findings);
         }
 
+        let not_covered = coverage_gaps(&all_findings);
+
         write_report(
             all_findings,
             Some(&fp),
@@ -377,7 +379,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             args.format,
             args.out,
             None,
-            Vec::new(),
+            not_covered,
         )
     }
 }

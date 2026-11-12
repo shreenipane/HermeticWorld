@@ -864,7 +864,7 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
             if !is_large_archive {
                 sink.fixed(Finding {
                     detector: "D2".into(),
-                    channel: "file".into(),
+                    channel: "file_oversize_skipped".into(),
                     path: display_path,
                     visibility: opts.visibility,
                     severity: Severity::Info,

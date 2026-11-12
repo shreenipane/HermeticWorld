@@ -429,141 +429,156 @@ RESTORE_MODES_SH = r"""#!/bin/bash
 # chmod 644
 # chmod 755
 set -euo pipefail
-cd /testbed
+TARGET_DIR="${1:-/testbed}"
+cd "$TARGET_DIR"
 PYTHON_BIN="$(command -v python3)"
-env -i PATH="$PATH" HERMETIC_MAX_TREE_BYTES="${HERMETIC_MAX_TREE_BYTES:-}" HERMETIC_MAX_TREE_ENTRIES="${HERMETIC_MAX_TREE_ENTRIES:-}" HERMETIC_MAX_PATH_LENGTH="${HERMETIC_MAX_PATH_LENGTH:-}" "$PYTHON_BIN" -I -S - << 'PYEOF'
+# Isolated interpreter (-I -S, empty environment): tracked modules in the work tree never load.
+env -i PATH="$PATH" \
+  HERMETIC_MAX_TREE_BYTES="${HERMETIC_MAX_TREE_BYTES:-}" \
+  HERMETIC_MAX_TREE_ENTRIES="${HERMETIC_MAX_TREE_ENTRIES:-}" \
+  HERMETIC_MAX_PATH_LENGTH="${HERMETIC_MAX_PATH_LENGTH:-}" \
+  HERMETIC_MAX_LS_TREE_BYTES="${HERMETIC_MAX_LS_TREE_BYTES:-}" \
+  HERMETIC_MAX_LS_TREE_ENTRIES="${HERMETIC_MAX_LS_TREE_ENTRIES:-}" \
+  HERMETIC_LS_TREE_TIMEOUT="${HERMETIC_LS_TREE_TIMEOUT:-}" \
+  "$PYTHON_BIN" -I -S - "$TARGET_DIR" << 'PYEOF'
 import sys
-sys.path = [p for p in sys.path if p and p != "." and p != "/testbed" and not p.startswith("/testbed/")]
+TARGET = sys.argv[1] if len(sys.argv) > 1 else "/testbed"
+_roots = ("/testbed", TARGET.rstrip("/") or "/")
+sys.path = [p for p in sys.path if p and p != "." and not any(p == r or p.startswith(r + "/") for r in _roots)]
 import os
+import selectors
 import stat
 import subprocess
+import time
 
-MAX_TREE_BYTES = int(os.environ.get("HERMETIC_MAX_TREE_BYTES") or 32 * 1024 * 1024)
-MAX_TREE_ENTRIES = int(os.environ.get("HERMETIC_MAX_TREE_ENTRIES") or 100000)
-MAX_PATH_LENGTH = int(os.environ.get("HERMETIC_MAX_PATH_LENGTH") or 4096)
 
-proc = subprocess.Popen(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"], stdout=subprocess.PIPE)
-if proc.stdout is None:
-    print("Failed to start git ls-tree stream", file=sys.stderr)
+def cap(names, default):
+    values = [int(os.environ[n]) for n in names if os.environ.get(n)]
+    return min(values) if values else default
+
+
+MAX_TREE_BYTES = cap(("HERMETIC_MAX_TREE_BYTES", "HERMETIC_MAX_LS_TREE_BYTES"), 32 * 1024 * 1024)
+MAX_TREE_ENTRIES = cap(("HERMETIC_MAX_TREE_ENTRIES", "HERMETIC_MAX_LS_TREE_ENTRIES"), 100000)
+MAX_PATH_LENGTH = cap(("HERMETIC_MAX_PATH_LENGTH",), 4096)
+TIMEOUT = float(os.environ.get("HERMETIC_LS_TREE_TIMEOUT") or 30.0)
+
+proc = None
+
+
+def refuse(message):
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    print("Refusing to restore modes: " + message, file=sys.stderr)
     sys.exit(1)
 
-total_bytes = 0
-entry_count = 0
-entries_to_apply = []
-buf = bytearray()
 
+# Pass 1: read the whole listing under byte, entry, path-length and time caps, before any chmod.
+proc = subprocess.Popen(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+                        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, cwd=TARGET)
+if proc.stdout is None:
+    refuse("git ls-tree stream unavailable")
+deadline = time.monotonic() + TIMEOUT
+selector = selectors.DefaultSelector()
+selector.register(proc.stdout.fileno(), selectors.EVENT_READ)
+data = bytearray()
+separators = 0
 while True:
-    chunk = proc.stdout.read(65536)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not selector.select(remaining):
+        refuse("git ls-tree timeout exceeded")
+    chunk = os.read(proc.stdout.fileno(), 65536)
     if not chunk:
         break
-    total_bytes += len(chunk)
-    if total_bytes > MAX_TREE_BYTES:
-        proc.kill()
-        proc.wait()
-        print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_BYTES ({MAX_TREE_BYTES})", file=sys.stderr)
-        sys.exit(1)
-    buf.extend(chunk)
-    while True:
-        idx = buf.find(b"\0")
-        if idx == -1:
-            break
-        entry = bytes(buf[:idx])
-        del buf[:idx + 1]
-        if not entry:
-            continue
-        entry_count += 1
-        if entry_count > MAX_TREE_ENTRIES:
-            proc.kill()
-            proc.wait()
-            print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES})", file=sys.stderr)
-            sys.exit(1)
-        parts = entry.split(b"\t", 1)
-        if len(parts) != 2:
-            continue
-        meta, path_bytes = parts
-        if len(path_bytes) > MAX_PATH_LENGTH:
-            proc.kill()
-            proc.wait()
-            print(f"Refusing to restore modes: path exceeds MAX_PATH_LENGTH ({MAX_PATH_LENGTH})", file=sys.stderr)
-            sys.exit(1)
-        meta_parts = meta.split(b" ")
-        mode_str = meta_parts[0]
-        if mode_str == b"100644":
-            target_mode = 0o644
-        elif mode_str == b"100755":
-            target_mode = 0o755
-        else:
-            continue
-        path_str = os.fsdecode(path_bytes)
-        comp_parts = path_str.split("/")
-        entries_to_apply.append((target_mode, comp_parts, path_str))
-
-if buf:
-    entry = bytes(buf)
-    if entry:
-        entry_count += 1
-        if entry_count > MAX_TREE_ENTRIES:
-            proc.kill()
-            proc.wait()
-            print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES})", file=sys.stderr)
-            sys.exit(1)
-        parts = entry.split(b"\t", 1)
-        if len(parts) == 2:
-            meta, path_bytes = parts
-            if len(path_bytes) > MAX_PATH_LENGTH:
-                proc.kill()
-                proc.wait()
-                print(f"Refusing to restore modes: path exceeds MAX_PATH_LENGTH ({MAX_PATH_LENGTH})", file=sys.stderr)
-                sys.exit(1)
-            meta_parts = meta.split(b" ")
-            mode_str = meta_parts[0]
-            if mode_str in (b"100644", b"100755"):
-                target_mode = 0o644 if mode_str == b"100644" else 0o755
-                path_str = os.fsdecode(path_bytes)
-                entries_to_apply.append((target_mode, path_str.split("/"), path_str))
-
-ret = proc.wait()
+    data.extend(chunk)
+    if len(data) > MAX_TREE_BYTES:
+        refuse(f"tree listing exceeds MAX_TREE_BYTES ({MAX_TREE_BYTES}): byte cap exceeded")
+    separators += chunk.count(b"\0")
+    if separators > MAX_TREE_ENTRIES:
+        refuse(f"tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES}): entry count cap exceeded")
+selector.close()
+try:
+    ret = proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+except subprocess.TimeoutExpired:
+    refuse("git ls-tree timeout exceeded")
 if ret != 0:
-    print(f"git ls-tree failed with exit code {ret}", file=sys.stderr)
-    sys.exit(ret)
+    refuse(f"git ls-tree failed with exit code {ret}")
 
-for target_mode, comp_parts, path_str in entries_to_apply:
-    dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        for comp in comp_parts[:-1]:
-            next_fd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-            os.close(dir_fd)
-            dir_fd = next_fd
+entries = [e for e in bytes(data).split(b"\0") if e]
+if len(entries) > MAX_TREE_ENTRIES:
+    refuse(f"tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES}): entry count cap exceeded")
+to_apply = []
+for entry in entries:
+    meta, sep, path_bytes = entry.partition(b"\t")
+    if not sep:
+        continue
+    if len(path_bytes) > MAX_PATH_LENGTH:
+        refuse(f"path exceeds MAX_PATH_LENGTH ({MAX_PATH_LENGTH})")
+    mode = meta.split(b" ")[0]
+    if mode == b"100644":
+        target_mode = 0o644
+    elif mode == b"100755":
+        target_mode = 0o755
+    else:
+        continue
+    parts = path_bytes.split(b"/")
+    if any(part in (b"", b".", b"..") for part in parts):
+        refuse("tree listing contains an invalid path")
+    to_apply.append((target_mode, parts))
 
-        filename = comp_parts[-1]
+# Pass 2: walk each path by descriptor without following links; any tracked path that is a
+# symlink, FIFO, device, hard link or replaced object refuses the whole restore.
+root_fd = os.open(TARGET, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for target_mode, parts in to_apply:
+        dir_fd = os.dup(root_fd)
         try:
-            st = os.stat(filename, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
-            sys.exit(1)
-        if st.st_nlink > 1:
-            print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
-            sys.exit(1)
-
-        file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-        try:
-            fst = os.fstat(file_fd)
-            if not stat.S_ISREG(fst.st_mode):
-                print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
-                sys.exit(1)
-            if fst.st_nlink > 1:
-                print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
-                sys.exit(1)
-            if fst.st_ino != st.st_ino or fst.st_dev != st.st_dev:
-                print(f"Refusing to restore mode: {path_str} changed during traversal", file=sys.stderr)
-                sys.exit(1)
-            os.fchmod(file_fd, target_mode)
+            missing = False
+            for part in parts[:-1]:
+                try:
+                    before = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    missing = True
+                    break
+                if not stat.S_ISDIR(before.st_mode):
+                    refuse("a tracked path has a non-directory ancestor")
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                after = os.fstat(next_fd)
+                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                    os.close(next_fd)
+                    refuse("a tracked directory changed during traversal")
+                os.close(dir_fd)
+                dir_fd = next_fd
+            if missing:
+                continue
+            name = parts[-1]
+            try:
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                refuse("a tracked path is not a regular file")
+            if st.st_nlink > 1:
+                refuse("a tracked file is multiply linked")
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+            try:
+                fst = os.fstat(file_fd)
+                if not stat.S_ISREG(fst.st_mode):
+                    refuse("a tracked path is not a regular file")
+                if fst.st_nlink > 1:
+                    refuse("a tracked file is multiply linked")
+                if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                    refuse("a tracked file changed during traversal")
+                os.fchmod(file_fd, target_mode)
+            finally:
+                os.close(file_fd)
         finally:
-            os.close(file_fd)
-    finally:
-        os.close(dir_fd)
+            os.close(dir_fd)
+finally:
+    os.close(root_fd)
 PYEOF
 git update-index -q --refresh || true
 """

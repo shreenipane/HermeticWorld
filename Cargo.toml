@@ -2,6 +2,7 @@
 members = [
     "crates/hermetic-common",
     "crates/hermetic-sealcheck",
+    "crates/hermetic-world-server",
 ]
 resolver = "2"
 
@@ -30,5 +31,9 @@ bzip2 = "0.4"
 xz2 = "0.1"
 zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "=1.8.7"
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+libc = "=0.2.191"
 tree-sitter = "=0.25.0"
 tree-sitter-python = "=0.25.0"
