@@ -169,6 +169,45 @@ pub fn resolve_in_rootfs(rootfs: &Path, path: &Path) -> Result<PathBuf, TrustErr
     Ok(current)
 }
 
+/// Named cap for PEM bundles (16 MiB)
+pub const MAX_PEM_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+/// Named cap for Java KeyStores (8 MiB)
+pub const MAX_JKS_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Read a file up to `cap` bytes. If reported metadata length exceeds `cap` or if reading
+/// yields more than `cap` bytes, an error is returned.
+fn read_file_capped(path: &Path, cap: u64) -> Result<Vec<u8>, TrustError> {
+    use std::io::Read;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(TrustError::Cert(format!(
+            "file '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() > cap {
+        return Err(TrustError::Cert(format!(
+            "file '{}' exceeds size cap of {} bytes (size {})",
+            path.display(),
+            cap,
+            meta.len()
+        )));
+    }
+
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    let mut handle = file.take(cap + 1);
+    handle.read_to_end(&mut buf)?;
+    if buf.len() as u64 > cap {
+        return Err(TrustError::Cert(format!(
+            "file '{}' exceeds size cap of {} bytes",
+            path.display(),
+            cap
+        )));
+    }
+    Ok(buf)
+}
+
 /// Write data atomically into target_path: writes to a temporary file in the same directory,
 /// sets matching permissions and ownership (best-effort), flushes, and renames.
 pub fn atomic_write_preserving(
@@ -176,11 +215,29 @@ pub fn atomic_write_preserving(
     data: &[u8],
     new_file_mode: Option<u32>,
 ) -> Result<(), TrustError> {
+    if let Ok(m) = fs::symlink_metadata(target_path) {
+        if m.file_type().is_symlink() {
+            return Err(TrustError::Symlink(format!(
+                "target '{}' is a symlink",
+                target_path.display()
+            )));
+        }
+        if !m.file_type().is_file() {
+            return Err(TrustError::Symlink(format!(
+                "target '{}' is not a regular file",
+                target_path.display()
+            )));
+        }
+    }
+
     let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
     // Get existing metadata if file exists
-    let existing_meta = fs::symlink_metadata(target_path).ok();
+    let existing_meta = match fs::symlink_metadata(target_path) {
+        Ok(m) if m.file_type().is_file() => Some(m),
+        _ => None,
+    };
 
     // Create temporary file in same directory
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -193,15 +250,33 @@ pub fn atomic_write_preserving(
         use std::os::unix::fs::PermissionsExt;
 
         if let Some(ref meta) = existing_meta {
+            let temp_meta = fs::symlink_metadata(temp.path())?;
+            if !temp_meta.file_type().is_file() {
+                return Err(TrustError::Cert(
+                    "temporary file is not a regular file".to_string(),
+                ));
+            }
             let perms = meta.permissions();
-            let _ = fs::set_permissions(temp.path(), perms);
+            fs::set_permissions(temp.path(), perms)?;
 
+            let temp_meta = fs::symlink_metadata(temp.path())?;
+            if !temp_meta.file_type().is_file() {
+                return Err(TrustError::Cert(
+                    "temporary file is not a regular file".to_string(),
+                ));
+            }
             let uid = meta.uid();
             let gid = meta.gid();
             let _ = std::os::unix::fs::chown(temp.path(), Some(uid), Some(gid));
         } else if let Some(mode) = new_file_mode {
+            let temp_meta = fs::symlink_metadata(temp.path())?;
+            if !temp_meta.file_type().is_file() {
+                return Err(TrustError::Cert(
+                    "temporary file is not a regular file".to_string(),
+                ));
+            }
             let perms = fs::Permissions::from_mode(mode);
-            let _ = fs::set_permissions(temp.path(), perms);
+            fs::set_permissions(temp.path(), perms)?;
         }
     }
 
@@ -212,48 +287,66 @@ pub fn atomic_write_preserving(
 
 /// Check if a PEM bundle already contains the given certificate DER.
 pub fn bundle_contains_cert(bundle_content: &[u8], ca_cert_pem: &str, ca_cert_der: &[u8]) -> bool {
-    let bundle_str = String::from_utf8_lossy(bundle_content);
-
-    // 1. Direct substring check of the exact PEM (fast path)
-    let trimmed_ca_pem = ca_cert_pem.trim();
-    if bundle_str.contains(trimmed_ca_pem) {
+    // 1. Direct substring check of the exact PEM (fast path, zero-alloc)
+    let trimmed_ca_pem = ca_cert_pem.trim().as_bytes();
+    if !trimmed_ca_pem.is_empty()
+        && bundle_content
+            .windows(trimmed_ca_pem.len())
+            .any(|w| w == trimmed_ca_pem)
+    {
         return true;
     }
 
-    // 2. Check base64 payload match
-    let ca_b64: String = ca_cert_pem
+    // 2. Check base64 payload match without large copies
+    let ca_b64: Vec<u8> = ca_cert_pem
         .lines()
         .filter(|l| !l.trim().starts_with("---"))
-        .flat_map(|l| l.chars())
-        .filter(|c| !c.is_whitespace())
+        .flat_map(|l| l.bytes())
+        .filter(|b| !b.is_ascii_whitespace())
         .collect();
 
-    // Split bundle by PEM blocks
-    for part in bundle_str.split("-----BEGIN CERTIFICATE-----") {
-        if let Some((body, _)) = part.split_once("-----END CERTIFICATE-----") {
-            let body_b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-            if body_b64 == ca_b64 {
-                return true;
-            }
-            if let Ok(p) = pem::parse(format!(
-                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
-                body
-            )) {
-                if p.contents() == ca_cert_der {
-                    return true;
+    const BEGIN_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END_MARKER: &[u8] = b"-----END CERTIFICATE-----";
+
+    let mut pos = 0;
+    while pos + BEGIN_MARKER.len() <= bundle_content.len() {
+        if let Some(offset) = bundle_content[pos..]
+            .windows(BEGIN_MARKER.len())
+            .position(|w| w == BEGIN_MARKER)
+        {
+            let block_start = pos + offset;
+            let body_start = block_start + BEGIN_MARKER.len();
+            if let Some(end_offset) = bundle_content[body_start..]
+                .windows(END_MARKER.len())
+                .position(|w| w == END_MARKER)
+            {
+                let body_end = body_start + end_offset;
+                let block_end = body_end + END_MARKER.len();
+                let body = &bundle_content[body_start..body_end];
+
+                if !ca_b64.is_empty() {
+                    let body_non_ws = body.iter().copied().filter(|b| !b.is_ascii_whitespace());
+                    if body_non_ws.eq(ca_b64.iter().copied()) {
+                        return true;
+                    }
                 }
+
+                let block_slice = &bundle_content[block_start..block_end];
+                if let Ok(p) = pem::parse(block_slice) {
+                    if p.tag() == "CERTIFICATE" && p.contents() == ca_cert_der {
+                        return true;
+                    }
+                }
+
+                pos = block_end;
+            } else {
+                break;
             }
+        } else {
+            break;
         }
     }
 
-    // 3. Fallback to pem::parse_many
-    if let Ok(pems) = pem::parse_many(bundle_content) {
-        for p in pems {
-            if p.tag() == "CERTIFICATE" && p.contents() == ca_cert_der {
-                return true;
-            }
-        }
-    }
     false
 }
 
@@ -264,10 +357,10 @@ pub fn append_pem_bundle_idempotent(
     ca_pem: &str,
     ca_der: &[u8],
 ) -> Result<bool, TrustError> {
-    let content = match fs::read(target_path) {
+    let content = match read_file_capped(target_path, MAX_PEM_BUNDLE_BYTES) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(TrustError::Io(e)),
+        Err(TrustError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
     };
 
     if !content.is_empty() && bundle_contains_cert(&content, ca_pem, ca_der) {
@@ -288,6 +381,9 @@ pub fn append_pem_bundle_idempotent(
 }
 
 /// Install the CA certificate into every trust store found under rootfs.
+///
+/// # Precondition
+/// The rootfs must not be modified concurrently during install (exclusive access).
 pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, TrustError> {
     // FIX 1: Parse --ca-cert, require exactly one CERTIFICATE block and reject any
     // file containing a PRIVATE KEY (any "PRIVATE KEY" label) or other block types with a clear error;
@@ -368,68 +464,75 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
 
     for rel_str in &known_system_bundles {
         let bundle_path = rootfs.join(rel_str);
-        if fs::symlink_metadata(&bundle_path).is_ok() {
-            // Found a bundle candidate
-            match resolve_in_rootfs(rootfs, &bundle_path) {
-                Ok(target) => {
-                    let target_meta = match fs::symlink_metadata(&target) {
-                        Ok(m) => m,
+        match resolve_in_rootfs(rootfs, &bundle_path) {
+            Ok(target) => {
+                let target_meta = match fs::symlink_metadata(&target) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(e) => {
+                        skipped_paths.push(SkippedPath {
+                            path: make_rel(&bundle_path),
+                            reason: format!("cannot stat target: {}", e),
+                        });
+                        continue;
+                    }
+                };
+
+                if target_meta.is_dir() {
+                    skipped_paths.push(SkippedPath {
+                        path: make_rel(&bundle_path),
+                        reason: "bundle_is_directory".to_string(),
+                    });
+                    continue;
+                }
+
+                if !target_meta.file_type().is_file() {
+                    skipped_paths.push(SkippedPath {
+                        path: make_rel(&bundle_path),
+                        reason: "not a regular file".to_string(),
+                    });
+                    continue;
+                }
+
+                if processed_targets.insert(target.clone()) {
+                    let rechecked = resolve_in_rootfs(rootfs, &bundle_path)?;
+                    if rechecked != target {
+                        return Err(TrustError::Symlink(format!(
+                            "target path changed during install for '{}'",
+                            bundle_path.display()
+                        )));
+                    }
+
+                    match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der) {
+                        Ok(modified) => {
+                            successful_bundle_targets.insert(target.clone());
+                            if modified {
+                                modified_paths.insert(make_rel(&target));
+                            }
+                            if first_existing_system_bundle.is_none() {
+                                first_existing_system_bundle = Some(format!("/{}", rel_str));
+                            }
+                        }
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
-                                path: make_rel(&bundle_path),
-                                reason: format!("cannot stat target: {}", e),
+                                path: make_rel(&target),
+                                reason: e.to_string(),
                             });
-                            continue;
                         }
-                    };
-
-                    if target_meta.is_dir() {
-                        skipped_paths.push(SkippedPath {
-                            path: make_rel(&bundle_path),
-                            reason: "bundle_is_directory".to_string(),
-                        });
-                        continue;
                     }
-
-                    if !target_meta.file_type().is_file() {
-                        skipped_paths.push(SkippedPath {
-                            path: make_rel(&bundle_path),
-                            reason: "not a regular file".to_string(),
-                        });
-                        continue;
-                    }
-
-                    if processed_targets.insert(target.clone()) {
-                        match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der)
-                        {
-                            Ok(modified) => {
-                                successful_bundle_targets.insert(target.clone());
-                                if modified {
-                                    modified_paths.insert(make_rel(&target));
-                                }
-                                if first_existing_system_bundle.is_none() {
-                                    first_existing_system_bundle = Some(format!("/{}", rel_str));
-                                }
-                            }
-                            Err(e) => {
-                                skipped_paths.push(SkippedPath {
-                                    path: make_rel(&target),
-                                    reason: e.to_string(),
-                                });
-                            }
-                        }
-                    } else if successful_bundle_targets.contains(&target)
-                        && first_existing_system_bundle.is_none()
-                    {
-                        first_existing_system_bundle = Some(format!("/{}", rel_str));
-                    }
+                } else if successful_bundle_targets.contains(&target)
+                    && first_existing_system_bundle.is_none()
+                {
+                    first_existing_system_bundle = Some(format!("/{}", rel_str));
                 }
-                Err(e) => {
-                    skipped_paths.push(SkippedPath {
-                        path: rel_str.to_string(),
-                        reason: e.to_string(),
-                    });
-                }
+            }
+            Err(e) => {
+                skipped_paths.push(SkippedPath {
+                    path: rel_str.to_string(),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -448,7 +551,15 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
 
     for (dir_rel, file_rel) in &anchor_targets {
         let dir_path = rootfs.join(dir_rel);
-        if dir_path.is_dir() {
+        let dir_exists = match resolve_in_rootfs(rootfs, &dir_path) {
+            Ok(resolved_dir) => match fs::symlink_metadata(&resolved_dir) {
+                Ok(m) => m.is_dir(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
+        if dir_exists {
             let file_path = rootfs.join(file_rel);
             match resolve_in_rootfs(rootfs, &file_path) {
                 Ok(target) => {
@@ -467,8 +578,28 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                     }
                     if processed_targets.insert(target.clone()) {
                         let content = canonical_ca_pem.as_bytes();
-                        let existing = fs::read(&target).ok();
+                        let existing = match read_file_capped(&target, MAX_PEM_BUNDLE_BYTES) {
+                            Ok(c) => Some(c),
+                            Err(TrustError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                                None
+                            }
+                            Err(e) => {
+                                skipped_paths.push(SkippedPath {
+                                    path: make_rel(&target),
+                                    reason: e.to_string(),
+                                });
+                                continue;
+                            }
+                        };
                         if existing.as_deref() != Some(content) {
+                            let rechecked = resolve_in_rootfs(rootfs, &file_path)?;
+                            if rechecked != target {
+                                return Err(TrustError::Symlink(format!(
+                                    "target path changed during install for '{}'",
+                                    file_path.display()
+                                )));
+                            }
+
                             match atomic_write_preserving(&target, content, Some(0o644)) {
                                 Ok(()) => {
                                     modified_paths.insert(make_rel(&target));
@@ -601,6 +732,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             }
 
                             if processed_targets.insert(target.clone()) {
+                                let rechecked = resolve_in_rootfs(rootfs, &entry_path)?;
+                                if rechecked != target {
+                                    return Err(TrustError::Symlink(format!(
+                                        "target path changed during install for '{}'",
+                                        entry_path.display()
+                                    )));
+                                }
+
                                 match append_pem_bundle_idempotent(
                                     &target,
                                     &canonical_ca_pem,
@@ -659,7 +798,7 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                         }
 
                         if processed_targets.insert(target.clone()) {
-                            let content = match fs::read(&target) {
+                            let content = match read_file_capped(&target, MAX_JKS_BYTES) {
                                 Ok(c) => c,
                                 Err(e) => {
                                     skipped_paths.push(SkippedPath {
@@ -681,6 +820,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             // Process JKS
                             match inject_ca_into_jks(&content, ca_cert_der, 0) {
                                 Ok(Some(new_jks_bytes)) => {
+                                    let rechecked = resolve_in_rootfs(rootfs, &entry_path)?;
+                                    if rechecked != target {
+                                        return Err(TrustError::Symlink(format!(
+                                            "target path changed during install for '{}'",
+                                            entry_path.display()
+                                        )));
+                                    }
+
                                     match atomic_write_preserving(&target, &new_jks_bytes, None) {
                                         Ok(()) => {
                                             modified_paths.insert(make_rel(&target));
@@ -745,6 +892,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                             });
                         }
                     } else {
+                        let rechecked = resolve_in_rootfs(rootfs, &fallback_path)?;
+                        if rechecked != target {
+                            return Err(TrustError::Symlink(format!(
+                                "target path changed during install for '{}'",
+                                fallback_path.display()
+                            )));
+                        }
+
                         match append_pem_bundle_idempotent(&target, &canonical_ca_pem, ca_cert_der)
                         {
                             Ok(modified) => {
@@ -764,6 +919,14 @@ pub fn install_ca(rootfs: &Path, ca_cert_pem: &str) -> Result<InstallReport, Tru
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(parent) = target.parent() {
                         fs::create_dir_all(parent)?;
+                    }
+
+                    let rechecked = resolve_in_rootfs(rootfs, &fallback_path)?;
+                    if rechecked != target {
+                        return Err(TrustError::Symlink(format!(
+                            "target path changed during install for '{}'",
+                            fallback_path.display()
+                        )));
                     }
 
                     atomic_write_preserving(&target, canonical_ca_pem.as_bytes(), Some(0o644))?;

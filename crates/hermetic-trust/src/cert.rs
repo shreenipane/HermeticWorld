@@ -28,15 +28,27 @@ pub struct Ca {
     pub key: RsaPrivateKey,
     pub subject_dn_der: Vec<u8>,
     pub ski: [u8; 20],
+    pub spki_der: Vec<u8>,
 }
 
 /// Represents a minted leaf certificate and private key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LeafCert {
     pub cert_pem: String,
     pub cert_der: Vec<u8>,
     pub key_pem: String,
     pub key_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for LeafCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafCert")
+            .field("cert_pem", &self.cert_pem)
+            .field("cert_der", &self.cert_der)
+            .field("key_pem", &"[REDACTED]")
+            .field("key_der", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Derive deterministic 32-byte seed from host secret and world ID using HKDF-SHA256.
@@ -247,6 +259,7 @@ pub fn mint_ca(
         key: private_key,
         subject_dn_der: dn_der,
         ski,
+        spki_der,
     })
 }
 
@@ -411,13 +424,32 @@ fn get_current_uid() -> Result<u32, TrustError> {
     Ok(meta.uid())
 }
 
+#[cfg(unix)]
+// Linux open(2) flags: O_NOFOLLOW (0o400000) prevents following symlinks, O_NONBLOCK (0o4000) prevents blocking on FIFOs
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(unix)]
+const O_NONBLOCK: i32 = 0o4000;
+
 /// Read and validate seed file: regular file owned by current user, mode & 0o077 == 0, exactly 32 bytes.
 pub fn read_seed_file(path: &Path) -> Result<[u8; 32], TrustError> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(O_NOFOLLOW | O_NONBLOCK);
+    }
+
+    let file = options.open(path)?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::symlink_metadata(path)?;
+        let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
             return Err(TrustError::Cert(format!(
                 "seed file '{}' is not a regular file",
@@ -439,7 +471,8 @@ pub fn read_seed_file(path: &Path) -> Result<[u8; 32], TrustError> {
         }
     }
 
-    let bytes = std::fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.take(33).read_to_end(&mut bytes)?;
     if bytes.len() != 32 {
         return Err(TrustError::InvalidSeedFileLength(bytes.len()));
     }

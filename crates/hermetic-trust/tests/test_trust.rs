@@ -1142,3 +1142,238 @@ fn test_preserve_existing_resolved_fallback_bundle() {
         "Directory bundle in fallback must be skipped with bundle_is_directory"
     );
 }
+
+// Defect 1: Unbounded reads
+#[test]
+fn test_unbounded_reads_sparse_file_capped() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sparse_pem = temp_dir.path().join("sparse_bundle.pem");
+    let f = fs::File::create(&sparse_pem).expect("create sparse pem");
+    f.set_len(17 * 1024 * 1024).expect("set_len 17MiB"); // 17 MiB > 16 MiB cap
+    drop(f);
+
+    let seed: [u8; 32] = [1u8; 32];
+    let ca = mint_ca("cap-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let res = hermetic_trust::append_pem_bundle_idempotent(&sparse_pem, &ca.cert_pem, &ca.cert_der);
+    assert!(
+        res.is_err(),
+        "append_pem_bundle_idempotent must reject files exceeding 16 MiB"
+    );
+    let err_str = res.err().unwrap().to_string();
+    assert!(err_str.contains("exceeds size cap"));
+
+    // Also test JKS > 8 MiB in rootfs install
+    let rootfs = temp_dir.path().join("rootfs");
+    let jks_dir = rootfs.join("usr/lib/jvm/default/lib/security");
+    fs::create_dir_all(&jks_dir).expect("create jks dir");
+    let sparse_jks = jks_dir.join("cacerts");
+    let fj = fs::File::create(&sparse_jks).expect("create sparse jks");
+    fj.set_len(9 * 1024 * 1024).expect("set_len 9MiB"); // 9 MiB > 8 MiB cap
+    drop(fj);
+
+    let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca with oversized jks");
+    let skipped = report
+        .skipped_paths
+        .iter()
+        .find(|s| s.path.ends_with("cacerts"));
+    assert!(skipped.is_some(), "Oversized JKS must be skipped");
+    assert!(skipped.unwrap().reason.contains("exceeds size cap"));
+
+    // Also test anchor read > 16 MiB in rootfs install
+    let rootfs_anchor = temp_dir.path().join("rootfs_anchor");
+    let anchor_dir = rootfs_anchor.join("usr/local/share/ca-certificates");
+    fs::create_dir_all(&anchor_dir).expect("create anchor dir");
+    let sparse_anchor = anchor_dir.join("hermetic-world-ca.crt");
+    let fa = fs::File::create(&sparse_anchor).expect("create sparse anchor");
+    fa.set_len(17 * 1024 * 1024).expect("set_len 17MiB");
+    drop(fa);
+
+    let report_anchor =
+        install_ca(&rootfs_anchor, &ca.cert_pem).expect("install_ca with oversized anchor");
+    let skipped_anchor = report_anchor
+        .skipped_paths
+        .iter()
+        .find(|s| s.path.ends_with("hermetic-world-ca.crt"));
+    assert!(skipped_anchor.is_some(), "Oversized anchor must be skipped");
+    assert!(skipped_anchor.unwrap().reason.contains("exceeds size cap"));
+}
+
+// Defect 2: Output depends on the host filesystem
+#[test]
+fn test_host_symlink_independence() {
+    let host_temp = tempfile::tempdir().expect("host tempdir");
+    let host_dir = host_temp.path().join("host_usr_local");
+    fs::create_dir_all(host_dir.join("share/ca-certificates")).expect("create host share");
+
+    let seed: [u8; 32] = [2u8; 32];
+    let ca = mint_ca(
+        "host-indep-world",
+        datetime!(2024-01-01 00:00:00 UTC),
+        &seed,
+    )
+    .expect("mint ca");
+
+    // Case 1: host directory exists
+    let rootfs_a_temp = tempfile::tempdir().expect("rootfs_a tempdir");
+    let rootfs_a = rootfs_a_temp.path().join("rootfs");
+    fs::create_dir_all(rootfs_a.join("usr")).expect("create usr");
+    std::os::unix::fs::symlink(&host_dir, rootfs_a.join("usr/local")).expect("symlink usr/local");
+
+    let report_a = install_ca(&rootfs_a, &ca.cert_pem).expect("install_ca case A");
+
+    // Case 2: host directory does NOT exist
+    let non_existent_host_dir = host_temp.path().join("non_existent_host_usr_local");
+    assert!(!non_existent_host_dir.exists());
+
+    let rootfs_b_temp = tempfile::tempdir().expect("rootfs_b tempdir");
+    let rootfs_b = rootfs_b_temp.path().join("rootfs");
+    fs::create_dir_all(rootfs_b.join("usr")).expect("create usr");
+    std::os::unix::fs::symlink(&non_existent_host_dir, rootfs_b.join("usr/local"))
+        .expect("symlink usr/local 2");
+
+    let report_b = install_ca(&rootfs_b, &ca.cert_pem).expect("install_ca case B");
+
+    // Both reports must have identical modified and skipped paths
+    assert_eq!(report_a.modified_paths, report_b.modified_paths);
+    assert_eq!(report_a.env_defaults, report_b.env_defaults);
+
+    // No files created in host_dir
+    let host_files: Vec<_> = fs::read_dir(host_dir.join("share/ca-certificates"))
+        .expect("read host share")
+        .collect();
+    assert!(
+        host_files.is_empty(),
+        "No files may be written to host directory"
+    );
+}
+
+// Defect 3: Refusal on symlink target
+#[test]
+fn test_check_then_use_symlink_refusal() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let outside_target = temp_dir.path().join("outside.txt");
+    fs::write(&outside_target, b"ORIGINAL_OUTSIDE\n").expect("write outside");
+
+    let symlink_path = temp_dir.path().join("symlink_target");
+    std::os::unix::fs::symlink(&outside_target, &symlink_path).expect("create symlink");
+
+    // atomic_write_preserving on a symlink must refuse
+    let res = hermetic_trust::atomic_write_preserving(&symlink_path, b"NEW_DATA\n", Some(0o644));
+    assert!(
+        res.is_err(),
+        "atomic_write_preserving must refuse symlink target"
+    );
+    assert!(matches!(res.unwrap_err(), TrustError::Symlink(_)));
+
+    // Ensure outside target was not modified
+    let content = fs::read(&outside_target).expect("read outside");
+    assert_eq!(content, b"ORIGINAL_OUTSIDE\n");
+}
+
+// Defect 4: Seed file race & permissions
+#[test]
+fn test_seed_file_race_symlink_fifo_oversized() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // 1. Valid seed
+    let valid_seed = temp_dir.path().join("valid.seed");
+    fs::write(&valid_seed, [7u8; 32]).expect("write valid");
+    fs::set_permissions(&valid_seed, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    // Symlink seed must be rejected
+    let symlink_seed = temp_dir.path().join("symlink.seed");
+    std::os::unix::fs::symlink(&valid_seed, &symlink_seed).expect("create symlink");
+    assert!(
+        read_seed_file(&symlink_seed).is_err(),
+        "Symlink seed must be rejected"
+    );
+
+    // 2. Oversized seed (33 bytes and 100 bytes)
+    let seed_33 = temp_dir.path().join("seed_33.bin");
+    fs::write(&seed_33, [7u8; 33]).expect("write 33");
+    fs::set_permissions(&seed_33, fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(matches!(
+        read_seed_file(&seed_33),
+        Err(TrustError::InvalidSeedFileLength(33))
+    ));
+
+    let seed_100 = temp_dir.path().join("seed_100.bin");
+    fs::write(&seed_100, [7u8; 100]).expect("write 100");
+    fs::set_permissions(&seed_100, fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(matches!(
+        read_seed_file(&seed_100),
+        Err(TrustError::InvalidSeedFileLength(33))
+    ));
+
+    // 3. FIFO seed rejected without blocking
+    let fifo_seed = temp_dir.path().join("fifo.seed");
+    let status = Command::new("mkfifo")
+        .arg(&fifo_seed)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let res = read_seed_file(&fifo_seed);
+    assert!(res.is_err(), "FIFO seed must be rejected");
+}
+
+// Defect 5: Known-answer test for CA
+#[test]
+fn test_ca_known_answer_test() {
+    let seed: [u8; 32] = [42u8; 32];
+    let world_id = "swe-bench-world-kat";
+    let t_clock = datetime!(2024-01-01 00:00:00 UTC);
+
+    let ca = mint_ca(world_id, t_clock, &seed).expect("mint ca");
+
+    let cert_sha256 = hex::encode(sha2::Sha256::digest(&ca.cert_der));
+    let spki_sha256 = hex::encode(sha2::Sha256::digest(&ca.spki_der));
+
+    assert_eq!(
+        cert_sha256,
+        "10306bcd579e6dfe86faa01f9bc696c716af4164c7dcbfd3a0b543a86d781133"
+    );
+    assert_eq!(
+        spki_sha256,
+        "d7c00c72122e86f76b2c081fcafcb8884649591290db6bb1f59fa0217e120ec0"
+    );
+
+    // Verify SPKI is contained in cert_der
+    assert!(ca
+        .cert_der
+        .windows(ca.spki_der.len())
+        .any(|w| w == ca.spki_der));
+}
+
+// Defect 6: LeafCert Debug redaction
+#[test]
+fn test_leaf_cert_debug_redacted() {
+    let seed: [u8; 32] = [77u8; 32];
+    let ca = mint_ca("debug-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let leaf =
+        mint_leaf(&ca, &["debug.internal"], datetime!(2024-01-01 00:00:00 UTC)).expect("mint leaf");
+
+    let debug_output = format!("{:?}", leaf);
+
+    assert!(debug_output.contains("[REDACTED]"));
+    assert!(!debug_output.contains(&leaf.key_pem));
+    assert!(!debug_output.contains("PRIVATE KEY"));
+
+    let key_der_hex = hex::encode(&leaf.key_der);
+    assert!(!debug_output.contains(&key_der_hex));
+
+    let key_b64 = leaf
+        .key_pem
+        .lines()
+        .filter(|l| !l.starts_with("---"))
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(!debug_output.contains(&key_b64));
+
+    for line in leaf.key_pem.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("---") {
+            assert!(!debug_output.contains(trimmed));
+        }
+    }
+}
