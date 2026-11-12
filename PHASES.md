@@ -111,7 +111,12 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** Any Linux box.
 
 ### Deliverables
-- [ ] Rootfs build with `SOURCE_DATE_EPOCH` mke2fs (e2fsprogs ≥ 1.47.1) and a D4 guard (TR-SEAL-7, TR-SEAL-8)
+- [x] Rootfs build with `SOURCE_DATE_EPOCH` mke2fs (e2fsprogs ≥ 1.47.1) and a D4 guard (TR-SEAL-7, TR-SEAL-8) (T2.4; tar stream into `mke2fs -d`, pinned e2fsprogs 1.47.2 and `data/mke2fs-hermetic.conf`)
+  - [ ] Decision to confirm (T2.4): the image keeps no extended attributes; mtimes are clamped to min(source, T_clock); source paths with symlinked ancestors are refused
+  - [ ] Deferred (T2.4): `_make_output_dirs` still creates missing output directories by path (the directory is then opened anchored and checked before any write)
+  - [ ] Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
+  - [ ] Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
+- [ ] Open (T2.2, found while gating T2.4): `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run (handlers still held after 8 s) and passed in every rerun; establish whether this is test timing under load or a real slot leak
 - [ ] Package world (TR-PKG-*)
   - [ ] Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [ ] Yanked-release handling
