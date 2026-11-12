@@ -1,0 +1,15 @@
+{
+  "cpuid_modifiers": [
+    {
+      "leaf": "0x40000001",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxxxxxx0xx0"
+        }
+      ]
+    }
+  ]
+}
