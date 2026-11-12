@@ -165,10 +165,11 @@ impl QuotaTracker {
             if state.limit_exceeded {
                 return Err(state.terminal());
             }
+            let current_elapsed = elapsed_secs.saturating_add(start.elapsed().as_secs());
             if let Some(limit) = self.config.max_wall_time_seconds {
-                if elapsed_secs >= limit {
+                if current_elapsed >= limit {
                     return Err(state.mark(QuotaBreach::WallTimeExceeded {
-                        elapsed_secs,
+                        elapsed_secs: current_elapsed,
                         limit,
                     }));
                 }
@@ -179,7 +180,7 @@ impl QuotaTracker {
                 }
             }
             let now = Instant::now();
-            let wait_until = match self.config.max_concurrent_requests {
+            let mut wait_until = match self.config.max_concurrent_requests {
                 Some(limit) if state.concurrent_requests + 1 > limit => {
                     let active = state
                         .concurrent_requests
@@ -202,6 +203,12 @@ impl QuotaTracker {
                     return Ok(());
                 }
             };
+            if let Some(limit) = self.config.max_wall_time_seconds {
+                if let Some(rem_secs) = limit.checked_sub(elapsed_secs) {
+                    let wall_deadline = start + Duration::from_secs(rem_secs);
+                    wait_until = wait_until.min(wall_deadline);
+                }
+            }
             let wait = wait_until.saturating_duration_since(now);
             state = match self.slot_released.wait_timeout(state, wait) {
                 Ok((g, _)) => g,

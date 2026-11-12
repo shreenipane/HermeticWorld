@@ -117,6 +117,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
   - [ ] Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
 - [ ] Open, postponed by the owner on 2026-11-12 (T2.2): gateway deadline handling. `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run; investigation found no slot leak (load timing, inferred, not reproduced) but a real defect: the next request's head deadline is armed at hand-off and overwrites the current request's body deadline (body deadline cut to the head deadline; kept-alive connections closed after any request longer than the head deadline). A first fix is on branch `t2.2` (`b0c7867`, not merged) and was rejected in review: its wait for request completion is unbounded (a retained writer plus a client disconnect parks the connection thread forever), two loosened timing tests no longer prove their deadline, and the two new regressions are not deterministic. Review: `t2.2-codex-deadline-rearm-20261112`
+  - [ ] Also found by CodeRabbit on main (2026-11-12): keep the body deadline active until the body reader finishes (`crates/vendor/tiny_http/src/client.rs:162`); do not release a successor before its predecessor finishes (`util/sequential.rs:172`); do not block while dropping a waiting reader (`util/sequential.rs:159`). Details: `cr-main-crates-20261112.log`
 - [ ] Package world (TR-PKG-*)
   - [ ] Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [ ] Yanked-release handling
@@ -168,7 +169,9 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** Linux x86 with KVM (bare metal, or EC2 with nested virtualization).
 
 ### Deliverables
-- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (in progress: T3.3, brief in `agy-tasks/`)
+- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (T3.3 merged: spec validation, request plan with the kvmclock-hiding CPU template, jail plan, lifecycle, API client, dev-unjailed mode; Firecracker v1.18.0 pinned)
+  - [ ] Open (T3.3): run the jailer tests as root (owner runs `sudo -v` first) and the in-VM boot test once a guest kernel and rootfs exist
+  - [ ] Open (T3.3): confirm the status-frame format against `hermetic-execd` (T3.1)
 - [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
 - [ ] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (in progress: T3.1, brief in `agy-tasks/`)
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
