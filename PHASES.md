@@ -169,7 +169,9 @@ The oracle passes on every slice task, and one agent run is graded.
 **Runs on.** Linux x86 with KVM (bare metal, or EC2 with nested virtualization).
 
 ### Deliverables
-- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (in progress: T3.3, brief in `agy-tasks/`)
+- [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (T3.3 merged: spec validation, request plan with the kvmclock-hiding CPU template, jail plan, lifecycle, API client, dev-unjailed mode; Firecracker v1.18.0 pinned)
+  - [ ] Open (T3.3): run the jailer tests as root (owner runs `sudo -v` first) and the in-VM boot test once a guest kernel and rootfs exist
+  - [ ] Open (T3.3): confirm the status-frame format against `hermetic-execd` (T3.1)
 - [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
 - [ ] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (in progress: T3.1, brief in `agy-tasks/`)
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
