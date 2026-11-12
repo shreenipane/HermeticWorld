@@ -4,13 +4,13 @@
 //! task-independent facts. `query` matches one task's fingerprints against those records
 //! without reading the tree again.
 //!
-//! # File format (version 4)
+//! # File format (version 5)
 //!
 //! The file is one zstd stream. Decompressed, it holds:
 //!
 //! ```text
 //! magic           6 bytes   "HWIDX1"
-//! version         u32       4
+//! version         u32       5
 //! root            str       the indexed root, as `scan` would display it
 //! canonical_root  str       root canonicalized at index time ("" if failed)
 //! count           u64       number of records
@@ -37,10 +37,11 @@
 //! | 9   | member time | path, mtime seconds i64 |
 //! | 10  | dir         | path, mtime seconds i64, mtime nanos u32 |
 //! | 11  | symlink     | path, mtime seconds i64, mtime nanos u32 |
+//! | 12  | pyc code obj| path, name str, symbol set |
 //!
-//! The reader accepts versions 2, 3 and 4 (a version-2 index has no member-time records,
+//! The reader accepts versions 2, 3, 4 and 5 (a version-2 index has no member-time records,
 //! directory records, or symlink records; a version-3 index has member-time records but lacks
-//! directory and symlink records). Older versions report their uncovered aspects via `not_covered`.
+//! directory and symlink records; a version-4 index lacks pyc code-object records). Older versions report their uncovered aspects via `not_covered`.
 //! Version 1 and anything else stay `UnsupportedVersion`.
 //!
 //! `fixed` holds a finding that depends on the unit alone (errors, bombs, skipped
@@ -70,6 +71,11 @@
 //! canary, dataset host, and dataset dump findings are still reported. Note that `scan` and
 //! `query` differ for such an oversized unit: `scan` scans the large unit in memory, whereas
 //! `query` reports the `index_skipped` Info finding alongside any D9 content findings.
+//!
+//! A text unit's tier-2 context (`tier2_context` binary record) is extracted within
+//! `tier2::MAX_TIER2_CONTEXT_BYTES`. When extraction stops at that bound, a `Fixed` record
+//! (detector "D2", channel "tier2_truncated", severity Info) reports the coverage gap and
+//! the partial context is still written.
 //!
 //! # Not covered by a query
 //!
@@ -101,7 +107,7 @@ use crate::scan::{
 };
 
 pub const MAGIC: &[u8; 6] = b"HWIDX1";
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 /// The largest record payload the reader accepts.
 pub const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 /// The maximum encoded hash bytes of one unit after merging continuations (1 GiB).
@@ -122,6 +128,9 @@ pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
     } else if version == 3 {
         list.push("D4:directories_symlinks");
     }
+    if version < 5 {
+        list.push("D3b:pyc_code_objects");
+    }
     list
 }
 
@@ -136,6 +145,10 @@ const TAG_BINARY_CONT: u8 = 8;
 const TAG_MEMBER_TIME: u8 = 9;
 const TAG_DIR: u8 = 10;
 const TAG_SYMLINK: u8 = 11;
+const TAG_PYC: u8 = 12;
+// Text context uses the existing bounded, splittable two-set record encoding.
+// Older indexes omit these optional records, so T2 remains conservatively uncovered.
+const TIER2_CONTEXT_CHANNEL: &str = "tier2_context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -240,6 +253,11 @@ pub enum IndexRecord {
         mtime_secs: i64,
         mtime_nanos: u32,
     },
+    PycCodeObject {
+        path: IndexPath,
+        name: String,
+        symbols: HashSet<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------------------
@@ -288,6 +306,38 @@ impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
             hashes: compute_unit_hashes(text),
         };
         (self.emit)(record);
+        // Bounded extraction: a hostile unit cannot make indexing allocate more than
+        // `MAX_TIER2_CONTEXT_BYTES`; a truncated context is reported as a coverage gap.
+        let ctx = crate::tier2::extract_unit_tier2_context(text);
+        if ctx.truncated {
+            let gap_path = self.ipath(path);
+            (self.emit)(IndexRecord::Fixed(StoredFinding {
+                detector: "D2".to_string(),
+                channel: "tier2_truncated".to_string(),
+                path: gap_path,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![crate::tier2::tier2_truncated_evidence()],
+            }));
+        }
+        let context_path = self.ipath(path);
+        (self.emit)(IndexRecord::Binary {
+            path: context_path,
+            channel: TIER2_CONTEXT_CHANNEL.to_string(),
+            strings: HashedBinaryStrings {
+                exact: ctx
+                    .anchor_tokens
+                    .iter()
+                    .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
+                    .collect(),
+                tokens: ctx
+                    .symbols
+                    .iter()
+                    .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
+                    .collect(),
+            },
+        });
     }
 
     fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
@@ -320,6 +370,22 @@ impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
             mtime_secs: unix_secs,
         };
         (self.emit)(record);
+    }
+
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]) {
+        let ipath = self.ipath(path);
+        for co in objects {
+            let sym_u64: HashSet<u64> = co
+                .symbols
+                .iter()
+                .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
+                .collect();
+            (self.emit)(IndexRecord::PycCodeObject {
+                path: ipath.clone(),
+                name: co.name.clone(),
+                symbols: sym_u64,
+            });
+        }
     }
 }
 
@@ -508,6 +574,7 @@ pub fn write_index_with_limits(
     {
         let mut w = BufWriter::new(&mut scratch);
         let mut payload = Vec::new();
+        let mut skipped_text_context = None;
         let opts = index_scan_options();
         walk_tree(
             root,
@@ -536,6 +603,11 @@ pub fn write_index_with_limits(
                     } => {
                         let count = text_hash_count(&hashes);
                         let bytes = (count as u64).saturating_mul(8);
+                        skipped_text_context = if bytes > max_unit_bytes {
+                            Some(path.clone())
+                        } else {
+                            None
+                        };
                         if bytes > max_unit_bytes {
                             let skipped = IndexRecord::Fixed(StoredFinding {
                                 detector: "D2".to_string(),
@@ -568,6 +640,11 @@ pub fn write_index_with_limits(
                         channel,
                         strings,
                     } => {
+                        if channel == TIER2_CONTEXT_CHANNEL
+                            && skipped_text_context.take().as_ref() == Some(&path)
+                        {
+                            return;
+                        }
                         let count = binary_hash_count(&strings);
                         let bytes = (count as u64).saturating_mul(8);
                         if bytes > max_unit_bytes {
@@ -951,6 +1028,16 @@ pub fn encode_record(r: &IndexRecord, b: &mut Vec<u8>) {
             b.extend_from_slice(&mtime_secs.to_le_bytes());
             put_u32(b, *mtime_nanos);
         }
+        IndexRecord::PycCodeObject {
+            path,
+            name,
+            symbols,
+        } => {
+            put_u8(b, TAG_PYC);
+            put_path(b, path);
+            put_str(b, name);
+            put_set(b, symbols);
+        }
     }
 }
 
@@ -1180,6 +1267,11 @@ pub fn decode_record(payload: &[u8]) -> Result<IndexRecord, IndexError> {
                 n
             },
         },
+        TAG_PYC => IndexRecord::PycCodeObject {
+            path: c.path()?,
+            name: c.str("pyc code object name")?,
+            symbols: c.set("pyc symbols")?,
+        },
         t => return Err(IndexError::Malformed(format!("unknown record tag {t}"))),
     };
     if c.remaining() != 0 {
@@ -1233,7 +1325,7 @@ impl<R: Read> IndexReader<R> {
         let mut b4 = [0u8; 4];
         read_exact_or_truncated(&mut inner, &mut b4, "version")?;
         let version = u32::from_le_bytes(b4);
-        if version != 2 && version != 3 && version != 4 {
+        if version != 2 && version != 3 && version != 4 && version != 5 {
             return Err(IndexError::UnsupportedVersion(version));
         }
         read_exact_or_truncated(&mut inner, &mut b4, "root length")?;
@@ -1639,9 +1731,40 @@ fn query_record(
             strings,
         } => {
             let display = path.display(root);
-            findings.extend(match_hashed_binary_items(
-                strings, fp, opts, channel, &display,
-            ));
+            if channel == TIER2_CONTEXT_CHANNEL {
+                for hunk in &fp.hunks {
+                    if findings.iter().any(|f| {
+                        f.detector == "D2"
+                            && f.path == display
+                            && f.hunk == Some(hunk.hunk_index)
+                            && f.severity == Severity::Gate
+                    }) {
+                        continue;
+                    }
+                    if let Some(finding) = crate::tier2::match_tier2_by_membership(
+                        |symbol| {
+                            strings
+                                .tokens
+                                .contains(&crate::fingerprint::sha256_u64(symbol.as_bytes()))
+                        },
+                        |anchor| {
+                            strings
+                                .exact
+                                .contains(&crate::fingerprint::sha256_u64(anchor.as_bytes()))
+                        },
+                        hunk,
+                        opts,
+                        "D2",
+                        &display,
+                    ) {
+                        findings.push(finding);
+                    }
+                }
+            } else {
+                findings.extend(match_hashed_binary_items(
+                    strings, fp, opts, channel, &display,
+                ));
+            }
         }
         IndexRecord::Pkg {
             path,
@@ -1657,6 +1780,22 @@ fn query_record(
                 version.as_deref(),
                 &display,
                 opts,
+            ));
+        }
+        IndexRecord::PycCodeObject {
+            path,
+            name,
+            symbols,
+        } => {
+            let display = path.display(root);
+            findings.extend(crate::pyc_marshal::match_hashed_pyc_code_objects(
+                &[crate::pyc_marshal::HashedPycCodeObject {
+                    name: name.clone(),
+                    symbols: symbols.clone(),
+                }],
+                fp,
+                opts,
+                &display,
             ));
         }
     }
@@ -1724,7 +1863,8 @@ pub fn query_reader_with_limit<R: Read>(
             | IndexRecord::Pkg { path, .. }
             | IndexRecord::MemberTime { path, .. }
             | IndexRecord::Dir { path, .. }
-            | IndexRecord::Symlink { path, .. } => path,
+            | IndexRecord::Symlink { path, .. }
+            | IndexRecord::PycCodeObject { path, .. } => path,
             IndexRecord::Fixed(f) => &f.path,
             IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
         };

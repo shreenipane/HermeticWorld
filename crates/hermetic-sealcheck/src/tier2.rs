@@ -455,91 +455,201 @@ pub fn find_first_anchor<'a>(text: &str, anchors: &'a [String]) -> Option<&'a st
     None
 }
 
-fn process_prose_token(
-    raw_tok: &str,
-    symbols: &mut HashSet<String>,
-    anchor_tokens: &mut HashSet<String>,
-) {
+/// Longest dotted sub-chain (in parts) that tier-2 context extraction records.
+///
+/// A dotted token with `k` parts has `O(k^2)` contiguous sub-chains; recording only those
+/// with at most this many parts keeps the work and output linear in the token length. The
+/// whole token and every single part are always recorded.
+pub const MAX_TIER2_SUBCHAIN_PARTS: usize = 16;
+
+/// Upper bound on the bytes one unit's tier-2 context may hold (string bytes of both sets
+/// plus a fixed per-entry overhead). Extraction stops as soon as the next entry would exceed
+/// it and reports the context as truncated.
+pub const MAX_TIER2_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Accounted overhead per stored entry (hash-set slot and `String` header).
+const TIER2_ENTRY_OVERHEAD: usize = 48;
+
+/// The symbols and anchor tokens of one unit, as tier 2 matches them.
+#[derive(Debug, Default, Clone)]
+pub struct Tier2UnitContext {
+    pub symbols: HashSet<String>,
+    pub anchor_tokens: HashSet<String>,
+    /// True when extraction stopped at `MAX_TIER2_CONTEXT_BYTES`: the sets hold only part of
+    /// the unit's context and a coverage gap must be reported.
+    pub truncated: bool,
+}
+
+struct ContextBuilder {
+    ctx: Tier2UnitContext,
+    used: usize,
+    limit: usize,
+}
+
+impl ContextBuilder {
+    fn new(limit: usize) -> Self {
+        Self {
+            ctx: Tier2UnitContext::default(),
+            used: 0,
+            limit,
+        }
+    }
+
+    /// Records `s` in both sets. Returns false (and marks the context truncated) when the
+    /// byte budget is exhausted; nothing is allocated in that case.
+    fn insert(&mut self, s: &str) -> bool {
+        if self.ctx.truncated {
+            return false;
+        }
+        let in_symbols = self.ctx.symbols.contains(s);
+        let in_anchors = self.ctx.anchor_tokens.contains(s);
+        if in_symbols && in_anchors {
+            return true;
+        }
+        let per_set = s.len().saturating_add(TIER2_ENTRY_OVERHEAD);
+        let copies = usize::from(!in_symbols) + usize::from(!in_anchors);
+        let cost = per_set.saturating_mul(copies);
+        let next = self.used.saturating_add(cost);
+        if next > self.limit {
+            self.ctx.truncated = true;
+            return false;
+        }
+        self.used = next;
+        if !in_symbols {
+            self.ctx.symbols.insert(s.to_string());
+        }
+        if !in_anchors {
+            self.ctx.anchor_tokens.insert(s.to_string());
+        }
+        true
+    }
+
+    fn stopped(&self) -> bool {
+        self.ctx.truncated
+    }
+}
+
+fn process_prose_token(raw_tok: &str, b: &mut ContextBuilder) {
     let trimmed = raw_tok.trim_matches('.');
     if trimmed.is_empty() {
         return;
     }
 
-    symbols.insert(trimmed.to_string());
-    anchor_tokens.insert(trimmed.to_string());
+    if !b.insert(trimmed) {
+        return;
+    }
 
+    if !trimmed.contains('.') {
+        return;
+    }
     let parts: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();
     if parts.len() > 1 {
         for part in &parts {
-            symbols.insert((*part).to_string());
-            anchor_tokens.insert((*part).to_string());
+            if !b.insert(part) {
+                return;
+            }
         }
+        let mut chain = String::new();
         for (i, part) in parts.iter().enumerate() {
-            let mut chain = (*part).to_string();
-            for next_part in parts.iter().skip(i + 1) {
+            chain.clear();
+            chain.push_str(part);
+            // Sub-chains of 2..=MAX_TIER2_SUBCHAIN_PARTS parts starting at `i`.
+            for next_part in parts
+                .iter()
+                .skip(i.saturating_add(1))
+                .take(MAX_TIER2_SUBCHAIN_PARTS.saturating_sub(1))
+            {
                 chain.push('.');
                 chain.push_str(next_part);
-                symbols.insert(chain.clone());
-                anchor_tokens.insert(chain.clone());
+                if !b.insert(&chain) {
+                    return;
+                }
             }
         }
     }
 }
 
-fn extract_prose_tokens_into(
-    text: &str,
-    symbols: &mut HashSet<String>,
-    anchor_tokens: &mut HashSet<String>,
-) {
+fn extract_prose_tokens_into(text: &str, b: &mut ContextBuilder) {
     let mut start_opt = None;
     for (idx, ch) in text.char_indices() {
+        if b.stopped() {
+            return;
+        }
         if ch.is_alphanumeric() || ch == '_' || ch == '.' {
             if start_opt.is_none() {
                 start_opt = Some(idx);
             }
         } else if let Some(start) = start_opt.take() {
-            process_prose_token(&text[start..idx], symbols, anchor_tokens);
+            process_prose_token(&text[start..idx], b);
         }
     }
     if let Some(start) = start_opt {
-        process_prose_token(&text[start..], symbols, anchor_tokens);
+        process_prose_token(&text[start..], b);
+    }
+}
+
+/// Extracts a unit's tier-2 context within `MAX_TIER2_CONTEXT_BYTES`.
+pub fn extract_unit_tier2_context(text: &str) -> Tier2UnitContext {
+    extract_unit_tier2_context_with_limit(text, MAX_TIER2_CONTEXT_BYTES)
+}
+
+/// Extracts a unit's tier-2 context, holding at most `limit` accounted bytes.
+pub fn extract_unit_tier2_context_with_limit(text: &str, limit: usize) -> Tier2UnitContext {
+    let mut b = ContextBuilder::new(limit);
+    extract_prose_tokens_into(text, &mut b);
+    extract_delimited_spans_into(text, '`', '`', &mut b);
+    extract_delimited_spans_into(text, '\'', '\'', &mut b);
+    extract_delimited_spans_into(text, '"', '"', &mut b);
+    b.ctx
+}
+
+/// The evidence line of a tier-2 coverage gap finding.
+pub fn tier2_truncated_evidence() -> String {
+    format!("tier-2 context truncated at {MAX_TIER2_CONTEXT_BYTES} bytes; unit only partly matched")
+}
+
+/// An Info finding that reports a unit whose tier-2 context was truncated.
+pub fn tier2_truncated_finding(
+    detector: &str,
+    path: &str,
+    visibility: crate::scan::Visibility,
+) -> Finding {
+    Finding {
+        detector: detector.to_string(),
+        channel: "tier2_truncated".to_string(),
+        path: path.to_string(),
+        visibility,
+        severity: Severity::Info,
+        confidence: 0.0,
+        hunk: None,
+        evidence: vec![tier2_truncated_evidence()],
     }
 }
 
 pub fn extract_unit_symbols_and_anchors(text: &str) -> (HashSet<String>, HashSet<String>) {
-    let mut symbols = HashSet::new();
-    let mut anchor_tokens = HashSet::new();
-
-    extract_prose_tokens_into(text, &mut symbols, &mut anchor_tokens);
-
-    extract_delimited_spans_into(text, '`', '`', &mut symbols, &mut anchor_tokens);
-    extract_delimited_spans_into(text, '\'', '\'', &mut symbols, &mut anchor_tokens);
-    extract_delimited_spans_into(text, '"', '"', &mut symbols, &mut anchor_tokens);
-
-    (symbols, anchor_tokens)
+    let ctx = extract_unit_tier2_context(text);
+    (ctx.symbols, ctx.anchor_tokens)
 }
 
 pub fn extract_unit_candidate_symbols(text: &str) -> HashSet<String> {
     extract_unit_symbols_and_anchors(text).0
 }
 
-fn extract_delimited_spans_into(
-    text: &str,
-    open: char,
-    close: char,
-    symbols: &mut HashSet<String>,
-    anchor_tokens: &mut HashSet<String>,
-) {
+fn extract_delimited_spans_into(text: &str, open: char, close: char, b: &mut ContextBuilder) {
     let mut start_idx = 0;
     while let Some(o_idx) = text[start_idx..].find(open) {
+        if b.stopped() {
+            return;
+        }
         let abs_open = start_idx + o_idx;
         let rest = &text[abs_open + open.len_utf8()..];
         if let Some(c_idx) = rest.find(close) {
             let span = rest[..c_idx].trim();
             if !span.is_empty() && span.len() <= 500 && !span.contains('\n') {
-                symbols.insert(span.to_string());
-                anchor_tokens.insert(span.to_string());
-                extract_prose_tokens_into(span, symbols, anchor_tokens);
+                if !b.insert(span) {
+                    return;
+                }
+                extract_prose_tokens_into(span, b);
             }
             start_idx = abs_open + open.len_utf8() + c_idx + close.len_utf8();
         } else {
@@ -593,6 +703,24 @@ pub fn match_tier2_with_context(
     detector: &str,
     path: &str,
 ) -> Option<Finding> {
+    match_tier2_by_membership(
+        |symbol| unit_symbols.contains(symbol),
+        |anchor| unit_anchor_tokens.contains(anchor),
+        hunk,
+        opts,
+        detector,
+        path,
+    )
+}
+
+pub(crate) fn match_tier2_by_membership(
+    contains_symbol: impl Fn(&str) -> bool,
+    contains_anchor: impl Fn(&str) -> bool,
+    hunk: &HunkFingerprints,
+    opts: &ScanOptions,
+    detector: &str,
+    path: &str,
+) -> Option<Finding> {
     if hunk.tier2_total_weight <= 0.0
         || hunk.tier2_symbols.len() < 2
         || hunk.tier2_anchors.is_empty()
@@ -600,13 +728,16 @@ pub fn match_tier2_with_context(
         return None;
     }
 
-    let matched_anchor = find_first_anchor_in_tokens(&hunk.tier2_anchors, unit_anchor_tokens)?;
+    let matched_anchor = hunk
+        .tier2_anchors
+        .iter()
+        .find(|anchor| contains_anchor(anchor))?;
 
     let mut matched_symbols = Vec::new();
     let mut matched_weight = 0.0;
 
     for (sym, weight) in &hunk.tier2_symbols {
-        if unit_symbols.contains(sym) {
+        if contains_symbol(sym) {
             matched_symbols.push((sym.clone(), *weight));
             matched_weight += weight;
         }
