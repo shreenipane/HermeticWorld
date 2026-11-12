@@ -31,7 +31,7 @@ class IntakeError(Exception):
 def validate_commit_sha(sha: Any, label: str = "commit") -> str:
     """Validate a commit or merge identifier as a bounded hexadecimal string."""
     if not isinstance(sha, str) or not (4 <= len(sha) <= 64) or not re.fullmatch(r"[0-9a-fA-F]{4,64}", sha):
-        raise IntakeError(f"malformed_{label}_identifier; expected bounded hexadecimal string, got {sha!r}")
+        raise IntakeError(f"malformed_{label}_identifier")
     return sha
 
 

@@ -222,39 +222,61 @@ def test_repeated_cursor_terminates_without_certifying(tmp_path, document):
 def test_named_pagination_and_aggregate_caps_exclude(tmp_path, cap):
     node = issue()
     node["lastEditedAt"] = "2020-01-10T00:00:00Z"
+    target_resp = response("issue", node)
+    target_resp["data"]["repository"]["issue"]["userContentEdits"] = connection(
+        [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+        more=True,
+        cursor="page2",
+    )
+    pr_resp = response("pullRequest", pr())
+    edits_resp = {
+        "data": {
+            "repository": {
+                "issue": {
+                    "includesCreatedEdit": True,
+                    "userContentEdits": connection(
+                        [{"editedAt": "2020-01-01T00:00:00Z", "diff": "clean"}],
+                        more=False,
+                    ),
+                }
+            }
+        }
+    }
+
+    n1, s1 = thread_scrub._measure_response(pr_resp)
+    n2, s2 = thread_scrub._measure_response(target_resp)
+
+    if cap == "MAX_GRAPHQL_NODES":
+        cap_val = max(n1, n2)
+        expected_calls = 2
+    elif cap == "MAX_GRAPHQL_BYTES":
+        cap_val = max(s1, s2)
+        expected_calls = 2
+    elif cap == "MAX_GRAPHQL_PAGES":
+        cap_val = 2
+        expected_calls = 2
+    elif cap == "MAX_CONNECTION_PAGES":
+        cap_val = 1
+        expected_calls = 2
+    elif cap == "MAX_CONNECTION_NODES":
+        cap_val = 1
+        expected_calls = 3
+
     calls = []
     def post(url, payload):
         op = payload["operationName"]
         calls.append(op)
         if op == "PullRequestData":
-            return response("pullRequest", pr())
+            return deepcopy(pr_resp)
         if op == "TargetIssueData":
-            result = response("issue", node)
-            result["data"]["repository"]["issue"]["userContentEdits"] = connection(
-                [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
-                more=True,
-                cursor="page2",
-            )
-            return result
+            return deepcopy(target_resp)
         if op == "IssueEditsPage":
-            return {
-                "data": {
-                    "repository": {
-                        "issue": {
-                            "includesCreatedEdit": True,
-                            "userContentEdits": connection(
-                                [{"editedAt": "2020-01-01T00:00:00Z", "diff": "clean"}],
-                                more=False,
-                            ),
-                        }
-                    }
-                }
-            }
+            return deepcopy(edits_resp)
         return response("issue", issue())
 
-    with patch.object(thread_scrub, cap, 1):
+    with patch.object(thread_scrub, cap, cap_val):
         result = run_scrub(tmp_path, post=post)
-    assert len(calls) <= 3
+    assert len(calls) == expected_calls
     assert result.problem_statement_revision == "excluded"
     assert LATE not in result.problem_statement + result.hints_text
     assert_denied(result.scrub_entries)
@@ -864,3 +886,394 @@ def test_defect5_ancestor_symlink_swap_leaves_sentinel_untouched(tmp_path):
     assert staging_sentinel.exists()
     assert staging_sentinel.read_text(encoding="utf-8") == "staging_sentinel_data"
     assert not (outside_dir / "task.json").exists()
+
+
+def test_defect1_containing_comment_collections_blocked_when_forbidden_comments_exist(tmp_path):
+    """Regression Defect 1: Successful discovery with forbidden comments denies containing collection endpoints and their query variants."""
+    target_node = issue()
+    late_c = {
+        "id": "c_late",
+        "databaseId": 101,
+        "url": f"https://github.com/{REPO}/issues/1#issuecomment-101",
+        "body": "late hint text",
+        "createdAt": "2020-01-10T00:00:00Z",
+        "lastEditedAt": None,
+    }
+    target_node["comments"] = connection([late_c])
+
+    pr_node = pr()
+    pr_rc = {
+        "id": "pr_rc_1",
+        "databaseId": 201,
+        "url": f"https://github.com/{REPO}/pull/50#discussion_r201",
+        "body": "review comment text",
+    }
+    pr_node["reviewThreads"] = connection([{
+        "id": "thread_1",
+        "comments": connection([pr_rc]),
+    }])
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr_node)
+        if op == "TargetIssueData":
+            return response("issue", target_node)
+        raise OSError("unexpected op")
+
+    warnings: list[str] = []
+    res = run_scrub(tmp_path, node=target_node, post=post, warnings=warnings)
+
+    assert not any(e["kind"] == "unresolved_scope" for e in res.scrub_entries)
+
+    issues_coll = f"https://api.github.com/repos/{REPO}/issues/comments"
+    pulls_coll = f"https://api.github.com/repos/{REPO}/pulls/comments"
+
+    for coll_url in (issues_coll, pulls_coll):
+        assert thread_scrub.matches_any_scrub_entry(res.scrub_entries, coll_url)
+        assert thread_scrub.matches_any_scrub_entry(res.scrub_entries, f"{coll_url}?page=1")
+        assert thread_scrub.matches_any_scrub_entry(res.scrub_entries, f"{coll_url}?page=2&per_page=100")
+        assert thread_scrub.matches_any_scrub_entry(res.scrub_entries, f"{coll_url}?since=2020-01-01T00:00:00Z")
+
+    diff_issues = "https://api.github.com/repos/other-org/other-repo/issues/comments?page=1"
+    diff_pulls = "https://api.github.com/repos/other-org/other-repo/pulls/comments?page=1"
+    assert not thread_scrub.matches_any_scrub_entry(res.scrub_entries, diff_issues)
+    assert not thread_scrub.matches_any_scrub_entry(res.scrub_entries, diff_pulls)
+
+
+@pytest.mark.parametrize("kind,case", [
+    ("review_comment", "conflicting_id"),
+    ("review_comment", "foreign_repo"),
+    ("pr_comment", "conflicting_id"),
+    ("pr_comment", "foreign_repo"),
+    ("issue_comment", "conflicting_id"),
+    ("issue_comment", "foreign_repo"),
+])
+def test_defect2_comment_identity_validation_conflicting_ids_and_foreign_repos(tmp_path, kind, case):
+    """Regression Defect 2: exercise conflicting IDs and foreign-repository URLs through top-level processing for review and conversation comments."""
+    target_node = issue()
+    pr_node = pr()
+
+    if kind == "review_comment":
+        if case == "conflicting_id":
+            rc = {
+                "id": "rc_bad",
+                "databaseId": 101,
+                "url": f"https://github.com/{REPO}/pull/50#discussion_r202",
+            }
+        else:
+            rc = {
+                "id": "rc_bad",
+                "databaseId": 101,
+                "url": "https://github.com/foreign-org/foreign-repo/pull/50#discussion_r101",
+            }
+        pr_node["reviewThreads"] = connection([{"id": "t1", "comments": connection([rc])}])
+
+    elif kind == "pr_comment":
+        if case == "conflicting_id":
+            c = {
+                "id": "c_bad",
+                "databaseId": 101,
+                "url": f"https://github.com/{REPO}/pull/50#issuecomment-202",
+            }
+        else:
+            c = {
+                "id": "c_bad",
+                "databaseId": 101,
+                "url": "https://github.com/foreign-org/foreign-repo/pull/50#issuecomment-101",
+            }
+        pr_node["comments"] = connection([c])
+
+    elif kind == "issue_comment":
+        if case == "conflicting_id":
+            c = {
+                "id": "c_bad",
+                "databaseId": 101,
+                "url": f"https://github.com/{REPO}/issues/1#issuecomment-202",
+                "body": "some text",
+                "createdAt": "2020-01-02T00:00:00Z",
+                "lastEditedAt": None,
+            }
+        else:
+            c = {
+                "id": "c_bad",
+                "databaseId": 101,
+                "url": "https://github.com/foreign-org/foreign-repo/issues/1#issuecomment-101",
+                "body": "some text",
+                "createdAt": "2020-01-02T00:00:00Z",
+                "lastEditedAt": None,
+            }
+        target_node["comments"] = connection([c])
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr_node)
+        if op == "TargetIssueData":
+            return response("issue", target_node)
+        raise OSError("unexpected op")
+
+    warnings: list[str] = []
+    res = run_scrub(tmp_path, node=target_node, post=post, warnings=warnings)
+    assert_denied(res.scrub_entries)
+
+
+def test_defect3_mixed_case_repository_matching():
+    """Regression Defect 3: Assert mixed-case repository variants are blocked for HTML, API and prefix entries while different repositories remain unmatched."""
+    entries = [
+        {"kind": "pull_request", "match": "exact", "url": "https://github.com/test-org/test-repo/pull/50", "reason": "PR HTML"},
+        {"kind": "pull_request", "match": "exact", "url": "https://api.github.com/repos/test-org/test-repo/pulls/50", "reason": "PR API"},
+        {"kind": "pull_request_prefix", "match": "prefix", "url": "https://api.github.com/repos/test-org/test-repo/pulls/50/", "reason": "PR API prefix"},
+        {"kind": "pull_request_prefix", "match": "prefix", "url": "https://github.com/test-org/test-repo/pull/50/", "reason": "PR HTML prefix"},
+    ]
+
+    # HTML mixed-case matches
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://github.com/TEST-ORG/TEST-REPO/pull/50")
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://github.com/Test-Org/test-repo/pull/50")
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://github.com/TEST-org/test-REPO/pull/50")
+
+    # API mixed-case matches
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/TEST-ORG/TEST-REPO/pulls/50")
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/Test-Org/test-repo/pulls/50")
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/TEST-org/test-REPO/pulls/50")
+
+    # Prefix mixed-case matches
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/TEST-ORG/TEST-REPO/pulls/50/comments")
+    assert thread_scrub.matches_any_scrub_entry(entries, "https://github.com/TEST-ORG/TEST-REPO/pull/50/files")
+
+    # Different repositories remain unmatched
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/pull/50")
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/pulls/50")
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/test-repo/pulls/50")
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/test-org/other-repo/pulls/50")
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/pulls/50/comments")
+    assert not thread_scrub.matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/pull/50/files")
+
+
+@pytest.mark.parametrize("secret_id", [
+    "SECRET_CANARY_VALUE_SCALAR_12345",
+    "abcdef" + "SECRET_CANARY_VALUE_SCALAR_12345" * 10,
+    ["safe_token", "SECRET_CANARY_VALUE_LIST_12345"],
+    {"token_key": "SECRET_CANARY_VALUE_OBJECT_12345"},
+])
+def test_defect4_secret_markers_never_in_exceptions_or_cli_output(tmp_path, secret_id, capsys):
+    """Regression Defect 4: pass secret markers inside malformed scalar, list and object identifiers; assert their absence from exceptions and captured CLI output."""
+    marker = "SECRET_CANARY_VALUE"
+
+    with pytest.raises(IntakeError) as exc_info:
+        from hermetic_slice.intake import validate_commit_sha
+        validate_commit_sha(secret_id, "merge_commit")
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value)
+
+    with pytest.raises(thread_scrub.GraphQLResponseError) as exc_info2:
+        thread_scrub.get_solution_pr_scrub_entries("test-org/test-repo", 50, commit_shas=[secret_id])
+    assert marker not in str(exc_info2.value)
+    assert marker not in repr(exc_info2.value)
+
+    row = {
+        "repo": REPO,
+        "base_commit": "abc",
+        "problem_statement": "Statement",
+        "hints_text": "Hints",
+        "patch": "gold",
+        "test_patch": "tests",
+    }
+    def get(url):
+        if "/commits?" in url:
+            return b"[]"
+        if "/issues/" in url:
+            return b'{"created_at":"2020-01-01T00:00:00Z"}'
+        data = {"created_at": "2020-02-01T00:00:00Z", "body": "Fixes #1", "merge_commit_sha": secret_id}
+        return json.dumps(data).encode()
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
+        if op == "TargetIssueData":
+            return response("issue", issue())
+        raise OSError(f"unexpected op: {op}")
+
+    out_dir = tmp_path / "out"
+    with patch("hermetic_slice.intake.repo_dates", return_value=(WORLD, WORLD)):
+        with pytest.raises(IntakeError) as exc_info3:
+            intake_task(
+                "test-org__test-repo-50",
+                {"test-org__test-repo-50": row},
+                get,
+                tmp_path / "cache",
+                out_dir,
+                http_post_json=post,
+            )
+        assert marker not in str(exc_info3.value)
+        assert marker not in repr(exc_info3.value)
+
+    from hermetic_slice import __main__ as cli_main
+    tasks_dir = tmp_path / "cli_tasks"
+    tasks_dir.mkdir(parents=True)
+    cache_dir = tmp_path / "cli_cache"
+    cache_dir.mkdir(parents=True)
+    verified_file = cache_dir / "swebench_verified.jsonl"
+    verified_row = dict(row, instance_id="test-org__test-repo-50")
+    verified_file.write_text(json.dumps(verified_row) + "\n", encoding="utf-8")
+
+    capsys.readouterr()
+    with patch("hermetic_slice.__main__.intake_task", side_effect=exc_info3.value):
+        cli_main.main(["intake", "--tasks-dir", str(tasks_dir), "--cache-dir", str(cache_dir), "--only", "test-org__test-repo-50"])
+    captured = capsys.readouterr()
+    assert marker not in captured.err
+    assert marker not in captured.out
+
+
+def test_defect5_cumulative_nodes_enforcement_fails_if_cumulative_check_removed(tmp_path):
+    """Regression Defect 5: finite responses that individually fit the node budget but collectively exceed it fail on cumulative enforcement."""
+    node = issue()
+    node["lastEditedAt"] = "2020-01-10T00:00:00Z"
+    target_resp = response("issue", node)
+    target_resp["data"]["repository"]["issue"]["userContentEdits"] = connection(
+        [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+        more=True,
+        cursor="page2",
+    )
+    pr_resp = response("pullRequest", pr())
+
+    n1, _ = thread_scrub._measure_response(pr_resp)
+    n2, _ = thread_scrub._measure_response(target_resp)
+
+    budget = max(n1, n2)
+    assert n1 <= budget
+    assert n2 <= budget
+    assert n1 + n2 > budget
+
+    calls = []
+    def post(url, payload):
+        op = payload["operationName"]
+        calls.append(op)
+        if op == "PullRequestData":
+            return deepcopy(pr_resp)
+        if op == "TargetIssueData":
+            return deepcopy(target_resp)
+        if op == "IssueEditsPage":
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "includesCreatedEdit": True,
+                            "userContentEdits": connection(
+                                [{"editedAt": "2020-01-10T00:00:00Z", "diff": "clean"}],
+                                more=False,
+                            ),
+                        }
+                    }
+                }
+            }
+        return response("issue", issue())
+
+    with patch.object(thread_scrub, "MAX_GRAPHQL_NODES", budget):
+        result = run_scrub(tmp_path, post=post)
+
+    assert len(calls) == 2
+    assert result.problem_statement_revision == "excluded"
+    assert LATE not in result.problem_statement + result.hints_text
+    assert_denied(result.scrub_entries)
+
+
+def test_defect5_cumulative_bytes_enforcement_fails_if_cumulative_check_removed(tmp_path):
+    """Regression Defect 5: finite responses that individually fit the byte budget but collectively exceed it fail on cumulative enforcement."""
+    node = issue()
+    node["lastEditedAt"] = "2020-01-10T00:00:00Z"
+    target_resp = response("issue", node)
+    target_resp["data"]["repository"]["issue"]["userContentEdits"] = connection(
+        [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+        more=True,
+        cursor="page2",
+    )
+    pr_resp = response("pullRequest", pr())
+
+    _, s1 = thread_scrub._measure_response(pr_resp)
+    _, s2 = thread_scrub._measure_response(target_resp)
+
+    budget = max(s1, s2)
+    assert s1 <= budget
+    assert s2 <= budget
+    assert s1 + s2 > budget
+
+    calls = []
+    def post(url, payload):
+        op = payload["operationName"]
+        calls.append(op)
+        if op == "PullRequestData":
+            return deepcopy(pr_resp)
+        if op == "TargetIssueData":
+            return deepcopy(target_resp)
+        if op == "IssueEditsPage":
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "includesCreatedEdit": True,
+                            "userContentEdits": connection(
+                                [{"editedAt": "2020-01-10T00:00:00Z", "diff": "clean"}],
+                                more=False,
+                            ),
+                        }
+                    }
+                }
+            }
+        return response("issue", issue())
+
+    with patch.object(thread_scrub, "MAX_GRAPHQL_BYTES", budget):
+        result = run_scrub(tmp_path, post=post)
+
+    assert len(calls) == 2
+    assert result.problem_statement_revision == "excluded"
+    assert LATE not in result.problem_statement + result.hints_text
+    assert_denied(result.scrub_entries)
+
+
+def test_defect5_connection_pages_cap_enforces_across_paginated_responses(tmp_path):
+    """Regression Defect 5: connection pagination enforces MAX_CONNECTION_PAGES across pages."""
+    node = issue()
+    node["lastEditedAt"] = "2020-01-10T00:00:00Z"
+    target_resp = response("issue", node)
+    target_resp["data"]["repository"]["issue"]["userContentEdits"] = connection(
+        [{"editedAt": "2020-01-10T00:00:00Z", "diff": LATE}],
+        more=True,
+        cursor="page2",
+    )
+    pr_resp = response("pullRequest", pr())
+
+    calls = []
+    def post(url, payload):
+        op = payload["operationName"]
+        calls.append(op)
+        if op == "PullRequestData":
+            return deepcopy(pr_resp)
+        if op == "TargetIssueData":
+            return deepcopy(target_resp)
+        if op == "IssueEditsPage":
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "includesCreatedEdit": True,
+                            "userContentEdits": connection(
+                                [{"editedAt": "2020-01-05T00:00:00Z", "diff": "clean"}],
+                                more=True,
+                                cursor="page3",
+                            ),
+                        }
+                    }
+                }
+            }
+        return response("issue", issue())
+
+    with patch.object(thread_scrub, "MAX_CONNECTION_PAGES", 2):
+        result = run_scrub(tmp_path, post=post)
+
+    assert len(calls) == 3
+    assert result.problem_statement_revision == "excluded"
+    assert LATE not in result.problem_statement + result.hints_text
+    assert_denied(result.scrub_entries)
+

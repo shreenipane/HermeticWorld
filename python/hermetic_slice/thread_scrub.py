@@ -163,6 +163,24 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
 
     path = parsed.path or "/"
 
+    # Canonicalize GitHub owner/repository components
+    parts = path.split("/")
+    if canon_netloc == "api.github.com":
+        if len(parts) >= 4 and parts[1].lower() == "repos":
+            parts[1] = "repos"
+            parts[2] = parts[2].lower()
+            parts[3] = parts[3].lower()
+            path = "/".join(parts)
+        elif len(parts) >= 3 and parts[1].lower() in ("orgs", "users"):
+            parts[1] = parts[1].lower()
+            parts[2] = parts[2].lower()
+            path = "/".join(parts)
+    elif canon_netloc in ("github.com", "www.github.com"):
+        if len(parts) >= 3 and parts[1] and parts[2]:
+            parts[1] = parts[1].lower()
+            parts[2] = parts[2].lower()
+            path = "/".join(parts)
+
     return (scheme, canon_netloc, path, parsed.query, parsed.fragment)
 
 
@@ -1070,12 +1088,85 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
         pr[field]["nodes"] = nodes
     return pr
 
+
+def _canonicalize_repo_slug(repo: str) -> str:
+    """Canonicalize GitHub repository slug 'owner/repo' to lowercase."""
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        return f"{owner.lower()}/{name.lower()}"
+    return repo.lower()
+
+
+def _validate_comment_identity(
+    database_id: Any,
+    url: Any,
+    expected_repo: str,
+    expected_parent_type: str,
+    expected_parent_num: int,
+    expected_fragment_prefix: str,
+) -> tuple[int | None, bool]:
+    """Validate repository, parent resource, and fragment identity agreement with databaseId.
+
+    Returns (resolved_id, is_valid). If invalid or inconsistent, is_valid is False.
+    """
+    db_id: int | None = None
+    if database_id is not None:
+        if type(database_id) is not int or isinstance(database_id, bool) or database_id <= 0 or database_id > MAX_DATABASE_ID:
+            return None, False
+        db_id = database_id
+
+    if url is None:
+        if db_id is None:
+            return None, False
+        return db_id, True
+
+    if not isinstance(url, str) or len(url) > MAX_RESOURCE_URL_LENGTH:
+        return db_id, False
+
+    pattern = (
+        rf"^https://github\.com/([^/]+)/([^/]+)/{re.escape(expected_parent_type)}/(\d+)"
+        rf"(?:/[^#]*)?#{re.escape(expected_fragment_prefix)}(\d+)$"
+    )
+    m = re.match(pattern, url)
+    if not m:
+        return db_id, False
+
+    url_owner, url_repo_name, url_parent_s, url_frag_s = m.groups()
+    if len(url_parent_s) > 18 or len(url_frag_s) > 18:
+        return db_id, False
+
+    try:
+        url_parent_num = int(url_parent_s)
+        url_frag_id = int(url_frag_s)
+    except ValueError:
+        return db_id, False
+
+    if url_parent_num <= 0 or url_parent_num > MAX_DATABASE_ID:
+        return db_id, False
+    if url_frag_id <= 0 or url_frag_id > MAX_DATABASE_ID:
+        return db_id, False
+
+    url_repo = f"{url_owner}/{url_repo_name}"
+    if _canonicalize_repo_slug(url_repo) != _canonicalize_repo_slug(expected_repo):
+        return db_id, False
+
+    if url_parent_num != expected_parent_num:
+        return db_id, False
+
+    if db_id is not None and db_id != url_frag_id:
+        return None, False
+
+    resolved_id = db_id if db_id is not None else url_frag_id
+    return resolved_id, True
+
+
 def get_solution_pr_scrub_entries(
     repo: str,
     pr_number: int,
     commit_shas: Sequence[str] = (),
 ) -> list[ScrubEntry]:
     """Generate static scrub entries for the solution PR itself, its sub-views, prefixes, and commits."""
+    repo = _canonicalize_repo_slug(repo)
     entries: list[ScrubEntry] = [
         ScrubEntry(kind="pull_request", match="exact", url=f"https://github.com/{repo}/pull/{pr_number}", reason="solution PR HTML URL"),
         ScrubEntry(kind="pull_request_prefix", match="prefix", url=f"https://github.com/{repo}/pull/{pr_number}/", reason="solution PR URL prefix"),
@@ -1094,9 +1185,11 @@ def get_solution_pr_scrub_entries(
     seen_shas: set[str] = set()
     for sha in commit_shas:
         if not isinstance(sha, str) or not sha:
-            raise GraphQLResponseError(f"malformed_commit_identifier; invalid {sha!r}")
+            raise GraphQLResponseError("malformed_commit_identifier")
         if len(sha) > 64:
-            raise GraphQLResponseError(f"oversized_commit_identifier; length {len(sha)}")
+            raise GraphQLResponseError("oversized_commit_identifier")
+        if not (4 <= len(sha) <= 64) or not re.fullmatch(r"[0-9a-fA-F]{4,64}", sha):
+            raise GraphQLResponseError("malformed_commit_identifier")
         if sha in seen_shas:
             continue
         seen_shas.add(sha)
@@ -1116,6 +1209,7 @@ def get_referencing_pr_scrub_entries(
     base_reason: str = "referencing PR",
 ) -> list[ScrubEntry]:
     """Generate the full scrub entry set for a referencing PR."""
+    pr_repo = _canonicalize_repo_slug(pr_repo)
     return [
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{pr_repo}/pull/{pr_num}", reason=base_reason),
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{pr_repo}/pull/{pr_num}/", reason=f"{base_reason} URL prefix"),
@@ -1139,6 +1233,7 @@ def get_referencing_issue_scrub_entries(
     base_reason: str = "referencing issue",
 ) -> list[ScrubEntry]:
     """Generate the full scrub entry set for a referencing issue with delimiter-bounded prefixes."""
+    issue_repo = _canonicalize_repo_slug(issue_repo)
     return [
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{issue_repo}/issues/{issue_num}", reason=base_reason),
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} URL prefix"),
@@ -1295,6 +1390,7 @@ def process_thread_scrub_and_revision(
     """
     if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
         raise GraphQLResponseError("invalid_repository")
+    repo = _canonicalize_repo_slug(repo)
     owner, name = repo.split("/", 1)
     base_entries = get_solution_pr_scrub_entries(repo, pr_number, commit_shas=commit_shas)
 
@@ -1376,16 +1472,10 @@ def process_thread_scrub_and_revision(
         for thread in (pr_data.get("reviewThreads") or {}).get("nodes") or []:
             for rc in (thread.get("comments") or {}).get("nodes") or []:
                 rc_url = rc.get("url") if isinstance(rc.get("url"), str) else None
-                rc_id = rc.get("databaseId") if type(rc.get("databaseId")) is int and rc.get("databaseId") > 0 else None
-                if not rc_id and rc_url:
-                    m = re.search(r"#discussion_r(\d+)", rc_url)
-                    if m and len(m.group(1)) <= 18:
-                        try:
-                            rc_id = int(m.group(1))
-                        except ValueError:
-                            rc_id = None
-                valid_url = (rc_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#discussion_r\d+$", rc_url))
-                if not rc_id or not valid_url:
+                rc_id, is_valid = _validate_comment_identity(
+                    rc.get("databaseId"), rc_url, repo, "pull", pr_number, "discussion_r"
+                )
+                if not is_valid:
                     deny_unresolved_scope(pr_entries)
                     if unrev_warning not in warnings_list:
                         warnings_list.append(unrev_warning)
@@ -1399,20 +1489,20 @@ def process_thread_scrub_and_revision(
                         url=f"https://api.github.com/repos/{repo}/pulls/comments/{rc_id}",
                         reason="solution PR review comment",
                     ))
+                pr_entries.append(ScrubEntry(
+                    kind="review_comment",
+                    match="exact",
+                    url=f"https://api.github.com/repos/{repo}/pulls/comments",
+                    reason="repository pull request comments collection containing solution PR review comment",
+                ))
 
         # Defect 9: PR conversation comments (IssueComments on PR)
         for c in (pr_data.get("comments") or {}).get("nodes") or []:
             c_url = c.get("url") if isinstance(c.get("url"), str) else None
-            c_id = c.get("databaseId") if type(c.get("databaseId")) is int and c.get("databaseId") > 0 else None
-            if not c_id and c_url:
-                m = re.search(r"#issuecomment-(\d+)", c_url)
-                if m and len(m.group(1)) <= 18:
-                    try:
-                        c_id = int(m.group(1))
-                    except ValueError:
-                        c_id = None
-            valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/pull/\d+.*#issuecomment-\d+$", c_url))
-            if not c_id or not valid_url:
+            c_id, is_valid = _validate_comment_identity(
+                c.get("databaseId"), c_url, repo, "pull", pr_number, "issuecomment-"
+            )
+            if not is_valid:
                 deny_unresolved_scope(pr_entries)
                 if unrev_warning not in warnings_list:
                     warnings_list.append(unrev_warning)
@@ -1426,6 +1516,12 @@ def process_thread_scrub_and_revision(
                     url=f"https://api.github.com/repos/{repo}/issues/comments/{c_id}",
                     reason="solution PR conversation comment API URL",
                 ))
+            pr_entries.append(ScrubEntry(
+                kind="comment",
+                match="exact",
+                url=f"https://api.github.com/repos/{repo}/issues/comments",
+                reason="repository issue comments collection containing solution PR comment",
+            ))
     except Exception:
         return make_fallback("pr_discovery_failed; repository_scope_denied", pr_entries)
 
@@ -1466,16 +1562,10 @@ def process_thread_scrub_and_revision(
                     continue
                 c_created = parse_iso(c.get("createdAt"))
                 c_url = c.get("url") if isinstance(c.get("url"), str) else None
-                c_id = c.get("databaseId") if type(c.get("databaseId")) is int and c.get("databaseId") > 0 else None
-                if not c_id and c_url:
-                    m = re.search(r"#issuecomment-(\d+)", c_url)
-                    if m and len(m.group(1)) <= 18:
-                        try:
-                            c_id = int(m.group(1))
-                        except ValueError:
-                            c_id = None
-                valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/issues/\d+.*#issuecomment-\d+$", c_url))
-                if not c_id or not valid_url:
+                c_id, is_valid = _validate_comment_identity(
+                    c.get("databaseId"), c_url, repo, "issues", iss_num, "issuecomment-"
+                )
+                if not is_valid:
                     deny_unresolved_scope(all_entries)
                     if unrev_warning not in warnings_list:
                         warnings_list.append(unrev_warning)
@@ -1503,6 +1593,12 @@ def process_thread_scrub_and_revision(
                         match="exact",
                         url=f"https://api.github.com/repos/{repo}/issues/{iss_num}/comments",
                         reason="target issue comments collection containing late comment created after T_world",
+                    ))
+                    all_entries.append(ScrubEntry(
+                        kind="comment",
+                        match="exact",
+                        url=f"https://api.github.com/repos/{repo}/issues/comments",
+                        reason="repository issue comments collection containing late comment created after T_world",
                     ))
 
             _add_timeline_scrub_entries(all_entries, iss_data, repo, target_set)
@@ -1578,22 +1674,18 @@ def process_thread_scrub_and_revision(
         c_created = parse_iso(comment.get("createdAt"))
         c_last_edited = parse_iso(comment.get("lastEditedAt"))
         c_url = comment.get("url") if isinstance(comment.get("url"), str) else None
-        c_db_id = comment.get("databaseId") if type(comment.get("databaseId")) is int and comment.get("databaseId") > 0 else None
-        if not c_db_id and c_url:
-            m = re.search(r"#issuecomment-(\d+)", c_url)
-            if m and len(m.group(1)) <= 18:
-                try:
-                    c_db_id = int(m.group(1))
-                except ValueError:
-                    c_db_id = None
+        c_db_id, is_valid = _validate_comment_identity(
+            comment.get("databaseId"), c_url, repo, "issues", single_issue_number, "issuecomment-"
+        )
         c_comment_ident = str(c_db_id) if c_db_id is not None else "unknown"
 
-        valid_url = (c_url is None) or bool(re.search(r"^https://github\.com/[^/]+/[^/]+/issues/\d+.*#issuecomment-\d+$", c_url))
-        if not c_db_id or not valid_url:
+        if not is_valid:
             deny_unresolved_scope(all_entries)
             if unrev_warning not in warnings_list:
                 warnings_list.append(unrev_warning)
             warnings_list.append(f"Comment {c_comment_ident}: missing identity; repository_scope_denied")
+            hints_excluded_no_history += 1
+            continue
 
         # Defect 4: Comment with missing or unparseable createdAt
         if c_created is None:
@@ -1624,6 +1716,12 @@ def process_thread_scrub_and_revision(
                 match="exact",
                 url=f"https://api.github.com/repos/{repo}/issues/{single_issue_number}/comments",
                 reason="target issue comments collection containing late comment created after T_world",
+            ))
+            all_entries.append(ScrubEntry(
+                kind="comment",
+                match="exact",
+                url=f"https://api.github.com/repos/{repo}/issues/comments",
+                reason="repository issue comments collection containing late comment created after T_world",
             ))
             continue
 

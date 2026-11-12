@@ -1541,7 +1541,7 @@ def test_defect6_cache_refresh_for_mutable_graphql_snapshot(tmp_path: Path) -> N
 def test_defect7_cross_repo_reference_derives_owner_repo_from_source_url(tmp_path: Path) -> None:
     """Defect 7: Derive owner/repo from source item's own URL, not the target repo."""
     fixture_data = load_fixture_json("issue_cross_repo_reference.json")
-    pr_fixture = load_fixture_json("pull_request_scrub.json")
+    pr_fixture = json.loads(json.dumps(load_fixture_json("pull_request_scrub.json")).replace("test-org/test-repo", "target-org/target-repo"))
 
     def fake_post(url: str, payload: dict) -> dict:
         op = payload.get("operationName")
@@ -1581,7 +1581,7 @@ def test_defect7_cross_repo_reference_derives_owner_repo_from_source_url(tmp_pat
 def test_defect8_referencing_prs_emitted_full_set(tmp_path: Path) -> None:
     """Defect 8: For every referencing PR, emit the same full set as solution PR."""
     fixture_data = load_fixture_json("issue_cross_repo_reference.json")
-    pr_fixture = load_fixture_json("pull_request_scrub.json")
+    pr_fixture = json.loads(json.dumps(load_fixture_json("pull_request_scrub.json")).replace("test-org/test-repo", "target-org/target-repo"))
 
     def fake_post(url: str, payload: dict) -> dict:
         op = payload.get("operationName")
@@ -1638,7 +1638,7 @@ def test_defect9_solution_pr_entries_gaps_filled(tmp_path: Path) -> None:
             return pr_comments_fixture
         raise ValueError(f"Unexpected op: {op}")
 
-    commit_shas = ["fix_sha_1001", "merge_sha_2002"]
+    commit_shas = ["1001a1", "2002b2"]
     result = process_thread_scrub_and_revision(
         repo="test-org/test-repo",
         pr_number=50,
@@ -1733,7 +1733,7 @@ def test_defect9_solution_pr_conversation_comments_multi_page_pagination(tmp_pat
 
 def test_defect10_prefixes_have_trailing_delimiter_and_match_field() -> None:
     """Defect 10: Prefixes end with trailing slash, exact entries do not, and match field is present."""
-    entries = get_solution_pr_scrub_entries("test-org/test-repo", 12, commit_shas=["sha123"])
+    entries = get_solution_pr_scrub_entries("test-org/test-repo", 12, commit_shas=["a123"])
     entries_dict = dedupe_and_sort_entries(entries)
 
     for e in entries_dict:
@@ -1879,7 +1879,7 @@ def test_defect3_query_bearing_resource_matching() -> None:
     from hermetic_slice.thread_scrub import get_referencing_pr_scrub_entries
 
     repo = "test-org/test-repo"
-    pr_entries = get_solution_pr_scrub_entries(repo, 50, commit_shas=["sha123"])
+    pr_entries = get_solution_pr_scrub_entries(repo, 50, commit_shas=["a123"])
 
     # Add standalone comment entry
     pr_entries.append(ScrubEntry(
@@ -1931,7 +1931,7 @@ def test_defect3_query_bearing_resource_matching() -> None:
 def test_defect2_referencing_issue_subresources_and_boundary(tmp_path: Path) -> None:
     """Regression Defect 2: referencing issues block comments, events, timeline URLs and query variants without blocking 880."""
     fixture_data = load_fixture_json("issue_cross_repo_reference.json")
-    pr_fixture = load_fixture_json("pull_request_scrub.json")
+    pr_fixture = json.loads(json.dumps(load_fixture_json("pull_request_scrub.json")).replace("test-org/test-repo", "target-org/target-repo"))
 
     def fake_post(url: str, payload: dict) -> dict:
         op = payload.get("operationName")
