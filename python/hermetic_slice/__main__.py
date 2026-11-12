@@ -101,6 +101,14 @@ def main(argv: list[str] | None = None) -> int:
         "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
     )
 
+    kernel_check = subparsers.add_parser("kernel-check-config", help="Check final guest kernel config")
+    kernel_check.add_argument("--config", type=Path, required=True)
+    kernel_build = subparsers.add_parser("kernel-build", help="Build pinned guest kernel offline")
+    kernel_build.add_argument("--lock", type=Path, default=Path(__file__).absolute().parents[2] / "images/kernel/kernel.lock.json")
+    kernel_build.add_argument("--tarball", type=Path, required=True)
+    kernel_build.add_argument("--out", type=Path, required=True, help="Existing private output directory")
+    kernel_build.add_argument("--verify-reproducible", action="store_true")
+
     dispositions_parser = subparsers.add_parser("dispositions", help="Process gate outputs and emit dispositions.json (§5.5)")
     dispositions_parser.add_argument("--gate-output", "-i", type=Path, required=True, help="Path to gate output JSON or directory")
     dispositions_parser.add_argument("--out", "-o", type=Path, default=Path("dispositions.json"), help="Output path for dispositions.json")
@@ -111,6 +119,25 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return 0 if (exc.code == 0 or exc.code is None) else 1
+
+    if args.subcommand in ("kernel-check-config", "kernel-build"):
+        from hermetic_slice.guest_kernel import KernelError, MAX_CONFIG_BYTES, build_kernel, check_config, read_file
+
+        try:
+            if args.subcommand == "kernel-check-config":
+                findings = check_config(read_file(args.config, MAX_CONFIG_BYTES))
+                print(json.dumps({"findings": [asdict(f) for f in findings]}, sort_keys=True))
+                return 2 if findings else 0
+            result = build_kernel(args.lock, args.tarball, args.out,
+                                  verify_reproducible=args.verify_reproducible)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        except KernelError as exc:
+            print(json.dumps({"error": str(exc)}, sort_keys=True))
+            return 1
+        except (OSError, ValueError):
+            print(json.dumps({"error": "kernel input or build operation failed"}, sort_keys=True))
+            return 1
 
     if args.subcommand == "seal-repo":
         try:

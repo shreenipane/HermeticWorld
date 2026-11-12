@@ -1,0 +1,10 @@
+{
+  "boot_args": "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-execd clocksource=tsc tsc=reliable no-kvmclock hermetic.t={t_clock}",
+  "build_host": "hermetic",
+  "build_user": "hermetic",
+  "builder_image": "hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER",
+  "release_date": "TO-BE-FILLED-BY-OWNER",
+  "sha256": "TO-BE-FILLED-BY-OWNER",
+  "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz",
+  "version": "6.1.128"
+}
