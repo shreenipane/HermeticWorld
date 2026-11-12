@@ -1,0 +1,59 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest201",
+        "databaseId": 201,
+        "url": "https://github.com/test-org/test-repo/issues/201",
+        "body": "Issue with comment needing edit pagination",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOtest_c999",
+              "databaseId": 999,
+              "url": "https://github.com/test-org/test-repo/issues/201#issuecomment-999",
+              "body": "Comment text with fix appended in later edit",
+              "createdAt": "2020-01-01T12:00:00Z",
+              "lastEditedAt": "2020-01-10T12:00:00Z",
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": true,
+                  "endCursor": "comment_edits_cursor_p1"
+                },
+                "nodes": [
+                  {
+                    "createdAt": "2020-01-10T12:00:00Z",
+                    "editedAt": "2020-01-10T12:00:00Z",
+                    "diff": "Comment text with fix appended in later edit"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

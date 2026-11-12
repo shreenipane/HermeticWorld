@@ -1,0 +1,69 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest105",
+        "databaseId": 105,
+        "url": "https://github.com/test-org/test-repo/issues/105",
+        "body": "Issue with cross references and timeline events.",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOtest_c401",
+              "databaseId": 401,
+              "url": "https://github.com/test-org/test-repo/issues/105#issuecomment-401",
+              "body": "Comment posted after cutoff with late discussion",
+              "createdAt": "2020-01-20T10:00:00Z",
+              "lastEditedAt": null,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "__typename": "CrossReferencedEvent",
+              "url": "https://github.com/test-org/test-repo/issues/105#event-999",
+              "source": {
+                "__typename": "Issue",
+                "number": 120,
+                "url": "https://github.com/test-org/test-repo/issues/120"
+              }
+            },
+            {
+              "__typename": "ConnectedEvent",
+              "subject": {
+                "__typename": "PullRequest",
+                "number": 55,
+                "url": "https://github.com/test-org/test-repo/pull/55"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
