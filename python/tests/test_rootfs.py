@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -11,28 +13,46 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
 import time
 import uuid
 
 import pytest
 
+from hermetic_slice import rootfs
 from hermetic_slice.__main__ import main
 from hermetic_slice.rootfs import (
+    ALLOWED_E2FSPROGS_VERSIONS,
+    BLOCK_SIZE,
+    EXT4_FEATURES,
     HERMETIC_NAMESPACE,
+    INODE_SIZE,
     MIN_E2FSPROGS_VERSION,
+    MKE2FS_CONFIG_PATH,
     RootfsGateError,
+    RootfsLimitError,
+    RootfsLimits,
+    RootfsTimeoutError,
+    SourceChangedError,
+    TreeScan,
     build_rootfs,
-    calculate_image_size_mib,
     calculate_inode_count,
     check_e2fsprogs_version,
-    clean_rootfs_staging,
-    compute_tree_size_bytes,
-    compute_tree_stats,
-    copy_to_staging,
+    directory_blocks,
     find_sealcheck_bin,
+    is_cleanup_target,
+    make_tarinfo,
     parse_mke2fs_version,
+    plan_image,
     resolve_mke2fs_bin,
+    write_rootfs_tar,
 )
+
+SUBPROCESS_TIMEOUT_S = 60
+T_EPOCH = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp())
 
 
 def _check_mke2fs_usable() -> tuple[bool, str]:
@@ -47,32 +67,86 @@ def _check_mke2fs_usable() -> tuple[bool, str]:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=SUBPROCESS_TIMEOUT_S,
         )
-        ver = parse_mke2fs_version(f"{proc.stdout}\n{proc.stderr}")
-        if ver < MIN_E2FSPROGS_VERSION:
-            return False, f"mke2fs version {ver} is older than required 1.47.1"
+        check_e2fsprogs_version(f"{proc.stdout}\n{proc.stderr}")
         return True, ""
     except Exception as exc:
-        return False, f"mke2fs version check failed: {exc}"
+        return False, f"mke2fs not usable (need a pinned e2fsprogs version): {exc}"
 
 
-def _check_sealcheck_usable() -> tuple[bool, str]:
-    try:
-        find_sealcheck_bin()
-        return True, ""
-    except Exception as exc:
-        return False, f"hermetic-sealcheck binary not found: {exc}"
+def _locate_test_sealcheck() -> tuple[Path | None, str]:
+    """Test-only discovery of a hermetic-sealcheck build that supports d4-image.
+
+    The builder itself never searches (review finding 5); the tests look in this worktree's
+    cargo target dirs (and $HERMETIC_SEALCHECK_BIN), then in the owner's other cargo target
+    dirs, and copy the binary into a private 0700 directory with mode 0755 so it passes the
+    builder's owner/mode checks (cargo leaves binaries group-writable under umask 002).
+    """
+    candidates: list[Path] = []
+    env_bin = os.environ.get("HERMETIC_SEALCHECK_BIN")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    repo_root = Path(__file__).resolve().parents[2]
+    cargo_root = Path.home() / "hermetic" / "cargo-target"
+    own = [repo_root / "target", cargo_root / repo_root.name]
+    others: list[Path] = []
+    if cargo_root.is_dir():
+        others = [p for p in cargo_root.iterdir() if p.is_dir() and not p.is_symlink() and p not in own]
+    found_own: list[Path] = []
+    found_other: list[Path] = []
+    for bucket, bases in ((found_own, own), (found_other, others)):
+        for base in bases:
+            for mode in ("debug", "release"):
+                cand = base / mode / "hermetic-sealcheck"
+                if cand.is_file() and not cand.is_symlink():
+                    bucket.append(cand)
+    found_other.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates += found_own + found_other
+
+    private = Path(tempfile.mkdtemp(prefix="hermetic-sealcheck-test-"))
+    atexit.register(shutil.rmtree, private, True)
+    for cand in candidates:
+        try:
+            proc = subprocess.run(
+                [str(cand), "d4-image", "--help"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=SUBPROCESS_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            dest = private / "hermetic-sealcheck"
+            shutil.copyfile(cand, dest)
+            os.chmod(dest, 0o755)
+            return dest, ""
+    return None, "no hermetic-sealcheck build with d4-image found (run rust-gate or set HERMETIC_SEALCHECK_BIN)"
 
 
 MKE2FS_AVAILABLE, MKE2FS_REASON = _check_mke2fs_usable()
-SEALCHECK_AVAILABLE, SEALCHECK_REASON = _check_sealcheck_usable()
+SEALCHECK_BIN, SEALCHECK_REASON = _locate_test_sealcheck()
+SEALCHECK_AVAILABLE = SEALCHECK_BIN is not None
+DEBUGFS = shutil.which("debugfs") or next(
+    (p for p in ("/sbin/debugfs", "/usr/sbin/debugfs") if os.path.isfile(p)), None
+)
 
 requires_mke2fs = pytest.mark.skipif(not MKE2FS_AVAILABLE, reason=MKE2FS_REASON)
 requires_sealcheck = pytest.mark.skipif(not SEALCHECK_AVAILABLE, reason=SEALCHECK_REASON)
+requires_debugfs = pytest.mark.skipif(DEBUGFS is None, reason="debugfs not found")
+
+
+@pytest.fixture(autouse=True)
+def _sealcheck_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    if SEALCHECK_BIN is not None:
+        monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(SEALCHECK_BIN))
+    else:
+        monkeypatch.delenv("HERMETIC_SEALCHECK_BIN", raising=False)
 
 
 def hash_directory_tree(root: Path) -> str:
-    """Compute deterministic SHA256 over all relative paths and contents in a directory."""
+    """Compute deterministic SHA256 over all relative paths, modes and contents in a directory."""
     hasher = hashlib.sha256()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -87,168 +161,144 @@ def hash_directory_tree(root: Path) -> str:
     return hasher.hexdigest()
 
 
+def _norm(name: str) -> str:
+    name = name.rstrip("/")
+    if name in ("", "."):
+        return "."
+    return name[2:] if name.startswith("./") else name
+
+
+def _tar_tree(src: Path, tmp_path: Path, **limit_kwargs) -> tuple[TreeScan, dict[str, tarfile.TarInfo], Path]:
+    """Run the walker on src; return the scan, the tar members by normalised name and the tar path."""
+    tar_path = tmp_path / f"stream-{uuid.uuid4().hex}.tar"
+    scan = write_rootfs_tar(src, tar_path, mtime_ceiling=T_EPOCH, limits=RootfsLimits(**limit_kwargs))
+    with tarfile.open(tar_path) as tf:
+        members = {_norm(m.name): m for m in tf.getmembers()}
+    return scan, members, tar_path
+
+
+def _debugfs(image: Path, request: str) -> str:
+    proc = subprocess.run(
+        [DEBUGFS, "-R", request, str(image)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_S,
+        check=False,
+    )
+    return proc.stdout
+
+
+def _fake_tool(path: Path, body: str, mode: int = 0o755) -> Path:
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    os.chmod(path, mode)
+    return path
+
+
 # -----------------------------------------------------------------------------
 # Unit Tests (no subprocess needed)
 # -----------------------------------------------------------------------------
 
 
 def test_version_check_rejects_and_accepts() -> None:
-    """Version check rejects 1.47.0 and accepts 1.47.2 (unit test, no subprocess)."""
-    # Accept 1.47.2
-    v1 = check_e2fsprogs_version("mke2fs 1.47.2 (1-Jan-2025)")
+    """Version check: below the minimum and outside the pinned allow-list are rejected."""
+    assert (1, 47, 2) in ALLOWED_E2FSPROGS_VERSIONS
+    v1 = check_e2fsprogs_version("mke2fs 1.47.2 (1-Jan-2025)\n\tUsing EXT2FS Library version 1.47.2")
     assert v1 == (1, 47, 2)
 
-    # Accept 1.47.1
-    v2 = check_e2fsprogs_version("mke2fs 1.47.1 (20-May-2024)\n\tUsing EXT2FS Library version 1.47.1")
-    assert v2 == (1, 47, 1)
-
-    # Reject 1.47.0
     with pytest.raises(RuntimeError) as excinfo:
         check_e2fsprogs_version("mke2fs 1.47.0 (5-Feb-2023)")
     assert "1.47.0" in str(excinfo.value)
     assert "1.47.1" in str(excinfo.value)
 
-    # Invalid version string
+    # Review finding 2: newer than the minimum but not pinned -> refused
+    for other in ("mke2fs 1.47.1 (20-May-2024)", "mke2fs 1.47.3 (1-Jan-2026)", "mke2fs 1.48.0 (1-Jan-2027)"):
+        with pytest.raises(RuntimeError, match="not a pinned version"):
+            check_e2fsprogs_version(other)
+
     with pytest.raises(ValueError):
         parse_mke2fs_version("invalid version string")
 
 
-def test_calculate_image_size_mib(tmp_path: Path) -> None:
-    """Size calculation computes staging * 1.3 + 64 MiB or uses explicit size_mib."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-
-    # Empty staging: 0 MiB * 1.3 + 64 = 64 MiB
-    assert calculate_image_size_mib(staging) == 64
-
-    # 10 MiB in staging: 10 * 1.3 + 64 = 77 MiB
-    (staging / "test.bin").write_bytes(b"\x00" * (10 * 1024 * 1024))
-    assert calculate_image_size_mib(staging) == 77
-
-    # Explicit size_mib overrides calculation
-    assert calculate_image_size_mib(staging, size_mib=128) == 128
-
-    # Negative / zero size_mib raises ValueError
+def test_plan_image_explicit_and_minimum() -> None:
+    """Explicit size_mib is used as is; an empty tree gets the 64 MiB floor; size_mib <= 0 is refused."""
+    empty = TreeScan(removed=[], skipped_special=[])
+    assert plan_image(empty).size_mib == 64
+    assert plan_image(empty, 128).size_mib == 128
+    assert plan_image(empty, 128).journal_mib == 4
     with pytest.raises(ValueError):
-        calculate_image_size_mib(staging, size_mib=0)
+        plan_image(empty, 0)
 
 
 def test_special_files_skipped(tmp_path: Path) -> None:
-    """Special files (FIFOs, device nodes) are skipped and listed in skipped_special."""
+    """Special files (FIFOs) are skipped and listed in skipped_special; the walk never opens them."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "file.txt").write_text("hello")
     sub = src / "sub"
     sub.mkdir()
     (sub / "nested.txt").write_text("world")
+    os.mkfifo(src / "dev_fifo")
+    os.mkfifo(sub / "nested_fifo")
 
-    fifo_path = src / "dev_fifo"
-    os.mkfifo(fifo_path)
+    scan, members, _ = _tar_tree(src, tmp_path)
 
-    nested_fifo = sub / "nested_fifo"
-    os.mkfifo(nested_fifo)
-
-    staging = tmp_path / "staging"
-    skipped = copy_to_staging(src, staging)
-
-    assert skipped == ["dev_fifo", "sub/nested_fifo"]
-    assert not (staging / "dev_fifo").exists()
-    assert not (staging / "sub" / "nested_fifo").exists()
-    assert (staging / "file.txt").read_text() == "hello"
-    assert (staging / "sub" / "nested_txt" if False else (staging / "sub" / "nested.txt")).read_text() == "world"
+    assert scan.skipped_special == ["dev_fifo", "sub/nested_fifo"]
+    assert "dev_fifo" not in members
+    assert "sub/nested_fifo" not in members
+    assert members["file.txt"].isfile()
+    assert members["sub/nested.txt"].isfile()
 
 
 def test_cleanup_targets_and_src_untouched(tmp_path: Path) -> None:
-    """Clean-up removes exactly listed caches and histories, keeps var/log and var/cache, and preserves src."""
+    """Clean-up removes exactly the listed caches and histories, keeps var/log and var/cache, preserves src."""
     src = tmp_path / "src"
     src.mkdir()
-
-    # 1. var/log
     (src / "var" / "log" / "nginx").mkdir(parents=True)
     (src / "var" / "log" / "syslog").write_text("logs")
     (src / "var" / "log" / "nginx" / "access.log").write_text("access")
-
-    # 2. var/cache
     (src / "var" / "cache" / "apt").mkdir(parents=True)
     (src / "var" / "cache" / "apt" / "pkg.deb").write_bytes(b"deb")
-
-    # 3. var/lib/apt/lists
     (src / "var" / "lib" / "apt" / "lists").mkdir(parents=True)
     (src / "var" / "lib" / "apt" / "lists" / "deb.debian.org_Packages").write_text("packages")
-
-    # 4. pip and uv caches
     (src / "root" / ".cache" / "pip" / "wheels").mkdir(parents=True)
     (src / "root" / ".cache" / "pip" / "wheels" / "pkg.whl").write_bytes(b"whl")
     (src / "root" / ".cache" / "uv").mkdir(parents=True)
     (src / "root" / ".cache" / "uv" / "cache.db").write_text("uvcache")
-
     (src / "home" / "user1" / ".cache" / "pip").mkdir(parents=True)
     (src / "home" / "user1" / ".cache" / "pip" / "p.whl").write_bytes(b"whl")
     (src / "home" / "user1" / ".cache" / "uv").mkdir(parents=True)
     (src / "home" / "user1" / ".cache" / "uv" / "u.db").write_text("uv")
-
-    # 5. conda pkgs
     (src / "opt" / "conda" / "pkgs").mkdir(parents=True)
     (src / "opt" / "conda" / "pkgs" / "pkg1.tar.bz2").write_bytes(b"pkg1")
     (src / "opt" / "conda" / "pkgs" / "urls.txt").write_text("https://conda.anaconda.org/main\n")
-
     (src / "home" / "user1" / "miniconda3" / "pkgs").mkdir(parents=True)
     (src / "home" / "user1" / "miniconda3" / "pkgs" / "pkg2.tar.bz2").write_bytes(b"pkg2")
     (src / "home" / "user1" / "miniconda3" / "pkgs" / "urls.txt").write_text("https://conda.anaconda.org/r\n")
-
-    # 6. shell histories
     (src / "root" / ".bash_history").write_text("ls\n")
     (src / "home" / "user1" / ".bash_history").write_text("cd\n")
     (src / "home" / "user1" / ".zsh_history").write_text(": 1234:0;echo hi\n")
     (src / "home" / "user1" / ".python_history").write_text("import os\n")
     (src / "home" / "user1" / ".lesshst").write_text(".search\n")
     (src / "root" / ".viminfo").write_text("'0  1  0\n")
-
-    # 7. Non-cache files that MUST be preserved
     (src / "etc").mkdir()
     (src / "etc" / "passwd").write_text("root:x:0:0::/root:/bin/bash\n")
     (src / "home" / "user1" / "project").mkdir()
     (src / "home" / "user1" / "project" / "main.py").write_text("print('hello')\n")
 
     src_hash_before = hash_directory_tree(src)
+    scan, members, _ = _tar_tree(src, tmp_path)
+    assert hash_directory_tree(src) == src_hash_before, "Clean-up modified src directory!"
 
-    staging = tmp_path / "staging"
-    copy_to_staging(src, staging)
-    removed = clean_rootfs_staging(staging)
-
-    # Verify src is untouched
-    src_hash_after = hash_directory_tree(src)
-    assert src_hash_before == src_hash_after, "Clean-up modified src directory!"
-
-    # Verify kept directories
-    assert (staging / "var" / "log").is_dir()
-    assert (staging / "var" / "cache").is_dir()
-    assert (staging / "var" / "lib" / "apt" / "lists").is_dir()
-    assert (staging / "opt" / "conda" / "pkgs").is_dir()
-    assert (staging / "opt" / "conda" / "pkgs" / "urls.txt").is_file()
-    assert (staging / "home" / "user1" / "miniconda3" / "pkgs" / "urls.txt").is_file()
-
-    # Verify kept regular files
-    assert (staging / "etc" / "passwd").is_file()
-    assert (staging / "home" / "user1" / "project" / "main.py").is_file()
-
-    # Verify deleted paths
-    assert not (staging / "var" / "log" / "syslog").exists()
-    assert not (staging / "var" / "log" / "nginx").exists()
-    assert not (staging / "var" / "cache" / "apt").exists()
-    assert not (staging / "var" / "lib" / "apt" / "lists" / "deb.debian.org_Packages").exists()
-    assert not (staging / "root" / ".cache" / "pip").exists()
-    assert not (staging / "root" / ".cache" / "uv").exists()
-    assert not (staging / "home" / "user1" / ".cache" / "pip").exists()
-    assert not (staging / "home" / "user1" / ".cache" / "uv").exists()
-    assert not (staging / "opt" / "conda" / "pkgs" / "pkg1.tar.bz2").exists()
-    assert not (staging / "home" / "user1" / "miniconda3" / "pkgs" / "pkg2.tar.bz2").exists()
-    assert not (staging / "root" / ".bash_history").exists()
-    assert not (staging / "home" / "user1" / ".bash_history").exists()
-    assert not (staging / "home" / "user1" / ".zsh_history").exists()
-    assert not (staging / "home" / "user1" / ".python_history").exists()
-    assert not (staging / "home" / "user1" / ".lesshst").exists()
-    assert not (staging / "root" / ".viminfo").exists()
+    for kept_dir in ("var/log", "var/cache", "var/lib/apt/lists", "opt/conda/pkgs"):
+        assert members[kept_dir].isdir()
+    for kept_file in (
+        "opt/conda/pkgs/urls.txt",
+        "home/user1/miniconda3/pkgs/urls.txt",
+        "etc/passwd",
+        "home/user1/project/main.py",
+    ):
+        assert members[kept_file].isfile()
 
     expected_removed = sorted([
         "var/log/syslog",
@@ -268,7 +318,21 @@ def test_cleanup_targets_and_src_untouched(tmp_path: Path) -> None:
         "home/user1/.lesshst",
         "root/.viminfo",
     ])
-    assert removed == expected_removed
+    assert scan.removed == expected_removed
+    for gone in expected_removed:
+        assert gone not in members
+        assert not any(name.startswith(gone + "/") for name in members)
+
+
+def test_cleanup_rule_table() -> None:
+    """The TR-SEAL-8 predicate on relative paths."""
+    assert is_cleanup_target(("var", "log", "x"))
+    assert not is_cleanup_target(("var", "log"))
+    assert is_cleanup_target(("miniconda3", "pkgs", "a"))
+    assert not is_cleanup_target(("miniconda3", "pkgs", "urls.txt"))
+    assert is_cleanup_target(("home", "u", "deep", ".viminfo"))
+    assert not is_cleanup_target(("etc", ".bash_history"))
+    assert not is_cleanup_target((".bash_history",))
 
 
 def test_naive_t_clock_rejected(tmp_path: Path) -> None:
@@ -506,206 +570,165 @@ def test_measured_build_time_20mib(tmp_path: Path) -> None:
     print(f"\n[MEASURED_BUILD_TIME_20MIB] Elapsed: {elapsed:.3f} s, image sha256: {res['sha256']}, size_bytes: {res['size_bytes']}")
 
 
+
+
 # -----------------------------------------------------------------------------
-# Regression Tests for Security Review Fixes 1-6
+# Symlinks and read-only directories in the source (earlier review rounds)
 # -----------------------------------------------------------------------------
 
 
-def test_fix1_symlinks_in_cleanup_a_staging_var_log_absolute_host_dir(tmp_path: Path) -> None:
-    """FIX 1 (a): staging var/log -> absolute path of a tmp host directory containing files:
-    after the build those host files still exist."""
+def test_fix1_symlinks_in_cleanup_a_var_log_absolute_host_dir(tmp_path: Path) -> None:
+    """var/log -> an absolute host directory: it is shipped as a symlink, never entered or cleaned."""
     host_dir = tmp_path / "host_log"
     host_dir.mkdir()
     host_file = host_dir / "syslog.host"
     host_file.write_text("critical host log content")
 
     src = tmp_path / "src_a"
-    src.mkdir()
-    (src / "var").mkdir()
+    (src / "var").mkdir(parents=True)
     (src / "var" / "log").symlink_to(host_dir.resolve())
 
-    staging = tmp_path / "staging_a"
-    copy_to_staging(src, staging)
-    removed = clean_rootfs_staging(staging)
+    scan, members, tar_path = _tar_tree(src, tmp_path)
 
-    assert host_file.exists(), "Host file was deleted by clean-up following symlink!"
     assert host_file.read_text() == "critical host log content"
-    assert "var/log/syslog.host" not in removed
+    assert members["var/log"].issym()
+    assert members["var/log"].linkname == str(host_dir.resolve())
+    assert "var/log/syslog.host" not in scan.removed
+    assert b"critical host log content" not in tar_path.read_bytes()
 
 
 def test_fix1_symlinks_in_cleanup_b_home_u_host_dir_with_history(tmp_path: Path) -> None:
-    """FIX 1 (b): home/u -> a host dir containing .bash_history: the host file still exists."""
+    """home/u -> a host dir containing .bash_history: nothing behind the link is read or removed."""
     host_dir = tmp_path / "host_user"
     host_dir.mkdir()
     host_hist = host_dir / ".bash_history"
     host_hist.write_text("secret host history")
 
     src = tmp_path / "src_b"
-    src.mkdir()
-    (src / "home").mkdir()
+    (src / "home").mkdir(parents=True)
     (src / "home" / "u").symlink_to(host_dir.resolve())
 
-    staging = tmp_path / "staging_b"
-    copy_to_staging(src, staging)
-    removed = clean_rootfs_staging(staging)
+    scan, members, tar_path = _tar_tree(src, tmp_path)
 
-    assert host_hist.exists(), "Host history was deleted by clean-up following symlink!"
     assert host_hist.read_text() == "secret host history"
-    assert "home/u/.bash_history" not in removed
+    assert members["home/u"].issym()
+    assert "home/u/.bash_history" not in scan.removed
+    assert b"secret host history" not in tar_path.read_bytes()
 
 
 def test_fix1_symlinks_in_cleanup_c_var_points_outside(tmp_path: Path) -> None:
-    """FIX 1 (c): var -> ../outside: nothing outside staging is touched."""
+    """var -> ../outside: nothing outside src is read or touched."""
     outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    outside_file = outside_dir / "untouchable.txt"
-    outside_file.write_text("outside data")
-    outside_log = outside_dir / "log"
-    outside_log.mkdir()
-    outside_log_file = outside_log / "app.log"
-    outside_log_file.write_text("outside log")
+    (outside_dir / "log").mkdir(parents=True)
+    (outside_dir / "untouchable.txt").write_text("outside data")
+    (outside_dir / "log" / "app.log").write_text("outside log")
 
     src = tmp_path / "src_c"
     src.mkdir()
     (src / "var").symlink_to(Path("..") / "outside")
 
-    staging = tmp_path / "staging_c"
-    copy_to_staging(src, staging)
-    removed = clean_rootfs_staging(staging)
+    scan, members, tar_path = _tar_tree(src, tmp_path)
 
-    assert outside_file.exists()
-    assert outside_file.read_text() == "outside data"
-    assert outside_log_file.exists()
-    assert outside_log_file.read_text() == "outside log"
-    assert not any(r.startswith("var/") for r in removed)
+    assert (outside_dir / "untouchable.txt").read_text() == "outside data"
+    assert (outside_dir / "log" / "app.log").read_text() == "outside log"
+    assert not any(r.startswith("var/") for r in scan.removed)
+    assert members["var"].issym()
+    assert b"outside data" not in tar_path.read_bytes()
 
 
 def test_fix1_symlinks_in_cleanup_d_history_symlink_to_host_file(tmp_path: Path) -> None:
-    """FIX 1 (d): a .bash_history that is itself a symlink to a host file:
-    the link is removed, the host file stays."""
+    """A .bash_history that is a symlink to a host file: the link is dropped, the host file stays."""
     host_file = tmp_path / "host_bash_history"
     host_file.write_text("precious history")
 
     src = tmp_path / "src_d"
-    src.mkdir()
     (src / "home" / "user").mkdir(parents=True)
     (src / "home" / "user" / ".bash_history").symlink_to(host_file.resolve())
 
-    staging = tmp_path / "staging_d"
-    copy_to_staging(src, staging)
-    removed = clean_rootfs_staging(staging)
+    scan, members, _ = _tar_tree(src, tmp_path)
 
-    # Host file stays!
-    assert host_file.exists()
     assert host_file.read_text() == "precious history"
-    # The symlink in staging was unlinked!
-    assert not (staging / "home" / "user" / ".bash_history").exists()
-    assert not (staging / "home" / "user" / ".bash_history").is_symlink()
-    assert "home/user/.bash_history" in removed
+    assert "home/user/.bash_history" in scan.removed
+    assert "home/user/.bash_history" not in members
+    assert (src / "home" / "user" / ".bash_history").is_symlink(), "src must never be modified"
 
 
-def test_fix2_readonly_parent_made_writable_in_staging_never_in_src(tmp_path: Path) -> None:
-    """FIX 2: A history file in a read-only directory inside source is still removed
-    (parent made writable in staging, never in src)."""
+def test_readonly_source_dir_history_dropped_src_untouched(tmp_path: Path) -> None:
+    """A history file in a read-only source directory is dropped without making anything writable."""
     if os.geteuid() == 0:
         pytest.skip("Read-only directory test requires non-root user")
 
     src = tmp_path / "src_ro"
-    src.mkdir()
     user_dir = src / "home" / "user"
     user_dir.mkdir(parents=True)
-    hist = user_dir / ".bash_history"
-    hist.write_text("history")
-
-    # Make parent directory in src read-only (no user write: 0o555)
+    (user_dir / ".bash_history").write_text("history")
     os.chmod(user_dir, 0o555)
     try:
-        staging = tmp_path / "staging_ro"
-        copy_to_staging(src, staging)
-
-        staging_user = staging / "home" / "user"
-        # Verify staging started read-only like src
-        assert (staging_user.stat().st_mode & stat.S_IWUSR) == 0
-
-        removed = clean_rootfs_staging(staging)
-
-        # Removed from staging
-        assert "home/user/.bash_history" in removed
-        assert not (staging / "home" / "user" / ".bash_history").exists()
-
-        # Parent in staging made writable
-        assert (staging_user.stat().st_mode & stat.S_IWUSR) != 0
-
-        # Parent in src NEVER made writable!
+        scan, members, _ = _tar_tree(src, tmp_path)
+        assert "home/user/.bash_history" in scan.removed
+        assert "home/user/.bash_history" not in members
+        assert stat.S_IMODE(members["home/user"].mode) == 0o555, "the image keeps the source mode"
         assert (user_dir.stat().st_mode & stat.S_IWUSR) == 0
+        assert (user_dir / ".bash_history").exists()
     finally:
-        # Restore src permissions for clean tmp_path teardown
         os.chmod(user_dir, 0o755)
 
 
-def test_readonly_staging_dir_with_symlinked_history_leaves_host_mode_unchanged(tmp_path: Path) -> None:
-    """The rootfs builder test with a read-only staging directory holding a
-    symlinked history file leaves the host target's mode unchanged."""
+def test_readonly_source_dir_with_symlinked_history_leaves_host_mode_unchanged(tmp_path: Path) -> None:
+    """A read-only source directory holding a symlinked history leaves the host target's mode unchanged."""
     if os.geteuid() == 0:
         pytest.skip("Read-only directory test requires non-root user")
 
     host_file = tmp_path / "host_bash_history"
     host_file.write_text("precious history")
     os.chmod(host_file, 0o644)
-    orig_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
 
     src = tmp_path / "src_ro_symlink"
-    src.mkdir()
     user_dir = src / "home" / "user"
     user_dir.mkdir(parents=True)
     (user_dir / ".bash_history").symlink_to(host_file.resolve())
-
     os.chmod(user_dir, 0o555)
     try:
-        staging = tmp_path / "staging_ro_symlink"
-        copy_to_staging(src, staging)
-
-        staging_user = staging / "home" / "user"
-        assert (staging_user.stat().st_mode & stat.S_IWUSR) == 0
-
-        removed = clean_rootfs_staging(staging)
-
-        assert "home/user/.bash_history" in removed
-        assert not (staging / "home" / "user" / ".bash_history").exists()
-        assert not (staging / "home" / "user" / ".bash_history").is_symlink()
-
-        assert host_file.exists()
+        scan, _, _ = _tar_tree(src, tmp_path)
+        assert "home/user/.bash_history" in scan.removed
+        assert stat.S_IMODE(os.lstat(host_file).st_mode) == 0o644
         assert host_file.read_text() == "precious history"
-        assert stat.S_IMODE(os.lstat(host_file).st_mode) == orig_mode
-        assert (user_dir.stat().st_mode & stat.S_IWUSR) == 0
     finally:
         os.chmod(user_dir, 0o755)
 
 
-def test_fix2_unremovable_file_raises_error_naming_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """FIX 2: A case that cannot be removed (monkeypatch on os.unlink raising PermissionError twice) raises."""
-    src = tmp_path / "src_fail"
-    src.mkdir()
-    (src / "home" / "user").mkdir(parents=True)
-    (src / "home" / "user" / ".bash_history").write_text("history")
+def test_cleanup_nested_pkgs_cache_directories(tmp_path: Path) -> None:
+    """Cache directories nested beneath other clean-up targets are dropped once, urls.txt kept."""
+    src = tmp_path / "src_nested_pkgs"
+    outer_pkgs = src / "miniconda3" / "pkgs"
+    inner_pkgs = outer_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
+    inner_pkgs.mkdir(parents=True)
+    (outer_pkgs / "outer.tar.bz2").write_text("outer package")
+    (inner_pkgs / "inner.tar.bz2").write_text("inner package")
+    opt_pkgs = src / "opt" / "conda" / "pkgs"
+    opt_inner = opt_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
+    opt_inner.mkdir(parents=True)
+    (opt_pkgs / "opt_pkg.tar.bz2").write_text("opt package")
+    (opt_inner / "nested_opt.tar.bz2").write_text("nested opt package")
+    (outer_pkgs / "urls.txt").write_text("https://example.com/repo\n")
 
-    staging = tmp_path / "staging_fail"
-    copy_to_staging(src, staging)
+    scan, members, _ = _tar_tree(src, tmp_path)
 
-    unlink_calls = 0
+    assert "miniconda3/pkgs/outer.tar.bz2" in scan.removed
+    assert "miniconda3/pkgs/nested_pkg" in scan.removed
+    assert "opt/conda/pkgs/opt_pkg.tar.bz2" in scan.removed
+    assert "opt/conda/pkgs/nested_pkg" in scan.removed
+    assert members["miniconda3/pkgs/urls.txt"].isfile()
+    assert not any("nested_pkg" in name for name in members)
 
-    def mock_unlink(path, *args, **kwargs):
-        nonlocal unlink_calls
-        unlink_calls += 1
-        raise PermissionError(f"Permission denied on {path}")
 
-    monkeypatch.setattr(os, "unlink", mock_unlink)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        clean_rootfs_staging(staging)
-
-    assert ".bash_history" in str(excinfo.value)
-    assert unlink_calls >= 2
+def test_plan_image_inode_overhead_for_many_entries() -> None:
+    """300,000 empty files: the inode tables (~92 MiB) are covered on top of the floor."""
+    scan = TreeScan(removed=[], skipped_special=[], inodes=300_001, dir_blocks=directory_blocks(300_000 * 8, 300_000))
+    plan = plan_image(scan)
+    inode_table_mib = calculate_inode_count(300_001) * INODE_SIZE / (1024 * 1024)
+    assert plan.inode_count == calculate_inode_count(300_001)
+    assert plan.size_mib >= math.ceil(inode_table_mib) + plan.journal_mib + 16
 
 
 def test_fix3_existing_out_image_survives_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -878,103 +901,6 @@ def test_fix6_many_empty_files_automatic_sizing(tmp_path: Path) -> None:
     print(f"\n[20000_FILES_BUILD_TIME] Elapsed: {elapsed:.3f} s")
 
 
-def test_readonly_cleanup_with_injected_permission_error_triggers_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Regression test (Finding 1): chmod retry succeeds when unlink initially fails with PermissionError."""
-    src = tmp_path / "src_retry"
-    src.mkdir()
-    user_dir = src / "home" / "user"
-    user_dir.mkdir(parents=True)
-    hist = user_dir / ".bash_history"
-    hist.write_text("history")
-
-    staging = tmp_path / "staging_retry"
-    copy_to_staging(src, staging)
-    staging_user = staging / "home" / "user"
-    os.chmod(staging_user, 0o555)
-
-    real_unlink = os.unlink
-    first_call = True
-
-    def mock_unlink(path, *args, **kwargs):
-        nonlocal first_call
-        if first_call and Path(path).name == ".bash_history":
-            first_call = False
-            raise PermissionError("Simulated permission error")
-        return real_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "unlink", mock_unlink)
-
-    removed = clean_rootfs_staging(staging)
-    assert "home/user/.bash_history" in removed
-    assert not (staging / "home" / "user" / ".bash_history").exists()
-    assert (staging_user.stat().st_mode & stat.S_IWUSR) != 0
-
-
-def test_clean_rootfs_staging_nested_pkgs_cache_directories(tmp_path: Path) -> None:
-    """Regression test (Finding 2): cache directories nested beneath other cleanup targets
-    do not cause FileNotFoundError or traversal errors."""
-    staging = tmp_path / "staging_nested_pkgs"
-    staging.mkdir()
-
-    # Case A: miniconda3/pkgs/nested_pkg/miniconda3/pkgs
-    outer_pkgs = staging / "miniconda3" / "pkgs"
-    inner_pkgs = outer_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
-    inner_pkgs.mkdir(parents=True)
-    (outer_pkgs / "outer.tar.bz2").write_text("outer package")
-    (inner_pkgs / "inner.tar.bz2").write_text("inner package")
-
-    # Case B: opt/conda/pkgs/nested_pkg/miniconda3/pkgs
-    opt_pkgs = staging / "opt" / "conda" / "pkgs"
-    opt_inner = opt_pkgs / "nested_pkg" / "miniconda3" / "pkgs"
-    opt_inner.mkdir(parents=True)
-    (opt_pkgs / "opt_pkg.tar.bz2").write_text("opt package")
-    (opt_inner / "nested_opt.tar.bz2").write_text("nested opt package")
-
-    # urls.txt in outer_pkgs should be preserved
-    (outer_pkgs / "urls.txt").write_text("https://example.com/repo\n")
-
-    removed = clean_rootfs_staging(staging)
-
-    assert "miniconda3/pkgs/outer.tar.bz2" in removed
-    assert "miniconda3/pkgs/nested_pkg" in removed
-    assert "opt/conda/pkgs/opt_pkg.tar.bz2" in removed
-    assert "opt/conda/pkgs/nested_pkg" in removed
-    # urls.txt preserved
-    assert (outer_pkgs / "urls.txt").exists()
-    assert not (outer_pkgs / "outer.tar.bz2").exists()
-    assert not (opt_pkgs / "opt_pkg.tar.bz2").exists()
-
-
-def test_calculate_image_size_mib_inode_overhead_when_min_mib_exceeds_base_mib(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Regression test (Finding 3): when entry count causes min_mib to exceed base_mib,
-    the resulting size includes sufficient filesystem metadata/journal overhead."""
-    staging = tmp_path / "staging_huge_entries"
-    staging.mkdir()
-
-    # 300,000 empty files: staging_bytes = 0, entry_count = 300,000
-    # base_mib = 0 * 1.3 + 64 = 64 MiB
-    # requested_inodes = ceil(300,000 * 1.25 + 1024) = 376,024 inodes
-    # Inode table alone = 376,024 * 256 = 96,262,144 bytes (~91.8 MiB)
-    monkeypatch.setattr(
-        "hermetic_slice.rootfs.compute_tree_stats",
-        lambda _: (0, 300_000),
-    )
-
-    size = calculate_image_size_mib(staging)
-
-    # Inode table alone takes ~91.8 MiB.
-    # The calculated size must exceed base_mib (64 MiB) and provide 64 MiB overhead
-    # beyond the inode table requirement (156 MiB).
-    assert size > 64
-    inode_table_mib = (calculate_inode_count(300_000) * 256) / (1024 * 1024)
-    assert size >= math.ceil(inode_table_mib) + 63
-    assert size == 156
-
-
 @requires_mke2fs
 @requires_sealcheck
 def test_build_rootfs_metadata_computed_from_tmp_image_under_concurrent_replacement(
@@ -1056,3 +982,507 @@ def test_build_rootfs_rejects_out_image_symlink_inside_src(tmp_path: Path) -> No
     # Verify no staging directory or files were created inside src/nested
     assert list(nested_dir.iterdir()) == [symlink_out]
     assert not outside_target.exists()
+
+
+# -----------------------------------------------------------------------------
+# Regression tests for the final review (t2.4-claude-final-20261112), one block per finding
+# -----------------------------------------------------------------------------
+
+
+def _mock_toolchain(monkeypatch: pytest.MonkeyPatch, version: str = "mke2fs 1.47.2 (1-Jan-2025)\n"):
+    """Mock mke2fs and sealcheck; record every subprocess.run call (cmd, kwargs)."""
+    calls: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr("hermetic_slice.rootfs.resolve_mke2fs_bin", lambda: "/bin/mke2fs")
+    monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: Path("/bin/hermetic-sealcheck"))
+    behaviour: dict[str, object] = {"build": "ok"}
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if "-V" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout=version, stderr="")
+        if "d4-image" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout='{"findings": []}', stderr="")
+        if behaviour["build"] == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        Path(cmd[cmd.index("-F") + 1]).write_bytes(b"fake ext4")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls, behaviour
+
+
+# Finding 1: builder identity ------------------------------------------------
+
+
+def test_finding1_tarinfo_uses_source_owner_mode_and_clamped_mtime() -> None:
+    """Tar headers carry the source uid/gid and every permission bit (setgid included), no names."""
+    fake = os.stat_result((stat.S_IFREG | 0o2755, 1, 1, 1, 0, 50, 6, 0, T_EPOCH + 999, 0))
+    info = make_tarinfo("usr/bin/tool", fake, T_EPOCH)
+    assert (info.uid, info.gid) == (0, 50)
+    assert info.mode == 0o2755
+    assert info.uname == "" and info.gname == ""
+    assert info.mtime == T_EPOCH, "mtime is clamped to T_clock"
+    old = os.stat_result((stat.S_IFREG | 0o644, 1, 1, 1, 7, 8, 0, 0, 1000, 0))
+    assert make_tarinfo("a", old, T_EPOCH).mtime == 1000
+
+
+def test_finding1_stream_carries_source_ownership_and_setgid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stream reflects the source inodes, not the (simulated) builder identity."""
+    src = tmp_path / "src"
+    (src / "usr" / "bin").mkdir(parents=True)
+    tool = src / "usr" / "bin" / "tool"
+    tool.write_text("#!/bin/sh\n")
+    os.chmod(tool, 0o2755)
+    st = os.lstat(tool)
+
+    _, members_a, tar_a = _tar_tree(src, tmp_path)
+    monkeypatch.setattr(os, "geteuid", lambda: 4242)
+    monkeypatch.setattr(os, "getegid", lambda: 4343)
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    monkeypatch.setattr(os, "getgid", lambda: 4343)
+    _, _, tar_b = _tar_tree(src, tmp_path)
+
+    member = members_a["usr/bin/tool"]
+    assert (member.uid, member.gid) == (st.st_uid, st.st_gid)
+    assert stat.S_IMODE(member.mode) == stat.S_IMODE(st.st_mode)
+    assert tar_a.read_bytes() == tar_b.read_bytes()
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_finding1_image_independent_of_builder_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two builds of the same tree with different (simulated) effective uids give the same sha256,
+    and the image keeps the source owner and the setgid bit."""
+    src = tmp_path / "src"
+    (src / "usr" / "bin").mkdir(parents=True)
+    tool = src / "usr" / "bin" / "tool"
+    tool.write_text("#!/bin/sh\necho hi\n")
+    os.chmod(tool, 0o2755)
+    t_clock = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    res1 = build_rootfs(src=src, out_image=tmp_path / "a" / "r.ext4", t_clock=t_clock, world_id="w", size_mib=64)
+    sealcheck = find_sealcheck_bin()
+    monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: sealcheck)
+    for fn, value in (("geteuid", 4242), ("getuid", 4242), ("getegid", 4343), ("getgid", 4343)):
+        monkeypatch.setattr(os, fn, lambda value=value: value)
+    res2 = build_rootfs(
+        src=src, out_image=tmp_path / "b" / "r.ext4", t_clock=t_clock, world_id="w", size_mib=64,
+        work_dir=tmp_path,
+    )
+    monkeypatch.undo()
+    assert res1["sha256"] == res2["sha256"]
+
+    if DEBUGFS is not None:
+        out = _debugfs(tmp_path / "a" / "r.ext4", "stat /usr/bin/tool")
+        assert "Mode:  02755" in out
+        assert f"User: {os.lstat(tool).st_uid:>5}" in out
+
+
+# Finding 2: pinned mke2fs config, options and version ----------------------
+
+
+def test_finding2_mke2fs_gets_pinned_config_and_explicit_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    calls, _ = _mock_toolchain(monkeypatch)
+
+    res = build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                       world_id="w", work_dir=tmp_path)
+
+    build_cmd, build_kwargs = next((c, k) for c, k in calls if "-d" in c)
+    env = build_kwargs["env"]
+    assert env["MKE2FS_CONFIG"] == str(MKE2FS_CONFIG_PATH)
+    assert MKE2FS_CONFIG_PATH.is_file() and not MKE2FS_CONFIG_PATH.is_symlink()
+    assert set(env) == {"PATH", "LANG", "TZ", "MKE2FS_CONFIG", "SOURCE_DATE_EPOCH", "E2FSPROGS_FAKE_TIME"}
+
+    def opt(flag: str) -> str:
+        return build_cmd[build_cmd.index(flag) + 1]
+
+    assert opt("-O") == EXT4_FEATURES and opt("-O").startswith("none,")
+    assert opt("-b") == str(BLOCK_SIZE)
+    assert opt("-I") == str(INODE_SIZE)
+    assert opt("-N") == str(res["inode_count"])
+    assert opt("-J") == f"size={res['journal_mib']}"
+    assert opt("-t") == "ext4"
+    assert opt("-m") == "5"
+    assert "lazy_itable_init=0" in opt("-E") and "root_owner=0:0" in opt("-E")
+    assert opt("-d").endswith(".tar")
+    assert res["e2fsprogs_version"] == "1.47.2"
+    assert res["mke2fs_config_sha256"] == hashlib.sha256(MKE2FS_CONFIG_PATH.read_bytes()).hexdigest()
+
+
+def test_finding2_unpinned_mke2fs_version_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    _mock_toolchain(monkeypatch, version="mke2fs 1.47.3 (1-Jan-2026)\n")
+    with pytest.raises(RuntimeError, match="not a pinned version"):
+        build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                     world_id="w", work_dir=tmp_path)
+    assert not (tmp_path / "o.img").exists()
+
+
+# Finding 3: copy TOCTOU ------------------------------------------------------
+
+
+def _run_walker_bounded(src: Path, tar_path: Path, timeout_s: float = 20.0):
+    outcome: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            outcome["scan"] = write_rootfs_tar(src, tar_path, mtime_ceiling=T_EPOCH, limits=RootfsLimits())
+        except BaseException as exc:  # noqa: BLE001 - reported to the test thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+    assert not worker.is_alive(), "walker blocked"
+    return outcome
+
+
+def _swap_on_open(monkeypatch: pytest.MonkeyPatch, victim: Path, replace) -> None:
+    real_open = os.open
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and path == victim.name and victim.exists() and not victim.is_symlink():
+            victim.unlink()
+            replace(victim)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+
+def test_finding3_file_swapped_for_symlink_is_not_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = tmp_path / "host_secret"
+    secret.write_text("HOST-SECRET-CONTENT")
+    src = tmp_path / "src"
+    src.mkdir()
+    victim = src / "victim"
+    victim.write_text("ordinary file")
+
+    _swap_on_open(monkeypatch, victim, lambda p: p.symlink_to(secret))
+    tar_path = tmp_path / "s.tar"
+    outcome = _run_walker_bounded(src, tar_path)
+
+    assert isinstance(outcome.get("error"), SourceChangedError)
+    assert b"HOST-SECRET-CONTENT" not in tar_path.read_bytes()
+
+
+def test_finding3_file_swapped_for_fifo_does_not_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    victim = src / "victim"
+    victim.write_text("ordinary file")
+
+    _swap_on_open(monkeypatch, victim, lambda p: os.mkfifo(p))
+    outcome = _run_walker_bounded(src, tmp_path / "s.tar")
+    assert isinstance(outcome.get("error"), SourceChangedError)
+
+
+def test_finding3_symlinks_recorded_never_followed(tmp_path: Path) -> None:
+    secret = tmp_path / "host_secret"
+    secret.write_text("HOST-SECRET-CONTENT")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "link").symlink_to(secret)
+    (src / "dirlink").symlink_to(tmp_path)
+
+    _, members, tar_path = _tar_tree(src, tmp_path)
+    assert members["link"].issym() and members["link"].linkname == str(secret)
+    assert members["dirlink"].issym()
+    assert b"HOST-SECRET-CONTENT" not in tar_path.read_bytes()
+
+
+# Finding 4: resource caps, hard links, sparse files, depth -------------------
+
+
+def test_finding4_hard_links_not_amplified(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    first = src / "big"
+    first.write_bytes(os.urandom(1024 * 1024))
+    for i in range(49):
+        os.link(first, src / f"link{i:02d}")
+
+    scan, members, tar_path = _tar_tree(src, tmp_path)
+    assert scan.hardlinks == 49
+    assert scan.data_bytes == 1024 * 1024
+    assert tar_path.stat().st_size < 2 * 1024 * 1024
+    assert members["link00"].islnk() and members["link00"].linkname == "big"
+
+
+def test_finding4_sparse_file_streamed_sparsely(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    fd = os.open(src / "sparse", os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.pwrite(fd, b"D" * 4096, 512 * 1024 * 1024)
+        os.ftruncate(fd, 1024 * 1024 * 1024)
+    finally:
+        os.close(fd)
+    if os.lstat(src / "sparse").st_blocks * 512 >= 1024 * 1024:
+        pytest.skip("temporary filesystem does not keep holes")
+
+    scan, members, tar_path = _tar_tree(src, tmp_path)
+    assert scan.data_bytes == 4096
+    assert scan.data_blocks == 1
+    assert tar_path.stat().st_size < 1024 * 1024
+    assert members["sparse"].size == 1024 * 1024 * 1024
+    assert plan_image(scan).size_mib < 128, "sizing uses data runs, not st_size"
+
+
+def test_finding4_entry_cap_trips_early(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(50):
+        (src / f"f{i}").write_bytes(b"x")
+    with pytest.raises(RootfsLimitError, match="more than 10 entries"):
+        _tar_tree(src, tmp_path, max_entries=10)
+
+
+def test_finding4_byte_cap_trips_early(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        (src / f"f{i}").write_bytes(b"y" * 65536)
+    tar_path_dir = tmp_path / "out"
+    tar_path_dir.mkdir()
+    with pytest.raises(RootfsLimitError, match="exceeds 100000 bytes"):
+        _tar_tree(src, tar_path_dir, max_bytes=100_000)
+    written = sum(p.stat().st_size for p in tar_path_dir.iterdir())
+    assert written < 3 * 65536, "the walk stopped at the cap instead of reading everything"
+
+
+def test_finding4_depth_cap_and_iterative_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    deep = src.joinpath(*(["d"] * 300))
+    deep.mkdir(parents=True)
+    (deep / "leaf").write_text("leaf")
+
+    with pytest.raises(RootfsLimitError, match="deeper than 20"):
+        _tar_tree(src, tmp_path, max_depth=20)
+
+    # A recursive walker needs one Python frame per level; this one needs none.
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(len(inspect.stack()) + 120)
+    try:
+        _, members, _ = _tar_tree(src, tmp_path, max_depth=400)
+    finally:
+        sys.setrecursionlimit(old_limit)
+    assert "/".join(["d"] * 300) + "/leaf" in members
+
+
+def test_finding4_free_space_checked_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    monkeypatch.setattr(os, "statvfs", lambda _p: os.statvfs_result((4096, 4096, 100, 10, 10, 100, 10, 10, 0, 255)))
+    with pytest.raises(RootfsLimitError, match="Not enough free space"):
+        write_rootfs_tar(src, tmp_path / "s.tar", mtime_ceiling=T_EPOCH, limits=RootfsLimits())
+    assert not (tmp_path / "s.tar").exists()
+
+
+def test_finding4_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMETIC_ROOTFS_MAX_BYTES", "123")
+    monkeypatch.setenv("HERMETIC_ROOTFS_MAX_ENTRIES", "45")
+    monkeypatch.setenv("HERMETIC_ROOTFS_MAX_DEPTH", "6")
+    assert RootfsLimits.from_env() == RootfsLimits(max_bytes=123, max_entries=45, max_depth=6)
+    monkeypatch.setenv("HERMETIC_ROOTFS_MAX_DEPTH", "0")
+    with pytest.raises(ValueError):
+        RootfsLimits.from_env()
+
+
+# Finding 5: sealcheck discovery ----------------------------------------------
+
+
+def test_finding5_no_ambient_sealcheck_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binary planted under ~/hermetic/cargo-target, /home/hermetic-style dirs or $PATH is never used."""
+    fake_home = tmp_path / "home" / "me"
+    planted_dir = fake_home / "hermetic" / "cargo-target" / "x" / "release"
+    planted_dir.mkdir(parents=True)
+    marker = tmp_path / "executed"
+    _fake_tool(planted_dir / "hermetic-sealcheck", f"touch {marker}; exit 0")
+    other = tmp_path / "home" / "hermetic" / "cargo-target" / "y" / "release"
+    other.mkdir(parents=True)
+    _fake_tool(other / "hermetic-sealcheck", f"touch {marker}; exit 0")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", f"{planted_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("HERMETIC_SEALCHECK_BIN", raising=False)
+
+    with pytest.raises(FileNotFoundError, match="No hermetic-sealcheck binary given"):
+        find_sealcheck_bin()
+    assert not marker.exists(), "a planted binary was executed"
+
+
+def test_finding5_sealcheck_path_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    good = _fake_tool(tmp_path / "good", "exit 0")
+    assert find_sealcheck_bin(good) == good
+    monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(good))
+    assert find_sealcheck_bin() == good
+
+    with pytest.raises(FileNotFoundError, match="absolute"):
+        find_sealcheck_bin(Path("relative/hermetic-sealcheck"))
+    link = tmp_path / "link"
+    link.symlink_to(good)
+    with pytest.raises(PermissionError, match="regular file"):
+        find_sealcheck_bin(link)
+    writable = _fake_tool(tmp_path / "writable", "exit 0", mode=0o775)
+    with pytest.raises(PermissionError, match="writable"):
+        find_sealcheck_bin(writable)
+    monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(writable))
+    with pytest.raises(PermissionError, match="writable"):
+        find_sealcheck_bin()
+    no_d4 = _fake_tool(tmp_path / "no_d4", "exit 1")
+    with pytest.raises(FileNotFoundError, match="does not support the d4-image"):
+        find_sealcheck_bin(no_d4)
+    monkeypatch.setattr(os, "geteuid", lambda: 4242)
+    with pytest.raises(PermissionError, match="owned by uid"):
+        find_sealcheck_bin(good)
+
+
+# Finding 6: subprocess timeouts ----------------------------------------------
+
+
+def test_finding6_every_subprocess_call_has_a_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    calls, _ = _mock_toolchain(monkeypatch)
+    build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                 world_id="w", work_dir=tmp_path)
+    assert len(calls) == 3
+    for _cmd, kwargs in calls:
+        assert kwargs.get("timeout") and kwargs["timeout"] > 0
+
+
+def test_finding6_mke2fs_timeout_is_clear_error_and_cleans_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    _, behaviour = _mock_toolchain(monkeypatch)
+    behaviour["build"] = "timeout"
+    work = tmp_path / "work"
+    work.mkdir()
+    out_dir = tmp_path / "out"
+
+    with pytest.raises(RootfsTimeoutError, match="timed out"):
+        build_rootfs(src=src, out_image=out_dir / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                     world_id="w", work_dir=work)
+    assert list(work.iterdir()) == [], "work directory left behind"
+    assert list(out_dir.iterdir()) == [], "temporary image left behind"
+
+
+def test_finding6_sealcheck_probe_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    hang = _fake_tool(tmp_path / "hang", "exec sleep 30")
+    monkeypatch.setenv("HERMETIC_ROOTFS_TIMEOUT_SEALCHECK_PROBE", "1")
+    t0 = time.monotonic()
+    with pytest.raises(RootfsTimeoutError, match="timed out after 1 s"):
+        find_sealcheck_bin(hang)
+    assert time.monotonic() - t0 < 15
+
+
+# Finding 7: host ACL / xattr leakage -----------------------------------------
+
+
+def test_finding7_stream_has_no_xattrs_and_work_dir_is_private(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "f"
+    f.write_text("x")
+    try:
+        os.setxattr(f, "user.origin", b"host")
+    except OSError:
+        pass  # filesystem without user xattrs: the header check below still applies
+
+    _, members, _ = _tar_tree(src, tmp_path)
+    for member in members.values():
+        assert not any("xattr" in key or "acl" in key.lower() for key in member.pax_headers)
+
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
+    _mock_toolchain(monkeypatch)
+    out_dir = tmp_path / "out"
+    work = tmp_path / "work"
+    work.mkdir()
+    res = build_rootfs(src=src, out_image=out_dir / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                       world_id="w", work_dir=work)
+    assert res["xattrs"] == "none"
+    assert created and all(p.parent == work for p in created), "staging must be a fresh dir under work_dir"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["o.img"], "nothing staged next to the output"
+
+
+@requires_mke2fs
+@requires_sealcheck
+@requires_debugfs
+def test_finding7_image_has_no_xattrs(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "f"
+    f.write_text("x")
+    try:
+        os.setxattr(f, "user.origin", b"host")
+    except OSError:
+        pytest.skip("temporary filesystem has no user xattrs")
+    out = tmp_path / "r.ext4"
+    build_rootfs(src=src, out_image=out, t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc), world_id="w", size_mib=64)
+    for path in ("/", "/f"):
+        assert "user." not in _debugfs(out, f"ea_list {path}")
+        assert "security." not in _debugfs(out, f"ea_list {path}")
+
+
+# Finding 8: sizing --------------------------------------------------------------
+
+
+def test_finding8_100k_small_files_get_enough_space() -> None:
+    """100,000 files of 100 bytes need 100,000 data blocks (~391 MiB), not 10 MB."""
+    n = 100_000
+    names = n * len("f_000000")
+    scan = TreeScan(
+        removed=[],
+        skipped_special=[],
+        inodes=n + 1,
+        data_bytes=n * 100,
+        data_blocks=n,
+        dir_blocks=directory_blocks(names + n * 4, n),
+    )
+    plan = plan_image(scan)
+    needed_blocks = n + scan.dir_blocks + math.ceil(plan.inode_count * INODE_SIZE / BLOCK_SIZE)
+    assert plan.size_mib * 1024 * 1024 >= needed_blocks * BLOCK_SIZE + plan.journal_mib * 1024 * 1024
+    assert plan.size_mib >= 391 + 31
+
+
+def test_finding8_scan_counts_whole_blocks(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(300):
+        (src / f"f_{i:03d}").write_bytes(b"z" * 100)
+    (src / "long_link").symlink_to("x" * 80)
+    scan, _, _ = _tar_tree(src, tmp_path)
+    assert scan.data_blocks == 300, "each 100-byte file takes a whole 4 KiB block"
+    assert scan.symlink_blocks == 1
+    assert scan.dir_blocks >= 2, "301 dirents (~4.8 KiB) do not fit one directory block"
+    assert scan.inodes == 302
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_finding8_many_small_files_automatic_sizing(tmp_path: Path) -> None:
+    """20,000 files of 100 bytes (~78 MiB of blocks) build with automatic sizing."""
+    src = tmp_path / "src_small"
+    src.mkdir()
+    payload = b"s" * 100
+    for i in range(20000):
+        (src / f"f_{i:05d}").write_bytes(payload)
+    res = build_rootfs(src=src, out_image=tmp_path / "r.ext4", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                       world_id="small-files", size_mib=None)
+    assert res["d4"] == "pass"

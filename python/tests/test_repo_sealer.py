@@ -503,37 +503,122 @@ def test_clean_directory_symlink_to_host_directory(tmp_path: Path) -> None:
     assert (host_dir / "subdir" / "file2.txt").read_text() == "precious file 2"
 
 
-def test_rootfs_clean_staging_readonly_dir_symlinked_history(tmp_path: Path) -> None:
-    """(c) the rootfs builder test with a read-only staging directory holding a
-    symlinked history file leaves the host target's mode unchanged."""
+def test_rootfs_tar_readonly_dir_symlinked_history(tmp_path: Path) -> None:
+    """(c) the rootfs builder on a read-only source directory holding a symlinked history
+    file drops the history from the image stream and never touches the source or the host target."""
     if os.geteuid() == 0:
         pytest.skip("Read-only directory test requires non-root user")
 
-    from hermetic_slice.rootfs import clean_rootfs_staging
+    from hermetic_slice.rootfs import write_rootfs_tar
 
     host_file = tmp_path / "host_bash_history"
     host_file.write_text("secret host commands\n")
     os.chmod(host_file, 0o600)
     orig_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
 
-    staging = tmp_path / "staging_ro"
-    staging.mkdir()
-    user_dir = staging / "home" / "user"
+    src = tmp_path / "src_ro"
+    user_dir = src / "home" / "user"
     user_dir.mkdir(parents=True)
     symlink_hist = user_dir / ".bash_history"
     symlink_hist.symlink_to(host_file.resolve())
 
     os.chmod(user_dir, 0o555)
     try:
-        removed = clean_rootfs_staging(staging)
+        scan = write_rootfs_tar(src, tmp_path / "out.tar", mtime_ceiling=1_700_000_000)
     finally:
-        if user_dir.exists():
-            os.chmod(user_dir, 0o755)
+        os.chmod(user_dir, 0o755)
 
-    assert "home/user/.bash_history" in removed
-    assert not symlink_hist.exists()
-    assert not symlink_hist.is_symlink()
-    assert host_file.exists()
+    assert "home/user/.bash_history" in scan.removed
+    assert symlink_hist.is_symlink(), "the source must never be modified"
     assert host_file.read_text() == "secret host commands\n"
     current_mode = stat.S_IMODE(os.lstat(host_file).st_mode)
     assert current_mode == orig_mode, f"Host file mode changed from {oct(orig_mode)} to {oct(current_mode)}"
+
+
+def test_chmod_nofollow_never_changes_symlink_target(tmp_path: Path) -> None:
+    """Review finding 9: chmod_nofollow on a symlink changes nothing and reports False."""
+    from hermetic_slice.repo_sealer import chmod_nofollow
+
+    host_file = tmp_path / "host.txt"
+    host_file.write_text("host\n")
+    os.chmod(host_file, 0o644)
+    link = tmp_path / "link"
+    link.symlink_to(host_file)
+
+    assert chmod_nofollow(link, 0o700) is False
+    assert stat.S_IMODE(os.lstat(host_file).st_mode) == 0o644
+
+    regular = tmp_path / "regular.txt"
+    regular.write_text("x")
+    os.chmod(regular, 0o400)
+    assert chmod_nofollow(regular, 0o700) is True
+    assert stat.S_IMODE(os.lstat(regular).st_mode) == 0o700
+
+
+def test_make_writable_and_retry_symlink_swapped_after_lstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 9: an entry that lstat saw as a regular file but that has been replaced
+    by a symlink to a host file before the chmod: the host file's mode is unchanged."""
+    from hermetic_slice import repo_sealer
+
+    host_file = tmp_path / "host_secret"
+    host_file.write_text("secret\n")
+    os.chmod(host_file, 0o600)
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    victim = tree / "victim"
+    victim.symlink_to(host_file)
+
+    real_lstat = os.lstat
+    fake_regular = real_lstat(host_file)
+
+    def lying_lstat(path, *args, **kwargs):
+        # Simulates the race: the lstat happened while 'victim' was still a regular file.
+        if Path(path) == victim:
+            return fake_regular
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(repo_sealer.os, "lstat", lying_lstat)
+    repo_sealer._make_writable_and_retry(os.unlink, str(victim), PermissionError("simulated"))
+    monkeypatch.setattr(repo_sealer.os, "lstat", real_lstat)
+
+    assert stat.S_IMODE(os.lstat(host_file).st_mode) == 0o600, "chmod followed a swapped-in symlink"
+    assert host_file.read_text() == "secret\n"
+
+
+def test_clean_directory_symlink_swapped_after_lstat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review finding 9 (_clean_directory sites): a symlink swapped in after the lstat is not chmod'ed."""
+    from hermetic_slice import repo_sealer
+
+    host_file = tmp_path / "host_file"
+    host_file.write_text("h")
+    os.chmod(host_file, 0o640)
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    item = clean_dir / "item"
+    item.symlink_to(host_file)
+
+    real_lstat = os.lstat
+    fake_regular = real_lstat(host_file)
+    real_is_symlink = Path.is_symlink
+
+    def lying_lstat(path, *args, **kwargs):
+        if Path(path) == item:
+            return fake_regular
+        return real_lstat(path, *args, **kwargs)
+
+    def lying_is_symlink(self):
+        if self == item:
+            return False
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(repo_sealer.os, "lstat", lying_lstat)
+    monkeypatch.setattr(Path, "is_symlink", lying_is_symlink)
+    monkeypatch.setattr(Path, "is_dir", lambda self: False if self == item else os.path.isdir(self))
+    repo_sealer._clean_directory(clean_dir)
+    monkeypatch.undo()
+
+    assert stat.S_IMODE(os.lstat(host_file).st_mode) == 0o640
+    assert host_file.read_text() == "h"

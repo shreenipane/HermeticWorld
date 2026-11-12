@@ -97,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     build_rootfs_parser.add_argument("--world-id", required=True, help="World identifier")
     build_rootfs_parser.add_argument("--size-mib", type=int, default=None, help="Filesystem size in MiB")
     build_rootfs_parser.add_argument("--sealcheck-bin", type=Path, default=None, help="Path to sealcheck binary")
+    build_rootfs_parser.add_argument(
+        "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
+    )
 
     try:
         args = parser.parse_args(argv)
@@ -560,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
                 world_id=args.world_id,
                 size_mib=args.size_mib,
                 sealcheck_bin=args.sealcheck_bin,
+                work_dir=args.work_dir,
             )
             print(json.dumps(res, indent=2))
             return 0

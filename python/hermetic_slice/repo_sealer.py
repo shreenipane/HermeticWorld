@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -33,24 +34,67 @@ class SealReport:
     dropped_tags: dict[str, str]
 
 
+def chmod_nofollow(path, mode: int) -> bool:
+    """chmod path itself, never a symlink's target; return False (and change nothing) for a symlink.
+
+    Uses chmod(follow_symlinks=False) where the platform has it. On Linux that is not
+    available, so the path is opened with O_PATH|O_NOFOLLOW (which pins the inode without
+    following a final symlink), the fd is checked with fstat, and the mode is changed through
+    that fd. Nothing is ever resolved by name between the type check and the chmod.
+    """
+    try:
+        os.chmod(path, mode, follow_symlinks=False)
+        return True
+    except NotImplementedError:
+        pass
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+    o_path = getattr(os, "O_PATH", 0)
+    if o_path:
+        fd = os.open(path, o_path | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if stat.S_ISLNK(os.fstat(fd).st_mode):
+                return False
+            proc_fd = f"/proc/self/fd/{fd}"
+            if os.path.isdir("/proc/self/fd"):
+                os.chmod(proc_fd, mode)
+                return True
+        finally:
+            os.close(fd)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return False
+        raise
+    try:
+        os.fchmod(fd, mode)
+        return True
+    finally:
+        os.close(fd)
+
+
 def _make_writable_and_retry(func, path, _exc):
     try:
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
             parent = os.path.dirname(path) or "."
             pst = os.lstat(parent)
-            if not stat.S_ISLNK(pst.st_mode):
-                os.chmod(parent, pst.st_mode | stat.S_IRWXU)
+            if not stat.S_ISLNK(pst.st_mode) and chmod_nofollow(parent, stat.S_IMODE(pst.st_mode) | stat.S_IRWXU):
                 os.unlink(path)
         else:
-            os.chmod(path, stat.S_IRWXU)  # S_IWRITE alone would strip r/x from directories on POSIX
+            # S_IWRITE alone would strip r/x from directories on POSIX. A symlink swapped in
+            # after the lstat is never chmod'ed (chmod_nofollow returns False).
+            if not chmod_nofollow(path, stat.S_IRWXU):
+                os.unlink(path)
+                return
             try:
                 func(path)
             except OSError:
                 parent = os.path.dirname(path) or "."
                 pst = os.lstat(parent)
-                if not stat.S_ISLNK(pst.st_mode):
-                    os.chmod(parent, pst.st_mode | stat.S_IRWXU)
+                if not stat.S_ISLNK(pst.st_mode) and chmod_nofollow(parent, stat.S_IMODE(pst.st_mode) | stat.S_IRWXU):
                     func(path)
     except OSError:
         pass
@@ -81,7 +125,7 @@ def _clean_directory(path: Path) -> None:
     try:
         st = os.lstat(path)
         if not stat.S_ISLNK(st.st_mode) and (st.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
-            os.chmod(path, st.st_mode | stat.S_IRWXU)
+            chmod_nofollow(path, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
     except OSError:
         pass
     for item in list(path.iterdir()):
@@ -96,7 +140,7 @@ def _clean_directory(path: Path) -> None:
             try:
                 st = os.lstat(item)
                 if not stat.S_ISLNK(st.st_mode):
-                    os.chmod(item, stat.S_IRWXU)
+                    chmod_nofollow(item, stat.S_IRWXU)
                 item.unlink()
             except OSError as exc:
                 _make_writable_and_retry(os.unlink, item, exc)
