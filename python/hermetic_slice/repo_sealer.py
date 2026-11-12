@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -33,37 +34,255 @@ class SealReport:
     dropped_tags: dict[str, str]
 
 
-def _make_writable_and_retry(func, path, _exc):
+_O_PATH = getattr(os, "O_PATH", 0)
+_LOOKUP_FLAGS = (_O_PATH or os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_dir_anchored(dirpath) -> int:
+    """Open a directory by walking its absolute path from "/" one component at a time with
+    O_NOFOLLOW|O_DIRECTORY relative to the previous descriptor: a symlink anywhere in the path,
+    an ancestor swapped for a symlink included, fails with ELOOP/ENOTDIR instead of being followed."""
+    absolute = os.path.abspath(os.fspath(dirpath))
+    fd = os.open("/", _LOOKUP_FLAGS)
     try:
-        os.chmod(path, stat.S_IRWXU)  # S_IWRITE alone would strip r/x from directories on POSIX
-        func(path)
+        for part in absolute.split("/"):
+            if part in ("", "."):
+                continue
+            next_fd = os.open(part, _LOOKUP_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_parent_anchored(path) -> tuple[int, str]:
+    absolute = os.path.abspath(os.fspath(path))
+    parent, name = os.path.split(absolute)
+    if not name:
+        raise OSError(errno.EINVAL, "path has no final component", absolute)
+    return _open_dir_anchored(parent), name
+
+
+def _fchmod_any(fd: int, mode: int) -> None:
+    """chmod the inode behind fd (an O_PATH descriptor is changed through /proc/self/fd)."""
+    try:
+        os.fchmod(fd, mode)
+    except OSError as exc:
+        if exc.errno != errno.EBADF:
+            raise
+        os.chmod(f"/proc/self/fd/{fd}", mode)
+
+
+def _chmod_at(dir_fd: int, name: str, mode: int) -> bool:
+    """chmod the entry name inside dir_fd itself; False (nothing changed) if it is a symlink."""
+    flags = (_O_PATH or (os.O_RDONLY | os.O_NONBLOCK)) | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return False
+        raise
+    try:
+        if stat.S_ISLNK(os.fstat(fd).st_mode):
+            return False
+        _fchmod_any(fd, mode)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _add_owner_rwx(fd: int) -> None:
+    _fchmod_any(fd, stat.S_IMODE(os.fstat(fd).st_mode) | stat.S_IRWXU)
+
+
+def chmod_nofollow(path, mode: int) -> bool:
+    """chmod path itself, never a symlink target and never through a symlinked ancestor.
+
+    The parent directory is reached by anchored component-wise descriptor traversal from "/"
+    (O_NOFOLLOW at each level) and the entry is opened relative to it with O_NOFOLLOW; the
+    mode is changed on that descriptor. Returns False and changes nothing if the entry or any
+    ancestor is a symlink.
+    """
+    try:
+        parent_fd, name = _open_parent_anchored(path)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return False
+        raise
+    try:
+        return _chmod_at(parent_fd, name, mode)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_at(func, parent_fd: int, name: str) -> None:
+    if func is os.rmdir:
+        os.rmdir(name, dir_fd=parent_fd)
+    elif func in (os.unlink, os.remove):
+        os.unlink(name, dir_fd=parent_fd)
+    # Other failing calls (open, scandir, lstat) need no retry here: making the entry
+    # writable/searchable is the fix, and rmtree's own removal then proceeds or reports.
+
+
+def _make_writable_and_retry(func, path, _exc):
+    """shutil.rmtree error handler: every chmod, unlink and rmdir is relative to the parent's
+    descriptor, reached without following any symlink (a swapped ancestor is refused)."""
+    try:
+        parent_fd, name = _open_parent_anchored(path)
+    except OSError:
+        return
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            _add_owner_rwx(parent_fd)
+            os.unlink(name, dir_fd=parent_fd)
+            return
+        # S_IWRITE alone would strip r/x from directories on POSIX.
+        if not _chmod_at(parent_fd, name, stat.S_IRWXU):
+            os.unlink(name, dir_fd=parent_fd)  # swapped for a symlink: remove the link only
+            return
+        try:
+            _remove_at(func, parent_fd, name)
+        except OSError:
+            _add_owner_rwx(parent_fd)
+            _remove_at(func, parent_fd, name)
     except OSError:
         pass
+    finally:
+        os.close(parent_fd)
+
+
+def _open_subdir_for_removal(parent_fd: int, name: str) -> int | None:
+    """Open name inside parent_fd as a directory without following symlinks; None if it is
+    not a directory (anymore). Grants owner rwx (on the opened inode) when needed."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return None
+        if exc.errno != errno.EACCES or not _chmod_at(parent_fd, name, stat.S_IRWXU):
+            raise
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        st = os.fstat(fd)
+        if (st.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
+            _fchmod_any(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _unlink_at(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except PermissionError:
+        _add_owner_rwx(dir_fd)
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def _list_for_removal(fd: int) -> list[tuple[str, bool]]:
+    with os.scandir(fd) as it:
+        return [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in it]
+
+
+def remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove the entry name inside parent_fd, recursively, entirely through descriptors.
+
+    Iterative; every directory is opened with O_NOFOLLOW|O_DIRECTORY relative to its parent's
+    descriptor, entries are typed with lstat-equivalent checks (scandir without following),
+    and unlink/rmdir/chmod are all relative to held descriptors. A symlink is removed as a
+    link and never followed, so swapping any directory for a symlink mid-removal cannot reach
+    outside the tree. Errors propagate (OSError).
+    """
+    st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        _unlink_at(parent_fd, name)
+        return
+    top = _open_subdir_for_removal(parent_fd, name)
+    if top is None:
+        _unlink_at(parent_fd, name)
+        return
+    stack: list[tuple[int, str, list[tuple[str, bool]]]] = [(top, name, _list_for_removal(top))]
+    try:
+        while stack:
+            fd, dir_name, entries = stack[-1]
+            if entries:
+                entry_name, is_dir = entries.pop()
+                child = _open_subdir_for_removal(fd, entry_name) if is_dir else None
+                if child is None:
+                    _unlink_at(fd, entry_name)
+                else:
+                    try:
+                        child_entries = _list_for_removal(child)
+                    except BaseException:
+                        os.close(child)
+                        raise
+                    stack.append((child, entry_name, child_entries))
+                continue
+            stack.pop()
+            os.close(fd)
+            holder = stack[-1][0] if stack else parent_fd
+            try:
+                os.rmdir(dir_name, dir_fd=holder)
+            except PermissionError:
+                _add_owner_rwx(holder)
+                os.rmdir(dir_name, dir_fd=holder)
+    finally:
+        for fd, _, _ in stack:
+            os.close(fd)
 
 
 def rmtree_force(path: Path) -> None:
-    """Remove a directory tree, clearing read-only flags and retrying on failure."""
-    if not path.exists():
+    """Remove a directory tree (or a single entry), clearing read-only flags as needed.
+
+    The parent is reached by anchored descriptor traversal (no symlink followed anywhere in
+    the path) and the removal is descriptor-relative (remove_tree_at). A path under a
+    symlinked ancestor is left alone. Like shutil.rmtree with a swallowing error handler,
+    this never raises; callers check whether the path still exists.
+    """
+    try:
+        parent_fd, name = _open_parent_anchored(path)
+    except OSError:
         return
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_make_writable_and_retry)
-    else:
-        shutil.rmtree(path, onerror=_make_writable_and_retry)
+    try:
+        remove_tree_at(parent_fd, name)
+    except OSError:
+        pass
+    finally:
+        os.close(parent_fd)
 
 
 def _clean_directory(path: Path) -> None:
-    """Remove all contents within a directory, handling read-only files."""
-    if not path.exists():
+    """Remove all contents within a directory, handling read-only files.
+
+    The directory is opened by anchored descriptor traversal (no symlink followed anywhere in
+    its path); entries are listed and removed relative to that descriptor (remove_tree_at).
+    """
+    path = Path(path)
+    try:
+        parent_fd, name = _open_parent_anchored(path)
+    except OSError:
         return
-    for item in list(path.iterdir()):
-        if item.is_dir():
-            rmtree_force(item)
-        else:
+    try:
+        dir_fd = _open_subdir_for_removal(parent_fd, name)
+    except OSError:
+        dir_fd = None
+    finally:
+        os.close(parent_fd)
+    if dir_fd is None:
+        return
+    try:
+        for entry_name, _is_dir in _list_for_removal(dir_fd):
             try:
-                os.chmod(item, stat.S_IRWXU)
-                item.unlink()
+                remove_tree_at(dir_fd, entry_name)
             except OSError:
                 pass
+    finally:
+        os.close(dir_fd)
 
 
 def seal_repo(
