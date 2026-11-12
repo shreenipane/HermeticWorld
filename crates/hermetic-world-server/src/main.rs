@@ -50,6 +50,12 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     recover: bool,
+
+    #[arg(long)]
+    frame_deadline_ms: Option<u64>,
+
+    #[arg(long)]
+    transmission_deadline_ms: Option<u64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -221,6 +227,10 @@ fn main() {
         no_sandbox: cli.no_sandbox,
         resume_log: cli.resume_log,
         recover: cli.recover,
+        frame_deadline: cli.frame_deadline_ms.map(std::time::Duration::from_millis),
+        transmission_deadline: cli
+            .transmission_deadline_ms
+            .map(std::time::Duration::from_millis),
     };
 
     let server = match WorldServer::new(config) {

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use hermetic_common::{Method, RequestFrame, ResponseFrame};
+use hermetic_common::{Method, RequestFrame, ResponseFrame, ResponseHeader};
 use hermetic_world_server::{format_imf_fixdate, DirStore, ServerConfig, Store, WorldServer};
 use std::fs;
 use std::io::Write;
@@ -32,6 +32,8 @@ fn start_test_server(
         no_sandbox: true,
         resume_log: false,
         recover: false,
+        frame_deadline: None,
+        transmission_deadline: None,
     };
 
     let server = WorldServer::new(config).expect("create server");
@@ -283,11 +285,11 @@ fn test_get_head_range_miss_and_headers() {
 #[test]
 fn test_date_header_advances() {
     let t_start = datetime!(2025-01-01 00:00:00 UTC);
-    let s1 = format_imf_fixdate(t_start);
+    let s1 = format_imf_fixdate(t_start).unwrap();
     assert_eq!(s1, "Wed, 01 Jan 2025 00:00:00 GMT");
 
     let t_plus = t_start + Duration::from_secs(3665);
-    let s2 = format_imf_fixdate(t_plus);
+    let s2 = format_imf_fixdate(t_plus).unwrap();
     assert_eq!(s2, "Wed, 01 Jan 2025 01:01:05 GMT");
 }
 
@@ -376,30 +378,69 @@ fn test_fix1_authority_traversal_and_sibling_protection() {
 #[test]
 fn test_fix4_deterministic_headers() {
     let temp = tempdir().expect("tempdir");
-    let store_dir = temp.path().join("store");
-    let obj_dir = store_dir.join("example.com").join("files");
-    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    let store_dir1 = temp.path().join("store1");
+    let obj_dir1 = store_dir1.join("example.com").join("files");
+    fs::create_dir_all(&obj_dir1).expect("create obj dir 1");
 
-    let file_path = obj_dir.join("data.txt");
-    fs::write(&file_path, b"determinism test content").expect("write data.txt");
+    let file_path1 = obj_dir1.join("data.txt");
+    fs::write(&file_path1, b"determinism test content").expect("write data.txt 1");
 
-    // Sidecar with 20 headers in non-alphabetical order
-    let sidecar_path = obj_dir.join("data.txt.headers.json");
-    let mut header_pairs = Vec::new();
-    for i in (1..=20).rev() {
-        header_pairs.push(format!("\"x-header-{i:02}\": \"val-{i}\""));
+    // Headers allowlisted by ALLOWED_SIDECAR_HEADERS
+    let retained_ordered = [
+        ("access-control-allow-credentials", "val-01"),
+        ("access-control-allow-headers", "val-02"),
+        ("access-control-allow-methods", "val-03"),
+        ("access-control-allow-origin", "val-04"),
+        ("access-control-expose-headers", "val-05"),
+        ("access-control-max-age", "val-06"),
+        ("cache-control", "val-07"),
+        ("cross-origin-embedder-policy", "val-08"),
+        ("cross-origin-opener-policy", "val-09"),
+        ("cross-origin-resource-policy", "val-10"),
+        ("etag", "val-11"),
+        ("expires", "val-12"),
+        ("last-modified", "val-13"),
+        ("vary", "val-14"),
+    ];
+
+    // Sidecar 1: headers in reverse order
+    let sidecar_path1 = obj_dir1.join("data.txt.headers.json");
+    let mut header_pairs1 = Vec::new();
+    for (name, val) in retained_ordered.iter().rev() {
+        header_pairs1.push(format!("\"{name}\": \"{val}\""));
     }
-    let sidecar_content = format!(
+    let sidecar_content1 = format!(
         "{{\n\"content_type\": \"text/plain\",\n\"headers\": {{\n{}\n}}\n}}",
-        header_pairs.join(",\n")
+        header_pairs1.join(",\n")
     );
-    fs::write(&sidecar_path, sidecar_content).expect("write sidecar");
+    fs::write(&sidecar_path1, sidecar_content1).expect("write sidecar 1");
+
+    // Sidecar 2: different order (every other item, then remainder)
+    let store_dir2 = temp.path().join("store2");
+    let obj_dir2 = store_dir2.join("example.com").join("files");
+    fs::create_dir_all(&obj_dir2).expect("create obj dir 2");
+    let file_path2 = obj_dir2.join("data.txt");
+    fs::write(&file_path2, b"determinism test content").expect("write data.txt 2");
+
+    let sidecar_path2 = obj_dir2.join("data.txt.headers.json");
+    let mut header_pairs2 = Vec::new();
+    for (name, val) in retained_ordered.iter().step_by(2) {
+        header_pairs2.push(format!("\"{name}\": \"{val}\""));
+    }
+    for (name, val) in retained_ordered.iter().skip(1).step_by(2) {
+        header_pairs2.push(format!("\"{name}\": \"{val}\""));
+    }
+    let sidecar_content2 = format!(
+        "{{\n\"content_type\": \"text/plain\",\n\"headers\": {{\n{}\n}}\n}}",
+        header_pairs2.join(",\n")
+    );
+    fs::write(&sidecar_path2, sidecar_content2).expect("write sidecar 2");
 
     // Server instance 1
     let log_dir1 = temp.path().join("log1");
     let sock_path1 = temp.path().join("s1.sock");
     let t_clock = datetime!(2024-01-01 00:00:00 UTC);
-    let sock1 = start_test_server(&store_dir, &log_dir1, &sock_path1, t_clock);
+    let sock1 = start_test_server(&store_dir1, &log_dir1, &sock_path1, t_clock);
 
     let req = RequestFrame {
         method: Method::Get,
@@ -413,7 +454,7 @@ fn test_fix4_deterministic_headers() {
     // Server instance 2
     let log_dir2 = temp.path().join("log2");
     let sock_path2 = temp.path().join("s2.sock");
-    let sock2 = start_test_server(&store_dir, &log_dir2, &sock_path2, t_clock);
+    let sock2 = start_test_server(&store_dir2, &log_dir2, &sock_path2, t_clock);
 
     let resp2 = send_req(&sock2, &req);
 
@@ -425,23 +466,114 @@ fn test_fix4_deterministic_headers() {
     let bytes1 = resp1_nodate.encode(1024 * 1024).expect("encode resp1");
     let bytes2 = resp2_nodate.encode(1024 * 1024).expect("encode resp2");
 
-    // FIX 6: Compare the frames with the date header removed, so the test checks header ordering only
+    // Compare frames with date header removed: must match fixed expected response bytes
+    let expected_frame = ResponseFrame {
+        request_id: 10,
+        status: 200,
+        headers: vec![
+            ResponseHeader {
+                name: "content-length".into(),
+                value: "24".into(),
+            },
+            ResponseHeader {
+                name: "accept-ranges".into(),
+                value: "bytes".into(),
+            },
+            ResponseHeader {
+                name: "content-type".into(),
+                value: "text/plain".into(),
+            },
+            ResponseHeader {
+                name: "access-control-allow-credentials".into(),
+                value: "val-01".into(),
+            },
+            ResponseHeader {
+                name: "access-control-allow-headers".into(),
+                value: "val-02".into(),
+            },
+            ResponseHeader {
+                name: "access-control-allow-methods".into(),
+                value: "val-03".into(),
+            },
+            ResponseHeader {
+                name: "access-control-allow-origin".into(),
+                value: "val-04".into(),
+            },
+            ResponseHeader {
+                name: "access-control-expose-headers".into(),
+                value: "val-05".into(),
+            },
+            ResponseHeader {
+                name: "access-control-max-age".into(),
+                value: "val-06".into(),
+            },
+            ResponseHeader {
+                name: "cache-control".into(),
+                value: "val-07".into(),
+            },
+            ResponseHeader {
+                name: "cross-origin-embedder-policy".into(),
+                value: "val-08".into(),
+            },
+            ResponseHeader {
+                name: "cross-origin-opener-policy".into(),
+                value: "val-09".into(),
+            },
+            ResponseHeader {
+                name: "cross-origin-resource-policy".into(),
+                value: "val-10".into(),
+            },
+            ResponseHeader {
+                name: "etag".into(),
+                value: "val-11".into(),
+            },
+            ResponseHeader {
+                name: "expires".into(),
+                value: "val-12".into(),
+            },
+            ResponseHeader {
+                name: "last-modified".into(),
+                value: "val-13".into(),
+            },
+            ResponseHeader {
+                name: "vary".into(),
+                value: "val-14".into(),
+            },
+        ],
+        body: b"determinism test content".to_vec(),
+    };
+    let expected_bytes = expected_frame.encode(1024 * 1024).expect("encode expected");
+
+    assert_eq!(
+        bytes1, expected_bytes,
+        "Resp1 must match fixed expected response bytes"
+    );
+    assert_eq!(
+        bytes2, expected_bytes,
+        "Resp2 must match fixed expected response bytes"
+    );
     assert_eq!(
         bytes1, bytes2,
-        "Two server instances must yield byte-identical response frames with date header removed"
+        "Two server instances must yield byte-identical response frames"
     );
 
-    // Extra headers must appear in alphabetical order
-    let x_headers: Vec<&str> = resp1
+    // Retained headers must be present and appear in alphabetical order
+    let retained_names: Vec<&str> = retained_ordered.iter().map(|(n, _)| *n).collect();
+    let retained_in_resp: Vec<&str> = resp1
         .headers
         .iter()
         .map(|h| h.name.as_str())
-        .filter(|n| n.starts_with("x-header-"))
+        .filter(|n| retained_names.contains(n))
         .collect();
-    let mut sorted_x_headers = x_headers.clone();
-    sorted_x_headers.sort();
     assert_eq!(
-        x_headers, sorted_x_headers,
+        retained_in_resp.len(),
+        retained_names.len(),
+        "All retained headers must be present in response"
+    );
+    let mut sorted_retained = retained_in_resp.clone();
+    sorted_retained.sort();
+    assert_eq!(
+        retained_in_resp, sorted_retained,
         "Headers must be sorted by name"
     );
 }
@@ -580,6 +712,8 @@ fn test_fix1_relative_store_root_with_parent_dir() {
         no_sandbox: true,
         resume_log: false,
         recover: false,
+        frame_deadline: None,
+        transmission_deadline: None,
     };
     let server_res = WorldServer::new(config);
     assert!(

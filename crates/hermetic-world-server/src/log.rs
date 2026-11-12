@@ -4,15 +4,17 @@ use crate::safe_fs::{invalid, Directory};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAX_LOG_LINE_BYTES: u64 = 128 * 1024;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024;
 pub const MAX_LOG_RECORDS: u64 = 16384;
 pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_DEDUPE_ENTRIES: usize = 4096;
-pub const MAX_DEDUPE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DEDUPE_ENTRIES: usize = 8320;
+pub const TERMINAL_RESERVE_ENTRIES: usize = 64;
+pub const TERMINAL_RESERVE_RECORDS: u64 = 64;
+pub const MAX_DEDUPE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
 
 pub const INITIAL_PREV_HASH: &str =
@@ -111,6 +113,18 @@ pub struct LogManager {
     failed: bool,
 }
 
+pub fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "tampered"
+            | "limit_exceeded"
+            | "clock_exhausted"
+            | "write_error"
+            | "frame_timeout"
+            | "read_timeout"
+    )
+}
+
 impl LogManager {
     pub fn new<P: AsRef<Path>>(log_dir: P) -> Result<Self, LogError> {
         Self::new_opts(log_dir, false)
@@ -123,10 +137,23 @@ impl LogManager {
         resume_log: bool,
         recover: bool,
     ) -> Result<Self, LogError> {
+        Self::new_opts_recover_binding(log_dir, resume_log, recover, None)
+    }
+    pub fn new_opts_recover_binding<P: AsRef<Path>>(
+        log_dir: P,
+        resume_log: bool,
+        recover: bool,
+        expected_binding: Option<&str>,
+    ) -> Result<Self, LogError> {
         let log_dir = log_dir.as_ref().to_path_buf();
         let directory = Directory::create(&log_dir)?;
         let log_name = Path::new("requests.log");
         let exists = entry_exists(&directory, log_name)?;
+
+        if resume_log && !exists {
+            return Err(LogError::ResumeVerification("requests.log missing".into()));
+        }
+
         // Fresh startup must never reuse any artifact, including an empty log.
         if !resume_log {
             for name in [
@@ -141,20 +168,28 @@ impl LogManager {
                 }
             }
         }
+        let mut log_file = directory.open_file(log_name, true, !exists)?;
         let mut seq = 0;
         let mut prev_hash = INITIAL_PREV_HASH.to_string();
         let mut state = RunState::default();
         let mut dedupe = BTreeMap::new();
         if resume_log {
-            // Never create a missing log to conceal lost evidence.
-            let scan = verify_in_directory(&directory, log_name, false, recover, true)
-                .map_err(|e| LogError::ResumeVerification(e.to_string()))?;
+            // Retain open descriptor through binding validation, scanning, recovery, rebuilding, and appending
+            let scan = verify_on_file(
+                &directory,
+                log_name,
+                &mut log_file,
+                false,
+                recover,
+                true,
+                expected_binding,
+            )
+            .map_err(|e| LogError::ResumeVerification(e.to_string()))?;
             seq = scan.count;
             prev_hash = scan.hash;
             state = scan.state;
-            dedupe = rebuild(&directory, log_name, seq)?;
+            dedupe = scan.dedupe;
         }
-        let log_file = directory.open_file(log_name, true, !exists)?;
         let log_bytes = log_file.metadata()?.len();
         directory.sync()?;
         let dedupe_bytes = dedupe.keys().map(key_cost).sum();
@@ -174,8 +209,17 @@ impl LogManager {
 
     pub fn validate_binding(log_dir: &Path, binding: &str) -> Result<(), LogError> {
         let directory = Directory::open(log_dir)?;
-        let scan = verify_in_directory(&directory, Path::new("requests.log"), false, true, false)
-            .map_err(|e| LogError::ResumeVerification(e.to_string()))?;
+        let mut file = directory.open_file(Path::new("requests.log"), false, false)?;
+        let scan = verify_on_file(
+            &directory,
+            Path::new("requests.log"),
+            &mut file,
+            false,
+            true,
+            false,
+            Some(binding),
+        )
+        .map_err(|e| LogError::ResumeVerification(e.to_string()))?;
         if scan.state.binding.as_deref() != Some(binding) {
             return Err(invalid().into());
         }
@@ -267,10 +311,16 @@ impl LogManager {
             return Err(invalid().into());
         }
         validate_params(params)?;
+        let is_terminal = is_terminal_status(params.status);
+        let max_records = if is_terminal {
+            MAX_LOG_RECORDS
+        } else {
+            MAX_LOG_RECORDS.saturating_sub(TERMINAL_RESERVE_RECORDS)
+        };
         let next_seq = self
             .seq
             .checked_add(1)
-            .filter(|n| *n <= MAX_LOG_RECORDS)
+            .filter(|n| *n <= max_records)
             .ok_or_else(invalid)?;
         let key = (
             params.authority.to_owned(),
@@ -282,8 +332,13 @@ impl LogManager {
         } else {
             key_cost(&key)
         };
+        let max_entries = if is_terminal {
+            MAX_DEDUPE_ENTRIES.saturating_add(TERMINAL_RESERVE_ENTRIES)
+        } else {
+            MAX_DEDUPE_ENTRIES
+        };
         if cost > 0
-            && (self.dedupe.len() >= MAX_DEDUPE_ENTRIES
+            && (self.dedupe.len() >= max_entries
                 || self.dedupe_bytes.saturating_add(cost) > MAX_DEDUPE_BYTES)
         {
             return Err(invalid().into());
@@ -383,7 +438,7 @@ fn key_cost(key: &(String, String, String)) -> usize {
 }
 fn update_dedupe(dedupe: &mut Dedupe, key: (String, String, String), seq: u64) -> io::Result<()> {
     if !dedupe.contains_key(&key)
-        && (dedupe.len() >= MAX_DEDUPE_ENTRIES
+        && (dedupe.len() >= MAX_DEDUPE_ENTRIES.saturating_add(TERMINAL_RESERVE_ENTRIES)
             || dedupe
                 .keys()
                 .map(key_cost)
@@ -431,7 +486,7 @@ fn update_state(state: &mut RunState, params: &LogEventParams<'_>) -> io::Result
                 .checked_add(1)
                 .ok_or_else(invalid)?;
         }
-        "write_error" | "200" | "206" | "404" | "416" => {
+        "write_error" | "200" | "206" | "404" | "416" | "frame_timeout" | "read_timeout" => {
             state.incomplete_transmissions = state.incomplete_transmissions.saturating_sub(1);
         }
         _ => (),
@@ -474,7 +529,7 @@ pub fn write_head_atomic(head_path: &Path, head: &LogHead) -> io::Result<()> {
 }
 
 // All callers share the same line and whole-file budgets, including rebuilds.
-fn next_line(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
+fn next_line<R: Read>(reader: &mut BufReader<R>) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
     reader
         .take(MAX_LOG_LINE_BYTES.saturating_add(1))
@@ -484,17 +539,7 @@ fn next_line(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
     }
     Ok(line)
 }
-fn bounded_reader(
-    directory: &Directory,
-    name: &Path,
-    writable: bool,
-) -> io::Result<BufReader<File>> {
-    let file = directory.open_file(name, writable, false)?;
-    if file.metadata()?.len() > MAX_LOG_BYTES {
-        return Err(invalid());
-    }
-    Ok(BufReader::new(file))
-}
+
 fn params_from_value(value: &serde_json::Value) -> io::Result<LogEventParams<'_>> {
     let text = |key| value.get(key).and_then(|v| v.as_str()).ok_or_else(invalid);
     Ok(LogEventParams {
@@ -517,35 +562,20 @@ fn params_from_value(value: &serde_json::Value) -> io::Result<LogEventParams<'_>
             .ok_or_else(invalid)?,
     })
 }
-fn rebuild(directory: &Directory, name: &Path, max_seq: u64) -> Result<Dedupe, LogError> {
-    let mut reader = bounded_reader(directory, name, false)?;
-    let mut dedupe = BTreeMap::new();
-    for seq in 1..=max_seq {
-        let line = next_line(&mut reader)?;
-        if line.is_empty() {
-            break;
-        }
-        let value: serde_json::Value = serde_json::from_slice(&line)?;
-        let params = params_from_value(&value)?;
-        validate_params(&params)?;
-        update_dedupe(
-            &mut dedupe,
-            (
-                params.authority.to_owned(),
-                params.path_and_query.to_owned(),
-                params.status.to_owned(),
-            ),
-            seq,
-        )?;
-    }
-    Ok(dedupe)
+
+fn rebuild(directory: &Directory, name: &Path, _max_seq: u64) -> Result<Dedupe, LogError> {
+    let scan = verify_in_directory(directory, name, true, false, false)
+        .map_err(|e| LogError::ResumeVerification(e.to_string()))?;
+    Ok(scan.dedupe)
 }
 
 struct Scan {
     count: u64,
     hash: String,
     state: RunState,
+    dedupe: Dedupe,
 }
+
 fn bad(line: u64, reason: &str) -> VerifyError {
     VerifyError::BadLine {
         line: usize::try_from(line).unwrap_or(usize::MAX),
@@ -559,13 +589,16 @@ fn io_error(_: io::Error) -> VerifyError {
     }
 }
 
-fn verify_in_directory(
+fn verify_on_file(
     directory: &Directory,
     name: &Path,
+    file: &mut File,
     allow_unanchored: bool,
     recover: bool,
     mutate: bool,
+    expected_binding: Option<&str>,
 ) -> Result<Scan, VerifyError> {
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let head_name = head_path_for(name);
     let head = if entry_exists(directory, &head_name).map_err(io_error)? {
         let data = directory
@@ -580,10 +613,33 @@ fn verify_in_directory(
             return Err(bad(0, "invalid checkpoint"));
         }
         Some(head)
+    } else if name != Path::new("requests.log")
+        && name
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("requests.log"))
+        && entry_exists(directory, Path::new("requests.log.head")).map_err(io_error)?
+    {
+        let data = directory
+            .read(Path::new("requests.log.head"), MAX_CHECKPOINT_BYTES)
+            .map_err(io_error)?;
+        let head: LogHead =
+            serde_json::from_slice(&data).map_err(|_| bad(0, "invalid checkpoint"))?;
+        if head.seq > MAX_LOG_RECORDS
+            || head.hash.len() != 64
+            || !head.hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(bad(0, "invalid checkpoint"));
+        }
+        Some(head)
     } else {
         None
     };
-    let mut reader = bounded_reader(directory, name, recover && mutate).map_err(io_error)?;
+
+    if file.metadata().map_err(io_error)?.len() > MAX_LOG_BYTES {
+        return Err(bad(0, "log size limit"));
+    }
+
     let mut count = 0u64;
     let mut length = 0u64;
     let mut partial = false;
@@ -595,6 +651,7 @@ fn verify_in_directory(
     };
     let mut state = RunState::default();
     let mut dedupe = BTreeMap::new();
+    let mut reader = BufReader::new(std::io::Read::by_ref(file));
     loop {
         let line = next_line(&mut reader)
             .map_err(|_| bad(count.saturating_add(1), "record size or I/O limit"))?;
@@ -640,6 +697,13 @@ fn verify_in_directory(
         let params = params_from_value(&value).map_err(|_| bad(seq, "invalid record"))?;
         validate_params(&params).map_err(|_| bad(seq, "record field limit"))?;
         update_state(&mut state, &params).map_err(|_| bad(seq, "invalid run state"))?;
+        if seq == 1 {
+            if let Some(expected) = expected_binding {
+                if state.binding.as_deref() != Some(expected) {
+                    return Err(bad(seq, "binding mismatch"));
+                }
+            }
+        }
         update_dedupe(
             &mut dedupe,
             (
@@ -660,6 +724,8 @@ fn verify_in_directory(
             hash_at_checkpoint = Some(hash.clone());
         }
     }
+    drop(reader);
+
     if let Some(checkpoint) = &head {
         let actual = hash_at_checkpoint.as_deref().unwrap_or(&hash);
         if checkpoint.seq > count
@@ -676,12 +742,13 @@ fn verify_in_directory(
     } else if !recover && !allow_unanchored {
         return Err(VerifyError::Unanchored);
     }
+
     // No input changes occur until every complete record and the checkpoint verify.
     if recover && mutate && (partial || head.as_ref().is_none_or(|h| h.seq != count)) {
         if partial {
-            reader.get_mut().set_len(length).map_err(io_error)?;
+            file.set_len(length).map_err(io_error)?;
         }
-        reader.get_ref().sync_all().map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
         publish_head(
             directory,
             &head_name,
@@ -695,7 +762,34 @@ fn verify_in_directory(
     if recover && mutate {
         directory.sync().map_err(io_error)?;
     }
-    Ok(Scan { count, hash, state })
+    file.seek(SeekFrom::End(0)).map_err(io_error)?;
+    Ok(Scan {
+        count,
+        hash,
+        state,
+        dedupe,
+    })
+}
+
+fn verify_in_directory(
+    directory: &Directory,
+    name: &Path,
+    allow_unanchored: bool,
+    recover: bool,
+    mutate: bool,
+) -> Result<Scan, VerifyError> {
+    let mut file = directory
+        .open_file(name, recover && mutate, false)
+        .map_err(io_error)?;
+    verify_on_file(
+        directory,
+        name,
+        &mut file,
+        allow_unanchored,
+        recover,
+        mutate,
+        None,
+    )
 }
 
 /// Only truncate a suffix after validating the checkpoint and complete chain.

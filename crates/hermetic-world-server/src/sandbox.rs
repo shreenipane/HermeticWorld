@@ -31,6 +31,13 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
 }
 
+static INJECT_LANDLOCK_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_inject_landlock_unavailable(val: bool) {
+    INJECT_LANDLOCK_UNAVAILABLE.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Apply Landlock filesystem restrictions.
 ///
 /// Grants read-only access to `store_dir`, and read-write access to `log_dir`.
@@ -40,6 +47,22 @@ pub fn apply_landlock(
     log_dir: &Path,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
+    if INJECT_LANDLOCK_UNAVAILABLE.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var_os("HERMETIC_TEST_INJECT_LANDLOCK_UNAVAILABLE").is_some()
+    {
+        if allow_no_landlock {
+            return Ok(SandboxLandlockStatus::NotEnforced);
+        } else {
+            return Err(SandboxError::LandlockUnavailable);
+        }
+    }
+    if std::env::var_os("HERMETIC_TEST_INJECT_LANDLOCK_UNAVAILABLE").is_some() {
+        if allow_no_landlock {
+            return Ok(SandboxLandlockStatus::NotEnforced);
+        } else {
+            return Err(SandboxError::LandlockUnavailable);
+        }
+    }
     let abi = ABI::V3;
     let ruleset_res = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))

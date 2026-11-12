@@ -31,7 +31,7 @@
 //! | headers          | ...    | each: name_len u16, name, value_len u16, value|
 //! | body             | bytes  | `body_len` bytes                              |
 
-pub const MAX_RESPONSE_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024 * 1024;
 
 use std::io::{self, Read, Write};
 
@@ -808,6 +808,68 @@ impl ResponseFrame {
             headers,
             body,
         })
+    }
+
+    /// Write fixed response header and encoded response headers to a writer without buffering the body.
+    pub fn write_header_and_headers<W: Write>(
+        request_id: u64,
+        status: u16,
+        headers: &[ResponseHeader],
+        body_len: u64,
+        max_body_len: u64,
+        writer: &mut W,
+    ) -> Result<usize, WireError> {
+        if headers.len() > MAX_RESPONSE_HEADERS {
+            return Err(WireError::Malformed(format!(
+                "too many headers: {} > {}",
+                headers.len(),
+                MAX_RESPONSE_HEADERS
+            )));
+        }
+
+        let mut headers_bytes: usize = 0;
+        for h in headers {
+            validate_header_name(h.name.as_bytes())?;
+            validate_header_value(h.value.as_bytes())?;
+            headers_bytes += h.name.len() + h.value.len();
+        }
+        if headers_bytes > MAX_RESPONSE_HEADERS_BYTES {
+            return Err(WireError::Malformed(format!(
+                "headers too large: {headers_bytes} > {MAX_RESPONSE_HEADERS_BYTES}"
+            )));
+        }
+
+        if body_len > max_body_len || body_len > MAX_RESPONSE_BODY_BYTES {
+            return Err(WireError::Malformed(format!(
+                "body too large: {body_len} > {max_body_len}"
+            )));
+        }
+
+        let header_data_len: usize = headers
+            .iter()
+            .map(|h| 2 + h.name.len() + 2 + h.value.len())
+            .sum();
+
+        let total = RESPONSE_HEADER_SIZE + header_data_len;
+        let mut buf = Vec::with_capacity(total);
+
+        buf.write_all(RESPONSE_MAGIC)?;
+        buf.push(WIRE_VERSION);
+        buf.write_all(&[0u8; 3])?; // reserved
+        buf.write_all(&request_id.to_le_bytes())?;
+        buf.write_all(&status.to_le_bytes())?;
+        buf.write_all(&(headers.len() as u16).to_le_bytes())?;
+        buf.write_all(&body_len.to_le_bytes())?;
+
+        for h in headers {
+            buf.write_all(&(h.name.len() as u16).to_le_bytes())?;
+            buf.write_all(h.name.as_bytes())?;
+            buf.write_all(&(h.value.len() as u16).to_le_bytes())?;
+            buf.write_all(h.value.as_bytes())?;
+        }
+
+        writer.write_all(&buf)?;
+        Ok(buf.len())
     }
 
     /// Write this response frame to a `Write` sink.

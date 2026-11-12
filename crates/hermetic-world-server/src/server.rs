@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
-use hermetic_common::{Method, RequestFrame, ResponseFrame, ResponseHeader, WireError};
-use std::io::ErrorKind;
+use hermetic_common::{Method, RequestFrame, ResponseFrame, ResponseHeader};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use crate::limits::{validate_rate, Limits};
 use crate::log::{LogEventParams, LogManager};
 use crate::safe_fs::Directory;
 use crate::sandbox::{apply_sandbox, SandboxLandlockStatus};
-use crate::store::{DirStore, MAX_BODY_BYTES};
+use crate::store::DirStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerExit {
@@ -49,11 +49,21 @@ pub struct ServerConfig {
     pub no_sandbox: bool, // For in-process unit testing without restricting cargo test runner
     pub resume_log: bool,
     pub recover: bool,
+    pub frame_deadline: Option<std::time::Duration>,
+    pub transmission_deadline: Option<std::time::Duration>,
 }
 
+pub const DEFAULT_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+pub const DEFAULT_TRANSMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Format an OffsetDateTime in IMF-fixdate format (RFC 7231 / RFC 9110), e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
-pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
-    let utc = dt.to_offset(time::UtcOffset::UTC);
+pub fn format_imf_fixdate(dt: OffsetDateTime) -> Result<String, ServerExit> {
+    let utc = dt
+        .checked_to_offset(time::UtcOffset::UTC)
+        .ok_or(ServerExit::LimitExceeded)?;
+    if utc.year() < 0 || utc.year() > 9999 {
+        return Err(ServerExit::LimitExceeded);
+    }
     let weekday = match utc.weekday() {
         time::Weekday::Monday => "Mon",
         time::Weekday::Tuesday => "Tue",
@@ -77,7 +87,7 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
         time::Month::November => "Nov",
         time::Month::December => "Dec",
     };
-    format!(
+    Ok(format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         weekday,
         utc.day(),
@@ -86,7 +96,7 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> String {
         utc.hour(),
         utc.minute(),
         utc.second()
-    )
+    ))
 }
 
 pub const MAX_SOCKET_NAME_BYTES: usize = 80;
@@ -96,10 +106,32 @@ pub fn guest_clock(base: OffsetDateTime, elapsed_ms: u64) -> Result<OffsetDateTi
     if elapsed_ms > MAX_RUN_ELAPSED_MS {
         return Err(ServerExit::LimitExceeded);
     }
-    base.checked_add(time::Duration::milliseconds(
-        i64::try_from(elapsed_ms).map_err(|_| ServerExit::LimitExceeded)?,
-    ))
-    .ok_or(ServerExit::LimitExceeded)
+    let utc_base = base
+        .checked_to_offset(time::UtcOffset::UTC)
+        .ok_or(ServerExit::LimitExceeded)?;
+    let dt = utc_base
+        .checked_add(time::Duration::milliseconds(
+            i64::try_from(elapsed_ms).map_err(|_| ServerExit::LimitExceeded)?,
+        ))
+        .ok_or(ServerExit::LimitExceeded)?;
+    if dt.year() < 1601 || dt.year() > 9999 {
+        return Err(ServerExit::LimitExceeded);
+    }
+    Ok(dt)
+}
+
+/// Server-owned headers whose generated values are authoritative.
+/// Conflicting sidecar copies (including case variants) are strictly excluded.
+pub const SERVER_OWNED_HEADERS: &[&str] = &[
+    "date",
+    "content-length",
+    "accept-ranges",
+    "content-type",
+    "content-range",
+];
+
+pub fn is_server_owned_header(name: &str) -> bool {
+    SERVER_OWNED_HEADERS.contains(&name)
 }
 
 /// Allowed metadata headers for sidecars.
@@ -110,7 +142,6 @@ pub const ALLOWED_SIDECAR_HEADERS: &[&str] = &[
     "accept-charset",
     "accept-encoding",
     "accept-language",
-    "accept-ranges",
     "access-control-allow-credentials",
     "access-control-allow-headers",
     "access-control-allow-methods",
@@ -127,7 +158,6 @@ pub const ALLOWED_SIDECAR_HEADERS: &[&str] = &[
     "content-language",
     "content-location",
     "content-md5",
-    "content-range",
     "content-security-policy",
     "content-security-policy-report-only",
     "cross-origin-embedder-policy",
@@ -258,16 +288,84 @@ pub fn filter_headers(
         );
     }
 
-    // Extra headers with security stripping & validation
+    // Extra headers with security stripping & validation, sorted alphabetically for determinism
+    let mut valid_extras: Vec<(String, String)> = Vec::new();
     for (name, val) in extra_headers {
         let lower = name.to_ascii_lowercase();
-        if !is_allowed_sidecar_header(&lower) {
+        if is_server_owned_header(&lower) || !is_allowed_sidecar_header(&lower) {
             continue;
         }
+        if hermetic_common::validate_header_name(lower.as_bytes()).is_err() {
+            continue;
+        }
+        if hermetic_common::validate_header_value(val.as_bytes()).is_err() {
+            continue;
+        }
+        valid_extras.push((lower, val));
+    }
+
+    valid_extras.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    for (lower, val) in valid_extras {
         try_push(lower, val, &mut out, &mut total_bytes);
     }
 
     out
+}
+
+fn path_is_ancestor_or_equal(ancestor: &Path, path: &Path) -> bool {
+    let mut a_comps = ancestor.components();
+    let mut p_comps = path.components();
+    for a in &mut a_comps {
+        match p_comps.next() {
+            Some(p) if p == a => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn validate_root_separation(store_dir: &Directory, log_path: &Path) -> Result<(), ServerExit> {
+    use std::os::unix::fs::MetadataExt;
+
+    let store_fd_path = store_dir.descriptor_path();
+    let store_canon = std::fs::read_link(&store_fd_path).map_err(|_| ServerExit::StartupFailed)?;
+    let store_meta = std::fs::metadata(&store_canon).map_err(|_| ServerExit::StartupFailed)?;
+
+    let norm_log = crate::safe_fs::normalize_path(log_path);
+    let mut cur = norm_log.as_path();
+    let mut log_dir_desc = None;
+    while !cur.as_os_str().is_empty() {
+        if let Ok(d) = Directory::open(cur) {
+            log_dir_desc = Some((d, cur.to_path_buf()));
+            break;
+        }
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => break,
+        }
+    }
+    let (log_d, existing_log_ancestor) = log_dir_desc.ok_or(ServerExit::StartupFailed)?;
+    let log_fd_path = log_d.descriptor_path();
+    let log_canon = std::fs::read_link(&log_fd_path).map_err(|_| ServerExit::StartupFailed)?;
+    let log_meta = std::fs::metadata(&log_canon).map_err(|_| ServerExit::StartupFailed)?;
+
+    let rel_suffix = norm_log
+        .strip_prefix(&existing_log_ancestor)
+        .unwrap_or(Path::new(""));
+    let full_log_canon = log_canon.join(rel_suffix);
+
+    if (norm_log == existing_log_ancestor
+        && store_meta.dev() == log_meta.dev()
+        && store_meta.ino() == log_meta.ino())
+        || store_canon == full_log_canon
+        || path_is_ancestor_or_equal(&store_canon, &full_log_canon)
+        || path_is_ancestor_or_equal(&full_log_canon, &store_canon)
+    {
+        return Err(ServerExit::StartupFailed);
+    }
+
+    Ok(())
 }
 
 pub struct WorldServer {
@@ -281,8 +379,167 @@ pub struct WorldServer {
     socket_name: PathBuf,
 }
 
+enum ReadFrameResult {
+    Ok(RequestFrame),
+    CleanEof,
+    Malformed(String),
+    FrameTimeout,
+    RunTimeout,
+    Io(std::io::Error),
+}
+
+fn read_request_frame_deadline(
+    stream: &mut UnixStream,
+    frame_deadline: Instant,
+    run_deadline: Instant,
+) -> ReadFrameResult {
+    let mut header = [0u8; hermetic_common::REQUEST_HEADER_SIZE];
+    let mut n = 0;
+    while n < hermetic_common::REQUEST_HEADER_SIZE {
+        let now = Instant::now();
+        if now >= run_deadline {
+            return ReadFrameResult::RunTimeout;
+        }
+        if now >= frame_deadline {
+            return ReadFrameResult::FrameTimeout;
+        }
+        let rem = run_deadline
+            .saturating_duration_since(now)
+            .min(frame_deadline.saturating_duration_since(now))
+            .max(Duration::from_millis(1));
+        if let Err(e) = stream.set_read_timeout(Some(rem)) {
+            return ReadFrameResult::Io(e);
+        }
+        match stream.read(&mut header[n..]) {
+            Ok(0) => {
+                if n == 0 {
+                    return ReadFrameResult::CleanEof;
+                } else {
+                    return ReadFrameResult::Malformed("truncated header".into());
+                }
+            }
+            Ok(bytes) => n += bytes,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                let now = Instant::now();
+                if now >= run_deadline {
+                    return ReadFrameResult::RunTimeout;
+                } else {
+                    return ReadFrameResult::FrameTimeout;
+                }
+            }
+            Err(e) => return ReadFrameResult::Io(e),
+        }
+    }
+
+    if &header[0..4] != hermetic_common::REQUEST_MAGIC.as_slice() {
+        return ReadFrameResult::Malformed("bad request magic".into());
+    }
+    let authority_len = u16::from_le_bytes([header[16], header[17]]) as usize;
+    let path_len = u16::from_le_bytes([header[18], header[19]]) as usize;
+    if authority_len > hermetic_common::MAX_AUTHORITY_LEN {
+        return ReadFrameResult::Malformed(format!(
+            "authority too long: {authority_len} > {}",
+            hermetic_common::MAX_AUTHORITY_LEN
+        ));
+    }
+    if path_len > hermetic_common::MAX_PATH_LEN {
+        return ReadFrameResult::Malformed(format!(
+            "path too long: {path_len} > {}",
+            hermetic_common::MAX_PATH_LEN
+        ));
+    }
+    let payload_len = authority_len + path_len;
+    let total_len = hermetic_common::REQUEST_HEADER_SIZE + payload_len;
+    if total_len > hermetic_common::MAX_REQUEST_FRAME_SIZE {
+        return ReadFrameResult::Malformed("request frame too large".into());
+    }
+
+    let mut frame_buf = Vec::with_capacity(total_len);
+    frame_buf.extend_from_slice(&header);
+    frame_buf.resize(total_len, 0);
+
+    let mut m = hermetic_common::REQUEST_HEADER_SIZE;
+    while m < total_len {
+        let now = Instant::now();
+        if now >= run_deadline {
+            return ReadFrameResult::RunTimeout;
+        }
+        if now >= frame_deadline {
+            return ReadFrameResult::FrameTimeout;
+        }
+        let rem = run_deadline
+            .saturating_duration_since(now)
+            .min(frame_deadline.saturating_duration_since(now))
+            .max(Duration::from_millis(1));
+        if let Err(e) = stream.set_read_timeout(Some(rem)) {
+            return ReadFrameResult::Io(e);
+        }
+        match stream.read(&mut frame_buf[m..]) {
+            Ok(0) => {
+                return ReadFrameResult::Malformed("truncated payload".into());
+            }
+            Ok(bytes) => m += bytes,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                let now = Instant::now();
+                if now >= run_deadline {
+                    return ReadFrameResult::RunTimeout;
+                } else {
+                    return ReadFrameResult::FrameTimeout;
+                }
+            }
+            Err(e) => return ReadFrameResult::Io(e),
+        }
+    }
+
+    match RequestFrame::decode(&frame_buf) {
+        Ok(req) => ReadFrameResult::Ok(req),
+        Err(e) => ReadFrameResult::Malformed(e.to_string()),
+    }
+}
+
+struct DeadlineWriter<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> Write for DeadlineWriter<'a> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let now = Instant::now();
+        if now >= self.deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "transmission deadline exceeded",
+            ));
+        }
+        let rem = self
+            .deadline
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1));
+        self.stream.set_write_timeout(Some(rem))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl Drop for WorldServer {
+    fn drop(&mut self) {
+        if let Ok(entry) = self.socket_directory.path(&self.socket_name) {
+            let _ = std::fs::remove_file(entry);
+        }
+    }
+}
+
 impl WorldServer {
     pub fn new(mut config: ServerConfig) -> Result<Self, ServerExit> {
+        config.t_clock = config
+            .t_clock
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or(ServerExit::StartupFailed)?;
         if !validate_rate(config.rate_rps, config.burst)
             || config.t_clock.year() < 1601
             || guest_clock(config.t_clock, MAX_RUN_ELAPSED_MS).is_err()
@@ -291,6 +548,10 @@ impl WorldServer {
             return Err(ServerExit::StartupFailed);
         }
         // Validate all configured roots and the endpoint before creating artifacts.
+        let store_directory =
+            Directory::open(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
+        validate_root_separation(&store_directory, &config.log_dir)?;
+
         let store = DirStore::try_new(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
         config.store_dir =
             std::path::absolute(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
@@ -316,6 +577,33 @@ impl WorldServer {
             .map_err(|_| ServerExit::StartupFailed)?;
         match std::fs::symlink_metadata(&socket_entry) {
             Err(e) if e.kind() == ErrorKind::NotFound => (),
+            Ok(meta) => {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+                    return Err(ServerExit::StartupFailed);
+                }
+                if !config.recover {
+                    return Err(ServerExit::StartupFailed);
+                }
+                let parent_fd_path = socket_directory.descriptor_path();
+                let parent_canon =
+                    std::fs::read_link(&parent_fd_path).map_err(|_| ServerExit::StartupFailed)?;
+                let parent_meta =
+                    std::fs::metadata(&parent_canon).map_err(|_| ServerExit::StartupFailed)?;
+                if meta.uid() != parent_meta.uid() {
+                    return Err(ServerExit::StartupFailed);
+                }
+                match UnixStream::connect(&socket_entry) {
+                    Ok(_) => {
+                        return Err(ServerExit::StartupFailed);
+                    }
+                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(&socket_entry)
+                            .map_err(|_| ServerExit::StartupFailed)?;
+                    }
+                    Err(_) => return Err(ServerExit::StartupFailed),
+                }
+            }
             _ => return Err(ServerExit::StartupFailed),
         }
         // Bind the run to its supplied clock, resource policy, store and sandbox policy.
@@ -331,13 +619,17 @@ impl WorldServer {
         ))
         .map_err(|_| ServerExit::StartupFailed)?;
         let binding = blake3::hash(&binding_data).to_hex().to_string();
-        if config.resume_log {
-            LogManager::validate_binding(&config.log_dir, &binding)
-                .map_err(|_| ServerExit::StartupFailed)?;
-        }
-        let mut log =
-            LogManager::new_opts_recover(&config.log_dir, config.resume_log, config.recover)
-                .map_err(|_| ServerExit::StartupFailed)?;
+        let mut log = LogManager::new_opts_recover_binding(
+            &config.log_dir,
+            config.resume_log,
+            config.recover,
+            if config.resume_log {
+                Some(&binding)
+            } else {
+                None
+            },
+        )
+        .map_err(|_| ServerExit::StartupFailed)?;
         let mut limits = Limits::new(
             config.rate_rps,
             config.burst,
@@ -442,6 +734,13 @@ impl WorldServer {
                 }
                 return Err(exit);
             }
+            if !self.config.no_sandbox {
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return Err(ServerExit::LogFailed);
+                }
+                return Ok(());
+            }
         }
 
         if let Err(e) = self.log.finish() {
@@ -453,19 +752,58 @@ impl WorldServer {
 
     /// Handle requests on a single connection sequentially until EOF or fatal error.
     fn handle_connection(&mut self, stream: &mut UnixStream) -> ServerExit {
+        let frame_timeout = self.config.frame_deadline.unwrap_or(DEFAULT_FRAME_DEADLINE);
+        let trans_timeout = self
+            .config
+            .transmission_deadline
+            .unwrap_or(DEFAULT_TRANSMISSION_DEADLINE);
+
         loop {
-            let frame = match RequestFrame::read_from(stream) {
-                Ok(f) => f,
-                Err(WireError::Io(e))
-                    if e.kind() == ErrorKind::UnexpectedEof
-                        || e.kind() == ErrorKind::ConnectionReset
-                        || e.kind() == ErrorKind::BrokenPipe =>
-                {
-                    // Clean EOF from client
+            let remaining_run_ms = MAX_RUN_ELAPSED_MS.saturating_sub(self.elapsed_ms());
+            let run_deadline = Instant::now() + Duration::from_millis(remaining_run_ms);
+            let frame_deadline = Instant::now() + frame_timeout;
+
+            let frame = match read_request_frame_deadline(stream, frame_deadline, run_deadline) {
+                ReadFrameResult::Ok(f) => f,
+                ReadFrameResult::CleanEof => return ServerExit::Normal,
+                ReadFrameResult::FrameTimeout => {
+                    let elapsed_ms = self.elapsed_ms();
+                    if let Err(e) = self.log.log_event(&LogEventParams {
+                        elapsed_ms,
+                        request_id: 0,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "frame_timeout",
+                        bytes: 0,
+                    }) {
+                        eprintln!("log_failed: {e}");
+                        let _ = self.log.finish();
+                        return ServerExit::LogFailed;
+                    }
+                    if let Err(e) = self.log.finish() {
+                        eprintln!("log_failed: {e}");
+                        return ServerExit::LogFailed;
+                    }
                     return ServerExit::Normal;
                 }
-                Err(WireError::Malformed(reason)) => {
-                    // Malformed frame: log tampered, exit code 3
+                ReadFrameResult::RunTimeout => {
+                    let elapsed_ms = self.elapsed_ms();
+                    let _ = self.log.log_event(&LogEventParams {
+                        elapsed_ms,
+                        request_id: 0,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    });
+                    let _ = self.log.finish();
+                    return ServerExit::LimitExceeded;
+                }
+                ReadFrameResult::Malformed(reason) => {
                     let elapsed_ms = self.elapsed_ms();
                     eprintln!("Malformed frame received: {reason}");
                     if let Err(e) = self.log.log_event(&LogEventParams {
@@ -488,7 +826,13 @@ impl WorldServer {
                     }
                     return ServerExit::Tampered;
                 }
-                Err(e) => {
+                ReadFrameResult::Io(e) => {
+                    if e.kind() == ErrorKind::UnexpectedEof
+                        || e.kind() == ErrorKind::ConnectionReset
+                        || e.kind() == ErrorKind::BrokenPipe
+                    {
+                        return ServerExit::Normal;
+                    }
                     eprintln!("I/O error reading frame: {e}");
                     return ServerExit::Normal;
                 }
@@ -531,26 +875,37 @@ impl WorldServer {
             let current_clock = match guest_clock(self.config.t_clock, elapsed_ms) {
                 Ok(clock) => clock,
                 Err(exit) => {
-                    if self
-                        .log
-                        .log_event(&LogEventParams {
-                            elapsed_ms,
-                            request_id: frame.request_id,
-                            method: "",
-                            authority: "",
-                            path_and_query: "",
-                            range: None,
-                            status: "clock_exhausted",
-                            bytes: 0,
-                        })
-                        .is_err()
-                    {
-                        return ServerExit::LogFailed;
-                    }
+                    let _ = self.log.log_event(&LogEventParams {
+                        elapsed_ms,
+                        request_id: frame.request_id,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    });
+                    let _ = self.log.finish();
                     return exit;
                 }
             };
-            let date_str = format_imf_fixdate(current_clock);
+            let date_str = match format_imf_fixdate(current_clock) {
+                Ok(s) => s,
+                Err(exit) => {
+                    let _ = self.log.log_event(&LogEventParams {
+                        elapsed_ms,
+                        request_id: frame.request_id,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    });
+                    let _ = self.log.finish();
+                    return exit;
+                }
+            };
 
             let method_str = match frame.method {
                 Method::Get => "GET",
@@ -559,14 +914,14 @@ impl WorldServer {
 
             let stored = self.store.open(&frame.authority, &frame.path_and_query);
 
-            let (status, headers, body) = match stored {
-                Some(mut obj) => {
+            let (status, headers, response_bytes, body_file_info, body_mem) = match stored {
+                Some(obj) => {
                     let total_len = obj.len;
                     let (status, start, length, cr) = match frame.range {
                         Some((start, end))
                             if total_len == 0 || start >= total_len || start > end =>
                         {
-                            (416u16, 0, 0, Some(format!("bytes */{total_len}")))
+                            (416u16, 0u64, 0u64, Some(format!("bytes */{total_len}")))
                         }
                         Some((start, end)) => {
                             let end = end.min(total_len.saturating_sub(1));
@@ -578,62 +933,59 @@ impl WorldServer {
                                 Some(format!("bytes {start}-{end}/{total_len}")),
                             )
                         }
-                        None => (200u16, 0, total_len, None),
+                        None => (200u16, 0u64, total_len, None),
                     };
-                    let body = if frame.method == Method::Head {
-                        Vec::new()
-                    } else {
-                        if self.limits.check_bytes_cap(length).is_err() || length > MAX_BODY_BYTES {
-                            if self
-                                .log
-                                .log_event(&LogEventParams {
-                                    elapsed_ms,
-                                    request_id: frame.request_id,
-                                    method: method_str,
-                                    authority: &frame.authority,
-                                    path_and_query: &frame.path_and_query,
-                                    range: frame.range,
-                                    status: "limit_exceeded",
-                                    bytes: 0,
-                                })
-                                .is_err()
-                            {
-                                return ServerExit::LogFailed;
-                            }
-                            return ServerExit::LimitExceeded;
-                        }
-                        match obj.read_range(start, length, MAX_BODY_BYTES) {
-                            Ok(body) => body,
-                            Err(_) => return ServerExit::StartupFailed,
-                        }
-                    };
-                    let Ok(length) = usize::try_from(length) else {
+                    let Ok(header_content_len) = usize::try_from(length) else {
                         return ServerExit::LimitExceeded;
                     };
                     let headers = filter_headers(
                         obj.extra_headers,
                         obj.content_type.as_deref(),
-                        length,
+                        header_content_len,
                         &date_str,
                         cr.as_deref(),
                     );
-                    (status, headers, body)
+                    let resp_bytes = if frame.method == Method::Head {
+                        0u64
+                    } else {
+                        length
+                    };
+                    (
+                        status,
+                        headers,
+                        resp_bytes,
+                        Some((obj.file, start, length)),
+                        None,
+                    )
                 }
                 None => {
                     // Miss -> 404
-                    let (st, ct, b) = self.store.get_404(&frame.authority);
-                    let length = b.len();
-                    let hdrs = filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
-                    let resp_body = if frame.method == Method::Head {
-                        Vec::new()
+                    let (st, ct, b) = if DirStore::is_internal_metadata_path(&frame.path_and_query)
+                    {
+                        (
+                            404,
+                            Some("text/html".to_string()),
+                            b"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>".to_vec(),
+                        )
                     } else {
-                        b
+                        self.store.get_404(&frame.authority)
                     };
-                    (st, hdrs, resp_body)
+                    let length = b.len();
+                    let headers =
+                        filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
+                    let resp_bytes = if frame.method == Method::Head {
+                        0u64
+                    } else {
+                        length as u64
+                    };
+                    let mem_body = if frame.method == Method::Head {
+                        None
+                    } else {
+                        Some(b)
+                    };
+                    (st, headers, resp_bytes, None, mem_body)
                 }
             };
-
-            let response_bytes = body.len() as u64;
 
             // 4. Check byte cap
             if self.limits.check_bytes_cap(response_bytes).is_err() {
@@ -682,17 +1034,63 @@ impl WorldServer {
 
             #[cfg(test)]
             review_tests::crash_at("after_intent");
-            // 5. Send response frame
-            let response = ResponseFrame {
-                request_id: frame.request_id,
-                status,
-                headers,
-                body,
+
+            // 5. Send response frame with transmission deadline and bounded streaming
+            let trans_deadline = Instant::now() + trans_timeout;
+            let effective_trans_deadline = trans_deadline.min(run_deadline);
+            let max_body = self.config.max_bytes.unwrap_or(u64::MAX);
+
+            let mut writer = DeadlineWriter {
+                stream,
+                deadline: effective_trans_deadline,
             };
 
-            let max_body = self.config.max_bytes.unwrap_or(u64::MAX);
-            if let Err(e) = response.write_to(stream, max_body) {
+            let send_result = (|| -> std::io::Result<()> {
+                ResponseFrame::write_header_and_headers(
+                    frame.request_id,
+                    status,
+                    &headers,
+                    response_bytes,
+                    max_body,
+                    &mut writer,
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                if frame.method == Method::Get && response_bytes > 0 {
+                    if let Some((mut file, start, length)) = body_file_info {
+                        file.seek(SeekFrom::Start(start))?;
+                        let mut chunk_buf = [0u8; 64 * 1024];
+                        let mut remaining = length;
+                        while remaining > 0 {
+                            let to_read = (remaining as usize).min(chunk_buf.len());
+                            file.read_exact(&mut chunk_buf[..to_read])?;
+                            writer.write_all(&chunk_buf[..to_read])?;
+                            remaining -= to_read as u64;
+                        }
+                    } else if let Some(mem_body) = body_mem {
+                        writer.write_all(&mem_body)?;
+                    }
+                }
+                writer.flush()?;
+                Ok(())
+            })();
+
+            if let Err(e) = send_result {
                 eprintln!("Error writing response frame: {e}");
+                if Instant::now() >= run_deadline {
+                    let _ = self.log.log_event(&LogEventParams {
+                        elapsed_ms: self.elapsed_ms(),
+                        request_id: frame.request_id,
+                        method: "",
+                        authority: "",
+                        path_and_query: "",
+                        range: None,
+                        status: "clock_exhausted",
+                        bytes: 0,
+                    });
+                    let _ = self.log.finish();
+                    return ServerExit::LimitExceeded;
+                }
                 if let Err(log_err) = self.log.log_event(&LogEventParams {
                     elapsed_ms,
                     request_id: frame.request_id,
@@ -716,6 +1114,7 @@ impl WorldServer {
 
             #[cfg(test)]
             review_tests::crash_at("after_send");
+
             // 6. Record usage and log event
             let status_str = status.to_string();
             if let Err(e) = self.log.log_event(&LogEventParams {
@@ -742,6 +1141,8 @@ impl WorldServer {
 mod review_tests {
     use super::*;
     use crate::log::LogWriter;
+    use crate::store::MAX_BODY_BYTES;
+    use hermetic_common::WireError;
     use std::fs::{self, File};
     use std::io::{Read, Write};
     use std::net::Shutdown;
@@ -779,6 +1180,8 @@ mod review_tests {
             no_sandbox: true,
             resume_log: false,
             recover: false,
+            frame_deadline: None,
+            transmission_deadline: None,
         }
     }
     fn request() -> RequestFrame {

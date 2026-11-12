@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
-pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_BODY_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_STORE_PATH_BYTES: usize = 8192;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -165,6 +165,29 @@ impl DirStore {
         )
     }
 
+    /// Check if a request path targets internal metadata files (.404.json or *.headers.json)
+    pub fn is_internal_metadata_path(path_and_query: &str) -> bool {
+        let (path_part, _) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path_and_query, None),
+        };
+        let raw_lower = path_part.to_ascii_lowercase();
+        for seg in raw_lower.split('/') {
+            if seg == ".404.json" || seg.ends_with(".headers.json") {
+                return true;
+            }
+        }
+        if let Some(decoded) = Self::percent_decode(path_part) {
+            let decoded_lower = decoded.to_ascii_lowercase();
+            for seg in decoded_lower.split('/') {
+                if seg == ".404.json" || seg.ends_with(".headers.json") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Percent-decode an ASCII path string, rejecting invalid escapes and NUL characters.
     fn percent_decode(input: &str) -> Option<String> {
         let mut bytes = input.as_bytes().iter();
@@ -214,9 +237,11 @@ impl DirStore {
             return None;
         }
 
-        // Reject .. and . traversal segments
+        // Reject .. and . traversal segments and internal metadata files
         for seg in decoded_path.split('/') {
-            if seg == ".." || seg == "." {
+            let lower = seg.to_ascii_lowercase();
+            if seg == ".." || seg == "." || lower == ".404.json" || lower.ends_with(".headers.json")
+            {
                 return None;
             }
         }
@@ -233,6 +258,18 @@ impl DirStore {
         // Normalize segments (strip leading/trailing empty segments)
         let raw_segs: Vec<&str> = decoded_path.split('/').filter(|s| !s.is_empty()).collect();
 
+        let is_forbidden = |p: &Path| -> bool {
+            for comp in p.components() {
+                if let std::path::Component::Normal(c) = comp {
+                    let s = c.to_string_lossy().to_ascii_lowercase();
+                    if s == ".404.json" || s.ends_with(".headers.json") {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
         // Construct file candidates
         // If there is a query string, the query selects `<path>?<query>` stored with `?` as `%3F`
         if let Some(q) = query_part {
@@ -240,13 +277,13 @@ impl DirStore {
             if raw_segs.is_empty() {
                 // Root with query: %3F<query>
                 candidate.push(format!("%3F{q}"));
-                if self.open_path(&candidate).is_some() {
+                if !is_forbidden(&candidate) && self.open_path(&candidate).is_some() {
                     return Some(candidate);
                 }
                 // Or index.html%3F<query>
                 let mut alt = auth_dir.clone();
                 alt.push(format!("index.html%3F{q}"));
-                if self.open_path(&alt).is_some() {
+                if !is_forbidden(&alt) && self.open_path(&alt).is_some() {
                     return Some(alt);
                 }
             } else {
@@ -256,33 +293,32 @@ impl DirStore {
                 }
                 let mut with_q = candidate.clone();
                 with_q.push(format!("{last}%3F{q}"));
-                if self.open_path(&with_q).is_some() {
+                if !is_forbidden(&with_q) && self.open_path(&with_q).is_some() {
                     return Some(with_q);
                 }
                 // If trailing slash was requested, might be `<last>/index.html%3F<q>`
                 let mut index_with_q = candidate.clone();
                 index_with_q.push(last);
                 index_with_q.push(format!("index.html%3F{q}"));
-                if self.open_path(&index_with_q).is_some() {
+                if !is_forbidden(&index_with_q) && self.open_path(&index_with_q).is_some() {
                     return Some(index_with_q);
                 }
             }
-            return None;
         }
 
-        // No query string
+        // No query string or query-specific file was not found
         let mut candidate = auth_dir.clone();
         for seg in &raw_segs {
             candidate.push(seg);
         }
 
-        if self.open_path(&candidate).is_some() {
+        if !is_forbidden(&candidate) && self.open_path(&candidate).is_some() {
             return Some(candidate);
         }
 
         // If directory or trailing slash, look for index.html
         let index_candidate = candidate.join("index.html");
-        if self.open_path(&index_candidate).is_some() {
+        if !is_forbidden(&index_candidate) && self.open_path(&index_candidate).is_some() {
             return Some(index_candidate);
         }
 
@@ -352,7 +388,7 @@ impl DirStore {
 }
 
 pub struct OpenedObject {
-    file: File,
+    pub file: File,
     pub len: u64,
     pub content_type: Option<String>,
     pub extra_headers: Vec<(String, String)>,
@@ -360,9 +396,7 @@ pub struct OpenedObject {
 
 impl OpenedObject {
     pub fn read_range(&mut self, start: u64, length: u64, cap: u64) -> std::io::Result<Vec<u8>> {
-        if length > cap.min(MAX_BODY_BYTES)
-            || start.checked_add(length).is_none_or(|end| end > self.len)
-        {
+        if length > cap || start.checked_add(length).is_none_or(|end| end > self.len) {
             return Err(crate::safe_fs::invalid());
         }
         self.file.seek(SeekFrom::Start(start))?;

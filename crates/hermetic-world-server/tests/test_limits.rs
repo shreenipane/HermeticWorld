@@ -43,6 +43,8 @@ fn test_token_bucket_delays_requests() {
         no_sandbox: true,
         resume_log: false,
         recover: false,
+        frame_deadline: None,
+        transmission_deadline: None,
     };
 
     let server = WorldServer::new(config).expect("create server");
