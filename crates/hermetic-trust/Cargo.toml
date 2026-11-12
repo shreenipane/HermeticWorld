@@ -1,0 +1,29 @@
+[package]
+name = "hermetic-trust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "hermetic_trust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermetic-trust"
+path = "src/main.rs"
+
+[dependencies]
+rsa = { version = "=0.9.10", features = ["sha2"] }
+rand_chacha = "=0.3.1"
+hkdf = "=0.12.4"
+blake3 = "=1.8.7"
+sha2 = { workspace = true }
+time = { workspace = true }
+pem = "=3.0.6"
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+sha1 = { workspace = true }
+tempfile = { workspace = true }
