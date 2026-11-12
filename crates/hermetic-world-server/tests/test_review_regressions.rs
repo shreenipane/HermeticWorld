@@ -2384,3 +2384,35 @@ fn review_startup_validates_endpoint_and_proposed_log_before_creating_artifacts(
         assert!(!root.join("nonexistent_log").exists());
     }
 }
+
+#[test]
+fn rereview_1_invalid_fixed_header_without_payload_is_tampering() {
+    // (header byte, value): version, method (two values), flags, reserved.
+    for (offset, value) in [(4usize, 2u8), (5, 0), (5, 3), (6, 0x02), (7, 1)] {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("store/example.org")).unwrap();
+        let mut child = AuditChild(
+            audit_command(temp.path(), "socket")
+                .args(["--frame-deadline-ms", "1000"])
+                .spawn()
+                .unwrap(),
+        );
+        let mut stream = audit_connect(temp.path(), &mut child);
+        let request = RequestFrame {
+            method: Method::Get,
+            request_id: 1,
+            authority: "example.org".into(),
+            path_and_query: "/item".into(),
+            range: None,
+        };
+        let mut header = request.encode().unwrap();
+        header.truncate(hermetic_common::REQUEST_HEADER_SIZE);
+        header[offset] = value;
+        // Send only the fixed header and keep the write half open: the
+        // declared payload is withheld, so only header validation can end it.
+        stream.write_all(&header).unwrap();
+        assert_eq!(child.wait_code(), 3, "header byte {offset} = {value}");
+        assert_audit_chain(temp.path(), "tampered", 0);
+        drop(stream);
+    }
+}

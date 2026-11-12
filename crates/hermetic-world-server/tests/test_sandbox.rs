@@ -2,24 +2,88 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{symlink, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
-fn bin_path() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current exe");
-    p.pop(); // deps
-    p.pop(); // debug
-    p.push("hermetic-world-server");
-    if p.exists() {
-        return p;
+const CHILD_STORE: &str = "HERMETIC_SANDBOX_CHILD_STORE";
+const CHILD_LOG: &str = "HERMETIC_SANDBOX_CHILD_LOG";
+const CHILD_OUTSIDE: &str = "HERMETIC_SANDBOX_CHILD_OUTSIDE";
+
+/// Create a fixture file exclusively: never through a planted entry.
+fn create_fixture(path: &Path, contents: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .expect("create fixture exclusively");
+    file.write_all(contents).expect("write fixture");
+}
+
+/// Sandbox checks, run in a child copy of this test binary. All fixtures are
+/// created by the parent test in its private temporary directory.
+#[test]
+fn sandbox_child() {
+    let Some(store_path) = std::env::var_os(CHILD_STORE).map(PathBuf::from) else {
+        return;
+    };
+    let log_path = PathBuf::from(std::env::var_os(CHILD_LOG).expect("child log"));
+    let outside = PathBuf::from(std::env::var_os(CHILD_OUTSIDE).expect("child outside"));
+
+    let status = match hermetic_world_server::apply_sandbox(&store_path, &log_path, true) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to apply sandbox: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if status == hermetic_world_server::SandboxLandlockStatus::NotEnforced {
+        println!("Note: Landlock not supported by running kernel, checking only seccomp");
+    } else {
+        // 1. Opening a file outside allowed paths fails with PermissionDenied
+        match fs::File::open(&outside) {
+            Ok(_) => {
+                eprintln!("Opening file outside allowed paths unexpectedly succeeded");
+                std::process::exit(10);
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::PermissionDenied {
+                    eprintln!("Expected PermissionDenied opening outside file, got: {e}");
+                    std::process::exit(10);
+                }
+            }
+        }
+
+        // 2. Writing into the store fails
+        if fs::write(store_path.join("probe.txt"), b"bad").is_ok() {
+            eprintln!("Writing into store unexpectedly succeeded");
+            std::process::exit(11);
+        }
     }
-    let target =
-        PathBuf::from("/home/flingboot/hermetic/cargo-target/t2.1/debug/hermetic-world-server");
-    if target.exists() {
-        return target;
+
+    // 3. Command::new("true").status() fails
+    if let Ok(s) = Command::new("true").status() {
+        if s.success() {
+            eprintln!("Command::new('true') unexpectedly succeeded");
+            std::process::exit(12);
+        }
     }
-    panic!("hermetic-world-server binary not found at {:?}", p);
+
+    // 4. Creating an AF_INET socket fails
+    println!("CHECKPOINT: BEFORE_AF_INET");
+    if std::net::TcpListener::bind("127.0.0.1:0").is_ok() {
+        eprintln!("Creating AF_INET socket unexpectedly succeeded");
+        std::process::exit(13);
+    }
+
+    println!("CHECKPOINT: ALL_PASSED");
+    std::process::exit(0);
 }
 
 #[test]
@@ -27,15 +91,18 @@ fn test_sandbox_child_process() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
-    std::fs::create_dir_all(&store_dir).expect("create store");
-    std::fs::create_dir_all(&log_dir).expect("create log");
+    fs::create_dir(&store_dir).expect("create store");
+    fs::create_dir(&log_dir).expect("create log");
+    create_fixture(&store_dir.join("test.txt"), b"read only content");
+    let outside = temp.path().join("outside.txt");
+    create_fixture(&outside, b"secret");
 
-    let bin = bin_path();
     let output = support::output_bounded(
-        Command::new(&bin)
-            .env("HERMETIC_CHILD_ROLE", "sandbox")
-            .env("HERMETIC_TEST_STORE", &store_dir)
-            .env("HERMETIC_TEST_LOG", &log_dir),
+        Command::new(std::env::current_exe().expect("current exe"))
+            .args(["--exact", "sandbox_child", "--nocapture"])
+            .env(CHILD_STORE, &store_dir)
+            .env(CHILD_LOG, &log_dir)
+            .env(CHILD_OUTSIDE, &outside),
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -80,42 +147,59 @@ fn test_sandbox_child_process() {
             stdout.contains("CHECKPOINT: ALL_PASSED"),
             "Child exited 0 but did not reach ALL_PASSED"
         );
-    } else {
-        // Killed by seccomp (SIGSYS or signal termination on AF_INET socket)
-        assert!(
-            output.status.code().is_none() || output.status.code() != Some(0),
-            "Child process failed as expected on AF_INET socket"
-        );
     }
+    assert_eq!(fs::read(&outside).expect("outside fixture"), b"secret");
+    assert!(!store_dir.join("probe.txt").exists());
 }
 
+/// The production binary must not create test fixtures: a symlink or a
+/// regular sentinel planted at the former fixed fixture location in its
+/// temporary directory is left untouched, whatever the environment says.
 #[test]
-fn test_fix7_sandbox_child_outside_fixture_failure() {
-    let temp = tempdir().expect("tempdir");
-    let store_dir = temp.path().join("store");
-    let log_dir = temp.path().join("log");
-    std::fs::create_dir_all(&store_dir).expect("create store");
-    std::fs::create_dir_all(&log_dir).expect("create log");
+fn rereview_4_binary_never_writes_fixture_through_planted_entries() {
+    for planted_symlink in [true, false] {
+        let temp = tempdir().expect("tempdir");
+        let tmpdir = temp.path().join("tmp");
+        fs::create_dir(&tmpdir).expect("create tmp");
+        let sentinel = temp.path().join("sentinel");
+        create_fixture(&sentinel, b"sentinel");
+        let old_fixture = tmpdir.join("hw_test_outside.txt");
+        if planted_symlink {
+            symlink(&sentinel, &old_fixture).expect("plant symlink");
+        } else {
+            create_fixture(&old_fixture, b"regular sentinel");
+        }
 
-    let bin = bin_path();
-    let invalid_outside = temp.path().join("nonexistent_dir").join("outside.txt");
+        let output = support::output_bounded(
+            Command::new(env!("CARGO_BIN_EXE_hermetic-world-server"))
+                .env("HERMETIC_CHILD_ROLE", "sandbox")
+                .env("TMPDIR", &tmpdir)
+                .env_remove("HERMETIC_TEST_STORE")
+                .env_remove("HERMETIC_TEST_LOG")
+                .env_remove("HERMETIC_TEST_OUTSIDE"),
+        );
+        assert!(
+            !output.status.success(),
+            "binary without server arguments must not succeed"
+        );
 
-    let output = support::output_bounded(
-        Command::new(&bin)
-            .env("HERMETIC_CHILD_ROLE", "sandbox")
-            .env("HERMETIC_TEST_STORE", &store_dir)
-            .env("HERMETIC_TEST_LOG", &log_dir)
-            .env("HERMETIC_TEST_OUTSIDE", &invalid_outside),
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "Child process must exit with non-zero code 2 on fixture write failure before sandbox"
-    );
-    assert!(
-        stderr.contains("Failed to create outside fixture file"),
-        "Child process must emit clear error message on fixture write failure: {stderr}"
-    );
+        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"sentinel");
+        let meta = fs::symlink_metadata(&old_fixture).expect("planted entry");
+        if planted_symlink {
+            assert!(meta.file_type().is_symlink());
+            assert_eq!(fs::read_link(&old_fixture).expect("link"), sentinel);
+        } else {
+            assert!(meta.file_type().is_file());
+            assert_eq!(
+                fs::read(&old_fixture).expect("regular sentinel"),
+                b"regular sentinel"
+            );
+        }
+        let mut names: Vec<_> = fs::read_dir(&tmpdir)
+            .expect("read tmp")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, [std::ffi::OsString::from("hw_test_outside.txt")]);
+    }
 }

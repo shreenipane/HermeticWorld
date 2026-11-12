@@ -251,22 +251,47 @@ impl Directory {
             Err(e) => return Err(e),
         }
         let mut file = self.open_file(temp, true, true)?;
+        let written = file.metadata()?;
+        let id = (written.dev(), written.ino());
         #[cfg(test)]
         publication_tests::at_boundary(temp, "created");
         let result = (|| {
+            self.check_publication_directory(written.uid())?;
             file.write_all(data)?;
             #[cfg(test)]
             publication_tests::at_boundary(temp, "written");
             file.sync_all()?;
             #[cfg(test)]
             publication_tests::at_boundary(temp, "synced");
+            // rename(2) works on names, so the temporary name is bound to the
+            // written descriptor immediately before and the destination
+            // immediately after: a replaced staging entry is never accepted.
+            if !entry_is(&temporary, id)? {
+                return Err(invalid());
+            }
             fs::rename(&temporary, &destination)?;
+            if !entry_is(&destination, id)? {
+                return Err(invalid());
+            }
             self.sync()
         })();
-        if result.is_err() {
+        if result.is_err() && entry_is(&temporary, id).unwrap_or(false) {
+            // Remove only the artifact this call created, never a replacement.
             let _ = fs::remove_file(temporary);
         }
         result
+    }
+
+    /// Publication renames by name, so the directory holding the names must
+    /// belong to the writer and must not be writable by other users.
+    fn check_publication_directory(&self, owner: u32) -> io::Result<()> {
+        let meta = self.metadata()?;
+        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o002 != 0 {
+            return Err(io::Error::other(
+                "publication directory is not exclusively owned",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_atomic_write(&self, name: &Path, temp: &Path) -> io::Result<()> {
@@ -284,6 +309,17 @@ impl Directory {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether `path` (never followed) is the single-link regular file `id`.
+fn entry_is(path: &Path, id: (u64, u64)) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            Ok(meta.file_type().is_file() && (meta.dev(), meta.ino()) == id && meta.nlink() == 1)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -382,9 +418,34 @@ mod publication_tests {
     const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
     thread_local! {
         static STOP_AT: std::cell::RefCell<Option<(String, String, PathBuf)>> = const { std::cell::RefCell::new(None) };
+        /// (temporary name, directory, outside target, replace with a symlink)
+        static REPLACE_AT: std::cell::RefCell<Option<(String, PathBuf, PathBuf, bool)>> = const { std::cell::RefCell::new(None) };
     }
 
     pub(super) fn at_boundary(temp: &Path, boundary: &str) {
+        if boundary == "synced" {
+            let selected = REPLACE_AT.with(|point| {
+                let mut point = point.borrow_mut();
+                if point
+                    .as_ref()
+                    .is_some_and(|(name, ..)| temp == Path::new(name))
+                {
+                    point.take()
+                } else {
+                    None
+                }
+            });
+            if let Some((name, dir, outside, use_symlink)) = selected {
+                // Atomically swap a forged entry in for the synced temporary.
+                let staged = dir.join("forged.staging");
+                if use_symlink {
+                    std::os::unix::fs::symlink(&outside, &staged).unwrap();
+                } else {
+                    fs::write(&staged, b"forged").unwrap();
+                }
+                fs::rename(&staged, dir.join(name)).unwrap();
+            }
+        }
         STOP_AT.with(|point| {
             if let Some((selected_temp, selected_boundary, ready)) = point.borrow().as_ref() {
                 if temp == Path::new(selected_temp) && boundary == selected_boundary {
@@ -435,6 +496,52 @@ mod publication_tests {
         });
         log.finish().unwrap();
         panic!("publication boundary was not reached");
+    }
+
+    #[test]
+    fn rereview_2_replaced_synced_temporaries_are_never_published() {
+        for artifact in [".head.tmp", ".dedupe.json.tmp"] {
+            for use_symlink in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path().join("log");
+                fs::create_dir(&dir).unwrap();
+                let outside = root.path().join("outside");
+                fs::write(&outside, b"forged").unwrap();
+                let mut log = LogManager::new(&dir).unwrap();
+                log.log_event(&event()).unwrap();
+                REPLACE_AT.with(|point| {
+                    *point.borrow_mut() =
+                        Some((artifact.into(), dir.clone(), outside.clone(), use_symlink))
+                });
+                let result = log.finish();
+                let fired = REPLACE_AT.with(|point| point.borrow_mut().take().is_none());
+                assert!(fired, "{artifact}: replacement boundary not reached");
+                let published = dir.join(if artifact == ".head.tmp" {
+                    "requests.log.head"
+                } else {
+                    "dedupe.json"
+                });
+                // Either rejected (nothing published) or the original bytes.
+                match fs::symlink_metadata(&published) {
+                    Ok(meta) => {
+                        assert!(
+                            meta.file_type().is_file(),
+                            "{artifact} symlink={use_symlink}: published a non-file"
+                        );
+                        assert_ne!(
+                            fs::read(&published).unwrap(),
+                            b"forged",
+                            "{artifact} symlink={use_symlink}: published the replacement"
+                        );
+                    }
+                    Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+                }
+                assert_eq!(fs::read(&outside).unwrap(), b"forged");
+                if result.is_ok() {
+                    verify_log_recover(dir.join("requests.log"), false, false).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

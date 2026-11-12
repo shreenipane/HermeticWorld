@@ -392,6 +392,29 @@ enum ReadFrameResult {
     Io(std::io::Error),
 }
 
+/// Check the magic, version, method, flags and reserved bytes of a complete
+/// fixed header. Length fields are bounded separately by the caller.
+fn validate_fixed_header(
+    header: &[u8; hermetic_common::REQUEST_HEADER_SIZE],
+) -> Result<(), String> {
+    if &header[0..4] != hermetic_common::REQUEST_MAGIC.as_slice() {
+        return Err("bad request magic".into());
+    }
+    if header[4] != hermetic_common::wire::WIRE_VERSION {
+        return Err(format!("unsupported version: {}", header[4]));
+    }
+    if header[5] != Method::Get as u8 && header[5] != Method::Head as u8 {
+        return Err(format!("unknown method byte: {}", header[5]));
+    }
+    if header[6] & !0x01 != 0 {
+        return Err(format!("unknown flag bits set: 0x{:02x}", header[6]));
+    }
+    if header[7] != 0 {
+        return Err(format!("reserved byte is not zero: {}", header[7]));
+    }
+    Ok(())
+}
+
 fn read_request_frame_deadline(
     stream: &mut UnixStream,
     frame_deadline: Instant,
@@ -444,8 +467,10 @@ fn read_request_frame_deadline(
         }
     }
 
-    if &header[0..4] != hermetic_common::REQUEST_MAGIC.as_slice() {
-        return ReadFrameResult::Malformed("bad request magic".into());
+    // Every fixed-header field is validated before any payload byte is awaited,
+    // so a malformed header with a withheld payload is tampering, not a timeout.
+    if let Err(reason) = validate_fixed_header(&header) {
+        return ReadFrameResult::Malformed(reason);
     }
     let authority_len = u16::from_le_bytes([header[16], header[17]]) as usize;
     let path_len = u16::from_le_bytes([header[18], header[19]]) as usize;
@@ -552,14 +577,45 @@ fn socket_identity(entry: &Path) -> Option<(EntryId, u32)> {
     }
 }
 
-/// Unlink `entry` only if it is still the socket identified by `id`.
-fn remove_owned_socket(entry: &Path, id: EntryId) -> std::io::Result<()> {
-    match socket_identity(entry) {
-        Some((current, _)) if current == id => std::fs::remove_file(entry),
-        _ => Err(std::io::Error::other(
-            "endpoint entry is not the owned socket",
-        )),
+/// Unlink the entry `name` of `directory` only if it is the socket `id`.
+///
+/// Unlinking by name after a check would delete whatever replaced the entry
+/// in between. Instead the entry is first moved to a fresh private name in the
+/// descriptor-held directory, its identity is verified there, and only then is
+/// it unlinked; anything else is moved back without replacing a newer entry.
+fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_PRIVATE: AtomicU64 = AtomicU64::new(0);
+    let not_owned = || std::io::Error::other("endpoint entry is not the owned socket");
+    let entry = directory.path(name)?;
+    if !matches!(socket_identity(&entry), Some((current, _)) if current == id) {
+        return Err(not_owned());
     }
+    #[cfg(test)]
+    review_tests::endpoint_verified();
+    let private = directory.path(Path::new(&format!(
+        ".{}.reclaim-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT_PRIVATE.fetch_add(1, Ordering::Relaxed)
+    )))?;
+    match std::fs::symlink_metadata(&private) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        _ => return Err(not_owned()),
+    }
+    std::fs::rename(&entry, &private)?;
+    if matches!(socket_identity(&private), Some((current, _)) if current == id) {
+        return std::fs::remove_file(&private);
+    }
+    // Not ours: put it back. A hard link never replaces an entry that has
+    // appeared at the name meanwhile; directories cannot be hard-linked.
+    if std::fs::hard_link(&private, &entry).is_ok() {
+        let _ = std::fs::remove_file(&private);
+    } else if matches!(std::fs::symlink_metadata(&entry), Err(e) if e.kind() == ErrorKind::NotFound)
+    {
+        let _ = std::fs::rename(&private, &entry);
+    }
+    Err(not_owned())
 }
 
 fn lock_name_for(socket_name: &Path) -> PathBuf {
@@ -569,17 +625,14 @@ fn lock_name_for(socket_name: &Path) -> PathBuf {
 impl Drop for WorldServer {
     fn drop(&mut self) {
         if let Some(id) = self.owned_endpoint {
-            if let Ok(entry) = self.socket_directory.path(&self.socket_name) {
-                let _ = remove_owned_socket(&entry, id);
-            }
+            let _ = remove_owned_socket(&self.socket_directory, &self.socket_name, id);
         }
         if let Some(id) = self.owned_lock {
-            if let Ok(entry) = self
-                .socket_directory
-                .path(&lock_name_for(&self.socket_name))
-            {
-                let _ = remove_owned_socket(&entry, id);
-            }
+            let _ = remove_owned_socket(
+                &self.socket_directory,
+                &lock_name_for(&self.socket_name),
+                id,
+            );
         }
     }
 }
@@ -657,7 +710,7 @@ impl WorldServer {
                 };
                 match UnixStream::connect(&lock_entry) {
                     Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                        Some((lock_entry, lock_id, socket_entry, (meta.dev(), meta.ino())))
+                        Some((lock_id, (meta.dev(), meta.ino())))
                     }
                     _ => return Err(ServerExit::StartupFailed),
                 }
@@ -670,9 +723,11 @@ impl WorldServer {
             .into_directory()
             .map_err(|_| ServerExit::StartupFailed)?;
 
-        if let Some((lock_entry, lock_id, socket_entry, socket_id)) = stale_cleanup {
-            remove_owned_socket(&lock_entry, lock_id).map_err(|_| ServerExit::StartupFailed)?;
-            remove_owned_socket(&socket_entry, socket_id).map_err(|_| ServerExit::StartupFailed)?;
+        if let Some((lock_id, socket_id)) = stale_cleanup {
+            remove_owned_socket(&socket_directory, &lock_name, lock_id)
+                .map_err(|_| ServerExit::StartupFailed)?;
+            remove_owned_socket(&socket_directory, &socket_name, socket_id)
+                .map_err(|_| ServerExit::StartupFailed)?;
         }
         // Bind the run to its supplied clock, resource policy, store and sandbox policy.
         let binding_data = serde_json::to_vec(&(
@@ -806,8 +861,12 @@ impl WorldServer {
                 };
                 match UnixStream::connect(&lock_entry) {
                     Err(ce) if ce.kind() == ErrorKind::ConnectionRefused => {
-                        remove_owned_socket(&lock_entry, stale_id)
-                            .map_err(|_| ServerExit::StartupFailed)?;
+                        remove_owned_socket(
+                            &self.socket_directory,
+                            &lock_name_for(&self.socket_name),
+                            stale_id,
+                        )
+                        .map_err(|_| ServerExit::StartupFailed)?;
                         UnixListener::bind(&lock_entry).map_err(|_| ServerExit::StartupFailed)?
                     }
                     _ => return Err(ServerExit::StartupFailed),
@@ -1361,6 +1420,17 @@ mod review_tests {
     use time::macros::datetime;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    thread_local! {
+        static ENDPOINT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+    /// Runs once, after an endpoint entry's identity has been verified and
+    /// before it is unlinked.
+    pub(super) fn endpoint_verified() {
+        if let Some(hook) = ENDPOINT_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
     thread_local! { static CRASH_BOUNDARY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") }; }
     pub(super) fn crash_at(boundary: &str) {
         CRASH_BOUNDARY
@@ -1936,5 +2006,51 @@ mod review_tests {
         assert!(fs::symlink_metadata(&socket).is_ok());
         assert!(fs::symlink_metadata(&lock).is_ok());
         let _client = UnixStream::connect(&lock).unwrap();
+    }
+
+    #[test]
+    fn rereview_3_endpoint_replaced_after_verification_survives_cleanup() {
+        use std::os::unix::fs::MetadataExt;
+        for live in [false, true] {
+            let temp = tempdir().unwrap();
+            let directory = Directory::open(temp.path()).unwrap();
+            let entry = temp.path().join("socket");
+            let owned = UnixListener::bind(&entry).unwrap();
+            let meta = fs::symlink_metadata(&entry).unwrap();
+            let id = (meta.dev(), meta.ino());
+            // Prepare the replacement aside so the hook swaps it in atomically.
+            let staged = temp.path().join("replacement");
+            let _replacement_listener = if live {
+                Some(UnixListener::bind(&staged).unwrap())
+            } else {
+                fs::write(&staged, b"replacement").unwrap();
+                None
+            };
+            let replacement = fs::symlink_metadata(&staged).unwrap();
+            let replacement_id = (replacement.dev(), replacement.ino());
+            let (from, to) = (staged.clone(), entry.clone());
+            ENDPOINT_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || fs::rename(from, to).unwrap()))
+            });
+            let result = remove_owned_socket(&directory, Path::new("socket"), id);
+            let fired = ENDPOINT_HOOK.with(|hook| hook.borrow_mut().take().is_none());
+            assert!(fired, "live={live}: hook did not run");
+            assert!(result.is_err(), "live={live}: replacement treated as owned");
+            let survivor = fs::symlink_metadata(&entry).expect("replacement was deleted");
+            assert_eq!(
+                (survivor.dev(), survivor.ino()),
+                replacement_id,
+                "live={live}"
+            );
+            if !live {
+                assert_eq!(fs::read(&entry).unwrap(), b"replacement");
+            }
+            let names: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [std::ffi::OsString::from("socket")], "live={live}");
+            drop(owned);
+        }
     }
 }
