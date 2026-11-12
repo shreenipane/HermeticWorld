@@ -26,6 +26,9 @@ pub struct UpstreamClient {
 
 impl UpstreamClient {
     pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB limit
+    /// A non-2xx body is only inspected for its error type and is never forwarded, so far
+    /// less of it is read (bounds memory per in-flight request).
+    pub const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 
     pub fn new(config: Arc<GatewayConfig>) -> Self {
         let agent = ureq::AgentBuilder::new()
@@ -105,7 +108,7 @@ impl UpstreamClient {
                         headers.push((h_name, val.to_string()));
                     }
                 }
-                let mut reader = resp.into_reader().take(Self::MAX_RESPONSE_BYTES as u64);
+                let mut reader = resp.into_reader().take(Self::MAX_ERROR_BODY_BYTES as u64);
                 let mut body = String::new();
                 let _ = reader.read_to_string(&mut body);
                 Ok(UpstreamResponse::Body {

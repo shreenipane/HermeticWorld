@@ -36,7 +36,7 @@ fn default_upstream_read_timeout_s() -> u64 {
     120
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     pub upstream_base_url: String,
     pub anthropic_version: String,
@@ -48,6 +48,23 @@ pub struct GatewayConfig {
     pub upstream_read_timeout_s: u64,
     /// Loaded once into memory; never logged.
     api_key: String,
+}
+
+impl std::fmt::Debug for GatewayConfig {
+    /// Same as a derived Debug, except that the API key is redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayConfig")
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field("anthropic_version", &self.anthropic_version)
+            .field("allowed_betas", &self.allowed_betas)
+            .field("pinned_models", &self.pinned_models)
+            .field("quotas", &self.quotas)
+            .field("log_dir", &self.log_dir)
+            .field("api_key_file", &self.api_key_file)
+            .field("upstream_read_timeout_s", &self.upstream_read_timeout_s)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl GatewayConfig {

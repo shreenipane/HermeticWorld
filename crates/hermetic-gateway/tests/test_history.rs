@@ -56,12 +56,12 @@ fn test_history_rewrites_logged_and_never_rejected_via_gateway() {
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
         for _ in 0..3 {
-            let req = mock.recv().unwrap();
+            let req = common::recv_upstream(&mock);
             req.respond(Response::from_string(r#"{"id":"1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#)).unwrap();
         }
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
 
     // Turn 1: 1 message -> starts conversation
     let body1 = r#"{
@@ -110,7 +110,7 @@ fn test_history_rewrites_logged_and_never_rejected_via_gateway() {
         .expect("turn 3 ok (rewrites are NEVER rejected)");
     assert_eq!(res3.status(), 200);
 
-    mock_handle.join().unwrap();
+    common::join_within(mock_handle);
 
     // Check host logs
     let logs = env.read_host_logs();

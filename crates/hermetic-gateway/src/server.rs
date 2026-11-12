@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::io::{Cursor, ErrorKind, Read};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -11,19 +12,100 @@ use crate::anthropic::{parse_and_validate_request, ANTHROPIC_ADAPTER_VERSION};
 use crate::config::GatewayConfig;
 use crate::error::{
     standard_message_for_type, AnthropicErrorResponse, API_ERROR, INVALID_REQUEST_ERROR,
-    NOT_FOUND_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
+    NOT_FOUND_ERROR, OVERLOADED_ERROR, RATE_LIMIT_ERROR, REQUEST_TOO_LARGE,
 };
 use crate::history::HistoryLog;
 use crate::log::{HostLogEntry, HostLogger};
 use crate::nonce::RunNonce;
 use crate::quota::QuotaTracker;
 use crate::response::{
-    filter_response_headers, rewrite_json_timestamps, sanitize_error_body, GuestClock,
-    SanitizingSseReader, StreamSlotGuard, StreamUsage,
+    filter_response_headers, format_imf_fixdate, rewrite_json_timestamps, sanitize_error_body,
+    GuestClock, SanitizingSseReader, StreamSlotGuard, StreamUsage,
 };
 use crate::upstream::{UpstreamClient, UpstreamResponse};
 
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// Most agent requests handled at once (one thread each). A request arriving while this many
+/// are in flight has its connection closed without a response; nothing of it is read.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
+/// Most request-body bytes buffered at once across all in-flight requests. A request whose
+/// body would push the total over this gets a 529 `overloaded_error` (not a quota breach).
+/// Together with `MAX_IN_FLIGHT_REQUESTS` this bounds the memory agent requests can pin.
+pub const MAX_BUFFERED_BODY_BYTES: usize = 3 * MAX_REQUEST_BODY_BYTES;
+
+/// Body bytes read (and reserved from the budget) per step.
+const BODY_READ_CHUNK: usize = 64 * 1024;
+
+/// Shared budget of buffered request-body bytes.
+struct BodyBudget {
+    used: Mutex<usize>,
+    limit: usize,
+}
+
+impl BodyBudget {
+    fn try_reserve(&self, bytes: usize) -> bool {
+        let mut used = match self.used.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match used.checked_add(bytes) {
+            Some(total) if total <= self.limit => {
+                *used = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut used = match self.used.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *used = used.saturating_sub(bytes);
+    }
+}
+
+/// Bytes reserved from the `BodyBudget` by one request; returned on drop.
+struct BodyReservation {
+    budget: Arc<BodyBudget>,
+    bytes: usize,
+}
+
+impl BodyReservation {
+    fn grow(&mut self, bytes: usize) -> bool {
+        if self.budget.try_reserve(bytes) {
+            self.bytes = self.bytes.saturating_add(bytes);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// Decrements the in-flight request count when a handler thread ends.
+struct InFlightSlot(Arc<AtomicUsize>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Why reading an agent request body stopped early.
+enum BodyReadError {
+    TooLarge,
+    Overloaded,
+    Io(std::io::Error),
+}
 
 #[derive(Clone)]
 pub struct GatewayServer {
@@ -35,12 +117,46 @@ pub struct GatewayServer {
     logger: Arc<HostLogger>,
     upstream: Arc<UpstreamClient>,
     running: Arc<AtomicBool>,
+    /// Guest `Date` used if formatting the current guest time ever fails: the latest guest
+    /// instant validated at startup (T_clock + wall-time limit, or T_clock).
+    fallback_date: Arc<String>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: usize,
+    body_budget: Arc<BodyBudget>,
 }
 
 impl GatewayServer {
     pub fn new(config: GatewayConfig, t_clock: time::OffsetDateTime) -> Result<Self, String> {
+        Self::new_with_clock(config, GuestClock::new(t_clock))
+    }
+
+    /// Builds the gateway with a given guest clock (tests use `GuestClock::frozen`).
+    ///
+    /// Refuses to start unless T_clock and T_clock + the wall-time limit both format as
+    /// IMF-fixdate, so every response can carry a guest `Date`.
+    pub fn new_with_clock(config: GatewayConfig, clock: GuestClock) -> Result<Self, String> {
+        // Validate T_clock is formattable as IMF-fixdate
+        let mut fallback_date = format_imf_fixdate(clock.t_clock())
+            .map_err(|e| format!("Invalid t_clock: cannot format as IMF-fixdate: {e}"))?;
+
+        // Validate T_clock + configured wall-time limit is formattable as IMF-fixdate
+        if let Some(wall_limit) = config.quotas.max_wall_time_seconds {
+            let dur = i64::try_from(wall_limit)
+                .map(time::Duration::seconds)
+                .map_err(|_| {
+                    format!("Configured wall-time limit {wall_limit}s exceeds i64 range")
+                })?;
+            let t_end = clock.t_clock().checked_add(dur).ok_or_else(|| {
+                format!("T_clock + wall-time limit ({wall_limit}s) overflows datetime")
+            })?;
+            fallback_date = format_imf_fixdate(t_end).map_err(|e| {
+                format!("Invalid T_clock + wall-time limit: cannot format as IMF-fixdate: {e}")
+            })?;
+        }
+        Header::from_bytes(&b"Date"[..], fallback_date.as_bytes())
+            .map_err(|_| "Invalid guest Date header value".to_string())?;
+
         let config_arc = Arc::new(config);
-        let clock = GuestClock::new(t_clock);
         let nonce = RunNonce::generate()?;
         let quota = Arc::new(QuotaTracker::new(config_arc.quotas.clone()));
         let history = Arc::new(HistoryLog::new());
@@ -60,7 +176,32 @@ impl GatewayServer {
             logger,
             upstream,
             running,
+            fallback_date: Arc::new(fallback_date),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: MAX_IN_FLIGHT_REQUESTS,
+            body_budget: Arc::new(BodyBudget {
+                used: Mutex::new(0),
+                limit: MAX_BUFFERED_BODY_BYTES,
+            }),
         })
+    }
+
+    /// Makes sure `headers` carries exactly one `Date`, holding guest time. The HTTP layer
+    /// (vendored tiny_http) never adds a Date of its own, so every response must get it here.
+    fn ensure_date_header(&self, headers: &mut Vec<Header>) {
+        if headers.iter().any(|h| h.field.equiv("Date")) {
+            return;
+        }
+        let date_str = self
+            .clock
+            .format_imf_fixdate()
+            .unwrap_or_else(|_| self.fallback_date.as_str().to_string());
+        let header = Header::from_bytes(&b"Date"[..], date_str.as_bytes())
+            .or_else(|_| Header::from_bytes(&b"Date"[..], self.fallback_date.as_bytes()));
+        // The fallback was validated as a header value at startup, so this always succeeds.
+        if let Ok(h) = header {
+            headers.push(h);
+        }
     }
 
     pub fn nonce(&self) -> &RunNonce {
@@ -83,15 +224,56 @@ impl GatewayServer {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    /// Overrides `MAX_IN_FLIGHT_REQUESTS` and `MAX_BUFFERED_BODY_BYTES` (tests use small
+    /// values so the caps can be exercised without large memory use). Call before serving.
+    pub fn with_request_limits(
+        mut self,
+        max_in_flight: usize,
+        max_buffered_body_bytes: usize,
+    ) -> Self {
+        self.max_in_flight = max_in_flight;
+        self.body_budget = Arc::new(BodyBudget {
+            used: Mutex::new(0),
+            limit: max_buffered_body_bytes,
+        });
+        self
+    }
+
+    /// Number of agent requests currently being handled.
+    pub fn in_flight_requests(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Request-body bytes currently buffered across all in-flight requests.
+    pub fn buffered_body_bytes(&self) -> usize {
+        match self.body_budget.used.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
     pub fn run_loop(&self, server: Server) {
         while self.running.load(Ordering::SeqCst) {
             // Use recv_timeout so the loop can check running flag
             match server.recv_timeout(Duration::from_millis(200)) {
                 Ok(Some(request)) => {
+                    if self.in_flight.fetch_add(1, Ordering::AcqRel) >= self.max_in_flight {
+                        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        // Over the cap: close without reading or answering (no thread, no
+                        // memory). A reply here would need a thread to write it.
+                        request.close_without_response();
+                        continue;
+                    }
+                    let slot = InFlightSlot(self.in_flight.clone());
                     let server_clone = self.clone();
-                    std::thread::spawn(move || {
-                        server_clone.handle_agent_request(request);
-                    });
+                    // If the thread cannot be spawned the closure is dropped: the slot is
+                    // returned and the request's connection is closed without a response.
+                    let _ = std::thread::Builder::new()
+                        .name("gateway-request".to_string())
+                        .spawn(move || {
+                            let _slot = slot;
+                            server_clone.handle_agent_request(request);
+                        });
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -125,11 +307,7 @@ impl GatewayServer {
         ) {
             headers.push(h);
         }
-        if let Ok(date_hdr) = self.clock.format_imf_fixdate() {
-            if let Ok(h) = Header::from_bytes(&b"Date"[..], date_hdr.as_bytes()) {
-                headers.push(h);
-            }
-        }
+        self.ensure_date_header(&mut headers);
         let response = Response::new(
             status.into(),
             headers,
@@ -259,9 +437,27 @@ impl GatewayServer {
             return;
         }
 
-        // 3. Read body bytes (cap 32 MiB)
-        let declared_len = request.body_length();
-        if let Some(len) = declared_len {
+        // 3. Once the gateway is in the terminal limit_exceeded state every request is refused:
+        // do it before reading (and buffering) the body.
+        if self.quota.is_limit_exceeded() {
+            let reason = self
+                .quota
+                .snapshot()
+                .limit_exceeded_reason
+                .unwrap_or_else(|| "limit_exceeded".to_string());
+            self.respond_with_error(
+                request,
+                429,
+                RATE_LIMIT_ERROR,
+                &format!("Limit exceeded: {reason}"),
+                &endpoint,
+            );
+            return;
+        }
+
+        // 4. Read body bytes: at most 32 MiB per request, and only while the shared body budget
+        // allows (checked per chunk, before the bytes are buffered).
+        if let Some(len) = request.body_length() {
             if len > MAX_REQUEST_BODY_BYTES {
                 self.respond_with_error(
                     request,
@@ -274,33 +470,45 @@ impl GatewayServer {
             }
         }
 
-        let mut body_bytes = Vec::new();
-        let mut reader = request
-            .as_reader()
-            .take((MAX_REQUEST_BODY_BYTES + 1) as u64);
-        if let Err(e) = reader.read_to_end(&mut body_bytes) {
-            self.respond_with_error(
-                request,
-                400,
-                INVALID_REQUEST_ERROR,
-                &format!("Failed to read request body: {e}"),
-                &endpoint,
-            );
-            return;
-        }
+        let mut reservation = BodyReservation {
+            budget: self.body_budget.clone(),
+            bytes: 0,
+        };
+        let body_bytes = match read_body_bounded(request.as_reader(), &mut reservation) {
+            Ok(b) => b,
+            Err(BodyReadError::TooLarge) => {
+                self.respond_with_error(
+                    request,
+                    413,
+                    REQUEST_TOO_LARGE,
+                    "Request body exceeds 32 MiB limit",
+                    &endpoint,
+                );
+                return;
+            }
+            Err(BodyReadError::Overloaded) => {
+                self.respond_with_error(
+                    request,
+                    529,
+                    OVERLOADED_ERROR,
+                    standard_message_for_type(OVERLOADED_ERROR),
+                    &endpoint,
+                );
+                return;
+            }
+            Err(BodyReadError::Io(e)) => {
+                self.respond_with_error(
+                    request,
+                    400,
+                    INVALID_REQUEST_ERROR,
+                    &format!("Failed to read request body: {e}"),
+                    &endpoint,
+                );
+                return;
+            }
+        };
 
-        if body_bytes.len() > MAX_REQUEST_BODY_BYTES {
-            self.respond_with_error(
-                request,
-                413,
-                REQUEST_TOO_LARGE,
-                "Request body exceeds 32 MiB limit",
-                &endpoint,
-            );
-            return;
-        }
-
-        // 4. Validate UTF-8
+        // 4b. Validate UTF-8
         let body_str = match std::str::from_utf8(&body_bytes) {
             Ok(s) => s,
             Err(_) => {
@@ -343,6 +551,14 @@ impl GatewayServer {
             return;
         }
 
+        // The slot is now held. Every path below releases it through `slot` (exactly once,
+        // also on drop), and a client disconnect releases it early (see `watch_disconnect`).
+        let slot = Arc::new(StreamSlotGuard::new(
+            self.quota.clone(),
+            Arc::new(Mutex::new(StreamUsage::default())),
+        ));
+        spawn_disconnect_watcher(request.try_clone_peer_tcp_stream(), &slot);
+
         // 7. Inject Run Nonce into system prompt
         parsed_req.inject_nonce(&self.nonce);
 
@@ -350,7 +566,7 @@ impl GatewayServer {
         let rebuilt_json = match parsed_req.rebuild_json() {
             Ok(j) => j,
             Err(e) => {
-                self.quota.release_concurrent();
+                slot.record_and_release();
                 self.respond_with_error(
                     request,
                     400,
@@ -395,7 +611,7 @@ impl GatewayServer {
                 let filtered = match filter_response_headers(&headers, &self.clock) {
                     Ok(f) => f,
                     Err(e) => {
-                        self.quota.release_concurrent();
+                        slot.record_and_release();
                         self.respond_with_error(
                             request,
                             e.status_code(),
@@ -409,7 +625,7 @@ impl GatewayServer {
 
                 if !(200..300).contains(&status) {
                     // Non-2xx upstream error: sanitize body, preserve status
-                    self.quota.release_concurrent();
+                    slot.record_and_release();
                     let (sanitized_body, _) = sanitize_error_body(status, &upstream_body);
                     let body_bytes = sanitized_body.into_bytes();
                     let body_len = body_bytes.len();
@@ -433,6 +649,7 @@ impl GatewayServer {
                             }
                         }
                     }
+                    self.ensure_date_header(&mut resp_headers);
 
                     let resp = Response::new(
                         status.into(),
@@ -488,9 +705,8 @@ impl GatewayServer {
                         upstream_body
                     };
 
-                    let _ = self
-                        .quota
-                        .record_usage_and_release(input_tokens, output_tokens);
+                    slot.set_usage(input_tokens, output_tokens);
+                    slot.record_and_release();
 
                     let body_bytes = final_body.into_bytes();
                     let body_len = body_bytes.len();
@@ -503,6 +719,7 @@ impl GatewayServer {
                             }
                         }
                     }
+                    self.ensure_date_header(&mut resp_headers);
 
                     let resp = Response::new(
                         status.into(),
@@ -542,7 +759,7 @@ impl GatewayServer {
                 let filtered = match filter_response_headers(&headers, &self.clock) {
                     Ok(f) => f,
                     Err(e) => {
-                        self.quota.release_concurrent();
+                        slot.record_and_release();
                         self.respond_with_error(
                             request,
                             e.status_code(),
@@ -554,17 +771,13 @@ impl GatewayServer {
                     }
                 };
 
-                let shared_usage = Arc::new(Mutex::new(StreamUsage::default()));
-                let slot_guard = Arc::new(StreamSlotGuard::new(
-                    self.quota.clone(),
-                    shared_usage.clone(),
-                ));
-
+                // The stream reader records the streamed usage into `slot` and stops at its next
+                // read once the disconnect watcher has cancelled `slot`.
                 let sse_reader = SanitizingSseReader::with_slot_guard(
                     reader,
                     self.clock.clone(),
-                    shared_usage,
-                    slot_guard.clone(),
+                    slot.usage_handle(),
+                    slot.clone(),
                 );
 
                 let mut resp_headers = Vec::new();
@@ -575,12 +788,13 @@ impl GatewayServer {
                         }
                     }
                 }
+                self.ensure_date_header(&mut resp_headers);
 
                 let tiny_response =
                     Response::new(status.into(), resp_headers, sse_reader, None, None);
 
                 let _ = request.respond(tiny_response);
-                slot_guard.record_and_release();
+                slot.record_and_release();
 
                 self.logger.log(&HostLogEntry {
                     timestamp: self
@@ -602,7 +816,7 @@ impl GatewayServer {
                 });
             }
             Err(e) => {
-                self.quota.release_concurrent();
+                slot.record_and_release();
                 self.respond_with_error(
                     request,
                     e.status_code(),
@@ -612,5 +826,91 @@ impl GatewayServer {
                 );
             }
         }
+    }
+}
+
+/// Reads an agent request body: at most `MAX_REQUEST_BODY_BYTES`, reserving every chunk from
+/// the shared body budget before buffering it.
+fn read_body_bounded(
+    reader: &mut dyn Read,
+    reservation: &mut BodyReservation,
+) -> Result<Vec<u8>, BodyReadError> {
+    let mut body = Vec::new();
+    let mut chunk = vec![0u8; BODY_READ_CHUNK];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(body),
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(BodyReadError::Io(e)),
+        };
+        if body.len().saturating_add(n) > MAX_REQUEST_BODY_BYTES {
+            return Err(BodyReadError::TooLarge);
+        }
+        if !reservation.grow(n) {
+            return Err(BodyReadError::Overloaded);
+        }
+        let Some(read) = chunk.get(..n) else {
+            return Err(BodyReadError::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "reader reported more bytes than its buffer",
+            )));
+        };
+        body.extend_from_slice(read);
+    }
+}
+
+/// Starts a thread that releases `slot` as soon as the agent's connection closes.
+///
+/// While a request waits on upstream (before or during a stream), the gateway does not read
+/// or write the agent's socket, so a cancelled request would otherwise hold its concurrency
+/// slot until upstream next sends data or times out (up to `upstream_read_timeout_s`, or
+/// forever for a slow drip), and the agent's next request would be a terminal concurrency
+/// breach. The watcher blocks in `TcpStream::peek`, which consumes nothing:
+///
+/// - `Ok(0)` (the client closed its side) or a reset: `slot.cancel()` releases the slot at
+///   once and makes the stream stop at its next read. A client that half-closes its sending
+///   side while still reading the response is treated as gone too.
+/// - data (`Ok(n > 0)`, e.g. the next request on a keep-alive connection) or any other error:
+///   the watcher stops; this request has finished or will finish normally.
+///
+/// The release is therefore prompt (bounded by the kernel delivering the FIN or RST), and
+/// `QuotaTracker::check_and_acquire` additionally waits up to `CONCURRENCY_RELEASE_GRACE` for
+/// a slot, covering the race between a cancel and the agent's next request. The watcher holds
+/// only a weak reference, and lives at most until the client sends again or closes, so there
+/// is at most one idle watcher per open connection (connections are capped by tiny_http's
+/// `MAX_CONNECTIONS`). If no socket handle or thread is available, no watcher runs and the
+/// slot is released when the request ends, as before.
+fn spawn_disconnect_watcher(stream: Option<TcpStream>, slot: &Arc<StreamSlotGuard>) {
+    let Some(stream) = stream else {
+        return;
+    };
+    let weak = Arc::downgrade(slot);
+    let _ = std::thread::Builder::new()
+        .name("gateway-disconnect-watch".to_string())
+        .spawn(move || watch_disconnect(stream, weak));
+}
+
+fn watch_disconnect(stream: TcpStream, slot: Weak<StreamSlotGuard>) {
+    let mut probe = [0u8; 1];
+    loop {
+        let gone = match stream.peek(&mut probe) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => matches!(
+                e.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::NotConnected
+            ),
+        };
+        if gone {
+            if let Some(slot) = slot.upgrade() {
+                slot.cancel();
+            }
+        }
+        return;
     }
 }

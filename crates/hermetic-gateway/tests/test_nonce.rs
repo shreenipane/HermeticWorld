@@ -133,7 +133,7 @@ fn test_nonce_across_requests_and_instances() {
         (body1, body2)
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
@@ -151,7 +151,7 @@ fn test_nonce_across_requests_and_instances() {
         .send_string(body)
         .expect("req2 ok");
 
-    let (body1, body2) = mock_handle.join().expect("mock finished");
+    let (body1, body2) = common::join_within(mock_handle);
 
     let expected_nonce_str = format!("[run-nonce {}]", env1.gateway_server.nonce().hex());
     assert!(body1.contains(&expected_nonce_str));

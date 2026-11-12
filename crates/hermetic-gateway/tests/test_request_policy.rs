@@ -79,7 +79,7 @@ fn test_allowed_request_rebuilt_and_verified_at_mock() {
         req.respond(response).expect("respond");
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let agent_request_body = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [
@@ -102,7 +102,7 @@ fn test_allowed_request_rebuilt_and_verified_at_mock() {
         .expect("agent request success");
 
     assert_eq!(res.status(), 200);
-    mock_handle.join().expect("mock finished");
+    common::join_within(mock_handle);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_unknown_field_rejected_before_mock() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let hostile_body = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -154,7 +154,7 @@ fn test_server_tool_rejected_before_mock() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body_with_server_tool = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -197,7 +197,7 @@ fn test_url_image_source_rejected_before_mock() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body_url_image = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [
@@ -245,7 +245,7 @@ fn test_file_id_document_rejected_before_mock() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body_file_id = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [
@@ -296,7 +296,7 @@ fn test_unlisted_beta_flag_rejected() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -335,7 +335,7 @@ fn test_unpinned_model_rejected() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body = r#"{
         "model": "claude-3-opus-20240229",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -373,7 +373,7 @@ fn test_wrong_endpoint_rejected_with_404() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let err = client
         .post(&format!("{}/v1/complete", env.gateway_url))
         .set("anthropic-version", "2023-06-01")
@@ -402,7 +402,7 @@ fn test_forbidden_fields_mcp_servers_and_container() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
 
     // Test mcp_servers
     let body_mcp = r#"{

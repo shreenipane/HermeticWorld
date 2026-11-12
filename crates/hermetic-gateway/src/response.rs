@@ -19,6 +19,7 @@ use crate::quota::QuotaTracker;
 pub struct GuestClock {
     t_clock: OffsetDateTime,
     start_instant: Instant,
+    frozen_elapsed: Option<std::time::Duration>,
 }
 
 impl GuestClock {
@@ -26,11 +27,27 @@ impl GuestClock {
         Self {
             t_clock,
             start_instant: Instant::now(),
+            frozen_elapsed: None,
         }
     }
 
+    /// Test constructor with frozen elapsed time.
+    pub fn frozen(t_clock: OffsetDateTime, elapsed: std::time::Duration) -> Self {
+        Self {
+            t_clock,
+            start_instant: Instant::now(),
+            frozen_elapsed: Some(elapsed),
+        }
+    }
+
+    pub fn t_clock(&self) -> OffsetDateTime {
+        self.t_clock
+    }
+
     pub fn now(&self) -> OffsetDateTime {
-        let elapsed = self.start_instant.elapsed();
+        let elapsed = self
+            .frozen_elapsed
+            .unwrap_or_else(|| self.start_instant.elapsed());
         let seconds = elapsed.as_secs();
         let nanos = elapsed.subsec_nanos();
         let dur = Duration::new(seconds as i64, nanos as i32);
@@ -38,7 +55,9 @@ impl GuestClock {
     }
 
     pub fn elapsed_secs(&self) -> u64 {
-        self.start_instant.elapsed().as_secs()
+        self.frozen_elapsed
+            .map(|d| d.as_secs())
+            .unwrap_or_else(|| self.start_instant.elapsed().as_secs())
     }
 
     /// Formats guest time in IMF-fixdate format (RFC 7231 / RFC 9110):
@@ -52,6 +71,10 @@ pub fn format_imf_fixdate(dt: OffsetDateTime) -> Result<String, DateFormatError>
     let utc_dt = dt
         .checked_to_offset(time::UtcOffset::UTC)
         .ok_or(DateFormatError)?;
+
+    if !(0..=9999).contains(&utc_dt.year()) {
+        return Err(DateFormatError);
+    }
 
     let weekday = match utc_dt.weekday() {
         time::Weekday::Monday => "Mon",
@@ -140,35 +163,44 @@ fn parse_imf_fixdate(s: &str) -> Option<OffsetDateTime> {
     Some(date.with_time(time).assume_utc())
 }
 
+/// Longest `Retry-After` delay forwarded to the agent, in seconds.
+pub const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
+/// `Retry-After` sent to the agent when upstream gives an absolute date that cannot be turned
+/// into a delay safely (no parseable upstream `Date` to measure it against).
+pub const FALLBACK_RETRY_AFTER_SECS: u64 = 60;
+
 /// Converts a `Retry-After` header value to integer seconds.
-/// An integer seconds value is kept.
-/// An HTTP-date or RFC 3339 value is converted relative to upstream's own `date` header
-/// (or guest_time if upstream date is missing), rounded up, minimum 0.
-pub fn convert_retry_after(
-    retry_after_raw: &str,
-    upstream_date_header: Option<&str>,
-    clock: &GuestClock,
-) -> String {
+///
+/// - An integer seconds value is kept (capped at `MAX_RETRY_AFTER_SECS`).
+/// - An HTTP-date or RFC 3339 value is converted to a delay measured against upstream's own
+///   `Date` header only (rounded up, clamped to `0..=MAX_RETRY_AFTER_SECS`). Both instants come
+///   from upstream's clock, so their difference reveals nothing about the real date.
+/// - If upstream sent no parseable `Date`, the absolute value is never compared with guest or
+///   host time (either would leak the real date through `guest_now + Retry-After`); the fixed
+///   `FALLBACK_RETRY_AFTER_SECS` is used instead.
+/// - Anything else becomes `0`.
+pub fn convert_retry_after(retry_after_raw: &str, upstream_date_header: Option<&str>) -> String {
     let trimmed = retry_after_raw.trim();
 
     // Check if integer seconds
     if let Ok(secs) = trimmed.parse::<u64>() {
-        return secs.to_string();
+        return secs.min(MAX_RETRY_AFTER_SECS).to_string();
     }
 
     // Try parsing as timestamp
     if let Some(target_dt) = parse_date_or_rfc3339(trimmed) {
-        let base_dt = upstream_date_header
-            .and_then(parse_date_or_rfc3339)
-            .unwrap_or_else(|| clock.now());
+        let Some(base_dt) = upstream_date_header.and_then(parse_date_or_rfc3339) else {
+            return FALLBACK_RETRY_AFTER_SECS.to_string();
+        };
 
         let diff = target_dt - base_dt;
         let mut whole_secs = diff.whole_seconds();
         if diff.subsec_nanoseconds() > 0 {
-            whole_secs += 1;
+            whole_secs = whole_secs.saturating_add(1);
         }
-        let final_secs = if whole_secs < 0 { 0 } else { whole_secs as u64 };
-        return final_secs.to_string();
+        let final_secs = u64::try_from(whole_secs).unwrap_or(0);
+        return final_secs.min(MAX_RETRY_AFTER_SECS).to_string();
     }
 
     "0".to_string()
@@ -208,7 +240,7 @@ pub fn filter_response_headers(
                 agent_headers.push(("Content-Encoding".to_string(), v.clone()));
             }
             "retry-after" => {
-                let converted = convert_retry_after(v, upstream_date, clock);
+                let converted = convert_retry_after(v, upstream_date);
                 agent_headers.push(("Retry-After".to_string(), converted));
             }
             "date" => {
@@ -396,11 +428,18 @@ pub fn sanitize_sse_event(event_block: &str, clock: &GuestClock) -> (String, Str
     (out, usage)
 }
 
-/// Guard that records token usage and releases the concurrency slot exactly once.
+/// Guard over one request's concurrency slot and token usage.
+///
+/// The slot is released exactly once: either when the request finishes (`record_and_release`,
+/// also run on drop) or earlier, when the client disconnects (`cancel`). Token usage is
+/// recorded exactly once, when the request finishes, even if the slot was released earlier,
+/// so a cancelled request still counts the tokens upstream reported for it.
 pub struct StreamSlotGuard {
     quota: Arc<QuotaTracker>,
     usage: Arc<Mutex<StreamUsage>>,
-    released: AtomicBool,
+    slot_released: AtomicBool,
+    usage_recorded: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 impl StreamSlotGuard {
@@ -408,20 +447,59 @@ impl StreamSlotGuard {
         Self {
             quota,
             usage,
-            released: AtomicBool::new(false),
+            slot_released: AtomicBool::new(false),
+            usage_recorded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         }
     }
 
+    /// The usage cell this guard records from (shared with a `SanitizingSseReader`).
+    pub fn usage_handle(&self) -> Arc<Mutex<StreamUsage>> {
+        self.usage.clone()
+    }
+
+    /// Sets the usage to record when the request finishes (non-streaming responses).
+    pub fn set_usage(&self, input_tokens: u64, output_tokens: u64) {
+        let mut u = match self.usage.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        u.input_tokens = input_tokens;
+        u.output_tokens = output_tokens;
+    }
+
+    /// Records the usage seen so far and releases the slot (if `cancel` has not already).
     pub fn record_and_release(&self) {
-        if !self.released.swap(true, Ordering::SeqCst) {
+        if !self.usage_recorded.swap(true, Ordering::SeqCst) {
             let u = match self.usage.lock() {
                 Ok(g) => *g,
                 Err(p) => *p.into_inner(),
             };
-            let _ = self
-                .quota
-                .record_usage_and_release(u.input_tokens, u.output_tokens);
+            if self.slot_released.swap(true, Ordering::SeqCst) {
+                let _ = self.quota.record_usage(u.input_tokens, u.output_tokens);
+            } else {
+                let _ = self
+                    .quota
+                    .record_usage_and_release(u.input_tokens, u.output_tokens);
+            }
         }
+    }
+
+    /// The client went away: release the slot now (never counted as a breach) and make any
+    /// `SanitizingSseReader` holding this guard stop at its next read.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if !self.slot_released.swap(true, Ordering::SeqCst) {
+            self.quota.release_concurrent();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn is_slot_released(&self) -> bool {
+        self.slot_released.load(Ordering::SeqCst)
     }
 }
 
@@ -520,6 +598,9 @@ impl<R: Read> SanitizingSseReader<R> {
 
 impl<R: Read> Read for SanitizingSseReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.is_cancelled() {
+            return Err(client_gone());
+        }
         while self.buffer.is_empty() && !self.eof {
             if let Some(event_block) = self.fetch_next_event()? {
                 let (sanitized_event, ev_usage) = sanitize_sse_event(&event_block, &self.clock);
@@ -530,6 +611,10 @@ impl<R: Read> Read for SanitizingSseReader<R> {
                 self.buffer.extend_from_slice(sanitized_event.as_bytes());
             } else {
                 break;
+            }
+            // The upstream read may have blocked for a long time; stop if the client left.
+            if self.is_cancelled() {
+                return Err(client_gone());
             }
         }
 
@@ -544,5 +629,29 @@ impl<R: Read> Read for SanitizingSseReader<R> {
         buf[..to_copy].copy_from_slice(&self.buffer[..to_copy]);
         self.buffer.drain(..to_copy);
         Ok(to_copy)
+    }
+}
+
+fn client_gone() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "client disconnected; stream cancelled",
+    )
+}
+
+impl<R: Read> SanitizingSseReader<R> {
+    fn is_cancelled(&self) -> bool {
+        self.slot_guard
+            .as_ref()
+            .map(|g| g.is_cancelled())
+            .unwrap_or(false)
+    }
+}
+
+impl<R: Read> Drop for SanitizingSseReader<R> {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.slot_guard {
+            guard.record_and_release();
+        }
     }
 }

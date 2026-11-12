@@ -1,0 +1,2 @@
+# Vendored third-party code: keep upstream formatting byte-for-byte where possible.
+disable_all_formatting = true

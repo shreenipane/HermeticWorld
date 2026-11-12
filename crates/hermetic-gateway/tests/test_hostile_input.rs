@@ -14,7 +14,7 @@ fn test_huge_body_rejected_with_413() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
 
     // Declared content-length exceeds 32 MiB
     let err = client
@@ -46,7 +46,7 @@ fn test_deeply_nested_json_rejected() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
 
     // Create 100-deep nested array
     let mut nested = String::new();
@@ -89,7 +89,7 @@ fn test_invalid_utf8_rejected_without_panic() {
         QuotasConfig::default(),
     );
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
 
     // Send invalid UTF-8 bytes (0xFF, 0xFE)
     let invalid_bytes: &[u8] = b"{\"model\":\"claude-3-5-sonnet-20241022\", \xff\xfe: 123}";
@@ -124,7 +124,7 @@ fn test_malformed_sse_from_mock_does_not_panic() {
 
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
-        let req = mock.recv().unwrap();
+        let req = common::recv_upstream(&mock);
 
         // Malformed SSE: random non-JSON data lines, broken events, truncated fields
         let sse_garbage = "garbage_line_without_colon\n\
@@ -147,7 +147,7 @@ data: {}\n\n";
         req.respond(resp).unwrap();
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body = r#"{
         "model": "claude-3-5-sonnet-20241022",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -167,7 +167,7 @@ data: {}\n\n";
     let mut reader = res.into_reader();
     let _ = reader.read_to_string(&mut body_out);
 
-    mock_handle.join().unwrap();
+    common::join_within(mock_handle);
 
     // Verify server survived and stream completed without panic
     assert!(body_out.contains("event: message_stop"));

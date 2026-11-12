@@ -45,18 +45,19 @@ fn main() -> ExitCode {
         }
     };
 
-    let server_http = match Server::http(&args.listen) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to bind server on '{}': {e}", args.listen);
-            return ExitCode::from(1);
-        }
-    };
-
+    // Validates T_clock (and T_clock + wall-time limit) before anything listens.
     let gateway = match GatewayServer::new(config, t_clock) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Failed to initialize gateway server: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let server_http = match Server::http(&args.listen) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to bind server on '{}': {e}", args.listen);
             return ExitCode::from(1);
         }
     };

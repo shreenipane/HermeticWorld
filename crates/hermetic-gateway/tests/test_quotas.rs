@@ -20,11 +20,11 @@ fn test_request_quota_triggers_limit_exceeded() {
 
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
-        let req = mock.recv().unwrap();
+        let req = common::recv_upstream(&mock);
         req.respond(Response::from_string(r#"{"id":"1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#)).unwrap();
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
@@ -36,7 +36,7 @@ fn test_request_quota_triggers_limit_exceeded() {
         .send_string(body)
         .expect("first request ok");
     assert_eq!(res1.status(), 200);
-    mock_handle.join().unwrap();
+    common::join_within(mock_handle);
 
     // Second request breaches quota
     let err2 = client
@@ -84,12 +84,12 @@ fn test_output_token_quota_triggers_limit_exceeded() {
 
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
-        let req = mock.recv().unwrap();
+        let req = common::recv_upstream(&mock);
         // Return 15 output tokens, which breaches limit of 10
         req.respond(Response::from_string(r#"{"id":"1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":15}}"#)).unwrap();
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
@@ -100,7 +100,7 @@ fn test_output_token_quota_triggers_limit_exceeded() {
         .send_string(body)
         .expect("first request ok");
     assert_eq!(res1.status(), 200);
-    mock_handle.join().unwrap();
+    common::join_within(mock_handle);
 
     // Now gateway is in limit_exceeded state
     assert!(env.gateway_server.quota().snapshot().limit_exceeded);
@@ -134,12 +134,12 @@ fn test_input_token_quota_triggers_limit_exceeded() {
 
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
-        let req = mock.recv().unwrap();
+        let req = common::recv_upstream(&mock);
         // Return 25 input tokens, breaching cap of 20
         req.respond(Response::from_string(r#"{"id":"1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":25,"output_tokens":1}}"#)).unwrap();
     });
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
@@ -150,7 +150,7 @@ fn test_input_token_quota_triggers_limit_exceeded() {
         .send_string(body)
         .expect("first request ok");
     assert_eq!(res1.status(), 200);
-    mock_handle.join().unwrap();
+    common::join_within(mock_handle);
 
     assert!(env.gateway_server.quota().snapshot().limit_exceeded);
 
@@ -184,14 +184,16 @@ fn test_concurrency_quota_triggers_limit_exceeded() {
 
     let mock = env.mock_server.clone();
     let mock_handle = thread::spawn(move || {
-        let req = mock.recv().unwrap();
+        let req = common::recv_upstream(&mock);
         req1_started_tx.send(()).unwrap();
-        release_req1_rx.recv().unwrap();
+        release_req1_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         req.respond(Response::from_string(r#"{"id":"1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#)).unwrap();
     });
 
     let gw_url1 = env.gateway_url.clone();
-    let client1 = ureq::AgentBuilder::new().build();
+    let client1 = common::test_client();
     let req1_handle = thread::spawn(move || {
         let body =
             r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
@@ -210,7 +212,7 @@ fn test_concurrency_quota_triggers_limit_exceeded() {
         .unwrap();
 
     // Now send req2 while req1 is still active
-    let client2 = ureq::AgentBuilder::new().build();
+    let client2 = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
     let err2 = client2
@@ -230,8 +232,8 @@ fn test_concurrency_quota_triggers_limit_exceeded() {
 
     // Release req1
     release_req1_tx.send(()).unwrap();
-    let _ = req1_handle.join().unwrap();
-    mock_handle.join().unwrap();
+    let _ = common::join_within(req1_handle);
+    common::join_within(mock_handle);
 
     // Terminal limit_exceeded must now reject all later requests
     assert!(env.gateway_server.quota().snapshot().limit_exceeded);
@@ -251,7 +253,7 @@ fn test_wall_time_quota_triggers_limit_exceeded() {
     // Sleep past the 1s wall time cap
     thread::sleep(Duration::from_millis(1100));
 
-    let client = ureq::AgentBuilder::new().build();
+    let client = common::test_client();
     let body =
         r#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hi"}]}"#;
 
