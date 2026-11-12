@@ -1171,7 +1171,7 @@ fn cli_index_and_query_match_scan() {
     assert_eq!(qv["mode"], "query");
     assert_eq!(
         qv["not_covered"],
-        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external"])
+        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"])
     );
 
     // --root-visibility must give one value per index.
@@ -1345,12 +1345,12 @@ fn cli_sarif_query_and_scan_properties() {
         scan_json["runs"][0].get("properties")
     );
 
-    // Query SARIF contains runs[0].properties.mode == "query" and the five not_covered values
+    // Query SARIF contains runs[0].properties.mode == "query" and the not_covered values
     let props = &query_json["runs"][0]["properties"];
     assert_eq!(props["mode"], "query");
     assert_eq!(
         props["not_covered"],
-        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external"])
+        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"])
     );
 }
 

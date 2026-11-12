@@ -63,10 +63,10 @@ The oracle passes on every slice task, and one agent run is graded.
 
 ### Deliverables
 - [x] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain (T1.1)
-- [ ] Both modes: dated and undated (TR-SC-9)
+- [x] Both modes: dated and undated (TR-SC-9)
 - [ ] Fingerprints with baseline subtraction (TR-SC-1)
   - [x] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2) (T1.1)
-  - [ ] Tier 2: tree-sitter IDF symbols, as review (TR-SC-3)
+  - [x] Tier 2: tree-sitter IDF symbols, as review (TR-SC-3)
   - [x] Tier 3: winnowing, k=8, w=8 (TR-SC-4) (T1.2)
   - [x] Binary tier (TR-SC-5) (T1.4; `.pyc` coverage is weak, see BUILD_LOG)
 - [x] Container recursion with bomb limits, including git packs (TR-SC-6) (T1.2, T1.3)
@@ -74,7 +74,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] Thread scrub and mutable-content revision rule (TR-SEAL-9)
 - [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
-- [ ] Layer index plus per-task query, under 5 s (TR-SC-10)
+- [x] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
 - [ ] Calibrate the tier-1 and tier-2 thresholds against E3
 
@@ -103,7 +103,8 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10)
 - [ ] Gateway with the Anthropic adapter (TR-GW-*)
 - [ ] Container isolation of the agent, with the run spec applied
-- [ ] Manifest with `world_root`; reproducibility check (E7)
+- [x] Manifest with `world_root`
+- [ ] Reproducibility check (E7)
 - [ ] E4 oracle harness: gold passes, `FAIL_TO_PASS` fails on base, per-test parity with the official harness, flaky-test detection (3×), pytest plugin list
 - [ ] E2 design: a paired subset of 50–100 tasks stratified by repo and year, ≥ 2 seeds, bootstrap intervals, McNemar, drift control
 
@@ -132,7 +133,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] `hermetic_mutants`: variant pool, base-failing assertion finder, validation (TR-GR-8, TR-GR-9)
 - [ ] Differential runs R0, R1 and R2 in parallel; R3 advisory (cut list: R3, then R2)
 - [ ] Escape probe (TR-SEC-6)
-- [ ] Real-date sentinel D12 (TR-SEC-5)
+- [x] Real-date sentinel D12 (TR-SEC-5)
 - [ ] Classifier (TR-CLS-*)
 - [ ] Attestations: `hermetic-run/v1`, `hermetic-transcript-audit/v1`, score card (TR-ATT-*)
 - [ ] Harbor backend (TR-HB-1); prototype registration early, since it's a known risk

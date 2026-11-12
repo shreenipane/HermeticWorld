@@ -49,6 +49,8 @@ pub struct ScanOptions {
     pub hunk_threshold: f64,
     pub winnow_threshold: f64,
     pub binary_threshold: f64,
+    /// Tier 2 symbol weight fraction threshold (TR-SC-3, TRD.md §4.2; default 0.35, to be calibrated in E3)
+    pub tier2_threshold: f64,
     pub visibility: Visibility,
     pub max_depth: usize,
     pub max_member_bytes: u64,
@@ -62,6 +64,7 @@ pub struct ScanOptions {
     pub max_delta_depth: usize,
     pub target_packages: Vec<String>,
     pub task_version: Option<String>,
+    pub undated: bool,
 }
 
 impl Default for ScanOptions {
@@ -71,6 +74,7 @@ impl Default for ScanOptions {
             hunk_threshold: 0.60,
             winnow_threshold: 0.60,
             binary_threshold: 0.60,
+            tier2_threshold: 0.35,
             visibility: Visibility::AgentVisible,
             max_depth: 4,
             max_member_bytes: 256 * 1024 * 1024, // 256 MiB
@@ -83,6 +87,7 @@ impl Default for ScanOptions {
             max_delta_depth: 4096,
             target_packages: Vec::new(),
             task_version: None,
+            undated: false,
         }
     }
 }
@@ -470,6 +475,39 @@ pub fn scan_problem_statement(text: &str, fp: &FingerprintSet, opts: &ScanOption
         }
     }
 
+    // Tier 2 problem statement matching (D0 review flag, TR-SC-3)
+    let gate_hunks: HashSet<usize> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .filter_map(|f| f.hunk)
+        .collect();
+
+    let has_tier2_candidates = fp.hunks.iter().any(|h| {
+        !gate_hunks.contains(&h.hunk_index)
+            && h.tier2_total_weight > 0.0
+            && h.tier2_symbols.len() >= 2
+            && !h.tier2_anchors.is_empty()
+    });
+
+    if has_tier2_candidates {
+        let (unit_symbols, unit_anchor_tokens) =
+            crate::tier2::extract_unit_symbols_and_anchors(text);
+        for hunk in &fp.hunks {
+            if gate_hunks.contains(&hunk.hunk_index) {
+                continue;
+            }
+            if let Some(t2_finding) = hunk.match_tier2_with_context(
+                &unit_symbols,
+                &unit_anchor_tokens,
+                opts,
+                "D0",
+                problem_path,
+            ) {
+                findings.push(t2_finding);
+            }
+        }
+    }
+
     findings
 }
 
@@ -519,13 +557,22 @@ impl UnitSink for TreeMatchSink<'_> {
 
 impl TreeSink for TreeMatchSink<'_> {
     fn git_repo(&mut self, dir: &Path) {
+        if self.inner.opts.undated {
+            return;
+        }
         let found = crate::d1::scan_git_repo(dir, self.inner.fp, self.inner.opts);
         self.inner.findings.extend(found);
     }
     fn d1_finding(&mut self, finding: Finding) {
+        if self.inner.opts.undated {
+            return;
+        }
         self.inner.findings.push(finding);
     }
     fn pyc_file(&mut self, path: &Path, display_path: &str) {
+        if self.inner.opts.undated {
+            return;
+        }
         match check_pyc_bytecode(path, self.inner.opts.visibility) {
             Ok(d3_findings) => self.inner.findings.extend(d3_findings),
             Err(e) => self.inner.findings.push(Finding {
