@@ -112,6 +112,22 @@ def deny_unresolved_scope(entries: list[ScrubEntry]) -> None:
         entries.append(ScrubEntry("unresolved_scope", url, "incomplete discovery; deny GitHub scope", "prefix"))
 
 
+_UNRESERVED_BYTES = set(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+)
+
+
+def _normalize_unreserved_percent_encodings(s: str) -> str:
+    """Normalize percent-encoded unreserved characters (RFC 3986 section 2.3) to literal characters."""
+    def _replace(m: re.Match[str]) -> str:
+        code = int(m.group(1), 16)
+        if code in _UNRESERVED_BYTES:
+            return chr(code)
+        return f"%{m.group(1).upper()}"
+
+    return re.sub(r"%([0-9a-fA-F]{2})", _replace, s)
+
+
 def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
     """Validate, bound, and canonicalize URL components.
 
@@ -148,6 +164,11 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
     if not hostname:
         return None
 
+    if "%" in hostname:
+        if re.search(r"%(?![0-9a-fA-F]{2})", hostname):
+            return None
+        hostname = _normalize_unreserved_percent_encodings(hostname)
+
     hostname = hostname.lower()
 
     default_port = 443 if scheme == "https" else 80
@@ -162,6 +183,10 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
         canon_netloc = hostname
 
     path = parsed.path or "/"
+    if "%" in path:
+        if re.search(r"%(?![0-9a-fA-F]{2})", path):
+            return None
+        path = _normalize_unreserved_percent_encodings(path)
 
     # Canonicalize GitHub owner/repository components
     parts = path.split("/")
@@ -181,7 +206,19 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
             parts[2] = parts[2].lower()
             path = "/".join(parts)
 
-    return (scheme, canon_netloc, path, parsed.query, parsed.fragment)
+    query = parsed.query
+    if query and "%" in query:
+        if re.search(r"%(?![0-9a-fA-F]{2})", query):
+            return None
+        query = _normalize_unreserved_percent_encodings(query)
+
+    fragment = parsed.fragment
+    if fragment and "%" in fragment:
+        if re.search(r"%(?![0-9a-fA-F]{2})", fragment):
+            return None
+        fragment = _normalize_unreserved_percent_encodings(fragment)
+
+    return (scheme, canon_netloc, path, query, fragment)
 
 
 def match_scrub_entry(entry: dict[str, str] | ScrubEntry, candidate_url: str) -> bool:
@@ -1224,6 +1261,10 @@ def get_referencing_pr_scrub_entries(
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{pr_repo}/pulls/{pr_num}/commits", reason=f"{base_reason} commits API"),
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{pr_repo}/pull/{pr_num}.diff", reason=f"{base_reason} diff"),
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{pr_repo}/pull/{pr_num}.patch", reason=f"{base_reason} patch"),
+        ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{pr_repo}/issues/comments", reason=f"{base_reason} issue comments collection"),
+        ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://api.github.com/repos/{pr_repo}/issues/comments/", reason=f"{base_reason} standalone issue comment prefix"),
+        ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{pr_repo}/pulls/comments", reason=f"{base_reason} review comments collection"),
+        ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://api.github.com/repos/{pr_repo}/pulls/comments/", reason=f"{base_reason} standalone review comment prefix"),
     ]
 
 
@@ -1239,6 +1280,8 @@ def get_referencing_issue_scrub_entries(
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} URL prefix"),
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{issue_repo}/issues/{issue_num}", reason=base_reason),
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://api.github.com/repos/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} API URL prefix"),
+        ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{issue_repo}/issues/comments", reason=f"{base_reason} comments collection"),
+        ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://api.github.com/repos/{issue_repo}/issues/comments/", reason=f"{base_reason} standalone comment prefix"),
     ]
 
 

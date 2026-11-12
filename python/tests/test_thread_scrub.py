@@ -19,6 +19,8 @@ from hermetic_slice.thread_scrub import (
     ScrubResult,
     dedupe_and_sort_entries,
     deny_unresolved_scope,
+    get_referencing_issue_scrub_entries,
+    get_referencing_pr_scrub_entries,
     get_solution_pr_scrub_entries,
     match_scrub_entry,
     matches_any_scrub_entry,
@@ -2021,4 +2023,139 @@ def test_defect4_hostile_malformed_bracketed_authority_controlled_denial() -> No
     # Other malformed/unsupported authorities
     assert matches_any_scrub_entry(pr_entries, "https://user:pass@api.github.com/repos/o/r/pulls/50")
     assert matches_any_scrub_entry(pr_entries, "https://api.github.com:invalid_port/repos/o/r/pulls/50")
+
+
+def test_cross_repository_references_standalone_comments_and_collections(tmp_path: Path) -> None:
+    """Regression: Cross-repository referencing issues and PRs deny standalone comments and collections."""
+    fixture_data = load_fixture_json("issue_cross_repo_reference.json")
+    pr_fixture = json.loads(json.dumps(load_fixture_json("pull_request_scrub.json")).replace("test-org/test-repo", "target-org/target-repo"))
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result = process_thread_scrub_and_revision(
+        repo="target-org/target-repo",
+        pr_number=50,
+        target_issue_number=307,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Cross Repo\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+    )
+
+    entries = result.scrub_entries
+
+    # 1. Standalone comments on referencing issue 88 in other-org/other-repo are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments/999")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments/999?view=simple")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments/1")
+
+    # 2. Issue comments collection and query variants on referencing issue repo are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments?page=1")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments?page=2&per_page=100")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments?since=2020-01-01T00:00:00Z")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/comments?sort=created&direction=desc")
+
+    # 3. Standalone review comments on referencing PR 77 in external-org/external-repo are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments/555")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments/555?view=simple")
+
+    # 4. PR review comments collection and query variants on referencing PR repo are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments?page=1")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments?page=2&per_page=50")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/comments?sort=created&direction=desc")
+
+    # 5. Standalone conversation comments and collections on referencing PR repo are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/comments/777")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/comments/777?view=simple")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/comments")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/comments?page=1")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/comments?since=2020-01-01T00:00:00Z")
+
+    # 6. Unrelated repository comments and collections remain unblocked
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/unrelated-org/unrelated-repo/issues/comments/999")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/unrelated-org/unrelated-repo/issues/comments")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/unrelated-org/unrelated-repo/pulls/comments/555")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/unrelated-org/unrelated-repo/pulls/comments")
+
+    # 7. Boundary assertions: issue 880 and PR 770 remain unblocked
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/comments")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/events")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/timeline")
+    assert not matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/issues/880")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/770")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/pulls/770/comments")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/external-org/external-repo/issues/770")
+    assert not matches_any_scrub_entry(entries, "https://github.com/external-org/external-repo/pull/770")
+
+
+def test_percent_encoded_unreserved_characters_canonicalization_and_matching() -> None:
+    """Regression: Percent-encoded unreserved characters in repo names and numeric identifiers match exact and prefix entries."""
+    repo = "test-org/test-repo"
+    pr_entries = get_solution_pr_scrub_entries(repo, 50)
+
+    # 1. Encoded numeric identifiers match exact entries
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/issues/%35%30")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/issues/%35%30")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30.diff")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30.patch")
+
+    # 2. Encoded numeric identifiers match prefix entries
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30/")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30/comments")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30/commits")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30/files")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30/commits")
+
+    # 3. Encoded repository names match exact and prefix entries
+    # "%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f" == "test-org/test-repo"
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f/pulls/50")
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f/pulls/%35%30")
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f/pulls/%35%30/files")
+    assert matches_any_scrub_entry(pr_entries, "https://github.com/%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f/pull/50")
+    assert matches_any_scrub_entry(pr_entries, "https://github.com/%74%65%73%74-%6f%72%67/%74%65%73%74-%72%65%70%6f/pull/%35%30")
+
+    # Mixed-case percent encoding and unreserved symbols (- . _ ~)
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%54%65%73%74-%4f%72%67/%54%65%73%74-%52%65%70%6f/pulls/%35%30")
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%74%65%73%74%2d%6f%72%67/%74%65%73%74%2d%72%65%70%6f/pulls/%35%30")
+
+    # 4. Unrelated resources remain unblocked
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%31")
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/branches/%35%30")
+    assert not matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%6f%74%68%65%72-%6f%72%67/%6f%74%68%65%72-%72%65%70%6f/pulls/50")
+    assert not matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/%6f%74%68%65%72-%6f%72%67/%6f%74%68%65%72-%72%65%70%6f/pulls/%35%30")
+
+    # 5. Strict numeric boundary assertions retained
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30%30")
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30%30/comments")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30%30")
+    assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30%30/files")
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%30%35%30")
+    assert not matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/test-org/%74%65%73%74-%72%65%70%6f%32/pulls/50")
+    assert not matches_any_scrub_entry(pr_entries, "https://api.github.com/repos/test-org/%74%65%73%74-%72%65%70%6f%32/pulls/%35%30")
+
+    # 6. Encoded query and fragment variants
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/50?x=%31")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%35%30?x=%31")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30#issuecomment-%39%39%39")
+
+    # 7. Non-unreserved percent encoding preserves security / rejection
+    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls%2f50")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%2")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%zz")
 
