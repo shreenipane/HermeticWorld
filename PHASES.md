@@ -79,7 +79,17 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T1.13 review): decide whether the scrub fallback paths should return the as-scraped statement with `problem_statement_revision = as_scraped` and a warning (today they exclude content)
   - [ ] Deferred (T1.13 review): fixture `pytest_issue_6189_edits.json` has a creation edit dated before the issue's creation; the cache case in `test_http.py` can pass before the bounded-read check
   - [ ] Deferred (gates): Docker tests use fixed image and network names (`hermetic-test/fake-swebench`, `hermetic-world-test-inst-1-net`), so two py-gate runs at once make `test_cli_seal_images` and `test_world_probe_cli` fail; use per-run names
-- [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
+- [x] Dispositions: `repaired` / `excluded`, never silent (§5.5) (T1.14)
+  - [ ] Deferred (T1.14 review, non-blocking): a report with an inline manifest is rejected on rerun after publication changed the disk manifest, so an interrupted repair cannot finish in that case; reconcile the inline manifest with verified repair metadata
+  - [ ] Deferred (T1.14 review): Python checks UTF-8 span boundaries after merging spans (`redact_problem_statement("é", [(0,1),(1,2)])` succeeds; Rust rejects); validate every supplied boundary first
+  - [ ] Deferred (T1.14 review): Python and Rust count surviving characters differently (literal `[REDACTED]` in the original, whitespace definition incl. U+001C–U+001F); specify one rule and add cross-language cases
+  - [ ] Deferred (T1.14 review): empty spans are accepted during repair but rejected by persisted-metadata validation, so every later rerun fails; reject them before publication
+  - [ ] Deferred (T1.14 review): every replaced file becomes mode 0600, including an originally 0644 problem statement, so a runner under another uid cannot read it; preserve statement permissions
+  - [ ] Deferred (T1.14 review): an unusable explicit `--sealcheck` path silently falls back to PATH and developer locations; fail instead
+  - [ ] Deferred (T1.14 review): clean tasks get a manifest `clean` disposition although TRD §2 allows only `repaired` and `excluded`, which also changes an unchanged world's root; keep `clean` in the per-run report only
+  - [ ] Deferred (T1.14 review): excluding a previously repaired task appends to the manifest, leaving both statuses; separate repair history from the current disposition
+  - [ ] Deferred (T1.14 review): missing tests for the merged mode-restore script (`RESTORE_MODES_SH`): replacement between stat and open, fstat hard-link rejection, stalled `git ls-tree` with child termination, ancestor swap, and a FIFO-replacement test that runs the real script with an outside sentinel (the current race section tests its own `os.open` flags)
+  - [ ] Deferred (T1.14): `extract`-side note: files with NUL bytes are scanned as text, printable strings and both UTF-16 alignments; oversized files stay an explicit coverage gap (`file_oversize_skipped`)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [x] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
