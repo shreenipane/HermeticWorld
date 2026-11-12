@@ -138,6 +138,61 @@ def test_restore_modes_symlink_to_private_sentinel_rejected(tmp_path: Path) -> N
     # Sentinel permissions MUST remain 0600
     assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
 
+    # Replace tracked file with hard link to sentinel
+    f_tracked.unlink()
+    os.link(sentinel, f_tracked)
+    assert os.stat(sentinel).st_nlink > 1
+
+    res_hl = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res_hl.returncode != 0, f"Expected rejection for hard link, but script succeeded: {res_hl.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+
+def test_restore_modes_hardlink_to_private_sentinel_rejected(tmp_path: Path) -> None:
+    """Regression Defect 3: tracked regular file replaced by hard link to private sentinel is rejected and sentinel remains 0600."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file in git
+    f_tracked = repo_dir / "tracked.txt"
+    f_tracked.write_text("tracked content\n", encoding="utf-8")
+    run_git(["add", "tracked.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Outside private sentinel file
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Replace tracked file with hard link to sentinel
+    f_tracked.unlink()
+    os.link(sentinel, f_tracked)
+    assert os.stat(sentinel).st_nlink > 1
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode != 0, f"Expected rejection, but script succeeded: {res.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
 
 def test_restore_modes_isolated_from_untrusted_subprocess_module(tmp_path: Path) -> None:
     """Regression Defect 5: tracked subprocess.py modifying a sentinel never executes during mode restoration."""

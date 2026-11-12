@@ -543,12 +543,21 @@ for target_mode, comp_parts, path_str in entries_to_apply:
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
             sys.exit(1)
+        if st.st_nlink > 1:
+            print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
+            sys.exit(1)
 
         file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         try:
             fst = os.fstat(file_fd)
             if not stat.S_ISREG(fst.st_mode):
                 print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
+                sys.exit(1)
+            if fst.st_nlink > 1:
+                print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
+                sys.exit(1)
+            if fst.st_ino != st.st_ino or fst.st_dev != st.st_dev:
+                print(f"Refusing to restore mode: {path_str} changed during traversal", file=sys.stderr)
                 sys.exit(1)
             os.fchmod(file_fd, target_mode)
         finally:
