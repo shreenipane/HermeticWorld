@@ -154,61 +154,133 @@ def _make_writable_and_retry(func, path, _exc):
         os.close(parent_fd)
 
 
+def _open_subdir_for_removal(parent_fd: int, name: str) -> int | None:
+    """Open name inside parent_fd as a directory without following symlinks; None if it is
+    not a directory (anymore). Grants owner rwx (on the opened inode) when needed."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return None
+        if exc.errno != errno.EACCES or not _chmod_at(parent_fd, name, stat.S_IRWXU):
+            raise
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        st = os.fstat(fd)
+        if (st.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
+            _fchmod_any(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _unlink_at(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except PermissionError:
+        _add_owner_rwx(dir_fd)
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def _list_for_removal(fd: int) -> list[tuple[str, bool]]:
+    with os.scandir(fd) as it:
+        return [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in it]
+
+
+def remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove the entry name inside parent_fd, recursively, entirely through descriptors.
+
+    Iterative; every directory is opened with O_NOFOLLOW|O_DIRECTORY relative to its parent's
+    descriptor, entries are typed with lstat-equivalent checks (scandir without following),
+    and unlink/rmdir/chmod are all relative to held descriptors. A symlink is removed as a
+    link and never followed, so swapping any directory for a symlink mid-removal cannot reach
+    outside the tree. Errors propagate (OSError).
+    """
+    st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        _unlink_at(parent_fd, name)
+        return
+    top = _open_subdir_for_removal(parent_fd, name)
+    if top is None:
+        _unlink_at(parent_fd, name)
+        return
+    stack: list[tuple[int, str, list[tuple[str, bool]]]] = [(top, name, _list_for_removal(top))]
+    try:
+        while stack:
+            fd, dir_name, entries = stack[-1]
+            if entries:
+                entry_name, is_dir = entries.pop()
+                child = _open_subdir_for_removal(fd, entry_name) if is_dir else None
+                if child is None:
+                    _unlink_at(fd, entry_name)
+                else:
+                    try:
+                        child_entries = _list_for_removal(child)
+                    except BaseException:
+                        os.close(child)
+                        raise
+                    stack.append((child, entry_name, child_entries))
+                continue
+            stack.pop()
+            os.close(fd)
+            holder = stack[-1][0] if stack else parent_fd
+            try:
+                os.rmdir(dir_name, dir_fd=holder)
+            except PermissionError:
+                _add_owner_rwx(holder)
+                os.rmdir(dir_name, dir_fd=holder)
+    finally:
+        for fd, _, _ in stack:
+            os.close(fd)
+
+
 def rmtree_force(path: Path) -> None:
-    """Remove a directory tree, clearing read-only flags and retrying on failure."""
-    path = Path(path)
-    if path.is_symlink():
-        try:
-            path.unlink()
-        except OSError as exc:
-            _make_writable_and_retry(os.unlink, path, exc)
+    """Remove a directory tree (or a single entry), clearing read-only flags as needed.
+
+    The parent is reached by anchored descriptor traversal (no symlink followed anywhere in
+    the path) and the removal is descriptor-relative (remove_tree_at). A path under a
+    symlinked ancestor is left alone. Like shutil.rmtree with a swallowing error handler,
+    this never raises; callers check whether the path still exists.
+    """
+    try:
+        parent_fd, name = _open_parent_anchored(path)
+    except OSError:
         return
-    if not path.exists():
-        return
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_make_writable_and_retry)
-    else:
-        shutil.rmtree(path, onerror=_make_writable_and_retry)
+    try:
+        remove_tree_at(parent_fd, name)
+    except OSError:
+        pass
+    finally:
+        os.close(parent_fd)
 
 
 def _clean_directory(path: Path) -> None:
     """Remove all contents within a directory, handling read-only files.
 
     The directory is opened by anchored descriptor traversal (no symlink followed anywhere in
-    its path); entries are listed, chmod'ed and unlinked relative to that descriptor.
+    its path); entries are listed and removed relative to that descriptor (remove_tree_at).
     """
     path = Path(path)
-    if not path.exists() and not path.is_symlink():
-        return
     try:
         parent_fd, name = _open_parent_anchored(path)
     except OSError:
         return
     try:
-        try:
-            dir_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
-        except OSError:
-            if not _chmod_at(parent_fd, name, stat.S_IRWXU):
-                return
-            dir_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+        dir_fd = _open_subdir_for_removal(parent_fd, name)
+    except OSError:
+        dir_fd = None
     finally:
         os.close(parent_fd)
+    if dir_fd is None:
+        return
     try:
-        st = os.fstat(dir_fd)
-        if (st.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
-            _fchmod_any(dir_fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
-        with os.scandir(dir_fd) as it:
-            entries = [(entry.name, entry.is_dir(follow_symlinks=False), entry.is_symlink()) for entry in it]
-        for entry_name, is_dir, is_link in entries:
-            if is_dir and not is_link:
-                rmtree_force(path / entry_name)
-                continue
+        for entry_name, _is_dir in _list_for_removal(dir_fd):
             try:
-                if not is_link:
-                    _chmod_at(dir_fd, entry_name, stat.S_IRWXU)
-                os.unlink(entry_name, dir_fd=dir_fd)
-            except OSError as exc:
-                _make_writable_and_retry(os.unlink, path / entry_name, exc)
+                remove_tree_at(dir_fd, entry_name)
+            except OSError:
+                pass
     finally:
         os.close(dir_fd)
 

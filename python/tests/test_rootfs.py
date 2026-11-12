@@ -939,12 +939,12 @@ def test_build_rootfs_metadata_computed_from_tmp_image_under_concurrent_replacem
 
     real_replace = os.replace
 
-    def replace_interleaving(src_path, dst_path):
-        # Perform the real replace of tmp_image -> out_image
-        real_replace(src_path, dst_path)
+    def replace_interleaving(src_path, dst_path, **kwargs):
+        # Perform the real (descriptor-relative) replace of the work image -> out_image
+        real_replace(src_path, dst_path, **kwargs)
         # Simulate another build immediately overwriting out_image with img2
-        if Path(dst_path) == out_image:
-            with open(dst_path, "wb") as f:
+        if Path(dst_path).name == out_image.name:
+            with open(out_image, "wb") as f:
                 f.write(img2_bytes)
 
     monkeypatch.setattr(os, "replace", replace_interleaving)
@@ -1070,6 +1070,10 @@ def test_finding1_image_independent_of_builder_identity(tmp_path: Path, monkeypa
     res1 = build_rootfs(src=src, out_image=tmp_path / "a" / "r.ext4", t_clock=t_clock, world_id="w", size_mib=64)
     sealcheck = find_sealcheck_bin()
     monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: sealcheck)
+    # The simulated builder does not own the real test directories; the ownership checks on
+    # storage directories are covered by the B4 tests, this test is about the image bytes.
+    monkeypatch.setattr("hermetic_slice.rootfs.check_safe_dir_fd", lambda *_args: None)
+    monkeypatch.setattr("hermetic_slice.rootfs.check_private_dir_fd", lambda *_args: None)
     for fn, value in (("geteuid", 4242), ("getuid", 4242), ("getegid", 4343), ("getgid", 4343)):
         monkeypatch.setattr(os, fn, lambda value=value: value)
     res2 = build_rootfs(
@@ -1116,7 +1120,10 @@ def test_finding2_mke2fs_gets_pinned_config_and_explicit_options(
     assert opt("-t") == "ext4"
     assert opt("-m") == "5"
     assert "lazy_itable_init=0" in opt("-E") and "root_owner=0:0" in opt("-E")
-    assert opt("-d").endswith(".tar")
+    assert opt("-d").startswith("/proc/self/fd/"), "mke2fs reads the held tar descriptor"
+    assert build_cmd[build_cmd.index("-F") + 1].startswith("/proc/self/fd/"), "and writes the held image descriptor"
+    assert set(build_kwargs["pass_fds"]) == {int(opt("-d").rsplit("/", 1)[1]),
+                                             int(build_cmd[build_cmd.index("-F") + 1].rsplit("/", 1)[1])}
     assert res["e2fsprogs_version"] == "1.47.2"
     assert res["mke2fs_config_sha256"] == hashlib.sha256(MKE2FS_CONFIG_PATH.read_bytes()).hexdigest()
 
@@ -1374,7 +1381,7 @@ def test_finding6_mke2fs_timeout_is_clear_error_and_cleans_up(tmp_path: Path, mo
     _, behaviour = _mock_toolchain(monkeypatch)
     behaviour["build"] = "timeout"
     work = tmp_path / "work"
-    work.mkdir()
+    work.mkdir(mode=0o700)
     out_dir = tmp_path / "out"
 
     with pytest.raises(RootfsTimeoutError, match="timed out"):
@@ -1410,23 +1417,23 @@ def test_finding7_stream_has_no_xattrs_and_work_dir_is_private(tmp_path: Path, m
     for member in members.values():
         assert not any("xattr" in key or "acl" in key.lower() for key in member.pax_headers)
 
-    created: list[Path] = []
-    real_mkdtemp = tempfile.mkdtemp
+    seen_work: list[str] = []
+    calls, _ = _mock_toolchain(monkeypatch)
+    real_run = subprocess.run
 
-    def recording_mkdtemp(*args, **kwargs):
-        path = real_mkdtemp(*args, **kwargs)
-        created.append(Path(path))
-        return path
+    def recording_run(cmd, *args, **kwargs):
+        seen_work.extend(p.name for p in work.iterdir())
+        return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
-    _mock_toolchain(monkeypatch)
+    monkeypatch.setattr(subprocess, "run", recording_run)
     out_dir = tmp_path / "out"
     work = tmp_path / "work"
-    work.mkdir()
+    work.mkdir(mode=0o700)
     res = build_rootfs(src=src, out_image=out_dir / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
                        world_id="w", work_dir=work)
     assert res["xattrs"] == "none"
-    assert created and all(p.parent == work for p in created), "staging must be a fresh dir under work_dir"
+    assert seen_work and all(name.startswith("hermetic-rootfs-") for name in seen_work), "staging under work_dir"
+    assert list(work.iterdir()) == [], "the private work directory is removed"
     assert sorted(p.name for p in out_dir.iterdir()) == ["o.img"], "nothing staged next to the output"
 
 
@@ -1694,22 +1701,102 @@ def test_b4_output_dir_substitutions_cannot_redirect_or_replace(tmp_path: Path, 
     assert res["sha256"] == hashlib.sha256(b"GOOD-IMAGE").hexdigest()
 
 
-def test_b4_image_replaced_after_d4_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _only_work_dir(parent: Path) -> Path:
+    entries = [p for p in parent.iterdir() if p.name.startswith("hermetic-rootfs-")]
+    assert len(entries) == 1, entries
+    return entries[0]
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=False)
+    os.chmod(path, 0o700)
+    return path
+
+
+def test_b4_image_entry_replaced_after_d4_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The work entry is checked against the held descriptor right before the descriptor-relative rename."""
     out_dir, out = _out_dir_with_original(tmp_path)
+    work_parent = _private_dir(tmp_path / "wp")
     src = tmp_path / "src"
     src.mkdir()
     (src / "f").write_text("x")
 
-    def swap(image: Path) -> None:
-        evil = image.with_name("evil")
-        evil.write_bytes(b"EVIL")
-        os.replace(evil, image)
+    def swap(_image: Path) -> None:
+        work = _only_work_dir(work_parent)
+        (work / "evil").write_bytes(b"EVIL")
+        os.replace(work / "evil", work / "rootfs.img")
 
     _hooked_toolchain(monkeypatch, on_d4=swap)
-    with pytest.raises(RuntimeError, match="was replaced"):
-        build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="refusing to"):
+        build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=work_parent)
     assert out.read_bytes() == b"ORIGINAL"
     assert sorted(p.name for p in out_dir.iterdir()) == ["r.img"]
+
+
+def _substitute_work_dir(work_parent: Path, sentinel: Path, *, as_symlink_entry: bool) -> Path:
+    """Attacker: move the build's work directory away and put a look-alike at its name whose
+    rootfs.img is a symlink to the sentinel (or a file with EVIL content)."""
+    work = _only_work_dir(work_parent)
+    moved = work_parent / "moved-away"
+    os.rename(work, moved)
+    fake = work_parent / work.name
+    fake.mkdir(mode=0o700)
+    if as_symlink_entry:
+        (fake / "rootfs.img").symlink_to(sentinel)
+        (fake / "rootfs.tar").symlink_to(sentinel)
+    else:
+        (fake / "rootfs.img").write_bytes(b"EVIL")
+    return moved
+
+
+def _substitute_ancestor(anchor: Path, sentinel: Path, *, as_symlink_entry: bool) -> None:
+    """Attacker: replace an ancestor of the work directory with a symlink to a look-alike tree."""
+    wp = anchor / "wp"
+    work = _only_work_dir(wp)
+    os.rename(anchor, anchor.with_name(anchor.name + "-real"))
+    evil_root = anchor.with_name(anchor.name + "-evil")
+    fake_work = evil_root / "wp" / work.name
+    fake_work.mkdir(parents=True, mode=0o700)
+    if as_symlink_entry:
+        (fake_work / "rootfs.img").symlink_to(sentinel)
+    else:
+        (fake_work / "rootfs.img").write_bytes(b"EVIL")
+    anchor.symlink_to(evil_root)
+
+
+@pytest.mark.parametrize("stage", ["before_mke2fs", "before_publication"])
+@pytest.mark.parametrize("target", ["work_dir", "ancestor"])
+def test_b4_work_storage_substitution_never_written_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, target: str
+) -> None:
+    """B4: the work directory (or an ancestor of it) is substituted before mke2fs runs or just
+    before publication. The build never writes through the substitute, never publishes its
+    content, and the outside sentinel and the existing output stay intact unless the verified
+    image replaces the output."""
+    out_dir, out = _out_dir_with_original(tmp_path)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"SENTINEL")
+    os.chmod(sentinel, 0o600)
+    anchor = _private_dir(tmp_path / "anc")
+    work_parent = _private_dir(anchor / "wp")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+
+    def attack() -> None:
+        if target == "work_dir":
+            _substitute_work_dir(work_parent, sentinel, as_symlink_entry=(stage == "before_mke2fs"))
+        else:
+            _substitute_ancestor(anchor, sentinel, as_symlink_entry=(stage == "before_mke2fs"))
+
+    hooks = {"on_build": (lambda _img, _tar: attack())} if stage == "before_mke2fs" else {"on_d4": (lambda _img: attack())}
+    _hooked_toolchain(monkeypatch, **hooks)
+    res = build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=work_parent)
+
+    assert sentinel.read_bytes() == b"SENTINEL", "wrote through the substituted work storage"
+    assert stat.S_IMODE(os.lstat(sentinel).st_mode) == 0o600
+    assert out.read_bytes() == b"GOOD-IMAGE", "published something other than the verified image"
+    assert res["sha256"] == hashlib.sha256(b"GOOD-IMAGE").hexdigest()
 
 
 def test_b4_shared_output_dir_needs_sticky_bit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1739,7 +1826,7 @@ def test_b4_cross_filesystem_publish_copies_held_image(tmp_path: Path, monkeypat
     real_replace = os.replace
 
     def replace(a, b, *args, **kwargs):
-        if Path(a).parent.name.startswith("hermetic-rootfs-"):
+        if kwargs.get("src_dir_fd") is not None and kwargs.get("src_dir_fd") != kwargs.get("dst_dir_fd"):
             raise OSError(errno.EXDEV, "cross-device link")
         return real_replace(a, b, *args, **kwargs)
 

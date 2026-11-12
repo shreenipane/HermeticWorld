@@ -57,7 +57,7 @@ import uuid
 
 from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.intake import iso_utc
-from hermetic_slice.repo_sealer import rmtree_force
+from hermetic_slice.repo_sealer import remove_tree_at
 
 HERMETIC_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "hermetic.world")
 NAMESPACE = HERMETIC_NAMESPACE
@@ -242,8 +242,8 @@ class PinnedExecutable:
             raise RuntimeError(f"sealcheck descriptor already closed: {self.path}")
         return f"/proc/self/fd/{self.fd}"
 
-    def run(self, args: list[str], timeout_name: str) -> subprocess.CompletedProcess:
-        return _run([self.exec_path, *args], timeout_name, pass_fds=(self.fd,))
+    def run(self, args: list[str], timeout_name: str, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
+        return _run([self.exec_path, *args], timeout_name, pass_fds=(self.fd, *pass_fds))
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -358,12 +358,12 @@ class RootfsLimits:
         )
 
 
-def free_bytes(path: Path) -> int:
+def free_bytes(path: Path | int) -> int:
     st = os.statvfs(path)
     return st.f_bavail * st.f_frsize
 
 
-def require_free_space(path: Path, needed: int, what: str) -> None:
+def require_free_space(path: Path | int, needed: int, what: str) -> None:
     """Fail early with a clear error if the filesystem holding path has less than needed bytes free."""
     available = free_bytes(path)
     if available < needed:
@@ -375,7 +375,7 @@ def require_free_space(path: Path, needed: int, what: str) -> None:
 class _SpaceGuard:
     """Checks free space on the work filesystem before and while the tar stream grows."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path | int) -> None:
         self.path = path
         self.pending = 0
 
@@ -670,6 +670,7 @@ def write_rootfs_tar(
     *,
     mtime_ceiling: int,
     limits: RootfsLimits | None = None,
+    dir_fd: int | None = None,
 ) -> TreeScan:
     """Walk src (never following symlinks) and write the cleaned tree as a deterministic tar.
 
@@ -679,7 +680,7 @@ def write_rootfs_tar(
     """
     limits = limits or RootfsLimits.from_env()
     scan = TreeScan(removed=[], skipped_special=[])
-    guard = _SpaceGuard(Path(tar_path).parent)
+    guard = _SpaceGuard(dir_fd if dir_fd is not None else Path(tar_path).parent)
     guard.reserve(0, force=True)
     hardlink_first: dict[tuple[int, int], str] = {}
 
@@ -688,7 +689,9 @@ def write_rootfs_tar(
     root_fd = os.dup(src) if isinstance(src, int) else open_dir_anchored(src)
     stack: list[_Frame] = []
     try:
-        out_fd = os.open(tar_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        out_fd = os.open(
+            tar_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+        )
     except BaseException:
         os.close(root_fd)
         raise
@@ -967,30 +970,55 @@ def _make_output_dirs(directory: Path) -> None:
             pass
 
 
-def check_output_dir(directory: Path) -> None:
-    """Refuse an output directory that other users may write into, unless it has the sticky bit."""
-    st = os.stat(directory)
+def check_safe_dir_fd(fd: int, what: str, where: Path | str) -> None:
+    """Refuse a directory (checked on its held descriptor) that another user could rearrange:
+    it must be owned by the current user or root, and not group/other-writable unless sticky."""
+    st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode):
-        raise NotADirectoryError(f"Output directory is not a directory: {directory}")
+        raise NotADirectoryError(f"{what} is not a directory: {where}")
+    if st.st_uid not in (0, os.geteuid()):
+        raise PermissionError(f"{what} {where} is owned by uid {st.st_uid}, not by the current user or root")
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
         raise PermissionError(
-            f"Output directory {directory} is writable by group or others without the sticky bit; "
-            "another user could replace the published image"
+            f"{what} {where} is writable by group or others without the sticky bit; "
+            "another user could substitute its entries"
         )
 
 
-def _same_file(path: Path, fd: int) -> bool:
+def check_private_dir_fd(fd: int, where: Path | str) -> None:
+    """The work directory must be owned by the current user with no group/other access."""
+    st = os.fstat(fd)
+    if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise PermissionError(f"Work directory {where} is not private to this user")
+
+
+def check_output_dir(directory: Path) -> None:
+    """Path-level form of check_safe_dir_fd for the output directory (opened anchored)."""
+    fd = open_dir_anchored(directory)
     try:
-        st = os.lstat(path)
+        check_safe_dir_fd(fd, "Output directory", directory)
+    finally:
+        os.close(fd)
+
+
+def _fd_path(fd: int) -> str:
+    """Path a child process (given fd via pass_fds) uses to reach exactly the inode behind fd."""
+    return f"/proc/self/fd/{fd}"
+
+
+def _entry_is(dir_fd: int, name: str, fd: int) -> bool:
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except OSError:
         return False
     held = os.fstat(fd)
     return stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino)
 
 
-def _require_same_file(path: Path, fd: int, when: str) -> None:
-    if not _same_file(path, fd):
-        raise RuntimeError(f"Temporary image {path} was replaced {when}; refusing to continue")
+def _require_regular_fd(fd: int, when: str) -> None:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink < 1:
+        raise RuntimeError(f"Temporary image is no longer a linked regular file {when}; refusing to continue")
 
 
 def _sha256_fd(fd: int) -> str:
@@ -1005,50 +1033,60 @@ def _sha256_fd(fd: int) -> str:
     return h.hexdigest()
 
 
-def _publish(image_fd: int, image_path: Path, out_image: Path) -> None:
-    """Move the verified image to out_image atomically.
+def _publish(image_fd: int, work_fd: int, image_name: str, out_dir_fd: int, out_name: str) -> None:
+    """Publish the verified image to out_name inside the held output directory descriptor.
 
-    Same filesystem: rename out of the private work directory (the path was just checked
-    against the held descriptor). Otherwise: copy from the held descriptor into a new
-    O_EXCL|O_NOFOLLOW temporary next to out_image (holes kept), fsync, then rename.
+    Same filesystem: renameat from the private work directory descriptor to the output
+    directory descriptor (the work entry is first checked against the held image descriptor;
+    only this process can change entries of the 0700 work directory). Otherwise the held image
+    descriptor is copied (holes kept) into an O_EXCL|O_NOFOLLOW temporary created relative to
+    the output directory descriptor, fsynced, and renamed relative to that descriptor. In both
+    cases the published entry is checked against the descriptor that was written.
     """
-    _require_same_file(image_path, image_fd, "before publication")
+    if not _entry_is(work_fd, image_name, image_fd):
+        raise RuntimeError("Temporary image entry in the work directory changed; refusing to publish")
     try:
-        os.replace(image_path, out_image)
-        return
+        os.replace(image_name, out_name, src_dir_fd=work_fd, dst_dir_fd=out_dir_fd)
+        published_fd = image_fd
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-    tmp = out_image.parent / f".{out_image.name}.{uuid.uuid4().hex}.tmp"
-    out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    try:
-        size = os.fstat(image_fd).st_size
-        offset = 0
-        while offset < size:
-            chunk = os.pread(image_fd, min(1024 * 1024, size - offset), offset)
-            if not chunk:
-                raise RuntimeError(f"Temporary image shrank while publishing: {image_path}")
-            if chunk.count(0) != len(chunk):
-                os.pwrite(out_fd, chunk, offset)
-            offset += len(chunk)
-        os.ftruncate(out_fd, size)
-        os.fsync(out_fd)
-    except BaseException:
-        os.close(out_fd)
+        tmp_name = f".{out_name}.{uuid.uuid4().hex}.tmp"
+        tmp_fd = os.open(
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=out_dir_fd
+        )
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    os.close(out_fd)
-    try:
-        os.replace(tmp, out_image)
-    except BaseException:
+            size = os.fstat(image_fd).st_size
+            offset = 0
+            while offset < size:
+                chunk = os.pread(image_fd, min(1024 * 1024, size - offset), offset)
+                if not chunk:
+                    raise RuntimeError("Temporary image shrank while publishing")
+                if chunk.count(0) != len(chunk):
+                    os.pwrite(tmp_fd, chunk, offset)
+                offset += len(chunk)
+            os.ftruncate(tmp_fd, size)
+            os.fsync(tmp_fd)
+            if not _entry_is(out_dir_fd, tmp_name, tmp_fd):
+                raise RuntimeError("Temporary output entry changed before publication")
+            os.replace(tmp_name, out_name, src_dir_fd=out_dir_fd, dst_dir_fd=out_dir_fd)
+        except BaseException:
+            try:
+                if _entry_is(out_dir_fd, tmp_name, tmp_fd):
+                    os.unlink(tmp_name, dir_fd=out_dir_fd)
+            except OSError:
+                pass
+            os.close(tmp_fd)
+            raise
+        published_fd = tmp_fd
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            if not _entry_is(out_dir_fd, out_name, published_fd):
+                raise RuntimeError(f"Published image entry {out_name} does not match the verified image")
+        finally:
+            os.close(tmp_fd)
+        return
+    if not _entry_is(out_dir_fd, out_name, published_fd):
+        raise RuntimeError(f"Published image entry {out_name} does not match the verified image")
 
 
 def build_rootfs(
@@ -1086,8 +1124,9 @@ def build_rootfs(
         raise FileNotFoundError(f"Source directory does not exist or is not a directory: {src}")
     src_fd = open_dir_anchored(src)
     sealcheck: PinnedExecutable | None = None
-    work: Path | None = None
-    image_fd = -1
+    work_parent_fd = out_dir_fd = work_fd = tar_fd = image_fd = -1
+    work_name: str | None = None
+    work_ident: tuple[int, int] | None = None
     try:
         src_st = os.fstat(src_fd)
         out_image = Path(out_image)
@@ -1125,26 +1164,43 @@ def build_rootfs(
         e2fsprogs_version_str = _fmt_version(parsed_ver)
         config_path, config_sha256 = pinned_mke2fs_config()
 
+        # Storage is descriptor-anchored: the output directory and the work parent are opened
+        # component by component without following symlinks and must not be rearrangeable by
+        # other users; the private work directory is created and opened relative to its
+        # parent's descriptor, and every file in it is reached through held descriptors.
         _make_output_dirs(out_image.parent)
-        check_output_dir(out_image.parent)
-        work = Path(tempfile.mkdtemp(prefix="hermetic-rootfs-", dir=work_parent))
-        tar_path = work / "rootfs.tar"
+        out_dir_fd = open_dir_anchored(out_image.parent)
+        check_safe_dir_fd(out_dir_fd, "Output directory", out_image.parent)
+        work_parent_fd = open_dir_anchored(work_parent)
+        check_safe_dir_fd(work_parent_fd, "Work directory parent", work_parent)
+        work_name = f"hermetic-rootfs-{uuid.uuid4().hex}"
+        os.mkdir(work_name, 0o700, dir_fd=work_parent_fd)
+        work_fd = os.open(work_name, _DIR_OPEN_FLAGS, dir_fd=work_parent_fd)
+        work_st = os.fstat(work_fd)
+        work_ident = (work_st.st_dev, work_st.st_ino)
+        check_private_dir_fd(work_fd, work_parent / work_name)
 
         # 1-2. Walk the source once: TR-SEAL-8 clean-up, special files skipped, caps enforced
-        scan = write_rootfs_tar(src_fd, tar_path, mtime_ceiling=source_date_epoch, limits=limits)
+        scan = write_rootfs_tar(
+            src_fd, "rootfs.tar", mtime_ceiling=source_date_epoch, limits=limits, dir_fd=work_fd
+        )
+        tar_fd = os.open("rootfs.tar", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=work_fd)
 
         # 3. Size calculation and inode demand
         plan = plan_image(scan, size_mib)
-        require_free_space(work, plan.required_bytes + FREE_SPACE_MARGIN_BYTES, "ext4 image")
-        if os.stat(work).st_dev != os.stat(out_image.parent).st_dev:
-            require_free_space(out_image.parent, plan.required_bytes + FREE_SPACE_MARGIN_BYTES, "published image")
+        require_free_space(work_fd, plan.required_bytes + FREE_SPACE_MARGIN_BYTES, "ext4 image")
+        if work_st.st_dev != os.fstat(out_dir_fd).st_dev:
+            require_free_space(out_dir_fd, plan.required_bytes + FREE_SPACE_MARGIN_BYTES, "published image")
 
-        # The image lives in the private 0700 work directory; its descriptor is held until publication.
-        image_path = work / "rootfs.img"
-        image_fd = os.open(image_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        # The image is created in the private work directory; mke2fs and sealcheck reach it only
+        # through the inherited descriptor (/proc/self/fd/N), never by a pathname that could be
+        # redirected, and it is hashed and published from the same held descriptor.
+        image_fd = os.open(
+            "rootfs.img", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=work_fd
+        )
 
         # 4. Build ext4 image (TR-SEAL-7) from the tar stream with a pinned config and options
-        cmd = mke2fs_command(mke2fs_bin, tar_path, image_path, plan, rootfs_uuid, hash_seed)
+        cmd = mke2fs_command(mke2fs_bin, _fd_path(tar_fd), _fd_path(image_fd), plan, rootfs_uuid, hash_seed)
         path_env = os.environ.get("PATH", "/bin:/usr/bin:/sbin:/usr/sbin")
         if "/sbin" not in path_env:
             path_env = f"{path_env}:/sbin:/usr/sbin"
@@ -1156,19 +1212,20 @@ def build_rootfs(
             "SOURCE_DATE_EPOCH": str(source_date_epoch),
             "E2FSPROGS_FAKE_TIME": str(source_date_epoch),
         }
-        build_proc = _run(cmd, "MKE2FS_BUILD", env=mke2fs_env)
+        build_proc = _run(cmd, "MKE2FS_BUILD", env=mke2fs_env, pass_fds=(tar_fd, image_fd))
         if build_proc.returncode != 0:
             raise RuntimeError(
                 f"mke2fs failed with exit code {build_proc.returncode}: {build_proc.stderr.strip()}"
             )
-        _require_same_file(image_path, image_fd, "during mke2fs")
+        _require_regular_fd(image_fd, "after mke2fs")
 
         # 5. Guard (D4) - run the pinned sealcheck descriptor against the image BEFORE publication
         sc_proc = sealcheck.run(
-            ["d4-image", "--image", str(image_path), "--t-clock", t_clock_str, "--format", "json"],
+            ["d4-image", "--image", _fd_path(image_fd), "--t-clock", t_clock_str, "--format", "json"],
             "SEALCHECK_D4",
+            pass_fds=(image_fd,),
         )
-        _require_same_file(image_path, image_fd, "during the D4 check")
+        _require_regular_fd(image_fd, "after the D4 check")
 
         if sc_proc.returncode == 2:
             findings = []
@@ -1187,7 +1244,7 @@ def build_rootfs(
         # 6. Result metadata from the held descriptor, then publish that same inode
         sha256_hex = _sha256_fd(image_fd)
         size_bytes = os.fstat(image_fd).st_size
-        _publish(image_fd, image_path, out_image)
+        _publish(image_fd, work_fd, "rootfs.img", out_dir_fd, out_image.name)
 
         return {
             "image": str(out_image),
@@ -1209,10 +1266,22 @@ def build_rootfs(
             "d4": "pass",
         }
     finally:
-        if image_fd >= 0:
-            os.close(image_fd)
+        for fd in (image_fd, tar_fd):
+            if fd >= 0:
+                os.close(fd)
         if sealcheck is not None:
             sealcheck.close()
         os.close(src_fd)
-        if work is not None:
-            rmtree_force(work)
+        if work_fd >= 0:
+            os.close(work_fd)
+        if work_ident is not None and work_name is not None and work_parent_fd >= 0:
+            # Remove only our own work directory: if the entry was substituted, leave it alone.
+            try:
+                entry = os.stat(work_name, dir_fd=work_parent_fd, follow_symlinks=False)
+                if stat.S_ISDIR(entry.st_mode) and (entry.st_dev, entry.st_ino) == work_ident:
+                    remove_tree_at(work_parent_fd, work_name)
+            except OSError:
+                pass
+        for fd in (work_parent_fd, out_dir_fd):
+            if fd >= 0:
+                os.close(fd)

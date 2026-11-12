@@ -647,3 +647,43 @@ def test_ancestor_swapped_for_symlink_is_never_followed(tmp_path: Path) -> None:
 
     assert repo_sealer.chmod_nofollow(tree / "sub" / "file", 0o777) is False
     assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
+
+
+def test_clean_directory_ancestor_swapped_during_cleanup_stays_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prior-check 2, item 9: after _clean_directory has listed the directory, an ancestor is
+    swapped for a symlink to an outside tree with the same layout. The recursive removal must
+    stay on the directory it opened; the outside subdirectory and its files survive."""
+    anchor = tmp_path / "a"
+    dest = anchor / "dest"
+    (dest / "sub" / "deeper").mkdir(parents=True)
+    (dest / "sub" / "file").write_text("inside")
+    (dest / "sub" / "deeper" / "file2").write_text("inside")
+
+    outside = tmp_path / "outside"
+    (outside / "dest" / "sub").mkdir(parents=True)
+    victim = outside / "dest" / "sub" / "precious"
+    victim.write_text("outside data\n")
+    os.chmod(victim, 0o644)
+
+    dest_ino = os.lstat(dest).st_ino
+    real_scandir = os.scandir
+    swapped: list[bool] = []
+
+    def swapping_scandir(arg=".", *args, **kwargs):
+        result = real_scandir(arg, *args, **kwargs)
+        if not swapped and isinstance(arg, int) and os.fstat(arg).st_ino == dest_ino:
+            swapped.append(True)
+            os.rename(anchor, tmp_path / "a-real")
+            anchor.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(os, "scandir", swapping_scandir)
+    _clean_directory(dest)
+    monkeypatch.undo()
+
+    assert swapped, "the swap hook did not run"
+    assert victim.read_text() == "outside data\n", "removal followed the swapped ancestor"
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o644
+    assert list((tmp_path / "a-real" / "dest").iterdir()) == [], "the real directory was not cleaned"
