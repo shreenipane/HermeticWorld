@@ -367,47 +367,82 @@ pub fn pre_validate_raw_json(val: &serde_json::Value) -> Result<(), GatewayError
         }
     }
 
-    // Recursively check image and document sources for url or file_id
-    check_sources_recursive(val)?;
+    // Check protocol content-block locations for url or file_id sources
+    check_protocol_sources(val)?;
 
     Ok(())
 }
 
-fn check_sources_recursive(val: &serde_json::Value) -> Result<(), GatewayError> {
+fn check_block_source(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GatewayError> {
+    if let Some(block_type) = map.get("type").and_then(|t| t.as_str()) {
+        if block_type == "image" || block_type == "document" {
+            if let Some(source) = map.get("source").and_then(|s| s.as_object()) {
+                let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if source_type == "url" {
+                    return Err(GatewayError::InvalidRequest(format!(
+                        "URL {block_type} sources are forbidden; only base64 is permitted"
+                    )));
+                }
+                if source_type == "file_id" || source_type == "file" {
+                    return Err(GatewayError::InvalidRequest(format!(
+                        "File-ID {block_type} sources are forbidden; only base64 is permitted"
+                    )));
+                }
+                if source_type != "base64" {
+                    return Err(GatewayError::InvalidRequest(format!(
+                        "Invalid {block_type} source type '{source_type}': only base64 is permitted"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_content_blocks(val: &serde_json::Value) -> Result<(), GatewayError> {
     match val {
-        serde_json::Value::Object(map) => {
-            if let Some(block_type) = map.get("type").and_then(|t| t.as_str()) {
-                if block_type == "image" || block_type == "document" {
-                    if let Some(source) = map.get("source").and_then(|s| s.as_object()) {
-                        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if source_type == "url" {
-                            return Err(GatewayError::InvalidRequest(format!(
-                                "URL {block_type} sources are forbidden; only base64 is permitted"
-                            )));
-                        }
-                        if source_type == "file_id" || source_type == "file" {
-                            return Err(GatewayError::InvalidRequest(format!(
-                                "File-ID {block_type} sources are forbidden; only base64 is permitted"
-                            )));
-                        }
-                        if source_type != "base64" {
-                            return Err(GatewayError::InvalidRequest(format!(
-                                "Invalid {block_type} source type '{source_type}': only base64 is permitted"
-                            )));
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(map) = item.as_object() {
+                    check_block_source(map)?;
+                    if map.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        if let Some(inner_content) = map.get("content") {
+                            check_content_blocks(inner_content)?;
                         }
                     }
                 }
             }
-            for v in map.values() {
-                check_sources_recursive(v)?;
-            }
         }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                check_sources_recursive(v)?;
+        serde_json::Value::Object(map) => {
+            check_block_source(map)?;
+            if map.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                if let Some(inner_content) = map.get("content") {
+                    check_content_blocks(inner_content)?;
+                }
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn check_protocol_sources(val: &serde_json::Value) -> Result<(), GatewayError> {
+    let Some(obj) = val.as_object() else {
+        return Ok(());
+    };
+    if let Some(messages) = obj.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if let Some(msg_obj) = msg.as_object() {
+                if let Some(content) = msg_obj.get("content") {
+                    check_content_blocks(content)?;
+                }
+            }
+        }
+    }
+    if let Some(system) = obj.get("system") {
+        check_content_blocks(system)?;
     }
     Ok(())
 }
