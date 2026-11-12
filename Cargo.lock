@@ -542,6 +542,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-netvm-dns"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hermetic-sealcheck"
 version = "0.1.0"
 dependencies = [
