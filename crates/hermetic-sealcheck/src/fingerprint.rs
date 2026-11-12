@@ -3287,6 +3287,64 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
+fn add_text_to_baseline(
+    content: &str,
+    base_line_counts: &mut HashMap<String, usize>,
+    base_line_hashes: &mut HashSet<String>,
+    base_window_hashes: &mut HashSet<String>,
+    base_binary_tokens: &mut HashSet<String>,
+    base_winnow_hashes: &mut HashSet<u64>,
+) {
+    let file_lines: Vec<&str> = content.lines().collect();
+
+    // Line hashes & counts
+    for line in &file_lines {
+        if let Some(norm) = normalize_line(line) {
+            *base_line_counts.entry(norm.clone()).or_insert(0) += 1;
+            base_line_hashes.insert(sha256_hex(norm.as_bytes()));
+        }
+    }
+
+    // Window hashes
+    for i in 0..file_lines.len() {
+        if i + 1 < file_lines.len() {
+            let w = [file_lines[i], file_lines[i + 1]];
+            if !w.iter().all(|l| normalize_line(l).is_none()) {
+                let norm_w = w
+                    .iter()
+                    .map(|l| clean_line(l, false))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+            }
+        }
+        if i + 2 < file_lines.len() {
+            let w = [file_lines[i], file_lines[i + 1], file_lines[i + 2]];
+            if !w.iter().all(|l| normalize_line(l).is_none()) {
+                let norm_w = w
+                    .iter()
+                    .map(|l| clean_line(l, false))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
+            }
+        }
+    }
+
+    // Winnow hashes and binary tokens for base tree
+    let base_tokens = tokenize(content);
+    for tok in &base_tokens {
+        base_binary_tokens.insert(tok.text.clone());
+        if let Some(literal_content) = crate::binary::extract_string_literal_content(&tok.text) {
+            base_binary_tokens.insert(literal_content);
+        }
+    }
+    let base_token_texts: Vec<String> = base_tokens.into_iter().map(|t| t.text).collect();
+    for hash in kgram_hashes(&base_token_texts) {
+        base_winnow_hashes.insert(hash);
+    }
+}
+
 fn finish_fingerprint_set(
     candidate_hunks: Vec<CandidateHunk>,
     base_tree_root: &Path,
@@ -3380,60 +3438,51 @@ fn finish_fingerprint_set(
                             }
                         }
                     }
+
+                    // Decode binary files the way the scanner does:
+                    // 1) control-byte separated lossy UTF-8
+                    // 2) both UTF-16 views
+                    // so every text unit the scanner can see at the base is also subtracted here.
+                    let separated: Vec<u8> = bytes
+                        .iter()
+                        .map(|&b| {
+                            if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                                b'\n'
+                            } else {
+                                b
+                            }
+                        })
+                        .collect();
+                    add_text_to_baseline(
+                        &String::from_utf8_lossy(&separated),
+                        &mut base_line_counts,
+                        &mut base_line_hashes,
+                        &mut base_window_hashes,
+                        &mut base_binary_tokens,
+                        &mut base_winnow_hashes,
+                    );
+                    for view in crate::binary::utf16_text_views(&bytes) {
+                        for run in view.split('\n').filter(|run| run.chars().count() >= 6) {
+                            base_binary_tokens.insert(run.to_string());
+                        }
+                        add_text_to_baseline(
+                            &view,
+                            &mut base_line_counts,
+                            &mut base_line_hashes,
+                            &mut base_window_hashes,
+                            &mut base_binary_tokens,
+                            &mut base_winnow_hashes,
+                        );
+                    }
                 } else {
-                    // Decode the way the scanner does (lossy UTF-8, binary skipped), so every text unit the scanner can see at the base is also subtracted here.
-                    let content = String::from_utf8_lossy(&bytes);
-                    let file_lines: Vec<&str> = content.lines().collect();
-
-                    // Line hashes & counts
-                    for line in &file_lines {
-                        if let Some(norm) = normalize_line(line) {
-                            *base_line_counts.entry(norm.clone()).or_insert(0) += 1;
-                            base_line_hashes.insert(sha256_hex(norm.as_bytes()));
-                        }
-                    }
-
-                    // Window hashes
-                    for i in 0..file_lines.len() {
-                        if i + 1 < file_lines.len() {
-                            let w = [file_lines[i], file_lines[i + 1]];
-                            if !w.iter().all(|l| normalize_line(l).is_none()) {
-                                let norm_w = w
-                                    .iter()
-                                    .map(|l| clean_line(l, false))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
-                            }
-                        }
-                        if i + 2 < file_lines.len() {
-                            let w = [file_lines[i], file_lines[i + 1], file_lines[i + 2]];
-                            if !w.iter().all(|l| normalize_line(l).is_none()) {
-                                let norm_w = w
-                                    .iter()
-                                    .map(|l| clean_line(l, false))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                base_window_hashes.insert(sha256_hex(norm_w.as_bytes()));
-                            }
-                        }
-                    }
-
-                    // Winnow hashes and binary tokens for base tree
-                    let base_tokens = tokenize(&content);
-                    for tok in &base_tokens {
-                        base_binary_tokens.insert(tok.text.clone());
-                        if let Some(literal_content) =
-                            crate::binary::extract_string_literal_content(&tok.text)
-                        {
-                            base_binary_tokens.insert(literal_content);
-                        }
-                    }
-                    let base_token_texts: Vec<String> =
-                        base_tokens.into_iter().map(|t| t.text).collect();
-                    for hash in kgram_hashes(&base_token_texts) {
-                        base_winnow_hashes.insert(hash);
-                    }
+                    add_text_to_baseline(
+                        &String::from_utf8_lossy(&bytes),
+                        &mut base_line_counts,
+                        &mut base_line_hashes,
+                        &mut base_window_hashes,
+                        &mut base_binary_tokens,
+                        &mut base_winnow_hashes,
+                    );
                 }
             } else {
                 let mut reader = std::io::BufReader::new(file.take(allowed_bytes));

@@ -312,3 +312,61 @@ fn test_symlink_to_outside_leak_is_scanned() {
         );
     }
 }
+
+#[test]
+fn test_regression_cr1_finding2_base_binary_subtracted_from_text_baseline() {
+    let base_dir = tempdir().expect("tempdir");
+    let mut binary_content = vec![0u8; 16];
+    let lines = "distinctive_shared_line_one = 1001;\ndistinctive_shared_line_two = 2002;\ndistinctive_shared_line_three = 3003;\n";
+    binary_content.extend_from_slice(lines.as_bytes());
+    fs::write(base_dir.path().join("libsample.so"), &binary_content).expect("write binary");
+
+    let patch = format!(
+        "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,4 @@\n dummy_line = 0\n+{}\n+{}\n+{}\n",
+        "distinctive_shared_line_one = 1001;",
+        "distinctive_shared_line_two = 2002;",
+        "distinctive_shared_line_three = 3003;"
+    );
+
+    let fp = FingerprintSet::from_task(&patch, "", base_dir.path()).expect("fingerprint set");
+
+    let scan_dir = tempdir().expect("tempdir");
+    fs::write(scan_dir.path().join("libsample.so"), &binary_content).expect("write scan binary");
+
+    let findings = scan_tree(scan_dir.path(), &fp, &ScanOptions::default());
+    let gate_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .collect();
+    assert!(
+        gate_findings.is_empty(),
+        "base tree binary lines must be subtracted by baseline, but got gate findings: {gate_findings:#?}"
+    );
+
+    // Also verify UTF-16 encoded lines in base tree binary file are subtracted
+    let utf16_lines =
+        "distinctive_utf16_base_line_one = 4004;\ndistinctive_utf16_base_line_two = 5005;\n";
+    let mut utf16_binary = vec![0u8; 8];
+    for u in utf16_lines.encode_utf16() {
+        utf16_binary.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(base_dir.path().join("libutf16.so"), &utf16_binary).expect("write utf16 binary");
+
+    let patch2 = format!(
+        "diff --git a/bar.py b/bar.py\n--- a/bar.py\n+++ b/bar.py\n@@ -1,1 +1,3 @@\n dummy_line = 0\n+{}\n+{}\n",
+        "distinctive_utf16_base_line_one = 4004;",
+        "distinctive_utf16_base_line_two = 5005;"
+    );
+
+    let fp2 = FingerprintSet::from_task(&patch2, "", base_dir.path()).expect("fingerprint set 2");
+    fs::write(scan_dir.path().join("libutf16.so"), &utf16_binary).expect("write scan utf16 binary");
+    let findings2 = scan_tree(scan_dir.path(), &fp2, &ScanOptions::default());
+    let gate_findings2: Vec<_> = findings2
+        .iter()
+        .filter(|f| f.severity == Severity::Gate)
+        .collect();
+    assert!(
+        gate_findings2.is_empty(),
+        "base tree utf16 binary lines must be subtracted by baseline: {gate_findings2:#?}"
+    );
+}
