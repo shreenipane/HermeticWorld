@@ -3330,3 +3330,291 @@ fn test_root_anchored_write_refuses_intermediate_symlink() {
             .expect("idempotent append")
     );
 }
+
+// =========================================================================
+// Prior-check 2026-11-12 regressions (items 8 and 4)
+// =========================================================================
+
+/// Item 8: the exported descriptor-relative helpers accept only one plain
+/// file-name component, so a root descriptor plus "link/sub/bundle.pem" (link
+/// pointing outside) can neither write nor read through the symlink.
+#[test]
+fn test_descriptor_helpers_refuse_multi_component_names() {
+    use std::os::unix::io::AsRawFd;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let outside = temp_dir.path().join("outside");
+    fs::create_dir_all(outside.join("sub")).expect("create outside/sub");
+    let outside_bundle = outside.join("sub/bundle.pem");
+    fs::write(&outside_bundle, b"OUTSIDE_BUNDLE\n").expect("write outside bundle");
+    fs::set_permissions(&outside_bundle, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let rootfs = temp_dir.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("real")).expect("create real");
+    std::os::unix::fs::symlink(&outside, rootfs.join("link")).expect("symlink link");
+    let root = open_dir_handle(&rootfs).expect("open rootfs");
+    let owner = current_owner();
+
+    let names = [
+        "link/sub/bundle.pem",
+        "link/sub/new.pem",
+        "real/../link/sub/bundle.pem",
+        "/link/sub/bundle.pem",
+        "link/",
+        "..",
+        ".",
+        "",
+    ];
+    for name in names {
+        let write = hermetic_trust::atomic_write_preserving_handle(
+            &root,
+            name,
+            b"REPLACED\n",
+            NEW_FILE_MODE,
+            owner,
+        );
+        assert!(
+            write.is_err(),
+            "atomic_write_preserving_handle accepted {:?}",
+            name
+        );
+        let read = hermetic_trust::read_file_capped_from_parent(&root, name, 1024);
+        assert!(
+            read.is_err(),
+            "read_file_capped_from_parent accepted {:?}",
+            name
+        );
+        assert!(
+            hermetic_trust::open_child_dir(root.as_raw_fd(), name).is_err(),
+            "open_child_dir accepted {:?}",
+            name
+        );
+    }
+    assert!(
+        hermetic_trust::open_child_dir(root.as_raw_fd(), "link/sub").is_err(),
+        "open_child_dir followed an intermediate symlink"
+    );
+    assert!(
+        hermetic_trust::open_parent_dir_handle(
+            &rootfs,
+            std::path::Path::new("link/sub/bundle.pem")
+        )
+        .is_err(),
+        "open_parent_dir_handle followed an intermediate symlink"
+    );
+
+    assert_eq!(
+        fs::read(&outside_bundle).expect("read outside"),
+        b"OUTSIDE_BUNDLE\n"
+    );
+    assert_eq!(
+        fs::metadata(&outside_bundle)
+            .expect("outside meta")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(
+        fs::read_dir(outside.join("sub"))
+            .expect("read outside/sub")
+            .count(),
+        1,
+        "outside directory gained entries"
+    );
+
+    // A single plain name still works through a validated parent descriptor.
+    let real = hermetic_trust::open_child_dir(root.as_raw_fd(), "real").expect("open real");
+    hermetic_trust::atomic_write_preserving_handle(&real, "ok.pem", b"OK\n", NEW_FILE_MODE, owner)
+        .expect("single component write");
+    assert_eq!(
+        hermetic_trust::read_file_capped_from_parent(&real, "ok.pem", 1024).expect("read ok"),
+        b"OK\n"
+    );
+}
+
+/// Item 4: with a fixed guest owner that differs from the sealing process, the
+/// ownership step for every created directory, anchor and fallback bundle is
+/// asked for exactly that owner and the fixed mode (recorded through the
+/// thread-local ownership path instead of fchown, which needs privilege).
+#[test]
+fn test_ownership_steps_use_fixed_guest_owner_distinct_from_process() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("recorded-owner-world", 37);
+    let process = current_owner();
+    let guest = GuestOwner {
+        uid: if process.uid == 4242 { 4243 } else { 4242 },
+        gid: if process.gid == 4343 { 4344 } else { 4343 },
+    };
+    assert_ne!((guest.uid, guest.gid), (process.uid, process.gid));
+
+    let rootfs = temp_dir.path().join("rootfs");
+    build_creation_rootfs(&rootfs);
+    let guard = hermetic_trust::record_ownership_guard();
+    let report = install_ca_with_options(
+        &rootfs,
+        &ca.cert_pem,
+        &InstallOptions {
+            owner: guest,
+            report_path: None,
+        },
+    )
+    .expect("install with recorded ownership");
+    let records = guard.records();
+    drop(guard);
+
+    use hermetic_trust::OwnershipTarget;
+    let named = |target: OwnershipTarget| -> Vec<(String, u32, u32, Option<u32>)> {
+        let mut v: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == target)
+            .map(|r| (r.name.to_string_lossy().to_string(), r.uid, r.gid, r.mode))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        named(OwnershipTarget::Probe),
+        vec![(String::new(), guest.uid, guest.gid, None)],
+        "guest owner must be probed once before mutation"
+    );
+    assert_eq!(
+        named(OwnershipTarget::NewDirectory),
+        vec![
+            (
+                "certs".to_string(),
+                guest.uid,
+                guest.gid,
+                Some(NEW_DIR_MODE)
+            ),
+            ("ssl".to_string(), guest.uid, guest.gid, Some(NEW_DIR_MODE)),
+        ],
+        "created parent directories must get the guest owner and 0755"
+    );
+    assert_eq!(
+        named(OwnershipTarget::NewFile),
+        vec![
+            (
+                "ca-certificates.crt".to_string(),
+                guest.uid,
+                guest.gid,
+                Some(NEW_FILE_MODE)
+            ),
+            (
+                "hermetic-world-ca.crt".to_string(),
+                guest.uid,
+                guest.gid,
+                Some(NEW_FILE_MODE)
+            ),
+            (
+                "hermetic-world-ca.pem".to_string(),
+                guest.uid,
+                guest.gid,
+                Some(NEW_FILE_MODE)
+            ),
+        ],
+        "created anchors and fallback bundle must get the guest owner and 0644"
+    );
+    assert!(named(OwnershipTarget::ExistingFile).is_empty());
+    assert!(records
+        .iter()
+        .all(|r| (r.uid, r.gid) != (process.uid, process.gid)));
+    assert_eq!(
+        report.env_defaults.get("SSL_CERT_FILE").map(String::as_str),
+        Some("/etc/ssl/certs/ca-certificates.crt")
+    );
+
+    // Modes are still applied through descriptors.
+    for rel in CREATED_ENTRIES {
+        let meta = fs::symlink_metadata(rootfs.join(rel)).expect("created entry");
+        let expected = if meta.is_dir() {
+            NEW_DIR_MODE
+        } else {
+            NEW_FILE_MODE
+        };
+        assert_eq!(meta.mode() & 0o7777, expected, "{} mode", rel);
+    }
+}
+
+/// Item 4: inside a user namespace with several mapped ids, the install runs as
+/// namespace root and creates entries for guest owner 1:1, which differs from
+/// the sealing identity; on-disk ownership and modes are checked under umask
+/// 077. Skipped (with a message) when no such namespace can be created.
+#[test]
+fn test_created_entries_owned_by_guest_owner_in_user_namespace() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let probe_file = temp_dir.path().join("userns-probe");
+    let variants: [&[&str]; 2] = [&["--user", "--map-root-user", "--map-auto"], &["-Ur"]];
+    let mut chosen: Option<&[&str]> = None;
+    for flags in variants {
+        fs::write(&probe_file, b"").expect("write probe");
+        let child = Command::new("unshare")
+            .args(flags)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("chown 1:1 \"$0\" && id -u")
+            .arg(&probe_file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(child) = child else { break };
+        let out = wait_child_with_timeout(child, std::time::Duration::from_secs(30));
+        let inner_uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !inner_uid.is_empty() && inner_uid != "1" {
+            chosen = Some(flags);
+            break;
+        }
+    }
+    let Some(flags) = chosen else {
+        eprintln!(
+            "SKIPPED test_created_entries_owned_by_guest_owner_in_user_namespace: \
+             no user namespace with ids other than root mapped is available \
+             (unshare/newuidmap missing or unprivileged user namespaces restricted)"
+        );
+        return;
+    };
+
+    let ca = mint_test_ca("userns-owner-world", 38);
+    let ca_path = temp_dir.path().join("CA.pem");
+    fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+    let rootfs = temp_dir.path().join("rootfs");
+    build_creation_rootfs(&rootfs);
+
+    let script = "umask 077 && \"$0\" install --rootfs \"$1\" --ca-cert \"$2\" \
+                  --guest-uid 1 --guest-gid 1 >/dev/null && cd \"$1\" && \
+                  stat -c '%u %g %a %n' \"$3\" \"$4\" \"$5\" \"$6\" \"$7\"";
+    let child = Command::new("unshare")
+        .args(flags)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_hermetic-trust"))
+        .arg(&rootfs)
+        .arg(&ca_path)
+        .args(CREATED_ENTRIES)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn install in user namespace");
+    let out = wait_child_with_timeout(child, std::time::Duration::from_secs(120));
+    assert!(
+        out.status.success(),
+        "install in user namespace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        CREATED_ENTRIES.len(),
+        "stat output: {}",
+        stdout
+    );
+    for line in lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(&parts[..2], &["1", "1"], "not owned by guest 1:1: {}", line);
+        let is_dir = !parts[3].ends_with(".crt") && !parts[3].ends_with(".pem");
+        let expected = if is_dir { "755" } else { "644" };
+        assert_eq!(parts[2], expected, "mode under umask 077: {}", line);
+    }
+}

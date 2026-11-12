@@ -285,6 +285,53 @@ thread_local! {
     static THREAD_CHOWN_FAILURE: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
     static THREAD_BEFORE_USE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static THREAD_BEFORE_DIR_ENUM_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static THREAD_OWNERSHIP_RECORDS: std::cell::RefCell<Option<Vec<OwnershipRecord>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What an ownership step was applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipTarget {
+    /// Host probe run before mutation to check the guest owner is settable.
+    Probe,
+    /// Directory created in the rootfs.
+    NewDirectory,
+    /// File (anchor or bundle) created in the rootfs.
+    NewFile,
+    /// Replacement of an existing file, keeping its owner and mode.
+    ExistingFile,
+}
+
+/// One ownership step as recorded by [`record_ownership_guard`]: the owner and
+/// mode the installer asked for, and the name of the entry (empty for the probe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipRecord {
+    pub target: OwnershipTarget,
+    pub name: OsString,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: Option<u32>,
+}
+
+/// Thread-local ownership recorder for tests. While the guard lives, each
+/// ownership step on this thread is recorded instead of performing fchown
+/// (an injected failure from [`set_chown_failure_guard`] still applies first);
+/// modes are still set through descriptors.
+pub struct OwnershipRecordGuard;
+impl OwnershipRecordGuard {
+    /// Ownership steps recorded so far, in order.
+    pub fn records(&self) -> Vec<OwnershipRecord> {
+        THREAD_OWNERSHIP_RECORDS.with(|c| c.borrow().clone().unwrap_or_default())
+    }
+}
+impl Drop for OwnershipRecordGuard {
+    fn drop(&mut self) {
+        THREAD_OWNERSHIP_RECORDS.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub fn record_ownership_guard() -> OwnershipRecordGuard {
+    THREAD_OWNERSHIP_RECORDS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    OwnershipRecordGuard
 }
 
 pub struct ChownFailureGuard;
@@ -386,12 +433,28 @@ pub fn open_dir_handle(path: &Path) -> Result<fs::File, TrustError> {
     options.open(path).map_err(TrustError::Io)
 }
 
+/// Validate that `name` is exactly one plain file-name component: not empty, no
+/// `/`, not `.` or `..`. Descriptor-relative helpers only accept such names, so
+/// a lookup can never traverse an intermediate (possibly symlinked) directory.
+fn single_component(name: &OsStr) -> Result<&OsStr, TrustError> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+        return Err(TrustError::Symlink(format!(
+            "'{}' is not a single file-name component",
+            encode_path_lossless(Path::new(name))
+        )));
+    }
+    Ok(name)
+}
+
 /// Open a child directory through an existing directory handle without following symlinks.
+/// `comp` must be a single file-name component.
 pub fn open_child_dir<P: AsRef<std::ffi::OsStr> + ?Sized>(
     parent_fd: std::os::unix::io::RawFd,
     comp: &P,
 ) -> Result<fs::File, TrustError> {
-    let comp = comp.as_ref();
+    let comp = single_component(comp.as_ref())?;
     let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd)).join(comp);
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -489,12 +552,37 @@ fn chown_failure_injected() -> bool {
 }
 
 /// Set ownership through an open descriptor (never through a path).
-fn set_owner_fd(file: &fs::File, uid: u32, gid: u32) -> Result<(), TrustError> {
+/// `target`, `name` and `mode` describe the step for the test recorder.
+fn set_owner_fd(
+    file: &fs::File,
+    uid: u32,
+    gid: u32,
+    target: OwnershipTarget,
+    name: &OsStr,
+    mode: Option<u32>,
+) -> Result<(), TrustError> {
     if chown_failure_injected() {
         return Err(TrustError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "forced chown failure for test: Operation not permitted",
         )));
+    }
+    let recorded = THREAD_OWNERSHIP_RECORDS.with(|c| {
+        if let Some(records) = c.borrow_mut().as_mut() {
+            records.push(OwnershipRecord {
+                target,
+                name: name.to_os_string(),
+                uid,
+                gid,
+                mode,
+            });
+            true
+        } else {
+            false
+        }
+    });
+    if recorded {
+        return Ok(());
     }
     std::os::unix::fs::fchown(file, Some(uid), Some(gid)).map_err(|e| {
         TrustError::Io(std::io::Error::new(
@@ -509,7 +597,14 @@ fn set_owner_fd(file: &fs::File, uid: u32, gid: u32) -> Result<(), TrustError> {
 /// The probe is an unnamed host temporary file, so the rootfs is not touched.
 fn verify_guest_owner_settable(owner: GuestOwner) -> Result<(), TrustError> {
     let probe = tempfile::tempfile().map_err(TrustError::Io)?;
-    set_owner_fd(&probe, owner.uid, owner.gid)
+    set_owner_fd(
+        &probe,
+        owner.uid,
+        owner.gid,
+        OwnershipTarget::Probe,
+        OsStr::new(""),
+        None,
+    )
 }
 
 /// Create directory `name` under `parent` and give it the guest owner and
@@ -526,7 +621,14 @@ fn create_dir_in(
     fs::DirBuilder::new().mode(0o700).create(&path)?;
     let res = (|| -> Result<fs::File, TrustError> {
         let dir = open_child_dir(parent.as_raw_fd(), name)?;
-        set_owner_fd(&dir, owner.uid, owner.gid)?;
+        set_owner_fd(
+            &dir,
+            owner.uid,
+            owner.gid,
+            OwnershipTarget::NewDirectory,
+            name,
+            Some(NEW_DIR_MODE),
+        )?;
         dir.set_permissions(fs::Permissions::from_mode(NEW_DIR_MODE))?;
         Ok(dir)
     })();
@@ -573,6 +675,7 @@ fn ensure_parent_dirs(
 }
 
 /// Read a file up to `cap` bytes through a parent directory handle.
+/// `file_name` must be a single file-name component.
 /// Prevents symlink following and FIFO blocking, validating the opened descriptor.
 pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
     parent_dir: &fs::File,
@@ -583,7 +686,7 @@ pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let file_name = file_name.as_ref();
+    let file_name = single_component(file_name.as_ref())?;
     let proc_path =
         PathBuf::from(format!("/proc/self/fd/{}", parent_dir.as_raw_fd())).join(file_name);
     let mut options = fs::OpenOptions::new();
@@ -637,6 +740,8 @@ pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
 /// anchored to the directory handle, sets permissions and ownership through descriptors,
 /// flushes, and replaces atomically through the handle.
 ///
+/// `file_name` must be a single file-name component.
+///
 /// An existing target keeps its owner and mode. A new target gets `new_owner`
 /// and exactly `new_file_mode` (independent of the umask); failure to set either
 /// aborts the write without creating the target.
@@ -651,7 +756,7 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let file_name = file_name.as_ref();
+    let file_name = single_component(file_name.as_ref())?;
     let parent_fd = parent_dir.as_raw_fd();
     let target_proc_path = proc_child(parent_fd, file_name);
 
@@ -740,14 +845,28 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
                             || target_uid != temp_meta.uid()
                             || target_gid != temp_meta.gid()
                         {
-                            set_owner_fd(&temp_file, target_uid, target_gid)?;
+                            set_owner_fd(
+                                &temp_file,
+                                target_uid,
+                                target_gid,
+                                OwnershipTarget::ExistingFile,
+                                file_name,
+                                Some(meta.mode() & 0o7777),
+                            )?;
                         }
 
                         // Restore permissions AFTER ownership changes so special mode bits are preserved
                         temp_file.set_permissions(meta.permissions())?;
                     } else {
                         // New entry: explicit guest owner and deterministic mode.
-                        set_owner_fd(&temp_file, new_owner.uid, new_owner.gid)?;
+                        set_owner_fd(
+                            &temp_file,
+                            new_owner.uid,
+                            new_owner.gid,
+                            OwnershipTarget::NewFile,
+                            file_name,
+                            Some(new_file_mode),
+                        )?;
                         temp_file.set_permissions(fs::Permissions::from_mode(new_file_mode))?;
                     }
                     temp_file.sync_all()?;
