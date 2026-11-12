@@ -1015,3 +1015,160 @@ def test_regression_snapshot_entry_cap_separated_from_task_enumeration(tmp_path,
         d.snapshot_tree_safely(extra_dir, tmp_path / "over_cap_dst")
 
 
+def test_regression_symlink_confinement_validated_against_completed_snapshot(task_world, tmp_path, monkeypatch):
+    """Defect 1: validate symlinks against completed private snapshot; rejects concurrent link mutation before sealcheck."""
+    tasks, task, root, initial, binary = task_world
+
+    # Place canary in parent of root (tmp_path / "canary")
+    canary = tmp_path / "canary"
+    canary.write_text("CANARY_OUTSIDE_LEAK_SECRET\n", encoding="utf-8")
+
+    deep_dir = root / "dir" / "deep"
+    deep_dir.mkdir(parents=True, exist_ok=True)
+    inside_canary = root / "canary"
+    inside_canary.write_text("safe inside canary\n", encoding="utf-8")
+
+    link_b = root / "b"
+    link_b.symlink_to("dir/deep")
+
+    link_a = root / "a"
+    link_a.symlink_to("b/../../canary")
+    backdate(root)
+
+    task_json_before = (task / "task.json").read_bytes()
+    statement_before = (task / "agent/problem_statement.md").read_bytes()
+    manifest_before = (task / "manifest.json").read_bytes()
+
+    canary_read = False
+    orig_open = open
+
+    def guarded_open(file, *args, **kwargs):
+        nonlocal canary_read
+        if str(canary) in str(file):
+            canary_read = True
+        return orig_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+
+    sealcheck_ran = False
+    orig_bounded_process = d.bounded_process
+
+    def spy_process(cmd, *args, **kwargs):
+        nonlocal sealcheck_ran
+        sealcheck_ran = True
+        return orig_bounded_process(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(d, "bounded_process", spy_process)
+
+    # Deterministically change 'b' to 'dir' between validation and copying
+    orig_symlink = os.symlink
+    changed = False
+
+    def race_symlink(src, dst, *args, **kwargs):
+        nonlocal changed
+        res = orig_symlink(src, dst, *args, **kwargs)
+        if not changed and Path(dst).name == "a":
+            link_b.unlink()
+            link_b.symlink_to("dir")
+            changed = True
+        return res
+
+    monkeypatch.setattr(os, "symlink", race_symlink)
+
+    with pytest.raises(d.DispositionsError, match="Escaping symlink rejected"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+
+    assert changed
+    assert not sealcheck_ran
+    assert not canary_read
+    assert (task / "task.json").read_bytes() == task_json_before
+    assert (task / "agent/problem_statement.md").read_bytes() == statement_before
+    assert (task / "manifest.json").read_bytes() == manifest_before
+
+
+def test_regression_queued_directory_substitution_rejected(task_world, monkeypatch):
+    """Defect 2: queued directory substitution after enumeration is rejected; task artifacts unchanged; no fd leak."""
+    tasks, task, root, initial, binary = task_world
+
+    task_json_before = (task / "task.json").read_bytes()
+    statement_before = (task / "agent/problem_statement.md").read_bytes()
+    manifest_before = (task / "manifest.json").read_bytes()
+
+    dir_a = root / "a"
+    dir_a.mkdir()
+    (dir_a / "leak.txt").write_text("LEAK_IN_A\n", encoding="utf-8")
+
+    dir_z = root / "z"
+    dir_z.mkdir()
+    (dir_z / "child.txt").write_text("clean_z\n", encoding="utf-8")
+    backdate(root)
+
+    def count_open_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    initial_fds = count_open_fds()
+
+    orig_open_descendant = d.open_safe_descendant
+    replaced = False
+
+    def hook_open_descendant(root_dir, rel_path, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and rel_path == ("z",):
+            shutil.rmtree(dir_a)
+            dir_a.mkdir()
+            (dir_a / "clean.txt").write_text("replacement\n", encoding="utf-8")
+            backdate(root)
+            replaced = True
+        return orig_open_descendant(root_dir, rel_path, *args, **kwargs)
+
+    monkeypatch.setattr(d, "open_safe_descendant", hook_open_descendant)
+
+    with pytest.raises(d.DispositionsError, match="Directory substituted or changed during traversal"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+
+    assert replaced
+    assert (task / "task.json").read_bytes() == task_json_before
+    assert (task / "agent/problem_statement.md").read_bytes() == statement_before
+    assert (task / "manifest.json").read_bytes() == manifest_before
+    assert count_open_fds() == initial_fds
+
+
+def test_regression_destination_utime_failure_fails_closed(task_world, monkeypatch):
+    """Defect 3: destination file utime failure fails closed with sanitized error; task artifacts unchanged."""
+    tasks, task, root, initial, binary = task_world
+
+    task_json_before = (task / "task.json").read_bytes()
+    statement_before = (task / "agent/problem_statement.md").read_bytes()
+    manifest_before = (task / "manifest.json").read_bytes()
+
+    orig_utime = os.utime
+    utime_failed = False
+
+    def failing_utime(path, *args, **kwargs):
+        nonlocal utime_failed
+        p_str = str(path)
+        if "disposition_config_" in p_str and (p_str.endswith(".py") or p_str.endswith(".txt") or p_str.endswith(".md")):
+            utime_failed = True
+            raise OSError("Injected destination file utime hardware fault")
+        return orig_utime(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "utime", failing_utime)
+
+    subprocess_executed = False
+    orig_bounded_process = d.bounded_process
+
+    def spy_process(cmd, *args, **kwargs):
+        nonlocal subprocess_executed
+        subprocess_executed = True
+        return orig_bounded_process(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(d, "bounded_process", spy_process)
+
+    with pytest.raises(d.DispositionsError, match="Failed to preserve file timestamp in snapshot"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+
+    assert utime_failed
+    assert not subprocess_executed
+    assert (task / "task.json").read_bytes() == task_json_before
+    assert (task / "agent/problem_statement.md").read_bytes() == statement_before
+    assert (task / "manifest.json").read_bytes() == manifest_before

@@ -568,24 +568,42 @@ MAX_SNAPSHOT_ENTRIES = 100000
 MAX_SYMLINK_HOPS = 32
 
 
-def open_safe_descendant(root_dir: SafeDirectory, rel_path: tuple[str, ...]) -> SafeDirectory:
-    """Open a descendant directory safely from root_dir, retaining only 1 open descriptor."""
+def open_safe_descendant(
+    root_dir: SafeDirectory,
+    rel_path: tuple[str, ...],
+    expected_identities: tuple[tuple[int, int], ...] | None = None,
+) -> SafeDirectory:
+    """Open a descendant directory safely from root_dir, retaining only 1 open descriptor
+    and verifying expected directory identities including all ancestors."""
     if not rel_path:
         new_fd = os.dup(root_dir.fd)
         obj = object.__new__(SafeDirectory)
         obj.fd = new_fd
         return obj
+    if expected_identities is not None and len(expected_identities) != len(rel_path):
+        raise DispositionsError("Identity chain length mismatch")
     cur_fd = os.dup(root_dir.fd)
     try:
-        for part in rel_path:
+        for idx, part in enumerate(rel_path):
             before = os.stat(part, dir_fd=cur_fd, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode):
                 raise DispositionsError("Symlink rejected or non-directory component")
+            if expected_identities is not None:
+                expected_id = expected_identities[idx]
+                if (before.st_dev, before.st_ino) != expected_id:
+                    raise DispositionsError("Directory substituted or changed during traversal")
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
-            after = os.fstat(next_fd)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            try:
+                after = os.fstat(next_fd)
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise DispositionsError("Directory changed during traversal")
+                if expected_identities is not None:
+                    expected_id = expected_identities[idx]
+                    if (after.st_dev, after.st_ino) != expected_id:
+                        raise DispositionsError("Directory substituted or changed during traversal")
+            except BaseException:
                 os.close(next_fd)
-                raise DispositionsError("Directory changed during traversal")
+                raise
             os.close(cur_fd)
             cur_fd = next_fd
         obj = object.__new__(SafeDirectory)
@@ -673,6 +691,36 @@ def verify_symlink_confined(root_fd: int, rel_path: tuple[str, ...], target: str
             break
 
 
+def validate_snapshot_symlinks(snap_path: Path) -> None:
+    """Validate every link against the completed private snapshot using bounded confined traversal."""
+    with SafeDirectory(snap_path) as root_dir:
+        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = [((), ())]
+        total_entries = 0
+        while stack:
+            rel_path, id_chain = stack.pop()
+            if len(rel_path) > MAX_PATH_COMPONENTS:
+                raise DispositionsError("Path component cap exceeded")
+            with open_safe_descendant(root_dir, rel_path, id_chain) as curr_dir:
+                names = curr_dir.names(cap=MAX_SNAPSHOT_ENTRIES)
+                for name in names:
+                    total_entries += 1
+                    if total_entries > MAX_SNAPSHOT_ENTRIES:
+                        raise DispositionsError("Snapshot entry count cap exceeded")
+                    try:
+                        info = os.stat(name, dir_fd=curr_dir.fd, follow_symlinks=False)
+                    except OSError as e:
+                        raise DispositionsError("Failed to stat directory entry during snapshot validation") from e
+                    if stat.S_ISLNK(info.st_mode):
+                        try:
+                            target = os.readlink(name, dir_fd=curr_dir.fd)
+                        except OSError as e:
+                            raise DispositionsError("Failed to readlink during snapshot validation") from e
+                        verify_symlink_confined(root_dir.fd, rel_path, target)
+                    elif stat.S_ISDIR(info.st_mode):
+                        child_chain = id_chain + ((info.st_dev, info.st_ino),)
+                        stack.append((rel_path + (name,), child_chain))
+
+
 def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
     """Snapshot a directory tree into dst_path using safe descriptor traversal without check-then-use."""
     dst_path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -682,16 +730,16 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
     with SafeDirectory(src_path) as root_dir:
         root_stat = os.fstat(root_dir.fd)
         dir_times.append((dst_path, root_stat.st_atime_ns, root_stat.st_mtime_ns))
-        stack: list[tuple[str, ...]] = [()]
+        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = [((), ())]
         while stack:
-            rel_path = stack.pop()
+            rel_path, id_chain = stack.pop()
             if len(rel_path) > MAX_PATH_COMPONENTS:
                 raise DispositionsError("Path component cap exceeded")
             curr_dst = dst_path
             for part in rel_path:
                 curr_dst = curr_dst / part
             curr_dst.mkdir(mode=0o700, exist_ok=True)
-            with open_safe_descendant(root_dir, rel_path) as curr_dir:
+            with open_safe_descendant(root_dir, rel_path, id_chain) as curr_dir:
                 names = curr_dir.names(cap=MAX_SNAPSHOT_ENTRIES)
                 for name in names:
                     total_entries += 1
@@ -719,7 +767,8 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
                     elif stat.S_ISDIR(info.st_mode):
                         child_dst = curr_dst / name
                         dir_times.append((child_dst, info.st_atime_ns, info.st_mtime_ns))
-                        stack.append(rel_path + (name,))
+                        child_chain = id_chain + ((info.st_dev, info.st_ino),)
+                        stack.append((rel_path + (name,), child_chain))
                     elif stat.S_ISREG(info.st_mode):
                         if total_bytes + info.st_size > max_bytes:
                             raise DispositionsError("Snapshot byte cap exceeded")
@@ -752,8 +801,8 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
                                 raise DispositionsError("Failed to write snapshot file") from e
                             try:
                                 os.utime(out_file, ns=(info.st_atime_ns, info.st_mtime_ns))
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                raise DispositionsError("Failed to preserve file timestamp in snapshot") from e
                         finally:
                             if fd >= 0:
                                 os.close(fd)
@@ -764,8 +813,9 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
     for d_path, atime_ns, mtime_ns in reversed(dir_times):
         try:
             os.utime(d_path, ns=(atime_ns, mtime_ns))
-        except OSError:
-            pass
+        except OSError as e:
+            raise DispositionsError("Failed to preserve directory timestamp in snapshot") from e
+    validate_snapshot_symlinks(dst_path)
 
 
 def run_real_sealcheck(
