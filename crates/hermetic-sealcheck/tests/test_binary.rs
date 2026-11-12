@@ -968,21 +968,30 @@ fn test_coverage_gaps_explicit_channels_only() {
     );
     assert!(coverage_gaps(&findings).is_empty());
 
-    // UTF-16 text cannot be scanned as printable runs: a real gap, fails closed.
-    let utf16 = tempdir().expect("tempdir");
-    let mut wide = vec![0xFFu8, 0xFE];
-    for unit in "opaque_leaked_func_one()\n".encode_utf16() {
-        wide.extend_from_slice(&unit.to_le_bytes());
+    // UTF-16 text anywhere in the payload is decoded and matched, past the first 8 KiB, at
+    // either byte alignment and in either byte order (review fixture: NUL, 8191 'A's, then
+    // the UTF-16LE solution).
+    let leak = "\nopaque_leaked_func_one()\nopaque_leaked_func_two()\n";
+    let le: Vec<u8> = leak.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let be: Vec<u8> = leak.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    for (name, prefix_len, encoded) in [
+        ("le_even.bin", 8191usize, &le),
+        ("le_odd.bin", 8192usize, &le),
+        ("be_even.bin", 8191usize, &be),
+    ] {
+        let dir = tempdir().expect("tempdir");
+        let mut payload = vec![0u8];
+        payload.extend(std::iter::repeat_n(b'A', prefix_len));
+        payload.extend_from_slice(encoded);
+        fs::write(dir.path().join(name), &payload).expect("write utf16");
+        let findings = scan_tree(dir.path(), &fp, &opts);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Gate && f.path.ends_with(name)),
+            "UTF-16 leak in {name} must gate: {findings:#?}"
+        );
     }
-    fs::write(utf16.path().join("notes.txt"), &wide).expect("write utf16");
-    let findings = scan_tree(utf16.path(), &fp, &opts);
-    assert_eq!(coverage_gaps(&findings), vec!["D2".to_string()]);
-    let mut wide_no_bom = Vec::new();
-    for unit in "plain wide text without a byte order mark\n".encode_utf16() {
-        wide_no_bom.extend_from_slice(&unit.to_le_bytes());
-    }
-    assert!(hermetic_sealcheck::looks_like_utf16(&wide_no_bom));
-    assert!(!hermetic_sealcheck::looks_like_utf16(&png));
 
     // An oversized file is skipped: a real gap, reported through its own channel.
     let big = tempdir().expect("tempdir");

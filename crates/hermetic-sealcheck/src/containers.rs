@@ -512,23 +512,11 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                 return;
             }
 
-            // Binary (NUL byte in first 8 KiB): matched as text and its printable strings for
-            // D3b, so the file is covered. UTF-16 text matches neither; it stays a coverage gap.
+            // Binary (NUL byte in first 8 KiB): the whole payload is matched as text (control
+            // bytes split lines), as UTF-16 decoded at both byte alignments, and for printable
+            // strings (D3b), so every byte of the file is covered whatever its encoding.
             let head = bytes.get(..8192).unwrap_or(bytes);
             if head.contains(&0) {
-                if crate::binary::looks_like_utf16(head) {
-                    self.push(Finding {
-                        detector: "D2".into(),
-                        channel: "binary_skipped".into(),
-                        path: path.to_string(),
-                        visibility: self.opts.visibility,
-                        severity: Severity::Info,
-                        confidence: 0.0,
-                        hunk: None,
-                        evidence: vec!["skipped binary file (UTF-16 text)".into()],
-                    });
-                    return;
-                }
                 self.push(Finding {
                     detector: "D2".into(),
                     channel: "binary_strings".into(),
@@ -538,7 +526,7 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     confidence: 0.0,
                     hunk: None,
                     evidence: vec![
-                        "binary file (contains NUL byte): text and printable strings scanned"
+                        "binary file (contains NUL byte): text, UTF-16 and printable strings scanned"
                             .into(),
                     ],
                 });
@@ -547,7 +535,6 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     "binary_opaque",
                     crate::binary::malformed_fallback_strings(bytes),
                 );
-                // Control bytes separate lines, so text next to a NUL still matches line by line
                 let separated: Vec<u8> = bytes
                     .iter()
                     .map(|&b| {
@@ -559,6 +546,22 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     })
                     .collect();
                 self.sink.text(path, &String::from_utf8_lossy(&separated));
+                for view in crate::binary::utf16_text_views(bytes) {
+                    let runs: Vec<String> = view
+                        .split('\n')
+                        .filter(|run| run.chars().count() >= 6)
+                        .map(str::to_string)
+                        .collect();
+                    self.sink.binary(
+                        path,
+                        "binary_opaque",
+                        crate::binary::BinaryStrings {
+                            exact_strings: std::collections::HashSet::new(),
+                            printable_runs: runs,
+                        },
+                    );
+                    self.sink.text(path, &view);
+                }
                 return;
             }
 

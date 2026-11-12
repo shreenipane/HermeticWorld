@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 
 pub use benchmark::{BenchmarkSignatures, ExternalSignature};
 pub use binary::{
-    is_minified_bundle, looks_like_utf16, parse_class, parse_elf, parse_minified, parse_wasm,
-    scan_binary_if_recognized, scan_minified_bundle,
+    is_minified_bundle, parse_class, parse_elf, parse_minified, parse_wasm,
+    scan_binary_if_recognized, scan_minified_bundle, utf16_text_views,
 };
 pub use bytecode::{check_pyc_bytecode, locate_pyc_source, pyc_header_len, pyc_magic};
 pub use containers::{

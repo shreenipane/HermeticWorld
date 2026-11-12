@@ -638,14 +638,16 @@ def test_regression_defect1_nul_byte_leak_refuses_clean_and_repair(task_world, t
     assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
     assert not (task / "problem_statement_redacted.json").exists()
 
-    # UTF-16 text cannot be matched: a real coverage gap still fails closed
+    # UTF-16 text after an 8 KiB prefix is decoded and matched: never repaired
     nul_file.unlink()
-    wide = root / "wide_leak.txt"
-    wide.write_bytes(b"\xff\xfe" + LEAK.encode("utf-16-le"))
-    backdate(root)
-    with pytest.raises((d.MalformedGateOutputError, d.DispositionsError)):
-        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
-    assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
+    for prefix in (b"\x00" + b"A" * 8191, b"\x00" + b"A" * 8192):
+        wide = root / "wide_leak.bin"
+        wide.write_bytes(prefix + ("def main():\n    " + LEAK + "\n").encode("utf-16-le"))
+        backdate(root)
+        entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+        assert entries[0]["disposition"] == "excluded"
+        assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
+        assert not (task / "problem_statement_redacted.json").exists()
 
 
 def test_regression_defect2_replace_ancestor_at_subprocess_launch_no_outside_reads(task_world, monkeypatch, tmp_path):
@@ -1408,3 +1410,64 @@ def test_final_review_coverage_signal_is_channel_not_evidence_wording():
     for channel in ("scan_error", "binary_skipped", "file_oversize_skipped", "container_error", "baseline_incomplete"):
         with pytest.raises(d.MalformedGateOutputError, match="not_covered"):
             d.validate_report(report(findings=[info(channel, "")], gate=False))
+
+
+# Codex re-review, BLOCKING 1: task IDs never collide with internal staging names.
+def test_rereview_task_id_root_0_cannot_hide_scan_root(tmp_path):
+    tasks = tmp_path / "tasks"
+    task = tasks / "root_0"
+    (task / "agent").mkdir(parents=True)
+    (task / "staging").mkdir()
+    (task / "agent/problem_statement.md").write_text(STATEMENT, encoding="utf-8")
+    (task / "task.json").write_text(json.dumps(complete_task("root_0")), encoding="utf-8")
+    (task / "manifest.json").write_text(json.dumps(complete_manifest("root_0")), encoding="utf-8")
+    (task / "staging/gold.patch").write_text(PATCH, encoding="utf-8")
+    (task / "staging/test.patch").write_text("", encoding="utf-8")
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "main.py").write_text("def main():\n    do_base_work_initial()\n", encoding="utf-8")
+    root = tmp_path / "world"
+    root.mkdir()
+    backdate(tmp_path)
+    config = {"base_tree": str(base), "roots": [{"path": str(root), "visibility": "agent_visible"}]}
+    binary = d.find_binary("hermetic-sealcheck")
+    initial = d.run_real_sealcheck(task, binary, scan_config=config)
+    assert {f["detector"] for f in initial["findings"] if f["severity"] == "gate"} == {"D0"}
+    initial["scan_config"] = config
+    # A separate D2 leak in the scan root: the re-scan must see it and refuse the repair.
+    (root / "leak.py").write_text("def main():\n    " + LEAK + "\n    do_base_work_initial()\n", encoding="utf-8")
+    backdate(root)
+    entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
+    assert entries[0]["disposition"] == "excluded"
+    assert "D2" in entries[0]["detectors"]
+    assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
+    assert not (task / "problem_statement_redacted.json").exists()
+
+
+# Codex re-review, BLOCKING 3: the snapshot traverses the validated directory, not a replacement.
+def test_rereview_base_tree_replaced_before_snapshot_rejected(task_world, tmp_path, monkeypatch):
+    tasks, task, _, initial, binary = task_world
+    base = Path(initial["scan_config"]["base_tree"])
+    manifest_before = (task / "manifest.json").read_bytes()
+    real_snapshot = d.snapshot_tree_safely
+    replaced = []
+
+    def replacing_snapshot(src, dst, *args, **kwargs):
+        if Path(src) == base and not replaced:
+            base.rename(tmp_path / "validated_base")
+            base.mkdir()
+            (base / "main.py").write_text(
+                "def main():\n    " + LEAK + "\n    do_base_work_initial()\n", encoding="utf-8")
+            backdate(base)
+            replaced.append(True)
+        return real_snapshot(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(d, "snapshot_tree_safely", replacing_snapshot)
+    out = tmp_path / "dispositions.json"
+    with pytest.raises(d.DispositionsError, match="modified or replaced"):
+        d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary, out_path=out)
+    assert replaced
+    assert not out.exists()
+    assert (task / "agent/problem_statement.md").read_text(encoding="utf-8") == STATEMENT
+    assert not (task / "problem_statement_redacted.json").exists()
+    assert (task / "manifest.json").read_bytes() == manifest_before

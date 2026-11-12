@@ -936,30 +936,26 @@ pub fn malformed_binary_finding(
     }
 }
 
-/// Whether `head` (a file's first bytes, containing a NUL) looks like UTF-16 text: a UTF-16
-/// byte-order mark, or NUL in nearly every byte of one parity and nearly no byte of the other.
-pub fn looks_like_utf16(head: &[u8]) -> bool {
-    if head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]) {
-        return true;
-    }
-    let pairs = head.len() / 2;
-    if pairs < 4 {
-        return false;
-    }
-    let mut nul_even = 0usize;
-    let mut nul_odd = 0usize;
-    for (i, b) in head.iter().take(pairs * 2).enumerate() {
-        if *b == 0 {
-            if i % 2 == 0 {
-                nul_even += 1;
-            } else {
-                nul_odd += 1;
-            }
-        }
-    }
-    let mostly = |n: usize| n.saturating_mul(10) >= pairs.saturating_mul(9);
-    let rarely = |n: usize| n.saturating_mul(10) <= pairs;
-    (mostly(nul_odd) && rarely(nul_even)) || (mostly(nul_even) && rarely(nul_odd))
+/// The payload decoded as UTF-16LE from byte offset 0 and from byte offset 1 (the second
+/// also reads UTF-16BE text), over its whole length. Control characters, unpaired
+/// surrogates and a trailing odd byte become line breaks, so text keeps its lines.
+pub fn utf16_text_views(bytes: &[u8]) -> [String; 2] {
+    let decode = |offset: usize| -> String {
+        let units = bytes
+            .get(offset..)
+            .unwrap_or(&[])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair));
+        char::decode_utf16(units)
+            .map(|c| match c {
+                Ok(ch) if !ch.is_control() || ch == '\t' || ch == '\n' => ch,
+                _ => '\n',
+            })
+            .collect()
+    };
+    [decode(0), decode(1)]
 }
 
 /// A corrupted header must not hide the file's strings: search its printable runs.

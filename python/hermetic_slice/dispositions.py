@@ -731,7 +731,8 @@ def validate_snapshot_symlinks(snap_path: Path) -> None:
                         stack.append((rel_path + (name,), child_chain))
 
 
-def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
+def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SNAPSHOT_BYTES,
+                         expected_identity: tuple[int, int] | None = None) -> None:
     """Snapshot a directory tree into dst_path using safe descriptor traversal without check-then-use."""
     dst_path.mkdir(mode=0o700, parents=True, exist_ok=True)
     total_bytes = 0
@@ -739,6 +740,9 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
     dir_times: list[tuple[Path, int, int]] = []
     with SafeDirectory(src_path) as root_dir:
         root_stat = os.fstat(root_dir.fd)
+        # The descriptor actually traversed must be the directory that was validated.
+        if expected_identity is not None and (root_stat.st_dev, root_stat.st_ino) != tuple(expected_identity):
+            raise DispositionsError("Scan tree modified or replaced between validation and execution")
         dir_times.append((dst_path, root_stat.st_atime_ns, root_stat.st_mtime_ns))
         stack: list[tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = [((), ())]
         while stack:
@@ -843,23 +847,30 @@ def run_real_sealcheck(
         "roots": [{"path": str(root), "visibility": "agent_visible"}] if root is not None else [],
     })
     tree_stats = config.get("_tree_stats", {})
-    all_trees = [config["base_tree"]] + [entry["path"] for entry in config["roots"]]
+    all_trees = [str(task_dir), config["base_tree"]] + [entry["path"] for entry in config["roots"]]
+    identities: dict[str, tuple[int, int]] = {}
     for path in all_trees:
         with SafeDirectory(Path(path)) as directory:
             st = os.fstat(directory.fd)
             if path in tree_stats and (st.st_dev, st.st_ino) != tuple(tree_stats[path]):
                 raise DispositionsError("Scan tree modified or replaced between validation and execution")
-    # Verify and stage configuration files and immutable snapshots in a private bounded directory
+            identities[path] = (st.st_dev, st.st_ino)
+    # Verify and stage configuration files and immutable snapshots in a private bounded directory.
+    # The task lives under "task/" and scan trees under "trees/": internal names never share a
+    # parent with the task directory, whatever the task ID is.
     with tempfile.TemporaryDirectory(prefix="disposition_config_") as staging_dir:
         staged_dir = Path(staging_dir)
-        staged_task = staged_dir / Path(task_dir).name
-        snapshot_tree_safely(Path(task_dir), staged_task)
-        staged_base = staged_dir / "base_tree"
-        snapshot_tree_safely(Path(config["base_tree"]), staged_base)
+        (staged_dir / "task").mkdir(mode=0o700)
+        (staged_dir / "trees").mkdir(mode=0o700)
+        (staged_dir / "config").mkdir(mode=0o700)
+        staged_task = staged_dir / "task" / Path(task_dir).name
+        snapshot_tree_safely(Path(task_dir), staged_task, expected_identity=identities[str(task_dir)])
+        staged_base = staged_dir / "trees" / "base_tree"
+        snapshot_tree_safely(Path(config["base_tree"]), staged_base, expected_identity=identities[config["base_tree"]])
         staged_roots = []
         for idx, entry in enumerate(config["roots"]):
-            staged_root = staged_dir / f"root_{idx}"
-            snapshot_tree_safely(Path(entry["path"]), staged_root)
+            staged_root = staged_dir / "trees" / f"root_{idx}"
+            snapshot_tree_safely(Path(entry["path"]), staged_root, expected_identity=identities[entry["path"]])
             staged_roots.append((staged_root, entry["visibility"]))
 
         cmd = [str(sealcheck_bin), "scan", "--task", str(staged_task),
@@ -875,7 +886,7 @@ def run_real_sealcheck(
                     info = directory.check_file(file_path.name)
                     if info is None or (key in file_stats and (info.st_dev, info.st_ino) != tuple(file_stats[key])):
                         raise DispositionsError("Configuration file modified or replaced between validation and execution")
-                staged_file = staged_dir / f"{key}.json"
+                staged_file = staged_dir / "config" / f"{key}.json"
                 staged_file.write_text(staged_contents.get(key, ""), encoding="utf-8")
                 cmd.extend(["--" + key.replace("_", "-"), str(staged_file)])
         if "baseline_budget" in config:
