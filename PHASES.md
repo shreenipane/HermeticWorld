@@ -89,7 +89,6 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T1.14 review): clean tasks get a manifest `clean` disposition although TRD §2 allows only `repaired` and `excluded`, which also changes an unchanged world's root; keep `clean` in the per-run report only
   - [ ] Deferred (T1.14 review): excluding a previously repaired task appends to the manifest, leaving both statuses; separate repair history from the current disposition
   - [ ] Deferred (T1.14 review): missing tests for the merged mode-restore script (`RESTORE_MODES_SH`): replacement between stat and open, fstat hard-link rejection, stalled `git ls-tree` with child termination, ancestor swap, and a FIFO-replacement test that runs the real script with an outside sentinel (the current race section tests its own `os.open` flags)
-  - [ ] Deferred (T1.14): `extract`-side note: files with NUL bytes are scanned as text, printable strings and both UTF-16 alignments; oversized files stay an explicit coverage gap (`file_oversize_skipped`)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [x] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
