@@ -79,7 +79,16 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T1.13 review): decide whether the scrub fallback paths should return the as-scraped statement with `problem_statement_revision = as_scraped` and a warning (today they exclude content)
   - [ ] Deferred (T1.13 review): fixture `pytest_issue_6189_edits.json` has a creation edit dated before the issue's creation; the cache case in `test_http.py` can pass before the bounded-read check
   - [ ] Deferred (gates): Docker tests use fixed image and network names (`hermetic-test/fake-swebench`, `hermetic-world-test-inst-1-net`), so two py-gate runs at once make `test_cli_seal_images` and `test_world_probe_cli` fail; use per-run names
-- [ ] Dispositions: `repaired` / `excluded`, never silent (§5.5)
+- [x] Dispositions: `repaired` / `excluded`, never silent (§5.5) (T1.14)
+  - [ ] Deferred (T1.14 review, non-blocking): a report with an inline manifest is rejected on rerun after publication changed the disk manifest, so an interrupted repair cannot finish in that case; reconcile the inline manifest with verified repair metadata
+  - [ ] Deferred (T1.14 review): Python checks UTF-8 span boundaries after merging spans (`redact_problem_statement("é", [(0,1),(1,2)])` succeeds; Rust rejects); validate every supplied boundary first
+  - [ ] Deferred (T1.14 review): Python and Rust count surviving characters differently (literal `[REDACTED]` in the original, whitespace definition incl. U+001C–U+001F); specify one rule and add cross-language cases
+  - [ ] Deferred (T1.14 review): empty spans are accepted during repair but rejected by persisted-metadata validation, so every later rerun fails; reject them before publication
+  - [ ] Deferred (T1.14 review): every replaced file becomes mode 0600, including an originally 0644 problem statement, so a runner under another uid cannot read it; preserve statement permissions
+  - [ ] Deferred (T1.14 review): an unusable explicit `--sealcheck` path silently falls back to PATH and developer locations; fail instead
+  - [ ] Deferred (T1.14 review): clean tasks get a manifest `clean` disposition although TRD §2 allows only `repaired` and `excluded`, which also changes an unchanged world's root; keep `clean` in the per-run report only
+  - [ ] Deferred (T1.14 review): excluding a previously repaired task appends to the manifest, leaving both statuses; separate repair history from the current disposition
+  - [ ] Deferred (T1.14 review): missing tests for the merged mode-restore script (`RESTORE_MODES_SH`): replacement between stat and open, fstat hard-link rejection, stalled `git ls-tree` with child termination, ancestor swap, and a FIFO-replacement test that runs the real script with an outside sentinel (the current race section tests its own `os.open` flags)
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1)
 - [x] Layer index plus per-task query, under 5 s (TR-SC-10)
 - [ ] E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
@@ -106,8 +115,20 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] apt snapshots where available
 - [ ] Ecosystems: PyPI, conda, Debian/Ubuntu, git dependencies (static mirrors)
 - [ ] `strict` class B rebuild, with `repo_only` fallback and labelling
-- [ ] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*)
-- [ ] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10)
+- [x] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*) (T2.1)
+  - [ ] Deferred (T2.1 review, non-blocking): endpoint probes use a blocking `UnixStream::connect` against a lock listener that never accepts; repeated recovery attempts on one endpoint can fill the backlog and block startup; use non-blocking exclusive ownership
+  - [ ] Deferred (T2.1 review): the live-endpoint test passes `--recover` without `--resume-log`, so it is rejected before endpoint ownership is checked; give it valid recovery inputs and assert the original listener still serves
+  - [ ] Deferred (T2.1 review): the seccomp allow-list still permits arbitrary Unix-socket connects, signalling other same-uid processes, credential-changing syscalls and `clock_settime`; remove them and test denial
+  - [ ] Deferred (T2.1 review): the Landlock failure-injection test sets a process-global flag while other tests start sandboxed servers; isolate it in a child process
+  - [ ] Deferred (T2.1 review): no test stalls a child, thread or socket to prove the bounded test helpers actually time out
+  - [ ] Deferred (T2.1): publication and endpoint reclaim trust same-uid processes and root (directories must be owned by the server uid and not group/other writable); `renameat2(RENAME_NOREPLACE)` is not used because the crate forbids unsafe code
+- [x] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10) (T2.5)
+  - [ ] Deferred (T2.5 review, non-blocking): a duplicate-alias error copies keystore alias text (incl. control characters) into `skipped_paths.reason` and reports; return a fixed code
+  - [ ] Deferred (T2.5 review): certificate validation gaps: unique-ID fields skipped unvalidated, BOOLEAN accepts any non-zero byte, `pathLenConstraint` checked by tag only, critical SAN/SKI/AKI payloads not validated
+  - [ ] Deferred (T2.5 review): the process-global test hooks `FORCE_CHOWN_FAILURE` and `BEFORE_USE_HOOK` are public and consulted in production paths; move injection to test-only, per-thread code
+  - [ ] Deferred (T2.5 review): CA seed and plaintext key PEM buffers are not zeroised; two guarded `unwrap()` calls remain; no compile-failure check for unsupported targets
+  - [ ] Deferred (T2.5): on-disk ownership with a guest owner different from the sealing user is tested only by recording the ownership step, because this host cannot create user namespaces; run `test_created_entries_owned_by_guest_owner_in_user_namespace` where `unshare -Ur` works
+  - [ ] Deferred (T2.5, owner decision): the installer's check-then-use protection assumes exclusive access to the rootfs; the full fix needs `openat2`/`cap-std` (new dependency)
 - [ ] Gateway with the Anthropic adapter (TR-GW-*)
 - [ ] Container isolation of the agent, with the run spec applied
 - [x] Manifest with `world_root`

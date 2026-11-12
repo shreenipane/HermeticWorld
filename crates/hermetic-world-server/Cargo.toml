@@ -1,0 +1,24 @@
+[package]
+name = "hermetic-world-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hermetic-world-server"
+path = "src/main.rs"
+
+[dependencies]
+hermetic-common = { workspace = true }
+blake3 = { workspace = true }
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

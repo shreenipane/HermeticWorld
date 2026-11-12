@@ -71,6 +71,7 @@ pub enum SubstrateAtT {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispositionKind {
+    Clean,
     Repaired,
     Excluded,
 }
@@ -670,6 +671,20 @@ impl WorldManifest {
         }
 
         Ok((target_value, proof))
+    }
+
+    /// Add a disposition to this manifest (§5.5, TR-SEAL-11).
+    pub fn add_disposition(
+        &mut self,
+        kind: DispositionKind,
+        detector: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.dispositions.push(Disposition {
+            kind,
+            detector: detector.into(),
+            detail: detail.into(),
+        });
     }
 }
 

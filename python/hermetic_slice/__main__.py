@@ -101,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
         "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
     )
 
+    dispositions_parser = subparsers.add_parser("dispositions", help="Process gate outputs and emit dispositions.json (§5.5)")
+    dispositions_parser.add_argument("--gate-output", "-i", type=Path, required=True, help="Path to gate output JSON or directory")
+    dispositions_parser.add_argument("--out", "-o", type=Path, default=Path("dispositions.json"), help="Output path for dispositions.json")
+    dispositions_parser.add_argument("--tasks-dir", type=Path, default=None, help="Optional directory containing task folders")
+    dispositions_parser.add_argument("--sealcheck", type=Path, default=None, help="Optional path to hermetic-sealcheck binary")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -582,6 +588,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+
+    if args.subcommand == "dispositions":
+        from hermetic_slice.dispositions import (
+            format_summary,
+            MalformedGateOutputError,
+            MissingDispositionError,
+            process_dispositions,
+        )
+
+        try:
+            _, summary = process_dispositions(
+                gate_source=args.gate_output,
+                out_path=args.out,
+                tasks_dir=args.tasks_dir,
+                sealcheck_bin=args.sealcheck,
+            )
+            print(format_summary(summary))
+            return 0
+        except (MalformedGateOutputError, MissingDispositionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            print("Fatal error processing dispositions: verification failed", file=sys.stderr)
+            return 2
 
     return 1
 
