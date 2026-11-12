@@ -2,6 +2,7 @@
 members = [
     "crates/hermetic-common",
     "crates/hermetic-sealcheck",
+    "crates/hermetic-trust",
     "crates/hermetic-world-server",
 ]
 resolver = "2"
