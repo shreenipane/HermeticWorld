@@ -110,7 +110,9 @@ pub const MAX_UNIT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 
 /// Detectors a query can't answer from an index.
-pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external"];
+///
+/// Tier 2 ("T2") is not answered from the index: symbol tokens are not stored in layer indexes.
+pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"];
 
 /// Detectors not covered when querying an index of a given format version.
 pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
@@ -1646,6 +1648,9 @@ fn query_record(
             name,
             version,
         } => {
+            if opts.undated {
+                return;
+            }
             let display = path.display(root);
             findings.extend(check_d5a_name_and_version(
                 name,
