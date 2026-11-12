@@ -1,0 +1,114 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_defect1",
+        "databaseId": 301,
+        "url": "https://github.com/test-org/test-repo/issues/301",
+        "body": "Issue body text",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOcomment_kept",
+              "databaseId": 801,
+              "url": "https://github.com/test-org/test-repo/issues/301#issuecomment-801",
+              "body": "Kept comment body: never edited",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": null,
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            },
+            {
+              "id": "IC_kwDOcomment_empty_edits",
+              "databaseId": 802,
+              "url": "https://github.com/test-org/test-repo/issues/301#issuecomment-802",
+              "body": "Dropped comment: empty edits",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": "2020-01-03T10:00:00Z",
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            },
+            {
+              "id": "IC_kwDOcomment_includes_created_not_true",
+              "databaseId": 803,
+              "url": "https://github.com/test-org/test-repo/issues/301#issuecomment-803",
+              "body": "Dropped comment: includesCreatedEdit false and no qualifying edit",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": "2020-01-20T10:00:00Z",
+              "includesCreatedEdit": false,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": [
+                  {
+                    "createdAt": "2020-01-20T10:00:00Z",
+                    "editedAt": "2020-01-20T10:00:00Z",
+                    "diff": "Late edit text after cutoff"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "IC_kwDOcomment_null_diff",
+              "databaseId": 804,
+              "url": "https://github.com/test-org/test-repo/issues/301#issuecomment-804",
+              "body": "Dropped comment: null diff",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": "2020-01-03T10:00:00Z",
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": [
+                  {
+                    "createdAt": "2020-01-03T10:00:00Z",
+                    "editedAt": "2020-01-03T10:00:00Z",
+                    "diff": null,
+                    "body": null
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

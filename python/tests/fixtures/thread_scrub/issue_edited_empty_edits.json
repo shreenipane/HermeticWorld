@@ -1,0 +1,36 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_empty_edits",
+        "databaseId": 204,
+        "url": "https://github.com/test-org/test-repo/issues/204",
+        "body": "Edited issue with empty userContentEdits",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": "2020-01-08T10:00:00Z",
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

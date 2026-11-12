@@ -1,0 +1,43 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR_kwDOtest_defect9",
+        "databaseId": 50,
+        "url": "https://github.com/test-org/test-repo/pull/50",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOpr_comment1",
+              "databaseId": 901,
+              "url": "https://github.com/test-org/test-repo/pull/50#issuecomment-901"
+            },
+            {
+              "id": "IC_kwDOpr_comment2",
+              "databaseId": 902,
+              "url": "https://github.com/test-org/test-repo/pull/50#issuecomment-902"
+            }
+          ]
+        },
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

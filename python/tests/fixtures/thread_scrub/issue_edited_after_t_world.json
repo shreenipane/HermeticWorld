@@ -1,0 +1,51 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest100",
+        "databaseId": 100,
+        "url": "https://github.com/test-org/test-repo/issues/100",
+        "body": "Bug: parser fails on unicode input. Fix: use utf-8 encoding.",
+        "createdAt": "2020-01-01T12:00:00Z",
+        "lastEditedAt": "2020-01-10T12:00:00Z",
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-10T12:00:00Z",
+              "editedAt": "2020-01-10T12:00:00Z",
+              "diff": "Bug: parser fails on unicode input. Fix: use utf-8 encoding."
+            },
+            {
+              "createdAt": "2020-01-03T12:00:00Z",
+              "editedAt": "2020-01-03T12:00:00Z",
+              "diff": "Bug: parser fails on unicode input with special characters."
+            },
+            {
+              "createdAt": "2020-01-01T12:00:00Z",
+              "editedAt": "2020-01-01T12:00:00Z",
+              "diff": "Bug: parser fails on unicode input."
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}
