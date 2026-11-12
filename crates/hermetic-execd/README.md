@@ -151,7 +151,7 @@ Replies:
 ```json
 {"type":"exec","code":0,"output":[65,10],"truncated":false,"timed_out":false}
 {"type":"download","data":[65,10]}
-{"type":"status","locked":false,"output_bytes":2}
+{"type":"status","locked":false,"output_bytes":2,"guest_time_unix":1700000000}
 {"type":"ok"}
 {"type":"error","reason":"invalid_input"}
 {"type":"frozen"}
@@ -164,14 +164,25 @@ struct order and environment keys follow byte order, with known-answer tests.
 
 Uploads validate paths/data before mutation, pin each parent beneath the root,
 reject symlinks, `..` and special destinations, create an exclusive temporary
-regular file in the same directory, write it through its descriptor, stamp it
+regular file in the same directory, write it through its descriptor, assign the
+run spec's uid/gid and private mode 0600, stamp it
 with the **current guest** clock, fsync, rename and fsync the directory. Frames
-have no timestamp field. Downloads pin and verify a regular inode before opening
+have no timestamp field. The resolver configuration uses mode 0644 so non-root
+commands can read it. Temporary-name selection skips the destination and retries
+collisions at most `MAX_UPLOAD_ATTEMPTS` times. Downloads pin and verify a regular inode before opening
 it for reading and read at most the transfer cap plus one byte. FIFOs/devices
 are never opened as regular files. The only internal magic-link resolutions are
 kernel `/proc/self/exe` and `/proc/self/fd/N` for already pinned descriptors; no
-guest-provided symlink is followed. This prevents swapped-device opens between
-lstat and a read-capable open.
+guest-provided symlink is followed. Procfs, the PID 1 process directory and its fd
+directory are verified and retained before any guest command runs, including
+across the root switch. Descriptor reopens and helper execution use those
+retained directories, so covering visible `/proc` cannot redirect them.
+Ordinary file reads accept only ext4, tmpfs and overlayfs, refusing regular-looking
+pseudo-files such as `/proc/kmsg`; internal proc metadata uses the retained
+procfs handle separately. Reads use nonblocking descriptors, a byte cap and
+`FILE_IO_TIMEOUT_MS` checks between chunks. Those checks cannot interrupt a
+kernel-stalled local filesystem operation; a hard deadline for that case needs
+process isolation for filesystem work.
 
 Guest root can alter the guest kernel and tamper with PID 1, its descriptors,
 namespaces, or the filesystem, including racing names used by atomic rename.
@@ -181,7 +192,8 @@ ordinary RPC filesystem operations; the VMM and extraction boundary protect the
 host. The host records `unclean_shutdown` unless it receives `frozen`.
 
 Shutdown executes TERM-all, bounded wait, KILL-all, bounded wait, verifies no
-other processes remain, sync, FIFREEZE on the descriptor retained at boot,
+other userspace processes remain (kernel threads are identified by the bounded
+`/proc/PID/stat` flags field), sync, FIFREEZE on the descriptor retained at boot,
 write/flush `frozen`, then poweroff. A freeze/wait failure produces an error,
 never `frozen`. A broken reply connection still leads to poweroff. There is no
 path lookup to reacquire the upper disk and no thaw operation.
@@ -229,6 +241,9 @@ Caps are named constants in `src/lib.rs` and `src/boot.rs`.
 | `MAX_CONNECTIONS`, `MAX_COMMANDS` | 1 active connection; 2 direct commands including initial child |
 | `MAX_DEV_NODES`, `MAX_DEV_DEPTH` | 16384 nodes; 32 levels |
 | `MAX_CHILDREN_BYTES`, `MAX_REAP_BATCH` | 64 KiB child listing; 4096 children/proc entries per sweep |
+| `MAX_PROC_STAT` | 4096 bytes per process metadata record |
+| `FILE_IO_TIMEOUT_MS` | 5000 ms, checked between file-read chunks |
+| `MAX_UPLOAD_ATTEMPTS` | 16 temporary-name attempts per write |
 | `SHUTDOWN_WAIT_MS`, `CHILD_KILL_WAIT_MS` | 2000 ms per wait |
 | `CHILD_START_TIMEOUT_MS` | 5000 ms; also bounded by the request deadline |
 | `IO_BUFFER`, `MAX_DRAIN_READS` | 8192 bytes; 16 reads/stream/tick |
@@ -257,6 +272,14 @@ only `sys.rs` allows it, with individually documented syscall wrappers.
 | TR-EXD-6 trusted reboot lock | `initramfs_exec_is_locked_until_explicit_authorize`, `authorization_failure_stays_locked_and_empty_initial_command_never_spawns` |
 | Serial/static logs, no pre-clock time | `log_errors_are_static_and_preclock_is_silent` |
 | Host invocation and malformed helper argv | `binary_refuses_host_boot_and_non_utf8_or_extra_helper_arguments_silently` |
+| Kernel-thread shutdown classification | `shutdown_ignores_kernel_threads_but_refuses_userspace_and_bad_metadata` |
+| Retained proc access after visible-path denial | `pinned_proc_reopens_work_when_visible_proc_opens_are_denied` |
+| Upload ownership and resolver permissions | `uploads_use_command_owner_and_private_mode_resolver_is_readable` |
+| Terminal authorization failure | `stuck_authorization_child_is_terminal_and_cannot_launch_again` |
+| VMM status clock and complete frame | `status_frame_supplies_vmm_guest_clock_schema` |
+| Shared production child effects and failure propagation | `production_child_path_applies_cwd_environment_resources_and_credentials` |
+| Temporary-name collision handling | `upload_destination_cannot_collide_with_its_temporary_name`, `upload_temporary_collisions_have_a_work_cap_and_preserve_existing_files` |
+| Pseudo-file refusal, file-read byte/time budgets | `transfers_refuse_regular_looking_pseudo_files`, `file_read_caps_deadlines_and_nonblocking_failures` |
 
 T3.3 must run the real binary as PID 1 in Firecracker and verify the trusted
 early-proc handoff, read-only kernel root, first writable timestamp, ordinary

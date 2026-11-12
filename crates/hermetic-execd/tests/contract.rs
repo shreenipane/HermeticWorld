@@ -35,6 +35,8 @@ struct Fake {
     reaped: usize,
     output_size: usize,
     execute_error: Option<Error>,
+    entry_error: Option<Error>,
+    guest_clock: Option<i64>,
     uploaded: Vec<(String, Vec<u8>)>,
     trace: Option<Rc<RefCell<Vec<String>>>>,
 }
@@ -88,7 +90,8 @@ impl Sys for Fake {
         self.effect(Effect::ApplySpec)
     }
     fn start_entrypoint(&mut self, spec: &RunSpec) -> Result<()> {
-        self.record(format!("entry:{:?}", spec.initial_argv()))
+        self.record(format!("entry:{:?}", spec.initial_argv()))?;
+        self.entry_error.map_or(Ok(()), Err)
     }
     fn execute(
         &mut self,
@@ -123,6 +126,22 @@ impl Sys for Fake {
     fn download(&mut self, _: &str) -> Result<Vec<u8>> {
         self.record("download".into())?;
         Ok(vec![1; self.output_size])
+    }
+    fn guest_time(&mut self) -> Result<i64> {
+        Ok(self.guest_clock.unwrap_or(1700000000))
+    }
+    fn child_cwd(&mut self, cwd: &std::fs::File) -> Result<()> {
+        assert!(cwd.metadata().unwrap().is_dir());
+        self.record("cwd".into())
+    }
+    fn exec_program(
+        &mut self,
+        executable: &std::fs::File,
+        argv: &[std::ffi::CString],
+        env: &[std::ffi::CString],
+    ) -> Result<()> {
+        assert!(executable.metadata().unwrap().is_file());
+        self.record(format!("program:{argv:?}:{env:?}"))
     }
     fn maintain(&mut self) -> Result<()> {
         self.record("maintain".into())
@@ -452,7 +471,8 @@ fn exec_applies_spec_tty_timeout_and_both_output_caps_and_reaps() {
         ask(&mut server, Request::Status {}),
         Reply::Status {
             locked: false,
-            output_bytes: MAX_RUN_OUTPUT
+            output_bytes: MAX_RUN_OUTPUT,
+            guest_time_unix: 1700000000
         }
     );
     for timeout in [0, MAX_TIMEOUT_MS + 1, u64::MAX] {
@@ -485,6 +505,158 @@ fn stuck_child_is_terminal_and_never_claims_frozen_shutdown() {
 }
 
 #[test]
+fn stuck_authorization_child_is_terminal_and_cannot_launch_again() {
+    let mut server = server(true);
+    server.sys.entry_error = Some(Error::ChildStuck);
+    assert_eq!(
+        ask(&mut server, Request::Authorize {}),
+        Reply::Error {
+            reason: Error::ChildStuck
+        }
+    );
+    assert_eq!(server.sys.events.last().unwrap(), "PowerOff(Shutdown)");
+    assert!(server.boot.locked);
+    server.sys.entry_error = None;
+    for request in [
+        Request::Authorize {},
+        exec(false, 100),
+        Request::Shutdown {},
+    ] {
+        assert_eq!(
+            ask(&mut server, request),
+            Reply::Error {
+                reason: Error::Shutdown
+            }
+        );
+    }
+    assert_eq!(
+        server
+            .sys
+            .events
+            .iter()
+            .filter(|e| e.starts_with("entry:"))
+            .count(),
+        1
+    );
+    assert!(!server.sys.events.iter().any(|e| e.starts_with("freeze:")));
+}
+
+#[test]
+fn status_frame_supplies_vmm_guest_clock_schema() {
+    // These are the fields required by hermetic-vmm/tests/guest.rs's decoder.
+    #[derive(serde::Deserialize)]
+    struct GuestStatus {
+        #[serde(rename = "type")]
+        kind: String,
+        guest_time_unix: u64,
+    }
+    let mut server = server(false);
+    let mut pipe = Pipe::request(&Request::Status {});
+    server.serve_one(&mut pipe).unwrap();
+    let status: GuestStatus = rpc::read_frame(&mut pipe.output.as_slice()).unwrap();
+    assert_eq!(status.kind, "status");
+    assert_eq!(status.guest_time_unix, 1700000000);
+    let body = br#"{"type":"status","locked":false,"output_bytes":0,"guest_time_unix":1700000000}"#;
+    let mut expected = (body.len() as u32).to_le_bytes().to_vec();
+    expected.extend_from_slice(body);
+    assert_eq!(pipe.output, expected);
+    server.sys.guest_clock = Some(1700000017);
+    let mut pipe = Pipe::request(&Request::Status {});
+    server.serve_one(&mut pipe).unwrap();
+    let status: GuestStatus = rpc::read_frame(&mut pipe.output.as_slice()).unwrap();
+    assert_eq!(status.guest_time_unix, 1700000017);
+}
+
+#[test]
+fn production_child_path_applies_cwd_environment_resources_and_credentials() {
+    let cwd = std::fs::File::open("/").unwrap();
+    let executable = tempfile::tempfile().unwrap();
+    let s = spec();
+    let argv = vec!["/program".into(), "arg".into()];
+    let mut fake = Fake::default();
+    boot::run_child(&mut fake, &s, &argv, &cwd, &executable, true).unwrap();
+    let expected = vec![
+        "Session",
+        "ControllingTerminal",
+        "cwd",
+        "MemoryLimit(536870912)",
+        "CoreLimit",
+        "ClearGroups",
+        "Gid(1001)",
+        "Uid(1000)",
+        "ClearSignalMask",
+        "program:[\"/program\", \"arg\"]:[\"A=first\", \"Z=last\"]",
+    ];
+    assert_eq!(fake.events, expected);
+    for fail in 0..expected.len() {
+        let mut fake = Fake {
+            fail: Some(fail),
+            ..Fake::default()
+        };
+        assert_eq!(
+            boot::run_child(&mut fake, &s, &argv, &cwd, &executable, true),
+            Err(Error::Io)
+        );
+        assert_eq!(fake.events, expected[..=fail]);
+    }
+    let mut fake = Fake::default();
+    boot::run_child(&mut fake, &s, &argv, &cwd, &executable, false).unwrap();
+    assert!(!fake.events.iter().any(|e| e == "ControllingTerminal"));
+    let mut invalid = s;
+    invalid.env.insert("BAD".into(), "value\0".into());
+    let mut fake = Fake::default();
+    assert!(boot::run_child(&mut fake, &invalid, &argv, &cwd, &executable, false).is_err());
+    assert!(fake.events.is_empty());
+}
+
+#[test]
+fn upload_destination_cannot_collide_with_its_temporary_name() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join(".hermetic-upload-1"), b"old").unwrap();
+    let mut root = Root::open_root(temp.path().to_str().unwrap()).unwrap();
+    root.atomic("/.hermetic-upload-1", b"new", 1700000000)
+        .unwrap();
+    assert_eq!(
+        fs::read(temp.path().join(".hermetic-upload-1")).unwrap(),
+        b"new"
+    );
+}
+
+#[test]
+fn upload_temporary_collisions_have_a_work_cap_and_preserve_existing_files() {
+    let temp = tempfile::tempdir().unwrap();
+    for n in 1..=MAX_UPLOAD_ATTEMPTS {
+        fs::write(
+            temp.path().join(format!(".hermetic-upload-{n}")),
+            b"occupied",
+        )
+        .unwrap();
+    }
+    fs::write(temp.path().join("destination"), b"old").unwrap();
+    let mut root = Root::open_root(temp.path().to_str().unwrap()).unwrap();
+    assert_eq!(
+        root.atomic("/destination", b"new", 1700000000),
+        Err(Error::Limit)
+    );
+    assert_eq!(fs::read(temp.path().join("destination")).unwrap(), b"old");
+    for n in 1..=MAX_UPLOAD_ATTEMPTS {
+        assert_eq!(
+            fs::read(temp.path().join(format!(".hermetic-upload-{n}"))).unwrap(),
+            b"occupied"
+        );
+    }
+    root.atomic("/destination", b"new", 1700000000).unwrap();
+    assert_eq!(fs::read(temp.path().join("destination")).unwrap(), b"new");
+}
+
+#[test]
+fn transfers_refuse_regular_looking_pseudo_files() {
+    let root = Root::open_root("/").unwrap();
+    assert!(fs::metadata("/proc/version").unwrap().is_file());
+    assert!(root.read("/proc/version", MAX_TRANSFER).is_err());
+}
+
+#[test]
 fn initramfs_exec_is_locked_until_explicit_authorize() {
     let mut fake = Fake::default();
     let mut cfg = config();
@@ -510,7 +682,8 @@ fn initramfs_exec_is_locked_until_explicit_authorize() {
         ask(&mut server, Request::Status {}),
         Reply::Status {
             locked: true,
-            output_bytes: 0
+            output_bytes: 0,
+            guest_time_unix: 1700000000
         }
     );
     assert_eq!(ask(&mut server, Request::Authorize {}), Reply::Ok);

@@ -101,6 +101,11 @@ pub enum Effect {
     ClearGroups,
     Gid(u32),
     Uid(u32),
+    Session,
+    ControllingTerminal,
+    MemoryLimit(u64),
+    CoreLimit,
+    ClearSignalMask,
     PowerOff(Error),
 }
 
@@ -125,6 +130,14 @@ pub trait Sys {
     fn upload(&mut self, path: &str, data: &[u8]) -> Result<()>;
     fn download(&mut self, path: &str) -> Result<Vec<u8>>;
     fn maintain(&mut self) -> Result<()>;
+    fn guest_time(&mut self) -> Result<i64>;
+    fn child_cwd(&mut self, cwd: &std::fs::File) -> Result<()>;
+    fn exec_program(
+        &mut self,
+        executable: &std::fs::File,
+        argv: &[std::ffi::CString],
+        env: &[std::ffi::CString],
+    ) -> Result<()>;
     fn child(
         &mut self,
         spec: &RunSpec,
@@ -191,6 +204,44 @@ pub fn drop_privileges(sys: &mut impl Sys, spec: &RunSpec) -> Result<()> {
     sys.effect(Effect::ClearGroups)?;
     sys.effect(Effect::Gid(spec.gid))?;
     sys.effect(Effect::Uid(spec.uid))
+}
+
+/// Shared production child path, including validation before the first effect.
+pub fn run_child(
+    sys: &mut impl Sys,
+    spec: &RunSpec,
+    argv: &[String],
+    cwd: &std::fs::File,
+    executable: &std::fs::File,
+    tty: bool,
+) -> Result<()> {
+    use std::ffi::CString;
+    spec.validate()?;
+    spec::args(argv, false)?;
+    let argv = argv
+        .iter()
+        .map(|s| CString::new(s.as_str()).map_err(|_| Error::InvalidInput))
+        .collect::<Result<Vec<_>>>()?;
+    let env = spec
+        .env
+        .iter()
+        .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|_| Error::InvalidInput))
+        .collect::<Result<Vec<_>>>()?;
+    let memory = spec
+        .resources
+        .memory_mib
+        .checked_mul(1024 * 1024)
+        .ok_or(Error::Limit)?;
+    sys.effect(Effect::Session)?;
+    if tty {
+        sys.effect(Effect::ControllingTerminal)?;
+    }
+    sys.child_cwd(cwd)?;
+    sys.effect(Effect::MemoryLimit(memory))?;
+    sys.effect(Effect::CoreLimit)?;
+    drop_privileges(sys, spec)?;
+    sys.effect(Effect::ClearSignalMask)?;
+    sys.exec_program(executable, &argv, &env)
 }
 
 /// Parsing failures produce no log or filesystem write. Poweroff reason is

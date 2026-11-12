@@ -14,6 +14,81 @@ fn checked(ret: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Spawn with a descriptor-relative working directory. The child hook performs
+/// only fchdir, which is async-signal-safe; std owns fork/exec and its error pipe.
+/// Command's program must be a relative path within the supplied directory.
+pub fn spawn_in(
+    command: &mut std::process::Command,
+    directory: &OwnedFd,
+) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let directory = directory.try_clone()?;
+    // SAFETY: the closure holds its descriptor alive and invokes only fchdir,
+    // passing a valid scalar descriptor. It does not allocate or take locks.
+    unsafe {
+        command.pre_exec(move || checked(libc::fchdir(directory.as_raw_fd())));
+    }
+    command.spawn()
+}
+
+/// Test-only process-local denial of openat(AT_FDCWD, ...). This models an
+/// unavailable visible proc path while allowing retained-directory access.
+#[cfg(test)]
+pub(crate) fn deny_cwd_opens() -> io::Result<()> {
+    let instructions = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as _,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as _,
+            jt: 0,
+            jf: 3,
+            k: libc::SYS_openat as _,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as _,
+            jt: 0,
+            jf: 0,
+            k: 16,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as _,
+            jt: 0,
+            jf: 1,
+            k: libc::AT_FDCWD as _,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as _,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as _,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: instructions.len() as _,
+        filter: instructions.as_ptr().cast_mut(),
+    };
+    // SAFETY: scalar prctl arguments; the filter storage remains initialized
+    // and alive while the kernel copies it, and is never modified by the call.
+    unsafe {
+        checked(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+        checked(libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &program,
+        ))
+    }
+}
+
 /// Duplicate a raw descriptor inherited across helper exec and mark the original
 /// close-on-exec too. rustix requires an already owned/borrowed descriptor; this
 /// boundary instead accepts a numeric descriptor from the bounded helper payload.

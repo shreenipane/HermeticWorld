@@ -30,6 +30,7 @@ pub struct Linux {
     terminating: bool,
     guest_clock_set: bool,
     base: Option<OwnedFd>,
+    upload_owner: Option<(process::Uid, process::Gid)>,
 }
 pub struct VsockListener(OwnedFd);
 impl Listener for VsockListener {
@@ -142,6 +143,25 @@ fn pid(child: &Child) -> Result<Pid> {
     Pid::from_raw(i32::try_from(child.id()).map_err(|_| Error::Limit)?).ok_or(Error::Io)
 }
 
+fn is_kernel_thread(stat: &[u8], expected_pid: &[u8]) -> Result<bool> {
+    // /proc/PID/stat field 2 is parenthesized and can itself contain ')' and
+    // spaces. Parse the fixed fields after the final ')' rather than comm.
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let text = std::str::from_utf8(stat).map_err(|_| Error::Io)?;
+    let (pid, rest) = text.split_once(" (").ok_or(Error::Io)?;
+    if pid.as_bytes() != expected_pid {
+        return Err(Error::Io);
+    }
+    let (_, fields) = rest.rsplit_once(')').ok_or(Error::Io)?;
+    let flags = fields
+        .split_ascii_whitespace()
+        .nth(6)
+        .ok_or(Error::Io)?
+        .parse::<u64>()
+        .map_err(|_| Error::Io)?;
+    Ok(flags & PF_KTHREAD != 0)
+}
+
 impl Linux {
     fn mount_guest(&self, source: &str, path: &str, kind: &str, data: Option<&str>) -> Result<()> {
         let target = self.root()?.directory(path)?;
@@ -219,6 +239,21 @@ impl Linux {
     fn root_mut(&mut self) -> Result<&mut Root> {
         self.root.as_mut().ok_or(Error::Boot)
     }
+    fn install_spec_files(&mut self, spec: &RunSpec) -> Result<()> {
+        spec.validate()?;
+        self.root_mut()?.atomic_as(
+            "/etc/resolv.conf",
+            spec.resolv_conf.as_bytes(),
+            now(),
+            None,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )?;
+        self.upload_owner = Some((
+            process::Uid::from_raw(spec.uid),
+            process::Gid::from_raw(spec.gid),
+        ));
+        Ok(())
+    }
     fn spawn(
         &mut self,
         spec: &RunSpec,
@@ -250,7 +285,7 @@ impl Linux {
         if encoded.len() > MAX_CHILD_PAYLOAD {
             return Err(Error::Limit);
         }
-        let mut command = Command::new(format!("/proc/self/fd/{}", helper.as_raw_fd()));
+        let mut command = Command::new(format!("./{}", helper.as_raw_fd()));
         command
             .arg("--child")
             .arg(encoded)
@@ -258,7 +293,7 @@ impl Linux {
             .stdin(Stdio::piped());
         let mut output = Vec::new();
         if tty {
-            let (master, slave) = allocate_pty()?;
+            let (master, slave) = allocate_pty(self.root()?)?;
             command
                 .stdin(slave.try_clone()?)
                 .stdout(slave.try_clone()?)
@@ -271,7 +306,7 @@ impl Linux {
         rustix::io::fcntl_setfd(&executable, rustix::io::FdFlags::empty())?;
         rustix::io::fcntl_setfd(&cwd, rustix::io::FdFlags::empty())?;
         rustix::io::fcntl_setfd(&startup_write, rustix::io::FdFlags::empty())?;
-        let spawned = command.spawn();
+        let spawned = sys::spawn_in(&mut command, &self.root()?.proc.fds);
         let reset_executable = rustix::io::fcntl_setfd(&executable, rustix::io::FdFlags::CLOEXEC);
         let reset_cwd = rustix::io::fcntl_setfd(&cwd, rustix::io::FdFlags::CLOEXEC);
         drop(startup_write);
@@ -355,11 +390,7 @@ impl Linux {
     fn reap(&mut self) -> Result<()> {
         // Only PID 1 uses this path. Skip managed children so std::Child
         // retains their exit statuses even while orphan zombies are reaped.
-        let process_id = process::getpid().as_raw_nonzero().get();
-        let children = self.root()?.read(
-            &format!("/proc/{process_id}/task/{process_id}/children"),
-            MAX_CHILDREN_BYTES,
-        )?;
+        let children = self.root()?.proc.children()?;
         self.reap_children(&children)
     }
     fn reap_children(&mut self, children: &[u8]) -> Result<()> {
@@ -388,8 +419,10 @@ impl Linux {
     }
     fn no_other_processes(&mut self) -> Result<bool> {
         self.reap()?;
-        let proc = self.root()?.directory("/proc")?;
-        let entries = fs::Dir::read_from(&proc)?;
+        self.no_userspace_processes(&self.root()?.proc.dir)
+    }
+    fn no_userspace_processes(&self, proc: &OwnedFd) -> Result<bool> {
+        let entries = fs::Dir::read_from(proc)?;
         for (count, entry) in entries.enumerate() {
             if count >= MAX_REAP_BATCH {
                 return Err(Error::Limit);
@@ -397,7 +430,36 @@ impl Linux {
             let entry = entry?;
             let name = entry.file_name().to_bytes();
             if name != b"1" && !name.is_empty() && name.iter().all(u8::is_ascii_digit) {
-                return Ok(false);
+                let directory = match fs::openat2(
+                    proc,
+                    entry.file_name(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+                ) {
+                    Ok(fd) => fd,
+                    Err(rustix::io::Errno::NOENT | rustix::io::Errno::SRCH) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let stat = match fs::openat(
+                    &directory,
+                    "stat",
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(rustix::io::Errno::NOENT | rustix::io::Errno::SRCH) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if fs::FileType::from_raw_mode(fs::fstat(&stat)?.st_mode)
+                    != fs::FileType::RegularFile
+                {
+                    return Err(Error::Io);
+                }
+                let metadata = read_capped(File::from(stat), MAX_PROC_STAT)?;
+                if !is_kernel_thread(&metadata, name)? {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -485,7 +547,7 @@ impl Sys for Linux {
                 rustix::mount::mount_move(".", "/")?;
                 process::chroot(".")?;
                 process::chdir("/")?;
-                self.root = Some(Root::new(root)?);
+                self.root = Some(self.root()?.reroot(root)?);
             }
             Effect::MountProc => self.mount_guest("proc", "/proc", "proc", None)?,
             Effect::MountSys => self.mount_guest("sysfs", "/sys", "sysfs", None)?,
@@ -522,6 +584,25 @@ impl Sys for Linux {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
+            Effect::Session => {
+                process::setsid()?;
+            }
+            Effect::ControllingTerminal => process::ioctl_tiocsctty(std::io::stdin())?,
+            Effect::MemoryLimit(memory) => process::setrlimit(
+                process::Resource::As,
+                process::Rlimit {
+                    current: Some(memory),
+                    maximum: Some(memory),
+                },
+            )?,
+            Effect::CoreLimit => process::setrlimit(
+                process::Resource::Core,
+                process::Rlimit {
+                    current: Some(0),
+                    maximum: Some(0),
+                },
+            )?,
+            Effect::ClearSignalMask => sys::clear_signal_mask()?,
             Effect::ClearGroups => sys::clear_groups()?,
             Effect::Gid(gid) => sys::set_gid(gid)?,
             Effect::Uid(uid) => sys::set_uid(uid)?,
@@ -545,7 +626,7 @@ impl Sys for Linux {
     fn keep_upper(&mut self) -> Result<OwnedFd> {
         // The running executable stays pinned across switch_root and hostile
         // overlay changes. /proc/self/exe is a kernel-owned magic link.
-        self.helper = Some(File::open("/proc/self/exe")?);
+        self.helper = Some(self.root()?.proc.executable()?);
         self.root()?.directory("/mnt/hermetic-overlay")
     }
     fn freeze(&mut self, fd: &OwnedFd) -> Result<()> {
@@ -561,8 +642,7 @@ impl Sys for Linux {
         self.signals = Some(sys::signals()?);
         let _ = self.root()?.directory(&spec.workdir)?;
         rustix::system::sethostname(spec.hostname.as_bytes())?;
-        self.root_mut()?
-            .atomic("/etc/resolv.conf", spec.resolv_conf.as_bytes(), now())
+        self.install_spec_files(spec)
     }
     fn start_entrypoint(&mut self, spec: &RunSpec) -> Result<()> {
         if self.entry.is_some() {
@@ -605,7 +685,9 @@ impl Sys for Linux {
     }
 
     fn upload(&mut self, path: &str, data: &[u8]) -> Result<()> {
-        self.root_mut()?.atomic(path, data, now())
+        let owner = self.upload_owner.ok_or(Error::Boot)?;
+        self.root_mut()?
+            .atomic_as(path, data, now(), Some(owner), Mode::RUSR | Mode::WUSR)
     }
     fn download(&mut self, path: &str) -> Result<Vec<u8>> {
         self.root()?.read(path, MAX_TRANSFER)
@@ -618,46 +700,22 @@ impl Sys for Linux {
         executable: &File,
         tty: bool,
     ) -> Result<()> {
-        spec.validate()?;
-        spec::args(argv, false)?;
-        process::setsid()?;
-        if tty {
-            process::ioctl_tiocsctty(std::io::stdin())?;
-        }
+        crate::boot::run_child(self, spec, argv, cwd, executable, tty)
+    }
+    fn child_cwd(&mut self, cwd: &File) -> Result<()> {
         process::fchdir(cwd)?;
-        let memory = spec
-            .resources
-            .memory_mib
-            .checked_mul(1024 * 1024)
-            .ok_or(Error::Limit)?;
-        process::setrlimit(
-            process::Resource::As,
-            process::Rlimit {
-                current: Some(memory),
-                maximum: Some(memory),
-            },
-        )?;
-        process::setrlimit(
-            process::Resource::Core,
-            process::Rlimit {
-                current: Some(0),
-                maximum: Some(0),
-            },
-        )?;
-        crate::boot::drop_privileges(self, spec)?;
-        sys::clear_signal_mask()?;
-        let argv = argv
-            .iter()
-            .map(|s| CString::new(s.as_str()).map_err(|_| Error::InvalidInput))
-            .collect::<Result<Vec<_>>>()?;
-        let env = spec
-            .env
-            .iter()
-            .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|_| Error::InvalidInput))
-            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
+    fn exec_program(&mut self, executable: &File, argv: &[CString], env: &[CString]) -> Result<()> {
         rustix::io::fcntl_setfd(executable, rustix::io::FdFlags::empty())?;
-        sys::exec(executable, &argv, &env)?;
+        sys::exec(executable, argv, env)?;
         Err(Error::Io)
+    }
+    fn guest_time(&mut self) -> Result<i64> {
+        if !self.guest_clock_set {
+            return Err(Error::Boot);
+        }
+        Ok(now())
     }
     fn maintain(&mut self) -> Result<()> {
         self.signals()?;
@@ -676,20 +734,15 @@ impl Sys for Linux {
     }
 }
 
-fn allocate_pty() -> Result<(File, File)> {
+fn allocate_pty(root: &Root) -> Result<(File, File)> {
     // Bind allocation to the devpts instance mounted during boot. The kernel's
     // earlier /dev/ptmx node can still refer to a different devpts instance.
-    let root = Root::open_root("/")?;
     let pinned = root.node("/dev/pts/ptmx", fs::FileType::CharacterDevice)?;
-    Ok(open_pty(&pinned)?)
+    Ok(open_pty(root, &pinned)?)
 }
 
-fn open_pty(pinned: &OwnedFd) -> std::io::Result<(File, File)> {
-    let master = fs::open(
-        fd_path(pinned),
-        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY,
-        Mode::empty(),
-    )?;
+fn open_pty(root: &Root, pinned: &OwnedFd) -> std::io::Result<(File, File)> {
+    let master = root.proc.reopen(pinned, OFlags::RDWR | OFlags::NOCTTY)?;
     rustix::pty::unlockpt(&master)?;
     let slave = File::from(rustix::pty::ioctl_tiocgptpeer(
         &master,
@@ -697,7 +750,6 @@ fn open_pty(pinned: &OwnedFd) -> std::io::Result<(File, File)> {
             | rustix::pty::OpenptFlags::CLOEXEC
             | rustix::pty::OpenptFlags::NOCTTY,
     )?);
-    let master = File::from(master);
     fs::fcntl_setfl(&master, fs::fcntl_getfl(&master)? | OFlags::NONBLOCK)?;
     Ok((master, slave))
 }
@@ -906,6 +958,112 @@ mod tests {
 
     fn deadline(ms: u64) -> Instant {
         Instant::now() + Duration::from_millis(ms)
+    }
+    fn run_spec() -> RunSpec {
+        RunSpec::parse(br#"{"env":{},"workdir":"/","uid":1000,"gid":1000,"entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n","resources":{"vcpus":1,"memory_mib":512,"disk_mib":1,"wall_time_s":1}}"#.as_slice()).unwrap()
+    }
+    #[test]
+    fn descriptor_relative_helper_spawn_executes_the_pinned_inode() {
+        let root = Root::open_root("/").unwrap();
+        let program = std::fs::canonicalize("/bin/sh").unwrap();
+        let helper = root.regular(program.to_str().unwrap()).unwrap();
+        let mut command = Command::new(format!("./{}", helper.as_raw_fd()));
+        command
+            .args(["-c", "printf pinned-helper"])
+            .env_clear()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = sys::spawn_in(&mut command, &root.proc.fds).unwrap();
+        assert!(killed_status(&mut child).unwrap().success());
+        let output = read_capped(child.stdout.take().unwrap(), MAX_COMMAND_OUTPUT).unwrap();
+        assert_eq!(output, b"pinned-helper");
+        assert!(
+            read_capped(child.stderr.take().unwrap(), MAX_COMMAND_OUTPUT)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn shutdown_ignores_kernel_threads_but_refuses_userspace_and_bad_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let write_stat = |id: u32, contents: &[u8]| {
+            let dir = temp.path().join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), contents).unwrap();
+        };
+        write_stat(1, b"1 (init) S 0 1 1 0 -1 0");
+        write_stat(2, b"2 (kthreadd) S 0 0 0 0 -1 2097152");
+        write_stat(3, b"3 (kworker ) 1) I 2 0 0 0 -1 2101312");
+        let dir = fs::open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let linux = Linux::default();
+        assert!(linux.no_userspace_processes(&dir).unwrap());
+        write_stat(4, b"4 (surviving task) S 1 4 4 0 -1 4194304");
+        assert!(!linux.no_userspace_processes(&dir).unwrap());
+        std::fs::remove_dir_all(temp.path().join("4")).unwrap();
+        assert!(linux.no_userspace_processes(&dir).unwrap());
+        write_stat(2, b"2 (kthreadd) S 0");
+        assert_eq!(linux.no_userspace_processes(&dir), Err(Error::Io));
+        write_stat(2, &vec![b'x'; MAX_PROC_STAT + 1]);
+        assert_eq!(linux.no_userspace_processes(&dir), Err(Error::Limit));
+        assert_eq!(
+            is_kernel_thread(b"3 (fake) S 0 0 0 0 -1 2097152", b"2"),
+            Err(Error::Io)
+        );
+        assert_eq!(
+            is_kernel_thread(b"2 (fake) S 0 0 0 0 -1 18446744073709551616", b"2"),
+            Err(Error::Io)
+        );
+    }
+    #[test]
+    fn uploads_use_command_owner_and_private_mode_resolver_is_readable() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("etc")).unwrap();
+        let mut spec = run_spec();
+        // The unprivileged fixture uses its own ids, exercising descriptor
+        // ownership assignment without changing any process credentials.
+        spec.uid = process::getuid().as_raw();
+        spec.gid = process::getgid().as_raw();
+        let mut linux = Linux {
+            root: Some(Root::open_root(temp.path().to_str().unwrap()).unwrap()),
+            ..Linux::default()
+        };
+        linux.install_spec_files(&spec).unwrap();
+        linux.upload("/input", b"private input").unwrap();
+        let upload = std::fs::metadata(temp.path().join("input")).unwrap();
+        assert_eq!(upload.uid(), spec.uid);
+        assert_eq!(upload.gid(), spec.gid);
+        assert_eq!(upload.mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read(temp.path().join("input")).unwrap(),
+            b"private input"
+        );
+        let resolver = std::fs::metadata(temp.path().join("etc/resolv.conf")).unwrap();
+        assert_eq!(resolver.mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::read(temp.path().join("etc/resolv.conf")).unwrap(),
+            spec.resolv_conf.as_bytes()
+        );
+        assert_eq!(
+            linux.upload_owner,
+            Some((
+                process::Uid::from_raw(spec.uid),
+                process::Gid::from_raw(spec.gid)
+            ))
+        );
+        // An unprivileged test cannot give a file to another uid. Requiring
+        // this failure proves the production upload actually applies the
+        // declared owner, even when the successful fixture shares our ids.
+        assert!(!process::geteuid().is_root());
+        spec.uid = 0;
+        linux.install_spec_files(&spec).unwrap();
+        assert_eq!(linux.upload("/refused", b"private"), Err(Error::Io));
+        assert!(!temp.path().join("refused").exists());
     }
     fn linux() -> Linux {
         Linux {
@@ -1139,12 +1297,12 @@ mod tests {
             let pinned = root
                 .node(path, fs::FileType::CharacterDevice)
                 .map_err(std::io::Error::other)?;
-            let available_pty = open_pty(&pinned)?;
+            let available_pty = open_pty(&root, &pinned)?;
             if path == "/dev/pts/ptmx" {
                 // Once the guest-style facility is available, failures in the
                 // production allocator are defects, never reasons to skip.
                 drop(available_pty);
-                allocate_pty().map_err(std::io::Error::other)
+                allocate_pty(&root).map_err(std::io::Error::other)
             } else {
                 Ok(available_pty)
             }

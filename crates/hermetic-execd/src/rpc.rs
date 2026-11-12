@@ -62,11 +62,19 @@ pub struct ExecReply {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     Ok,
-    Status { locked: bool, output_bytes: usize },
+    Status {
+        locked: bool,
+        output_bytes: usize,
+        guest_time_unix: i64,
+    },
     Exec(ExecReply),
-    Download { data: Vec<u8> },
+    Download {
+        data: Vec<u8>,
+    },
     Frozen,
-    Error { reason: Error },
+    Error {
+        reason: Error,
+    },
 }
 
 /// u32 little endian length then strict JSON; lengths checked before allocation.
@@ -122,11 +130,15 @@ impl<S: Sys> Server<S> {
             Request::Status {} => Ok(Reply::Status {
                 locked: self.boot.locked,
                 output_bytes: self.output,
+                guest_time_unix: self.sys.guest_time()?,
             }),
             Request::Authorize {} => {
                 if self.boot.locked {
                     if !self.boot.spec.initial_argv().is_empty() {
-                        self.sys.start_entrypoint(&self.boot.spec)?;
+                        if let Err(error) = self.sys.start_entrypoint(&self.boot.spec) {
+                            self.stopped |= error == Error::ChildStuck;
+                            return Err(error);
+                        }
                     }
                     self.boot.locked = false;
                 }
