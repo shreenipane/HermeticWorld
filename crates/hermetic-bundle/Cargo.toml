@@ -1,0 +1,21 @@
+[package]
+name = "hermetic-bundle"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic sealing and verification of Hermetic World directory bundles"
+
+[lib]
+name = "hermetic_bundle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermetic-bundle"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.10"
