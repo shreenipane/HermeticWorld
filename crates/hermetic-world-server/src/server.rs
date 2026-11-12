@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 use crate::limits::{validate_rate, Limits};
 use crate::log::{LogEventParams, LogManager};
-use crate::safe_fs::Directory;
+use crate::safe_fs::{is_descendant_of, Directory, LogTarget};
 use crate::sandbox::{apply_sandbox, SandboxLandlockStatus};
 use crate::store::DirStore;
 
@@ -313,35 +313,58 @@ pub fn filter_headers(
     out
 }
 
-fn path_is_ancestor_or_equal(ancestor: &Path, path: &Path) -> bool {
-    let mut a_comps = ancestor.components();
-    let mut p_comps = path.components();
-    for a in &mut a_comps {
-        match p_comps.next() {
-            Some(p) if p == a => {}
-            _ => return false,
-        }
-    }
-    true
+thread_local! {
+    static VALIDATION_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-fn validate_root_separation(store_dir: &Directory, log_dir: &Directory) -> Result<(), ServerExit> {
-    use std::os::unix::fs::MetadataExt;
+pub fn set_validation_rename_hook(hook: impl FnOnce() + Send + 'static) {
+    VALIDATION_RENAME_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(hook));
+    });
+}
 
-    let store_fd_path = store_dir.descriptor_path();
-    let store_canon = std::fs::read_link(&store_fd_path).map_err(|_| ServerExit::StartupFailed)?;
-    let store_meta = std::fs::metadata(&store_canon).map_err(|_| ServerExit::StartupFailed)?;
+fn run_validation_rename_hook() {
+    VALIDATION_RENAME_HOOK.with(|h| {
+        if let Some(hook) = h.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
-    let log_fd_path = log_dir.descriptor_path();
-    let log_canon = std::fs::read_link(&log_fd_path).map_err(|_| ServerExit::StartupFailed)?;
-    let log_meta = std::fs::metadata(&log_canon).map_err(|_| ServerExit::StartupFailed)?;
+pub fn validate_root_separation(
+    store_dir: &Directory,
+    log_dir: &Directory,
+) -> Result<(), ServerExit> {
+    validate_root_separation_target(store_dir, &LogTarget::Existing(log_dir.clone()))
+}
 
-    if (store_meta.dev() == log_meta.dev() && store_meta.ino() == log_meta.ino())
-        || store_canon == log_canon
-        || path_is_ancestor_or_equal(&store_canon, &log_canon)
-        || path_is_ancestor_or_equal(&log_canon, &store_canon)
-    {
-        return Err(ServerExit::StartupFailed);
+pub(crate) fn validate_root_separation_target(
+    store_dir: &Directory,
+    log_target: &LogTarget,
+) -> Result<(), ServerExit> {
+    let store_id = store_dir
+        .identity()
+        .map_err(|_| ServerExit::StartupFailed)?;
+    run_validation_rename_hook();
+    match log_target {
+        LogTarget::Existing(log_dir) => {
+            let log_id = log_dir.identity().map_err(|_| ServerExit::StartupFailed)?;
+            if store_id == log_id
+                || is_descendant_of(log_dir, &store_id).map_err(|_| ServerExit::StartupFailed)?
+                || is_descendant_of(store_dir, &log_id).map_err(|_| ServerExit::StartupFailed)?
+            {
+                return Err(ServerExit::StartupFailed);
+            }
+        }
+        LogTarget::ToCreate { parent, .. } => {
+            let parent_id = parent.identity().map_err(|_| ServerExit::StartupFailed)?;
+            if store_id == parent_id
+                || is_descendant_of(parent, &store_id).map_err(|_| ServerExit::StartupFailed)?
+            {
+                return Err(ServerExit::StartupFailed);
+            }
+        }
     }
 
     Ok(())
@@ -555,9 +578,9 @@ impl WorldServer {
         config.store_dir =
             std::path::absolute(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
 
-        let log_directory =
-            Directory::create(&config.log_dir).map_err(|_| ServerExit::StartupFailed)?;
-        validate_root_separation(&store_directory, &log_directory)?;
+        let log_target =
+            LogTarget::resolve(&config.log_dir).map_err(|_| ServerExit::StartupFailed)?;
+        validate_root_separation_target(&store_directory, &log_target)?;
 
         let store = DirStore::from_directory(store_directory, &config.store_dir);
 
@@ -582,8 +605,8 @@ impl WorldServer {
         let socket_entry = socket_directory
             .path(&socket_name)
             .map_err(|_| ServerExit::StartupFailed)?;
-        match std::fs::symlink_metadata(&socket_entry) {
-            Err(e) if e.kind() == ErrorKind::NotFound => (),
+        let stale_cleanup = match std::fs::symlink_metadata(&socket_entry) {
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
             Ok(meta) => {
                 use std::os::unix::fs::{FileTypeExt, MetadataExt};
                 if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
@@ -592,11 +615,9 @@ impl WorldServer {
                 if !config.recover {
                     return Err(ServerExit::StartupFailed);
                 }
-                let parent_fd_path = socket_directory.descriptor_path();
-                let parent_canon =
-                    std::fs::read_link(&parent_fd_path).map_err(|_| ServerExit::StartupFailed)?;
-                let parent_meta =
-                    std::fs::metadata(&parent_canon).map_err(|_| ServerExit::StartupFailed)?;
+                let parent_meta = socket_directory
+                    .metadata()
+                    .map_err(|_| ServerExit::StartupFailed)?;
                 if meta.uid() != parent_meta.uid() {
                     return Err(ServerExit::StartupFailed);
                 }
@@ -611,14 +632,22 @@ impl WorldServer {
                         if e.kind() == ErrorKind::ConnectionRefused
                             || e.kind() == ErrorKind::NotFound =>
                     {
-                        let _ = std::fs::remove_file(&lock_entry);
-                        std::fs::remove_file(&socket_entry)
-                            .map_err(|_| ServerExit::StartupFailed)?;
+                        Some((lock_entry, socket_entry))
                     }
                     Err(_) => return Err(ServerExit::StartupFailed),
                 }
             }
             _ => return Err(ServerExit::StartupFailed),
+        };
+
+        // Materialize log directory and clean up stale endpoint only after all validations succeed.
+        let log_directory = log_target
+            .into_directory()
+            .map_err(|_| ServerExit::StartupFailed)?;
+
+        if let Some((lock_entry, socket_entry)) = stale_cleanup {
+            let _ = std::fs::remove_file(&lock_entry);
+            std::fs::remove_file(&socket_entry).map_err(|_| ServerExit::StartupFailed)?;
         }
         // Bind the run to its supplied clock, resource policy, store and sandbox policy.
         let binding_data = serde_json::to_vec(&(

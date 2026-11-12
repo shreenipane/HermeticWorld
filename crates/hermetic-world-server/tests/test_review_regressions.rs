@@ -2240,3 +2240,155 @@ fn review_9_unbound_recovery_rejects_before_changing_any_artifact() {
         }
     }
 }
+
+#[test]
+fn review_root_separation_rename_during_validation_rejected_no_disclosure() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let store_dir = root.join("store");
+    let log_dir = store_dir.join("example.org");
+    let socket_path = root.join("server.sock");
+
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("item.txt"), b"genuine content").unwrap();
+
+    let mut cfg = config(root);
+    cfg.store_dir = store_dir.clone();
+    cfg.log_dir = log_dir.clone();
+    cfg.socket_path = socket_path.clone();
+    cfg.no_sandbox = false;
+
+    let store_for_rename = store_dir.clone();
+    let renamed_store = root.join("store_renamed");
+    let renamed_store_clone = renamed_store.clone();
+
+    hermetic_world_server::server::set_validation_rename_hook(move || {
+        fs::rename(&store_for_rename, &renamed_store_clone).unwrap();
+    });
+
+    let res = WorldServer::new(cfg);
+    assert_eq!(res.err(), Some(ServerExit::StartupFailed));
+
+    // Assert no audit disclosure: requests.log was never written to store or log
+    assert!(!renamed_store.join("example.org/requests.log").exists());
+    assert!(!store_dir.join("example.org/requests.log").exists());
+
+    use hermetic_world_server::Store;
+    let store = hermetic_world_server::DirStore::new(&renamed_store);
+    assert!(store.get("example.org", "/requests.log").is_none());
+}
+
+#[test]
+fn review_startup_validates_endpoint_and_proposed_log_before_creating_artifacts() {
+    fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut tree = std::collections::BTreeMap::new();
+        fn walk(
+            dir: &Path,
+            base: &Path,
+            tree: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                paths.sort();
+                for p in paths {
+                    let rel = p.strip_prefix(base).unwrap().to_path_buf();
+                    if p.is_dir() {
+                        tree.insert(rel.clone(), Vec::new());
+                        walk(&p, base, tree);
+                    } else if let Ok(data) = fs::read(&p) {
+                        tree.insert(rel, data);
+                    }
+                }
+            }
+        }
+        walk(root, root, &mut tree);
+        tree
+    }
+
+    // 1. Overlapping nonexistent log paths
+    for overlap in ["nonexistent_log", "example.org/nonexistent_child"] {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let store = root.join("store");
+        fs::create_dir_all(store.join("example.org")).unwrap();
+        fs::write(store.join("example.org/item.txt"), b"item").unwrap();
+
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = store.join(overlap);
+        cfg.socket_path = root.join("server.sock");
+
+        let before = tree_snapshot(root);
+        let res = WorldServer::new(cfg);
+        assert_eq!(res.err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!store.join(overlap).exists());
+    }
+
+    // 2. Invalid endpoints with nonexistent log directory
+    {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let store = root.join("store");
+        fs::create_dir_all(store.join("example.org")).unwrap();
+        fs::write(store.join("example.org/item.txt"), b"item").unwrap();
+
+        // Nonexistent socket parent
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = root.join("nonexistent_log");
+        cfg.socket_path = root.join("nonexistent_parent/server.sock");
+        let before = tree_snapshot(root);
+        assert_eq!(WorldServer::new(cfg).err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!root.join("nonexistent_log").exists());
+
+        // Regular file as socket
+        let reg_sock = root.join("reg.sock");
+        fs::write(&reg_sock, b"regular file").unwrap();
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = root.join("nonexistent_log");
+        cfg.socket_path = reg_sock;
+        let before = tree_snapshot(root);
+        assert_eq!(WorldServer::new(cfg).err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!root.join("nonexistent_log").exists());
+
+        // Symlink as socket
+        let sym_sock = root.join("sym.sock");
+        symlink(&store, &sym_sock).unwrap();
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = root.join("nonexistent_log");
+        cfg.socket_path = sym_sock;
+        let before = tree_snapshot(root);
+        assert_eq!(WorldServer::new(cfg).err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!root.join("nonexistent_log").exists());
+
+        // Socket name too long
+        let long_sock = root.join(format!("{}.sock", "a".repeat(300)));
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = root.join("nonexistent_log");
+        cfg.socket_path = long_sock;
+        let before = tree_snapshot(root);
+        assert_eq!(WorldServer::new(cfg).err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!root.join("nonexistent_log").exists());
+
+        // Existing socket when recover is false
+        let exist_sock = root.join("exist.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&exist_sock).unwrap();
+        let mut cfg = config(root);
+        cfg.store_dir = store.clone();
+        cfg.log_dir = root.join("nonexistent_log");
+        cfg.socket_path = exist_sock;
+        cfg.recover = false;
+        let before = tree_snapshot(root);
+        assert_eq!(WorldServer::new(cfg).err(), Some(ServerExit::StartupFailed));
+        assert_eq!(tree_snapshot(root), before);
+        assert!(!root.join("nonexistent_log").exists());
+    }
+}

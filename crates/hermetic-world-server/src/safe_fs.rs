@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -114,21 +114,47 @@ impl Directory {
         Ok(Self(Arc::new(file)))
     }
 
-    pub fn create(path: &Path) -> io::Result<Self> {
-        match Self::open(path) {
-            Ok(dir) => Ok(dir),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let parent = Self::open(
-                    path.parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or(Path::new(".")),
-                )?;
-                let name = path.file_name().ok_or_else(invalid)?;
-                fs::create_dir(parent.path(Path::new(name))?)?;
-                parent.child_dir(Path::new(name))
-            }
-            Err(e) => Err(e),
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+
+    pub fn identity(&self) -> io::Result<DirIdentity> {
+        let meta = self.metadata()?;
+        Ok(DirIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    pub fn parent_dir(&self) -> io::Result<Self> {
+        let path = PathBuf::from(format!("/proc/self/fd/{}/..", self.0.as_raw_fd()));
+        let meta = fs::symlink_metadata(&path)?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(invalid());
         }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(invalid());
+        }
+        Ok(Self(Arc::new(file)))
+    }
+
+    pub fn create_child_dir(&self, name: &Path) -> io::Result<Self> {
+        let path = self.path(name)?;
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Ok(_) => return Err(invalid()),
+            Err(e) => return Err(e),
+        }
+        fs::create_dir(&path)?;
+        self.child_dir(name)
+    }
+
+    pub fn create(path: &Path) -> io::Result<Self> {
+        LogTarget::resolve(path)?.into_directory()
     }
 
     pub fn parent(&self, relative: &Path) -> io::Result<(Self, PathBuf)> {
@@ -258,6 +284,84 @@ impl Directory {
             }
         }
         Ok(())
+    }
+}
+
+pub const MAX_ANCESTRY_DEPTH: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DirIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+pub fn is_descendant_of(descendant: &Directory, target_id: &DirIdentity) -> io::Result<bool> {
+    let desc_id = descendant.identity()?;
+    if desc_id == *target_id {
+        return Ok(true);
+    }
+    let mut curr = descendant.clone();
+    let mut curr_id = desc_id;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        let parent = curr.parent_dir()?;
+        let parent_id = parent.identity()?;
+        if parent_id == *target_id {
+            return Ok(true);
+        }
+        if parent_id == curr_id {
+            return Ok(false);
+        }
+        curr = parent;
+        curr_id = parent_id;
+    }
+    Err(invalid())
+}
+
+#[derive(Clone, Debug)]
+pub enum LogTarget {
+    Existing(Directory),
+    ToCreate { parent: Directory, name: PathBuf },
+}
+
+impl LogTarget {
+    pub fn resolve(path: &Path) -> io::Result<Self> {
+        if path.as_os_str().len() > MAX_PATH_BYTES {
+            return Err(invalid());
+        }
+        let norm = normalize_path(path);
+        match Directory::open(&norm) {
+            Ok(dir) => Ok(LogTarget::Existing(dir)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let parent_path = norm
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let name = norm.file_name().ok_or_else(invalid)?;
+                let mut parts = Path::new(name).components();
+                if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
+                    return Err(invalid());
+                }
+                let parent = Directory::open(parent_path)?;
+                let child_path = parent.path(Path::new(name))?;
+                match fs::symlink_metadata(&child_path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                    Ok(_) => return Err(invalid()),
+                    Err(e) => return Err(e),
+                }
+                Ok(LogTarget::ToCreate {
+                    parent,
+                    name: PathBuf::from(name),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn into_directory(self) -> io::Result<Directory> {
+        match self {
+            LogTarget::Existing(dir) => Ok(dir),
+            LogTarget::ToCreate { parent, name } => parent.create_child_dir(&name),
+        }
     }
 }
 
@@ -471,5 +575,39 @@ mod tests {
             crate::log::verify_log_recover(temp.path().join("requests.log"), false, true).is_err()
         );
         FAIL_SYNC.set(false);
+    }
+
+    #[test]
+    fn descriptor_identity_and_ancestry_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::create_dir(root.join("sub/leaf")).unwrap();
+        fs::create_dir(root.join("sibling")).unwrap();
+
+        let root_dir = Directory::open(&root).unwrap();
+        let sub_dir = Directory::open(&root.join("sub")).unwrap();
+        let leaf_dir = Directory::open(&root.join("sub/leaf")).unwrap();
+        let sibling_dir = Directory::open(&root.join("sibling")).unwrap();
+
+        let root_id = root_dir.identity().unwrap();
+        let sub_id = sub_dir.identity().unwrap();
+        let leaf_id = leaf_dir.identity().unwrap();
+        let _sibling_id = sibling_dir.identity().unwrap();
+
+        assert!(is_descendant_of(&leaf_dir, &sub_id).unwrap());
+        assert!(is_descendant_of(&leaf_dir, &root_id).unwrap());
+        assert!(is_descendant_of(&leaf_dir, &leaf_id).unwrap());
+        assert!(is_descendant_of(&sub_dir, &root_id).unwrap());
+        assert!(!is_descendant_of(&sub_dir, &leaf_id).unwrap());
+        assert!(!is_descendant_of(&sibling_dir, &sub_id).unwrap());
+        assert!(is_descendant_of(&sibling_dir, &root_id).unwrap());
+
+        // Rename sub to sub_renamed and verify descriptor ancestry is invariant
+        let renamed = root.join("sub_renamed");
+        fs::rename(root.join("sub"), &renamed).unwrap();
+        assert!(is_descendant_of(&leaf_dir, &sub_id).unwrap());
+        assert!(is_descendant_of(&leaf_dir, &root_id).unwrap());
     }
 }
