@@ -16,10 +16,12 @@ pub mod fingerprint;
 pub mod gitstore;
 pub mod index;
 pub mod normalize;
+pub mod pyc_marshal;
 pub mod sarif;
 pub mod scan;
 pub mod tier2;
 pub mod undated;
+pub mod unicode_names;
 pub mod winnow;
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +46,7 @@ pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
 };
 pub use ext4::{scan_ext4_image, scan_ext4_slice, Ext4Error};
-pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints};
+pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints, PycFunctionFingerprint};
 pub use gitstore::{
     apply_delta, compute_git_sha1, scan_stray_pack_slice, Commit, GitError, GitObject, GitStore,
     ObjectType, PackIndex, StrayPackResult, Tag, Tree, TreeEntry,
@@ -55,6 +57,10 @@ pub use index::{
 };
 pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
+pub use pyc_marshal::{
+    parse_pyc_code_objects, parse_pyc_code_objects_outcome, HashedPycCodeObject, PycCodeObject,
+    PycParseOutcome,
+};
 pub use sarif::{
     generate_sarif, generate_sarif_with_options, generate_sarif_with_properties, SarifLog,
     SarifRunProperties,

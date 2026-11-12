@@ -217,6 +217,142 @@ fn sqlite_db_with(text: &str) -> Vec<u8> {
     fs::read(&path).expect("read sqlite")
 }
 
+fn marshal_short_ascii(name: &str) -> Vec<u8> {
+    let mut b = vec![b'z', name.len() as u8];
+    b.extend_from_slice(name.as_bytes());
+    b
+}
+
+fn marshal_int(val: i32) -> Vec<u8> {
+    let mut b = vec![b'i'];
+    b.extend_from_slice(&val.to_le_bytes());
+    b
+}
+
+fn marshal_tuple(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![b')', items.len() as u8];
+    for it in items {
+        b.extend_from_slice(it);
+    }
+    b
+}
+
+fn marshal_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut b = vec![b's'];
+    b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    b.extend_from_slice(bytes);
+    b
+}
+
+fn marshal_frozenset(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![b'>'];
+    b.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for it in items {
+        b.extend_from_slice(it);
+    }
+    b
+}
+
+fn build_pyc_38(name: &str, consts: &[Vec<u8>], names: &[&str], varnames: &[&str]) -> Vec<u8> {
+    let mut pyc = Vec::new();
+    // Header (16 bytes): magic 3413 (Python 3.8)
+    pyc.extend_from_slice(&[0x55, 0x0d, 0x0d, 0x0a]);
+    pyc.extend_from_slice(&[0u8; 12]);
+
+    // Code object
+    pyc.push(b'c');
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // argcount
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // posonlyargcount
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // kwonlyargcount
+    pyc.extend_from_slice(&(varnames.len() as i32).to_le_bytes()); // nlocals
+    pyc.extend_from_slice(&1i32.to_le_bytes()); // stacksize
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // flags
+    pyc.extend_from_slice(&marshal_bytes(&[0])); // code
+    pyc.extend_from_slice(&marshal_tuple(consts)); // consts
+    let names_items: Vec<Vec<u8>> = names.iter().map(|n| marshal_short_ascii(n)).collect();
+    pyc.extend_from_slice(&marshal_tuple(&names_items)); // names
+    let var_items: Vec<Vec<u8>> = varnames.iter().map(|n| marshal_short_ascii(n)).collect();
+    pyc.extend_from_slice(&marshal_tuple(&var_items)); // varnames
+    pyc.extend_from_slice(&marshal_tuple(&[])); // freevars
+    pyc.extend_from_slice(&marshal_tuple(&[])); // cellvars
+    pyc.extend_from_slice(&marshal_short_ascii("test.py")); // filename
+    pyc.extend_from_slice(&marshal_short_ascii(name)); // name
+    pyc.extend_from_slice(&1i32.to_le_bytes()); // firstlineno
+    pyc.extend_from_slice(&marshal_bytes(&[])); // lnotab
+
+    pyc
+}
+
+fn build_pyc_311(
+    name: &str,
+    qualname: &str,
+    consts: &[Vec<u8>],
+    names: &[&str],
+    localsplusnames: &[&str],
+) -> Vec<u8> {
+    let mut pyc = Vec::new();
+    // Header (16 bytes): magic 3495 (Python 3.11)
+    pyc.extend_from_slice(&[0xa7, 0x0d, 0x0d, 0x0a]);
+    pyc.extend_from_slice(&[0u8; 12]);
+
+    // Code object
+    pyc.push(b'c');
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // argcount
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // posonlyargcount
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // kwonlyargcount
+    pyc.extend_from_slice(&1i32.to_le_bytes()); // stacksize
+    pyc.extend_from_slice(&0i32.to_le_bytes()); // flags
+    pyc.extend_from_slice(&marshal_bytes(&[0])); // code
+    pyc.extend_from_slice(&marshal_tuple(consts)); // consts
+    let names_items: Vec<Vec<u8>> = names.iter().map(|n| marshal_short_ascii(n)).collect();
+    pyc.extend_from_slice(&marshal_tuple(&names_items)); // names
+    let locals_items: Vec<Vec<u8>> = localsplusnames
+        .iter()
+        .map(|n| marshal_short_ascii(n))
+        .collect();
+    pyc.extend_from_slice(&marshal_tuple(&locals_items)); // localsplusnames
+    pyc.extend_from_slice(&marshal_bytes(&[])); // localspluskinds
+    pyc.extend_from_slice(&marshal_short_ascii("test.py")); // filename
+    pyc.extend_from_slice(&marshal_short_ascii(name)); // name
+    pyc.extend_from_slice(&marshal_short_ascii(qualname)); // qualname
+    pyc.extend_from_slice(&1i32.to_le_bytes()); // firstlineno
+    pyc.extend_from_slice(&marshal_bytes(&[])); // linetable
+    pyc.extend_from_slice(&marshal_bytes(&[])); // exceptiontable
+
+    pyc
+}
+
+fn raw_code_38(name: &str, consts: &[Vec<u8>], names: &[&str], varnames: &[&str]) -> Vec<u8> {
+    let mut pyc = Vec::new();
+    pyc.push(b'c');
+    pyc.extend_from_slice(&0i32.to_le_bytes());
+    pyc.extend_from_slice(&0i32.to_le_bytes());
+    pyc.extend_from_slice(&0i32.to_le_bytes());
+    pyc.extend_from_slice(&(varnames.len() as i32).to_le_bytes());
+    pyc.extend_from_slice(&1i32.to_le_bytes());
+    pyc.extend_from_slice(&0i32.to_le_bytes());
+    pyc.extend_from_slice(&marshal_bytes(&[0]));
+    pyc.extend_from_slice(&marshal_tuple(consts));
+    let names_items: Vec<Vec<u8>> = names.iter().map(|n| marshal_short_ascii(n)).collect();
+    pyc.extend_from_slice(&marshal_tuple(&names_items));
+    let var_items: Vec<Vec<u8>> = varnames.iter().map(|n| marshal_short_ascii(n)).collect();
+    pyc.extend_from_slice(&marshal_tuple(&var_items));
+    pyc.extend_from_slice(&marshal_tuple(&[]));
+    pyc.extend_from_slice(&marshal_tuple(&[]));
+    pyc.extend_from_slice(&marshal_short_ascii("test.py"));
+    pyc.extend_from_slice(&marshal_short_ascii(name));
+    pyc.extend_from_slice(&1i32.to_le_bytes());
+    pyc.extend_from_slice(&marshal_bytes(&[]));
+    pyc
+}
+
+fn custom_task(base_file: &str, base_content: &str, gold_patch: &str) -> Task {
+    let base = tempdir().expect("tempdir");
+    fs::write(base.path().join(base_file), base_content).expect("write base");
+    let fp = FingerprintSet::from_task(gold_patch, "", base.path()).expect("fp");
+    Task { _base: base, fp }
+}
+
 // ---------------------------------------------------------------------------------------
 // Equivalence
 // ---------------------------------------------------------------------------------------
@@ -516,6 +652,150 @@ fn query_applies_the_queried_visibility() {
     assert!(found.iter().all(|f| f.visibility == Visibility::ImageOnly));
 }
 
+#[test]
+fn equivalence_pyc_code_objects_38_and_311() {
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,2 @@\n-def process(x):\n-    return x\n+def process(x, strict=False):\n+    return x + 3\n";
+    let t = custom_task("service.py", "def process(x):\n    return x\n", patch);
+
+    // 1. Python 3.8 fixed pyc: both scan and query gate
+    let root_38 = tempdir().expect("tempdir");
+    let pyc_fixed_38 = build_pyc_38("process", &[marshal_int(3)], &[], &["x", "strict"]);
+    fs::write(root_38.path().join("service.pyc"), &pyc_fixed_38).expect("write pyc");
+    let f_38 = assert_equivalent(root_38.path(), &t, &opts());
+    assert_eq!(gates_with(&f_38, "binary_pyc_function"), 1, "{f_38:#?}");
+
+    // 2. Python 3.8 base pyc: neither scan nor query gate
+    let root_base = tempdir().expect("tempdir");
+    let pyc_base_38 = build_pyc_38("process", &[], &[], &["x"]);
+    fs::write(root_base.path().join("service.pyc"), &pyc_base_38).expect("write pyc");
+    let f_base = assert_equivalent(root_base.path(), &t, &opts());
+    assert_eq!(gates_with(&f_base, "binary_pyc_function"), 0, "{f_base:#?}");
+
+    // 3. Python 3.11 fixed pyc: both scan and query gate
+    let root_311 = tempdir().expect("tempdir");
+    let pyc_fixed_311 = build_pyc_311(
+        "process",
+        "process",
+        &[marshal_int(3)],
+        &[],
+        &["x", "strict"],
+    );
+    fs::write(root_311.path().join("service.pyc"), &pyc_fixed_311).expect("write pyc");
+    let f_311 = assert_equivalent(root_311.path(), &t, &opts());
+    assert_eq!(gates_with(&f_311, "binary_pyc_function"), 1, "{f_311:#?}");
+}
+
+#[test]
+fn test_regression_defect5_frozenset_scan_and_index_query_integration() {
+    let base = "def f(x):\n    return x in {2, 3}\n";
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,2 +1,2 @@\n-def f(x):\n-    return x in {2, 3}\n+def f(x):\n+    return x in {2, 4}\n";
+    let t = custom_task("service.py", base, patch);
+
+    let fs_fixed = marshal_frozenset(&[marshal_int(2), marshal_int(4)]);
+    let fs_base = marshal_frozenset(&[marshal_int(2), marshal_int(3)]);
+
+    // 1. Python 3.8 frozenset: both scan and query gate on fixed, not base
+    let root_fixed_38 = tempdir().expect("tempdir");
+    let pyc_fixed_38 = build_pyc_38("f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    fs::write(root_fixed_38.path().join("service.pyc"), &pyc_fixed_38).expect("write pyc");
+    let f_fixed_38 = assert_equivalent(root_fixed_38.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_fixed_38, "binary_pyc_function"),
+        1,
+        "{f_fixed_38:#?}"
+    );
+
+    let root_base_38 = tempdir().expect("tempdir");
+    let pyc_base_38 = build_pyc_38("f", std::slice::from_ref(&fs_base), &[], &["x"]);
+    fs::write(root_base_38.path().join("service.pyc"), &pyc_base_38).expect("write pyc");
+    let f_base_38 = assert_equivalent(root_base_38.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_base_38, "binary_pyc_function"),
+        0,
+        "{f_base_38:#?}"
+    );
+
+    // 2. Python 3.11 frozenset: both scan and query gate on fixed, not base
+    let root_fixed_311 = tempdir().expect("tempdir");
+    let pyc_fixed_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_fixed), &[], &["x"]);
+    fs::write(root_fixed_311.path().join("service.pyc"), &pyc_fixed_311).expect("write pyc");
+    let f_fixed_311 = assert_equivalent(root_fixed_311.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_fixed_311, "binary_pyc_function"),
+        1,
+        "{f_fixed_311:#?}"
+    );
+
+    let root_base_311 = tempdir().expect("tempdir");
+    let pyc_base_311 = build_pyc_311("f", "f", std::slice::from_ref(&fs_base), &[], &["x"]);
+    fs::write(root_base_311.path().join("service.pyc"), &pyc_base_311).expect("write pyc");
+    let f_base_311 = assert_equivalent(root_base_311.path(), &t, &opts());
+    assert_eq!(
+        gates_with(&f_base_311, "binary_pyc_function"),
+        0,
+        "{f_base_311:#?}"
+    );
+}
+
+#[test]
+fn equivalence_pyc_deletion_only_review() {
+    let patch = "diff --git a/cache.py b/cache.py\n--- a/cache.py\n+++ b/cache.py\n@@ -1,2 +1,2 @@\n-def clean_cache(target, force=True):\n-    return target + 42\n+def clean_cache(target):\n+    return target\n";
+    let t = custom_task(
+        "cache.py",
+        "def clean_cache(target, force=True):\n    return target + 42\n",
+        patch,
+    );
+
+    let root = tempdir().expect("tempdir");
+    let pyc_fixed = build_pyc_38("clean_cache", &[], &[], &["target"]);
+    fs::write(root.path().join("cache.pyc"), &pyc_fixed).expect("write pyc");
+
+    let f = assert_equivalent(root.path(), &t, &opts());
+    assert_eq!(gates_with(&f, "binary_pyc_function"), 0, "{f:#?}");
+    assert!(
+        f.iter().any(|s| s.contains("\"severity\":\"review\"")
+            && s.contains("binary_pyc_function")
+            && s.contains("clean_cache")),
+        "{f:#?}"
+    );
+}
+
+#[test]
+fn equivalence_pyc_nested_function_and_class_method() {
+    let patch = "diff --git a/worker.py b/worker.py\n--- a/worker.py\n+++ b/worker.py\n@@ -2,2 +2,2 @@\n-    def execute(self):\n-        return 1\n+    def execute(self, strict=True):\n+        return 3\n@@ -6,2 +6,2 @@\n-    def inner():\n-        return 1\n+    def inner(strict=True):\n+        return 3\n";
+    let t = custom_task(
+        "worker.py",
+        "class Worker:\n    def execute(self):\n        return 1\n\ndef outer():\n    def inner():\n        return 1\n",
+        patch,
+    );
+
+    let co_execute = raw_code_38("execute", &[marshal_int(3)], &[], &["self", "strict"]);
+    let co_worker = raw_code_38("Worker", &[co_execute], &["execute"], &[]);
+    let co_inner = raw_code_38("inner", &[marshal_int(3)], &[], &["strict"]);
+    let co_outer = raw_code_38("outer", &[co_inner], &["inner"], &[]);
+    let top_pyc = build_pyc_38(
+        "<module>",
+        &[co_worker, co_outer],
+        &["Worker", "outer"],
+        &[],
+    );
+
+    let root = tempdir().expect("tempdir");
+    fs::write(root.path().join("worker.pyc"), &top_pyc).expect("write pyc");
+
+    let f = assert_equivalent(root.path(), &t, &opts());
+    assert!(
+        f.iter()
+            .any(|s| s.contains("binary_pyc_function") && s.contains("execute")),
+        "must contain execute finding: {f:#?}"
+    );
+    assert!(
+        f.iter()
+            .any(|s| s.contains("binary_pyc_function") && s.contains("inner")),
+        "must contain inner finding: {f:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Round trip
 // ---------------------------------------------------------------------------------------
@@ -543,6 +823,11 @@ fn round_trip_every_record_identical() {
     )
     .expect("write");
     fs::write(root.path().join("blob.bin"), b"abc\0def").expect("write");
+    fs::write(
+        root.path().join("service.pyc"),
+        build_pyc_38("process", &[marshal_int(3)], &[], &["strict"]),
+    )
+    .expect("write");
 
     let expected = collect_records(root.path());
     assert!(expected.len() > 10, "{expected:#?}");
@@ -623,7 +908,7 @@ fn hostile_bad_magic() {
     raw[0..6].copy_from_slice(b"NOTIDX");
     assert!(matches!(read_raw(&raw), Err(IndexError::BadMagic)));
     assert_eq!(&MAGIC[..], b"HWIDX1");
-    assert_eq!(FORMAT_VERSION, 4);
+    assert_eq!(FORMAT_VERSION, 5);
     assert_eq!(MAX_UNIT_BYTES, 1024 * 1024 * 1024);
 }
 
@@ -1529,6 +1814,12 @@ fn query_older_version_index_reports_not_covered() {
             .any(|v| v == "D4:directories_symlinks_members"),
         "version 2 index query must report D4:directories_symlinks_members in not_covered: {not_covered_v2:#?}"
     );
+    assert!(
+        not_covered_v2
+            .iter()
+            .any(|v| v == "D3b:pyc_code_objects"),
+        "version 2 index query must report D3b:pyc_code_objects in not_covered: {not_covered_v2:#?}"
+    );
 
     // Build a hand-made version 3 index
     let idx_v3 = parent.path().join("image_v3.hwidx");
@@ -1564,4 +1855,157 @@ fn query_older_version_index_reports_not_covered() {
             .any(|v| v == "D4:directories_symlinks"),
         "version 3 index query must report D4:directories_symlinks in not_covered: {not_covered_v3:#?}"
     );
+    assert!(
+        not_covered_v3
+            .iter()
+            .any(|v| v == "D3b:pyc_code_objects"),
+        "version 3 index query must report D3b:pyc_code_objects in not_covered: {not_covered_v3:#?}"
+    );
+
+    // Build a hand-made version 4 index
+    let idx_v4 = parent.path().join("image_v4.hwidx");
+    let mut raw_v4 = Vec::new();
+    raw_v4.extend_from_slice(MAGIC);
+    raw_v4.extend_from_slice(&4u32.to_le_bytes()); // version 4
+    raw_v4.extend_from_slice(&(root_bytes.len() as u32).to_le_bytes());
+    raw_v4.extend_from_slice(root_bytes);
+    raw_v4.extend_from_slice(&0u32.to_le_bytes()); // canonical_root length 0
+    raw_v4.extend_from_slice(&0u64.to_le_bytes()); // record count 0
+
+    let compressed_v4 = zstd::encode_all(&raw_v4[..], 3).expect("encode v4");
+    fs::write(&idx_v4, compressed_v4).expect("write v4 idx");
+
+    let query_v4 = Command::new(bin)
+        .args(["query", "--task"])
+        .arg(&task)
+        .arg("--base-tree")
+        .arg(&base)
+        .arg("--index")
+        .arg(&idx_v4)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("run query v4");
+    assert_eq!(query_v4.status.code(), Some(0));
+    let val_v4: serde_json::Value =
+        serde_json::from_slice(&query_v4.stdout).expect("parse v4 json");
+    let not_covered_v4 = val_v4["not_covered"].as_array().expect("not_covered array");
+    assert!(
+        not_covered_v4
+            .iter()
+            .any(|v| v == "D3b:pyc_code_objects"),
+        "version 4 index query must report D3b:pyc_code_objects in not_covered: {not_covered_v4:#?}"
+    );
+}
+
+// T1.12 final review, finding 1: indexing a hostile dotted-name text unit is bounded and
+// a truncated tier-2 context is recorded as a coverage gap.
+/// Re-runs the test `name` of this binary in a child process with an address-space limit
+/// (`ulimit -v`, in KiB) and a wall-clock timeout. The child runs the real work when
+/// `env_key` is set. Returns true only when the child finished in time and passed, so a
+/// regression that blows up memory or time fails the test instead of the host.
+fn passes_in_limited_child(name: &str, env_key: &str, mem_kib: u64, timeout_secs: u64) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = std::env::current_exe().expect("test binary");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v \"$1\" || exit 99; exec \"$0\" --exact \"$2\" --test-threads=1 --nocapture")
+        .arg(exe)
+        .arg(mem_kib.to_string())
+        .arg(name)
+        .env(env_key, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().expect("wait child") {
+            Some(status) => return status.success(),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("{name}: child exceeded {timeout_secs}s");
+                return false;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// 1.5 GiB of address space for a limited child.
+const CHILD_MEM_KIB: u64 = 1536 * 1024;
+
+fn dotted_chain_text(parts: usize) -> String {
+    (0..parts)
+        .map(|i| format!("p{i:04}"))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+const INDEX_CHILD: &str = "HERMETIC_T112_INDEX_CHILD";
+
+#[test]
+fn t112_final_finding1_index_of_long_dotted_chain_is_bounded() {
+    if std::env::var_os(INDEX_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_index_of_long_dotted_chain_is_bounded",
+            INDEX_CHILD,
+            CHILD_MEM_KIB,
+            120,
+        ));
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("chain.txt"), dotted_chain_text(2000)).unwrap();
+    let records = collect_records(dir.path());
+    let context_hashes: usize = records
+        .iter()
+        .filter_map(|r| match r {
+            IndexRecord::Binary {
+                channel, strings, ..
+            } if channel == "tier2_context" => Some(strings.exact.len() + strings.tokens.len()),
+            _ => None,
+        })
+        .sum();
+    assert!(context_hashes > 0);
+    // 2000 parts, sub-chains of at most 16 parts, in two sets.
+    assert!(
+        context_hashes < 2 * 2000 * 17 + 16,
+        "context size not linear: {context_hashes}"
+    );
+    assert!(!records.iter().any(|r| matches!(
+        r,
+        IndexRecord::Fixed(f) if f.channel == "tier2_truncated"
+    )));
+}
+
+#[test]
+fn t112_final_finding1_index_records_tier2_truncation_gap() {
+    if std::env::var_os(INDEX_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "t112_final_finding1_index_records_tier2_truncation_gap",
+            INDEX_CHILD,
+            CHILD_MEM_KIB,
+            240,
+        ));
+        return;
+    }
+    let dir = tempdir().unwrap();
+    // ~1.5M sub-chains of ~50 bytes: far past the 32 MiB context budget.
+    fs::write(dir.path().join("chain.txt"), dotted_chain_text(100_000)).unwrap();
+    let records = collect_records(dir.path());
+    let gaps: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            IndexRecord::Fixed(f) if f.channel == "tier2_truncated" => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1, "truncation must be recorded once");
+    assert_eq!(gaps[0].severity, Severity::Info);
+    assert!(gaps[0].evidence[0].contains("truncated"));
+    let again = collect_records(dir.path());
+    assert_eq!(records, again, "index output must be deterministic");
 }

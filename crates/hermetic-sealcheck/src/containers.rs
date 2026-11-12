@@ -263,6 +263,8 @@ pub trait UnitSink {
     fn pkg_metadata(&mut self, path: &str, bytes: &[u8]);
     /// An archive member's modification time (tar mtime or zip DOS date-time), for D4.
     fn member_time(&mut self, path: &str, unix_secs: i64);
+    /// Parsed code objects from a .pyc container, for D3b binary_pyc_function.
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]);
 }
 
 /// The sink `scan` uses: matches every unit against one task's fingerprints at once.
@@ -329,8 +331,15 @@ impl UnitSink for MatchSink<'_> {
         });
 
         if has_tier2_candidates {
-            let (unit_symbols, unit_anchor_tokens) =
-                crate::tier2::extract_unit_symbols_and_anchors(text);
+            let ctx = crate::tier2::extract_unit_tier2_context(text);
+            if ctx.truncated {
+                self.findings.push(crate::tier2::tier2_truncated_finding(
+                    "D2",
+                    path,
+                    self.opts.visibility,
+                ));
+            }
+            let (unit_symbols, unit_anchor_tokens) = (ctx.symbols, ctx.anchor_tokens);
             for hunk in &self.fp.hunks {
                 if unit_gate_hunks.contains(&hunk.hunk_index) {
                     continue;
@@ -389,6 +398,13 @@ impl UnitSink for MatchSink<'_> {
                 });
             }
         }
+    }
+
+    fn pyc_code_objects(&mut self, path: &str, objects: &[crate::pyc_marshal::PycCodeObject]) {
+        self.findings
+            .extend(crate::pyc_marshal::match_pyc_code_objects(
+                objects, self.fp, self.opts, path,
+            ));
     }
 }
 
@@ -469,6 +485,27 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                     // Names and constants, matched exactly by the binary tier
                     self.sink
                         .binary(path, "binary_pyc", crate::binary::pyc_binary_strings(bytes));
+                    match crate::pyc_marshal::parse_pyc_code_objects_outcome(bytes) {
+                        crate::pyc_marshal::PycParseOutcome::Parsed(code_objects) => {
+                            if !code_objects.is_empty() {
+                                self.sink.pyc_code_objects(path, &code_objects);
+                            }
+                        }
+                        crate::pyc_marshal::PycParseOutcome::LimitExceeded(reason) => {
+                            // Coverage gap: the function-level check did not run.
+                            self.push(Finding {
+                                detector: "D3b".into(),
+                                channel: "pyc_limit_exceeded".into(),
+                                path: path.to_string(),
+                                visibility: self.opts.visibility,
+                                severity: Severity::Info,
+                                confidence: 0.0,
+                                hunk: None,
+                                evidence: vec![format!("pyc code objects not checked: {reason}")],
+                            });
+                        }
+                        crate::pyc_marshal::PycParseOutcome::Malformed => {}
+                    }
                 }
                 ContainerType::Sqlite => {
                     self.scan_sqlite(path, bytes);
