@@ -303,7 +303,7 @@ mod review_tests {
 
     #[test]
     fn sandbox_denies_store_and_outside_truncation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::safe_fs::private_tempdir().unwrap();
         let store = temp.path().join("store");
         let log = temp.path().join("log");
         fs::create_dir(&store).unwrap();

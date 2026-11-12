@@ -1002,7 +1002,7 @@ mod initialization_tests {
 
     #[test]
     fn review_2_path_replaced_inside_initialization_retains_verified_file() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::safe_fs::private_tempdir().unwrap();
         let event = LogEventParams {
             elapsed_ms: 0,
             request_id: 1,
@@ -1035,7 +1035,7 @@ mod initialization_tests {
 
     #[test]
     fn review_2_finalized_manager_cannot_write_after_releasing_ownership() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::safe_fs::private_tempdir().unwrap();
         let mut first = LogManager::new(root.path()).unwrap();
         first.finish().unwrap();
         let mut second = LogManager::new_opts(root.path(), true).unwrap();
@@ -1062,7 +1062,7 @@ mod initialization_tests {
 
     #[test]
     fn review_2_ownership_release_does_not_wait_for_inherited_description() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::safe_fs::private_tempdir().unwrap();
         let directory = Directory::open(root.path()).unwrap();
         let owner = acquire_audit_lock(&directory).unwrap();
         let inherited = owner._file.try_clone().unwrap();
@@ -1079,7 +1079,7 @@ mod initialization_tests {
     fn review_1_maximum_distinct_and_escaped_paths_retain_terminal_byte_capacity() {
         const TEST_REQUEST_CAP: u64 = 4096;
         for distinct in [true, false] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::safe_fs::private_tempdir().unwrap();
             let mut manager = LogManager::new(root.path()).unwrap();
             let mut accepted = 0;
             let mut exhausted = false;
@@ -1129,7 +1129,7 @@ mod initialization_tests {
     fn review_9_empty_or_partial_binding_is_rejected_before_recovery_mutation() {
         for content in [b"".as_slice(), b"{\"status\":\"run_config\"".as_slice()] {
             for checkpoint in [false, true] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::safe_fs::private_tempdir().unwrap();
                 fs::write(root.path().join("requests.log"), content).unwrap();
                 fs::write(root.path().join("dedupe.json"), b"{}").unwrap();
                 fs::write(root.path().join(".head.tmp"), b"abandoned").unwrap();
@@ -1172,7 +1172,7 @@ mod initialization_tests {
 
     #[test]
     fn review_1_completion_budget_covers_custom_u16_status_width() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::safe_fs::private_tempdir().unwrap();
         let mut manager = LogManager::new(root.path()).unwrap();
         let intent = (
             "example.org".into(),

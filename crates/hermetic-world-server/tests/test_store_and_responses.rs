@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use tempfile::tempdir;
+use support::private_tempdir as tempdir;
 use time::macros::datetime;
 use time::OffsetDateTime;
 
@@ -68,11 +68,11 @@ fn test_get_head_range_miss_and_headers() {
 
     // Populate store
     let auth_dir = store_dir.join("pypi.org");
-    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    support::create_private_dir_all(&auth_dir).expect("create auth dir");
 
     // Regular file: /simple/requests/index.html
     let req_dir = auth_dir.join("simple").join("requests");
-    fs::create_dir_all(&req_dir).expect("create requests dir");
+    support::create_private_dir_all(&req_dir).expect("create requests dir");
     let html_file = req_dir.join("index.html");
     let html_body = b"<!DOCTYPE html><html><body>requests package</body></html>";
     fs::write(&html_file, html_body).expect("write html");
@@ -92,7 +92,7 @@ fn test_get_head_range_miss_and_headers() {
 
     // Query string file: /api/search?q=requests -> stored as search%3Fq=requests
     let api_dir = auth_dir.join("api");
-    fs::create_dir_all(&api_dir).expect("create api dir");
+    support::create_private_dir_all(&api_dir).expect("create api dir");
     let query_file = api_dir.join("search%3Fq=requests");
     let query_body = b"{\"results\": [\"requests\"]}";
     fs::write(&query_file, query_body).expect("write query file");
@@ -299,7 +299,7 @@ fn test_fix1_authority_traversal_and_sibling_protection() {
     let temp = tempdir().expect("tempdir");
     let parent = temp.path();
     let store_dir = parent.join("store");
-    fs::create_dir_all(&store_dir).expect("create store dir");
+    support::create_private_dir_all(&store_dir).expect("create store dir");
 
     // Sibling secret file next to store dir
     let sibling_secret = parent.join("secret.txt");
@@ -381,7 +381,7 @@ fn test_fix4_deterministic_headers() {
     let temp = tempdir().expect("tempdir");
     let store_dir1 = temp.path().join("store1");
     let obj_dir1 = store_dir1.join("example.com").join("files");
-    fs::create_dir_all(&obj_dir1).expect("create obj dir 1");
+    support::create_private_dir_all(&obj_dir1).expect("create obj dir 1");
 
     let file_path1 = obj_dir1.join("data.txt");
     fs::write(&file_path1, b"determinism test content").expect("write data.txt 1");
@@ -419,7 +419,7 @@ fn test_fix4_deterministic_headers() {
     // Sidecar 2: different order (every other item, then remainder)
     let store_dir2 = temp.path().join("store2");
     let obj_dir2 = store_dir2.join("example.com").join("files");
-    fs::create_dir_all(&obj_dir2).expect("create obj dir 2");
+    support::create_private_dir_all(&obj_dir2).expect("create obj dir 2");
     let file_path2 = obj_dir2.join("data.txt");
     fs::write(&file_path2, b"determinism test content").expect("write data.txt 2");
 
@@ -584,7 +584,7 @@ fn test_fix6_filter_headers_sidecar_validation() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let obj_dir = store_dir.join("example.com").join("fix6");
-    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    support::create_private_dir_all(&obj_dir).expect("create obj dir");
 
     let file_path = obj_dir.join("index.html");
     fs::write(&file_path, b"valid body content").expect("write file");
@@ -681,11 +681,11 @@ fn test_fix1_relative_store_root_with_parent_dir() {
     let temp = tempdir().expect("tempdir");
     let actual_store = temp.path().join("store");
     let obj_dir = actual_store.join("example.com");
-    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    support::create_private_dir_all(&obj_dir).expect("create obj dir");
     fs::write(obj_dir.join("hello.txt"), b"relative root content").expect("write file");
 
     let dummy_dir = temp.path().join("dummy");
-    fs::create_dir_all(&dummy_dir).expect("create dummy dir");
+    support::create_private_dir_all(&dummy_dir).expect("create dummy dir");
 
     // Relative path containing "../"
     let rel_path = dummy_dir.join("..").join("store");
@@ -731,7 +731,7 @@ fn test_fix2_mixed_case_sidecar_headers() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let obj_dir = store_dir.join("example.com").join("headers");
-    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    support::create_private_dir_all(&obj_dir).expect("create obj dir");
 
     let file_path = obj_dir.join("item.json");
     fs::write(&file_path, b"{\"status\": \"ok\"}").expect("write file");
@@ -824,7 +824,7 @@ fn test_finding_reserve_header_space_for_content_range() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let obj_dir = store_dir.join("example.com").join("files");
-    fs::create_dir_all(&obj_dir).expect("create obj dir");
+    support::create_private_dir_all(&obj_dir).expect("create obj dir");
 
     let file_path = obj_dir.join("data.bin");
     fs::write(&file_path, b"abcdef").expect("write file");

@@ -1,11 +1,36 @@
 #![forbid(unsafe_code)]
+//! Descriptor-pinned filesystem access for the audit log and endpoints.
+//!
+//! Atomic publication and endpoint reclaim end in `rename(2)`/`unlink(2)`,
+//! which act on names, not descriptors. They are therefore only performed in
+//! a directory that the held descriptor shows (by `fstat`) to be owned by the
+//! server's effective uid and writable by nobody else (`mode & 0o022 == 0`).
+//! After that check the only parties able to race those names are the
+//! server's own uid and root, both inside the trust boundary.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Effective uid of this process, read once from `/proc/self/status`.
+/// The server calls this before installing the sandbox, which denies `/proc`.
+pub fn process_uid() -> io::Result<u32> {
+    static UID: OnceLock<u32> = OnceLock::new();
+    if let Some(uid) = UID.get() {
+        return Ok(*uid);
+    }
+    let status = fs::read_to_string("/proc/self/status")?;
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .and_then(|euid| euid.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("cannot determine effective uid"))?;
+    Ok(*UID.get_or_init(|| uid))
+}
 
 pub const MAX_PATH_COMPONENTS: usize = 128;
 pub const MAX_PATH_BYTES: usize = 8192;
@@ -149,7 +174,8 @@ impl Directory {
             Ok(_) => return Err(invalid()),
             Err(e) => return Err(e),
         }
-        fs::create_dir(&path)?;
+        // Private from creation, so it qualifies for name-based publication.
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
         self.child_dir(name)
     }
 
@@ -237,6 +263,8 @@ impl Directory {
         if data.len() > MAX_ATOMIC_WRITE_BYTES {
             return Err(invalid());
         }
+        // Refuse before any artifact is created or removed.
+        self.check_exclusive()?;
         self.validate_atomic_write(name, temp)?;
         // Check the destination before creating any temporary artifact.
         let destination = self.path(name)?;
@@ -256,7 +284,6 @@ impl Directory {
         #[cfg(test)]
         publication_tests::at_boundary(temp, "created");
         let result = (|| {
-            self.check_publication_directory(written.uid())?;
             file.write_all(data)?;
             #[cfg(test)]
             publication_tests::at_boundary(temp, "written");
@@ -266,6 +293,8 @@ impl Directory {
             // rename(2) works on names, so the temporary name is bound to the
             // written descriptor immediately before and the destination
             // immediately after: a replaced staging entry is never accepted.
+            // check_exclusive() leaves only this uid (or root) able to race
+            // the remaining window between these checks and the rename.
             if !entry_is(&temporary, id)? {
                 return Err(invalid());
             }
@@ -282,13 +311,23 @@ impl Directory {
         result
     }
 
-    /// Publication renames by name, so the directory holding the names must
-    /// belong to the writer and must not be writable by other users.
-    fn check_publication_directory(&self, owner: u32) -> io::Result<()> {
+    /// Name-based operations (publication renames, endpoint reclaim) are only
+    /// safe in a directory no other user can modify. `fstat` on the held
+    /// descriptor must show a directory owned by this process's effective
+    /// uid with no group or other write permission; then only this uid or
+    /// root, both trusted, can replace entries in it.
+    pub fn check_exclusive(&self) -> io::Result<()> {
         let meta = self.metadata()?;
-        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o002 != 0 {
-            return Err(io::Error::other(
-                "publication directory is not exclusively owned",
+        let uid = process_uid()?;
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "directory must be owned by uid {uid} and not writable by group or others \
+                     (owner {}, mode {:o})",
+                    meta.uid(),
+                    meta.mode() & 0o7777
+                ),
             ));
         }
         Ok(())
@@ -401,6 +440,16 @@ impl LogTarget {
     }
 }
 
+/// `crate::safe_fs::private_tempdir()` honours the umask (0002 gives 0775); publication and
+/// endpoint reclaim require a directory not writable by group or others.
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -499,12 +548,47 @@ mod publication_tests {
     }
 
     #[test]
+    fn priorcheck_2_group_or_world_writable_publication_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o770, 0o775, 0o720, 0o702, 0o777] {
+            let root = crate::safe_fs::private_tempdir().unwrap();
+            let dir = root.path().join("log");
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let mut log = LogManager::new(&dir).unwrap();
+            log.log_event(&event()).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            let error = log.finish().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not writable by group or others"),
+                "{mode:o}: {error}"
+            );
+            for name in [
+                "requests.log.head",
+                "dedupe.json",
+                ".head.tmp",
+                ".dedupe.json.tmp",
+            ] {
+                assert!(
+                    fs::symlink_metadata(dir.join(name)).is_err(),
+                    "{mode:o}: {name} was written"
+                );
+            }
+            // The same directory made private again publishes normally.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            log.finish().unwrap();
+            verify_log_recover(dir.join("requests.log"), false, false).unwrap();
+        }
+    }
+
+    #[test]
     fn rereview_2_replaced_synced_temporaries_are_never_published() {
         for artifact in [".head.tmp", ".dedupe.json.tmp"] {
             for use_symlink in [false, true] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::safe_fs::private_tempdir().unwrap();
                 let dir = root.path().join("log");
-                fs::create_dir(&dir).unwrap();
+                fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
                 let outside = root.path().join("outside");
                 fs::write(&outside, b"forged").unwrap();
                 let mut log = LogManager::new(&dir).unwrap();
@@ -548,7 +632,7 @@ mod publication_tests {
     fn review_7_killed_atomic_publications_resume_with_verified_head_and_dedupe() {
         for artifact in [".head.tmp", ".dedupe.json.tmp"] {
             for boundary in ["created", "written", "synced"] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::safe_fs::private_tempdir().unwrap();
                 let mut initial = LogManager::new(root.path()).unwrap();
                 initial.log_event(&event()).unwrap();
                 initial.finish().unwrap();
@@ -620,7 +704,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[test]
     fn checked_file_and_ancestor_swaps_never_escape_or_block() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::safe_fs::private_tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("a")).unwrap();
@@ -659,7 +743,7 @@ mod tests {
 
     #[test]
     fn directory_open_failure_is_propagated_by_finalization_and_recovery() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::safe_fs::private_tempdir().unwrap();
         let writer = File::create(temp.path().join("requests.log")).unwrap();
         let mut log = crate::log::LogManager::new_with_writer(temp.path(), writer);
         FAIL_OPEN.set(true);
@@ -673,7 +757,7 @@ mod tests {
 
     #[test]
     fn directory_sync_failure_is_propagated_by_finalization_and_recovery() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::safe_fs::private_tempdir().unwrap();
         let mut log = crate::log::LogManager::new(temp.path()).unwrap();
         FAIL_SYNC.set(true);
         assert!(log.finish().is_err());
@@ -686,7 +770,7 @@ mod tests {
 
     #[test]
     fn descriptor_identity_and_ancestry_traversal() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::safe_fs::private_tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("sub")).unwrap();

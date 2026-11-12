@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::tempdir;
+use support::private_tempdir as tempdir;
 
 const CHILD_STORE: &str = "HERMETIC_SANDBOX_CHILD_STORE";
 const CHILD_LOG: &str = "HERMETIC_SANDBOX_CHILD_LOG";
@@ -91,8 +91,8 @@ fn test_sandbox_child_process() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
-    fs::create_dir(&store_dir).expect("create store");
-    fs::create_dir(&log_dir).expect("create log");
+    support::create_private_dir(&store_dir).expect("create store");
+    support::create_private_dir(&log_dir).expect("create log");
     create_fixture(&store_dir.join("test.txt"), b"read only content");
     let outside = temp.path().join("outside.txt");
     create_fixture(&outside, b"secret");
@@ -160,7 +160,7 @@ fn rereview_4_binary_never_writes_fixture_through_planted_entries() {
     for planted_symlink in [true, false] {
         let temp = tempdir().expect("tempdir");
         let tmpdir = temp.path().join("tmp");
-        fs::create_dir(&tmpdir).expect("create tmp");
+        support::create_private_dir(&tmpdir).expect("create tmp");
         let sentinel = temp.path().join("sentinel");
         create_fixture(&sentinel, b"sentinel");
         let old_fixture = tmpdir.join("hw_test_outside.txt");

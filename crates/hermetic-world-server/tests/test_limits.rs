@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+use support::private_tempdir as tempdir;
 use support::BoundedChild;
-use tempfile::tempdir;
 use time::macros::datetime;
 
 fn send_req(socket: &Path, req: &RequestFrame) -> ResponseFrame {
@@ -29,7 +29,7 @@ fn test_token_bucket_delays_requests() {
     let socket_path = temp.path().join("server.sock");
     let t_clock = datetime!(2024-03-01 12:00:00 UTC);
 
-    fs::create_dir_all(store_dir.join("pypi.org")).expect("create store");
+    support::create_private_dir_all(store_dir.join("pypi.org")).expect("create store");
     fs::write(store_dir.join("pypi.org").join("test.txt"), b"ok").expect("write test file");
 
     let config = ServerConfig {
@@ -117,7 +117,7 @@ fn test_request_cap_exceeded_exit_code_4() {
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
 
-    fs::create_dir_all(store_dir.join("pypi.org")).expect("create store");
+    support::create_private_dir_all(store_dir.join("pypi.org")).expect("create store");
     fs::write(store_dir.join("pypi.org").join("test.txt"), b"ok").expect("write test file");
 
     let bin = bin_path();
@@ -186,7 +186,7 @@ fn test_byte_cap_exceeded_exit_code_4() {
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
 
-    fs::create_dir_all(store_dir.join("pypi.org")).expect("create store");
+    support::create_private_dir_all(store_dir.join("pypi.org")).expect("create store");
     // Write 50-byte file
     let data = vec![b'a'; 50];
     fs::write(store_dir.join("pypi.org").join("test.txt"), &data).expect("write file");
@@ -252,7 +252,7 @@ fn test_malformed_frame_exit_code_3() {
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
 
-    fs::create_dir_all(store_dir.join("pypi.org")).expect("create store");
+    support::create_private_dir_all(store_dir.join("pypi.org")).expect("create store");
 
     let bin = bin_path();
     let mut child = BoundedChild(
@@ -302,8 +302,8 @@ fn test_fix2_startup_failed_socket_nonexistent_dir() {
     let temp = tempdir().expect("tempdir");
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&store_dir).expect("create store");
-    fs::create_dir_all(&log_dir).expect("create log");
+    support::create_private_dir_all(&store_dir).expect("create store");
+    support::create_private_dir_all(&log_dir).expect("create log");
 
     let bad_socket = temp.path().join("nonexistent_subdir").join("server.sock");
     let bin = bin_path();
@@ -339,7 +339,7 @@ fn test_fix5_client_early_close_logs_write_error_and_chain_verifies() {
     let socket_path = temp.path().join("server.sock");
 
     let auth_dir = store_dir.join("example.com");
-    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    support::create_private_dir_all(&auth_dir).expect("create auth dir");
     // Write 500 KB file so server writing to dropped client will encounter broken pipe
     let big_body = vec![b'w'; 500 * 1024];
     fs::write(auth_dir.join("large.dat"), &big_body).expect("write large file");

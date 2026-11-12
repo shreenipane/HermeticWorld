@@ -146,3 +146,29 @@ pub fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<UnixStream> {
     bound_stream(&stream);
     Ok(stream)
 }
+
+/// Create a private (0700) directory. Publication and endpoint reclaim refuse
+/// directories writable by group or others, so test directories must not
+/// depend on the umask (0002 leaves them group-writable).
+pub fn create_private_dir<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// `create_dir_all` with every created directory private (0700).
+pub fn create_private_dir_all<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// `tempfile::tempdir()` honours the umask (0002 gives 0775); publication and
+/// endpoint reclaim require a directory not writable by group or others.
+pub fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}

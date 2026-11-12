@@ -13,8 +13,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use support::private_tempdir as tempdir;
 use support::BoundedChild as AuditChild;
-use tempfile::tempdir;
 use time::macros::datetime;
 
 fn event(path: &str) -> LogEventParams<'_> {
@@ -138,7 +138,7 @@ fn audit_symlinks_fifos_and_temporary_entries_are_rejected() {
         for fifo in [false, true] {
             let temp = tempdir().unwrap();
             let dir = temp.path().join("log");
-            fs::create_dir(&dir).unwrap();
+            support::create_private_dir(&dir).unwrap();
             let outside = temp.path().join("outside");
             fs::write(&outside, b"").unwrap();
             let target = dir.join(name);
@@ -243,7 +243,7 @@ fn invalid_and_extreme_rates_fail_before_creating_artifacts() {
         (1.0, 1e300),
     ] {
         let temp = tempdir().unwrap();
-        fs::create_dir(temp.path().join("store")).unwrap();
+        support::create_private_dir(temp.path().join("store")).unwrap();
         let mut cfg = config(temp.path());
         cfg.rate_rps = Some(rate);
         cfg.burst = Some(burst);
@@ -258,7 +258,7 @@ fn invalid_and_extreme_rates_fail_before_creating_artifacts() {
 #[test]
 fn upper_guest_clock_boundary_returns_error_without_artifacts() {
     let temp = tempdir().unwrap();
-    fs::create_dir(temp.path().join("store")).unwrap();
+    support::create_private_dir(temp.path().join("store")).unwrap();
     let upper = datetime!(9999-12-31 23:59:59 UTC);
     let mut cfg = config(temp.path());
     cfg.t_clock = upper;
@@ -296,7 +296,7 @@ fn unknown_and_transport_headers_are_excluded() {
 fn socket_regular_files_and_symlinks_survive_startup() {
     for link in [false, true] {
         let temp = tempdir().unwrap();
-        fs::create_dir(temp.path().join("store")).unwrap();
+        support::create_private_dir(temp.path().join("store")).unwrap();
         let outside = temp.path().join("outside");
         fs::write(&outside, b"keep").unwrap();
         let socket = temp.path().join("socket");
@@ -326,7 +326,7 @@ fn socket_regular_files_and_symlinks_survive_startup() {
 #[test]
 fn defect1_guest_clock_non_utc_overflow_rejected() {
     let temp = tempdir().unwrap();
-    fs::create_dir(temp.path().join("store")).unwrap();
+    support::create_private_dir(temp.path().join("store")).unwrap();
 
     let offset = time::UtcOffset::from_hms(-23, -59, 0).unwrap();
     let dt = time::Date::from_calendar_date(9999, time::Month::December, 30)
@@ -363,7 +363,7 @@ fn defect2_sidecar_internal_metadata_retrieval_rejected() {
     let temp = tempdir().unwrap();
     let store_dir = temp.path().join("store");
     let obj_dir = store_dir.join("example.org");
-    fs::create_dir_all(&obj_dir).unwrap();
+    support::create_private_dir_all(&obj_dir).unwrap();
 
     let canary = "CANARY_SECRET_METADATA_DISCLOSURE_98765";
     fs::write(obj_dir.join("index.html"), b"Hello Public World").unwrap();
@@ -447,7 +447,7 @@ fn defect3_overlapping_store_and_log_roots_rejected() {
     {
         let temp = tempdir().unwrap();
         let store = temp.path().join("store");
-        fs::create_dir_all(store.join("example.org")).unwrap();
+        support::create_private_dir_all(store.join("example.org")).unwrap();
         let log = store.join("example.org");
         let mut cfg = config(temp.path());
         cfg.store_dir = store.clone();
@@ -459,9 +459,9 @@ fn defect3_overlapping_store_and_log_roots_rejected() {
     {
         let temp = tempdir().unwrap();
         let log = temp.path().join("log");
-        fs::create_dir_all(&log).unwrap();
+        support::create_private_dir_all(&log).unwrap();
         let store = log.join("store");
-        fs::create_dir_all(&store).unwrap();
+        support::create_private_dir_all(&store).unwrap();
         let mut cfg = config(temp.path());
         cfg.store_dir = store.clone();
         cfg.log_dir = log.clone();
@@ -472,7 +472,7 @@ fn defect3_overlapping_store_and_log_roots_rejected() {
     {
         let temp = tempdir().unwrap();
         let root = temp.path().join("same_dir");
-        fs::create_dir_all(&root).unwrap();
+        support::create_private_dir_all(&root).unwrap();
         let mut cfg = config(temp.path());
         cfg.store_dir = root.clone();
         cfg.log_dir = root.clone();
@@ -485,7 +485,7 @@ fn defect3_overlapping_store_and_log_roots_rejected() {
 fn defect4_recovery_retains_verified_descriptor_across_pathname_replacement() {
     let temp = tempdir().unwrap();
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&log_dir).unwrap();
+    support::create_private_dir_all(&log_dir).unwrap();
 
     {
         let mut log = LogManager::new(&log_dir).unwrap();
@@ -521,7 +521,7 @@ fn defect5_crash_recovery_endpoint_reuse() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(
         store_dir.join("example.org/test.txt"),
         b"crash recovery data",
@@ -641,7 +641,7 @@ fn defect6_socket_deadlines_terminate_stalled_reader_and_writer() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(
         store_dir.join("example.org/large.txt"),
         vec![b'X'; 512 * 1024],
@@ -710,7 +710,7 @@ fn defect7_audit_capacity_and_terminal_reservation() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(store_dir.join("example.org/item"), b"content").unwrap();
 
     let mut cfg = config(temp.path());
@@ -765,7 +765,7 @@ fn defect8_stream_object_larger_than_16mib() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
 
     let size = 17 * 1024 * 1024usize;
     let file_path = store_dir.join("example.org/large.bin");
@@ -825,7 +825,7 @@ fn defect9_sidecar_conflicting_headers_excluded() {
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
     let obj_dir = store_dir.join("example.org");
-    fs::create_dir_all(&obj_dir).unwrap();
+    support::create_private_dir_all(&obj_dir).unwrap();
 
     fs::write(obj_dir.join("item.txt"), b"0123456789").unwrap();
     fs::write(
@@ -1020,7 +1020,7 @@ fn defect11_unavailable_landlock_startup_regression() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(store_dir.join("example.org/index.html"), b"hello").unwrap();
 
     let mut cfg = config(temp.path());
@@ -1072,7 +1072,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(store_dir.join("example.org/item"), b"data").unwrap();
 
     let mut cfg = config(temp.path());
@@ -1144,7 +1144,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     let store_dir2 = temp2.path().join("store");
     let log_dir2 = temp2.path().join("log");
     let socket_path2 = temp2.path().join("server.sock");
-    fs::create_dir_all(store_dir2.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir2.join("example.org")).unwrap();
     fs::write(store_dir2.join("example.org/item"), b"data").unwrap();
 
     let mut cfg2 = config(temp2.path());
@@ -1198,7 +1198,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
     let store_dir3 = temp3.path().join("store");
     let log_dir3 = temp3.path().join("log");
     let socket_path3 = temp3.path().join("server.sock");
-    fs::create_dir_all(store_dir3.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir3.join("example.org")).unwrap();
 
     let mut cfg3 = config(temp3.path());
     cfg3.store_dir = store_dir3;
@@ -1234,7 +1234,7 @@ fn review_defect1_capacity_exhaustion_escaped_paths_and_malformed_input() {
 fn review_defect2_exclusive_audit_ownership_and_init_pathname_replacement() {
     let temp = tempdir().unwrap();
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&log_dir).unwrap();
+    support::create_private_dir_all(&log_dir).unwrap();
 
     // 1. Active writer blocks second writer and recovery without changing evidence
     let mut writer1 = LogManager::new(&log_dir).unwrap();
@@ -1266,7 +1266,7 @@ fn review_defect2_exclusive_audit_ownership_and_init_pathname_replacement() {
     // 2. Replace pathname during initialization: descriptor is retained
     let temp2 = tempdir().unwrap();
     let log_dir2 = temp2.path().join("log");
-    fs::create_dir_all(&log_dir2).unwrap();
+    support::create_private_dir_all(&log_dir2).unwrap();
     {
         let mut lm = LogManager::new(&log_dir2).unwrap();
         lm.log_event(&event("/r1")).unwrap();
@@ -1304,9 +1304,9 @@ fn review_defect3_root_separation_ancestor_replacement_retained_descriptors() {
     let log_dir = log_parent.join("example.org");
     let socket_path = root.join("server.sock");
 
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(store_dir.join("example.org/item.txt"), b"genuine content").unwrap();
-    fs::create_dir_all(&log_dir).unwrap();
+    support::create_private_dir_all(&log_dir).unwrap();
 
     let mut cfg = config(root);
     cfg.store_dir = store_dir.clone();
@@ -1377,7 +1377,7 @@ fn review_defect4_live_sandboxed_server_survives_recovery_attempt() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
     fs::write(store_dir.join("example.org/item.txt"), b"payload").unwrap();
 
     let mut cfg = config(temp.path());
@@ -1437,7 +1437,7 @@ fn review_defect4_live_sandboxed_server_survives_recovery_attempt() {
 fn review_defect5_unowned_endpoint_survives_failed_startup_and_destruction() {
     let temp = tempdir().unwrap();
     let root = temp.path();
-    fs::create_dir_all(root.join("store")).unwrap();
+    support::create_private_dir_all(root.join("store")).unwrap();
 
     // 1. Regular sentinel file inserted between new() and run()
     let socket1 = root.join("sentinel.sock");
@@ -1488,7 +1488,7 @@ fn review_defect6_absolute_run_deadline_idle_listener_and_token_exhaustion() {
     let store_dir = temp.path().join("store");
     let log_dir = temp.path().join("log");
     let socket_path = temp.path().join("server.sock");
-    fs::create_dir_all(store_dir.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
 
     // Create a prior log whose elapsed_ms is near MAX_RUN_ELAPSED_MS
     let near_deadline_ms = hermetic_world_server::server::MAX_RUN_ELAPSED_MS - 50;
@@ -1541,7 +1541,7 @@ fn review_defect6_absolute_run_deadline_idle_listener_and_token_exhaustion() {
     let store_dir2 = temp2.path().join("store");
     let log_dir2 = temp2.path().join("log");
     let socket_path2 = temp2.path().join("server.sock");
-    fs::create_dir_all(store_dir2.join("example.org")).unwrap();
+    support::create_private_dir_all(store_dir2.join("example.org")).unwrap();
     fs::write(store_dir2.join("example.org/item"), b"content").unwrap();
 
     let mut cfg2 = config(temp2.path());
@@ -1621,7 +1621,7 @@ fn review_defect6_absolute_run_deadline_idle_listener_and_token_exhaustion() {
 fn review_defect7_crash_leftovers_atomic_publication_recovery() {
     let temp = tempdir().unwrap();
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&log_dir).unwrap();
+    support::create_private_dir_all(&log_dir).unwrap();
 
     {
         let mut lm = LogManager::new(&log_dir).unwrap();
@@ -1658,7 +1658,7 @@ fn review_defect7_crash_leftovers_atomic_publication_recovery() {
     // Verify symlink temp files are rejected fail-closed
     let temp_sym = tempdir().unwrap();
     let log_dir_sym = temp_sym.path().join("log");
-    fs::create_dir_all(&log_dir_sym).unwrap();
+    support::create_private_dir_all(&log_dir_sym).unwrap();
     {
         let mut lm = LogManager::new(&log_dir_sym).unwrap();
         lm.log_event(&event("/one")).unwrap();
@@ -1677,7 +1677,7 @@ fn review_defect8_missing_query_specific_object_returns_404() {
     let store_dir = temp.path().join("store");
     let socket_path = temp.path().join("server.sock");
     let obj_dir = store_dir.join("example.org");
-    fs::create_dir_all(&obj_dir).unwrap();
+    support::create_private_dir_all(&obj_dir).unwrap();
 
     // Queryless object
     fs::write(obj_dir.join("search"), b"queryless response").unwrap();
@@ -1749,11 +1749,11 @@ fn review_defect9_empty_and_partial_first_record_recovery_rejected() {
     let temp = tempdir().unwrap();
     let root = temp.path();
     // Reach binding verification rather than failing because the store is absent.
-    fs::create_dir(root.join("store")).unwrap();
+    support::create_private_dir(root.join("store")).unwrap();
 
     // 1. Server recovery on empty requests.log must be rejected
     let log_dir1 = root.join("log1");
-    fs::create_dir_all(&log_dir1).unwrap();
+    support::create_private_dir_all(&log_dir1).unwrap();
     let log_file1 = log_dir1.join("requests.log");
     fs::write(&log_file1, b"").unwrap();
 
@@ -1769,7 +1769,7 @@ fn review_defect9_empty_and_partial_first_record_recovery_rejected() {
 
     // 2. Server recovery on partial first record must be rejected with artifacts unchanged
     let log_dir2 = root.join("log2");
-    fs::create_dir_all(&log_dir2).unwrap();
+    support::create_private_dir_all(&log_dir2).unwrap();
     let log_file2 = log_dir2.join("requests.log");
     let partial_record = b"{\"seq\":1,\"run_config\":{\"incomplete\":\"truncated";
     fs::write(&log_file2, partial_record).unwrap();
@@ -1830,7 +1830,7 @@ fn audit_connect(root: &Path, child: &mut AuditChild) -> UnixStream {
 fn frame_timeout_reconnection_retains_ownership_and_finalizes_verified_evidence() {
     const RESPONSE_CAP: u64 = 1024;
     let root = tempdir().unwrap();
-    fs::create_dir_all(root.path().join("store/example.org")).unwrap();
+    support::create_private_dir_all(root.path().join("store/example.org")).unwrap();
     fs::write(root.path().join("store/example.org/item"), b"payload").unwrap();
     let mut child = AuditChild(
         audit_command(root.path(), "socket")
@@ -1942,7 +1942,7 @@ fn frame_timeout_reconnection_retains_ownership_and_finalizes_verified_evidence(
 #[test]
 fn sandboxed_accept_finalizes_evidence_and_releases_audit_ownership() {
     let root = tempdir().unwrap();
-    fs::create_dir_all(root.path().join("store/example.org")).unwrap();
+    support::create_private_dir_all(root.path().join("store/example.org")).unwrap();
     fs::write(root.path().join("store/example.org/item"), b"payload").unwrap();
     let mut child = AuditChild(
         std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-world-server"))
@@ -2031,7 +2031,7 @@ fn assert_audit_chain(root: &Path, status: &str, requests: u64) {
 fn review_1_process_exit_codes_and_maximum_path_byte_budgets() {
     for scenario in ["distinct", "escaped", "quota", "malformed"] {
         let temp = tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("store/example.org")).unwrap();
+        support::create_private_dir_all(temp.path().join("store/example.org")).unwrap();
         let mut child = AuditChild(audit_command(temp.path(), "socket").spawn().unwrap());
         let mut stream = audit_connect(temp.path(), &mut child);
         let mut accepted = 0;
@@ -2082,7 +2082,7 @@ fn review_1_process_exit_codes_and_maximum_path_byte_budgets() {
 #[test]
 fn review_2_competing_processes_cannot_recover_or_spend_restored_quota() {
     let temp = tempdir().unwrap();
-    fs::create_dir_all(temp.path().join("store/example.org")).unwrap();
+    support::create_private_dir_all(temp.path().join("store/example.org")).unwrap();
     let mut child = AuditChild(audit_command(temp.path(), "socket").spawn().unwrap());
     let mut stream = audit_connect(temp.path(), &mut child);
     let request = RequestFrame {
@@ -2193,8 +2193,8 @@ fn review_9_unbound_recovery_rejects_before_changing_any_artifact() {
     ] {
         for checkpoint in [false, true] {
             let root = tempdir().unwrap();
-            fs::create_dir(root.path().join("store")).unwrap();
-            fs::create_dir(root.path().join("log")).unwrap();
+            support::create_private_dir(root.path().join("store")).unwrap();
+            support::create_private_dir(root.path().join("log")).unwrap();
             fs::write(root.path().join("log/requests.log"), content).unwrap();
             fs::write(root.path().join("log/dedupe.json"), b"{}").unwrap();
             fs::write(root.path().join("log/.head.tmp"), b"abandoned").unwrap();
@@ -2241,7 +2241,7 @@ fn review_root_separation_rename_during_validation_rejected_no_disclosure() {
     let log_dir = store_dir.join("example.org");
     let socket_path = root.join("server.sock");
 
-    fs::create_dir_all(&log_dir).unwrap();
+    support::create_private_dir_all(&log_dir).unwrap();
     fs::write(log_dir.join("item.txt"), b"genuine content").unwrap();
 
     let mut cfg = config(root);
@@ -2302,7 +2302,7 @@ fn review_startup_validates_endpoint_and_proposed_log_before_creating_artifacts(
         let temp = tempdir().unwrap();
         let root = temp.path();
         let store = root.join("store");
-        fs::create_dir_all(store.join("example.org")).unwrap();
+        support::create_private_dir_all(store.join("example.org")).unwrap();
         fs::write(store.join("example.org/item.txt"), b"item").unwrap();
 
         let mut cfg = config(root);
@@ -2322,7 +2322,7 @@ fn review_startup_validates_endpoint_and_proposed_log_before_creating_artifacts(
         let temp = tempdir().unwrap();
         let root = temp.path();
         let store = root.join("store");
-        fs::create_dir_all(store.join("example.org")).unwrap();
+        support::create_private_dir_all(store.join("example.org")).unwrap();
         fs::write(store.join("example.org/item.txt"), b"item").unwrap();
 
         // Nonexistent socket parent
@@ -2390,7 +2390,7 @@ fn rereview_1_invalid_fixed_header_without_payload_is_tampering() {
     // (header byte, value): version, method (two values), flags, reserved.
     for (offset, value) in [(4usize, 2u8), (5, 0), (5, 3), (6, 0x02), (7, 1)] {
         let temp = tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("store/example.org")).unwrap();
+        support::create_private_dir_all(temp.path().join("store/example.org")).unwrap();
         let mut child = AuditChild(
             audit_command(temp.path(), "socket")
                 .args(["--frame-deadline-ms", "1000"])
@@ -2414,5 +2414,46 @@ fn rereview_1_invalid_fixed_header_without_payload_is_tampering() {
         assert_eq!(child.wait_code(), 3, "header byte {offset} = {value}");
         assert_audit_chain(temp.path(), "tampered", 0);
         drop(stream);
+    }
+}
+
+#[test]
+fn priorcheck_3_stale_endpoint_in_group_writable_directory_is_not_reclaimed() {
+    // The 0700 case is covered by the reclaim unit tests in server.rs.
+    for mode in [0o770, 0o775, 0o720] {
+        let temp = tempdir().unwrap();
+        support::create_private_dir_all(temp.path().join("store")).unwrap();
+        finalized(&temp.path().join("log"));
+        let socket = temp.path().join("socket");
+        let lock = temp.path().join(".socket.lock");
+        // Stale endpoint: both sockets exist but nothing listens on them.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(&lock).unwrap());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let output = support::output_bounded(
+            audit_command(temp.path(), "socket").args(["--resume-log", "--recover"]),
+        );
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{mode:o}: {stderr}");
+        assert!(
+            stderr.contains("not removed") && stderr.contains("remove the stale socket"),
+            "{mode:o}: {stderr}"
+        );
+        for entry in [&socket, &lock] {
+            assert!(
+                fs::symlink_metadata(entry).is_ok(),
+                "{mode:o}: {} was removed",
+                entry.display()
+            );
+        }
+        let names: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("reclaim")),
+            "{names:?}"
+        );
     }
 }

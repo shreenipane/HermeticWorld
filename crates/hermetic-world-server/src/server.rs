@@ -577,16 +577,32 @@ fn socket_identity(entry: &Path) -> Option<(EntryId, u32)> {
     }
 }
 
+/// Unpredictable suffix for a private reclaim name. `RandomState` keys come
+/// from the OS random source (getrandom), so no new dependency is needed.
+fn random_suffix() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut parts = [0u64; 2];
+    for (index, part) in parts.iter_mut().enumerate() {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_usize(index);
+        hasher.write_u32(std::process::id());
+        *part = hasher.finish();
+    }
+    format!("{:016x}{:016x}", parts[0], parts[1])
+}
+
 /// Unlink the entry `name` of `directory` only if it is the socket `id`.
 ///
-/// Unlinking by name after a check would delete whatever replaced the entry
-/// in between. Instead the entry is first moved to a fresh private name in the
-/// descriptor-held directory, its identity is verified there, and only then is
-/// it unlinked; anything else is moved back without replacing a newer entry.
+/// Automatic removal is refused unless `fstat` on the held directory shows it
+/// owned by this process's uid and not writable by group or others
+/// (`Directory::check_exclusive`). The entry is then moved to a fresh,
+/// unpredictable private name, its identity is verified there, and only then
+/// is it unlinked; anything else is moved back without replacing a newer
+/// entry. After the directory check, only this uid (or root), which is inside
+/// the trust boundary, can race the final unlink of the private name.
 fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_PRIVATE: AtomicU64 = AtomicU64::new(0);
     let not_owned = || std::io::Error::other("endpoint entry is not the owned socket");
+    directory.check_exclusive()?;
     let entry = directory.path(name)?;
     if !matches!(socket_identity(&entry), Some((current, _)) if current == id) {
         return Err(not_owned());
@@ -594,11 +610,12 @@ fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::
     #[cfg(test)]
     review_tests::endpoint_verified();
     let private = directory.path(Path::new(&format!(
-        ".{}.reclaim-{}-{}",
+        ".{}.reclaim-{}",
         name.to_string_lossy(),
-        std::process::id(),
-        NEXT_PRIVATE.fetch_add(1, Ordering::Relaxed)
+        random_suffix()
     )))?;
+    // rename(2) would replace an existing entry; renameat2(RENAME_NOREPLACE)
+    // needs unsafe code, so an existence check on the random name is used.
     match std::fs::symlink_metadata(&private) {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         _ => return Err(not_owned()),
@@ -624,15 +641,20 @@ fn lock_name_for(socket_name: &Path) -> PathBuf {
 
 impl Drop for WorldServer {
     fn drop(&mut self) {
-        if let Some(id) = self.owned_endpoint {
-            let _ = remove_owned_socket(&self.socket_directory, &self.socket_name, id);
-        }
-        if let Some(id) = self.owned_lock {
-            let _ = remove_owned_socket(
-                &self.socket_directory,
-                &lock_name_for(&self.socket_name),
-                id,
-            );
+        for (owned, name) in [
+            (self.owned_endpoint, self.socket_name.clone()),
+            (self.owned_lock, lock_name_for(&self.socket_name)),
+        ] {
+            if let Some(id) = owned {
+                if let Err(e) = remove_owned_socket(&self.socket_directory, &name, id) {
+                    if e.kind() == ErrorKind::PermissionDenied {
+                        eprintln!(
+                            "endpoint entry {} left in place: {e}; remove it manually",
+                            name.display()
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -650,6 +672,9 @@ impl WorldServer {
         {
             return Err(ServerExit::StartupFailed);
         }
+        // Directory ownership checks need the effective uid; read it now,
+        // before the sandbox denies /proc.
+        crate::safe_fs::process_uid().map_err(|_| ServerExit::StartupFailed)?;
         // Validate all configured roots and the endpoint before creating artifacts.
         let store_directory =
             Directory::open(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
@@ -658,6 +683,13 @@ impl WorldServer {
 
         let log_target =
             LogTarget::resolve(&config.log_dir).map_err(|_| ServerExit::StartupFailed)?;
+        // Evidence is published by name; refuse a log directory others can modify.
+        if let LogTarget::Existing(directory) = &log_target {
+            if let Err(e) = directory.check_exclusive() {
+                eprintln!("log directory refused: {e}");
+                return Err(ServerExit::StartupFailed);
+            }
+        }
         validate_root_separation_target(&store_directory, &log_target)?;
 
         let store = DirStore::from_directory(store_directory, &config.store_dir);
@@ -691,6 +723,16 @@ impl WorldServer {
                     return Err(ServerExit::StartupFailed);
                 }
                 if !config.recover {
+                    return Err(ServerExit::StartupFailed);
+                }
+                // Automatic cleanup is allowed only where no other user can
+                // replace entries; otherwise fail closed before any artifact.
+                if let Err(e) = socket_directory.check_exclusive() {
+                    eprintln!(
+                        "stale endpoint {} not removed: endpoint directory refused: {e}; \
+                         remove the stale socket and its lock manually",
+                        socket_entry.display()
+                    );
                     return Err(ServerExit::StartupFailed);
                 }
                 let parent_meta = socket_directory
@@ -861,6 +903,14 @@ impl WorldServer {
                 };
                 match UnixStream::connect(&lock_entry) {
                     Err(ce) if ce.kind() == ErrorKind::ConnectionRefused => {
+                        if let Err(e) = self.socket_directory.check_exclusive() {
+                            eprintln!(
+                                "stale endpoint lock {} not removed: endpoint directory \
+                                 refused: {e}; remove it manually",
+                                lock_entry.display()
+                            );
+                            return Err(ServerExit::StartupFailed);
+                        }
                         remove_owned_socket(
                             &self.socket_directory,
                             &lock_name_for(&self.socket_name),
@@ -1406,6 +1456,7 @@ impl WorldServer {
 mod review_tests {
     use super::*;
     use crate::log::LogWriter;
+    use crate::safe_fs::private_tempdir as tempdir;
     use crate::store::MAX_BODY_BYTES;
     use hermetic_common::WireError;
     use std::collections::BTreeMap;
@@ -1416,7 +1467,7 @@ mod review_tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::TempDir;
     use time::macros::datetime;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);

@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod support;
+
 use hermetic_world_server::{verify_log, DedupeEntry, LogEventParams, LogManager};
 use std::collections::BTreeMap;
 use std::fs;
-use tempfile::tempdir;
+use support::private_tempdir as tempdir;
 
 #[test]
 fn test_hash_chain_verification_and_tampering() {
@@ -175,7 +177,7 @@ impl hermetic_world_server::LogWriter for FailingWriter {}
 fn test_fix3_log_write_failure_chain_integrity() {
     let temp = tempdir().expect("tempdir");
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&log_dir).expect("create log dir");
+    support::create_private_dir_all(&log_dir).expect("create log dir");
 
     let mut lm = LogManager::new_with_writer(&log_dir, FailingWriter);
     assert_eq!(lm.current_seq(), 0);
@@ -243,7 +245,7 @@ fn test_fix7_tail_truncation_detection() {
     // 1. Deleting the last line is detected
     let last_1_deleted = lines[..4].join("\n") + "\n";
     let log_dir_del1 = temp.path().join("log_del1");
-    fs::create_dir_all(&log_dir_del1).expect("create dir");
+    support::create_private_dir_all(&log_dir_del1).expect("create dir");
     fs::write(log_dir_del1.join("requests.log"), &last_1_deleted).expect("write log");
     fs::copy(&head_path, log_dir_del1.join("requests.log.head")).expect("copy head");
 
@@ -261,7 +263,7 @@ fn test_fix7_tail_truncation_detection() {
     // 2. Deleting the last 3 lines is detected
     let last_3_deleted = lines[..2].join("\n") + "\n";
     let log_dir_del3 = temp.path().join("log_del3");
-    fs::create_dir_all(&log_dir_del3).expect("create dir");
+    support::create_private_dir_all(&log_dir_del3).expect("create dir");
     fs::write(log_dir_del3.join("requests.log"), &last_3_deleted).expect("write log");
     fs::copy(&head_path, log_dir_del3.join("requests.log.head")).expect("copy head");
 
@@ -281,7 +283,7 @@ fn test_fix7_tail_truncation_detection() {
 
     // 3. Missing head file is reported as unanchored
     let log_dir_nohead = temp.path().join("log_nohead");
-    fs::create_dir_all(&log_dir_nohead).expect("create dir");
+    support::create_private_dir_all(&log_dir_nohead).expect("create dir");
     fs::write(log_dir_nohead.join("requests.log"), &original_content).expect("write log");
 
     let nohead_res = verify_log(log_dir_nohead.join("requests.log"));
@@ -518,7 +520,7 @@ impl hermetic_world_server::LogWriter for FailingSyncWriter {
 fn test_fix4_finish_failure_prevents_head_anchor() {
     let temp = tempdir().expect("tempdir");
     let log_dir = temp.path().join("log");
-    fs::create_dir_all(&log_dir).expect("create log dir");
+    support::create_private_dir_all(&log_dir).expect("create log dir");
 
     let writer = FailingSyncWriter { inner: Vec::new() };
     let mut lm = LogManager::new_with_writer(&log_dir, writer);
@@ -642,7 +644,7 @@ fn test_finding_preserve_native_path_bytes_head_path() {
         let non_utf8_dir = temp
             .path()
             .join(OsStr::from_bytes(b"non_utf8_\xff\xfe_log_dir"));
-        fs::create_dir_all(&non_utf8_dir).expect("create non-utf8 dir");
+        support::create_private_dir_all(&non_utf8_dir).expect("create non-utf8 dir");
 
         let mut lm = LogManager::new(&non_utf8_dir).expect("create log manager");
         lm.log_event(&LogEventParams {
@@ -730,7 +732,7 @@ fn test_finding_verify_existing_checkpoint_when_log_empty() {
     // 2. Empty log with seq 0 checkpoint must be accepted
     let temp2 = tempdir().expect("tempdir");
     let log_dir2 = temp2.path().join("log2");
-    fs::create_dir_all(&log_dir2).expect("create dir");
+    support::create_private_dir_all(&log_dir2).expect("create dir");
     let log_path2 = log_dir2.join("requests.log");
     fs::write(&log_path2, b"").expect("write empty log");
     let head_path2 = log_dir2.join("requests.log.head");
