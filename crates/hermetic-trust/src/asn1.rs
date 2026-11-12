@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use crate::error::TrustError;
+
 /// Encode Tag-Length-Value in ASN.1 DER format.
 pub fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -190,4 +192,268 @@ pub fn encode_sha256_with_rsa_algorithm() -> Vec<u8> {
 /// SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
 pub fn encode_rsa_algorithm() -> Vec<u8> {
     encode_sequence(&[&encode_oid(OID_RSA_ENCRYPTION), &encode_null()])
+}
+
+/// Represents a parsed ASN.1 TLV item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tlv<'a> {
+    pub tag: u8,
+    pub value: &'a [u8],
+    pub raw: &'a [u8],
+}
+
+/// Decode a single DER TLV from input. Returns the parsed TLV and remaining bytes.
+pub fn parse_tlv(input: &[u8]) -> Result<(Tlv<'_>, &[u8]), TrustError> {
+    if input.is_empty() {
+        return Err(TrustError::Cert("empty ASN.1 DER input".to_string()));
+    }
+    let tag = input[0];
+    if input.len() < 2 {
+        return Err(TrustError::Cert("truncated ASN.1 DER length".to_string()));
+    }
+
+    let (length, header_len) = if input[1] < 0x80 {
+        (input[1] as usize, 2)
+    } else {
+        let num_octets = (input[1] & 0x7F) as usize;
+        if num_octets == 0 || num_octets > 4 {
+            return Err(TrustError::Cert(
+                "unsupported ASN.1 DER length encoding".to_string(),
+            ));
+        }
+        if input.len() < 2 + num_octets {
+            return Err(TrustError::Cert(
+                "truncated ASN.1 DER length octets".to_string(),
+            ));
+        }
+        let mut len: usize = 0;
+        for &byte in &input[2..2 + num_octets] {
+            len = len
+                .checked_mul(256)
+                .and_then(|l| l.checked_add(byte as usize))
+                .ok_or_else(|| TrustError::Cert("ASN.1 DER length overflow".to_string()))?;
+        }
+        // Canonical DER rule: shortest length encoding
+        if num_octets == 1 && len < 0x80 {
+            return Err(TrustError::Cert(
+                "non-canonical ASN.1 DER length".to_string(),
+            ));
+        }
+        (len, 2 + num_octets)
+    };
+
+    let total_len = header_len
+        .checked_add(length)
+        .ok_or_else(|| TrustError::Cert("ASN.1 DER total length overflow".to_string()))?;
+    if input.len() < total_len {
+        return Err(TrustError::Cert("truncated ASN.1 DER payload".to_string()));
+    }
+
+    let value = &input[header_len..total_len];
+    let raw = &input[..total_len];
+    let rem = &input[total_len..];
+    Ok((Tlv { tag, value, raw }, rem))
+}
+
+/// Parse all consecutive TLVs inside a container (e.g. inside a SEQUENCE).
+pub fn parse_sequence_items(mut input: &[u8]) -> Result<Vec<Tlv<'_>>, TrustError> {
+    let mut items = Vec::new();
+    while !input.is_empty() {
+        let (tlv, rem) = parse_tlv(input)?;
+        items.push(tlv);
+        input = rem;
+    }
+    Ok(items)
+}
+
+/// Validate a complete X.509 CA certificate, including basicConstraints (CA:true)
+/// and cryptographic signature before any mutation.
+pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
+    let (root, rem) = parse_tlv(der)?;
+    if !rem.is_empty() {
+        return Err(TrustError::Cert(
+            "trailing bytes after certificate DER".to_string(),
+        ));
+    }
+    if root.tag != 0x30 {
+        return Err(TrustError::Cert(
+            "certificate DER is not a SEQUENCE".to_string(),
+        ));
+    }
+
+    let cert_items = parse_sequence_items(root.value)?;
+    if cert_items.len() != 3 {
+        return Err(TrustError::Cert(format!(
+            "expected 3 items in Certificate SEQUENCE (tbs, sig_alg, sig_val), found {}",
+            cert_items.len()
+        )));
+    }
+    let tbs_tlv = &cert_items[0];
+    let sig_alg_tlv = &cert_items[1];
+    let sig_val_tlv = &cert_items[2];
+
+    if tbs_tlv.tag != 0x30 {
+        return Err(TrustError::Cert(
+            "tbsCertificate is not a SEQUENCE".to_string(),
+        ));
+    }
+    if sig_alg_tlv.tag != 0x30 {
+        return Err(TrustError::Cert(
+            "signatureAlgorithm is not a SEQUENCE".to_string(),
+        ));
+    }
+    if sig_val_tlv.tag != 0x03 {
+        return Err(TrustError::Cert(
+            "signatureValue is not a BIT STRING".to_string(),
+        ));
+    }
+
+    let tbs_items = parse_sequence_items(tbs_tlv.value)?;
+    if tbs_items.len() < 6 {
+        return Err(TrustError::Cert(
+            "too few items in TBSCertificate".to_string(),
+        ));
+    }
+    let mut idx = 0;
+    // Optional version: tag 0xA0 [0]
+    if tbs_items[idx].tag == 0xA0 {
+        let ver_items = parse_sequence_items(tbs_items[idx].value)?;
+        if ver_items.len() != 1 || ver_items[0].tag != 0x02 {
+            return Err(TrustError::Cert(
+                "invalid version in TBSCertificate".to_string(),
+            ));
+        }
+        idx += 1;
+    }
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x02 {
+        return Err(TrustError::Cert(
+            "missing or invalid serialNumber in TBSCertificate".to_string(),
+        ));
+    }
+    idx += 1;
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+        return Err(TrustError::Cert(
+            "missing or invalid signature in TBSCertificate".to_string(),
+        ));
+    }
+    idx += 1;
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+        return Err(TrustError::Cert(
+            "missing or invalid issuer in TBSCertificate".to_string(),
+        ));
+    }
+    let issuer_tlv = &tbs_items[idx];
+    idx += 1;
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+        return Err(TrustError::Cert(
+            "missing or invalid validity in TBSCertificate".to_string(),
+        ));
+    }
+    idx += 1;
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+        return Err(TrustError::Cert(
+            "missing or invalid subject in TBSCertificate".to_string(),
+        ));
+    }
+    let subject_tlv = &tbs_items[idx];
+    idx += 1;
+    if idx >= tbs_items.len() || tbs_items[idx].tag != 0x30 {
+        return Err(TrustError::Cert(
+            "missing or invalid subjectPublicKeyInfo in TBSCertificate".to_string(),
+        ));
+    }
+    let spki_tlv = &tbs_items[idx];
+    idx += 1;
+
+    // Skip optional [1] issuerUniqueID, [2] subjectUniqueID
+    while idx < tbs_items.len()
+        && (tbs_items[idx].tag == 0x81
+            || tbs_items[idx].tag == 0x82
+            || tbs_items[idx].tag == 0xA1
+            || tbs_items[idx].tag == 0xA2)
+    {
+        idx += 1;
+    }
+
+    // Find extensions ([3] EXPLICIT tag 0xA3)
+    let mut found_ca_true = false;
+    if idx < tbs_items.len() && tbs_items[idx].tag == 0xA3 {
+        let ext_seq_items = parse_sequence_items(tbs_items[idx].value)?;
+        if ext_seq_items.len() == 1 && ext_seq_items[0].tag == 0x30 {
+            let extensions = parse_sequence_items(ext_seq_items[0].value)?;
+            for ext in extensions {
+                if ext.tag != 0x30 {
+                    continue;
+                }
+                let ext_parts = parse_sequence_items(ext.value)?;
+                if ext_parts.len() < 2 {
+                    continue;
+                }
+                if ext_parts[0].tag == 0x06 && ext_parts[0].value == OID_BASIC_CONSTRAINTS {
+                    let last = &ext_parts[ext_parts.len() - 1];
+                    if last.tag == 0x04 {
+                        if let Ok(bc_items) = parse_sequence_items(last.value) {
+                            if bc_items.len() == 1 && bc_items[0].tag == 0x30 {
+                                if let Ok(bc_inner) = parse_sequence_items(bc_items[0].value) {
+                                    if !bc_inner.is_empty()
+                                        && bc_inner[0].tag == 0x01
+                                        && bc_inner[0].value.iter().any(|&b| b != 0)
+                                    {
+                                        found_ca_true = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !found_ca_true {
+        return Err(TrustError::Cert(
+            "certificate is not a CA: missing or false basicConstraints CA:true".to_string(),
+        ));
+    }
+
+    // Parse RSA Public Key from SPKI
+    let spki_parts = parse_sequence_items(spki_tlv.value)?;
+    if spki_parts.len() != 2 {
+        return Err(TrustError::Cert("invalid SPKI in certificate".to_string()));
+    }
+    let alg_tlv = &spki_parts[0];
+    let spk_bit_string = &spki_parts[1];
+    if alg_tlv.tag != 0x30 || spk_bit_string.tag != 0x03 {
+        return Err(TrustError::Cert(
+            "invalid SPKI algorithm or public key tag".to_string(),
+        ));
+    }
+    if spk_bit_string.value.is_empty() || spk_bit_string.value[0] != 0 {
+        return Err(TrustError::Cert("invalid BIT STRING in SPKI".to_string()));
+    }
+    let pkcs1_der = &spk_bit_string.value[1..];
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    let public_key = rsa::RsaPublicKey::from_pkcs1_der(pkcs1_der).map_err(|e| {
+        TrustError::Cert(format!("failed to parse RSA public key from SPKI: {}", e))
+    })?;
+
+    // Verify self-signed signature if issuer == subject
+    if sig_val_tlv.value.is_empty() || sig_val_tlv.value[0] != 0 {
+        return Err(TrustError::Cert("invalid signature BIT STRING".to_string()));
+    }
+    let sig_bytes = &sig_val_tlv.value[1..];
+
+    if issuer_tlv.raw == subject_tlv.raw {
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::signature::Verifier;
+        use sha2::Sha256;
+
+        let signature = Signature::try_from(sig_bytes)
+            .map_err(|e| TrustError::Cert(format!("invalid RSA signature length: {}", e)))?;
+        let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+        verifying_key.verify(tbs_tlv.raw, &signature).map_err(|e| {
+            TrustError::Cert(format!("CA self-signature verification failed: {}", e))
+        })?;
+    }
+
+    Ok(())
 }

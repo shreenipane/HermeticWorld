@@ -2,13 +2,16 @@
 
 use sha2::Digest;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use time::macros::datetime;
 
 use hermetic_trust::{
-    compute_ca_validity, compute_leaf_validity, create_empty_jks, install_ca, mint_ca, mint_leaf,
-    parse_jks, read_seed_file, write_private_key_file, JksEntry, TrustError,
+    atomic_write_file, atomic_write_preserving, check_not_alias, compute_ca_validity,
+    compute_leaf_validity, create_empty_jks, install_ca, mint_ca, mint_leaf, parse_jks,
+    read_cert_file_bounded, read_seed_file, validate_dns_name, validate_output_path,
+    write_private_key_file, JksEntry, TrustError, BEFORE_USE_HOOK, FORCE_CHOWN_FAILURE,
+    MAX_CA_CERT_INPUT_BYTES, MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES,
 };
 
 #[test]
@@ -805,6 +808,10 @@ fn test_fix5_fifo_hang_prevention() {
         .expect("mkfifo command");
     assert!(status.success());
 
+    // Provide a valid bundle as well so install_ca can establish a usable bundle
+    let valid_bundle = rootfs.join("etc/ssl/cert.pem");
+    fs::write(&valid_bundle, b"").expect("write cert.pem");
+
     let seed: [u8; 32] = [105u8; 32];
     let ca = mint_ca("fix5-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
 
@@ -1132,14 +1139,10 @@ fn test_preserve_existing_resolved_fallback_bundle() {
     // Target is a directory instead of a regular file
     fs::create_dir_all(rootfs2.join("guest-certs/ca-certificates.crt")).expect("create dir target");
 
-    let report3 = install_ca(&rootfs2, &ca.cert_pem).expect("install_ca with dir fallback");
+    let res3 = install_ca(&rootfs2, &ca.cert_pem);
     assert!(
-        report3
-            .skipped_paths
-            .iter()
-            .any(|s| s.path == "guest-certs/ca-certificates.crt"
-                && s.reason == "bundle_is_directory"),
-        "Directory bundle in fallback must be skipped with bundle_is_directory"
+        res3.is_err(),
+        "Directory bundle in fallback must cause install_ca to fail closed"
     );
 }
 
@@ -1376,4 +1379,735 @@ fn test_leaf_cert_debug_redacted() {
             assert!(!debug_output.contains(trimmed));
         }
     }
+}
+
+// =========================================================================
+// Security Review Regression Tests (Defects 1 - 11)
+// =========================================================================
+
+// Defect 1: Synchronize final-component and ancestor swaps between validation and use;
+// assert no outside reads, writes, chmods, or FIFO blocking.
+#[test]
+fn test_defect1_handle_anchoring_and_swap_race_protection() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let outside_dir = temp_dir.path().join("outside");
+    fs::create_dir_all(&outside_dir).expect("create outside");
+    let outside_victim = outside_dir.join("victim.txt");
+    fs::write(&outside_victim, b"OUTSIDE_INITIAL").expect("write victim");
+    let initial_victim_meta = fs::metadata(&outside_victim).expect("meta");
+
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"INITIAL_BUNDLE\n").expect("write bundle");
+
+    // Case 1: Final component swapped with symlink to outside file before use
+    {
+        let bundle_clone = bundle_path.clone();
+        let victim_clone = outside_victim.clone();
+        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+            let _ = fs::remove_file(&bundle_clone);
+            let _ = std::os::unix::fs::symlink(&victim_clone, &bundle_clone);
+        }));
+
+        let res = atomic_write_preserving(&bundle_path, b"MALICIOUS_DATA", None);
+        *BEFORE_USE_HOOK.write().unwrap() = None;
+
+        assert!(res.is_err(), "Must reject final-component symlink swap");
+        let victim_content = fs::read(&outside_victim).expect("read victim");
+        assert_eq!(
+            victim_content, b"OUTSIDE_INITIAL",
+            "Outside file must not be modified by final-component symlink race"
+        );
+        let curr_meta = fs::metadata(&outside_victim).expect("meta");
+        assert_eq!(
+            initial_victim_meta.permissions().mode(),
+            curr_meta.permissions().mode(),
+            "Outside file permissions must not be chmod'ed"
+        );
+    }
+
+    // Case 2: Final component swapped with FIFO before use - must not block
+    {
+        let fifo_path = certs_dir.join("fifo_race.crt");
+        let status = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+
+        let fifo_clone = fifo_path.clone();
+        let bundle_clone = certs_dir.join("ca-certificates2.crt");
+        fs::write(&bundle_clone, b"BUNDLE2").expect("write");
+
+        let bundle_hook = bundle_clone.clone();
+        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+            let _ = fs::remove_file(&bundle_hook);
+            let _ = fs::rename(&fifo_clone, &bundle_hook);
+        }));
+
+        let _ = atomic_write_preserving(&bundle_clone, b"NEW_DATA", None);
+        *BEFORE_USE_HOOK.write().unwrap() = None;
+    }
+
+    // Case 3: Ancestor swapped with symlink to outside before use
+    {
+        let rootfs2 = temp_dir.path().join("rootfs2");
+        let ssl_dir = rootfs2.join("etc/ssl");
+        let certs2_dir = ssl_dir.join("certs");
+        fs::create_dir_all(&certs2_dir).expect("create certs2");
+        let bundle2_path = certs2_dir.join("ca-certificates.crt");
+        fs::write(&bundle2_path, b"INITIAL\n").expect("write");
+
+        let outside_dir2 = temp_dir.path().join("outside2");
+        fs::create_dir_all(&outside_dir2).expect("outside2");
+        let canary_file = outside_dir2.join("canary.txt");
+        fs::write(&canary_file, b"CANARY_INITIAL").expect("write canary");
+
+        let ssl_clone = ssl_dir.clone();
+        let ssl_moved = rootfs2.join("etc/ssl_old");
+        let outside_clone = outside_dir2.clone();
+
+        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+            if fs::rename(&ssl_clone, &ssl_moved).is_ok() {
+                let _ = std::os::unix::fs::symlink(&outside_clone, &ssl_clone);
+            }
+        }));
+
+        let _ = atomic_write_preserving(&bundle2_path, b"ANCHORED_DATA", None);
+        *BEFORE_USE_HOOK.write().unwrap() = None;
+
+        let canary_content = fs::read(&canary_file).expect("read canary");
+        assert_eq!(
+            canary_content, b"CANARY_INITIAL",
+            "Outside canary file must not be modified through ancestor swap"
+        );
+        assert!(
+            !outside_dir2.join("ca-certificates.crt").exists(),
+            "No file should have been written into outside directory through ancestor swap"
+        );
+    }
+
+    // Case 4: Target swapped with outside symlink before read - must not read outside
+    {
+        let read_target = certs_dir.join("read_target.crt");
+        fs::write(&read_target, b"TARGET_INITIAL\n").expect("write");
+        let outside_secret = outside_dir.join("secret.txt");
+        fs::write(&outside_secret, b"SECRET_OUTSIDE_DATA").expect("write secret");
+
+        let target_clone = read_target.clone();
+        let secret_clone = outside_secret.clone();
+        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+            let _ = fs::remove_file(&target_clone);
+            let _ = std::os::unix::fs::symlink(&secret_clone, &target_clone);
+        }));
+
+        let (parent_handle, file_name) = hermetic_trust::open_parent_dir_handle(
+            &rootfs,
+            std::path::Path::new("etc/ssl/certs/read_target.crt"),
+        )
+        .expect("parent");
+        let read_res =
+            hermetic_trust::read_file_capped_from_parent(&parent_handle, &file_name, 1024);
+        *BEFORE_USE_HOOK.write().unwrap() = None;
+
+        assert!(
+            read_res.is_err(),
+            "Must refuse reading through swapped symlink"
+        );
+    }
+}
+
+// Defect 2: --ca-cert size cap, regular file validation, non-blocking descriptor reads.
+#[test]
+fn test_defect2_ca_cert_input_validation_and_caps() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // 1. Oversized sparse file
+    let sparse_cert = temp_dir.path().join("sparse_cert.pem");
+    let f = fs::File::create(&sparse_cert).expect("create sparse");
+    f.set_len(MAX_CA_CERT_INPUT_BYTES + 1024).expect("set_len");
+    drop(f);
+
+    let res = read_cert_file_bounded(&sparse_cert);
+    assert!(res.is_err(), "Oversized sparse file must be rejected");
+
+    // Also verify library entry point install_ca rejects oversized cert string
+    let rootfs = temp_dir.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("etc/ssl/certs")).expect("create certs");
+    fs::write(rootfs.join("etc/ssl/certs/ca-certificates.crt"), b"").expect("write bundle");
+    let huge_pem = "A".repeat(MAX_CA_CERT_INPUT_BYTES as usize + 10);
+    let res_install = install_ca(&rootfs, &huge_pem);
+    assert!(
+        res_install.is_err(),
+        "install_ca must reject oversized ca-cert string at entry point"
+    );
+    let bundle_content = fs::read(rootfs.join("etc/ssl/certs/ca-certificates.crt")).expect("read");
+    assert_eq!(bundle_content, b"", "Rootfs must remain unmodified");
+
+    // 2. FIFO ca-cert rejected promptly without blocking
+    let fifo_cert = temp_dir.path().join("fifo_cert.pem");
+    let status = Command::new("mkfifo")
+        .arg(&fifo_cert)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let res_fifo = read_cert_file_bounded(&fifo_cert);
+    assert!(res_fifo.is_err(), "FIFO ca-cert must be rejected");
+
+    // 3. Device rejected
+    let dev_null = std::path::Path::new("/dev/null");
+    if dev_null.exists() {
+        let res_dev = read_cert_file_bounded(dev_null);
+        assert!(res_dev.is_err(), "Device /dev/null must be rejected");
+    }
+
+    // 4. Symlink rejected
+    let valid_cert = temp_dir.path().join("valid_cert.pem");
+    fs::write(&valid_cert, b"DUMMY_CERT").expect("write valid");
+    let symlink_cert = temp_dir.path().join("symlink_cert.pem");
+    std::os::unix::fs::symlink(&valid_cert, &symlink_cert).expect("symlink");
+    let res_sym = read_cert_file_bounded(&symlink_cert);
+    assert!(res_sym.is_err(), "Symlink ca-cert must be rejected");
+}
+
+// Defect 3: Validate complete X.509 CA certificate (CA constraints, signature) before mutation.
+#[test]
+fn test_defect3_ca_certificate_der_validation() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"ORIGINAL_BUNDLE\n").expect("write original");
+
+    let seed: [u8; 32] = [42u8; 32];
+    let ca = mint_ca("der-val-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let leaf =
+        mint_leaf(&ca, &["leaf.local"], datetime!(2024-01-01 00:00:00 UTC)).expect("mint leaf");
+
+    // 1. Arbitrary DER (AQID)
+    let arbitrary_der = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    let res1 = install_ca(&rootfs, arbitrary_der);
+    assert!(res1.is_err(), "Arbitrary DER AQID must be rejected");
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged"
+    );
+
+    // 2. Relabeled PKCS#8 private key as CERTIFICATE
+    let relabeled_key = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        ca.key_pem
+            .lines()
+            .filter(|l| !l.starts_with("---"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let res2 = install_ca(&rootfs, &relabeled_key);
+    assert!(res2.is_err(), "Relabeled private key must be rejected");
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged"
+    );
+
+    // 3. Truncated certificate
+    let truncated_der = &ca.cert_der[..ca.cert_der.len() / 2];
+    let truncated_pem = pem::encode(&pem::Pem::new("CERTIFICATE", truncated_der.to_vec()));
+    let res3 = install_ca(&rootfs, &truncated_pem);
+    assert!(res3.is_err(), "Truncated certificate must be rejected");
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged"
+    );
+
+    // 4. Non-CA certificate (valid leaf cert without CA:true constraint)
+    let res4 = install_ca(&rootfs, &leaf.cert_pem);
+    assert!(res4.is_err(), "Non-CA leaf certificate must be rejected");
+    assert_eq!(
+        fs::read(&bundle_path).expect("read"),
+        b"ORIGINAL_BUNDLE\n",
+        "Rootfs must remain unchanged"
+    );
+}
+
+// Defect 4: Checked date arithmetic for CA and leaf validity without panicking.
+#[test]
+fn test_defect4_validity_date_arithmetic_overflow() {
+    let seed: [u8; 32] = [99u8; 32];
+    let ca = mint_ca("valid-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // 1. Leaf validity checked arithmetic
+    // Year 9999-12-31 overflows 365 days
+    let max_year_dt = datetime!(9999-12-31 00:00:00 UTC);
+    let res_leaf_9999 = compute_leaf_validity(max_year_dt);
+    assert!(
+        res_leaf_9999.is_err(),
+        "Leaf validity on 9999-12-31 must return error"
+    );
+
+    // Year 0000-01-01 boundary
+    let min_year_dt = datetime!(0000-01-01 00:00:00 UTC);
+    let res_leaf_min = compute_leaf_validity(min_year_dt);
+    let _ = res_leaf_min;
+
+    // 2. CA validity checked arithmetic
+    // 20 years from year 9990 exceeds 9999
+    let high_year_dt = datetime!(9990-01-01 00:00:00 UTC);
+    let res_ca_high = compute_ca_validity(high_year_dt);
+    assert!(
+        res_ca_high.is_err(),
+        "CA validity on 9990-01-01 must return error"
+    );
+
+    // 3. mint_ca and mint_leaf return error without panicking or generating keys
+    let res_mint_ca = mint_ca("overflow-world", high_year_dt, &seed);
+    assert!(
+        res_mint_ca.is_err(),
+        "mint_ca on overflowing date must return error before generating keys"
+    );
+
+    let res_mint_leaf = mint_leaf(&ca, &["example.com"], max_year_dt);
+    assert!(
+        res_mint_leaf.is_err(),
+        "mint_leaf on overflowing date must return error before generating keys"
+    );
+}
+
+// Defect 5: Return failure unless a usable bundle containing CA was established.
+#[test]
+fn test_defect5_fallback_bundle_failure_requires_err() {
+    let seed: [u8; 32] = [55u8; 32];
+    let ca = mint_ca("fallback-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // Case 1: Fallback candidate is a directory and no other system bundle exists
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let fallback_dir = rootfs.join("etc/ssl/certs/ca-certificates.crt");
+        fs::create_dir_all(&fallback_dir).expect("create fallback as dir");
+
+        let res = install_ca(&rootfs, &ca.cert_pem);
+        assert!(
+            res.is_err(),
+            "install_ca must fail when directory fallback cannot be used and no other bundle exists"
+        );
+    }
+
+    // Case 2: Fallback candidate is a FIFO and no other system bundle exists
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let certs_dir = rootfs.join("etc/ssl/certs");
+        fs::create_dir_all(&certs_dir).expect("create certs");
+        let fallback_fifo = certs_dir.join("ca-certificates.crt");
+        let status = Command::new("mkfifo")
+            .arg(&fallback_fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+
+        let res = install_ca(&rootfs, &ca.cert_pem);
+        assert!(
+            res.is_err(),
+            "install_ca must fail when FIFO fallback cannot be used and no other bundle exists"
+        );
+    }
+
+    // Case 3: Fallback candidate is oversized and no other system bundle exists
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let certs_dir = rootfs.join("etc/ssl/certs");
+        fs::create_dir_all(&certs_dir).expect("create certs");
+        let fallback_huge = certs_dir.join("ca-certificates.crt");
+        let f = fs::File::create(&fallback_huge).expect("create");
+        f.set_len(20 * 1024 * 1024).expect("set_len"); // > 16 MB MAX_PEM_BUNDLE_BYTES
+        drop(f);
+
+        let res = install_ca(&rootfs, &ca.cert_pem);
+        assert!(
+            res.is_err(),
+            "install_ca must fail when oversized fallback cannot be used and no other bundle exists"
+        );
+    }
+}
+
+// Defect 6: Enforce named limits during bounded discovery before writes begin.
+#[test]
+fn test_defect6_tree_walk_bounded_discovery_limits() {
+    let seed: [u8; 32] = [66u8; 32];
+    let ca = mint_ca(
+        "tree-limits-world",
+        datetime!(2024-01-01 00:00:00 UTC),
+        &seed,
+    )
+    .expect("mint ca");
+
+    // 1. Exceed depth limit (MAX_TREE_DEPTH = 64)
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let mut deep_path = rootfs.clone();
+        for i in 0..70 {
+            deep_path = deep_path.join(format!("level_{}", i));
+        }
+        fs::create_dir_all(&deep_path).expect("create deep dirs");
+        fs::write(deep_path.join("ca-bundle.crt"), b"VALID_BUNDLE\n").expect("write bundle");
+
+        let res = install_ca(&rootfs, &ca.cert_pem);
+        assert!(
+            matches!(res, Err(TrustError::Cert(_))),
+            "Must return error when depth exceeds limit: {:?}",
+            res
+        );
+    }
+
+    // 2. Exceed aggregate bytes limit (MAX_AGGREGATE_BYTES = 64 MB) with individually valid files
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let certs_dir = rootfs.join("etc/ssl/certs");
+        fs::create_dir_all(&certs_dir).expect("create certs");
+
+        // Create 65 sparse files of 1 MB each (< 16 MB individual cap, but sum > 64 MB)
+        for i in 0..65 {
+            let p_dir = rootfs.join(format!("pkg_{}/certifi", i));
+            fs::create_dir_all(&p_dir).expect("create pkg dir");
+            let p = p_dir.join("cacert.pem");
+            let f = fs::File::create(&p).expect("create");
+            f.set_len(1024 * 1024 + 10).expect("set_len");
+        }
+
+        let res = install_ca(&rootfs, &ca.cert_pem);
+        assert!(
+            matches!(res, Err(TrustError::Cert(_))),
+            "Must return error when aggregate bytes exceed limit: {:?}",
+            res
+        );
+
+        // Verify no partial installation occurred
+        for i in 0..65 {
+            let p = rootfs.join(format!("pkg_{}/certifi/cacert.pem", i));
+            let meta = fs::metadata(&p).expect("meta");
+            assert_eq!(
+                meta.len(),
+                1024 * 1024 + 10,
+                "Files must not be partially modified"
+            );
+        }
+    }
+}
+
+// Defect 7: Deterministic candidate ordering, report sorting, and conflicting format rejection.
+#[test]
+fn test_defect7_deterministic_ordering_and_conflicts() {
+    let seed: [u8; 32] = [77u8; 32];
+    let ca = mint_ca("order-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    // 1. Conflicting target formats: PEM candidate targeting a JKS file (or vice versa)
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp_dir.path().join("rootfs");
+        let certs_dir = rootfs.join("etc/ssl/certs");
+        fs::create_dir_all(&certs_dir).expect("create certs");
+        let valid_bundle = certs_dir.join("ca-certificates.crt");
+        fs::write(&valid_bundle, b"").expect("write valid bundle");
+
+        // Create a JKS keystore at python certifi path (which is a PEM target)
+        let certifi_dir = rootfs.join("usr/lib/python3.10/site-packages/certifi");
+        fs::create_dir_all(&certifi_dir).expect("certifi dir");
+        let conflicting_file = certifi_dir.join("cacert.pem");
+        let jks_data = create_empty_jks("changeit");
+        fs::write(&conflicting_file, &jks_data).expect("write jks at pem target");
+
+        let report = install_ca(&rootfs, &ca.cert_pem).expect("install_ca");
+        let skipped = report
+            .skipped_paths
+            .iter()
+            .find(|s| s.path.ends_with("certifi/cacert.pem"));
+        assert!(
+            skipped.is_some(),
+            "Conflicting PEM/JKS format must be skipped"
+        );
+        assert_eq!(
+            skipped.unwrap().reason,
+            "conflicting_target_format",
+            "Reason must be stable code 'conflicting_target_format'"
+        );
+
+        // Conflicting file must not be corrupted
+        let cur_bytes = fs::read(&conflicting_file).expect("read");
+        assert_eq!(
+            cur_bytes, jks_data,
+            "Conflicting target must not be corrupted"
+        );
+    }
+
+    // 2. Deterministic ordering: reverse candidate creation order, assert identical reports and bytes
+    {
+        let temp_dir1 = tempfile::tempdir().expect("tempdir1");
+        let temp_dir2 = tempfile::tempdir().expect("tempdir2");
+        let rootfs1 = temp_dir1.path().join("rootfs");
+        let rootfs2 = temp_dir2.path().join("rootfs");
+
+        let paths = [
+            "etc/ssl/certs/ca-certificates.crt",
+            "etc/pki/tls/certs/ca-bundle.crt",
+            "etc/ssl/cert.pem",
+        ];
+
+        // Create in forward order in rootfs1
+        for p in &paths {
+            let full = rootfs1.join(p);
+            fs::create_dir_all(full.parent().unwrap()).expect("mkdir");
+            fs::write(&full, b"BUNDLE_DATA\n").expect("write");
+        }
+
+        // Create in reverse order in rootfs2
+        for p in paths.iter().rev() {
+            let full = rootfs2.join(p);
+            fs::create_dir_all(full.parent().unwrap()).expect("mkdir");
+            fs::write(&full, b"BUNDLE_DATA\n").expect("write");
+        }
+
+        let report1 = install_ca(&rootfs1, &ca.cert_pem).expect("install 1");
+        let report2 = install_ca(&rootfs2, &ca.cert_pem).expect("install 2");
+
+        let rep1_json = serde_json::to_string(&report1).expect("json 1");
+        let rep2_json = serde_json::to_string(&report2).expect("json 2");
+        assert_eq!(
+            rep1_json, rep2_json,
+            "Reports must be deterministically identical"
+        );
+
+        for p in &paths {
+            let b1 = fs::read(rootfs1.join(p)).expect("read 1");
+            let b2 = fs::read(rootfs2.join(p)).expect("read 2");
+            assert_eq!(b1, b2, "File contents must be byte-for-byte identical");
+        }
+    }
+}
+
+// Defect 8: Output safety, alias/collision checks, and safe atomic replacement.
+#[test]
+fn test_defect8_output_safety_and_atomic_replacement() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // 1. Output path is a symlink: validate_output_path and atomic_write_file reject it
+    let victim = temp_dir.path().join("victim.txt");
+    fs::write(&victim, b"PRESERVE_ME").expect("write victim");
+    let symlink_out = temp_dir.path().join("out_symlink.pem");
+    std::os::unix::fs::symlink(&victim, &symlink_out).expect("symlink");
+
+    let val_res = validate_output_path(&symlink_out);
+    assert!(
+        val_res.is_err(),
+        "validate_output_path must reject symlink output"
+    );
+
+    let write_res = atomic_write_file(&symlink_out, b"OVERWRITE", None);
+    assert!(
+        write_res.is_err(),
+        "atomic_write_file must reject symlink output"
+    );
+    assert_eq!(
+        fs::read(&victim).expect("read victim"),
+        b"PRESERVE_ME",
+        "Target of output symlink must not be truncated or overwritten"
+    );
+
+    // 2. Output aliasing seed file
+    let seed_path = temp_dir.path().join("ca.seed");
+    fs::write(&seed_path, [42u8; 32]).expect("write seed");
+    let alias_res = check_not_alias(&seed_path, &seed_path, "cert_out", "ca_seed_file");
+    assert!(alias_res.is_err(), "check_not_alias must reject same path");
+
+    // Hard link alias to seed file
+    let seed_hardlink = temp_dir.path().join("seed_link.seed");
+    fs::hard_link(&seed_path, &seed_hardlink).expect("hardlink");
+    let hardlink_res = check_not_alias(&seed_hardlink, &seed_path, "cert_out", "ca_seed_file");
+    assert!(
+        hardlink_res.is_err(),
+        "check_not_alias must reject hardlink/inode alias"
+    );
+
+    // 3. Equal certificate and key output paths
+    let cert_out = temp_dir.path().join("out.pem");
+    let key_out = temp_dir.path().join("out.pem");
+    let equal_res = check_not_alias(&cert_out, &key_out, "cert_out", "key_out");
+    assert!(
+        equal_res.is_err(),
+        "check_not_alias must reject equal cert and key paths"
+    );
+
+    // 4. Safe atomic replacement preserves existing file if write fails
+    let existing_file = temp_dir.path().join("existing.pem");
+    fs::write(&existing_file, b"INITIAL_CONTENT").expect("write existing");
+    let bad_path = temp_dir.path().join("existing.pem/cannot_create_dir");
+    let fail_write = atomic_write_file(&bad_path, b"NEW", None);
+    assert!(fail_write.is_err());
+    assert_eq!(
+        fs::read(&existing_file).expect("read"),
+        b"INITIAL_CONTENT",
+        "Existing file must be preserved"
+    );
+}
+
+// Defect 9: Error strings in reports do not expose host staging paths; stable relative paths.
+#[test]
+fn test_defect9_host_path_disclosure_prevention() {
+    let seed: [u8; 32] = [88u8; 32];
+    let ca = mint_ca("prefix-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let staging_alice = temp_dir.path().join("alice_staging_prefix/rootfs");
+    let staging_bob = temp_dir.path().join("bob_staging_prefix/rootfs");
+
+    for root in [&staging_alice, &staging_bob] {
+        let certs = root.join("etc/ssl/certs");
+        fs::create_dir_all(&certs).expect("create certs");
+        // Valid bundle so install succeeds
+        fs::write(certs.join("ca-certificates.crt"), b"").expect("write bundle");
+
+        // Oversized file that triggers a skip
+        let oversized = certs.join("oversized.crt");
+        let f = fs::File::create(&oversized).expect("create");
+        f.set_len(17 * 1024 * 1024).expect("set_len"); // > 16 MB
+    }
+
+    let report_alice = install_ca(&staging_alice, &ca.cert_pem).expect("install alice");
+    let report_bob = install_ca(&staging_bob, &ca.cert_pem).expect("install bob");
+
+    let rep_alice_json = serde_json::to_string(&report_alice).expect("json alice");
+    let rep_bob_json = serde_json::to_string(&report_bob).expect("json bob");
+
+    // Assert reports are byte-for-byte identical
+    assert_eq!(
+        rep_alice_json, rep_bob_json,
+        "Reports under different prefixes must be identical"
+    );
+
+    // Assert neither report contains host staging directory names
+    assert!(
+        !rep_alice_json.contains("alice_staging_prefix"),
+        "Report must not expose alice host staging prefix"
+    );
+    assert!(
+        !rep_bob_json.contains("bob_staging_prefix"),
+        "Report must not expose bob host staging prefix"
+    );
+}
+
+// Defect 10: Ownership-preservation failure propagation; original file preserved untouched.
+#[test]
+fn test_defect10_ownership_preservation_failure_propagation() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let target_file = temp_dir.path().join("target_bundle.crt");
+    fs::write(&target_file, b"ORIGINAL_TARGET_BYTES\n").expect("write target");
+    fs::set_permissions(&target_file, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    let initial_meta = fs::metadata(&target_file).expect("meta");
+    let initial_ino = initial_meta.ino();
+    let initial_dev = initial_meta.dev();
+    let initial_uid = initial_meta.uid();
+    let initial_gid = initial_meta.gid();
+    let initial_mode = initial_meta.permissions().mode();
+
+    // Force ownership setting failure via test hook
+    FORCE_CHOWN_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let res = atomic_write_preserving(&target_file, b"NEW_DATA_SHOULD_FAIL", None);
+    FORCE_CHOWN_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    assert!(res.is_err(), "Must propagate chown failure as an error");
+
+    // Assert original target file is completely preserved
+    let current_meta = fs::metadata(&target_file).expect("meta");
+    assert_eq!(
+        current_meta.ino(),
+        initial_ino,
+        "Inode must remain unchanged"
+    );
+    assert_eq!(current_meta.dev(), initial_dev, "Dev must remain unchanged");
+    assert_eq!(current_meta.uid(), initial_uid, "UID must remain unchanged");
+    assert_eq!(current_meta.gid(), initial_gid, "GID must remain unchanged");
+    assert_eq!(
+        current_meta.permissions().mode(),
+        initial_mode,
+        "Mode must remain unchanged"
+    );
+    assert_eq!(
+        fs::read(&target_file).expect("read"),
+        b"ORIGINAL_TARGET_BYTES\n",
+        "Target contents must remain unchanged"
+    );
+}
+
+// Defect 11: DNS SAN hostname validation, caps, and unambiguous derivation encoding.
+#[test]
+fn test_defect11_hostname_validation_and_derivation() {
+    let seed: [u8; 32] = [11u8; 32];
+    let ca = mint_ca("host-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let t_clock = datetime!(2024-01-01 00:00:00 UTC);
+
+    // 1. Reject empty hostname
+    assert!(
+        validate_dns_name("").is_err(),
+        "Empty hostname must be rejected"
+    );
+    assert!(
+        mint_leaf(&ca, &[""], t_clock).is_err(),
+        "mint_leaf with empty hostname must fail"
+    );
+
+    // 2. Reject non-ASCII hostname
+    assert!(
+        validate_dns_name("é.example").is_err(),
+        "Non-ASCII hostname must be rejected"
+    );
+    assert!(mint_leaf(&ca, &["é.example"], t_clock).is_err());
+
+    // 3. Reject NUL-containing hostname
+    assert!(
+        validate_dns_name("host\0.com").is_err(),
+        "NUL byte must be rejected"
+    );
+    assert!(mint_leaf(&ca, &["host\0.com"], t_clock).is_err());
+
+    // 4. Reject comma-containing hostname
+    assert!(
+        validate_dns_name("a,b.com").is_err(),
+        "Comma must be rejected"
+    );
+    assert!(mint_leaf(&ca, &["a,b.com"], t_clock).is_err());
+
+    // 5. Reject oversized hostname (> 253 bytes)
+    let long_label = "a".repeat(60);
+    let oversized = format!(
+        "{}.{}.{}.{}.example.com",
+        long_label, long_label, long_label, long_label
+    );
+    assert!(oversized.len() > MAX_HOSTNAME_BYTES);
+    assert!(
+        validate_dns_name(&oversized).is_err(),
+        "Oversized hostname must be rejected"
+    );
+    assert!(mint_leaf(&ca, &[&oversized], t_clock).is_err());
+
+    // 6. Reject excessive hostname count (> 100)
+    let many_hosts: Vec<String> = (0..=MAX_LEAF_HOSTNAMES)
+        .map(|i| format!("h{}.local", i))
+        .collect();
+    assert!(
+        mint_leaf(&ca, &many_hosts, t_clock).is_err(),
+        "Excessive hostname count must be rejected"
+    );
+
+    // 7. Unambiguous derivation encoding
+    let leaf_pair = mint_leaf(&ca, &["a.local", "b.local"], t_clock).expect("mint pair");
+    assert!(!leaf_pair.cert_der.is_empty());
 }

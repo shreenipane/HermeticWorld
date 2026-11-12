@@ -14,15 +14,19 @@ pub mod install;
 pub mod jks;
 
 pub use cert::{
-    compute_ca_validity, compute_leaf_validity, compute_serial_number, derive_ca_seed,
-    generate_rsa_key_from_seed, mint_ca, mint_leaf, read_seed_file, write_private_key_file, Ca,
-    LeafCert,
+    atomic_write_file, check_not_alias, compute_ca_validity, compute_leaf_validity,
+    compute_serial_number, derive_ca_seed, generate_rsa_key_from_seed, mint_ca, mint_leaf,
+    read_cert_file_bounded, read_seed_file, validate_dns_name, validate_output_path,
+    write_private_key_file, Ca, LeafCert, MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES,
 };
 pub use error::TrustError;
 pub use install::{
-    append_pem_bundle_idempotent, atomic_write_preserving, bundle_contains_cert, install_ca,
-    resolve_in_rootfs, safe_join_rootfs, safe_join_rootfs_from, InstallReport, SkippedPath,
-    MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES,
+    append_pem_bundle_idempotent, atomic_write_preserving, atomic_write_preserving_handle,
+    bundle_contains_cert, ensure_parent_dirs_in_rootfs, install_ca, open_child_dir,
+    open_dir_handle, open_parent_dir_handle, read_file_capped_from_parent, resolve_in_rootfs,
+    safe_join_rootfs, safe_join_rootfs_from, InstallReport, SkippedPath, BEFORE_USE_HOOK,
+    FORCE_CHOWN_FAILURE, MAX_AGGREGATE_BYTES, MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES,
+    MAX_PEM_BUNDLE_BYTES, MAX_REPORT_ENTRIES, MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
 };
 pub use jks::{
     compute_jks_integrity_hash, create_empty_jks, inject_ca_into_jks, is_pkcs12, parse_jks,

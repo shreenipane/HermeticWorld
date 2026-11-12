@@ -17,6 +17,12 @@ use crate::error::TrustError;
 /// Salt for CA key derivation via HKDF-SHA256
 pub const CA_HKDF_SALT: &[u8] = b"hermetic-world-ca-v1";
 
+/// Maximum number of DNS hostnames allowed on a single leaf certificate.
+pub const MAX_LEAF_HOSTNAMES: usize = 100;
+
+/// Maximum length in bytes for a single DNS hostname.
+pub const MAX_HOSTNAME_BYTES: usize = 253;
+
 /// Represents a minted CA certificate and private key.
 #[derive(Clone)]
 pub struct Ca {
@@ -71,13 +77,28 @@ pub fn generate_rsa_key_from_seed(seed: [u8; 32]) -> Result<RsaPrivateKey, Trust
 pub fn compute_ca_validity(
     t_clock: OffsetDateTime,
 ) -> Result<(OffsetDateTime, OffsetDateTime), TrustError> {
-    let t_utc = t_clock.to_offset(time::UtcOffset::UTC);
+    let t_utc = t_clock
+        .checked_to_offset(time::UtcOffset::UTC)
+        .ok_or_else(|| TrustError::Time("overflow converting date to UTC".to_string()))?;
     let t_utc = t_utc
         .replace_nanosecond(0)
         .map_err(|e| TrustError::Time(e.to_string()))?;
 
-    let start_year = t_utc.year() - 10;
-    let end_year = t_utc.year() + 10;
+    let start_year = t_utc
+        .year()
+        .checked_sub(10)
+        .ok_or_else(|| TrustError::Time("underflow computing start_year".to_string()))?;
+    let end_year = t_utc
+        .year()
+        .checked_add(10)
+        .ok_or_else(|| TrustError::Time("overflow computing end_year".to_string()))?;
+
+    if start_year < 0 || end_year > 9999 {
+        return Err(TrustError::Time(
+            "validity window out of X.509 supported range 0000..=9999".to_string(),
+        ));
+    }
+
     let month = t_utc.month();
     let day = t_utc.day();
 
@@ -111,13 +132,30 @@ pub fn compute_ca_validity(
 pub fn compute_leaf_validity(
     t_clock: OffsetDateTime,
 ) -> Result<(OffsetDateTime, OffsetDateTime), TrustError> {
-    let t_utc = t_clock.to_offset(time::UtcOffset::UTC);
+    let t_utc = t_clock
+        .checked_to_offset(time::UtcOffset::UTC)
+        .ok_or_else(|| TrustError::Time("overflow converting date to UTC".to_string()))?;
     let t_utc = t_utc
         .replace_nanosecond(0)
         .map_err(|e| TrustError::Time(e.to_string()))?;
 
-    let not_before = t_utc - time::Duration::days(7);
-    let not_after = t_utc + time::Duration::days(365);
+    let not_before = t_utc
+        .checked_sub(time::Duration::days(7))
+        .ok_or_else(|| TrustError::Time("underflow computing not_before".to_string()))?;
+    let not_after = t_utc
+        .checked_add(time::Duration::days(365))
+        .ok_or_else(|| TrustError::Time("overflow computing not_after".to_string()))?;
+
+    if not_before.year() < 0
+        || not_before.year() > 9999
+        || not_after.year() < 0
+        || not_after.year() > 9999
+    {
+        return Err(TrustError::Time(
+            "validity window out of X.509 supported range 0000..=9999".to_string(),
+        ));
+    }
+
     Ok((not_before, not_after))
 }
 
@@ -161,27 +199,27 @@ pub fn mint_ca(
     t_clock: OffsetDateTime,
     ca_seed_secret: &[u8; 32],
 ) -> Result<Ca, TrustError> {
-    // 1. Derive seed
+    // 1. Validity check before generating keys
+    let (not_before, not_after) = compute_ca_validity(t_clock)?;
+
+    // 2. Derive seed
     let ca_seed = derive_ca_seed(ca_seed_secret, world_id)?;
 
-    // 2. Deterministic RSA-2048 key
+    // 3. Deterministic RSA-2048 key
     let private_key = generate_rsa_key_from_seed(ca_seed)?;
     let public_key = private_key.to_public_key();
 
-    // 3. Subject and Issuer: CN=Hermetic World CA <first 16 hex of BLAKE3(world_id)>, O=Hermetic World
+    // 4. Subject and Issuer: CN=Hermetic World CA <first 16 hex of BLAKE3(world_id)>, O=Hermetic World
     let blake3_hash = blake3::hash(world_id.as_bytes());
     let blake3_hex = hex::encode(blake3_hash.as_bytes());
     let cn = format!("Hermetic World CA {}", &blake3_hex[..16]);
     let dn_der = encode_dn(&cn, Some("Hermetic World"));
 
-    // 4. Serial: first 16 bytes of SHA-256("serial:" + world_id) with top bit cleared
+    // 5. Serial: first 16 bytes of SHA-256("serial:" + world_id) with top bit cleared
     let mut serial_input = Vec::new();
     serial_input.extend_from_slice(b"serial:");
     serial_input.extend_from_slice(world_id.as_bytes());
     let serial = compute_serial_number(&serial_input);
-
-    // 5. Validity: T_clock - 10 years to T_clock + 10 years
-    let (not_before, not_after) = compute_ca_validity(t_clock)?;
 
     // 6. SubjectPublicKeyInfo & SubjectKeyIdentifier
     let pkcs1_der = public_key.to_pkcs1_der()?;
@@ -269,20 +307,38 @@ pub fn mint_leaf(
     hostnames: &[impl AsRef<str>],
     t_clock: OffsetDateTime,
 ) -> Result<LeafCert, TrustError> {
+    // 1. Validity check before generating keys
+    let (not_before, not_after) = compute_leaf_validity(t_clock)?;
+
     if hostnames.is_empty() {
         return Err(TrustError::Cert(
             "Cannot mint leaf with empty hostnames list".to_string(),
         ));
+    }
+    if hostnames.len() > MAX_LEAF_HOSTNAMES {
+        return Err(TrustError::Cert(format!(
+            "hostname count {} exceeds maximum allowed {}",
+            hostnames.len(),
+            MAX_LEAF_HOSTNAMES
+        )));
+    }
+
+    for h in hostnames {
+        validate_dns_name(h.as_ref())?;
     }
 
     // Sort hostnames deterministically
     let mut sorted: Vec<String> = hostnames.iter().map(|h| h.as_ref().to_string()).collect();
     sorted.sort();
 
-    // 1. Derive leaf RSA key from HKDF(ca seed, info = "leaf:" + sorted hostnames)
+    // 2. Derive leaf RSA key from HKDF(ca seed, unambiguous framing of sorted hostnames)
     let mut info = Vec::new();
     info.extend_from_slice(b"leaf:");
-    info.extend_from_slice(sorted.join(",").as_bytes());
+    info.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+    for name in &sorted {
+        info.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        info.extend_from_slice(name.as_bytes());
+    }
 
     let hk = hkdf::Hkdf::<Sha256>::new(None, &ca.seed);
     let mut leaf_seed = [0u8; 32];
@@ -292,20 +348,21 @@ pub fn mint_leaf(
     let leaf_key = generate_rsa_key_from_seed(leaf_seed)?;
     let leaf_pub = leaf_key.to_public_key();
 
-    // 2. Leaf Subject DN
+    // 3. Leaf Subject DN
     let leaf_cn = &sorted[0];
     let leaf_subject_dn = encode_dn(leaf_cn, Some("Hermetic World"));
 
-    // 3. Leaf Serial
+    // 4. Leaf Serial: unambiguous framing
     let mut serial_input = Vec::new();
     serial_input.extend_from_slice(b"serial:leaf:");
+    serial_input.extend_from_slice(&(ca.world_id.len() as u32).to_be_bytes());
     serial_input.extend_from_slice(ca.world_id.as_bytes());
-    serial_input.extend_from_slice(b":");
-    serial_input.extend_from_slice(sorted.join(",").as_bytes());
+    serial_input.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+    for name in &sorted {
+        serial_input.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        serial_input.extend_from_slice(name.as_bytes());
+    }
     let serial = compute_serial_number(&serial_input);
-
-    // 4. Validity: T_clock - 7 days to T_clock + 365 days
-    let (not_before, not_after) = compute_leaf_validity(t_clock)?;
 
     // 5. SubjectPublicKeyInfo & SubjectKeyIdentifier
     let pkcs1_der = leaf_pub.to_pkcs1_der()?;
@@ -401,7 +458,7 @@ pub fn mint_leaf(
 }
 
 #[cfg(unix)]
-fn get_current_uid() -> Result<u32, TrustError> {
+pub(crate) fn get_current_uid() -> Result<u32, TrustError> {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
@@ -482,9 +539,177 @@ pub fn read_seed_file(path: &Path) -> Result<[u8; 32], TrustError> {
     Ok(seed)
 }
 
-/// Write private key to key_out with mode 0600 atomically via a temp file.
-pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), TrustError> {
-    use std::io::Write;
+/// Read and validate CA cert file: regular file, not a symlink, bounded by MAX_CA_CERT_INPUT_BYTES.
+pub fn read_cert_file_bounded(path: &Path) -> Result<String, TrustError> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(O_NOFOLLOW | O_NONBLOCK);
+    }
+
+    let file = options.open(path).map_err(|e| {
+        TrustError::Cert(format!(
+            "failed to open ca-cert file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(TrustError::Cert(format!(
+                "ca-cert file '{}' is not a regular file",
+                path.display()
+            )));
+        }
+        if metadata.len() > crate::install::MAX_CA_CERT_INPUT_BYTES {
+            return Err(TrustError::Cert(format!(
+                "ca-cert file '{}' exceeds size cap of {} bytes",
+                path.display(),
+                crate::install::MAX_CA_CERT_INPUT_BYTES
+            )));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    file.take(crate::install::MAX_CA_CERT_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > crate::install::MAX_CA_CERT_INPUT_BYTES {
+        return Err(TrustError::Cert(format!(
+            "ca-cert file '{}' exceeds size cap of {} bytes",
+            path.display(),
+            crate::install::MAX_CA_CERT_INPUT_BYTES
+        )));
+    }
+
+    String::from_utf8(bytes).map_err(|e| {
+        TrustError::Cert(format!(
+            "ca-cert file '{}' is not valid UTF-8: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+/// Validate a single DNS hostname according to RFC 5280 / RFC 1035 rules and bounds.
+pub fn validate_dns_name(s: &str) -> Result<(), TrustError> {
+    if s.is_empty() {
+        return Err(TrustError::Cert("empty hostname not allowed".to_string()));
+    }
+    if s.len() > MAX_HOSTNAME_BYTES {
+        return Err(TrustError::Cert(format!(
+            "hostname '{}' length {} exceeds max {}",
+            s,
+            s.len(),
+            MAX_HOSTNAME_BYTES
+        )));
+    }
+    if !s.is_ascii() {
+        return Err(TrustError::Cert(format!(
+            "hostname '{}' contains non-ASCII characters",
+            s
+        )));
+    }
+    if s.contains('\0') {
+        return Err(TrustError::Cert(format!(
+            "hostname '{}' contains NUL byte",
+            s
+        )));
+    }
+    if s.contains(',') {
+        return Err(TrustError::Cert(format!("hostname '{}' contains comma", s)));
+    }
+    // Validate DNS labels
+    for label in s.split('.') {
+        if label.is_empty() {
+            return Err(TrustError::Cert(format!(
+                "hostname '{}' contains empty DNS label",
+                s
+            )));
+        }
+        if label.len() > 63 {
+            return Err(TrustError::Cert(format!(
+                "DNS label '{}' in '{}' exceeds 63 bytes",
+                label, s
+            )));
+        }
+        for b in label.bytes() {
+            if !b.is_ascii_alphanumeric() && b != b'-' && b != b'_' && b != b'*' {
+                return Err(TrustError::Cert(format!(
+                    "invalid character '{}' in hostname '{}'",
+                    b as char, s
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate output path to ensure it is not a symlink or non-regular file.
+pub fn validate_output_path(path: &Path) -> Result<(), TrustError> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(TrustError::Symlink(format!(
+                "output path '{}' is a symlink",
+                path.display()
+            )));
+        }
+        if !meta.file_type().is_file() {
+            return Err(TrustError::Cert(format!(
+                "output path '{}' is not a regular file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check that two output paths do not alias the same filesystem location or inode.
+pub fn check_not_alias(
+    path1: &Path,
+    path2: &Path,
+    desc1: &str,
+    desc2: &str,
+) -> Result<(), TrustError> {
+    if path1 == path2 {
+        return Err(TrustError::Cert(format!(
+            "{} and {} point to the same path '{}'",
+            desc1,
+            desc2,
+            path1.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(m1), Ok(m2)) = (
+            std::fs::symlink_metadata(path1),
+            std::fs::symlink_metadata(path2),
+        ) {
+            if m1.dev() == m2.dev() && m1.ino() == m2.ino() {
+                return Err(TrustError::Cert(format!(
+                    "{} and {} alias the same inode (dev {}, ino {})",
+                    desc1,
+                    desc2,
+                    m1.dev(),
+                    m1.ino()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically write content to a file: creates parent dirs, writes to a temp file, flushes, syncs,
+/// verifies target is not a symlink, and renames atomically.
+pub fn atomic_write_file(path: &Path, content: &[u8], mode: Option<u32>) -> Result<(), TrustError> {
+    validate_output_path(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() {
         std::fs::create_dir_all(parent)?;
@@ -494,7 +719,7 @@ pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), Tru
     loop {
         attempt += 1;
         let tmp_name = format!(
-            ".tmp-key-{}-{}-{}",
+            ".tmp-out-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -510,15 +735,17 @@ pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), Tru
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(mode.unwrap_or(0o644));
         }
 
         match options.open(&tmp_path) {
             Ok(mut file) => {
                 let write_res = (|| -> Result<(), TrustError> {
-                    file.write_all(pem_contents.as_bytes())?;
+                    use std::io::Write;
+                    file.write_all(content)?;
                     file.sync_all()?;
                     drop(file);
+                    validate_output_path(path)?;
                     std::fs::rename(&tmp_path, path)?;
                     Ok(())
                 })();
@@ -536,4 +763,9 @@ pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), Tru
             Err(e) => return Err(TrustError::Io(e)),
         }
     }
+}
+
+/// Write private key to key_out with mode 0600 atomically via a temp file.
+pub fn write_private_key_file(path: &Path, pem_contents: &str) -> Result<(), TrustError> {
+    atomic_write_file(path, pem_contents.as_bytes(), Some(0o600))
 }
