@@ -104,7 +104,6 @@ fn test_allowed_request_rebuilt_and_verified_at_mock() {
     assert_eq!(res.status(), 200);
     common::join_within(mock_handle);
 }
-
 #[test]
 fn test_unknown_field_rejected_before_mock() {
     let env = TestEnv::new(
@@ -443,4 +442,85 @@ fn test_forbidden_fields_mcp_servers_and_container() {
         }
         other => panic!("Expected 400, got {other:?}"),
     }
+}
+
+#[test]
+fn test_tool_use_and_schema_with_image_like_source_not_rejected() {
+    let env = TestEnv::new(
+        vec!["claude-3-5-sonnet-20241022".to_string()],
+        vec![],
+        QuotasConfig::default(),
+    );
+
+    let mock = env.mock_server.clone();
+    let mock_handle = thread::spawn(move || {
+        let req = common::recv_upstream(&mock);
+        let resp_body = r#"{
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "OK"}],
+            "model": "claude-3-5-sonnet-20241022",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let response = tiny_http::Response::from_string(resp_body)
+            .with_status_code(200)
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap(),
+            );
+        req.respond(response).expect("respond");
+    });
+
+    let client = common::test_client();
+    let body_tool_data = r#"{
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "render_view",
+                        "input": {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.com/image.png"
+                            }
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 100,
+        "tools": [
+            {
+                "name": "render_view",
+                "description": "Render a view",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "view": {
+                            "type": "image",
+                            "source": {
+                                "type": "url"
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    }"#;
+
+    let res = client
+        .post(&format!("{}/v1/messages", env.gateway_url))
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_string(body_tool_data)
+        .expect("tool_use input with image-like source should not be rejected");
+
+    assert_eq!(res.status(), 200);
+    common::join_within(mock_handle);
 }

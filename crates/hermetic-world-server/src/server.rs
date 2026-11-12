@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use crate::limits::{validate_rate, Limits};
 use crate::log::{LogEventParams, LogManager};
 use crate::safe_fs::{is_descendant_of, Directory, LogTarget};
-use crate::sandbox::{apply_sandbox, SandboxLandlockStatus};
+use crate::sandbox::{apply_sandbox_for_endpoint, SandboxLandlockStatus};
 use crate::store::DirStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,7 +946,7 @@ impl WorldServer {
             None
         } else {
             Some(
-                apply_sandbox(
+                apply_sandbox_for_endpoint(
                     &self
                         .store
                         .descriptor_path()
@@ -955,6 +955,7 @@ impl WorldServer {
                         .log
                         .descriptor_path()
                         .map_err(|_| ServerExit::StartupFailed)?,
+                    Some(&self.socket_directory.descriptor_path()),
                     self.config.allow_no_landlock,
                 )
                 .map_err(|_| ServerExit::StartupFailed)?,
