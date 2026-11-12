@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 from datetime import datetime, timezone
+import errno
 import hashlib
 import inspect
 import json
@@ -32,6 +33,7 @@ from hermetic_slice.rootfs import (
     INODE_SIZE,
     MIN_E2FSPROGS_VERSION,
     MKE2FS_CONFIG_PATH,
+    PinnedExecutable,
     RootfsGateError,
     RootfsLimitError,
     RootfsLimits,
@@ -187,6 +189,11 @@ def _debugfs(image: Path, request: str) -> str:
         check=False,
     )
     return proc.stdout
+
+
+def _fake_sealcheck() -> PinnedExecutable:
+    """A pinned descriptor for tests that mock subprocess.run (the descriptor is never executed)."""
+    return PinnedExecutable(Path("/bin/hermetic-sealcheck"), os.open("/bin/sh", os.O_RDONLY | os.O_CLOEXEC))
 
 
 def _fake_tool(path: Path, body: str, mode: int = 0o755) -> Path:
@@ -365,7 +372,7 @@ def test_guard_failure_exit_2_and_exit_1(tmp_path: Path, monkeypatch: pytest.Mon
     # Mock find_sealcheck_bin
     monkeypatch.setattr(
         "hermetic_slice.rootfs.find_sealcheck_bin",
-        lambda _bin=None: Path("/bin/hermetic-sealcheck"),
+        lambda _bin=None: _fake_sealcheck(),
     )
 
     findings = [
@@ -762,7 +769,7 @@ def test_fix3_existing_out_image_survives_failures(tmp_path: Path, monkeypatch: 
     # Setup mock subprocess for exit 2 and exit 1
     monkeypatch.setattr(
         "hermetic_slice.rootfs.find_sealcheck_bin",
-        lambda _bin=None: Path("/bin/hermetic-sealcheck"),
+        lambda _bin=None: _fake_sealcheck(),
     )
 
     sc_exit = 2
@@ -993,7 +1000,7 @@ def _mock_toolchain(monkeypatch: pytest.MonkeyPatch, version: str = "mke2fs 1.47
     """Mock mke2fs and sealcheck; record every subprocess.run call (cmd, kwargs)."""
     calls: list[tuple[list[str], dict]] = []
     monkeypatch.setattr("hermetic_slice.rootfs.resolve_mke2fs_bin", lambda: "/bin/mke2fs")
-    monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: Path("/bin/hermetic-sealcheck"))
+    monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: _fake_sealcheck())
     behaviour: dict[str, object] = {"build": "ok"}
 
     def fake_run(cmd, *args, **kwargs):
@@ -1319,9 +1326,11 @@ def test_finding5_no_ambient_sealcheck_search(tmp_path: Path, monkeypatch: pytes
 
 def test_finding5_sealcheck_path_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     good = _fake_tool(tmp_path / "good", "exit 0")
-    assert find_sealcheck_bin(good) == good
+    with find_sealcheck_bin(good) as pinned:
+        assert pinned.path == good
     monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(good))
-    assert find_sealcheck_bin() == good
+    with find_sealcheck_bin() as pinned:
+        assert pinned.path == good
 
     with pytest.raises(FileNotFoundError, match="absolute"):
         find_sealcheck_bin(Path("relative/hermetic-sealcheck"))
@@ -1486,3 +1495,256 @@ def test_finding8_many_small_files_automatic_sizing(tmp_path: Path) -> None:
     res = build_rootfs(src=src, out_image=tmp_path / "r.ext4", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
                        world_id="small-files", size_mib=None)
     assert res["d4"] == "pass"
+
+
+# -----------------------------------------------------------------------------
+# Regression tests for the prior-defects check (t2.4-codex-priorcheck-20261112)
+# -----------------------------------------------------------------------------
+
+T_CLOCK = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+def _hooked_toolchain(monkeypatch: pytest.MonkeyPatch, *, on_build=None, on_d4=None, real_sealcheck: bool = False):
+    """Mock mke2fs (and sealcheck unless real_sealcheck); hooks run inside the mocked steps."""
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr("hermetic_slice.rootfs.resolve_mke2fs_bin", lambda: "/bin/mke2fs")
+    if not real_sealcheck:
+        monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: _fake_sealcheck())
+
+    def fake_run(cmd, *args, **kwargs):
+        cmd = [str(c) for c in cmd]
+        calls.append(cmd)
+        if real_sealcheck and cmd[0].startswith("/proc/self/fd/"):
+            return real_run(cmd, *args, **kwargs)
+        if "-V" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="mke2fs 1.47.2 (1-Jan-2025)\n", stderr="")
+        if "d4-image" in cmd:
+            if on_d4 is not None:
+                on_d4(Path(cmd[cmd.index("--image") + 1]))
+            return subprocess.CompletedProcess(cmd, 0, stdout='{"findings": []}', stderr="")
+        image = Path(cmd[cmd.index("-F") + 1])
+        if on_build is not None:
+            on_build(image, Path(cmd[cmd.index("-d") + 1]))
+        with open(image, "r+b") as handle:  # like mke2fs: write into the existing file
+            handle.write(b"GOOD-IMAGE")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def _write_sparse_fixture(path: Path) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        os.ftruncate(fd, 16 * 1024 * 1024)
+        os.pwrite(fd, b"A" * 5000, 1024 * 1024 + 100)        # data crossing a block boundary
+        os.pwrite(fd, bytes(64 * 1024), 4 * 1024 * 1024)     # allocated, but all zeros
+        os.pwrite(fd, b"Z" * 10, 16 * 1024 * 1024 - 10)      # data at the very end
+    finally:
+        os.close(fd)
+
+
+def _no_hole_reporting(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_lseek = os.lseek
+
+    def lseek(fd, pos, whence):
+        if whence in (os.SEEK_DATA, os.SEEK_HOLE):
+            raise OSError(errno.EINVAL, "hole reporting unsupported")
+        return real_lseek(fd, pos, whence)
+
+    monkeypatch.setattr(os, "lseek", lseek)
+
+
+def test_b1_hole_layout_independent_of_host_hole_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B1: the same content gives the same stream and image plan whether or not the host reports holes."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_sparse_fixture(src / "sparse.bin")
+
+    scan_native, _, tar_native = _tar_tree(src, tmp_path)
+    _no_hole_reporting(monkeypatch)
+    scan_fallback, members, tar_fallback = _tar_tree(src, tmp_path)
+    monkeypatch.undo()
+
+    assert tar_native.read_bytes() == tar_fallback.read_bytes()
+    assert plan_image(scan_native) == plan_image(scan_fallback)
+    assert scan_native.data_blocks == scan_fallback.data_blocks == 3, "the all-zero region is a hole"
+    assert members["sparse.bin"].size == 16 * 1024 * 1024
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_b1_image_hash_independent_of_host_hole_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_sparse_fixture(src / "sparse.bin")
+    res1 = build_rootfs(src=src, out_image=tmp_path / "a" / "r.ext4", t_clock=T_CLOCK, world_id="b1")
+    _no_hole_reporting(monkeypatch)
+    res2 = build_rootfs(src=src, out_image=tmp_path / "b" / "r.ext4", t_clock=T_CLOCK, world_id="b1")
+    assert res1["sha256"] == res2["sha256"]
+    assert res1["size_bytes"] == res2["size_bytes"]
+
+
+def test_b2_huge_all_hole_file_trips_logical_cap_before_mke2fs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B2: a 2 TiB all-hole file costs no stored bytes but must hit the logical-size cap before mke2fs."""
+    src = tmp_path / "src"
+    src.mkdir()
+    fd = os.open(src / "huge", os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, 2 * 1024**4)
+    except OSError:
+        pytest.skip("temporary filesystem cannot hold a 2 TiB sparse file")
+    finally:
+        os.close(fd)
+    calls = _hooked_toolchain(monkeypatch)
+
+    t0 = time.monotonic()
+    with pytest.raises(RootfsLimitError, match="logical size exceeds"):
+        build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=T_CLOCK, world_id="b2", work_dir=tmp_path)
+    assert time.monotonic() - t0 < 30
+    assert not any("-d" in cmd for cmd in calls), "mke2fs must not start"
+    assert not (tmp_path / "o.img").exists()
+
+
+def test_b3_swapped_source_ancestor_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B3: an ancestor of src replaced by a symlink after the caller chose the path is refused;
+    nothing from the symlink's target enters the stream."""
+    shared = tmp_path / "shared"
+    (shared / "input" / "root").mkdir(parents=True)
+    (shared / "input" / "root" / "f").write_text("inside")
+    outside = tmp_path / "outside"
+    (outside / "root").mkdir(parents=True)
+    (outside / "root" / "secret").write_text("OUTSIDE-SENTINEL")
+    src = shared / "input" / "root"
+
+    shutil.rmtree(shared / "input")
+    (shared / "input").symlink_to(outside)
+
+    seen: list[bytes] = []
+    calls = _hooked_toolchain(monkeypatch, on_build=lambda _img, tar: seen.append(tar.read_bytes()))
+    with pytest.raises(ValueError, match="symlinked"):
+        build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=T_CLOCK, world_id="b3", work_dir=tmp_path)
+    assert not any("-d" in cmd for cmd in calls)
+    assert not any(b"OUTSIDE-SENTINEL" in data for data in seen)
+    with pytest.raises(ValueError, match="symlinked"):
+        write_rootfs_tar(src, tmp_path / "s.tar", mtime_ceiling=T_EPOCH)
+
+
+def test_finding5_sealcheck_replaced_after_probe_does_not_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """5: the vetted descriptor runs for D4 even if the pathname is replaced after the probe."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(mode=0o755)
+    good = _fake_tool(
+        bindir / "hermetic-sealcheck",
+        'if [ "$2" = "--help" ]; then exit 0; fi\n'
+        'echo \'{"findings": [{"rule": "D4", "message": "checked by the vetted binary"}]}\'\nexit 2',
+    )
+    evil_marker = tmp_path / "evil-ran"
+    evil = _fake_tool(tmp_path / "evil", f"touch {evil_marker}; exit 0")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+
+    _hooked_toolchain(monkeypatch, real_sealcheck=True, on_build=lambda _img, _tar: os.replace(evil, good))
+    with pytest.raises(RootfsGateError) as excinfo:
+        build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=T_CLOCK, world_id="w5",
+                     sealcheck_bin=good, work_dir=tmp_path)
+    assert excinfo.value.findings[0]["message"] == "checked by the vetted binary"
+    assert not evil_marker.exists(), "the replacement binary ran"
+    assert not (tmp_path / "o.img").exists()
+
+
+def _out_dir_with_original(tmp_path: Path) -> tuple[Path, Path]:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o755)
+    out = out_dir / "r.img"
+    out.write_bytes(b"ORIGINAL")
+    return out_dir, out
+
+
+def test_b4_output_dir_substitutions_cannot_redirect_or_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B4: an attacker in the output directory swaps every other entry for a symlink before mke2fs
+    and rewrites it after D4: the outside sentinel is untouched and only the verified image is published."""
+    out_dir, out = _out_dir_with_original(tmp_path)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("SENTINEL")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+
+    def before_mke2fs(image: Path, _tar: Path) -> None:
+        for entry in list(out_dir.iterdir()):
+            if entry.name != out.name:
+                entry.unlink()
+                entry.symlink_to(sentinel)
+
+    def after_d4(_image: Path) -> None:
+        for entry in list(out_dir.iterdir()):
+            if entry.name != out.name:
+                entry.unlink()
+                entry.write_bytes(b"EVIL")
+
+    _hooked_toolchain(monkeypatch, on_build=before_mke2fs, on_d4=after_d4)
+    res = build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+
+    assert sentinel.read_text() == "SENTINEL"
+    assert out.read_bytes() == b"GOOD-IMAGE"
+    assert res["sha256"] == hashlib.sha256(b"GOOD-IMAGE").hexdigest()
+
+
+def test_b4_image_replaced_after_d4_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir, out = _out_dir_with_original(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+
+    def swap(image: Path) -> None:
+        evil = image.with_name("evil")
+        evil.write_bytes(b"EVIL")
+        os.replace(evil, image)
+
+    _hooked_toolchain(monkeypatch, on_d4=swap)
+    with pytest.raises(RuntimeError, match="was replaced"):
+        build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+    assert out.read_bytes() == b"ORIGINAL"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["r.img"]
+
+
+def test_b4_shared_output_dir_needs_sticky_bit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir, out = _out_dir_with_original(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    _hooked_toolchain(monkeypatch)
+    os.chmod(out_dir, 0o777)
+    with pytest.raises(PermissionError, match="sticky"):
+        build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+    assert out.read_bytes() == b"ORIGINAL"
+    os.chmod(out_dir, 0o1777)
+    try:
+        build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+    finally:
+        os.chmod(out_dir, 0o755)
+    assert out.read_bytes() == b"GOOD-IMAGE"
+
+
+def test_b4_cross_filesystem_publish_copies_held_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir, out = _out_dir_with_original(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    _hooked_toolchain(monkeypatch)
+    real_replace = os.replace
+
+    def replace(a, b, *args, **kwargs):
+        if Path(a).parent.name.startswith("hermetic-rootfs-"):
+            raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    res = build_rootfs(src=src, out_image=out, t_clock=T_CLOCK, world_id="b4", work_dir=tmp_path)
+    assert out.read_bytes() == b"GOOD-IMAGE"
+    assert res["sha256"] == hashlib.sha256(b"GOOD-IMAGE").hexdigest()
+    assert sorted(p.name for p in out_dir.iterdir()) == ["r.img"]
