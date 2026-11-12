@@ -1,0 +1,180 @@
+    Checking hermetic-sealcheck v0.1.0 (/home/flingboot/.hermetic/worktrees/t1.12/crates/hermetic-sealcheck)
+    Finished `dev` profile [unoptimized] target(s) in 0.64s
+   Compiling hermetic-sealcheck v0.1.0 (/home/flingboot/.hermetic/worktrees/t1.12/crates/hermetic-sealcheck)
+    Finished `test` profile [unoptimized] target(s) in 1.24s
+     Running unittests src/lib.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/hermetic_common-0cf9dbcac81ee673)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hermetic_manifest.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/hermetic_manifest-e6ea0029624caa0a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_cutoff.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_cutoff-38ad7aeaebbc703a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/test_hash.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_hash-13d95639baed61e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/test_manifest.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_manifest-49d80812ed4933ef)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_world_manifest.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_world_manifest-94df943899bf1fa1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/hermetic_sealcheck-e6b7b62e3ccac031)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/hermetic_sealcheck-93249cd7626cd95a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_benchmark.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_benchmark-94ca8e4ade9dab55)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/test_binary.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_binary-f6c2a19a5dabdcf8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+     Running tests/test_bytecode.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_bytecode-0468a88e3876dac7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/test_cli.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_cli-ae8f5c96adc7482f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/test_containers.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_containers-f74b057aeae246da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/test_d1.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d1-2e8f5b364365c662)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.00s
+
+     Running tests/test_d11.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d11-3663cfdfdc01eb00)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+     Running tests/test_d12.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d12-a05a636b9c25b4e3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+     Running tests/test_d4.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d4-ea5cac994f6af72c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+     Running tests/test_d5a.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d5a-7634ceae991dcb3a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/test_d6.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d6-afa1d98f0d09dcc3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/test_d8.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_d8-77ad4b3ee472bd7e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/test_diff.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_diff-6b39913260e1eed8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_fingerprint_and_scan.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_fingerprint_and_scan-a5759eca9a1c0792)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/test_gitstore.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_gitstore-962ac2067bb8f356)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running tests/test_index.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_index-045f60c642287b06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+
+     Running tests/test_normalize.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_normalize-3bf5c8082a0263ae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_perf.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_perf-ede0702fedcd06cb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/test_pyc_marshal.rs (/home/flingboot/hermetic/cargo-target/t1.12/debug/deps/test_pyc_marshal-56db2f3c42f2ac0a)
+
+running 1 test
+test test_regression_finding_1_multiline_signature_continuation_lines ... FAILED
+
+failures:
+
+---- test_regression_finding_1_multiline_signature_continuation_lines stdout ----
+
+thread 'test_regression_finding_1_multiline_signature_continuation_lines' (6233) panicked at crates/hermetic-sealcheck/tests/test_pyc_marshal.rs:432:10:
+pyc fingerprint
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_regression_finding_1_multiline_signature_continuation_lines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p hermetic-sealcheck --test test_pyc_marshal`

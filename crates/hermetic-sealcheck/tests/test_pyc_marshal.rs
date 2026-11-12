@@ -422,7 +422,7 @@ fn test_regression_finding_1_multiline_signature_continuation_lines() {
     )
     .expect("write base");
 
-    let gold_patch = "diff --git a/multiline.py b/multiline.py\n--- a/multiline.py\n+++ b/multiline.py\n@@ -4,2 +4,2 @@\n-    return a + b\n+    return a + b + 7\n";
+    let gold_patch = "diff --git a/multiline.py b/multiline.py\n--- a/multiline.py\n+++ b/multiline.py\n@@ -5,1 +5,1 @@\n-    return a + b\n+    return a + b + 7\n";
     let fp = FingerprintSet::from_task(gold_patch, "", &base_dir).expect("fingerprints");
 
     assert_eq!(fp.hunks.len(), 1);
@@ -431,6 +431,11 @@ fn test_regression_finding_1_multiline_signature_continuation_lines() {
         .as_ref()
         .expect("pyc fingerprint");
     assert_eq!(pyc_fp.function_name, "compute");
+    assert_eq!(pyc_fp.added, ["7".to_string()].into_iter().collect());
+    assert!(
+        pyc_fp.removed.is_empty(),
+        "valid signature parameters survive"
+    );
     assert!(
         pyc_fp.added.contains("7"),
         "added must contain 7: {:?}",
@@ -843,4 +848,233 @@ fn test_regression_finding_8_tuple_constant_scalar_symbols() {
         .collect();
     assert_eq!(gates.len(), 1, "tuple constant fix must gate: {findings:?}");
     assert!(gates[0].evidence.contains(&"4".to_string()));
+}
+
+#[test]
+fn reference_graph_drop_depth_is_bounded_in_subprocess() {
+    const CHILD: &str = "HERMETIC_PYC_GRAPH_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        for truncated in [false, true] {
+            let count = 150_000u32;
+            let mut pyc = vec![0x55, 0x0d, 0x0d, 0x0a];
+            pyc.extend_from_slice(&[0; 12]);
+            pyc.push(b'[');
+            pyc.extend_from_slice(&(count + 2).to_le_bytes());
+            pyc.extend_from_slice(&raw_code_38("sentinel", &[], &[], &[]));
+            pyc.extend_from_slice(&[0x80 | b')', 0]);
+            for index in 0..count {
+                pyc.extend_from_slice(&[0x80 | b')', 1, b'r']);
+                pyc.extend_from_slice(&index.to_le_bytes());
+            }
+            if truncated {
+                pyc.pop();
+            }
+            assert!(parse_pyc_code_objects(&pyc).is_empty());
+        }
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "reference_graph_drop_depth_is_bounded_in_subprocess",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("subprocess");
+    assert!(
+        status.success(),
+        "reference graph destruction must not overflow"
+    );
+}
+
+fn assert_both_pyc_matchers(fp: &FingerprintSet, fixed: &[u8], base: &[u8]) {
+    use hermetic_sealcheck::fingerprint::sha256_u64;
+    use hermetic_sealcheck::pyc_marshal::{
+        match_hashed_pyc_code_objects, match_pyc_code_objects, HashedPycCodeObject,
+    };
+    for (bytes, should_gate) in [(fixed, true), (base, false)] {
+        let objects = parse_pyc_code_objects(bytes);
+        assert!(!objects.is_empty());
+        let hashed: Vec<_> = objects
+            .iter()
+            .map(|object| HashedPycCodeObject {
+                name: object.name.clone(),
+                symbols: object
+                    .symbols
+                    .iter()
+                    .map(|s| sha256_u64(s.as_bytes()))
+                    .collect(),
+            })
+            .collect();
+        let opts = ScanOptions::default();
+        for findings in [
+            match_pyc_code_objects(&objects, fp, &opts, "fixture.pyc"),
+            match_hashed_pyc_code_objects(&hashed, fp, &opts, "fixture.pyc"),
+        ] {
+            assert_eq!(
+                findings.iter().any(|f| f.severity == Severity::Gate),
+                should_gate,
+                "{findings:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_same_named_methods_pair_by_scope_and_position() {
+    let parent = tempdir().expect("tempdir");
+    let base = "class A:\n    def run(self, force=True):\n        return 2\nclass B:\n    def run(self, force=True):\n        return 3\n";
+    fs::write(parent.path().join("service.py"), base).expect("base");
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,6 +1,6 @@\n class A:\n-    def run(self, force=True):\n+    def run(self):\n         return 2\n class B:\n-    def run(self, force=True):\n+    def run(self):\n         return 3\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let methods: Vec<_> = fp.hunks[0]
+        .pyc_fingerprints
+        .iter()
+        .filter(|f| f.function_name == "run")
+        .collect();
+    assert_eq!(methods.len(), 2);
+    for method in methods {
+        assert!(method.added.is_empty());
+        assert_eq!(method.removed, ["force".to_string()].into_iter().collect());
+    }
+    use hermetic_sealcheck::pyc_marshal::{
+        match_hashed_pyc_code_objects, match_pyc_code_objects, HashedPycCodeObject,
+    };
+    for constant in [2, 3] {
+        let objects = parse_pyc_code_objects(&build_pyc_38(
+            "run",
+            &[marshal_int(constant)],
+            &[],
+            &["self", "force"],
+        ));
+        let hashed: Vec<_> = objects
+            .iter()
+            .map(|co| HashedPycCodeObject {
+                name: co.name.clone(),
+                symbols: co
+                    .symbols
+                    .iter()
+                    .map(|s| hermetic_sealcheck::fingerprint::sha256_u64(s.as_bytes()))
+                    .collect(),
+            })
+            .collect();
+        for findings in [
+            match_pyc_code_objects(&objects, &fp, &ScanOptions::default(), "fixture.pyc"),
+            match_hashed_pyc_code_objects(&hashed, &fp, &ScanOptions::default(), "fixture.pyc"),
+        ] {
+            assert!(!findings.iter().any(|f| f.severity == Severity::Gate));
+        }
+    }
+}
+
+#[test]
+fn header_only_changes_schedule_module_and_nested_enclosing_objects() {
+    for nested in [false, true] {
+        for annotation in [false, true] {
+            let parent = tempdir().expect("tempdir");
+            let indent = if nested { "    " } else { "" };
+            let old_header = if annotation {
+                "def f(x: OldType):"
+            } else {
+                "def f(x=2):"
+            };
+            let new_header = if annotation {
+                "def f(x: NewType):"
+            } else {
+                "def f(x=3):"
+            };
+            let prefix = if nested { "def outer():\n" } else { "" };
+            let base = format!("{prefix}{indent}{old_header}\n{indent}    return x\n");
+            fs::write(parent.path().join("header.py"), base).expect("base");
+            let line = if nested { 2 } else { 1 };
+            let patch = format!("diff --git a/header.py b/header.py\n--- a/header.py\n+++ b/header.py\n@@ -{line},1 +{line},1 @@\n-{indent}{old_header}\n+{indent}{new_header}\n");
+            let fp = FingerprintSet::from_task(&patch, "", parent.path()).expect("fingerprints");
+            let name = if nested { "outer" } else { "<module>" };
+            let scope = fp.hunks[0]
+                .pyc_fingerprints
+                .iter()
+                .find(|f| f.function_name == name)
+                .expect("enclosing fingerprint");
+            let (old_symbol, new_symbol) = if annotation {
+                ("OldType", "NewType")
+            } else {
+                ("2", "3")
+            };
+            assert!(scope.added.contains(new_symbol));
+            assert!(scope.removed.contains(old_symbol));
+            let fixed = if annotation {
+                build_pyc_38(name, &[], &["f", "NewType"], &[])
+            } else {
+                build_pyc_38(name, &[marshal_int(3)], &["f"], &[])
+            };
+            let base = if annotation {
+                build_pyc_38(name, &[], &["f", "OldType"], &[])
+            } else {
+                build_pyc_38(name, &[marshal_int(2)], &["f"], &[])
+            };
+            assert_both_pyc_matchers(&fp, &fixed, &base);
+        }
+    }
+}
+
+#[test]
+fn signed_numbers_and_raw_strings_match_marshal_literals() {
+    let mut float_base = vec![b'g'];
+    float_base.extend_from_slice(&(-2.5f64).to_le_bytes());
+    let mut float_fixed = vec![b'g'];
+    float_fixed.extend_from_slice(&(-3.5f64).to_le_bytes());
+    for (old, new, old_value, new_value, canonical) in [
+        ("-2", "-3", marshal_int(-2), marshal_int(-3), "-3"),
+        ("-2.5", "-3.5", float_base, float_fixed, "-3.5"),
+        (
+            r#"r"\t""#,
+            r#"r"\n""#,
+            marshal_short_ascii(r"\t"),
+            marshal_short_ascii(r"\n"),
+            r"\n",
+        ),
+    ] {
+        let parent = tempdir().expect("tempdir");
+        fs::write(
+            parent.path().join("literal.py"),
+            format!("def f():\n    return {old}\n"),
+        )
+        .expect("base");
+        let patch = format!("diff --git a/literal.py b/literal.py\n--- a/literal.py\n+++ b/literal.py\n@@ -2,1 +2,1 @@\n-    return {old}\n+    return {new}\n");
+        let fp = FingerprintSet::from_task(&patch, "", parent.path()).expect("fingerprints");
+        assert_eq!(
+            fp.hunks[0].pyc_fingerprints[0].added,
+            [canonical.to_string()].into_iter().collect()
+        );
+        assert_both_pyc_matchers(
+            &fp,
+            &build_pyc_38("f", &[new_value], &[], &[]),
+            &build_pyc_38("f", &[old_value], &[], &[]),
+        );
+    }
+}
+
+#[test]
+fn inserted_same_named_definition_preserves_patch_position_pairing() {
+    let parent = tempdir().expect("tempdir");
+    let base = "class A:\n    def run(self, force=True):\n        return 2\n    def run(self, force=True):\n        return 3\n";
+    fs::write(parent.path().join("service.py"), base).expect("base");
+    let patch = "diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n@@ -1,5 +1,7 @@\n class A:\n+    def run(self):\n+        return 4\n     def run(self, force=True):\n         return 2\n-    def run(self, force=True):\n+    def run(self):\n         return 3\n";
+    let fp = FingerprintSet::from_task(patch, "", parent.path()).expect("fingerprints");
+    let methods: Vec<_> = fp.hunks[0]
+        .pyc_fingerprints
+        .iter()
+        .filter(|f| f.function_name == "run")
+        .collect();
+    assert_eq!(methods.len(), 2);
+    assert!(methods
+        .iter()
+        .any(|f| f.added == ["4".to_string()].into_iter().collect()));
+    assert!(methods
+        .iter()
+        .any(|f| f.added.is_empty() && f.removed == ["force".to_string()].into_iter().collect()));
+    assert!(methods
+        .iter()
+        .all(|f| !f.added.contains("2") && !f.added.contains("3")));
 }

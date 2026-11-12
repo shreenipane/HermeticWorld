@@ -111,7 +111,9 @@ pub const MAX_UNIT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 
 /// Detectors a query can't answer from an index.
-pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external"];
+///
+/// Tier 2 ("T2") is not answered from the index: symbol tokens are not stored in layer indexes.
+pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"];
 
 /// Detectors not covered when querying an index of a given format version.
 pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
@@ -139,6 +141,9 @@ const TAG_MEMBER_TIME: u8 = 9;
 const TAG_DIR: u8 = 10;
 const TAG_SYMLINK: u8 = 11;
 const TAG_PYC: u8 = 12;
+// Text context uses the existing bounded, splittable two-set record encoding.
+// Older indexes omit these optional records, so T2 remains conservatively uncovered.
+const TIER2_CONTEXT_CHANNEL: &str = "tier2_context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -296,6 +301,22 @@ impl<F: FnMut(IndexRecord)> UnitSink for IndexSink<F> {
             hashes: compute_unit_hashes(text),
         };
         (self.emit)(record);
+        let (symbols, anchors) = crate::tier2::extract_unit_symbols_and_anchors(text);
+        let context_path = self.ipath(path);
+        (self.emit)(IndexRecord::Binary {
+            path: context_path,
+            channel: TIER2_CONTEXT_CHANNEL.to_string(),
+            strings: HashedBinaryStrings {
+                exact: anchors
+                    .iter()
+                    .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
+                    .collect(),
+                tokens: symbols
+                    .iter()
+                    .map(|s| crate::fingerprint::sha256_u64(s.as_bytes()))
+                    .collect(),
+            },
+        });
     }
 
     fn binary(&mut self, path: &str, channel: &str, strings: BinaryStrings) {
@@ -532,6 +553,7 @@ pub fn write_index_with_limits(
     {
         let mut w = BufWriter::new(&mut scratch);
         let mut payload = Vec::new();
+        let mut skipped_text_context = None;
         let opts = index_scan_options();
         walk_tree(
             root,
@@ -560,6 +582,11 @@ pub fn write_index_with_limits(
                     } => {
                         let count = text_hash_count(&hashes);
                         let bytes = (count as u64).saturating_mul(8);
+                        skipped_text_context = if bytes > max_unit_bytes {
+                            Some(path.clone())
+                        } else {
+                            None
+                        };
                         if bytes > max_unit_bytes {
                             let skipped = IndexRecord::Fixed(StoredFinding {
                                 detector: "D2".to_string(),
@@ -592,6 +619,11 @@ pub fn write_index_with_limits(
                         channel,
                         strings,
                     } => {
+                        if channel == TIER2_CONTEXT_CHANNEL
+                            && skipped_text_context.take().as_ref() == Some(&path)
+                        {
+                            return;
+                        }
                         let count = binary_hash_count(&strings);
                         let bytes = (count as u64).saturating_mul(8);
                         if bytes > max_unit_bytes {
@@ -1678,15 +1710,49 @@ fn query_record(
             strings,
         } => {
             let display = path.display(root);
-            findings.extend(match_hashed_binary_items(
-                strings, fp, opts, channel, &display,
-            ));
+            if channel == TIER2_CONTEXT_CHANNEL {
+                for hunk in &fp.hunks {
+                    if findings.iter().any(|f| {
+                        f.detector == "D2"
+                            && f.path == display
+                            && f.hunk == Some(hunk.hunk_index)
+                            && f.severity == Severity::Gate
+                    }) {
+                        continue;
+                    }
+                    if let Some(finding) = crate::tier2::match_tier2_by_membership(
+                        |symbol| {
+                            strings
+                                .tokens
+                                .contains(&crate::fingerprint::sha256_u64(symbol.as_bytes()))
+                        },
+                        |anchor| {
+                            strings
+                                .exact
+                                .contains(&crate::fingerprint::sha256_u64(anchor.as_bytes()))
+                        },
+                        hunk,
+                        opts,
+                        "D2",
+                        &display,
+                    ) {
+                        findings.push(finding);
+                    }
+                }
+            } else {
+                findings.extend(match_hashed_binary_items(
+                    strings, fp, opts, channel, &display,
+                ));
+            }
         }
         IndexRecord::Pkg {
             path,
             name,
             version,
         } => {
+            if opts.undated {
+                return;
+            }
             let display = path.display(root);
             findings.extend(check_d5a_name_and_version(
                 name,

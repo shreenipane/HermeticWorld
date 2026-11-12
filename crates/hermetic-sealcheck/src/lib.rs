@@ -19,6 +19,8 @@ pub mod normalize;
 pub mod pyc_marshal;
 pub mod sarif;
 pub mod scan;
+pub mod tier2;
+pub mod undated;
 pub mod winnow;
 
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,7 @@ pub use index::{
     merge_continuations, query_index, write_index, write_index_with_threshold, IndexError,
     IndexReader, IndexRecord, IndexStats, MAX_UNIT_BYTES, NOT_COVERED,
 };
+pub const UNDATED_NOT_COVERED: &[&str] = &["D1", "D3", "D4", "D5a"];
 pub use normalize::{clean_line, is_trivial, normalize_diff_line, normalize_line};
 pub use pyc_marshal::{parse_pyc_code_objects, HashedPycCodeObject, PycCodeObject};
 pub use sarif::{
@@ -59,9 +62,10 @@ pub use sarif::{
     SarifRunProperties,
 };
 pub use scan::{
-    compute_unit_hashes, match_unit_hashes, scan_problem_statement, scan_tree, walk_tree, Finding,
-    ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
+    compute_unit_hashes, match_unit, match_unit_hashes, scan_problem_statement, scan_tree,
+    walk_tree, Finding, ScanOptions, Severity, TreeSink, UnitHashes, Visibility,
 };
+pub use undated::{load_undated_task, UndatedTask};
 pub use winnow::{
     hash_kgram, kgram_hashes, tokenize, winnow_hashes, winnow_tokens, Token, WinnowFingerprint,
 };
