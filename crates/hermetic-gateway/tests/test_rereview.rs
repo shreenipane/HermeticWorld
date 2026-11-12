@@ -182,7 +182,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
 fn test_2_timestamps_in_nested_containers_and_input_objects_are_rewritten() {
     let clock = GuestClock::frozen(t_clock_2019(), Duration::from_secs(0));
     let mut v: serde_json::Value = serde_json::from_str(&format!(
-        r#"{{"created":{{"created_at":"{REAL_DATE}T00:00:00Z"}},
+        r#"{{"type":"message","created":{{"created_at":"{REAL_DATE}T00:00:00Z"}},
             "expires_at":[{{"updated_at":1762905600}}],
             "input":{{"created_at":"{REAL_DATE}T01:00:00Z"}},
             "content":[{{"type":"tool_use","id":"t","name":"n","input":{{"created_at":1700000000}}}}]}}"#
@@ -1126,4 +1126,144 @@ fn test_10b_waiting_past_the_drain_deadline_gets_bounded_529() {
     common::join_within(h);
     let out_a = read_all_bounded(&mut a, 64 * 1024);
     assert!(out_a.starts_with("HTTP/1.1 200"), "{out_a}");
+}
+
+// ---------- prior-check 2 follow-ups (2, 8) ----------
+
+#[test]
+fn test_2c_tool_input_exemption_requires_the_right_event_type() {
+    let clock = GuestClock::frozen(t_clock_2019(), Duration::from_secs(0));
+    let leaky = [
+        // The reviewer's case: a `message` under a ping event.
+        format!(
+            r#"{{"type":"ping","message":{{"content":[{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}]}}}}"#
+        ),
+        // A message_start whose `message` is not a message.
+        format!(
+            r#"{{"type":"message_start","message":{{"type":"other","content":[{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}]}}}}"#
+        ),
+        // Top-level `content` of an object that is not a message (e.g. a delta event).
+        format!(
+            r#"{{"type":"message_delta","content":[{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}]}}"#
+        ),
+        // Top-level `content` without any type.
+        format!(
+            r#"{{"content":[{{"type":"tool_use","input":{{"created_at":"{REAL_DATE}T00:00:00Z"}}}}]}}"#
+        ),
+    ];
+    for text in &leaky {
+        let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+        rewrite_json_timestamps(&mut v, &clock);
+        assert!(!v.to_string().contains(REAL_DATE), "leaked: {v}");
+    }
+    // The validated contexts still keep tool input unchanged.
+    for text in [
+        r#"{"type":"message","content":[{"type":"tool_use","input":{"created_at":1700000000}}]}"#,
+        r#"{"type":"message_start","message":{"type":"message","content":[{"type":"tool_use","input":{"created_at":1700000000}}]}}"#,
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+        rewrite_json_timestamps(&mut v, &clock);
+        assert!(v.to_string().contains("1700000000"), "{v}");
+    }
+}
+
+#[test]
+fn test_8c_slow_continuing_readers_are_released_at_the_overall_stream_bound() {
+    let env = TestEnv::new_with_setup(QuotasConfig::default(), t_clock_2019(), None, |g| {
+        g.with_request_limits(2, 1024 * 1024)
+            .with_response_write_deadlines(Duration::from_secs(5), Duration::from_secs(5))
+            .with_stream_total_deadline(Duration::from_secs(3))
+    });
+    // Two endless (capped) streams.
+    let mock = env.mock_server.clone();
+    let h = thread::spawn(move || {
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let req = common::recv_upstream(&mock);
+            workers.push(thread::spawn(move || {
+                let p = CappedProducer {
+                    chunk: b"event: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec(),
+                    pos: 0,
+                    cap: 24 * 1024 * 1024,
+                    produced: Arc::new(AtomicUsize::new(0)),
+                    pause: Duration::ZERO,
+                };
+                let _ = req.respond(Response::new(
+                    200.into(),
+                    vec![
+                        Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                            .unwrap(),
+                    ],
+                    p,
+                    None,
+                    None,
+                ));
+            }));
+        }
+        for w in workers {
+            common::join_within(w);
+        }
+    });
+
+    // Readers that keep making progress (well inside the per-chunk deadline), slowly.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let body = simple_body(true);
+            let mut s = connect(&env.gateway_url);
+            s.write_all(
+                format!(
+                    "POST /v1/messages HTTP/1.1\r\nHost: x\r\nanthropic-version: 2023-06-01\r\ncontent-type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 512];
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => thread::sleep(Duration::from_millis(50)),
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let deadline = Instant::now() + common::TEST_WAIT;
+    while env.gateway_server.in_flight_requests() < 2 {
+        assert!(Instant::now() < deadline, "streams never in flight");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The handler cap is saturated: an extra request is closed unanswered.
+    let mut extra = connect(&env.gateway_url);
+    extra
+        .write_all(b"POST /v1/nope HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    assert!(read_all_bounded(&mut extra, 4096).is_empty());
+
+    // Both slow-but-continuing streams are cut at the overall bound (3 s).
+    let start = Instant::now();
+    while env.gateway_server.in_flight_requests() > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(12),
+            "slow readers still hold handlers after {:?}",
+            start.elapsed()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(env.gateway_server.quota().snapshot().concurrent_requests, 0);
+    let err = common::test_client()
+        .post(&format!("{}/v1/nope", env.gateway_url))
+        .send_string("{}")
+        .unwrap_err();
+    assert!(matches!(err, ureq::Error::Status(404, _)), "{err:?}");
+    stop.store(true, Ordering::SeqCst);
+    for r in readers {
+        common::join_within(r);
+    }
+    common::join_within(h);
 }

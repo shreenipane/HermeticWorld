@@ -271,9 +271,13 @@ const TIMESTAMP_KEYS: [&str; 4] = ["created", "created_at", "updated_at", "expir
 /// The one opaque subtree is the `input` of a `tool_use` content block (the tool arguments the
 /// model wrote, which the agent's tools must receive unchanged), and only at the places the
 /// Messages API puts tool content:
-/// - an element of the `content` array of the message (the top-level object of a
-///   non-streaming response, or `message` of a `message_start` event);
-/// - the `content_block` of a `content_block_start` event.
+/// - an element of the `content` array of a message: the top-level object of a non-streaming
+///   response when its `type` is `"message"`, or the `message` of an event whose `type` is
+///   `"message_start"` (and whose `message.type`, if present, is `"message"`);
+/// - the `content_block` of an event whose `type` is `"content_block_start"`.
+///
+/// The exemption is decided from the top-level `type`, so the same shapes under any other
+/// event or object type (e.g. a `ping` carrying a `message`) are rewritten.
 ///
 /// A `{"type":"tool_use","input":...}` object anywhere else is rewritten like any other value.
 /// Recursion depth is bounded by serde_json's parse limit.
@@ -287,11 +291,28 @@ pub fn rewrite_json_timestamps(val: &mut serde_json::Value, clock: &GuestClock) 
         rewrite_inner(val, ts, Place::Other);
         return;
     };
-    let is_block_start = root.get("type").and_then(|t| t.as_str()) == Some("content_block_start");
+    let root_type = root
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_message = root_type == "message";
+    let is_message_start = root_type == "message_start"
+        && root
+            .get("message")
+            .and_then(|m| m.as_object())
+            .map(|m| {
+                matches!(
+                    m.get("type").and_then(|t| t.as_str()),
+                    None | Some("message")
+                )
+            })
+            .unwrap_or(false);
+    let is_block_start = root_type == "content_block_start";
     for (k, v) in root.iter_mut() {
         let place = match k.as_str() {
-            "content" => Place::MessageContent,
-            "message" => Place::Message,
+            "content" if is_message => Place::MessageContent,
+            "message" if is_message_start => Place::Message,
             "content_block" if is_block_start => Place::ToolSlot,
             _ => Place::Other,
         };

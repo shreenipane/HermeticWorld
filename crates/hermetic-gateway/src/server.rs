@@ -54,19 +54,34 @@ pub const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(120);
 /// stops or slows below that pace loses the stream and frees the handler.
 pub const STREAM_CHUNK_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Renews the connection's write deadline each time a chunk of the stream is handed out.
+/// Overall bound on writing one stream to the agent, counted from when writing starts. The
+/// per-chunk renewals never extend past it, so a reader that keeps draining slowly (each chunk
+/// within `STREAM_CHUNK_WRITE_DEADLINE`) still frees the handler at this bound. Past it the
+/// stream is cut (the agent sees the connection end) and the handler and slot are released.
+pub const STREAM_TOTAL_WRITE_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Renews the connection's write deadline each time a chunk of the stream is handed out,
+/// capped at the stream's overall deadline; past the overall deadline it stops the stream.
 struct ChunkDeadlineReader<R: Read> {
     inner: R,
     handle: Option<tiny_http::DeadlineHandle>,
     per_chunk: Duration,
+    overall_end: std::time::Instant,
 }
 
 impl<R: Read> Read for ChunkDeadlineReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.overall_end {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "stream overall write deadline passed",
+            ));
+        }
         let n = self.inner.read(buf)?;
         if n > 0 {
             if let Some(h) = self.handle.as_ref() {
-                h.set(Some(std::time::Instant::now() + self.per_chunk));
+                let next = std::time::Instant::now() + self.per_chunk;
+                h.set(Some(next.min(self.overall_end)));
             }
         }
         Ok(n)
@@ -164,6 +179,8 @@ pub struct GatewayServer {
     client_deadlines: RequestDeadlines,
     /// (whole non-streaming response, per stream chunk) write deadlines.
     write_deadlines: (Duration, Duration),
+    /// Overall bound on writing one stream.
+    stream_total_deadline: Duration,
 }
 
 impl GatewayServer {
@@ -239,6 +256,7 @@ impl GatewayServer {
                 body: Some(REQUEST_BODY_DEADLINE),
             },
             write_deadlines: (RESPONSE_WRITE_DEADLINE, STREAM_CHUNK_WRITE_DEADLINE),
+            stream_total_deadline: STREAM_TOTAL_WRITE_DEADLINE,
         })
     }
 
@@ -258,6 +276,12 @@ impl GatewayServer {
         stream_chunk: Duration,
     ) -> Self {
         self.write_deadlines = (response, stream_chunk);
+        self
+    }
+
+    /// Overrides `STREAM_TOTAL_WRITE_DEADLINE` (tests).
+    pub fn with_stream_total_deadline(mut self, total: Duration) -> Self {
+        self.stream_total_deadline = total;
         self
     }
 
@@ -940,15 +964,20 @@ impl GatewayServer {
                 }
                 self.ensure_date_header(&mut resp_headers);
 
+                let overall_end = std::time::Instant::now() + self.stream_total_deadline;
                 let sse_reader = ChunkDeadlineReader {
                     inner: sse_reader,
                     handle: request.write_deadline(),
                     per_chunk: self.write_deadlines.1,
+                    overall_end,
                 };
                 let tiny_response =
                     Response::new(status.into(), resp_headers, sse_reader, None, None);
 
-                self.arm_write_deadline(&request, self.write_deadlines.1);
+                if let Some(h) = request.write_deadline() {
+                    let first = std::time::Instant::now() + self.write_deadlines.1;
+                    h.set(Some(first.min(overall_end)));
+                }
                 let _ = request.respond(tiny_response);
                 let _ = slot.record_and_release();
 
