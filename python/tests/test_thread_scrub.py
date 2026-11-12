@@ -18,6 +18,7 @@ from hermetic_slice.thread_scrub import (
     ScrubEntry,
     ScrubResult,
     dedupe_and_sort_entries,
+    deny_unresolved_scope,
     get_solution_pr_scrub_entries,
     match_scrub_entry,
     matches_any_scrub_entry,
@@ -1925,4 +1926,99 @@ def test_defect3_query_bearing_resource_matching() -> None:
     assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500/files")
     assert not matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/500/files?x=1")
     assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/500/commits")
+
+
+def test_defect2_referencing_issue_subresources_and_boundary(tmp_path: Path) -> None:
+    """Regression Defect 2: referencing issues block comments, events, timeline URLs and query variants without blocking 880."""
+    fixture_data = load_fixture_json("issue_cross_repo_reference.json")
+    pr_fixture = load_fixture_json("pull_request_scrub.json")
+
+    def fake_post(url: str, payload: dict) -> dict:
+        op = payload.get("operationName")
+        if op == "TargetIssueData":
+            return fixture_data
+        if op == "PullRequestData":
+            return pr_fixture
+        raise ValueError(f"Unexpected op: {op}")
+
+    result = process_thread_scrub_and_revision(
+        repo="target-org/target-repo",
+        pr_number=50,
+        target_issue_number=307,
+        target_issue_created=datetime.fromisoformat("2020-01-01T10:00:00+00:00"),
+        t_world=datetime.fromisoformat("2020-01-10T00:00:00+00:00"),
+        scraped_problem_statement="Title: Cross Repo\nBody",
+        scraped_hints="",
+        token="test-token",
+        http_post_json=fake_post,
+        cache_dir=tmp_path / "cache",
+        warnings_list=[],
+    )
+
+    entries = result.scrub_entries
+
+    # Comments, events, and timeline URLs of referencing issue 88 are blocked
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/comments")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/comments?page=2")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/comments?sort=created&direction=desc")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/events")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/events?per_page=50")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/timeline")
+    assert matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/88/timeline?since=2020-01-01")
+    assert matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/issues/88")
+    assert matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/issues/88/")
+    assert matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/issues/88#issuecomment-999")
+
+    # Boundary assertion: issue 88 does NOT block issue 880
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/comments")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/events")
+    assert not matches_any_scrub_entry(entries, "https://api.github.com/repos/other-org/other-repo/issues/880/timeline")
+    assert not matches_any_scrub_entry(entries, "https://github.com/other-org/other-repo/issues/880")
+
+
+def test_defect3_origin_case_and_effective_port_canonicalization() -> None:
+    """Regression Defect 3: uppercase hostname and default port 443 are blocked by PR and unresolved-scope entries while unrelated hosts are not."""
+    repo = "test-org/test-repo"
+    pr_entries = get_solution_pr_scrub_entries(repo, 50)
+    unres_entries: list[ScrubEntry] = []
+    deny_unresolved_scope(unres_entries)
+
+    # Solution-PR entries block uppercase and :443 variants
+    assert matches_any_scrub_entry(pr_entries, f"https://API.GITHUB.COM/repos/{repo}/pulls/50")
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com:443/repos/{repo}/pulls/50")
+    assert matches_any_scrub_entry(pr_entries, f"https://GITHUB.COM/{repo}/pull/50")
+    assert matches_any_scrub_entry(pr_entries, f"https://github.com:443/{repo}/pull/50")
+    assert matches_any_scrub_entry(pr_entries, f"https://API.GITHUB.COM:443/repos/{repo}/pulls/50")
+
+    # Broad unresolved_scope prefixes block uppercase and :443 variants
+    assert matches_any_scrub_entry(unres_entries, f"https://API.GITHUB.COM/repos/{repo}/pulls/50")
+    assert matches_any_scrub_entry(unres_entries, f"https://api.github.com:443/repos/{repo}/pulls/50")
+    assert matches_any_scrub_entry(unres_entries, f"https://GITHUB.COM/{repo}/pull/50")
+    assert matches_any_scrub_entry(unres_entries, f"https://github.com:443/{repo}/pull/50")
+
+    # Unrelated hosts remain unmatched
+    unrelated_host_url = f"https://example.com/repos/{repo}/pulls/50"
+    unrelated_subdomain_url = f"https://other.api.github.com/repos/{repo}/pulls/50"
+    assert not matches_any_scrub_entry(pr_entries, unrelated_host_url)
+    assert not matches_any_scrub_entry(pr_entries, unrelated_subdomain_url)
+    assert not matches_any_scrub_entry(unres_entries, unrelated_host_url)
+    assert not matches_any_scrub_entry(unres_entries, unrelated_subdomain_url)
+
+
+def test_defect4_hostile_malformed_bracketed_authority_controlled_denial() -> None:
+    """Regression Defect 4: Calling matcher with malformed bracketed authority yields controlled denial without uncaught exception."""
+    repo = "test-org/test-repo"
+    pr_entries = get_solution_pr_scrub_entries(repo, 50)
+
+    # Malformed bracketed authorities
+    assert matches_any_scrub_entry(pr_entries, "https://[")
+    assert matches_any_scrub_entry(pr_entries, "https://]")
+    assert matches_any_scrub_entry(pr_entries, "https://[:443")
+    assert matches_any_scrub_entry(pr_entries, "https://[invalid-bracket")
+    assert match_scrub_entry(pr_entries[0], "https://[")
+
+    # Other malformed/unsupported authorities
+    assert matches_any_scrub_entry(pr_entries, "https://user:pass@api.github.com/repos/o/r/pulls/50")
+    assert matches_any_scrub_entry(pr_entries, "https://api.github.com:invalid_port/repos/o/r/pulls/50")
 

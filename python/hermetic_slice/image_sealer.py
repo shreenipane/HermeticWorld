@@ -425,11 +425,13 @@ RESTORE_MODES_SH = r"""#!/bin/bash
 # chmod 755
 set -euo pipefail
 cd /testbed
-python3 - << 'PYEOF'
+PYTHON_BIN="$(command -v python3)"
+env -i PATH="$PATH" "$PYTHON_BIN" -I -S - << 'PYEOF'
+import sys
+sys.path = [p for p in sys.path if p and p != "." and p != "/testbed" and not p.startswith("/testbed/")]
 import os
 import stat
 import subprocess
-import sys
 
 out = subprocess.check_output(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"])
 for entry in out.split(bytes([0])):

@@ -103,10 +103,67 @@ class ScrubEntry:
         }
 
 
+MAX_RESOURCE_URL_LENGTH = 2048
+
+
 def deny_unresolved_scope(entries: list[ScrubEntry]) -> None:
     """Append mandatory prefix denials for GitHub web and API scope."""
     for url in ("https://github.com/", "https://api.github.com/"):
         entries.append(ScrubEntry("unresolved_scope", url, "incomplete discovery; deny GitHub scope", "prefix"))
+
+
+def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
+    """Validate, bound, and canonicalize URL components.
+
+    Rejects malformed bracketed authorities, unsupported authority forms
+    (e.g., userinfo, invalid ports), and URLs exceeding length bounds.
+    Canonicalizes hostname case and strips default effective ports (443 for https, 80 for http).
+    Returns (scheme, canonical_netloc, path, query, fragment) or None if invalid.
+    """
+    if not isinstance(url, str):
+        return None
+    if len(url) > MAX_RESOURCE_URL_LENGTH:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower() if parsed.scheme else ""
+    if scheme not in ("http", "https"):
+        return None
+
+    if not parsed.netloc:
+        return None
+
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return None
+
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    if not hostname:
+        return None
+
+    hostname = hostname.lower()
+
+    default_port = 443 if scheme == "https" else 80
+    if port is not None and port == default_port:
+        port = None
+
+    if port is not None:
+        if not (0 < port < 65536):
+            return None
+        canon_netloc = f"{hostname}:{port}"
+    else:
+        canon_netloc = hostname
+
+    path = parsed.path or "/"
+
+    return (scheme, canon_netloc, path, parsed.query, parsed.fragment)
 
 
 def match_scrub_entry(entry: dict[str, str] | ScrubEntry, candidate_url: str) -> bool:
@@ -118,32 +175,45 @@ def match_scrub_entry(entry: dict[str, str] | ScrubEntry, candidate_url: str) ->
         e_url = entry.get("url", "")
         e_match = entry.get("match", "exact")
 
-    if not e_url or not candidate_url:
+    if not e_url:
+        return False
+    if not candidate_url:
         return False
 
-    if candidate_url == e_url:
+    cand_canon = _canonicalize_url(candidate_url)
+    if cand_canon is None:
+        # Candidate URL is malformed, oversized, or unsupported authority: controlled rejection (cannot become allow)
         return True
 
-    cand_parsed = urlsplit(candidate_url)
-    entry_parsed = urlsplit(e_url)
+    entry_canon = _canonicalize_url(e_url)
+    if entry_canon is None:
+        return False
 
-    if cand_parsed.scheme != entry_parsed.scheme or cand_parsed.netloc != entry_parsed.netloc:
+    cand_scheme, cand_netloc, cand_path, cand_query, cand_frag = cand_canon
+    entry_scheme, entry_netloc, entry_path, entry_query, entry_frag = entry_canon
+
+    if cand_scheme != entry_scheme or cand_netloc != entry_netloc:
         return False
 
     if e_match == "exact":
-        if entry_parsed.fragment and cand_parsed.fragment != entry_parsed.fragment:
+        if entry_frag and cand_frag != entry_frag:
             return False
-        if entry_parsed.query and cand_parsed.query != entry_parsed.query:
+        if entry_query and cand_query != entry_query:
             return False
-        cand_path = cand_parsed.path.rstrip("/") if cand_parsed.path != "/" else "/"
-        entry_path = entry_parsed.path.rstrip("/") if entry_parsed.path != "/" else "/"
-        return cand_path == entry_path
+        c_path = cand_path.rstrip("/") if cand_path != "/" else "/"
+        e_path = entry_path.rstrip("/") if entry_path != "/" else "/"
+        return c_path == e_path
 
     if e_match == "prefix":
-        if candidate_url.startswith(e_url):
+        cand_base = f"{cand_scheme}://{cand_netloc}{cand_path}"
+        entry_base = f"{entry_scheme}://{entry_netloc}{entry_path}"
+        if entry_query:
+            entry_full = f"{entry_base}?{entry_query}"
+            cand_full = f"{cand_base}?{cand_query}" if cand_query else cand_base
+            return cand_full.startswith(entry_full)
+        if cand_base.startswith(entry_base):
             return True
-        cand_base = f"{cand_parsed.scheme}://{cand_parsed.netloc}{cand_parsed.path}"
-        if cand_base.startswith(e_url):
+        if candidate_url.startswith(e_url):
             return True
         return False
 
@@ -152,6 +222,12 @@ def match_scrub_entry(entry: dict[str, str] | ScrubEntry, candidate_url: str) ->
 
 def matches_any_scrub_entry(entries: Sequence[dict[str, str] | ScrubEntry], candidate_url: str) -> bool:
     """Evaluate whether candidate_url matches any scrub entry in the collection."""
+    if not candidate_url:
+        return False
+    cand_canon = _canonicalize_url(candidate_url)
+    if cand_canon is None:
+        # Controlled rejection that cannot become an allow decision
+        return True
     return any(match_scrub_entry(e, candidate_url) for e in entries)
 
 
@@ -859,6 +935,38 @@ def _validate_fields(node: dict[str, Any]) -> None:
         raise GraphQLResponseError("invalid_resource_url")
 
 
+def _parse_github_item_url(url: str | None) -> tuple[str, str, int] | None:
+    """Extract (repo, kind, number) from a GitHub issue or pull request URL."""
+    if not url:
+        return None
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(issues|pull|pulls)/(\d+)", url)
+    if m:
+        owner, repo_name, sub, num_str = m.groups()
+        if len(num_str) > 18:
+            return None
+        kind = "pull" if sub in ("pull", "pulls") else "issues"
+        return f"{owner}/{repo_name}", kind, int(num_str)
+    return None
+
+
+def _is_target_issue_ref(item: Any, target_repo: str, target_numbers: set[int] | int) -> bool:
+    """Check if an item dictionary references the target issue."""
+    if not isinstance(item, dict):
+        return False
+    if isinstance(target_numbers, int):
+        target_numbers = {target_numbers}
+    t_type = item.get("__typename") if isinstance(item.get("__typename"), str) else None
+    if t_type == "PullRequest":
+        return False
+    url = item.get("url") if isinstance(item.get("url"), str) else ""
+    num = item.get("number") if type(item.get("number")) is int else None
+    parsed = _parse_github_item_url(url)
+    item_repo = parsed[0] if parsed else target_repo
+    item_kind = parsed[1] if parsed else "issues"
+    item_num = parsed[2] if parsed else num
+    return item_repo == target_repo and item_kind == "issues" and item_num in target_numbers
+
+
 def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str, issue_number: int) -> dict[str, Any]:
     variables = {"owner": owner, "repo": name, "number": issue_number}
     data = _post_graphql(http_post_json, TARGET_ISSUE_QUERY, variables, "TargetIssueData")
@@ -889,7 +997,10 @@ def fetch_target_issue_data(http_post_json: HttpPostJson, owner: str, name: str,
                     subj = node.get("subject")
                     has_src = isinstance(src, dict) and bool(src.get("url") or src.get("number"))
                     has_subj = isinstance(subj, dict) and bool(subj.get("url") or subj.get("number"))
-                    if not has_src and not has_subj:
+                    target_repo_str = f"{owner}/{name}"
+                    src_outside = has_src and not _is_target_issue_ref(src, target_repo_str, issue_number)
+                    subj_outside = has_subj and not _is_target_issue_ref(subj, target_repo_str, issue_number)
+                    if not src_outside and not subj_outside:
                         raise GraphQLResponseError("missing_connected_event_identity")
                     for key in ("source", "subject"):
                         if node.get(key) is not None:
@@ -927,20 +1038,6 @@ def fetch_pull_request_data(http_post_json: HttpPostJson, owner: str, name: str,
                         raise GraphQLResponseError("missing_review_comment_identity")
         pr[field]["nodes"] = nodes
     return pr
-
-def _parse_github_item_url(url: str | None) -> tuple[str, str, int] | None:
-    """Extract (repo, kind, number) from a GitHub issue or pull request URL."""
-    if not url:
-        return None
-    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(issues|pull|pulls)/(\d+)", url)
-    if m:
-        owner, repo_name, sub, num_str = m.groups()
-        if len(num_str) > 18:
-            return None
-        kind = "pull" if sub in ("pull", "pulls") else "issues"
-        return f"{owner}/{repo_name}", kind, int(num_str)
-    return None
-
 
 def get_solution_pr_scrub_entries(
     repo: str,
@@ -1001,6 +1098,20 @@ def get_referencing_pr_scrub_entries(
     ]
 
 
+def get_referencing_issue_scrub_entries(
+    issue_repo: str,
+    issue_num: int,
+    base_reason: str = "referencing issue",
+) -> list[ScrubEntry]:
+    """Generate the full scrub entry set for a referencing issue with delimiter-bounded prefixes."""
+    return [
+        ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{issue_repo}/issues/{issue_num}", reason=base_reason),
+        ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} URL prefix"),
+        ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{issue_repo}/issues/{issue_num}", reason=base_reason),
+        ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://api.github.com/repos/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} API URL prefix"),
+    ]
+
+
 def dedupe_and_sort_entries(entries: list[ScrubEntry]) -> list[dict[str, str]]:
     """Deduplicate entries and sort deterministically by (url, kind, match, reason)."""
     seen: set[tuple[str, str, str, str]] = set()
@@ -1047,23 +1158,16 @@ def _add_timeline_scrub_entries(
                 elif src_url:
                     entries.append(ScrubEntry(kind="cross_reference", match="exact", url=src_url, reason="cross-references target issue"))
             else:
-                if src_url:
-                    entries.append(ScrubEntry(kind="cross_reference", match="exact", url=src_url, reason="cross-references target issue"))
                 if src_number:
-                    entries.append(ScrubEntry(
-                        kind="cross_reference",
-                        match="exact",
-                        url=f"https://api.github.com/repos/{src_repo}/issues/{src_number}",
-                        reason="cross-references target issue",
-                    ))
+                    entries.extend(get_referencing_issue_scrub_entries(src_repo, src_number, base_reason="cross-references target issue"))
+                elif src_url:
+                    entries.append(ScrubEntry(kind="cross_reference", match="exact", url=src_url, reason="cross-references target issue"))
             if item.get("url") and isinstance(item.get("url"), str):
                 entries.append(ScrubEntry(kind="cross_reference", match="exact", url=item["url"], reason="cross-reference event on target issue"))
 
         elif typename == "ConnectedEvent":
             conn_candidates = [conn for conn in (item.get("source"), item.get("subject")) if isinstance(conn, dict)]
-            if not conn_candidates or not any(c.get("url") or c.get("number") for c in conn_candidates):
-                deny_unresolved_scope(entries)
-                continue
+            outside_candidates = []
             for conn_item in conn_candidates:
                 c_url = conn_item.get("url") if isinstance(conn_item.get("url"), str) else ""
                 c_num = conn_item.get("number") if type(conn_item.get("number")) is int else None
@@ -1076,21 +1180,24 @@ def _add_timeline_scrub_entries(
                 if c_repo == repo and c_number in target_issue_numbers and c_kind == "issues":
                     continue
 
+                if c_url or c_number:
+                    outside_candidates.append((conn_item, c_repo, c_kind, c_number, c_url, c_type))
+
+            if not outside_candidates:
+                deny_unresolved_scope(entries)
+                continue
+
+            for conn_item, c_repo, c_kind, c_number, c_url, c_type in outside_candidates:
                 if c_kind == "pull" or c_type == "PullRequest":
                     if c_number:
                         entries.extend(get_referencing_pr_scrub_entries(c_repo, c_number, base_reason="connected to target issue"))
                     elif c_url:
                         entries.append(ScrubEntry(kind="cross_reference", match="exact", url=c_url, reason="connected to target issue"))
                 else:
-                    if c_url:
-                        entries.append(ScrubEntry(kind="cross_reference", match="exact", url=c_url, reason="connected to target issue"))
                     if c_number:
-                        entries.append(ScrubEntry(
-                            kind="cross_reference",
-                            match="exact",
-                            url=f"https://api.github.com/repos/{c_repo}/issues/{c_number}",
-                            reason="connected to target issue",
-                        ))
+                        entries.extend(get_referencing_issue_scrub_entries(c_repo, c_number, base_reason="connected to target issue"))
+                    elif c_url:
+                        entries.append(ScrubEntry(kind="cross_reference", match="exact", url=c_url, reason="connected to target issue"))
 
 
 def _add_linked_refs_scrub_entries(
@@ -1121,17 +1228,8 @@ def _add_linked_refs_scrub_entries(
         for ref in discovered:
             if ref.number not in target_issue_numbers:
                 if ref.kind == "github":
-                    entries.append(ScrubEntry(
-                        kind="cross_reference",
-                        match="exact",
-                        url=f"https://github.com/{repo}/issues/{ref.number}",
-                        reason="referenced in target issue discussion",
-                    ))
-                    entries.append(ScrubEntry(
-                        kind="cross_reference",
-                        match="exact",
-                        url=f"https://api.github.com/repos/{repo}/issues/{ref.number}",
-                        reason="referenced in target issue discussion",
+                    entries.extend(get_referencing_issue_scrub_entries(
+                        repo, ref.number, base_reason="referenced in target issue discussion"
                     ))
 
 

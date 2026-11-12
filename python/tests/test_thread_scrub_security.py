@@ -449,7 +449,7 @@ def test_output_directory_failure_has_no_host_path(tmp_path):
     assert not (tmp_path / "out/test-org__test-repo-50/task.json").exists()
 
 
-@pytest.mark.parametrize("unidentified_case", ["late_comment", "pr_comment", "null_source"])
+@pytest.mark.parametrize("unidentified_case", ["late_comment", "pr_comment", "null_source", "connected_null_source"])
 def test_defect1_unidentified_resources_require_scope_denial(tmp_path, unidentified_case):
     """Regression Defect 1: Unidentified late comments, PR comments, and null reference sources either fail publication or include scope denial."""
     target_node = issue()
@@ -476,11 +476,52 @@ def test_defect1_unidentified_resources_require_scope_denial(tmp_path, unidentif
             "url": None,
             "source": None,
         }])
+    elif unidentified_case == "connected_null_source":
+        target_node["timelineItems"] = connection([{
+            "__typename": "ConnectedEvent",
+            "source": None,
+            "subject": {
+                "__typename": "Issue",
+                "number": 1,
+                "url": f"https://github.com/{REPO}/issues/1",
+            },
+        }])
 
     def post(url, payload):
         op = payload["operationName"]
         if op == "PullRequestData":
             return response("pullRequest", pr_node)
+        if op == "TargetIssueData":
+            return response("issue", target_node)
+        raise OSError("unexpected op")
+
+    try:
+        task = publish(tmp_path, post=post, refs="Fixes #1")
+        scrub = json.loads((task / "staging/thread_scrub.json").read_text())
+        assert_denied(scrub)
+        assert (task / "agent/problem_statement.md").read_bytes() == b""
+        assert (task / "staging/hints.txt").read_bytes() == b""
+    except IntakeError:
+        pass
+
+
+def test_defect1_connected_event_null_source_and_target_subject_denial(tmp_path):
+    """Regression Defect 1: ConnectedEvent with source: null and target subject passes intake_task with mandatory scope denial or rejection."""
+    target_node = issue()
+    target_node["timelineItems"] = connection([{
+        "__typename": "ConnectedEvent",
+        "source": None,
+        "subject": {
+            "__typename": "Issue",
+            "number": 1,
+            "url": f"https://github.com/{REPO}/issues/1",
+        },
+    }])
+
+    def post(url, payload):
+        op = payload["operationName"]
+        if op == "PullRequestData":
+            return response("pullRequest", pr())
         if op == "TargetIssueData":
             return response("issue", target_node)
         raise OSError("unexpected op")

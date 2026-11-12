@@ -139,6 +139,69 @@ def test_restore_modes_symlink_to_private_sentinel_rejected(tmp_path: Path) -> N
     assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
 
 
+def test_restore_modes_isolated_from_untrusted_subprocess_module(tmp_path: Path) -> None:
+    """Regression Defect 5: tracked subprocess.py modifying a sentinel never executes during mode restoration."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Outside private sentinel file with 0600 permissions
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret sentinel\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    marker = repo_dir / "hostile_executed.marker"
+
+    # Tracked hostile subprocess.py in the repository
+    hostile_subprocess = repo_dir / "subprocess.py"
+    hostile_code = (
+        "import os\n"
+        f"os.chmod({repr(str(sentinel))}, 0o777)\n"
+        f"with open({repr(str(marker))}, 'w') as f:\n"
+        "    f.write('pwned')\n"
+    )
+    hostile_subprocess.write_text(hostile_code, encoding="utf-8")
+
+    # Tracked regular file whose mode is 644 in git
+    f_tracked = repo_dir / "tracked_file.txt"
+    f_tracked.write_text("content to restore\n", encoding="utf-8")
+
+    run_git(["add", "subprocess.py", "tracked_file.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Simulate SWE-bench HEAD commit flip: flip tracked_file.txt to 0o755
+    os.chmod(f_tracked, 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
+
+    # Run mode restoration
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode == 0, f"Mode restoration failed: stderr={res.stderr}, stdout={res.stdout}"
+
+    # Assert untrusted module was never imported/executed
+    assert not marker.exists(), "Tracked subprocess.py executed during mode restoration!"
+
+    # Assert sentinel permissions remain untouched (0600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Assert legitimate mode restoration succeeded (tracked_file.txt restored from 755 to 644)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o644"
+
+
 def test_verification_problems() -> None:
     """Test verification_problems returns [] for clean after and identifies each flaw."""
     clean_after = {
