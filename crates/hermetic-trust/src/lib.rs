@@ -21,15 +21,15 @@ pub use cert::{
 };
 pub use error::TrustError;
 pub use install::{
-    append_pem_bundle_idempotent, atomic_write_preserving, atomic_write_preserving_handle,
-    bundle_contains_cert, check_report_target_collision, encode_path_lossless,
-    ensure_parent_dirs_in_rootfs, install_ca, open_child_dir, open_dir_handle,
-    open_parent_dir_handle, read_file_capped_from_parent, resolve_in_rootfs, safe_join_rootfs,
-    safe_join_rootfs_from, set_before_dir_enum_hook_guard, set_before_use_hook_guard,
-    set_chown_failure_guard, BeforeDirEnumHookGuard, BeforeUseHookGuard, ChownFailureGuard,
-    InstallReport, SkippedPath, BEFORE_USE_HOOK, FORCE_CHOWN_FAILURE, MAX_AGGREGATE_BYTES,
-    MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES, MAX_REPORT_ENTRIES,
-    MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
+    append_pem_bundle_in_root, atomic_write_in_root, atomic_write_preserving_handle,
+    bundle_contains_cert, check_report_target_collision, encode_path_lossless, install_ca,
+    install_ca_with_options, open_child_dir, open_dir_handle, open_parent_dir_handle,
+    read_file_capped_from_parent, resolve_in_rootfs, safe_join_rootfs, safe_join_rootfs_from,
+    set_before_dir_enum_hook_guard, set_before_use_hook_guard, set_chown_failure_guard,
+    BeforeDirEnumHookGuard, BeforeUseHookGuard, ChownFailureGuard, GuestOwner, InstallOptions,
+    InstallReport, Resolution, SkippedPath, BEFORE_USE_HOOK, FORCE_CHOWN_FAILURE,
+    MAX_AGGREGATE_BYTES, MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES,
+    MAX_REPORT_ENTRIES, MAX_TREE_DEPTH, MAX_TREE_ENTRIES, NEW_DIR_MODE, NEW_FILE_MODE,
 };
 pub use jks::{
     compute_jks_integrity_hash, create_empty_jks, inject_ca_into_jks, is_pkcs12, parse_jks,

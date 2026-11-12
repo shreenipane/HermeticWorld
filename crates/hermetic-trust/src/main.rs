@@ -6,8 +6,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use hermetic_trust::{
-    atomic_write_file, check_not_alias, check_report_target_collision, install_ca, mint_ca,
-    read_cert_file_bounded, read_seed_file, validate_output_path, write_private_key_file,
+    atomic_write_file, check_not_alias, install_ca_with_options, mint_ca, read_cert_file_bounded,
+    read_seed_file, validate_output_path, write_private_key_file, GuestOwner, InstallOptions,
     TrustError,
 };
 
@@ -51,6 +51,14 @@ enum Commands {
 
         #[arg(long)]
         report: Option<PathBuf>,
+
+        /// Owner uid of rootfs entries created by the install (guest root by default)
+        #[arg(long, default_value_t = 0)]
+        guest_uid: u32,
+
+        /// Owner gid of rootfs entries created by the install (guest root by default)
+        #[arg(long, default_value_t = 0)]
+        guest_gid: u32,
     },
 }
 
@@ -88,15 +96,25 @@ fn run() -> Result<(), TrustError> {
             rootfs,
             ca_cert,
             report,
+            guest_uid,
+            guest_gid,
         } => {
             if let Some(ref report_path) = report {
                 check_not_alias(report_path, &ca_cert, "report", "ca_cert")?;
                 validate_output_path(report_path)?;
-                check_report_target_collision(&rootfs, report_path)?;
             }
 
             let ca_pem = read_cert_file_bounded(&ca_cert)?;
-            let install_report = install_ca(&rootfs, &ca_pem)?;
+            // The report destination is checked against the install's own
+            // discovery plan before the rootfs is modified.
+            let options = InstallOptions {
+                owner: GuestOwner {
+                    uid: guest_uid,
+                    gid: guest_gid,
+                },
+                report_path: report.clone(),
+            };
+            let install_report = install_ca_with_options(&rootfs, &ca_pem, &options)?;
 
             let report_json = serde_json::to_string_pretty(&install_report)?;
             if let Some(ref report_path) = report {

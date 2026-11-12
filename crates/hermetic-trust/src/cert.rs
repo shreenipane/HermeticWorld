@@ -677,97 +677,90 @@ pub fn validate_output_path(path: &Path) -> Result<(), TrustError> {
     Ok(())
 }
 
-type DestinationIdentity = (Option<(u64, u64)>, std::ffi::OsString, PathBuf);
+/// Resolve an output path to the absolute physical location the operating system
+/// would write it to, without creating anything.
+///
+/// Relative paths are anchored at the current directory. The longest existing
+/// ancestor of the destination's parent is canonicalized (it must be a directory);
+/// the components below it do not exist yet and must all be plain names (a `..`
+/// after a missing directory cannot be resolved by the kernel either). The final
+/// component itself is never followed.
+pub(crate) fn physical_destination(path: &Path) -> Result<PathBuf, TrustError> {
+    use std::path::Component;
 
-/// Helper to resolve parent directory identity and destination file name.
-/// Returns (parent_dev_ino, normalized_file_name, canon_parent_path).
-fn resolve_destination_identity(path: &Path) -> Result<DestinationIdentity, TrustError> {
-    let file_name = path
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let file_name = abs
         .file_name()
         .ok_or_else(|| {
             TrustError::Cert(format!(
-                "invalid path has no file name: '{}'",
+                "invalid output path has no file name: '{}'",
                 path.display()
             ))
         })?
         .to_os_string();
+    let parent = abs.parent().ok_or_else(|| {
+        TrustError::Cert(format!(
+            "invalid output path has no parent: '{}'",
+            path.display()
+        ))
+    })?;
 
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-
-    // If parent exists, canonicalize it and get (dev, ino)
-    if let Ok(canon) = parent.canonicalize() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = std::fs::metadata(&canon) {
-                return Ok((Some((meta.dev(), meta.ino())), file_name, canon));
-            }
+    let comps: Vec<Component> = parent.components().collect();
+    let mut existing = comps.len();
+    loop {
+        if existing == 0 {
+            return Err(TrustError::Cert(format!(
+                "output path '{}' has no existing ancestor",
+                path.display()
+            )));
         }
-        return Ok((None, file_name, canon));
-    }
-
-    // If parent does not exist, walk up ancestors until an existing ancestor is found
-    let mut missing_suffix = Vec::new();
-    let mut cur = parent;
-    let mut resolved_parent = None;
-
-    while !cur.as_os_str().is_empty() {
-        if let Ok(canon) = cur.canonicalize() {
-            let mut assembled = canon;
-            for part in missing_suffix.into_iter().rev() {
-                assembled.push(part);
+        let prefix: PathBuf = comps[..existing].iter().collect();
+        match std::fs::metadata(&prefix) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(TrustError::Cert(format!(
+                        "ancestor '{}' of output path '{}' is not a directory",
+                        prefix.display(),
+                        path.display()
+                    )));
+                }
+                let mut out = prefix.canonicalize()?;
+                for comp in &comps[existing..] {
+                    match comp {
+                        Component::Normal(n) => out.push(n),
+                        _ => {
+                            return Err(TrustError::Cert(format!(
+                            "output path '{}' cannot be resolved: '..' follows a missing directory",
+                            path.display()
+                        )))
+                        }
+                    }
+                }
+                out.push(&file_name);
+                return Ok(out);
             }
-            #[cfg(unix)]
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
             {
-                use std::os::unix::fs::MetadataExt;
-                if let Ok(meta) = std::fs::metadata(&assembled) {
-                    resolved_parent =
-                        Some((Some((meta.dev(), meta.ino())), file_name.clone(), assembled));
-                    break;
-                }
+                existing -= 1;
             }
-            resolved_parent = Some((None, file_name.clone(), assembled));
-            break;
+            Err(e) => return Err(TrustError::Io(e)),
         }
-        if let Some(comp) = cur.file_name() {
-            missing_suffix.push(comp.to_os_string());
-        }
-        cur = cur.parent().unwrap_or_else(|| Path::new(""));
-    }
-
-    if let Some(res) = resolved_parent {
-        Ok(res)
-    } else {
-        let mut norm = PathBuf::new();
-        for comp in parent.components() {
-            match comp {
-                std::path::Component::ParentDir => {
-                    norm.pop();
-                }
-                std::path::Component::CurDir => {}
-                std::path::Component::Normal(c) => {
-                    norm.push(c);
-                }
-                std::path::Component::RootDir => {
-                    norm.push("/");
-                }
-                std::path::Component::Prefix(p) => {
-                    norm.push(p.as_os_str());
-                }
-            }
-        }
-        Ok((None, file_name, norm))
     }
 }
 
-/// Check that two output paths do not alias the same filesystem location or inode.
-/// Compares resolved parent-directory identities and destination names before writing,
-/// including nonexistent destinations.
+/// Check that two output paths do not alias the same filesystem location or inode,
+/// and that neither is an ancestor of the other.
+///
+/// Both destinations are resolved to absolute physical locations against their
+/// longest existing ancestor (which must be a directory) before anything is
+/// written, so relative and absolute spellings of the same new file, and an
+/// existing file used as a parent directory of the other output, are rejected.
 pub fn check_not_alias(
     path1: &Path,
     path2: &Path,
@@ -801,25 +794,27 @@ pub fn check_not_alias(
         }
     }
 
-    // Compare resolved parent-directory identities and destination names before writing
-    let (parent_id1, fname1, canon1) = resolve_destination_identity(path1)?;
-    let (parent_id2, fname2, canon2) = resolve_destination_identity(path2)?;
+    let dest1 = physical_destination(path1)?;
+    let dest2 = physical_destination(path2)?;
 
-    if fname1 == fname2 {
-        let same_parent = match (parent_id1, parent_id2) {
-            (Some(id1), Some(id2)) => id1 == id2,
-            _ => canon1 == canon2,
-        };
-        if same_parent {
-            return Err(TrustError::Cert(format!(
-                "{} ('{}') and {} ('{}') alias the same destination in directory '{}'",
-                desc1,
-                path1.display(),
-                desc2,
-                path2.display(),
-                canon1.display()
-            )));
-        }
+    if dest1 == dest2 {
+        return Err(TrustError::Cert(format!(
+            "{} ('{}') and {} ('{}') alias the same destination '{}'",
+            desc1,
+            path1.display(),
+            desc2,
+            path2.display(),
+            dest1.display()
+        )));
+    }
+    if dest1.starts_with(&dest2) || dest2.starts_with(&dest1) {
+        return Err(TrustError::Cert(format!(
+            "{} ('{}') and {} ('{}') conflict: one is an ancestor of the other",
+            desc1,
+            path1.display(),
+            desc2,
+            path2.display()
+        )));
     }
 
     Ok(())

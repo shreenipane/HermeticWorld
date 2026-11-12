@@ -7,12 +7,37 @@ use std::process::Command;
 use time::macros::datetime;
 
 use hermetic_trust::{
-    atomic_write_file, atomic_write_preserving, check_not_alias, compute_ca_validity,
-    compute_leaf_validity, create_empty_jks, install_ca, mint_ca, mint_leaf, parse_jks,
-    read_cert_file_bounded, read_seed_file, validate_dns_name, validate_output_path,
-    write_private_key_file, JksEntry, TrustError, BEFORE_USE_HOOK, FORCE_CHOWN_FAILURE,
-    MAX_CA_CERT_INPUT_BYTES, MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES,
+    append_pem_bundle_in_root, atomic_write_file, atomic_write_in_root, check_not_alias,
+    compute_ca_validity, compute_leaf_validity, create_empty_jks, install_ca_with_options, mint_ca,
+    mint_leaf, open_dir_handle, parse_jks, read_cert_file_bounded, read_seed_file,
+    validate_dns_name, validate_output_path, write_private_key_file, GuestOwner, InstallOptions,
+    InstallReport, JksEntry, TrustError, BEFORE_USE_HOOK, MAX_CA_CERT_INPUT_BYTES,
+    MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES, NEW_DIR_MODE, NEW_FILE_MODE,
 };
+
+/// Owner (uid, gid) that files created by this test process receive.
+fn current_owner() -> GuestOwner {
+    let probe = tempfile::tempfile().expect("probe tempfile");
+    let meta = probe.metadata().expect("probe metadata");
+    GuestOwner {
+        uid: meta.uid(),
+        gid: meta.gid(),
+    }
+}
+
+/// Install as the test process's own identity. New rootfs entries default to
+/// guest root (0:0), which an unprivileged test process cannot assign; the
+/// ownership rules themselves are covered by dedicated tests below.
+fn install_ca(rootfs: &std::path::Path, ca_cert_pem: &str) -> Result<InstallReport, TrustError> {
+    install_ca_with_options(
+        rootfs,
+        ca_cert_pem,
+        &InstallOptions {
+            owner: current_owner(),
+            report_path: None,
+        },
+    )
+}
 
 #[test]
 fn test_determinism() {
@@ -1158,10 +1183,17 @@ fn test_unbounded_reads_sparse_file_capped() {
     let seed: [u8; 32] = [1u8; 32];
     let ca = mint_ca("cap-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
 
-    let res = hermetic_trust::append_pem_bundle_idempotent(&sparse_pem, &ca.cert_pem, &ca.cert_der);
+    let temp_root = open_dir_handle(temp_dir.path()).expect("open temp root");
+    let res = append_pem_bundle_in_root(
+        &temp_root,
+        std::path::Path::new("sparse_bundle.pem"),
+        &ca.cert_pem,
+        &ca.cert_der,
+        current_owner(),
+    );
     assert!(
         res.is_err(),
-        "append_pem_bundle_idempotent must reject files exceeding 16 MiB"
+        "append_pem_bundle_in_root must reject files exceeding 16 MiB"
     );
     let err_str = res.err().unwrap().to_string();
     assert!(err_str.contains("exceeds size cap"));
@@ -1261,11 +1293,18 @@ fn test_check_then_use_symlink_refusal() {
     let symlink_path = temp_dir.path().join("symlink_target");
     std::os::unix::fs::symlink(&outside_target, &symlink_path).expect("create symlink");
 
-    // atomic_write_preserving on a symlink must refuse
-    let res = hermetic_trust::atomic_write_preserving(&symlink_path, b"NEW_DATA\n", Some(0o644));
+    // atomic_write_in_root on a symlink must refuse
+    let temp_root = open_dir_handle(temp_dir.path()).expect("open temp root");
+    let res = atomic_write_in_root(
+        &temp_root,
+        std::path::Path::new("symlink_target"),
+        b"NEW_DATA\n",
+        NEW_FILE_MODE,
+        current_owner(),
+    );
     assert!(
         res.is_err(),
-        "atomic_write_preserving must refuse symlink target"
+        "atomic_write_in_root must refuse symlink target"
     );
     assert!(matches!(res.unwrap_err(), TrustError::Symlink(_)));
 
@@ -1411,7 +1450,14 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             let _ = std::os::unix::fs::symlink(&victim_clone, &bundle_clone);
         }));
 
-        let res = atomic_write_preserving(&bundle_path, b"MALICIOUS_DATA", None);
+        let root = open_dir_handle(&rootfs).expect("open rootfs");
+        let res = atomic_write_in_root(
+            &root,
+            std::path::Path::new("etc/ssl/certs/ca-certificates.crt"),
+            b"MALICIOUS_DATA",
+            NEW_FILE_MODE,
+            current_owner(),
+        );
         *BEFORE_USE_HOOK.write().unwrap() = None;
 
         assert!(res.is_err(), "Must reject final-component symlink swap");
@@ -1447,7 +1493,14 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             let _ = fs::rename(&fifo_clone, &bundle_hook);
         }));
 
-        let _ = atomic_write_preserving(&bundle_clone, b"NEW_DATA", None);
+        let root = open_dir_handle(&rootfs).expect("open rootfs");
+        let _ = atomic_write_in_root(
+            &root,
+            std::path::Path::new("etc/ssl/certs/ca-certificates2.crt"),
+            b"NEW_DATA",
+            NEW_FILE_MODE,
+            current_owner(),
+        );
         *BEFORE_USE_HOOK.write().unwrap() = None;
     }
 
@@ -1475,7 +1528,14 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             }
         }));
 
-        let _ = atomic_write_preserving(&bundle2_path, b"ANCHORED_DATA", None);
+        let root2 = open_dir_handle(&rootfs2).expect("open rootfs2");
+        let _ = atomic_write_in_root(
+            &root2,
+            std::path::Path::new("etc/ssl/certs/ca-certificates.crt"),
+            b"ANCHORED_DATA",
+            NEW_FILE_MODE,
+            current_owner(),
+        );
         *BEFORE_USE_HOOK.write().unwrap() = None;
 
         let canary_content = fs::read(&canary_file).expect("read canary");
@@ -2018,10 +2078,17 @@ fn test_defect10_ownership_preservation_failure_propagation() {
     let initial_gid = initial_meta.gid();
     let initial_mode = initial_meta.permissions().mode();
 
-    // Force ownership setting failure via test hook
-    FORCE_CHOWN_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
-    let res = atomic_write_preserving(&target_file, b"NEW_DATA_SHOULD_FAIL", None);
-    FORCE_CHOWN_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Force ownership setting failure via the thread-local test hook
+    let temp_root = open_dir_handle(temp_dir.path()).expect("open temp root");
+    let guard = hermetic_trust::set_chown_failure_guard();
+    let res = atomic_write_in_root(
+        &temp_root,
+        std::path::Path::new("target_bundle.crt"),
+        b"NEW_DATA_SHOULD_FAIL",
+        NEW_FILE_MODE,
+        current_owner(),
+    );
+    drop(guard);
 
     assert!(res.is_err(), "Must propagate chown failure as an error");
 
@@ -2767,4 +2834,499 @@ fn test_discovery_failure_aborts_install_without_modification() {
             "system bundle modified despite enumeration failure"
         );
     }
+}
+
+// =========================================================================
+// Re-review 2026-11-12 regressions (blocking items 1, 2, 3, 4 and 8)
+// =========================================================================
+
+fn mint_test_ca(world: &str, seed_byte: u8) -> hermetic_trust::Ca {
+    mint_ca(world, datetime!(2024-01-01 00:00:00 UTC), &[seed_byte; 32]).expect("mint ca")
+}
+
+fn spawn_cli(args: &[&std::ffi::OsStr], cwd: Option<&std::path::Path>) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hermetic-trust"));
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let child = cmd.spawn().expect("spawn hermetic-trust");
+    wait_child_with_timeout(child, std::time::Duration::from_secs(120))
+}
+
+/// Item 1: after a missing component, `..` must not be normalised away and no
+/// metadata may be read through a host symlink, so the outside file's existence
+/// and size cannot change the report.
+#[test]
+fn test_missing_component_dotdot_results_independent_of_host_files() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("missing-dotdot-world", 31);
+    let host_dir = temp_dir.path().join("host");
+    fs::create_dir_all(&host_dir).expect("create host dir");
+    let probe = host_dir.join("probe");
+
+    let build = |name: &str| -> std::path::PathBuf {
+        let rootfs = temp_dir.path().join(name);
+        let certs = rootfs.join("etc/ssl/certs");
+        fs::create_dir_all(&certs).expect("create certs");
+        fs::write(certs.join("ca-certificates.crt"), b"").expect("write system bundle");
+        let certifi = rootfs.join("opt/lib/certifi");
+        fs::create_dir_all(&certifi).expect("create certifi");
+        std::os::unix::fs::symlink("/missing/../escape/probe", certifi.join("cacert.pem"))
+            .expect("symlink cacert.pem");
+        std::os::unix::fs::symlink(&host_dir, rootfs.join("escape")).expect("symlink escape");
+        rootfs
+    };
+
+    // Host probe absent.
+    let report_absent = install_ca(&build("rootfs_absent"), &ca.cert_pem).expect("install absent");
+
+    // Host probe present and small.
+    fs::write(&probe, b"HOST_PROBE\n").expect("write probe");
+    let report_small = install_ca(&build("rootfs_small"), &ca.cert_pem).expect("install small");
+    assert_eq!(fs::read(&probe).expect("read probe"), b"HOST_PROBE\n");
+
+    // Host probe present and above the bundle size cap.
+    let f = fs::File::create(&probe).expect("create big probe");
+    f.set_len(17 * 1024 * 1024).expect("set_len probe");
+    drop(f);
+    let report_big = install_ca(&build("rootfs_big"), &ca.cert_pem).expect("install big");
+
+    let json = |r: &InstallReport| serde_json::to_string(r).expect("json");
+    assert_eq!(
+        json(&report_absent),
+        json(&report_small),
+        "report must not depend on whether a host file exists"
+    );
+    assert_eq!(
+        json(&report_absent),
+        json(&report_big),
+        "report must not depend on the size of a host file"
+    );
+    assert!(
+        report_absent
+            .skipped_paths
+            .iter()
+            .any(|s| s.path == "opt/lib/certifi/cacert.pem" && s.reason == "cannot stat target"),
+        "dangling '/missing/..' target must be reported as unresolvable: {:?}",
+        report_absent.skipped_paths
+    );
+    assert!(!json(&report_absent).contains("escape"));
+
+    // The host directory is untouched.
+    assert_eq!(
+        fs::metadata(&probe).expect("probe meta").len(),
+        17 * 1024 * 1024
+    );
+    assert_eq!(fs::read_dir(&host_dir).expect("read host").count(), 1);
+}
+
+/// Item 1: a system bundle symlink through `/missing/..` names nothing in the
+/// guest and must never become an environment default.
+#[test]
+fn test_missing_component_dotdot_cannot_become_env_default() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("missing-dotdot-default-world", 32);
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs).expect("create certs");
+    std::os::unix::fs::symlink(
+        "/missing/../existing-bundle.pem",
+        certs.join("ca-certificates.crt"),
+    )
+    .expect("symlink system bundle");
+    let existing = rootfs.join("existing-bundle.pem");
+    fs::write(&existing, b"EXISTING\n").expect("write existing bundle");
+
+    let result = install_ca(&rootfs, &ca.cert_pem);
+    if let Ok(ref report) = result {
+        assert!(
+            !report
+                .env_defaults
+                .values()
+                .any(|v| v == "/etc/ssl/certs/ca-certificates.crt"),
+            "unresolvable bundle selected as env default: {:?}",
+            report.env_defaults
+        );
+    }
+    assert!(
+        result.is_err(),
+        "install must fail when the only system bundle path cannot be resolved"
+    );
+    assert_eq!(fs::read(&existing).expect("read existing"), b"EXISTING\n");
+    assert!(fs::symlink_metadata(certs.join("ca-certificates.crt"))
+        .expect("lstat bundle")
+        .file_type()
+        .is_symlink());
+}
+
+/// Item 2: `--report` naming an installed bundle must be rejected before any
+/// mutation, both below depth 16 and in a wide tree under a low descriptor limit.
+#[test]
+fn test_report_collision_uses_complete_discovery_plan() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("report-collision-world", 33);
+    let ca_path = temp_dir.path().join("CA.pem");
+    fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+
+    // Case 1: certifi bundle at depth 23.
+    let rootfs = temp_dir.path().join("rootfs_deep");
+    let system_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&system_dir).expect("create system dir");
+    let system_bundle = system_dir.join("ca-certificates.crt");
+    fs::write(&system_bundle, b"").expect("write system bundle");
+    let mut deep = rootfs.join("opt");
+    for i in 0..20 {
+        deep = deep.join(format!("d{:02}", i));
+    }
+    let certifi_dir = deep.join("site-packages/certifi");
+    fs::create_dir_all(&certifi_dir).expect("create deep certifi");
+    let deep_bundle = certifi_dir.join("cacert.pem");
+    fs::write(&deep_bundle, b"ORIGINAL_DEEP\n").expect("write deep bundle");
+
+    let output = spawn_cli(
+        &[
+            "install".as_ref(),
+            "--rootfs".as_ref(),
+            rootfs.as_os_str(),
+            "--ca-cert".as_ref(),
+            ca_path.as_os_str(),
+            "--report".as_ref(),
+            deep_bundle.as_os_str(),
+        ],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "report colliding with a depth-23 bundle must be rejected"
+    );
+    assert_eq!(
+        fs::read(&deep_bundle).expect("read deep"),
+        b"ORIGINAL_DEEP\n"
+    );
+    assert!(fs::read(&system_bundle).expect("read system").is_empty());
+
+    // Case 2: wide tree under a 32-descriptor limit; the colliding bundle is shallow.
+    let rootfs2 = temp_dir.path().join("rootfs_wide");
+    let (system2, deep2) = build_wide_deep_rootfs(&rootfs2);
+    let wide_certifi = rootfs2.join("opt/app/node_modules/pkg0150/lib/certifi");
+    fs::create_dir_all(&wide_certifi).expect("create wide certifi");
+    let wide_bundle = wide_certifi.join("cacert.pem");
+    fs::write(&wide_bundle, b"ORIGINAL_WIDE\n").expect("write wide bundle");
+
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n 32 && exec \"$0\" install --rootfs \"$1\" --ca-cert \"$2\" --report \"$3\"")
+        .arg(env!("CARGO_BIN_EXE_hermetic-trust"))
+        .arg(&rootfs2)
+        .arg(&ca_path)
+        .arg(&wide_bundle)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn install under low nofile limit");
+    let output2 = wait_child_with_timeout(child, std::time::Duration::from_secs(120));
+    assert!(
+        !output2.status.success(),
+        "report colliding with a bundle in a wide tree must be rejected"
+    );
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert!(
+        stderr2.contains("report"),
+        "failure must come from the report collision check: {}",
+        stderr2
+    );
+    assert_eq!(
+        fs::read(&wide_bundle).expect("read wide"),
+        b"ORIGINAL_WIDE\n"
+    );
+    assert!(fs::read(&system2).expect("read system2").is_empty());
+    assert!(fs::read(&deep2).expect("read deep2").is_empty());
+}
+
+fn write_test_seed(dir: &std::path::Path) -> std::path::PathBuf {
+    let seed_path = dir.join("seed.bin");
+    fs::write(&seed_path, [42u8; 32]).expect("write seed");
+    fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).expect("chmod seed");
+    seed_path
+}
+
+/// Item 3: relative/absolute spellings of the same new output, and an existing
+/// certificate used as the parent of the key output, must be rejected before
+/// writing anything.
+#[test]
+fn test_cli_mint_ca_output_alias_and_ancestor_conflicts() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let work = temp_dir.path().canonicalize().expect("canonical temp");
+    let seed_path = write_test_seed(&work);
+
+    // Scenario 1: `new/` absent; relative cert path and absolute key path alias.
+    let abs_key = work.join("new/out.pem");
+    let output = spawn_cli(
+        &[
+            "mint-ca".as_ref(),
+            "--world-id".as_ref(),
+            "alias-world".as_ref(),
+            "--t-clock".as_ref(),
+            "2024-05-01T10:00:00Z".as_ref(),
+            "--ca-seed-file".as_ref(),
+            seed_path.as_os_str(),
+            "--cert-out".as_ref(),
+            "new/out.pem".as_ref(),
+            "--key-out".as_ref(),
+            abs_key.as_os_str(),
+        ],
+        Some(&work),
+    );
+    assert!(
+        !output.status.success(),
+        "relative and absolute aliases of one new output must be rejected"
+    );
+    assert!(
+        !work.join("new").exists(),
+        "no directory may be created on rejection"
+    );
+
+    // Scenario 2: existing certificate file used as the key's parent directory.
+    let existing_cert = work.join("o");
+    fs::write(&existing_cert, b"EXISTING_CERT_BYTES\n").expect("write existing cert");
+    let key_under_cert = work.join("o/k.pem");
+    for (cert_arg, key_arg) in [
+        (existing_cert.as_os_str(), key_under_cert.as_os_str()),
+        (key_under_cert.as_os_str(), existing_cert.as_os_str()),
+    ] {
+        let output = spawn_cli(
+            &[
+                "mint-ca".as_ref(),
+                "--world-id".as_ref(),
+                "ancestor-world".as_ref(),
+                "--t-clock".as_ref(),
+                "2024-05-01T10:00:00Z".as_ref(),
+                "--ca-seed-file".as_ref(),
+                seed_path.as_os_str(),
+                "--cert-out".as_ref(),
+                cert_arg,
+                "--key-out".as_ref(),
+                key_arg,
+            ],
+            None,
+        );
+        assert!(
+            !output.status.success(),
+            "output used as the parent of the other output must be rejected"
+        );
+        assert_eq!(
+            fs::read(&existing_cert).expect("read existing cert"),
+            b"EXISTING_CERT_BYTES\n",
+            "existing output bytes must be unchanged"
+        );
+    }
+
+    // Library level: new nested outputs with ancestor relationship are rejected.
+    let a = work.join("fresh/dir");
+    let b = work.join("fresh/dir/key.pem");
+    assert!(check_not_alias(&a, &b, "cert_out", "key_out").is_err());
+    assert!(!work.join("fresh").exists());
+}
+
+/// Rootfs with both anchor directories present (anchor files missing) and no
+/// system bundle, so the install creates anchors, `etc/ssl`, `etc/ssl/certs`
+/// and the fallback bundle.
+fn build_creation_rootfs(rootfs: &std::path::Path) {
+    fs::create_dir_all(rootfs.join("usr/local/share/ca-certificates")).expect("anchor dir 1");
+    fs::create_dir_all(rootfs.join("etc/pki/ca-trust/source/anchors")).expect("anchor dir 2");
+}
+
+const CREATED_ENTRIES: [&str; 5] = [
+    "etc/ssl",
+    "etc/ssl/certs",
+    "etc/ssl/certs/ca-certificates.crt",
+    "usr/local/share/ca-certificates/hermetic-world-ca.crt",
+    "etc/pki/ca-trust/source/anchors/hermetic-world-ca.pem",
+];
+
+/// Item 4: created anchors, fallback bundle and parent directories get the
+/// explicit guest owner and fixed modes, whatever the sealing process umask.
+#[test]
+fn test_created_entries_have_guest_owner_and_umask_independent_modes() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("ownership-world", 34);
+    let ca_path = temp_dir.path().join("CA.pem");
+    fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+    let owner = current_owner();
+
+    let mut observed = Vec::new();
+    for umask in ["022", "077"] {
+        let rootfs = temp_dir.path().join(format!("rootfs_{}", umask));
+        build_creation_rootfs(&rootfs);
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask \"$1\" && exec \"$0\" install --rootfs \"$2\" --ca-cert \"$3\" --guest-uid \"$4\" --guest-gid \"$5\"")
+            .arg(env!("CARGO_BIN_EXE_hermetic-trust"))
+            .arg(umask)
+            .arg(&rootfs)
+            .arg(&ca_path)
+            .arg(owner.uid.to_string())
+            .arg(owner.gid.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn install");
+        let output = wait_child_with_timeout(child, std::time::Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "install under umask {} failed: {}",
+            umask,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut metas = Vec::new();
+        for rel in CREATED_ENTRIES {
+            let meta = fs::symlink_metadata(rootfs.join(rel)).expect("created entry");
+            let expected_mode = if meta.is_dir() {
+                NEW_DIR_MODE
+            } else {
+                NEW_FILE_MODE
+            };
+            assert_eq!(
+                meta.mode() & 0o7777,
+                expected_mode,
+                "{} has mode {:o} under umask {}",
+                rel,
+                meta.mode() & 0o7777,
+                umask
+            );
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (owner.uid, owner.gid),
+                "{} not owned by guest owner",
+                rel
+            );
+            metas.push((rel, meta.uid(), meta.gid(), meta.mode() & 0o7777));
+        }
+        observed.push(metas);
+    }
+    assert_eq!(
+        observed[0], observed[1],
+        "metadata must not depend on umask"
+    );
+}
+
+/// Item 4: with the default guest owner (root 0:0) an unprivileged process must
+/// fail before creating anything; when ownership cannot be applied (injected
+/// failure) nothing is created either.
+#[test]
+fn test_guest_ownership_failure_aborts_before_creating_entries() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("ownership-fail-world", 35);
+    let owner = current_owner();
+
+    let assert_nothing_created = |rootfs: &std::path::Path| {
+        for rel in CREATED_ENTRIES {
+            assert!(
+                fs::symlink_metadata(rootfs.join(rel)).is_err(),
+                "{} created despite ownership failure",
+                rel
+            );
+        }
+    };
+
+    // Default guest owner 0:0.
+    let rootfs = temp_dir.path().join("rootfs_default");
+    build_creation_rootfs(&rootfs);
+    let result = hermetic_trust::install_ca(&rootfs, &ca.cert_pem);
+    if owner.uid == 0 {
+        result.expect("install as root");
+        for rel in CREATED_ENTRIES {
+            let meta = fs::symlink_metadata(rootfs.join(rel)).expect("created entry");
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{} not owned by 0:0", rel);
+        }
+    } else {
+        assert!(
+            result.is_err(),
+            "unprivileged install must not create entries owned by the sealing user"
+        );
+        assert_nothing_created(&rootfs);
+    }
+
+    // Injected ownership failure through the crate's ownership-failure path.
+    let rootfs2 = temp_dir.path().join("rootfs_injected");
+    build_creation_rootfs(&rootfs2);
+    let guard = hermetic_trust::set_chown_failure_guard();
+    let result2 = install_ca(&rootfs2, &ca.cert_pem);
+    drop(guard);
+    assert!(result2.is_err(), "ownership failure must abort the install");
+    assert_nothing_created(&rootfs2);
+}
+
+/// Item 8: the supported root-anchored write API refuses intermediate symlinks
+/// and `..`, leaves outside bytes and modes unchanged and creates nothing outside.
+#[test]
+fn test_root_anchored_write_refuses_intermediate_symlink() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ca = mint_test_ca("root-anchored-world", 36);
+    let outside = temp_dir.path().join("outside");
+    fs::create_dir_all(outside.join("sub")).expect("create outside/sub");
+    let outside_bundle = outside.join("sub/bundle.pem");
+    fs::write(&outside_bundle, b"OUTSIDE_BUNDLE\n").expect("write outside bundle");
+    fs::set_permissions(&outside_bundle, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let rootfs = temp_dir.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("real/sub")).expect("create real/sub");
+    std::os::unix::fs::symlink(&outside, rootfs.join("link")).expect("symlink link");
+    let root = open_dir_handle(&rootfs).expect("open rootfs");
+    let owner = current_owner();
+
+    let hostile = [
+        "link/sub/bundle.pem",
+        "link/newdir/bundle.pem",
+        "../outside/sub/bundle.pem",
+        "real/../link/sub/bundle.pem",
+        "/link/sub/bundle.pem",
+    ];
+    for rel in hostile {
+        let rel = std::path::Path::new(rel);
+        let write = atomic_write_in_root(&root, rel, b"REPLACED\n", NEW_FILE_MODE, owner);
+        assert!(write.is_err(), "atomic_write_in_root accepted {:?}", rel);
+        let append = append_pem_bundle_in_root(&root, rel, &ca.cert_pem, &ca.cert_der, owner);
+        assert!(
+            append.is_err(),
+            "append_pem_bundle_in_root accepted {:?}",
+            rel
+        );
+    }
+
+    assert_eq!(
+        fs::read(&outside_bundle).expect("read outside"),
+        b"OUTSIDE_BUNDLE\n"
+    );
+    assert_eq!(
+        fs::metadata(&outside_bundle)
+            .expect("outside meta")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert!(
+        !outside.join("newdir").exists(),
+        "outside directory created"
+    );
+    let outside_entries: Vec<_> = fs::read_dir(outside.join("sub"))
+        .expect("read outside/sub")
+        .collect();
+    assert_eq!(outside_entries.len(), 1, "outside directory gained entries");
+
+    // The same API works for a real in-rootfs path.
+    let real = std::path::Path::new("real/sub/bundle.pem");
+    assert!(
+        append_pem_bundle_in_root(&root, real, &ca.cert_pem, &ca.cert_der, owner)
+            .expect("append to real path")
+    );
+    assert!(
+        !append_pem_bundle_in_root(&root, real, &ca.cert_pem, &ca.cert_der, owner)
+            .expect("idempotent append")
+    );
 }
