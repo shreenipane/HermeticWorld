@@ -2154,7 +2154,8 @@ def test_percent_encoded_unreserved_characters_canonicalization_and_matching() -
     assert matches_any_scrub_entry(pr_entries, f"https://github.com/{repo}/pull/%35%30#issuecomment-%39%39%39")
 
     # 7. Non-unreserved percent encoding preserves security / rejection
-    assert not matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls%2f50")
+    # Encoded path separators are rejected (controlled rejection, never an allow).
+    assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls%2f50")
     assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%")
     assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%2")
     assert matches_any_scrub_entry(pr_entries, f"https://api.github.com/repos/{repo}/pulls/%zz")

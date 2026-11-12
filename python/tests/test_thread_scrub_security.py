@@ -1277,3 +1277,106 @@ def test_defect5_connection_pages_cap_enforces_across_paginated_responses(tmp_pa
     assert LATE not in result.problem_statement + result.hints_text
     assert_denied(result.scrub_entries)
 
+
+
+TIMELINE_SUFFIXES = ("timeline", "timeline?per_page=100", "timeline/", "events", "events?page=2&per_page=100", "events/")
+
+
+@pytest.mark.parametrize("late", [True, False])
+@pytest.mark.parametrize("targets", [[1], [1, 2]])
+def test_target_issue_timeline_and_events_always_denied(tmp_path, late, targets):
+    """Final review #1: the REST timeline/events of every target issue embed late comment
+    bodies and cross-referenced PR bodies, so they are denied with or without a late comment."""
+    node = issue()
+    if late:
+        late_c = comment()
+        late_c["createdAt"] = "2020-01-20T00:00:00Z"
+        node["comments"] = connection([late_c])
+    result = run_scrub(tmp_path, node=node, targets=targets)
+    entries = result.scrub_entries
+    for number in targets:
+        for suffix in TIMELINE_SUFFIXES:
+            url = f"https://api.github.com/repos/{REPO}/issues/{number}/{suffix}"
+            assert thread_scrub.matches_any_scrub_entry(entries, url), url
+    # The target issue itself stays servable when nothing else forces denial.
+    if not late and targets == [1]:
+        assert not thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/1")
+        assert not thread_scrub.matches_any_scrub_entry(entries, f"https://api.github.com/repos/{REPO}/issues/3/timeline")
+
+
+def test_cross_referenced_issue_and_pr_timelines_denied(tmp_path):
+    """Final review #1: timeline/events of every referencing issue or PR are denied."""
+    node = issue()
+    node["timelineItems"] = connection([
+        {"__typename": "CrossReferencedEvent", "url": None,
+         "source": {"__typename": "PullRequest", "url": "https://github.com/other-org/other-repo/pull/77"}},
+        {"__typename": "CrossReferencedEvent", "url": None,
+         "source": {"__typename": "Issue", "url": f"https://github.com/{REPO}/issues/88"}},
+    ])
+    entries = run_scrub(tmp_path, node=node).scrub_entries
+    for base in (f"https://api.github.com/repos/{REPO}/issues/1",
+                 "https://api.github.com/repos/other-org/other-repo/issues/77",
+                 f"https://api.github.com/repos/{REPO}/issues/88",
+                 f"https://api.github.com/repos/{REPO}/issues/50"):
+        for suffix in TIMELINE_SUFFIXES:
+            assert thread_scrub.matches_any_scrub_entry(entries, f"{base}/{suffix}"), f"{base}/{suffix}"
+    for helper, num in ((thread_scrub.get_referencing_pr_scrub_entries, 77),
+                        (thread_scrub.get_referencing_issue_scrub_entries, 77),
+                        (thread_scrub.get_solution_pr_scrub_entries, 77)):
+        urls = {e.url for e in helper("o/r", num)}
+        for kind in ("timeline", "events"):
+            assert f"https://api.github.com/repos/o/r/issues/{num}/{kind}" in urls
+            assert f"https://api.github.com/repos/o/r/issues/{num}/{kind}/" in urls
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.github.com/repos/o/r/pulls/49/../50",
+    "https://api.github.com/repos/o/r/pulls/%2E%2E/pulls/50",
+    "https://api.github.com/repos/o/r/pulls/%2e%2E/pulls/50/files",
+    "https://api.github.com/repos/o/r/pulls/./50",
+    "https://api.github.com/repos/o/r/pulls/%2E/50/",
+    "https://api.github.com/repos/o/r/x/y/../../pulls/50/comments",
+    "https://api.github.com/repos/o/r/pulls/49/%2E%2E/50/reviews?per_page=1",
+    "https://api.github.com/repos/x/y/../../o/r/issues/50",
+    "https://github.com/o/r/pull/49/../50",
+    "https://github.com/o/r/pull/%2E%2E/pull/50.diff",
+    "https://github.com/o/r/pull/50/x/..",
+    "https://api.github.com/repos/o/r/pulls/50/%2E%2E/50",
+])
+def test_dot_segments_are_removed_before_matching(url):
+    """Final review #2: raw and encoded dot segments resolve before exact and prefix matching."""
+    entries = thread_scrub.get_solution_pr_scrub_entries("o/r", 50)
+    assert thread_scrub.matches_any_scrub_entry(entries, url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.github.com/repos/o/r/pulls/%2E%2E/pulls/51",
+    "https://api.github.com/repos/o/r/pulls/49/../51",
+    "https://api.github.com/repos/o/r/x/../../r2/pulls/50",
+])
+def test_dot_segment_removal_does_not_overblock(url):
+    entries = thread_scrub.get_solution_pr_scrub_entries("o/r", 50)
+    assert not thread_scrub.matches_any_scrub_entry(entries, url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.github.com/repos/o/r/pulls%2F50",
+    "https://api.github.com/repos/o/r/pulls%2f50",
+    "https://api.github.com/repos/o/r/pulls/51%2F..%2F50",
+    "https://api.github.com/repos/o/r/pulls/51%5C..%5C50",
+    "https://api.github.com/repos/unrelated%2Frepo/issues/9",
+])
+def test_encoded_slashes_are_rejected_consistently(url):
+    """Encoded path separators cannot be canonicalised safely: controlled rejection (blocked)."""
+    assert thread_scrub._canonicalize_url(url) is None
+    assert thread_scrub.matches_any_scrub_entry(thread_scrub.get_solution_pr_scrub_entries("o/r", 50), url)
+
+
+def test_dot_segment_helper_follows_rfc3986():
+    rds = thread_scrub._remove_dot_segments
+    assert rds("/a/b/c/./../../g") == "/a/g"
+    assert rds("mid/content=5/../6") == "mid/6"
+    assert rds("/../a") == "/a"
+    assert rds("/a/..") == "/"
+    assert rds("/a/.") == "/a/"
+    assert rds("/a/b/") == "/a/b/"

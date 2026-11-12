@@ -60,6 +60,7 @@ Entry fields:
     * "comment": Target issue discussion comment created after T_world or PR conversation comment
     * "cross_reference": Issue, PR, or timeline event that links to the target issue
     * "cross_reference_prefix": URL prefixes covering sub-pages of a referencing PR
+    * "timeline" / "timeline_prefix": REST timeline and events of a target issue (always denied)
     * "unresolved_scope": Required prefix denial of GitHub services after incomplete discovery
 - match (str): Matching semantics ("exact" or "prefix").
 - reason (str): Human-readable explanation of why this resource must not be served.
@@ -128,6 +129,39 @@ def _normalize_unreserved_percent_encodings(s: str) -> str:
     return re.sub(r"%([0-9a-fA-F]{2})", _replace, s)
 
 
+def _remove_dot_segments(path: str) -> str:
+    """Remove "." and ".." segments as specified by RFC 3986 section 5.2.4."""
+    output: list[str] = []
+    buf = path
+    while buf:
+        if buf.startswith("../"):
+            buf = buf[3:]
+        elif buf.startswith("./"):
+            buf = buf[2:]
+        elif buf.startswith("/./"):
+            buf = buf[2:]
+        elif buf == "/.":
+            buf = "/"
+        elif buf.startswith("/../"):
+            buf = buf[3:]
+            if output:
+                output.pop()
+        elif buf == "/..":
+            buf = "/"
+            if output:
+                output.pop()
+        elif buf in (".", ".."):
+            buf = ""
+        else:
+            start = 1 if buf.startswith("/") else 0
+            end = buf.find("/", start)
+            if end == -1:
+                end = len(buf)
+            output.append(buf[:end])
+            buf = buf[end:]
+    return "".join(output)
+
+
 def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
     """Validate, bound, and canonicalize URL components.
 
@@ -186,7 +220,15 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
     if "%" in path:
         if re.search(r"%(?![0-9a-fA-F]{2})", path):
             return None
+        # Encoded path separators ("/" and "\\") have server-dependent meaning and
+        # cannot be canonicalised safely: controlled rejection.
+        if re.search(r"%(2[fF]|5[cC])", path):
+            return None
         path = _normalize_unreserved_percent_encodings(path)
+
+    # Resolve dot segments only after unreserved percent-decoding, so that
+    # "%2E%2E" is treated exactly like ".." (RFC 3986 sections 5.2.4, 6.2.2.3).
+    path = _remove_dot_segments(path) or "/"
 
     # Canonicalize GitHub owner/repository components
     parts = path.split("/")
@@ -1197,6 +1239,26 @@ def _validate_comment_identity(
     return resolved_id, True
 
 
+def get_issue_timeline_scrub_entries(
+    repo: str,
+    issue_num: int,
+    base_reason: str,
+    kind: str = "timeline",
+) -> list[ScrubEntry]:
+    """Deny the REST timeline and events of an issue or PR.
+
+    The timeline embeds comment bodies (including late ones) and the full body of
+    every cross-referencing issue or PR; events expose closing commits.
+    """
+    repo = _canonicalize_repo_slug(repo)
+    entries: list[ScrubEntry] = []
+    for view in ("timeline", "events"):
+        base = f"https://api.github.com/repos/{repo}/issues/{issue_num}/{view}"
+        entries.append(ScrubEntry(kind=kind, match="exact", url=base, reason=f"{base_reason} {view}"))
+        entries.append(ScrubEntry(kind=f"{kind}_prefix", match="prefix", url=f"{base}/", reason=f"{base_reason} {view} prefix"))
+    return entries
+
+
 def get_solution_pr_scrub_entries(
     repo: str,
     pr_number: int,
@@ -1237,6 +1299,7 @@ def get_solution_pr_scrub_entries(
             ScrubEntry(kind="commit", match="exact", url=f"https://api.github.com/repos/{repo}/commits/{sha}", reason="solution PR commit API URL"),
             ScrubEntry(kind="commit", match="exact", url=f"https://api.github.com/repos/{repo}/git/commits/{sha}", reason="solution PR git commit API URL"),
         ])
+    entries.extend(get_issue_timeline_scrub_entries(repo, pr_number, "solution PR", kind="pull_request"))
     return entries
 
 
@@ -1247,7 +1310,7 @@ def get_referencing_pr_scrub_entries(
 ) -> list[ScrubEntry]:
     """Generate the full scrub entry set for a referencing PR."""
     pr_repo = _canonicalize_repo_slug(pr_repo)
-    return [
+    return get_issue_timeline_scrub_entries(pr_repo, pr_num, base_reason, kind="cross_reference") + [
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{pr_repo}/pull/{pr_num}", reason=base_reason),
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{pr_repo}/pull/{pr_num}/", reason=f"{base_reason} URL prefix"),
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{pr_repo}/pulls/{pr_num}", reason=base_reason),
@@ -1275,7 +1338,7 @@ def get_referencing_issue_scrub_entries(
 ) -> list[ScrubEntry]:
     """Generate the full scrub entry set for a referencing issue with delimiter-bounded prefixes."""
     issue_repo = _canonicalize_repo_slug(issue_repo)
-    return [
+    return get_issue_timeline_scrub_entries(issue_repo, issue_num, base_reason, kind="cross_reference") + [
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://github.com/{issue_repo}/issues/{issue_num}", reason=base_reason),
         ScrubEntry(kind="cross_reference_prefix", match="prefix", url=f"https://github.com/{issue_repo}/issues/{issue_num}/", reason=f"{base_reason} URL prefix"),
         ScrubEntry(kind="cross_reference", match="exact", url=f"https://api.github.com/repos/{issue_repo}/issues/{issue_num}", reason=base_reason),
@@ -1307,7 +1370,13 @@ def _add_timeline_scrub_entries(
     repo: str,
     target_issue_numbers: set[int],
 ) -> None:
-    """Scrub timeline items (cross references and connected events) on an issue."""
+    """Scrub timeline items (cross references and connected events) on an issue.
+
+    The REST timeline/events of every target issue are always denied: they embed
+    late comment bodies and cross-referencing PR bodies (including the solution PR).
+    """
+    for target_num in sorted(target_issue_numbers):
+        entries.extend(get_issue_timeline_scrub_entries(repo, target_num, "target issue"))
     for item in (issue_data.get("timelineItems") or {}).get("nodes") or []:
         if not isinstance(item, dict):
             continue
