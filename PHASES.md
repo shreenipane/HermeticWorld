@@ -130,6 +130,15 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T2.5): on-disk ownership with a guest owner different from the sealing user is tested only by recording the ownership step, because this host cannot create user namespaces; run `test_created_entries_owned_by_guest_owner_in_user_namespace` where `unshare -Ur` works
   - [ ] Deferred (T2.5, owner decision): the installer's check-then-use protection assumes exclusive access to the rootfs; the full fix needs `openat2`/`cap-std` (new dependency)
 - [ ] Gateway with the Anthropic adapter (TR-GW-*)
+  - [x] Policy core: default-deny adapter, request and response rewriting, quotas, history, streaming (TR-GW-2 to TR-GW-8) (T2.2)
+  - [ ] Gateway isolation (TR-GW-1)
+  - [ ] Deferred (T2.2 review): operator config and API-key paths are opened without refusing symlinked ancestor directories
+  - [ ] Deferred (T2.2 review): quota errors expose internal reasons and configured limits instead of standard messages
+  - [ ] Deferred (T2.2 review): source validation traverses arbitrary tool inputs and schemas, so a legitimate tool argument shaped like a URL image source is refused
+  - [ ] Deferred (T2.2 review): every read failure on a successful upstream response is classified as a timeout (e.g. invalid UTF-8)
+  - [ ] Deferred (T2.2 review): original SSE error bodies are never logged (`original_error_body` is always `None` for streams)
+  - [ ] Deferred (T2.2 review): an unrecognised upstream error type falls back to the HTTP-status-derived type instead of `api_error`
+  - [ ] Note (T2.2): `tiny_http` 0.12.0 is vendored with local patches at `crates/vendor/tiny_http` (see `VENDORED.md`); a half-closed client never frees its slot before the upstream ends, and a waiting request gets a bounded 529
 - [ ] Container isolation of the agent, with the run spec applied
 - [x] Manifest with `world_root`
 - [ ] Reproducibility check (E7)
