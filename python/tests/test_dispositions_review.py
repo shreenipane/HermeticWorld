@@ -828,3 +828,190 @@ def test_regression_defect8_output_collisions_with_task_artifacts_rejected(task_
     after_bytes = target_path.read_bytes()
     assert before_bytes == after_bytes
 
+
+def test_regression_snapshot_escaping_symlinks_rejected_without_reading_canary(task_world, tmp_path):
+    """Defect 1: absolute and relative escaping symlinks must be rejected without reading outside canary."""
+    tasks, task, root, initial, binary = task_world
+
+    # Outside canary file with 000 permissions: any host read attempt causes PermissionError
+    canary = tmp_path / "outside_canary.txt"
+    canary.write_text("CRITICAL_OUTSIDE_CANARY_SECRET_DATA\n", encoding="utf-8")
+    os.chmod(canary, 0o000)
+
+    # 1. Absolute symlink to outside canary
+    abs_sym = root / "abs_link"
+    abs_sym.symlink_to(canary)
+    backdate(root)
+    with pytest.raises(d.DispositionsError, match="Escaping symlink rejected"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    abs_sym.unlink()
+
+    # 2. Relative escaping symlink to outside canary
+    sub_dir = root / "subdir"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    rel_sym = sub_dir / "rel_link"
+    # From root/subdir to outside canary: ../../outside_canary.txt
+    rel_sym.symlink_to(os.path.relpath(canary, sub_dir))
+    backdate(root)
+    with pytest.raises(d.DispositionsError, match="Escaping symlink rejected"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    rel_sym.unlink()
+
+    # 3. Permitted relative symlink staying inside root succeeds
+    inside_target = root / "inside_target.txt"
+    inside_target.write_text("def safe_inside():\n    return 42\n", encoding="utf-8")
+    safe_sym = sub_dir / "safe_link"
+    safe_sym.symlink_to("../inside_target.txt")
+    backdate(root)
+    dst_snap = tmp_path / "safe_snapshot"
+    d.snapshot_tree_safely(root, dst_snap)
+    assert (dst_snap / "subdir" / "safe_link").is_symlink()
+    assert os.readlink(dst_snap / "subdir" / "safe_link") == "../inside_target.txt"
+
+
+def test_regression_snapshot_unsupported_entries_and_failures_fail_closed(task_world, tmp_path, monkeypatch):
+    """Defect 5: FIFO/socket entries and injected metadata/readlink failures fail closed; task artifacts unchanged."""
+    import socket
+
+    tasks, task, root, initial, binary = task_world
+    task_json_before = (task / "task.json").read_bytes()
+    statement_before = (task / "agent/problem_statement.md").read_bytes()
+    manifest_before = (task / "manifest.json").read_bytes()
+
+    def assert_artifacts_unchanged():
+        assert (task / "task.json").read_bytes() == task_json_before
+        assert (task / "agent/problem_statement.md").read_bytes() == statement_before
+        assert (task / "manifest.json").read_bytes() == manifest_before
+
+    # 1. FIFO entry in root
+    fifo_path = root / "special_fifo"
+    os.mkfifo(fifo_path)
+    try:
+        with pytest.raises(d.DispositionsError, match="Unsupported file system entry type"):
+            d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+        assert_artifacts_unchanged()
+    finally:
+        fifo_path.unlink()
+
+    # 2. Socket entry in root
+    sock_path = root / "special_sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(sock_path))
+        with pytest.raises(d.DispositionsError, match="Unsupported file system entry type"):
+            d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+        assert_artifacts_unchanged()
+    finally:
+        sock.close()
+        if sock_path.exists():
+            sock_path.unlink()
+
+    # 3. Injected metadata (stat) failure during snapshot traversal
+    orig_stat = os.stat
+
+    def failing_stat(name, *args, **kwargs):
+        if str(name) == "main.py" or (isinstance(name, Path) and name.name == "main.py"):
+            raise OSError("Injected disk metadata I/O failure")
+        return orig_stat(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+    with pytest.raises(d.DispositionsError, match="Failed to stat directory entry"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    assert_artifacts_unchanged()
+    monkeypatch.undo()
+
+    # 4. Injected readlink failure
+    inside_target = root / "readable_target.txt"
+    inside_target.write_text("readable content\n", encoding="utf-8")
+    test_link = root / "test_link"
+    test_link.symlink_to("readable_target.txt")
+    backdate(root)
+
+    orig_readlink = os.readlink
+
+    def failing_readlink(path, *args, **kwargs):
+        if "test_link" in str(path):
+            raise OSError("Injected readlink hardware fault")
+        return orig_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", failing_readlink)
+    with pytest.raises(d.DispositionsError, match="Failed to readlink"):
+        d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
+    assert_artifacts_unchanged()
+    monkeypatch.undo()
+
+
+def test_regression_snapshot_descriptors_closed_and_bounded(tmp_path):
+    """Defect 6: directory descriptors closed on success and failure; bounded under lowered limit."""
+    import resource
+
+    tree_root = tmp_path / "deep_tree"
+    tree_root.mkdir()
+    # Create 30 child directories each with subdirectories and files
+    for i in range(30):
+        sub = tree_root / f"dir_{i}" / "nested"
+        sub.mkdir(parents=True)
+        (sub / f"file_{i}.txt").write_text(f"content {i}\n", encoding="utf-8")
+
+    dst_dir = tmp_path / "dst_tree"
+
+    def count_open_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    # Verify no descriptor leaks across repeated successful snapshots
+    initial_fds = count_open_fds()
+    for _ in range(5):
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir)
+        d.snapshot_tree_safely(tree_root, dst_dir)
+        assert count_open_fds() == initial_fds
+
+    # Verify no descriptor leaks across repeated failing snapshots
+    bad_root = tmp_path / "bad_tree"
+    bad_root.mkdir()
+    (bad_root / "bad_link").symlink_to("/outside/nonexistent")
+    failing_dst = tmp_path / "failing_dst"
+    for _ in range(5):
+        if failing_dst.exists():
+            shutil.rmtree(failing_dst)
+        with pytest.raises(d.DispositionsError):
+            d.snapshot_tree_safely(bad_root, failing_dst)
+        assert count_open_fds() == initial_fds
+
+    # Traversal under a lowered descriptor limit
+    cur_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # Give just enough descriptors for Python and the bounded descriptor traversal (around 15 more than currently open)
+    target_limit = initial_fds + 15
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard))
+        low_dst = tmp_path / "low_limit_dst"
+        d.snapshot_tree_safely(tree_root, low_dst)
+        assert (low_dst / "dir_0" / "nested" / "file_0.txt").read_text(encoding="utf-8") == "content 0\n"
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (cur_soft, hard))
+
+
+def test_regression_snapshot_entry_cap_separated_from_task_enumeration(tmp_path, monkeypatch):
+    """Defect 7: snapshot directory traversal handles >128 files; rejects at snapshot entry cap."""
+    base_dir = tmp_path / "base_tree_large"
+    base_dir.mkdir()
+    # 129 files in a single directory: exceeds MAX_TASKS (128)
+    for i in range(129):
+        (base_dir / f"module_{i:03d}.py").write_text(f"def fn_{i}(): pass\n", encoding="utf-8")
+
+    dst_dir = tmp_path / "dst_tree_large"
+    # Must succeed despite exceeding MAX_TASKS
+    d.snapshot_tree_safely(base_dir, dst_dir)
+    assert len(list(dst_dir.glob("module_*.py"))) == 129
+
+    # Verify rejection at the actual snapshot entry cap
+    monkeypatch.setattr(d, "MAX_SNAPSHOT_ENTRIES", 150)
+    extra_dir = tmp_path / "over_cap_dir"
+    extra_dir.mkdir()
+    for i in range(151):
+        (extra_dir / f"f_{i:03d}.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(d.DispositionsError, match="Snapshot entry count cap exceeded"):
+        d.snapshot_tree_safely(extra_dir, tmp_path / "over_cap_dst")
+
+

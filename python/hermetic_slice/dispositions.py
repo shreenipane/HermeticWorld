@@ -139,6 +139,7 @@ class SafeDirectory:
     """Retain no-follow directory descriptors for all filesystem operations."""
 
     def __init__(self, path: Path):
+        self.fd = -1
         absolute = Path(os.path.abspath(path))
         if len(absolute.parts) > MAX_PATH_COMPONENTS:
             raise DispositionsError("Path component cap exceeded")
@@ -172,9 +173,12 @@ class SafeDirectory:
         return child
 
     def close(self) -> None:
-        if self.fd >= 0:
+        if getattr(self, "fd", -1) >= 0:
             os.close(self.fd)
             self.fd = -1
+
+    def __del__(self) -> None:
+        self.close()
 
     def __enter__(self) -> SafeDirectory:
         return self
@@ -182,13 +186,18 @@ class SafeDirectory:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def names(self) -> list[str]:
+    def names(self, cap: int = MAX_TASKS) -> list[str]:
         names = []
-        with os.scandir(self.fd) as items:
-            for item in items:
-                if len(names) >= MAX_TASKS:
-                    raise DispositionsError("Directory entry cap exceeded")
-                names.append(item.name)
+        try:
+            with os.scandir(self.fd) as items:
+                for item in items:
+                    if len(names) >= cap:
+                        if cap == MAX_SNAPSHOT_ENTRIES:
+                            raise DispositionsError("Snapshot entry count cap exceeded")
+                        raise DispositionsError("Directory entry cap exceeded")
+                    names.append(item.name)
+        except OSError as e:
+            raise DispositionsError("Directory enumeration failed") from e
         return sorted(names)
 
     def check_file(self, name: str) -> os.stat_result | None:
@@ -556,6 +565,112 @@ def validate_scan_config(config: Any) -> dict[str, Any]:
 
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 100000
+MAX_SYMLINK_HOPS = 32
+
+
+def open_safe_descendant(root_dir: SafeDirectory, rel_path: tuple[str, ...]) -> SafeDirectory:
+    """Open a descendant directory safely from root_dir, retaining only 1 open descriptor."""
+    if not rel_path:
+        new_fd = os.dup(root_dir.fd)
+        obj = object.__new__(SafeDirectory)
+        obj.fd = new_fd
+        return obj
+    cur_fd = os.dup(root_dir.fd)
+    try:
+        for part in rel_path:
+            before = os.stat(part, dir_fd=cur_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise DispositionsError("Symlink rejected or non-directory component")
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+            after = os.fstat(next_fd)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                os.close(next_fd)
+                raise DispositionsError("Directory changed during traversal")
+            os.close(cur_fd)
+            cur_fd = next_fd
+        obj = object.__new__(SafeDirectory)
+        obj.fd = cur_fd
+        return obj
+    except BaseException:
+        if cur_fd >= 0:
+            os.close(cur_fd)
+        raise
+
+
+def verify_symlink_confined(root_fd: int, rel_path: tuple[str, ...], target: str) -> None:
+    """Verify that a symlink target does not escape root_fd using descriptor traversal."""
+    if not target:
+        raise DispositionsError("Empty symlink target rejected")
+    cur_parts = list(rel_path)
+    cur_target = target
+    hops = 0
+
+    while True:
+        if cur_target.startswith("/") or os.path.isabs(cur_target):
+            raise DispositionsError("Escaping symlink rejected")
+
+        raw_parts = [p for p in cur_target.split("/") if p and p != "."]
+        resolved_parts = list(cur_parts)
+        expanded_symlink = False
+
+        for i, comp in enumerate(raw_parts):
+            if comp == "..":
+                if not resolved_parts:
+                    raise DispositionsError("Escaping symlink rejected")
+                resolved_parts.pop()
+                continue
+
+            cur_fd = os.dup(root_fd)
+            try:
+                for part in resolved_parts:
+                    st = os.stat(part, dir_fd=cur_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(st.st_mode):
+                        raise DispositionsError("Symlink path traverses non-directory")
+                    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+                    os.close(cur_fd)
+                    cur_fd = next_fd
+
+                try:
+                    info = os.stat(comp, dir_fd=cur_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    if i == len(raw_parts) - 1:
+                        resolved_parts.append(comp)
+                        break
+                    raise DispositionsError("Symlink path traverses non-existent directory")
+
+                if stat.S_ISLNK(info.st_mode):
+                    hops += 1
+                    if hops > MAX_SYMLINK_HOPS:
+                        raise DispositionsError("Symlink hop cap exceeded")
+                    try:
+                        link_val = os.readlink(comp, dir_fd=cur_fd)
+                    except OSError as e:
+                        raise DispositionsError("Failed to readlink in traversal") from e
+                    if link_val.startswith("/") or os.path.isabs(link_val):
+                        raise DispositionsError("Escaping symlink rejected")
+                    remaining = raw_parts[i + 1:]
+                    if remaining:
+                        cur_target = link_val + "/" + "/".join(remaining)
+                    else:
+                        cur_target = link_val
+                    cur_parts = list(resolved_parts)
+                    expanded_symlink = True
+                    break
+                elif stat.S_ISDIR(info.st_mode):
+                    resolved_parts.append(comp)
+                elif stat.S_ISREG(info.st_mode):
+                    if i == len(raw_parts) - 1:
+                        resolved_parts.append(comp)
+                        break
+                    raise DispositionsError("Symlink path traverses regular file as directory")
+                else:
+                    raise DispositionsError("Unsupported file system entry type in snapshot")
+            finally:
+                if cur_fd >= 0:
+                    os.close(cur_fd)
+
+        if not expanded_symlink:
+            break
 
 
 def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
@@ -567,65 +682,85 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
     with SafeDirectory(src_path) as root_dir:
         root_stat = os.fstat(root_dir.fd)
         dir_times.append((dst_path, root_stat.st_atime_ns, root_stat.st_mtime_ns))
-        stack: list[tuple[SafeDirectory, tuple[str, ...]]] = [(root_dir, ())]
-        try:
-            while stack:
-                curr_dir, rel_path = stack.pop()
-                curr_dst = dst_path
-                for part in rel_path:
-                    curr_dst = curr_dst / part
-                curr_dst.mkdir(mode=0o700, exist_ok=True)
-                for name in curr_dir.names():
+        stack: list[tuple[str, ...]] = [()]
+        while stack:
+            rel_path = stack.pop()
+            if len(rel_path) > MAX_PATH_COMPONENTS:
+                raise DispositionsError("Path component cap exceeded")
+            curr_dst = dst_path
+            for part in rel_path:
+                curr_dst = curr_dst / part
+            curr_dst.mkdir(mode=0o700, exist_ok=True)
+            with open_safe_descendant(root_dir, rel_path) as curr_dir:
+                names = curr_dir.names(cap=MAX_SNAPSHOT_ENTRIES)
+                for name in names:
                     total_entries += 1
                     if total_entries > MAX_SNAPSHOT_ENTRIES:
                         raise DispositionsError("Snapshot entry count cap exceeded")
                     try:
                         info = os.stat(name, dir_fd=curr_dir.fd, follow_symlinks=False)
-                    except OSError:
-                        continue
+                    except OSError as e:
+                        raise DispositionsError("Failed to stat directory entry during snapshot") from e
                     if stat.S_ISLNK(info.st_mode):
                         try:
                             target = os.readlink(name, dir_fd=curr_dir.fd)
-                            link_dst = curr_dst / name
+                        except OSError as e:
+                            raise DispositionsError("Failed to readlink during snapshot traversal") from e
+                        verify_symlink_confined(root_dir.fd, rel_path, target)
+                        link_dst = curr_dst / name
+                        try:
                             os.symlink(target, link_dst)
-                            try:
-                                os.utime(link_dst, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
-                            except (OSError, NotImplementedError):
-                                pass
-                        except OSError:
+                        except OSError as e:
+                            raise DispositionsError("Failed to create symlink in snapshot") from e
+                        try:
+                            os.utime(link_dst, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+                        except (OSError, NotImplementedError):
                             pass
                     elif stat.S_ISDIR(info.st_mode):
-                        child = curr_dir.child(name)
                         child_dst = curr_dst / name
                         dir_times.append((child_dst, info.st_atime_ns, info.st_mtime_ns))
-                        stack.append((child, rel_path + (name,)))
+                        stack.append(rel_path + (name,))
                     elif stat.S_ISREG(info.st_mode):
                         if total_bytes + info.st_size > max_bytes:
                             raise DispositionsError("Snapshot byte cap exceeded")
                         fd = -1
+                        out_fd = -1
                         try:
-                            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=curr_dir.fd)
+                            try:
+                                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=curr_dir.fd)
+                            except OSError as e:
+                                raise DispositionsError("Failed to open file for snapshot") from e
                             after = os.fstat(fd)
                             if not stat.S_ISREG(after.st_mode) or (info.st_dev, info.st_ino) != (after.st_dev, after.st_ino):
                                 raise DispositionsError("File changed during snapshot traversal")
-                            with os.fdopen(fd, "rb") as stream:
-                                content = stream.read(max_bytes - total_bytes + 1)
-                                fd = -1
+                            try:
+                                with os.fdopen(fd, "rb") as stream:
+                                    fd = -1
+                                    content = stream.read(max_bytes - total_bytes + 1)
+                            except OSError as e:
+                                raise DispositionsError("Failed to read file for snapshot") from e
                             if len(content) > max_bytes - total_bytes:
                                 raise DispositionsError("Snapshot byte cap exceeded")
                             total_bytes += len(content)
                             out_file = curr_dst / name
-                            out_fd = os.open(str(out_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                            with os.fdopen(out_fd, "wb") as out_stream:
-                                out_stream.write(content)
-                            os.utime(out_file, ns=(info.st_atime_ns, info.st_mtime_ns))
+                            try:
+                                out_fd = os.open(str(out_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                                with os.fdopen(out_fd, "wb") as out_stream:
+                                    out_fd = -1
+                                    out_stream.write(content)
+                            except OSError as e:
+                                raise DispositionsError("Failed to write snapshot file") from e
+                            try:
+                                os.utime(out_file, ns=(info.st_atime_ns, info.st_mtime_ns))
+                            except OSError:
+                                pass
                         finally:
                             if fd >= 0:
                                 os.close(fd)
-        finally:
-            for d, _ in stack:
-                if d is not root_dir:
-                    d.close()
+                            if out_fd >= 0:
+                                os.close(out_fd)
+                    else:
+                        raise DispositionsError("Unsupported file system entry type in snapshot")
     for d_path, atime_ns, mtime_ns in reversed(dir_times):
         try:
             os.utime(d_path, ns=(atime_ns, mtime_ns))
