@@ -2009,3 +2009,40 @@ fn t112_final_finding1_index_records_tier2_truncation_gap() {
     let again = collect_records(dir.path());
     assert_eq!(records, again, "index output must be deterministic");
 }
+
+#[test]
+fn test_regression_cr1_finding1_tier2_query_performance_with_many_findings() {
+    let base = tempdir().expect("tempdir");
+    let mut patch =
+        String::from("diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n");
+    let mut base_code = String::new();
+    for i in 0..30 {
+        base_code.push_str(&format!("def func_{i}():\n    return {i}\n"));
+        patch.push_str(&format!(
+            "@@ -{line},2 +{line},4 @@\n def func_{i}():\n+    val_{i} = compute_val_{i}(\"strict_check_{i}\")\n+    if val_{i} > 1000:\n+        raise ValueError(\"limit\")\n     return {i}\n",
+            line = i * 2 + 1
+        ));
+    }
+    fs::write(base.path().join("service.py"), &base_code).expect("write base");
+    let fp = FingerprintSet::from_task(&patch, "", base.path()).expect("fp");
+
+    let dir = tempdir().expect("tempdir");
+    for i in 0..250 {
+        fs::write(
+            dir.path().join(format!("file_{i:04}.bin")),
+            b"\0hello binary data stream",
+        )
+        .expect("write");
+    }
+    let index_file = dir.path().join("layer.idx");
+    write_index(dir.path(), &index_file).expect("write_index");
+
+    let start = Instant::now();
+    let findings = query_index(&index_file, &fp, &opts()).expect("query_index");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 600,
+        "query took too long ({elapsed:?}), quadratic loop over findings detected"
+    );
+    assert!(!findings.is_empty());
+}
