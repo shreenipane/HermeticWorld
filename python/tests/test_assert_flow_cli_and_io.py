@@ -131,8 +131,8 @@ def test_refuses_symlinks_when_opening_files(
     captured = capsys.readouterr()
     assert captured.out == ""
     # Ensure host path is never leaked in stderr error output.
-    assert str(link_file) not in captured.stderr
-    assert str(real_file) not in captured.stderr
+    assert str(link_file) not in captured.err
+    assert str(real_file) not in captured.err
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not supported on this platform")

@@ -1,7 +1,7 @@
 use crate::table::DnsTable;
 use crate::wire::{
     parse_query, DnsHeader, DnsResponse, Rcode, ResourceRecordA, DEFAULT_TTL_SECONDS,
-    MAX_RESPONSE_ANSWERS, MAX_UDP_PAYLOAD_BYTES, QCLASS_IN, QTYPE_A, QTYPE_AAAA,
+    MAX_RESPONSE_ANSWERS, MAX_UDP_PAYLOAD_BYTES, QCLASS_IN, QTYPE_A,
 };
 
 /// Processes a single incoming UDP DNS packet against a static [`DnsTable`].
@@ -79,13 +79,6 @@ pub fn respond(packet: &[u8], table: &DnsTable) -> Option<Vec<u8>> {
                     ),
                     question: Some(query.question),
                     answers,
-                };
-                resp.encode().ok()
-            } else if query.question.qtype == QTYPE_AAAA {
-                let resp = DnsResponse {
-                    header: make_response_header(query.header, Rcode::NoError, 1, 0),
-                    question: Some(query.question),
-                    answers: Vec::new(),
                 };
                 resp.encode().ok()
             } else {

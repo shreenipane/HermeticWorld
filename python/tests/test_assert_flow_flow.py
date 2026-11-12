@@ -213,7 +213,6 @@ def test_lambda():
         ),
         (
             b"""
-G = 0
 def test_global():
     global G
     x = failing()

@@ -435,7 +435,8 @@ def test_08_fake_summary_and_closed_orig_fd(capsys):
             st = os.fstat(probe_fd)
         except OSError as exc:
             assert exc.errno == errno.EBADF
-    print("\\n========================= 99 passed in 0.01s =========================")
+    with capsys.disabled():
+        print("\\n========================= 99 passed in 0.01s =========================", flush=True)
     assert False, "real failure despite fake summary"
 
 
