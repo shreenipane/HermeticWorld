@@ -106,7 +106,13 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] apt snapshots where available
 - [ ] Ecosystems: PyPI, conda, Debian/Ubuntu, git dependencies (static mirrors)
 - [ ] `strict` class B rebuild, with `repo_only` fallback and labelling
-- [ ] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*)
+- [x] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*) (T2.1)
+  - [ ] Deferred (T2.1 review, non-blocking): endpoint probes use a blocking `UnixStream::connect` against a lock listener that never accepts; repeated recovery attempts on one endpoint can fill the backlog and block startup; use non-blocking exclusive ownership
+  - [ ] Deferred (T2.1 review): the live-endpoint test passes `--recover` without `--resume-log`, so it is rejected before endpoint ownership is checked; give it valid recovery inputs and assert the original listener still serves
+  - [ ] Deferred (T2.1 review): the seccomp allow-list still permits arbitrary Unix-socket connects, signalling other same-uid processes, credential-changing syscalls and `clock_settime`; remove them and test denial
+  - [ ] Deferred (T2.1 review): the Landlock failure-injection test sets a process-global flag while other tests start sandboxed servers; isolate it in a child process
+  - [ ] Deferred (T2.1 review): no test stalls a child, thread or socket to prove the bounded test helpers actually time out
+  - [ ] Deferred (T2.1): publication and endpoint reclaim trust same-uid processes and root (directories must be owned by the server uid and not group/other writable); `renameat2(RENAME_NOREPLACE)` is not used because the crate forbids unsafe code
 - [ ] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10)
 - [ ] Gateway with the Anthropic adapter (TR-GW-*)
 - [ ] Container isolation of the agent, with the run spec applied
