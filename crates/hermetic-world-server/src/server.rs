@@ -325,42 +325,21 @@ fn path_is_ancestor_or_equal(ancestor: &Path, path: &Path) -> bool {
     true
 }
 
-fn validate_root_separation(store_dir: &Directory, log_path: &Path) -> Result<(), ServerExit> {
+fn validate_root_separation(store_dir: &Directory, log_dir: &Directory) -> Result<(), ServerExit> {
     use std::os::unix::fs::MetadataExt;
 
     let store_fd_path = store_dir.descriptor_path();
     let store_canon = std::fs::read_link(&store_fd_path).map_err(|_| ServerExit::StartupFailed)?;
     let store_meta = std::fs::metadata(&store_canon).map_err(|_| ServerExit::StartupFailed)?;
 
-    let norm_log = crate::safe_fs::normalize_path(log_path);
-    let mut cur = norm_log.as_path();
-    let mut log_dir_desc = None;
-    while !cur.as_os_str().is_empty() {
-        if let Ok(d) = Directory::open(cur) {
-            log_dir_desc = Some((d, cur.to_path_buf()));
-            break;
-        }
-        match cur.parent() {
-            Some(p) if !p.as_os_str().is_empty() => cur = p,
-            _ => break,
-        }
-    }
-    let (log_d, existing_log_ancestor) = log_dir_desc.ok_or(ServerExit::StartupFailed)?;
-    let log_fd_path = log_d.descriptor_path();
+    let log_fd_path = log_dir.descriptor_path();
     let log_canon = std::fs::read_link(&log_fd_path).map_err(|_| ServerExit::StartupFailed)?;
     let log_meta = std::fs::metadata(&log_canon).map_err(|_| ServerExit::StartupFailed)?;
 
-    let rel_suffix = norm_log
-        .strip_prefix(&existing_log_ancestor)
-        .unwrap_or(Path::new(""));
-    let full_log_canon = log_canon.join(rel_suffix);
-
-    if (norm_log == existing_log_ancestor
-        && store_meta.dev() == log_meta.dev()
-        && store_meta.ino() == log_meta.ino())
-        || store_canon == full_log_canon
-        || path_is_ancestor_or_equal(&store_canon, &full_log_canon)
-        || path_is_ancestor_or_equal(&full_log_canon, &store_canon)
+    if (store_meta.dev() == log_meta.dev() && store_meta.ino() == log_meta.ino())
+        || store_canon == log_canon
+        || path_is_ancestor_or_equal(&store_canon, &log_canon)
+        || path_is_ancestor_or_equal(&log_canon, &store_canon)
     {
         return Err(ServerExit::StartupFailed);
     }
@@ -377,6 +356,7 @@ pub struct WorldServer {
     elapsed_offset_ms: u64,
     socket_directory: Directory,
     socket_name: PathBuf,
+    owned_endpoint: Option<(u64, u64)>,
 }
 
 enum ReadFrameResult {
@@ -418,7 +398,15 @@ fn read_request_frame_deadline(
                     return ReadFrameResult::Malformed("truncated header".into());
                 }
             }
-            Ok(bytes) => n += bytes,
+            Ok(bytes) => {
+                n += bytes;
+                // Reject recognizable malformed input without waiting for a full header.
+                if n >= hermetic_common::REQUEST_MAGIC.len()
+                    && !header.starts_with(hermetic_common::REQUEST_MAGIC)
+                {
+                    return ReadFrameResult::Malformed("bad request magic".into());
+                }
+            }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 let now = Instant::now();
@@ -528,8 +516,22 @@ impl<'a> Write for DeadlineWriter<'a> {
 
 impl Drop for WorldServer {
     fn drop(&mut self) {
-        if let Ok(entry) = self.socket_directory.path(&self.socket_name) {
-            let _ = std::fs::remove_file(entry);
+        if let Some((bound_dev, bound_ino)) = self.owned_endpoint {
+            if let Ok(entry) = self.socket_directory.path(&self.socket_name) {
+                if let Ok(meta) = std::fs::symlink_metadata(&entry) {
+                    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                    if meta.file_type().is_socket()
+                        && meta.dev() == bound_dev
+                        && meta.ino() == bound_ino
+                    {
+                        let _ = std::fs::remove_file(entry);
+                    }
+                }
+            }
+            let lock_name = PathBuf::from(format!(".{}.lock", self.socket_name.to_string_lossy()));
+            if let Ok(lock_entry) = self.socket_directory.path(&lock_name) {
+                let _ = std::fs::remove_file(lock_entry);
+            }
         }
     }
 }
@@ -550,11 +552,15 @@ impl WorldServer {
         // Validate all configured roots and the endpoint before creating artifacts.
         let store_directory =
             Directory::open(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
-        validate_root_separation(&store_directory, &config.log_dir)?;
-
-        let store = DirStore::try_new(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
         config.store_dir =
             std::path::absolute(&config.store_dir).map_err(|_| ServerExit::StartupFailed)?;
+
+        let log_directory =
+            Directory::create(&config.log_dir).map_err(|_| ServerExit::StartupFailed)?;
+        validate_root_separation(&store_directory, &log_directory)?;
+
+        let store = DirStore::from_directory(store_directory, &config.store_dir);
+
         let socket_directory = Directory::open(
             config
                 .socket_path
@@ -572,6 +578,7 @@ impl WorldServer {
         if socket_name.as_os_str().len() > MAX_SOCKET_NAME_BYTES {
             return Err(ServerExit::StartupFailed);
         }
+        let lock_name = PathBuf::from(format!(".{}.lock", socket_name.to_string_lossy()));
         let socket_entry = socket_directory
             .path(&socket_name)
             .map_err(|_| ServerExit::StartupFailed)?;
@@ -593,11 +600,18 @@ impl WorldServer {
                 if meta.uid() != parent_meta.uid() {
                     return Err(ServerExit::StartupFailed);
                 }
-                match UnixStream::connect(&socket_entry) {
+                let lock_entry = socket_directory
+                    .path(&lock_name)
+                    .map_err(|_| ServerExit::StartupFailed)?;
+                match UnixStream::connect(&lock_entry) {
                     Ok(_) => {
                         return Err(ServerExit::StartupFailed);
                     }
-                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                    Err(e)
+                        if e.kind() == ErrorKind::ConnectionRefused
+                            || e.kind() == ErrorKind::NotFound =>
+                    {
+                        let _ = std::fs::remove_file(&lock_entry);
                         std::fs::remove_file(&socket_entry)
                             .map_err(|_| ServerExit::StartupFailed)?;
                     }
@@ -619,8 +633,9 @@ impl WorldServer {
         ))
         .map_err(|_| ServerExit::StartupFailed)?;
         let binding = blake3::hash(&binding_data).to_hex().to_string();
-        let mut log = LogManager::new_opts_recover_binding(
-            &config.log_dir,
+        let mut log = LogManager::new_with_directory(
+            log_directory,
+            config.log_dir.clone(),
             config.resume_log,
             config.recover,
             if config.resume_log {
@@ -661,7 +676,12 @@ impl WorldServer {
             elapsed_offset_ms,
             socket_directory,
             socket_name,
+            owned_endpoint: None,
         })
+    }
+
+    pub fn finish(mut self) -> Result<(), crate::log::LogError> {
+        self.log.finish()
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -694,11 +714,42 @@ impl WorldServer {
     pub fn run(mut self) -> Result<(), ServerExit> {
         // Existing endpoints, including stale sockets, are refused without unlinking.
         // The pinned parent prevents ancestor replacement from redirecting the bind.
+        let lock_name = PathBuf::from(format!(".{}.lock", self.socket_name.to_string_lossy()));
+        let lock_entry = self
+            .socket_directory
+            .path(&lock_name)
+            .map_err(|_| ServerExit::StartupFailed)?;
+        let _lock_listener = match UnixListener::bind(&lock_entry) {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => match UnixStream::connect(&lock_entry) {
+                Ok(_) => return Err(ServerExit::StartupFailed),
+                Err(ce)
+                    if ce.kind() == ErrorKind::ConnectionRefused
+                        || ce.kind() == ErrorKind::NotFound =>
+                {
+                    let _ = std::fs::remove_file(&lock_entry);
+                    UnixListener::bind(&lock_entry).map_err(|_| ServerExit::StartupFailed)?
+                }
+                Err(_) => return Err(ServerExit::StartupFailed),
+            },
+            Err(_) => return Err(ServerExit::StartupFailed),
+        };
+
+        // Existing endpoints, including stale sockets, are refused without unlinking.
+        // The pinned parent prevents ancestor replacement from redirecting the bind.
         let socket = self
             .socket_directory
             .path(&self.socket_name)
             .map_err(|_| ServerExit::StartupFailed)?;
-        let listener = UnixListener::bind(socket).map_err(|_| ServerExit::StartupFailed)?;
+        let listener = UnixListener::bind(&socket).map_err(|_| ServerExit::StartupFailed)?;
+        let meta = std::fs::symlink_metadata(&socket).map_err(|_| ServerExit::StartupFailed)?;
+        use std::os::unix::fs::MetadataExt;
+        self.owned_endpoint = Some((meta.dev(), meta.ino()));
+
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| ServerExit::StartupFailed)?;
+
         let status = if self.config.no_sandbox {
             None
         } else {
@@ -719,35 +770,51 @@ impl WorldServer {
         };
         self.record_sandbox(status)?;
 
-        // Step 4: Accept connections
-        for stream_res in listener.incoming() {
-            let mut stream = match stream_res {
-                Ok(s) => s,
+        // Step 4: Accept connections with absolute run deadline
+        loop {
+            let elapsed = self.elapsed_ms();
+            if elapsed >= MAX_RUN_ELAPSED_MS {
+                let _ = self.log.log_event(&LogEventParams {
+                    elapsed_ms: elapsed,
+                    request_id: 0,
+                    method: "",
+                    authority: "",
+                    path_and_query: "",
+                    range: None,
+                    status: "clock_exhausted",
+                    bytes: 0,
+                });
+                let _ = self.log.finish();
+                return Err(ServerExit::LimitExceeded);
+            }
+
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Linux accept does not inherit the listener's O_NONBLOCK.
+                    // Changing it here would require ioctl after seccomp is active.
+                    let exit = self.handle_connection(&mut stream);
+                    if exit != ServerExit::Normal {
+                        if let Err(e) = self.log.finish() {
+                            eprintln!("log_failed: {e}");
+                            return Err(ServerExit::LogFailed);
+                        }
+                        return Err(exit);
+                    }
+                    if !self.config.no_sandbox {
+                        if let Err(e) = self.log.finish() {
+                            eprintln!("log_failed: {e}");
+                            return Err(ServerExit::LogFailed);
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let remaining = Duration::from_millis(MAX_RUN_ELAPSED_MS - elapsed);
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
                 Err(_) => continue,
-            };
-
-            let exit = self.handle_connection(&mut stream);
-            if exit != ServerExit::Normal {
-                if let Err(e) = self.log.finish() {
-                    eprintln!("log_failed: {e}");
-                    return Err(ServerExit::LogFailed);
-                }
-                return Err(exit);
-            }
-            if !self.config.no_sandbox {
-                if let Err(e) = self.log.finish() {
-                    eprintln!("log_failed: {e}");
-                    return Err(ServerExit::LogFailed);
-                }
-                return Ok(());
             }
         }
-
-        if let Err(e) = self.log.finish() {
-            eprintln!("log_failed: {e}");
-            return Err(ServerExit::LogFailed);
-        }
-        Ok(())
     }
 
     /// Handle requests on a single connection sequentially until EOF or fatal error.
@@ -782,10 +849,8 @@ impl WorldServer {
                         let _ = self.log.finish();
                         return ServerExit::LogFailed;
                     }
-                    if let Err(e) = self.log.finish() {
-                        eprintln!("log_failed: {e}");
-                        return ServerExit::LogFailed;
-                    }
+                    // The timeout ends this connection, while the run can still
+                    // accept requests and must retain its audit ownership.
                     return ServerExit::Normal;
                 }
                 ReadFrameResult::RunTimeout => {
@@ -838,16 +903,21 @@ impl WorldServer {
                 }
             };
 
-            // 1. Check request cap
-            if self.limits.check_request_cap().is_err() {
-                let elapsed_ms = self.elapsed_ms();
+            let elapsed_ms = self.elapsed_ms();
+            let method_str = match frame.method {
+                Method::Get => "GET",
+                Method::Head => "HEAD",
+            };
+
+            // 0. Budget intent, completion, and terminal evidence
+            if !self
+                .log
+                .can_budget_request(&frame.authority, &frame.path_and_query)
+            {
                 if let Err(e) = self.log.log_event(&LogEventParams {
                     elapsed_ms,
                     request_id: frame.request_id,
-                    method: match frame.method {
-                        Method::Get => "GET",
-                        Method::Head => "HEAD",
-                    },
+                    method: method_str,
                     authority: &frame.authority,
                     path_and_query: &frame.path_and_query,
                     range: frame.range,
@@ -865,8 +935,61 @@ impl WorldServer {
                 return ServerExit::LimitExceeded;
             }
 
-            // 2. Token bucket delay
-            if self.limits.acquire_token().is_err() {
+            // 1. Check request cap
+            if self.limits.check_request_cap().is_err() {
+                if let Err(e) = self.log.log_event(&LogEventParams {
+                    elapsed_ms,
+                    request_id: frame.request_id,
+                    method: method_str,
+                    authority: &frame.authority,
+                    path_and_query: &frame.path_and_query,
+                    range: frame.range,
+                    status: "limit_exceeded",
+                    bytes: 0,
+                }) {
+                    eprintln!("log_failed: {e}");
+                    let _ = self.log.finish();
+                    return ServerExit::LogFailed;
+                }
+                if let Err(e) = self.log.finish() {
+                    eprintln!("log_failed: {e}");
+                    return ServerExit::LogFailed;
+                }
+                return ServerExit::LimitExceeded;
+            }
+
+            // 2. Token bucket delay with absolute run deadline
+            let remaining_run_ms = MAX_RUN_ELAPSED_MS.saturating_sub(self.elapsed_ms());
+            if remaining_run_ms == 0 {
+                let _ = self.log.log_event(&LogEventParams {
+                    elapsed_ms: self.elapsed_ms(),
+                    request_id: frame.request_id,
+                    method: "",
+                    authority: "",
+                    path_and_query: "",
+                    range: None,
+                    status: "clock_exhausted",
+                    bytes: 0,
+                });
+                let _ = self.log.finish();
+                return ServerExit::LimitExceeded;
+            }
+            if self
+                .limits
+                .acquire_token_deadline(Duration::from_millis(remaining_run_ms))
+                .is_err()
+            {
+                let _ = self.log.log_event(&LogEventParams {
+                    elapsed_ms: self.elapsed_ms(),
+                    request_id: frame.request_id,
+                    method: "",
+                    authority: "",
+                    path_and_query: "",
+                    range: None,
+                    status: "clock_exhausted",
+                    bytes: 0,
+                });
+                let _ = self.log.finish();
                 return ServerExit::LimitExceeded;
             }
 
@@ -905,11 +1028,6 @@ impl WorldServer {
                     let _ = self.log.finish();
                     return exit;
                 }
-            };
-
-            let method_str = match frame.method {
-                Method::Get => "GET",
-                Method::Head => "HEAD",
             };
 
             let stored = self.store.open(&frame.authority, &frame.path_and_query);
@@ -1105,10 +1223,8 @@ impl WorldServer {
                     let _ = self.log.finish();
                     return ServerExit::LogFailed;
                 }
-                if let Err(e) = self.log.finish() {
-                    eprintln!("log_failed: {e}");
-                    return ServerExit::LogFailed;
-                }
+                // The event is durable; retain audit ownership while the server
+                // can accept another connection. The run exit path finalizes it.
                 return ServerExit::Normal;
             }
 
@@ -1143,6 +1259,7 @@ mod review_tests {
     use crate::log::LogWriter;
     use crate::store::MAX_BODY_BYTES;
     use hermetic_common::WireError;
+    use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::io::{Read, Write};
     use std::net::Shutdown;
@@ -1213,6 +1330,56 @@ mod review_tests {
         let response = receiver.recv_timeout(TEST_TIMEOUT).unwrap();
         let (server, exit) = worker.join().unwrap();
         (server, response, exit)
+    }
+
+    #[test]
+    fn early_close_retains_audit_ownership_until_quota_exit() {
+        let temp = fixture();
+        let mut cfg = config(&temp);
+        cfg.max_requests = Some(1);
+        let mut server = WorldServer::new(cfg).unwrap();
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client.write_all(&request().encode().unwrap()).unwrap();
+        // Queue a complete request, then deterministically refuse the response.
+        client.shutdown(Shutdown::Both).unwrap();
+        assert_eq!(server.handle_connection(&mut peer), ServerExit::Normal);
+        assert_eq!(server.limits.total_requests(), 1);
+        assert_eq!(server.log.run_state().incomplete_transmissions, 0);
+
+        let path = temp.path().join("log/requests.log");
+        let before = fs::read(&path).unwrap();
+        let records: Vec<serde_json::Value> = before
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1]["status"], "transmission_intent");
+        assert_eq!(records[2]["status"], "write_error");
+        assert!(LogManager::new_opts_recover(temp.path().join("log"), true, true).is_err());
+        assert!(crate::log::verify_log_recover(&path, false, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let (server, response, exit) = exchange(server, request());
+        assert_eq!(exit, ServerExit::LimitExceeded);
+        assert!(response.is_err());
+        assert_eq!(server.log.run_state().requests, 1);
+        assert_eq!(crate::log::verify_log(&path).unwrap(), 4);
+        let records: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[3]["status"], "limit_exceeded");
+        assert_eq!(records[3]["prev"], records[2]["hash"]);
+        let index: BTreeMap<String, crate::log::DedupeEntry> =
+            serde_json::from_slice(&fs::read(temp.path().join("log/dedupe.json")).unwrap())
+                .unwrap();
+        let rebuilt = LogManager::rebuild_dedupe_from_log(&path).unwrap();
+        assert_eq!(
+            index.values().collect::<Vec<_>>(),
+            rebuilt.values().collect::<Vec<_>>()
+        );
     }
 
     #[test]

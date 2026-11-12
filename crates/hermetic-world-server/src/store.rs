@@ -120,12 +120,21 @@ impl DirStore {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn try_new(root: &Path) -> std::io::Result<Self> {
         let root = crate::safe_fs::normalize_path(root);
         Ok(Self {
             directory: Some(Directory::open(&root)?),
             root,
         })
+    }
+
+    pub(crate) fn from_directory(directory: Directory, root: &Path) -> Self {
+        let root = crate::safe_fs::normalize_path(root);
+        Self {
+            directory: Some(directory),
+            root,
+        }
     }
 
     pub(crate) fn descriptor_path(&self) -> Option<PathBuf> {
@@ -304,9 +313,10 @@ impl DirStore {
                     return Some(index_with_q);
                 }
             }
+            return None;
         }
 
-        // No query string or query-specific file was not found
+        // No query string
         let mut candidate = auth_dir.clone();
         for seg in &raw_segs {
             candidate.push(seg);

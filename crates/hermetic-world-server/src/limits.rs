@@ -58,6 +58,11 @@ impl Limits {
 
     /// Delay until 1 token is available from the token bucket. Never refuses.
     pub fn acquire_token(&mut self) -> Result<(), LimitExceeded> {
+        self.acquire_token_deadline(Duration::MAX)
+    }
+
+    /// Delay until 1 token is available or until `max_wait`.
+    pub fn acquire_token_deadline(&mut self, max_wait: Duration) -> Result<(), LimitExceeded> {
         if !validate_rate(self.rate_rps, Some(self.burst)) {
             return Err(LimitExceeded::Requests(self.total_requests));
         }
@@ -75,6 +80,10 @@ impl Limits {
                 let wait_secs = needed / rate;
                 let wait = Duration::try_from_secs_f64(wait_secs)
                     .map_err(|_| LimitExceeded::Requests(self.total_requests))?;
+                if wait > max_wait {
+                    std::thread::sleep(max_wait);
+                    return Err(LimitExceeded::Requests(self.total_requests));
+                }
                 std::thread::sleep(wait);
                 self.last_update = Instant::now();
                 self.tokens = 0.0;

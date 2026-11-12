@@ -14,6 +14,8 @@ pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DEDUPE_ENTRIES: usize = 8320;
 pub const TERMINAL_RESERVE_ENTRIES: usize = 64;
 pub const TERMINAL_RESERVE_RECORDS: u64 = 64;
+pub const TERMINAL_RESERVE_DEDUPE_BYTES: usize = 2 * 1024 * 1024;
+pub const TERMINAL_RESERVE_LOG_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_DEDUPE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
 
@@ -100,9 +102,29 @@ pub struct RunState {
 
 type Dedupe = BTreeMap<(String, String, String), DedupeEntry>;
 
+#[derive(Debug)]
+pub struct AuditLock {
+    _file: File,
+}
+
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit the open description.
+        // Release explicitly so finalization does not depend on its exec timing.
+        let _ = self._file.unlock();
+    }
+}
+
+pub fn acquire_audit_lock(directory: &Directory) -> io::Result<AuditLock> {
+    Ok(AuditLock {
+        _file: directory.try_lock()?,
+    })
+}
+
 pub struct LogManager {
     log_dir: PathBuf,
     directory: Option<Directory>,
+    _audit_lock: Option<AuditLock>,
     log_file: Box<dyn LogWriter>,
     seq: u64,
     prev_hash: String,
@@ -111,6 +133,7 @@ pub struct LogManager {
     dedupe: Dedupe,
     state: RunState,
     failed: bool,
+    finalized: bool,
 }
 
 pub fn is_terminal_status(status: &str) -> bool {
@@ -139,14 +162,47 @@ impl LogManager {
     ) -> Result<Self, LogError> {
         Self::new_opts_recover_binding(log_dir, resume_log, recover, None)
     }
+    pub fn new_with_directory(
+        directory: Directory,
+        log_dir: PathBuf,
+        resume_log: bool,
+        recover: bool,
+        expected_binding: Option<&str>,
+    ) -> Result<Self, LogError> {
+        Self::new_opts_recover_binding_dir(
+            Some(directory),
+            log_dir,
+            resume_log,
+            recover,
+            expected_binding,
+        )
+    }
     pub fn new_opts_recover_binding<P: AsRef<Path>>(
         log_dir: P,
         resume_log: bool,
         recover: bool,
         expected_binding: Option<&str>,
     ) -> Result<Self, LogError> {
-        let log_dir = log_dir.as_ref().to_path_buf();
-        let directory = Directory::create(&log_dir)?;
+        Self::new_opts_recover_binding_dir(
+            None,
+            log_dir.as_ref().to_path_buf(),
+            resume_log,
+            recover,
+            expected_binding,
+        )
+    }
+    fn new_opts_recover_binding_dir(
+        directory: Option<Directory>,
+        log_dir: PathBuf,
+        resume_log: bool,
+        recover: bool,
+        expected_binding: Option<&str>,
+    ) -> Result<Self, LogError> {
+        let directory = match directory {
+            Some(d) => d,
+            None => Directory::create(&log_dir)?,
+        };
+        let audit_lock = acquire_audit_lock(&directory).map_err(LogError::Io)?;
         let log_name = Path::new("requests.log");
         let exists = entry_exists(&directory, log_name)?;
 
@@ -174,6 +230,8 @@ impl LogManager {
         let mut state = RunState::default();
         let mut dedupe = BTreeMap::new();
         if resume_log {
+            directory
+                .validate_atomic_write(Path::new("dedupe.json"), Path::new(".dedupe.json.tmp"))?;
             // Retain open descriptor through binding validation, scanning, recovery, rebuilding, and appending
             let scan = verify_on_file(
                 &directory,
@@ -190,12 +248,15 @@ impl LogManager {
             state = scan.state;
             dedupe = scan.dedupe;
         }
+        #[cfg(test)]
+        initialization_tests::after_verification();
         let log_bytes = log_file.metadata()?.len();
         directory.sync()?;
         let dedupe_bytes = dedupe.keys().map(key_cost).sum();
         Ok(Self {
             log_dir,
             directory: Some(directory),
+            _audit_lock: Some(audit_lock),
             log_file: Box::new(log_file),
             seq,
             prev_hash,
@@ -204,6 +265,7 @@ impl LogManager {
             dedupe,
             state,
             failed: false,
+            finalized: false,
         })
     }
 
@@ -251,6 +313,7 @@ impl LogManager {
         Self {
             log_dir: log_dir.as_ref().to_path_buf(),
             directory: None,
+            _audit_lock: None,
             log_file: Box::new(writer),
             seq: 0,
             prev_hash: INITIAL_PREV_HASH.to_string(),
@@ -259,6 +322,7 @@ impl LogManager {
             log_bytes: 0,
             state: RunState::default(),
             failed: false,
+            finalized: false,
         }
     }
     /// Compute canonical JSON without hash and hash = BLAKE3(prev_hash_hex || canonical_json_without_hash)
@@ -307,7 +371,7 @@ impl LogManager {
 
     /// Each record is durable before its caller can transmit content.
     pub fn log_event(&mut self, params: &LogEventParams<'_>) -> Result<(), LogError> {
-        if self.failed {
+        if self.failed || self.finalized {
             return Err(invalid().into());
         }
         validate_params(params)?;
@@ -337,9 +401,14 @@ impl LogManager {
         } else {
             MAX_DEDUPE_ENTRIES
         };
+        let max_dedupe_bytes = if is_terminal {
+            MAX_DEDUPE_BYTES
+        } else {
+            MAX_DEDUPE_BYTES.saturating_sub(TERMINAL_RESERVE_DEDUPE_BYTES)
+        };
         if cost > 0
             && (self.dedupe.len() >= max_entries
-                || self.dedupe_bytes.saturating_add(cost) > MAX_DEDUPE_BYTES)
+                || self.dedupe_bytes.saturating_add(cost) > max_dedupe_bytes)
         {
             return Err(invalid().into());
         }
@@ -347,7 +416,12 @@ impl LogManager {
         update_state(&mut state, params)?;
         let (hash, line) = Self::compute_hash(&self.prev_hash, next_seq, params)?;
         let bytes = (line.len() as u64).checked_add(1).ok_or_else(invalid)?;
-        if bytes > MAX_LOG_LINE_BYTES || self.log_bytes.saturating_add(bytes) > MAX_LOG_BYTES {
+        let max_log_bytes = if is_terminal {
+            MAX_LOG_BYTES
+        } else {
+            MAX_LOG_BYTES.saturating_sub(TERMINAL_RESERVE_LOG_BYTES)
+        };
+        if bytes > MAX_LOG_LINE_BYTES || self.log_bytes.saturating_add(bytes) > max_log_bytes {
             return Err(invalid().into());
         }
         let result = (|| -> io::Result<()> {
@@ -371,6 +445,75 @@ impl LogManager {
         Ok(())
     }
 
+    pub fn can_budget_request(&self, authority: &str, path_and_query: &str) -> bool {
+        if self.failed
+            || self.finalized
+            || authority.len() > hermetic_common::MAX_AUTHORITY_LEN
+            || path_and_query.len() > hermetic_common::MAX_PATH_LEN
+        {
+            return false;
+        }
+        let intent_key = (
+            authority.to_owned(),
+            path_and_query.to_owned(),
+            "transmission_intent".to_owned(),
+        );
+        let mut add_entries = 0usize;
+        let mut add_dedupe_bytes = 0usize;
+
+        if !self.dedupe.contains_key(&intent_key) {
+            add_entries = add_entries.saturating_add(1);
+            add_dedupe_bytes = add_dedupe_bytes.saturating_add(key_cost(&intent_key));
+        }
+        // A custom miss can supply any u16 status. Reserve a new key of maximum
+        // width even when familiar completion statuses are already in the index.
+        let completion_key = (
+            authority.to_owned(),
+            path_and_query.to_owned(),
+            u16::MAX.to_string(),
+        );
+        add_entries = add_entries.saturating_add(1);
+        add_dedupe_bytes = add_dedupe_bytes.saturating_add(key_cost(&completion_key));
+
+        if self
+            .seq
+            .saturating_add(2)
+            .saturating_add(TERMINAL_RESERVE_RECORDS)
+            > MAX_LOG_RECORDS
+        {
+            return false;
+        }
+        if self.dedupe.len().saturating_add(add_entries) > MAX_DEDUPE_ENTRIES {
+            return false;
+        }
+        if self
+            .dedupe_bytes
+            .saturating_add(add_dedupe_bytes)
+            .saturating_add(TERMINAL_RESERVE_DEDUPE_BYTES)
+            > MAX_DEDUPE_BYTES
+        {
+            return false;
+        }
+
+        let est_line_bytes = (path_and_query.len().saturating_mul(6))
+            .saturating_add(authority.len().saturating_mul(6))
+            .saturating_add(1024) as u64;
+        if est_line_bytes > MAX_LOG_LINE_BYTES {
+            return false;
+        }
+        let req_bytes = est_line_bytes.saturating_mul(2);
+        if self
+            .log_bytes
+            .saturating_add(req_bytes)
+            .saturating_add(TERMINAL_RESERVE_LOG_BYTES)
+            > MAX_LOG_BYTES
+        {
+            return false;
+        }
+
+        true
+    }
+
     fn directory(&self) -> io::Result<Directory> {
         match &self.directory {
             Some(d) => Ok(d.clone()),
@@ -378,6 +521,9 @@ impl LogManager {
         }
     }
     pub fn write_dedupe_atomic(&self) -> Result<(), LogError> {
+        if self.finalized {
+            return Err(invalid().into());
+        }
         let mut map = BTreeMap::new();
         for ((auth, pq, status), entry) in &self.dedupe {
             map.insert(format!("{auth} {pq} {status}"), entry);
@@ -391,6 +537,9 @@ impl LogManager {
         Ok(())
     }
     pub fn finish(&mut self) -> Result<(), LogError> {
+        if self.finalized {
+            return Ok(());
+        }
         if self.failed {
             return Err(invalid().into());
         }
@@ -405,6 +554,8 @@ impl LogManager {
                 hash: self.prev_hash.clone(),
             },
         )?;
+        self.finalized = true;
+        self._audit_lock = None;
         Ok(())
     }
     pub fn current_seq(&self) -> u64 {
@@ -743,8 +894,17 @@ fn verify_on_file(
         return Err(VerifyError::Unanchored);
     }
 
+    if let Some(expected) = expected_binding {
+        if state.binding.as_deref() != Some(expected) {
+            return Err(bad(count, "binding mismatch"));
+        }
+    }
+
     // No input changes occur until every complete record and the checkpoint verify.
     if recover && mutate && (partial || head.as_ref().is_none_or(|h| h.seq != count)) {
+        directory
+            .validate_atomic_write(&head_name, Path::new(".head.tmp"))
+            .map_err(io_error)?;
         if partial {
             file.set_len(length).map_err(io_error)?;
         }
@@ -778,6 +938,11 @@ fn verify_in_directory(
     recover: bool,
     mutate: bool,
 ) -> Result<Scan, VerifyError> {
+    let _audit_lock = if recover && mutate {
+        Some(acquire_audit_lock(directory).map_err(io_error)?)
+    } else {
+        None
+    };
     let mut file = directory
         .open_file(name, recover && mutate, false)
         .map_err(io_error)?;
@@ -815,4 +980,210 @@ pub fn verify_log_recover<P: AsRef<Path>>(
     let (directory, name) = directory_and_name(path.as_ref()).map_err(io_error)?;
     let scan = verify_in_directory(&directory, &name, allow_unanchored, recover, true)?;
     usize::try_from(scan.count).map_err(|_| bad(scan.count, "record count limit"))
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::fs;
+
+    thread_local! {
+        static AFTER_VERIFY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_verification() {
+        AFTER_VERIFY.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    #[test]
+    fn review_2_path_replaced_inside_initialization_retains_verified_file() {
+        let root = tempfile::tempdir().unwrap();
+        let event = LogEventParams {
+            elapsed_ms: 0,
+            request_id: 1,
+            method: "GET",
+            authority: "example.org",
+            path_and_query: "/body",
+            range: None,
+            status: "200",
+            bytes: 0,
+        };
+        let mut initial = LogManager::new(root.path()).unwrap();
+        initial.log_event(&event).unwrap();
+        initial.finish().unwrap();
+        let original = root.path().join("requests.log");
+        let moved = root.path().join("requests.log.verified");
+        let swap_original = original.clone();
+        let swap_moved = moved.clone();
+        AFTER_VERIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&swap_original, &swap_moved).unwrap();
+                fs::write(&swap_original, b"unverified replacement\n").unwrap();
+            }))
+        });
+        let mut resumed = LogManager::new_opts_recover(root.path(), true, true).unwrap();
+        resumed.log_event(&event).unwrap();
+        resumed.finish().unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"unverified replacement\n");
+        assert_eq!(verify_log_recover(&moved, false, false).unwrap(), 2);
+    }
+
+    #[test]
+    fn review_2_finalized_manager_cannot_write_after_releasing_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = LogManager::new(root.path()).unwrap();
+        first.finish().unwrap();
+        let mut second = LogManager::new_opts(root.path(), true).unwrap();
+        assert!(first.write_dedupe_atomic().is_err());
+        let event = LogEventParams {
+            elapsed_ms: 0,
+            request_id: 0,
+            method: "",
+            authority: "",
+            path_and_query: "",
+            range: None,
+            status: "tampered",
+            bytes: 0,
+        };
+        assert!(first.log_event(&event).is_err());
+        first.finish().unwrap();
+        second.log_event(&event).unwrap();
+        second.finish().unwrap();
+        assert_eq!(
+            verify_log_recover(root.path().join("requests.log"), false, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn review_2_ownership_release_does_not_wait_for_inherited_description() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let owner = acquire_audit_lock(&directory).unwrap();
+        let inherited = owner._file.try_clone().unwrap();
+        assert!(acquire_audit_lock(&directory).is_err());
+        drop(owner);
+        let next = acquire_audit_lock(&directory).unwrap();
+        drop(inherited);
+        assert!(acquire_audit_lock(&directory).is_err());
+        drop(next);
+        assert!(acquire_audit_lock(&directory).is_ok());
+    }
+
+    #[test]
+    fn review_1_maximum_distinct_and_escaped_paths_retain_terminal_byte_capacity() {
+        const TEST_REQUEST_CAP: u64 = 4096;
+        for distinct in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut manager = LogManager::new(root.path()).unwrap();
+            let mut accepted = 0;
+            let mut exhausted = false;
+            for request_id in 1..=TEST_REQUEST_CAP + 1 {
+                let path = if distinct {
+                    format!("/item?q={request_id:05}_{}", "a".repeat(8178))
+                } else {
+                    format!("/item?{}", "\"".repeat(8186))
+                };
+                assert_eq!(path.len(), hermetic_common::MAX_PATH_LEN);
+                let mut event = LogEventParams {
+                    elapsed_ms: 0,
+                    request_id,
+                    method: "GET",
+                    authority: "example.org",
+                    path_and_query: &path,
+                    range: Some((0, u64::MAX)),
+                    status: "transmission_intent",
+                    bytes: 0,
+                };
+                if !manager.can_budget_request(event.authority, &path) {
+                    event.status = "limit_exceeded";
+                    manager.log_event(&event).unwrap();
+                    exhausted = true;
+                    break;
+                }
+                manager.log_event(&event).unwrap();
+                event.status = if request_id.is_multiple_of(2) {
+                    "404"
+                } else {
+                    "206"
+                };
+                manager.log_event(&event).unwrap();
+                accepted += 1;
+            }
+            assert!(exhausted);
+            assert!(accepted > 100 && accepted < TEST_REQUEST_CAP);
+            manager.finish().unwrap();
+            let count = verify_log_recover(root.path().join("requests.log"), false, false).unwrap();
+            assert_eq!(count as u64, accepted * 2 + 1);
+            assert_eq!(manager.run_state().requests, accepted);
+            assert_eq!(manager.run_state().incomplete_transmissions, 0);
+        }
+    }
+
+    #[test]
+    fn review_9_empty_or_partial_binding_is_rejected_before_recovery_mutation() {
+        for content in [b"".as_slice(), b"{\"status\":\"run_config\"".as_slice()] {
+            for checkpoint in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                fs::write(root.path().join("requests.log"), content).unwrap();
+                fs::write(root.path().join("dedupe.json"), b"{}").unwrap();
+                fs::write(root.path().join(".head.tmp"), b"abandoned").unwrap();
+                fs::write(root.path().join(".dedupe.json.tmp"), b"abandoned").unwrap();
+                if checkpoint {
+                    fs::write(
+                        root.path().join("requests.log.head"),
+                        serde_json::to_vec(&LogHead {
+                            seq: 0,
+                            hash: INITIAL_PREV_HASH.into(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                let names = [
+                    "requests.log",
+                    "requests.log.head",
+                    "dedupe.json",
+                    ".head.tmp",
+                    ".dedupe.json.tmp",
+                ];
+                let before: Vec<_> = names
+                    .iter()
+                    .map(|name| fs::read(root.path().join(name)).ok())
+                    .collect();
+                assert!(LogManager::new_opts_recover_binding(
+                    root.path(),
+                    true,
+                    true,
+                    Some(&"a".repeat(64))
+                )
+                .is_err());
+                for (name, original) in names.iter().zip(before) {
+                    assert_eq!(fs::read(root.path().join(name)).ok(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_1_completion_budget_covers_custom_u16_status_width() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = LogManager::new(root.path()).unwrap();
+        let intent = (
+            "example.org".into(),
+            "/missing".into(),
+            "transmission_intent".into(),
+        );
+        let short_status = ("example.org".into(), "/missing".into(), "404".into());
+        manager.dedupe_bytes = MAX_DEDUPE_BYTES
+            - TERMINAL_RESERVE_DEDUPE_BYTES
+            - key_cost(&intent)
+            - key_cost(&short_status);
+        assert!(!manager.can_budget_request("example.org", "/missing"));
+    }
 }
