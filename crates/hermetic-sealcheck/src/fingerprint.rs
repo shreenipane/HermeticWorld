@@ -171,8 +171,12 @@ pub struct FingerprintSet {
     /// `\N{...}` names (upper case, sorted, at most `MAX_UNRESOLVED_UNICODE_NAMES`) the
     /// Unicode name table did not know while fingerprinting `.pyc` scopes.
     pub unresolved_unicode_names: Vec<String>,
-    /// Further distinct unresolved names beyond that bound.
+    /// Further distinct unresolved names beyond that bound, each counted once. Exact
+    /// unless `unresolved_unicode_names_saturated`, when it is a lower bound.
     pub unresolved_unicode_names_omitted: usize,
+    /// More than `MAX_OMITTED_UNICODE_NAME_DIGESTS` names were omitted, so
+    /// `unresolved_unicode_names_omitted` is "at least".
+    pub unresolved_unicode_names_saturated: bool,
 }
 
 struct CandidateHunk {
@@ -562,12 +566,37 @@ fn decode_py_string_literal(tok_text: &str, unresolved: &mut UnresolvedNames) ->
 /// Most distinct unresolved `\N{...}` names a fingerprint set records; more are counted.
 pub const MAX_UNRESOLVED_UNICODE_NAMES: usize = 64;
 
+/// Most digests of omitted (not retained) distinct unresolved names kept for counting.
+pub const MAX_OMITTED_UNICODE_NAME_DIGESTS: usize = 4096;
+
+/// A fixed-size digest of an omitted name: the first 16 bytes of its SHA-256.
+type NameDigest = [u8; 16];
+
+fn name_digest(name: &str) -> NameDigest {
+    let full: [u8; 32] = Sha256::digest(name.as_bytes()).into();
+    let mut d = [0u8; 16];
+    d.copy_from_slice(full.get(..16).unwrap_or(&[0u8; 16]));
+    d
+}
+
 /// The `\N{...}` names the Unicode name table did not know, recorded out of band where
-/// the lookup fails: sorted, de-duplicated and bounded.
+/// the lookup fails. Distinct names are counted exactly while bounded:
+///
+/// - `names` keeps the `MAX_UNRESOLVED_UNICODE_NAMES` smallest names (in byte order), so
+///   the retained set does not depend on the order of records and merges;
+/// - `omitted` keeps digests of the other distinct names, at most
+///   `MAX_OMITTED_UNICODE_NAME_DIGESTS` (the smallest digests, again order-independent);
+/// - `saturated` is set once a digest had to be dropped, and the count is then only a
+///   lower bound.
+///
+/// A name is counted once whether it is retained, omitted, or seen on both sides of a
+/// merge. Omitted names are always larger than every retained name, because the largest
+/// retained name only decreases over time.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct UnresolvedNames {
     names: std::collections::BTreeSet<String>,
-    omitted: usize,
+    omitted: std::collections::BTreeSet<NameDigest>,
+    saturated: bool,
 }
 
 impl UnresolvedNames {
@@ -576,9 +605,43 @@ impl UnresolvedNames {
             return;
         }
         if self.names.len() < MAX_UNRESOLVED_UNICODE_NAMES {
+            self.omitted.remove(&name_digest(name));
+            self.names.insert(name.to_string());
+            return;
+        }
+        let largest_is_larger = self
+            .names
+            .last()
+            .is_some_and(|largest| largest.as_str() > name);
+        if largest_is_larger {
+            // Keep the smallest names: the largest retained one becomes omitted.
+            if let Some(evicted) = self.names.pop_last() {
+                self.insert_digest(name_digest(&evicted));
+            }
+            self.omitted.remove(&name_digest(name));
             self.names.insert(name.to_string());
         } else {
-            self.omitted = self.omitted.saturating_add(1);
+            self.insert_digest(name_digest(name));
+        }
+    }
+
+    fn insert_digest(&mut self, digest: NameDigest) {
+        if self.omitted.contains(&digest) {
+            return;
+        }
+        // Never count a retained name again through its digest.
+        if self.names.iter().any(|n| name_digest(n) == digest) {
+            return;
+        }
+        if self.omitted.len() < MAX_OMITTED_UNICODE_NAME_DIGESTS {
+            self.omitted.insert(digest);
+            return;
+        }
+        self.saturated = true;
+        // Keep the smallest digests so the kept set does not depend on order.
+        if self.omitted.last().is_some_and(|largest| *largest > digest) {
+            self.omitted.pop_last();
+            self.omitted.insert(digest);
         }
     }
 
@@ -586,7 +649,15 @@ impl UnresolvedNames {
         for name in &other.names {
             self.record(name);
         }
-        self.omitted = self.omitted.saturating_add(other.omitted);
+        for digest in &other.omitted {
+            self.insert_digest(*digest);
+        }
+        self.saturated |= other.saturated;
+    }
+
+    /// The number of distinct names recorded (a lower bound when `saturated`).
+    fn distinct_count(&self) -> usize {
+        self.names.len().saturating_add(self.omitted.len())
     }
 }
 
@@ -2486,8 +2557,13 @@ impl FingerprintSet {
             .unresolved_unicode_names
             .len()
             .saturating_add(self.unresolved_unicode_names_omitted);
+        let bound = if self.unresolved_unicode_names_saturated {
+            "at least "
+        } else {
+            ""
+        };
         let mut evidence = vec![format!(
-            "{total} \\N{{...}} name(s) unknown to the Unicode 16.0.0 name table; .pyc constants with them are not matched"
+            "{bound}{total} distinct \\N{{...}} name(s) unknown to the Unicode 16.0.0 name table; .pyc constants with them are not matched"
         )];
         evidence.extend(self.unresolved_unicode_names.iter().take(5).cloned());
         vec![crate::scan::Finding {
@@ -2959,8 +3035,11 @@ impl FingerprintSet {
             tier2_max_files,
             tier2_max_bytes,
         );
+        set.unresolved_unicode_names_omitted = unresolved
+            .distinct_count()
+            .saturating_sub(unresolved.names.len());
+        set.unresolved_unicode_names_saturated = unresolved.saturated;
         set.unresolved_unicode_names = unresolved.names.into_iter().collect();
-        set.unresolved_unicode_names_omitted = unresolved.omitted;
         Ok(set)
     }
 
@@ -3666,6 +3745,7 @@ fn finish_fingerprint_set(
         tier2_chosen_files,
         unresolved_unicode_names: Vec::new(),
         unresolved_unicode_names_omitted: 0,
+        unresolved_unicode_names_saturated: false,
     }
 }
 
@@ -3841,5 +3921,125 @@ mod t112_final_review_tests {
         });
         assert!(symbols.contains("X"));
         assert!(symbols.contains("match"));
+    }
+}
+
+#[cfg(test)]
+mod unresolved_names_tests {
+    use super::*;
+
+    fn name(i: usize) -> String {
+        format!("NAME {i:05}")
+    }
+
+    fn collect(names: impl IntoIterator<Item = String>) -> UnresolvedNames {
+        let mut u = UnresolvedNames::default();
+        for n in names {
+            u.record(&n);
+        }
+        u
+    }
+
+    fn snapshot(u: &UnresolvedNames) -> (Vec<String>, usize, bool, Vec<NameDigest>) {
+        (
+            u.names.iter().cloned().collect(),
+            u.distinct_count(),
+            u.saturated,
+            u.omitted.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn retained_names_sorted_deduplicated_and_bounded() {
+        let u = collect(["B", "A", "B", "C", "A"].map(String::from));
+        assert_eq!(
+            u.names.iter().cloned().collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+        assert_eq!(u.distinct_count(), 3);
+        let u = collect((0..100).rev().map(name));
+        assert_eq!(u.names.len(), MAX_UNRESOLVED_UNICODE_NAMES);
+        // The retained names are the smallest, whatever the record order.
+        assert_eq!(u.names.first(), Some(&name(0)));
+        assert_eq!(u.names.last(), Some(&name(63)));
+        assert_eq!(u.distinct_count(), 100);
+        assert!(!u.saturated);
+    }
+
+    #[test]
+    fn repeated_overflow_name_counted_once() {
+        let mut u = collect((0..64).map(name));
+        u.record(&name(64));
+        u.record(&name(64));
+        u.record(&name(3));
+        assert_eq!(u.distinct_count(), 65);
+    }
+
+    #[test]
+    fn overlapping_merges_count_each_name_once() {
+        // The same omitted name on both sides.
+        let a = collect((0..70).map(name));
+        let b = collect((0..64).map(name).chain([name(65), name(99)]));
+        let mut m = a.clone();
+        m.merge(&b);
+        assert_eq!(m.distinct_count(), 71); // 0..70 plus 99
+                                            // A name retained on one side and omitted on the other.
+        let small = collect([name(64)]); // retained here
+        let full = collect((0..65).map(name)); // NAME 00064 omitted here
+        for (x, y) in [(&small, &full), (&full, &small)] {
+            let mut m = x.clone();
+            m.merge(y);
+            assert_eq!(m.distinct_count(), 65);
+            assert_eq!(m.names.len(), 64);
+        }
+    }
+
+    #[test]
+    fn record_and_merge_order_independent() {
+        let all: Vec<String> = (0..300).map(name).collect();
+        let forward = collect(all.iter().cloned());
+        let backward = collect(all.iter().rev().cloned());
+        let interleaved = collect(
+            all.iter()
+                .step_by(2)
+                .chain(all.iter().skip(1).step_by(2))
+                .cloned(),
+        );
+        assert_eq!(snapshot(&forward), snapshot(&backward));
+        assert_eq!(snapshot(&forward), snapshot(&interleaved));
+        let left = collect(all.iter().take(200).cloned());
+        let right = collect(all.iter().skip(100).cloned());
+        let mut lr = left.clone();
+        lr.merge(&right);
+        let mut rl = right.clone();
+        rl.merge(&left);
+        assert_eq!(snapshot(&lr), snapshot(&forward));
+        assert_eq!(snapshot(&rl), snapshot(&forward));
+    }
+
+    #[test]
+    fn saturation_sets_flag_and_stays_bounded() {
+        let below = collect((0..64 + MAX_OMITTED_UNICODE_NAME_DIGESTS).map(name));
+        assert!(!below.saturated);
+        assert_eq!(
+            below.distinct_count(),
+            64 + MAX_OMITTED_UNICODE_NAME_DIGESTS
+        );
+        let n = 64 + MAX_OMITTED_UNICODE_NAME_DIGESTS + 500;
+        let a = collect((0..n).map(name));
+        let b = collect((0..n).rev().map(name));
+        assert!(a.saturated);
+        assert_eq!(a.omitted.len(), MAX_OMITTED_UNICODE_NAME_DIGESTS);
+        assert_eq!(snapshot(&a), snapshot(&b));
+        let mut m = UnresolvedNames::default();
+        m.merge(&a);
+        assert!(m.saturated);
+
+        let mut set = FingerprintSet::from_task("", "", Path::new("/nonexistent")).expect("fp");
+        set.unresolved_unicode_names = a.names.iter().cloned().collect();
+        set.unresolved_unicode_names_omitted = a.distinct_count() - a.names.len();
+        set.unresolved_unicode_names_saturated = true;
+        let gaps = set.coverage_gap_findings("task");
+        assert!(gaps[0].evidence[0].starts_with("at least "), "{gaps:?}");
     }
 }

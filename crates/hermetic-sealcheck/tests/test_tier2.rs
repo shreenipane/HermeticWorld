@@ -380,6 +380,7 @@ fn test_perf_tier2_4mb_unit_200_hunks_under_2s() {
         tier2_chosen_files: Vec::new(),
         unresolved_unicode_names: Vec::new(),
         unresolved_unicode_names_omitted: 0,
+        unresolved_unicode_names_saturated: false,
     };
 
     let opts = ScanOptions::default();
