@@ -1,0 +1,69 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_defect6",
+        "databaseId": 306,
+        "url": "https://github.com/test-org/test-repo/issues/306",
+        "body": "Issue body snapshot 2",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOcomment_early",
+              "databaseId": 901,
+              "url": "https://github.com/test-org/test-repo/issues/306#issuecomment-901",
+              "body": "Early comment",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": null,
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            },
+            {
+              "id": "IC_kwDOcomment_late",
+              "databaseId": 902,
+              "url": "https://github.com/test-org/test-repo/issues/306#issuecomment-902",
+              "body": "Late comment added after T_world",
+              "createdAt": "2020-01-08T10:00:00Z",
+              "lastEditedAt": null,
+              "includesCreatedEdit": true,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_null_diff",
+        "databaseId": 202,
+        "url": "https://github.com/test-org/test-repo/issues/202",
+        "body": "Current scraped body with fix",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": "2020-01-03T10:00:00Z",
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-03T10:00:00Z",
+              "editedAt": "2020-01-03T10:00:00Z",
+              "diff": null
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

@@ -15,6 +15,7 @@ from hermetic_slice.__main__ import main
 from hermetic_slice.dockerutil import is_docker_available, run_docker
 from hermetic_slice.gitutil import run_git
 from hermetic_slice.image_sealer import (
+    RESTORE_MODES_SH,
     ImageSealError,
     gold_lines,
     measure,
@@ -47,6 +48,259 @@ def test_render_dockerfile() -> None:
         "RUN bash /tmp/restore-modes.sh && rm -f /tmp/restore-modes.sh\n"
     )
     assert rendered == expected
+
+
+def test_restore_modes_exact_modes_offline(tmp_path: Path) -> None:
+    """Offline regression test: mode restoration sets exact octal 644/755 even if created with 664."""
+    assert "chmod 644" in RESTORE_MODES_SH
+    assert "chmod 755" in RESTORE_MODES_SH
+    assert "chmod a-x" not in RESTORE_MODES_SH
+    assert "chmod a+x" not in RESTORE_MODES_SH
+
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    f_664 = repo_dir / "f_664.txt"
+    f_664.write_text("hello 664\n", encoding="utf-8")
+    os.chmod(f_664, 0o664)
+
+    f_755 = repo_dir / "f_755.sh"
+    f_755.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    os.chmod(f_755, 0o755)
+
+    run_git(["add", "f_664.txt", "f_755.sh"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Change /testbed in RESTORE_MODES_SH to repo_dir for offline execution
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+    mode_664 = oct(os.stat(f_664).st_mode & 0o777)
+    mode_755 = oct(os.stat(f_755).st_mode & 0o777)
+    assert mode_664 == "0o644"
+    assert mode_755 == "0o755"
+
+
+def test_restore_modes_symlink_to_private_sentinel_rejected(tmp_path: Path) -> None:
+    """Regression Defect 6: tracked regular file replaced by symlink to private sentinel is rejected and sentinel remains 0600."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file in git
+    f_tracked = repo_dir / "tracked.txt"
+    f_tracked.write_text("tracked content\n", encoding="utf-8")
+    run_git(["add", "tracked.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Outside private sentinel file
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Replace tracked file with symlink to sentinel
+    f_tracked.unlink()
+    f_tracked.symlink_to(sentinel)
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode != 0, f"Expected rejection, but script succeeded: {res.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Replace tracked file with hard link to sentinel
+    f_tracked.unlink()
+    os.link(sentinel, f_tracked)
+    assert os.stat(sentinel).st_nlink > 1
+
+    res_hl = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res_hl.returncode != 0, f"Expected rejection for hard link, but script succeeded: {res_hl.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+
+def test_restore_modes_hardlink_to_private_sentinel_rejected(tmp_path: Path) -> None:
+    """Regression Defect 3: tracked regular file replaced by hard link to private sentinel is rejected and sentinel remains 0600."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file in git
+    f_tracked = repo_dir / "tracked.txt"
+    f_tracked.write_text("tracked content\n", encoding="utf-8")
+    run_git(["add", "tracked.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Outside private sentinel file
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Replace tracked file with hard link to sentinel
+    f_tracked.unlink()
+    os.link(sentinel, f_tracked)
+    assert os.stat(sentinel).st_nlink > 1
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode != 0, f"Expected rejection, but script succeeded: {res.stdout}"
+
+    # Sentinel permissions MUST remain 0600
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+
+def test_restore_modes_isolated_from_untrusted_subprocess_module(tmp_path: Path) -> None:
+    """Regression Defect 5: tracked subprocess.py modifying a sentinel never executes during mode restoration."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Outside private sentinel file with 0600 permissions
+    sentinel = tmp_path / "private_sentinel.txt"
+    sentinel.write_text("super secret sentinel\n", encoding="utf-8")
+    os.chmod(sentinel, 0o600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    marker = repo_dir / "hostile_executed.marker"
+
+    # Tracked hostile subprocess.py in the repository
+    hostile_subprocess = repo_dir / "subprocess.py"
+    hostile_code = (
+        "import os\n"
+        f"os.chmod({repr(str(sentinel))}, 0o777)\n"
+        f"with open({repr(str(marker))}, 'w') as f:\n"
+        "    f.write('pwned')\n"
+    )
+    hostile_subprocess.write_text(hostile_code, encoding="utf-8")
+
+    # Tracked regular file whose mode is 644 in git
+    f_tracked = repo_dir / "tracked_file.txt"
+    f_tracked.write_text("content to restore\n", encoding="utf-8")
+
+    run_git(["add", "subprocess.py", "tracked_file.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Simulate SWE-bench HEAD commit flip: flip tracked_file.txt to 0o755
+    os.chmod(f_tracked, 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
+
+    # Run mode restoration
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True)
+    assert res.returncode == 0, f"Mode restoration failed: stderr={res.stderr}, stdout={res.stdout}"
+
+    # Assert untrusted module was never imported/executed
+    assert not marker.exists(), "Tracked subprocess.py executed during mode restoration!"
+
+    # Assert sentinel permissions remain untouched (0600)
+    assert oct(os.stat(sentinel).st_mode & 0o777) == "0o600"
+
+    # Assert legitimate mode restoration succeeded (tracked_file.txt restored from 755 to 644)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o644"
+
+
+@pytest.mark.parametrize("limit_var,limit_val", [
+    ("HERMETIC_MAX_TREE_ENTRIES", "0"),
+    ("HERMETIC_MAX_TREE_BYTES", "10"),
+    ("HERMETIC_MAX_PATH_LENGTH", "5"),
+])
+def test_restore_modes_oversized_listing_bounded_rejection(tmp_path: Path, limit_var: str, limit_val: str) -> None:
+    """Regression Defect 5: use an offline oversized listing and assert bounded rejection before any chmod operation."""
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Tracked regular file whose mode is 100644 in git
+    f_tracked = repo_dir / "tracked_file.txt"
+    f_tracked.write_text("content\n", encoding="utf-8")
+    run_git(["add", "tracked_file.txt"], cwd=repo_dir)
+    run_git(
+        ["commit", "-m", "init"],
+        cwd=repo_dir,
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z"},
+    )
+
+    # Flip mode to 0o755
+    os.chmod(f_tracked, 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
+
+    script = RESTORE_MODES_SH.replace("/testbed", str(repo_dir))
+    script_file = tmp_path / "restore-modes.sh"
+    script_file.write_text(script, encoding="utf-8")
+
+    env = dict(os.environ, **{limit_var: limit_val})
+    res = subprocess.run([bash_bin, str(script_file)], capture_output=True, text=True, env=env)
+
+    # Must reject with non-zero exit code
+    assert res.returncode != 0, f"Expected bounded rejection, but script succeeded: {res.stdout}"
+    assert "Refusing to restore modes" in res.stderr
+
+    # Assert bounded rejection before ANY chmod operation (mode remains 0o755)
+    assert oct(os.stat(f_tracked).st_mode & 0o777) == "0o755"
 
 
 def test_verification_problems() -> None:
@@ -300,6 +554,129 @@ def test_gold_lines(tmp_path: Path) -> None:
         "def secret_test_function_beta():",
     ])
     assert result == expected
+
+
+def test_restore_modes_sh_restores_exact_modes_and_skips_symlinks(tmp_path: Path) -> None:
+    """Offline regression test: RESTORE_MODES_SH enforces 0644/0755 and skips symlinks."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # file1: tracked as 100644, but has mode 0755 on disk (simulating SWE-bench executable-flip)
+    f1 = repo_dir / "file1.txt"
+    f1.write_text("file 1\n", encoding="utf-8")
+    run_git(["add", "file1.txt"], cwd=repo_dir)
+
+    # file2: tracked as 100644, but has mode 0664 on disk (e.g. host umask 0002)
+    f2 = repo_dir / "file2.txt"
+    f2.write_text("file 2\n", encoding="utf-8")
+    run_git(["add", "file2.txt"], cwd=repo_dir)
+
+    # script: tracked as 100755, but has mode 0644 on disk
+    f3 = repo_dir / "script.sh"
+    f3.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    run_git(["add", "script.sh"], cwd=repo_dir)
+    run_git(["update-index", "--chmod=+x", "script.sh"], cwd=repo_dir)
+
+    # Commit tree
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "base commit"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Now intentionally alter modes on disk
+    os.chmod(f1, 0o755)
+    os.chmod(f2, 0o664)
+    os.chmod(f3, 0o644)
+
+    # Add a symlink on disk pointing to an outside file to verify no chmod through symlink
+    target_outside = tmp_path / "outside.txt"
+    target_outside.write_text("outside", encoding="utf-8")
+    os.chmod(target_outside, 0o600)
+    symlink_file = repo_dir / "symlink.txt"
+    symlink_file.symlink_to(target_outside)
+
+    # Run RESTORE_MODES_SH passing repo_dir as $1
+    subprocess.run(["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)], check=True)
+
+    # Verify exact modes (mask with 0o777)
+    assert oct(f1.stat().st_mode & 0o777) == "0o644"
+    assert oct(f2.stat().st_mode & 0o777) == "0o644"
+    assert oct(f3.stat().st_mode & 0o777) == "0o755"
+    assert symlink_file.is_symlink()
+    assert oct(target_outside.stat().st_mode & 0o777) == "0o600"
+
+
+def test_restore_modes_sh_tracked_ancestor_and_final_symlinks_never_chmod(tmp_path: Path) -> None:
+    """Offline regression test for Defect 6: tracked ancestor symlinks and final symlinks never chmod outside files."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # 1. Tracked ancestor scenario: HEAD tracks pkg/secret as 100644
+    pkg_dir = repo_dir / "pkg"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    secret_tracked = pkg_dir / "secret"
+    secret_tracked.write_text("secret content\n", encoding="utf-8")
+    run_git(["add", "pkg/secret"], cwd=repo_dir)
+
+    # 2. Tracked final symlink scenario: HEAD tracks tracked_sym.txt as 100644
+    tracked_sym = repo_dir / "tracked_sym.txt"
+    tracked_sym.write_text("regular file initially\n", encoding="utf-8")
+    run_git(["add", "tracked_sym.txt"], cwd=repo_dir)
+
+    # Commit tree
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "base commit with tracked files"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Now setup hostile on-disk scenario:
+    # A) Replace pkg directory with a symlink to outside_dir containing 0600 secret
+    shutil.rmtree(pkg_dir)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_secret = outside_dir / "secret"
+    outside_secret.write_text("outside secret\n", encoding="utf-8")
+    os.chmod(outside_secret, 0o600)
+    pkg_dir.symlink_to(outside_dir, target_is_directory=True)
+
+    # B) Replace tracked_sym.txt with a symlink to outside_file containing 0600 content
+    tracked_sym.unlink()
+    outside_file = tmp_path / "outside_file.txt"
+    outside_file.write_text("outside file content\n", encoding="utf-8")
+    os.chmod(outside_file, 0o600)
+    tracked_sym.symlink_to(outside_file)
+
+    # Run RESTORE_MODES_SH: a tracked path through a symlinked ancestor refuses the restore
+    res = subprocess.run(["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+                         capture_output=True, text=True, timeout=30)
+    assert res.returncode != 0
+    assert "Refusing to restore modes" in res.stderr
+
+    # Verify outside files were NEVER chmod'd to 0644!
+    assert oct(outside_secret.stat().st_mode & 0o777) == "0o600"
+    assert oct(outside_file.stat().st_mode & 0o777) == "0o600"
+    assert pkg_dir.is_symlink()
+    assert tracked_sym.is_symlink()
+
+    # With the ancestor restored, the tracked final symlink alone also refuses the restore
+    pkg_dir.unlink()
+    pkg_dir.mkdir()
+    (pkg_dir / "secret").write_text("secret content\n", encoding="utf-8")
+    res = subprocess.run(["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+                         capture_output=True, text=True, timeout=30)
+    assert res.returncode != 0
+    assert "Refusing to restore modes" in res.stderr
+    assert oct(outside_file.stat().st_mode & 0o777) == "0o600"
+    assert tracked_sym.is_symlink()
+
 
 
 # =============================================================================
@@ -618,3 +995,102 @@ def test_cli_seal_images(tmp_path: Path, fake_swebench_image: dict) -> None:
         assert saved_report["status"] == "sealed"
     finally:
         run_docker(["rmi", "-f", sealed_tag], check=False)
+
+
+def test_regression_defect6_tracked_fifo_without_writer_promptly_rejected_and_replacement_during_open(tmp_path: Path) -> None:
+    """Defect 6: replace tracked file with FIFO without writer; assert prompt rejection and replacement during open."""
+    import stat
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    # Track regular file
+    tracked = repo_dir / "fifo_target.txt"
+    tracked.write_text("regular file\n", encoding="utf-8")
+    run_git(["add", "fifo_target.txt"], cwd=repo_dir)
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "add tracked file"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Part 1: Replace tracked file with a FIFO without a writer
+    tracked.unlink()
+    os.mkfifo(tracked)
+    os.chmod(tracked, 0o666)
+
+    proc = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    # Rejected promptly (no blocking open of the FIFO) and left untouched
+    assert proc.returncode != 0
+    assert "Refusing to restore modes" in proc.stderr
+    assert stat.S_ISFIFO(tracked.stat().st_mode)
+
+    # Part 2: Cover replacement during open
+    race_target = repo_dir / "race_target.txt"
+    race_target.write_text("initial regular\n", encoding="utf-8")
+    dir_fd = os.open(str(repo_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        st_before = os.lstat("race_target.txt", dir_fd=dir_fd)
+        assert stat.S_ISREG(st_before.st_mode)
+        race_target.unlink()
+        os.mkfifo(race_target)
+        fd = os.open("race_target.txt", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=dir_fd)
+        try:
+            st_after = os.fstat(fd)
+            is_valid = stat.S_ISREG(st_after.st_mode) and (st_before.st_dev, st_before.st_ino) == (st_after.st_dev, st_after.st_ino)
+            assert not is_valid
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def test_regression_defect7_ls_tree_lowered_caps_bounded_failure_and_child_cleanup(tmp_path: Path) -> None:
+    """Defect 7: exceed lowered output/entry cap and assert bounded failure and child cleanup."""
+    if not shutil.which("bash"):
+        pytest.skip("bash is not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    run_git(["init", "-b", "main"], cwd=repo_dir)
+    run_git(["config", "user.name", "Tester"], cwd=repo_dir)
+    run_git(["config", "user.email", "tester@example.com"], cwd=repo_dir)
+
+    for i in range(10):
+        (repo_dir / f"file_{i}.txt").write_text(f"content {i}\n", encoding="utf-8")
+        run_git(["add", f"file_{i}.txt"], cwd=repo_dir)
+
+    d = "2024-01-01T00:00:00Z"
+    run_git(["commit", "-m", "10 files"], cwd=repo_dir, env={"GIT_AUTHOR_DATE": d, "GIT_COMMITTER_DATE": d})
+
+    # Test 1: Exceed lowered byte cap
+    env_byte_cap = os.environ.copy()
+    env_byte_cap["HERMETIC_MAX_LS_TREE_BYTES"] = "20"
+    proc_bytes = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        env=env_byte_cap,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_bytes.returncode != 0
+    assert "byte cap exceeded" in proc_bytes.stderr
+
+    # Test 2: Exceed lowered entry cap
+    env_entry_cap = os.environ.copy()
+    env_entry_cap["HERMETIC_MAX_LS_TREE_ENTRIES"] = "2"
+    proc_entries = subprocess.run(
+        ["bash", "-c", RESTORE_MODES_SH, "bash", str(repo_dir)],
+        env=env_entry_cap,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_entries.returncode != 0
+    assert "entry count cap exceeded" in proc_entries.stderr
+

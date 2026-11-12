@@ -1,0 +1,20 @@
+{
+  "data": {
+    "node": {
+      "__typename": "PullRequestReviewThread",
+      "comments": {
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": null
+        },
+        "nodes": [
+          {
+            "id": "PRRC_kwDOcomment2",
+            "databaseId": 702,
+            "url": "https://github.com/test-org/test-repo/pull/50#discussion_r702"
+          }
+        ]
+      }
+    }
+  }
+}

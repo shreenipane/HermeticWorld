@@ -936,6 +936,28 @@ pub fn malformed_binary_finding(
     }
 }
 
+/// The payload decoded as UTF-16LE from byte offset 0 and from byte offset 1 (the second
+/// also reads UTF-16BE text), over its whole length. Control characters, unpaired
+/// surrogates and a trailing odd byte become line breaks, so text keeps its lines.
+pub fn utf16_text_views(bytes: &[u8]) -> [String; 2] {
+    let decode = |offset: usize| -> String {
+        let units = bytes
+            .get(offset..)
+            .unwrap_or(&[])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair));
+        char::decode_utf16(units)
+            .map(|c| match c {
+                Ok(ch) if !ch.is_control() || ch == '\t' || ch == '\n' => ch,
+                _ => '\n',
+            })
+            .collect()
+    };
+    [decode(0), decode(1)]
+}
+
 /// A corrupted header must not hide the file's strings: search its printable runs.
 pub fn malformed_fallback_strings(bytes: &[u8]) -> BinaryStrings {
     BinaryStrings {

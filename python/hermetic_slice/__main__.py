@@ -12,7 +12,7 @@ import sys
 
 from hermetic_slice.eval_spec import load_eval_rows, prepare_eval_script, write_eval_spec
 from hermetic_slice.grader import oracle_check
-from hermetic_slice.http import make_http_get
+from hermetic_slice.http import make_http_get, make_http_post_json
 from hermetic_slice.image_sealer import seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
 from hermetic_slice.pkg_index import build_index, env_info
@@ -90,6 +90,12 @@ def main(argv: list[str] | None = None) -> int:
     e3_run_parser.add_argument("--out", type=Path, required=True, help="Output directory for metrics and results")
     e3_run_parser.add_argument("--blind", type=Path, default=None, help="Optional directory containing blind cases")
 
+    dispositions_parser = subparsers.add_parser("dispositions", help="Process gate outputs and emit dispositions.json (§5.5)")
+    dispositions_parser.add_argument("--gate-output", "-i", type=Path, required=True, help="Path to gate output JSON or directory")
+    dispositions_parser.add_argument("--out", "-o", type=Path, default=Path("dispositions.json"), help="Output path for dispositions.json")
+    dispositions_parser.add_argument("--tasks-dir", type=Path, default=None, help="Optional directory containing task folders")
+    dispositions_parser.add_argument("--sealcheck", type=Path, default=None, help="Optional path to hermetic-sealcheck binary")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -127,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
 
         token = os.environ.get("GITHUB_TOKEN")
         http_get = make_http_get(args.cache, token=token)
+        http_post_json = make_http_post_json(args.cache, token=token) if token else None
 
         try:
             rows = load_verified(http_get, args.cache)
@@ -140,7 +147,15 @@ def main(argv: list[str] | None = None) -> int:
                 if task_id not in rows:
                     raise IntakeError(f"Unknown instance_id: {task_id}")
 
-                task_dir = intake_task(task_id, rows, http_get, args.cache, args.out)
+                task_dir = intake_task(
+                    task_id,
+                    rows,
+                    http_get,
+                    args.cache,
+                    args.out,
+                    token=token,
+                    http_post_json=http_post_json,
+                )
                 task_data = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
 
                 t_world = task_data["cutoffs"]["t_world"]
@@ -536,6 +551,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"Error running e3: {exc}", file=sys.stderr)
             return 1
+
+    if args.subcommand == "dispositions":
+        from hermetic_slice.dispositions import (
+            format_summary,
+            MalformedGateOutputError,
+            MissingDispositionError,
+            process_dispositions,
+        )
+
+        try:
+            _, summary = process_dispositions(
+                gate_source=args.gate_output,
+                out_path=args.out,
+                tasks_dir=args.tasks_dir,
+                sealcheck_bin=args.sealcheck,
+            )
+            print(format_summary(summary))
+            return 0
+        except (MalformedGateOutputError, MissingDispositionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            print("Fatal error processing dispositions: verification failed", file=sys.stderr)
+            return 2
 
     return 1
 

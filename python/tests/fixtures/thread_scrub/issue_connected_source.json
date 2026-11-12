@@ -1,0 +1,50 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest_connected_src",
+        "databaseId": 205,
+        "url": "https://github.com/test-org/test-repo/issues/205",
+        "body": "Issue connected as subject of incoming ConnectedEvent",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": null,
+        "includesCreatedEdit": true,
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "__typename": "ConnectedEvent",
+              "source": {
+                "__typename": "Issue",
+                "number": 350,
+                "url": "https://github.com/test-org/test-repo/issues/350"
+              },
+              "subject": {
+                "__typename": "Issue",
+                "number": 205,
+                "url": "https://github.com/test-org/test-repo/issues/205"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

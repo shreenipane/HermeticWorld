@@ -1,0 +1,57 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOtest104",
+        "databaseId": 104,
+        "url": "https://github.com/test-org/test-repo/issues/104",
+        "body": "Issue requiring pagination.",
+        "createdAt": "2020-01-01T10:00:00Z",
+        "lastEditedAt": "2020-01-10T10:00:00Z",
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": true,
+            "endCursor": "edits_cursor_p1"
+          },
+          "nodes": [
+            {
+              "createdAt": "2020-01-10T10:00:00Z",
+              "editedAt": "2020-01-10T10:00:00Z",
+              "diff": "Page 1 Edit: latest edit post-cutoff"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": true,
+            "endCursor": "comments_cursor_p1"
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOpage1_c1",
+              "databaseId": 301,
+              "url": "https://github.com/test-org/test-repo/issues/104#issuecomment-301",
+              "body": "Comment from page 1",
+              "createdAt": "2020-01-02T10:00:00Z",
+              "lastEditedAt": null,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}
