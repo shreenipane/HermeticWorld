@@ -512,19 +512,56 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                 return;
             }
 
-            // Check binary (NUL byte in first 8 KiB)
-            let check_len = bytes.len().min(8192);
-            if bytes[..check_len].contains(&0) {
+            // Binary (NUL byte in first 8 KiB): the whole payload is matched as text (control
+            // bytes split lines), as UTF-16 decoded at both byte alignments, and for printable
+            // strings (D3b), so every byte of the file is covered whatever its encoding.
+            let head = bytes.get(..8192).unwrap_or(bytes);
+            if head.contains(&0) {
                 self.push(Finding {
                     detector: "D2".into(),
-                    channel: "file".into(),
+                    channel: "binary_strings".into(),
                     path: path.to_string(),
                     visibility: self.opts.visibility,
                     severity: Severity::Info,
                     confidence: 0.0,
                     hunk: None,
-                    evidence: vec!["skipped binary file (contains NUL byte)".into()],
+                    evidence: vec![
+                        "binary file (contains NUL byte): text, UTF-16 and printable strings scanned"
+                            .into(),
+                    ],
                 });
+                self.sink.binary(
+                    path,
+                    "binary_opaque",
+                    crate::binary::malformed_fallback_strings(bytes),
+                );
+                let separated: Vec<u8> = bytes
+                    .iter()
+                    .map(|&b| {
+                        if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                            b'\n'
+                        } else {
+                            b
+                        }
+                    })
+                    .collect();
+                self.sink.text(path, &String::from_utf8_lossy(&separated));
+                for view in crate::binary::utf16_text_views(bytes) {
+                    let runs: Vec<String> = view
+                        .split('\n')
+                        .filter(|run| run.chars().count() >= 6)
+                        .map(str::to_string)
+                        .collect();
+                    self.sink.binary(
+                        path,
+                        "binary_opaque",
+                        crate::binary::BinaryStrings {
+                            exact_strings: std::collections::HashSet::new(),
+                            printable_runs: runs,
+                        },
+                    );
+                    self.sink.text(path, &view);
+                }
                 return;
             }
 

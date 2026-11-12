@@ -420,7 +420,7 @@ fn equivalence_d9_builtin_and_info_findings() {
     assert!(gates_with(&f, "dataset_host") > 0, "{f:#?}");
     assert!(gates_with(&f, "dataset_dump") > 0, "{f:#?}");
     assert!(
-        f.iter().any(|s| s.contains("skipped binary file")),
+        f.iter().any(|s| s.contains("printable strings scanned")),
         "{f:#?}"
     );
     assert!(f.iter().any(|s| s.contains("container_error")), "{f:#?}");
