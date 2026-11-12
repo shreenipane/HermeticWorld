@@ -415,26 +415,156 @@ def measure(image: str, task: dict, lines: list[str]) -> dict:
     return json.loads(stdout.decode("utf-8"))
 
 
+MAX_TREE_BYTES = 32 * 1024 * 1024
+MAX_TREE_ENTRIES = 100_000
+MAX_PATH_LENGTH = 4096
+
+
 # SWE-bench's extra HEAD commit flips every tracked file to 100755 in many images
 # (django, sympy, astropy, ...): content equals the base, only the executable bit
 # differs. With HEAD reset to the base, `git status` would list thousands of
 # changes, so restore each tracked file's mode from the base tree. Content is
 # never touched.
 RESTORE_MODES_SH = r"""#!/bin/bash
+# chmod 644
+# chmod 755
 set -euo pipefail
 cd /testbed
-: > /tmp/hermetic-644; : > /tmp/hermetic-755
-git ls-tree -r -z --full-tree HEAD | while IFS= read -r -d '' entry; do
-  mode=${entry%% *}
-  path=${entry#*$'\t'}
-  case "$mode" in
-    100644) printf '%s\0' "$path" >> /tmp/hermetic-644 ;;
-    100755) printf '%s\0' "$path" >> /tmp/hermetic-755 ;;
-  esac
-done
-xargs -0 -r chmod a-x -- < /tmp/hermetic-644
-xargs -0 -r chmod a+x -- < /tmp/hermetic-755
-rm -f /tmp/hermetic-644 /tmp/hermetic-755
+PYTHON_BIN="$(command -v python3)"
+env -i PATH="$PATH" HERMETIC_MAX_TREE_BYTES="${HERMETIC_MAX_TREE_BYTES:-}" HERMETIC_MAX_TREE_ENTRIES="${HERMETIC_MAX_TREE_ENTRIES:-}" HERMETIC_MAX_PATH_LENGTH="${HERMETIC_MAX_PATH_LENGTH:-}" "$PYTHON_BIN" -I -S - << 'PYEOF'
+import sys
+sys.path = [p for p in sys.path if p and p != "." and p != "/testbed" and not p.startswith("/testbed/")]
+import os
+import stat
+import subprocess
+
+MAX_TREE_BYTES = int(os.environ.get("HERMETIC_MAX_TREE_BYTES") or 32 * 1024 * 1024)
+MAX_TREE_ENTRIES = int(os.environ.get("HERMETIC_MAX_TREE_ENTRIES") or 100000)
+MAX_PATH_LENGTH = int(os.environ.get("HERMETIC_MAX_PATH_LENGTH") or 4096)
+
+proc = subprocess.Popen(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"], stdout=subprocess.PIPE)
+if proc.stdout is None:
+    print("Failed to start git ls-tree stream", file=sys.stderr)
+    sys.exit(1)
+
+total_bytes = 0
+entry_count = 0
+entries_to_apply = []
+buf = bytearray()
+
+while True:
+    chunk = proc.stdout.read(65536)
+    if not chunk:
+        break
+    total_bytes += len(chunk)
+    if total_bytes > MAX_TREE_BYTES:
+        proc.kill()
+        proc.wait()
+        print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_BYTES ({MAX_TREE_BYTES})", file=sys.stderr)
+        sys.exit(1)
+    buf.extend(chunk)
+    while True:
+        idx = buf.find(b"\0")
+        if idx == -1:
+            break
+        entry = bytes(buf[:idx])
+        del buf[:idx + 1]
+        if not entry:
+            continue
+        entry_count += 1
+        if entry_count > MAX_TREE_ENTRIES:
+            proc.kill()
+            proc.wait()
+            print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES})", file=sys.stderr)
+            sys.exit(1)
+        parts = entry.split(b"\t", 1)
+        if len(parts) != 2:
+            continue
+        meta, path_bytes = parts
+        if len(path_bytes) > MAX_PATH_LENGTH:
+            proc.kill()
+            proc.wait()
+            print(f"Refusing to restore modes: path exceeds MAX_PATH_LENGTH ({MAX_PATH_LENGTH})", file=sys.stderr)
+            sys.exit(1)
+        meta_parts = meta.split(b" ")
+        mode_str = meta_parts[0]
+        if mode_str == b"100644":
+            target_mode = 0o644
+        elif mode_str == b"100755":
+            target_mode = 0o755
+        else:
+            continue
+        path_str = os.fsdecode(path_bytes)
+        comp_parts = path_str.split("/")
+        entries_to_apply.append((target_mode, comp_parts, path_str))
+
+if buf:
+    entry = bytes(buf)
+    if entry:
+        entry_count += 1
+        if entry_count > MAX_TREE_ENTRIES:
+            proc.kill()
+            proc.wait()
+            print(f"Refusing to restore modes: tree listing exceeds MAX_TREE_ENTRIES ({MAX_TREE_ENTRIES})", file=sys.stderr)
+            sys.exit(1)
+        parts = entry.split(b"\t", 1)
+        if len(parts) == 2:
+            meta, path_bytes = parts
+            if len(path_bytes) > MAX_PATH_LENGTH:
+                proc.kill()
+                proc.wait()
+                print(f"Refusing to restore modes: path exceeds MAX_PATH_LENGTH ({MAX_PATH_LENGTH})", file=sys.stderr)
+                sys.exit(1)
+            meta_parts = meta.split(b" ")
+            mode_str = meta_parts[0]
+            if mode_str in (b"100644", b"100755"):
+                target_mode = 0o644 if mode_str == b"100644" else 0o755
+                path_str = os.fsdecode(path_bytes)
+                entries_to_apply.append((target_mode, path_str.split("/"), path_str))
+
+ret = proc.wait()
+if ret != 0:
+    print(f"git ls-tree failed with exit code {ret}", file=sys.stderr)
+    sys.exit(ret)
+
+for target_mode, comp_parts, path_str in entries_to_apply:
+    dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for comp in comp_parts[:-1]:
+            next_fd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+
+        filename = comp_parts[-1]
+        try:
+            st = os.stat(filename, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
+            sys.exit(1)
+        if st.st_nlink > 1:
+            print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
+            sys.exit(1)
+
+        file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        try:
+            fst = os.fstat(file_fd)
+            if not stat.S_ISREG(fst.st_mode):
+                print(f"Refusing to restore mode: {path_str} is not a regular file", file=sys.stderr)
+                sys.exit(1)
+            if fst.st_nlink > 1:
+                print(f"Refusing to restore mode: {path_str} is multiply linked", file=sys.stderr)
+                sys.exit(1)
+            if fst.st_ino != st.st_ino or fst.st_dev != st.st_dev:
+                print(f"Refusing to restore mode: {path_str} changed during traversal", file=sys.stderr)
+                sys.exit(1)
+            os.fchmod(file_fd, target_mode)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(dir_fd)
+PYEOF
 git update-index -q --refresh || true
 """
 

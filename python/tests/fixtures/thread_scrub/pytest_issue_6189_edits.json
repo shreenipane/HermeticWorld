@@ -1,0 +1,51 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "id": "I_kwDOpytest6189",
+        "databaseId": 6189,
+        "url": "https://github.com/pytest-dev/pytest/issues/6189",
+        "body": "Headline bug with fix appended later.",
+        "createdAt": "2019-11-14T13:11:34Z",
+        "lastEditedAt": "2019-11-20T12:00:00Z",
+        "userContentEdits": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "createdAt": "2019-11-20T12:00:00Z",
+              "editedAt": "2019-11-20T12:00:00Z",
+              "diff": "Headline bug. Fix: change replace to return s"
+            },
+            {
+              "createdAt": "2019-11-14T13:11:34Z",
+              "editedAt": "2019-11-14T13:11:34Z",
+              "diff": "Headline bug with pre-cutoff description"
+            },
+            {
+              "createdAt": "2019-11-14T13:00:00Z",
+              "editedAt": "2019-11-14T13:00:00Z",
+              "diff": "Initial issue report"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}

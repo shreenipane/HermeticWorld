@@ -1,0 +1,31 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "IC_kwDOpage2_c2",
+              "databaseId": 302,
+              "url": "https://github.com/test-org/test-repo/issues/104#issuecomment-302",
+              "body": "Comment from page 2",
+              "createdAt": "2020-01-04T10:00:00Z",
+              "lastEditedAt": null,
+              "userContentEdits": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
