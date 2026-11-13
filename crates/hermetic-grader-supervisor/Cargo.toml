@@ -10,6 +10,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 
+hermetic-grader-sandbox = { path = "../hermetic-grader-sandbox" }
+rustix = { version = "=1.1.6", features = ["fs", "process", "thread", "mount", "system", "time", "event", "stdio"] }
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 hermetic-grader-result = { path = "../hermetic-grader-result" }

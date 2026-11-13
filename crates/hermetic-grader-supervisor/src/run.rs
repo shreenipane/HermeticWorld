@@ -60,6 +60,8 @@ pub struct RunConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub cwd: String,
+    #[serde(default)]
+    pub sandbox: crate::sandbox::SandboxSettings,
     #[serde(alias = "deadline_secs")]
     pub deadline_seconds: u64,
     #[serde(alias = "expected_tests")]
@@ -110,7 +112,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::InvalidJson(e) => write!(f, "invalid run config JSON: {}", e),
+            ConfigError::InvalidJson(_) => write!(f, "invalid run config JSON"),
             ConfigError::EmptyArgv => write!(f, "config argv must not be empty"),
             ConfigError::TooManyArgs { count, max } => {
                 write!(f, "config argv has {} items (max {})", count, max)
@@ -125,12 +127,8 @@ impl fmt::Display for ConfigError {
             ConfigError::TooManyEnvVars { count, max } => {
                 write!(f, "config env has {} entries (max {})", count, max)
             }
-            ConfigError::EnvEntryTooLong { key, len, max } => {
-                write!(
-                    f,
-                    "env entry '{}' length {} exceeds max {} bytes",
-                    key, len, max
-                )
+            ConfigError::EnvEntryTooLong { len, max, .. } => {
+                write!(f, "env entry length {} exceeds max {} bytes", len, max)
             }
             ConfigError::InvalidCwd(msg) => write!(f, "invalid config cwd: {}", msg),
             ConfigError::InvalidDeadline { seconds, max } => {
@@ -144,9 +142,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "expected_test_ids count {} exceeds max {}", count, max)
             }
             ConfigError::InvalidTestId(msg) => write!(f, "invalid expected test id: {}", msg),
-            ConfigError::DuplicateTestId(id) => {
-                write!(f, "duplicate expected test id in config: '{}'", id)
-            }
+            ConfigError::DuplicateTestId(_) => write!(f, "duplicate expected test id in config"),
             ConfigError::InvalidVariantSetHash(msg) => {
                 write!(f, "invalid variant_set sha256: {}", msg)
             }
@@ -159,8 +155,14 @@ impl std::error::Error for ConfigError {}
 impl RunConfig {
     /// Parses and strictly validates a JSON run configuration.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let mut cfg: RunConfig =
-            serde_json::from_slice(bytes).map_err(|e| ConfigError::InvalidJson(e.to_string()))?;
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::InvalidJson(
+                "configuration exceeds size cap".into(),
+            ));
+        }
+        let mut cfg: RunConfig = serde_json::from_slice(bytes).map_err(|e| {
+            ConfigError::InvalidJson(format!("schema error at {}:{}", e.line(), e.column()))
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -184,7 +186,7 @@ impl RunConfig {
                     max: MAX_ARG_BYTES,
                 });
             }
-            if arg.len() > MAX_ARG_BYTES {
+            if arg.len() > MAX_ARG_BYTES || arg.contains('\0') {
                 return Err(ConfigError::ArgTooLong {
                     index: idx,
                     len: arg.len(),
@@ -202,21 +204,21 @@ impl RunConfig {
         for (k, v) in &self.env {
             if k.is_empty() || k.contains('=') || k.contains('\0') {
                 return Err(ConfigError::EnvEntryTooLong {
-                    key: k.clone(),
+                    key: "redacted".into(),
                     len: k.len(),
                     max: MAX_ENV_ENTRY_BYTES,
                 });
             }
             if k.len() > MAX_ENV_ENTRY_BYTES {
                 return Err(ConfigError::EnvEntryTooLong {
-                    key: k.clone(),
+                    key: "redacted".into(),
                     len: k.len(),
                     max: MAX_ENV_ENTRY_BYTES,
                 });
             }
-            if v.len() > MAX_ENV_ENTRY_BYTES {
+            if v.len() > MAX_ENV_ENTRY_BYTES || v.contains('\0') {
                 return Err(ConfigError::EnvEntryTooLong {
-                    key: k.clone(),
+                    key: "redacted".into(),
                     len: v.len(),
                     max: MAX_ENV_ENTRY_BYTES,
                 });
@@ -254,7 +256,7 @@ impl RunConfig {
                 )));
             }
             if !seen.insert(id.clone()) {
-                return Err(ConfigError::DuplicateTestId(id.clone()));
+                return Err(ConfigError::DuplicateTestId("redacted".into()));
             }
         }
 
@@ -481,7 +483,14 @@ pub fn run_supervisor<O: Os>(
         argv: config.argv.clone(),
         env: config.env.clone(),
         cwd: PathBuf::from(&config.cwd),
+        sandbox: config.sandbox.clone(),
+        deadline_seconds: config.deadline_seconds,
     };
+
+    crate::sandbox::build_plan(&spawn_spec).map_err(|_| OsError::Io {
+        operation: "validate_sandbox",
+        detail: "invalid sandbox configuration".into(),
+    })?;
 
     let start_time = os.now_monotonic();
     let deadline_at = start_time.saturating_add(Duration::from_secs(config.deadline_seconds));

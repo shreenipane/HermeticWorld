@@ -36,7 +36,7 @@ impl fmt::Display for CliError {
             CliError::TooManyArgs => write!(f, "too many command-line arguments"),
             CliError::MissingValue(flag) => write!(f, "flag {} requires a file path value", flag),
             CliError::DuplicateFlag(flag) => write!(f, "flag {} specified more than once", flag),
-            CliError::UnknownArgument(arg) => write!(f, "unknown argument: {}", arg),
+            CliError::UnknownArgument(_) => write!(f, "unknown argument"),
             CliError::MissingRequiredFlag(flag) => write!(f, "missing required flag: {}", flag),
             CliError::Supervisor(err) => write!(f, "{}", err),
         }
@@ -131,6 +131,20 @@ where
 }
 
 fn main() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().take(3).collect();
+    if args.len() == 2 {
+        if let Some(mode) = args.get(1).and_then(|s| s.to_str()) {
+            if matches!(mode, "--sandbox-launch" | "--sandbox-init") {
+                return if hermetic_grader_supervisor::sandbox::helper(mode == "--sandbox-init")
+                    .is_ok()
+                {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+        }
+    }
     let mut os = RealOs::new();
     match run_with_os(std::env::args_os(), &mut os) {
         Ok(()) => ExitCode::SUCCESS,

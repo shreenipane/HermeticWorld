@@ -1,11 +1,14 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread::{self, JoinHandle};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Maximum bytes read from the child result pipe in a single `read_pipe` call.
@@ -54,11 +57,14 @@ impl fmt::Display for OsError {
 impl std::error::Error for OsError {}
 
 /// Process launch specification passed to [`Os::spawn`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnSpec {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    pub sandbox: crate::sandbox::SandboxSettings,
+    pub deadline_seconds: u64,
 }
 
 /// Result of attempting to read from the child's result pipe.
@@ -126,64 +132,87 @@ pub trait Os {
     fn write_file_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), OsError>;
 }
 
-/// Real operating system implementation built strictly on `std::process` and `std`
-/// with `#![forbid(unsafe_code)]`.
-///
-/// # Limitations & Required Hardening for a Future Privileged Release
-/// Because this implementation uses `std::process` only without `unsafe` FFI or external
-/// system crates:
-/// 1. **Namespaces**: A later version must enter isolated PID, mount, network, IPC, UTS,
-///    and cgroup namespaces (`unshare` / `clone3`) before executing untrusted test code.
-/// 2. **Capability Drop**: A later version must clear ambient/inheritable/permitted capabilities
-///    and drop the capability bounding set (`prctl(PR_CAPBSET_DROP)` + `capset`) plus set
-///    `PR_SET_NO_NEW_PRIVS`.
-/// 3. **Device Cgroup**: A later version must attach the test process tree to a restrictive
-///    cgroup v2 device controller denying raw block/char device access (specifically blocking
-///    access to the result disk device until the supervisor writes it).
-/// 4. **Dedicated Extra Pipe FD & Process Group Kill**: Safe `std::process::Command` only exposes
-///    fds 0, 1, and 2 without `unsafe` `pre_exec`/`dup2`, so `RealOs` passes the result stream over
-///    fd 2 (`stderr`, advertising `HERMETIC_RESULT_FD=2`) while discarding stdout. A later version
-///    must `dup2` the result pipe onto a dedicated higher fd (such as fd 3) while keeping stderr
-///    isolated, and issue `kill(-pgid, SIGKILL)` to terminate all descendants in the process group
-///    rather than `Child::kill()` on the leader PID alone.
+/// Linux execution with a fresh single-threaded namespace helper.
 pub struct RealOs {
     epoch: Instant,
+    launcher: Option<PathBuf>,
 }
-
 impl RealOs {
-    /// Creates a new `RealOs` anchored at the current monotonic instant.
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
+            launcher: None,
+        }
+    }
+    /// Select the trusted supervisor executable (also used by integration tests).
+    pub fn with_launcher(path: PathBuf) -> Self {
+        Self {
+            epoch: Instant::now(),
+            launcher: Some(path),
         }
     }
 }
-
 impl Default for RealOs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Child handle managed by [`RealOs`].
 pub struct RealChild {
     child: Child,
-    pipe_rx: Receiver<Result<Vec<u8>, OsError>>,
-    reader_thread: Option<JoinHandle<()>>,
-    pipe_eof: bool,
+    pipe: Option<ChildStdout>,
+    init: Option<OwnedFd>,
     exited: Option<ExitKind>,
 }
-
-impl Drop for RealChild {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // The reader thread is detached, never joined: a descendant may still hold the write
-        // end of the pipe, or the thread may be blocked sending into the channel whose receiver
-        // is only dropped after this function returns. Joining would hang forever.
-        drop(self.reader_thread.take());
+fn os_error(operation: &'static str, _: impl std::fmt::Display) -> OsError {
+    OsError::Io {
+        operation,
+        detail: "operation refused".into(),
     }
 }
+fn group_pid(child: &Child) -> Result<rustix::process::Pid, OsError> {
+    rustix::process::Pid::from_raw(i32::try_from(child.id()).map_err(|e| os_error("pid", e))?)
+        .ok_or_else(|| os_error("pid", "invalid"))
+}
+fn kill_group(child: &Child) -> Result<(), OsError> {
+    match rustix::process::kill_process_group(group_pid(child)?, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(e) => Err(os_error("kill_group", e)),
+    }
+}
+fn init_done(child: &RealChild) -> Result<bool, OsError> {
+    let Some(fd) = &child.init else {
+        return Ok(true);
+    };
+    let mut poll = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
+    rustix::event::poll(
+        &mut poll,
+        Some(&rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    )
+    .map(|n| n != 0)
+    .map_err(|e| os_error("pidfd_poll", e))
+}
+impl Drop for RealChild {
+    fn drop(&mut self) {
+        if self.exited.is_none() {
+            let _ = kill_group(&self.child);
+            if let Some(init) = &self.init {
+                let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
+            }
+            // Cleanup never blocks indefinitely on an uninterruptible process.
+            for _ in 0..MAX_DROP_POLLS {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            }
+        }
+    }
+}
+const MAX_DROP_POLLS: usize = 200;
 
 impl Os for RealOs {
     type Child = RealChild;
@@ -193,92 +222,82 @@ impl Os for RealOs {
     }
 
     fn read_file(&mut self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, OsError> {
-        let file = File::open(path).map_err(|e| OsError::Io {
-            operation: "open",
-            detail: format!("{}: {}", path.display(), e),
-        })?;
+        let cap = max_bytes.min(MAX_FILE_READ_BYTES);
+        let file = crate::sandbox::open_path(
+            path,
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::FileType::RegularFile,
+        )
+        .map(File::from)
+        .map_err(|e| os_error("open_config", e))?;
         let mut buf = Vec::new();
-        let limit = u64::try_from(max_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        file.take(limit)
-            .read_to_end(&mut buf)
-            .map_err(|e| OsError::Io {
-                operation: "read",
-                detail: format!("{}: {}", path.display(), e),
-            })?;
-        if buf.len() > max_bytes {
+        file.take(
+            u64::try_from(cap)
+                .map_err(|e| os_error("read_cap", e))?
+                .saturating_add(1),
+        )
+        .read_to_end(&mut buf)
+        .map_err(|e| os_error("read_config", e))?;
+        if buf.len() > cap {
             return Err(OsError::FileTooLarge {
                 size: buf.len(),
-                max: max_bytes,
+                max: cap,
             });
         }
         Ok(buf)
     }
 
     fn spawn(&mut self, spec: &SpawnSpec) -> Result<Self::Child, OsError> {
-        let (program, args) = spec.argv.split_first().ok_or(OsError::EmptyArgv)?;
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        cmd.current_dir(&spec.cwd);
-        cmd.env_clear();
-        for (k, v) in &spec.env {
-            cmd.env(k, v);
-        }
-        if !spec.env.contains_key("HERMETIC_RESULT_FD") {
-            cmd.env("HERMETIC_RESULT_FD", "2");
-        }
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        let mut child = cmd.spawn().map_err(|e| OsError::Io {
-            operation: "spawn",
-            detail: e.to_string(),
-        })?;
-
-        let mut stderr_pipe = child.stderr.take().ok_or_else(|| OsError::Io {
-            operation: "take_pipe",
-            detail: "child stderr pipe missing".to_string(),
-        })?;
-
-        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>, OsError>>(REAL_OS_PIPE_CHANNEL_BOUND);
-        let reader_thread = thread::spawn(move || {
-            let mut buf = vec![0u8; MAX_PIPE_CHUNK_BYTES];
-            for _ in 0..MAX_READ_STEPS {
-                match stderr_pipe.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = buf.get(..n).unwrap_or(&[]).to_vec();
-                        if tx.send(Ok(chunk)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        let _ = tx.send(Err(OsError::Io {
-                            operation: "read_pipe",
-                            detail: e.to_string(),
-                        }));
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(RealChild {
+        crate::sandbox::build_plan(spec).map_err(|e| os_error("validate_sandbox", e))?;
+        let launcher = match &self.launcher {
+            Some(p) => p.clone(),
+            None => std::env::current_exe().map_err(|e| os_error("launcher", e))?,
+        };
+        let (mut peer, socket) = UnixStream::pair().map_err(|e| os_error("socket", e))?;
+        let timeout =
+            crate::sandbox::STARTUP_TIMEOUT.min(Duration::from_secs(spec.deadline_seconds.max(1)));
+        peer.set_read_timeout(Some(timeout))
+            .map_err(|e| os_error("timeout", e))?;
+        peer.set_write_timeout(Some(timeout))
+            .map_err(|e| os_error("timeout", e))?;
+        let fd: OwnedFd = socket.into();
+        let child = Command::new(launcher)
+            .arg("--sandbox-launch")
+            .env_clear()
+            .stdin(Stdio::from(fd))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|e| os_error("spawn", e))?;
+        let mut handle = RealChild {
             child,
-            pipe_rx: rx,
-            reader_thread: Some(reader_thread),
-            pipe_eof: false,
+            pipe: None,
+            init: None,
             exited: None,
-        })
+        };
+        handle.pipe = handle.child.stdout.take();
+        crate::sandbox::write_spec(&mut peer, spec).map_err(|e| os_error("launch_input", e))?;
+        let mut pid = [0; 4];
+        peer.read_exact(&mut pid)
+            .map_err(|e| os_error("launch_handshake", e))?;
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(u32::from_le_bytes(pid)).map_err(|e| os_error("init_pid", e))?,
+        )
+        .ok_or_else(|| os_error("init_pid", "invalid"))?;
+        handle.init = Some(
+            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                .map_err(|e| os_error("pin_init", e))?,
+        );
+        peer.write_all(&[1])
+            .map_err(|e| os_error("launch_ack", e))?;
+        let pipe = handle
+            .pipe
+            .as_ref()
+            .ok_or_else(|| os_error("record_pipe", "missing"))?;
+        rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK)
+            .map_err(|e| os_error("nonblock", e))?;
+        Ok(handle)
     }
 
     fn read_pipe(
@@ -287,43 +306,57 @@ impl Os for RealOs {
         max_bytes: usize,
         timeout: Duration,
     ) -> Result<PipeRead, OsError> {
-        if child.pipe_eof || max_bytes == 0 {
+        let Some(pipe) = &mut child.pipe else {
             return Ok(PipeRead::Eof);
-        }
-        let recv_res = if timeout.is_zero() {
-            child.pipe_rx.try_recv().map_err(|e| match e {
-                std::sync::mpsc::TryRecvError::Empty => RecvTimeoutError::Timeout,
-                std::sync::mpsc::TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
-            })
-        } else {
-            child.pipe_rx.recv_timeout(timeout)
         };
-
-        match recv_res {
-            Ok(Ok(mut data)) => {
-                if data.len() > max_bytes {
-                    data.truncate(max_bytes);
-                }
-                Ok(PipeRead::Data(data))
-            }
-            Ok(Err(err)) => Err(err),
-            Err(RecvTimeoutError::Timeout) => Ok(PipeRead::WouldBlock),
-            Err(RecvTimeoutError::Disconnected) => {
-                child.pipe_eof = true;
+        if max_bytes == 0 {
+            return Ok(PipeRead::WouldBlock);
+        }
+        let timeout =
+            rustix::time::Timespec::try_from(timeout.min(Duration::from_millis(POLL_INTERVAL_MS)))
+                .map_err(|e| os_error("poll_timeout", e))?;
+        let mut poll = [rustix::event::PollFd::new(
+            &*pipe,
+            rustix::event::PollFlags::IN,
+        )];
+        match rustix::event::poll(&mut poll, Some(&timeout)) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => return Ok(PipeRead::WouldBlock),
+            Err(e) => return Err(os_error("poll_pipe", e)),
+            Ok(_) => {}
+        }
+        let mut data = vec![0; max_bytes.min(MAX_PIPE_CHUNK_BYTES)];
+        match pipe.read(&mut data) {
+            Ok(0) => {
+                child.pipe = None;
                 Ok(PipeRead::Eof)
             }
+            Ok(n) => {
+                data.truncate(n);
+                Ok(PipeRead::Data(data))
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(PipeRead::WouldBlock)
+            }
+            Err(e) => Err(os_error("read_pipe", e)),
         }
     }
 
     fn kill_process_group(&mut self, child: &mut Self::Child) -> Result<(), OsError> {
-        match child.child.kill() {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
-            Err(e) => Err(OsError::Io {
-                operation: "kill_process_group",
-                detail: e.to_string(),
-            }),
+        if child.exited.is_some() {
+            return Ok(());
         }
+        if let Some(init) = &child.init {
+            match rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(e) => return Err(os_error("kill_init", e)),
+            }
+        }
+        kill_group(&child.child)
     }
 
     fn wait_tree(
@@ -331,116 +364,110 @@ impl Os for RealOs {
         child: &mut Self::Child,
         timeout: Duration,
     ) -> Result<TreeStatus, OsError> {
+        use rustix::process::{self, WaitId, WaitIdOptions as W};
         if let Some(kind) = child.exited {
             return Ok(TreeStatus::Exited(kind));
         }
-        match child.child.try_wait() {
-            Ok(Some(status)) => {
-                let kind = if status.code().is_some() {
-                    ExitKind::Clean
-                } else {
-                    ExitKind::Crash
-                };
-                // The leader has exited, but a descendant that inherited the result pipe keeps
-                // the tree alive until it closes it. Never block on the reader thread here (that
-                // would stall past every deadline); report `Running` until the reader has seen
-                // end-of-file, so the supervisor keeps enforcing its deadline and kill path.
-                let reader_done = child
-                    .reader_thread
-                    .as_ref()
-                    .is_none_or(JoinHandle::is_finished);
-                if !reader_done {
-                    let sleep_for = timeout.min(Duration::from_millis(POLL_INTERVAL_MS));
-                    if !sleep_for.is_zero() {
-                        thread::sleep(sleep_for);
-                    }
-                    return Ok(TreeStatus::Running);
-                }
-                if let Some(handle) = child.reader_thread.take() {
-                    // Already finished, so this returns immediately.
-                    let _ = handle.join();
-                }
-                child.exited = Some(kind);
-                Ok(TreeStatus::Exited(kind))
-            }
-            Ok(None) => {
-                let sleep_for = timeout.min(Duration::from_millis(POLL_INTERVAL_MS));
-                if !sleep_for.is_zero() {
-                    thread::sleep(sleep_for);
-                }
-                Ok(TreeStatus::Running)
-            }
-            Err(e) => Err(OsError::Io {
-                operation: "wait_tree",
-                detail: e.to_string(),
-            }),
+        // Do not reap before signaling the group: retaining the leader zombie
+        // reserves its PID and prevents signals from reaching a recycled PGID.
+        let status = process::waitid(
+            WaitId::Pid(group_pid(&child.child)?),
+            W::EXITED | W::NOHANG | W::NOWAIT,
+        )
+        .map_err(|e| os_error("waitid", e))?;
+        if status.is_some() && init_done(child)? {
+            kill_group(&child.child)?;
+            let status = child
+                .child
+                .try_wait()
+                .map_err(|e| os_error("reap", e))?
+                .ok_or_else(|| os_error("reap", "missing"))?;
+            let kind = if status.success() {
+                ExitKind::Clean
+            } else {
+                ExitKind::Crash
+            };
+            child.exited = Some(kind);
+            return Ok(TreeStatus::Exited(kind));
         }
+        let delay = timeout.min(Duration::from_millis(POLL_INTERVAL_MS));
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        Ok(TreeStatus::Running)
     }
 
     fn write_file_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), OsError> {
-        let is_special_device = match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(OsError::Io {
-                    operation: "open_result",
-                    detail: format!("{}: refusing to write through a symlink", path.display()),
-                });
-            }
-            Ok(meta) => !meta.file_type().is_file(),
-            Err(_) => false,
-        };
-
-        if is_special_device {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|e| OsError::Io {
-                    operation: "open_device",
-                    detail: format!("{}: {}", path.display(), e),
-                })?;
-            file.write_all(bytes).map_err(|e| OsError::Io {
-                operation: "write_device",
-                detail: format!("{}: {}", path.display(), e),
-            })?;
-            file.sync_all().map_err(|e| OsError::Io {
-                operation: "sync_device",
-                detail: format!("{}: {}", path.display(), e),
-            })?;
-            return Ok(());
+        use rustix::fs::{self as fs, AtFlags, FileType, Mode, OFlags};
+        if bytes.len() > crate::disk::RESULT_DISK_BYTES {
+            return Err(os_error("write_cap", "too large"));
         }
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = path
+        let parent_path = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = crate::sandbox::open_path(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            FileType::Directory,
+        )
+        .map_err(|e| os_error("result_parent", e))?;
+        let name = path
             .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("result-disk");
-        let tmp_path = parent.join(format!(".{}.tmp", file_name));
-
-        {
-            // `create_new` (O_CREAT | O_EXCL) never follows or truncates an entry planted at the
-            // predictable temporary path.
-            let mut tmp_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-                .map_err(|e| OsError::Io {
-                    operation: "create_temp",
-                    detail: format!("{}: {}", tmp_path.display(), e),
-                })?;
-            tmp_file.write_all(bytes).map_err(|e| OsError::Io {
-                operation: "write_temp",
-                detail: format!("{}: {}", tmp_path.display(), e),
-            })?;
-            tmp_file.sync_all().map_err(|e| OsError::Io {
-                operation: "sync_temp",
-                detail: format!("{}: {}", tmp_path.display(), e),
-            })?;
+            .ok_or_else(|| os_error("result_name", "missing"))?;
+        match fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(meta) if FileType::from_raw_mode(meta.st_mode) == FileType::BlockDevice => {
+                // The sole intentional special-file write is the result block
+                // drive. Compare lstat and fstat on the pinned parent and reject links.
+                let pinned =
+                    crate::sandbox::open_at(&parent, name, OFlags::PATH, FileType::BlockDevice)
+                        .map_err(|e| os_error("pin_result_drive", e))?;
+                let after = fs::fstat(&pinned).map_err(|e| os_error("stat_result_drive", e))?;
+                if after.st_dev != meta.st_dev
+                    || after.st_ino != meta.st_ino
+                    || FileType::from_raw_mode(after.st_mode) != FileType::BlockDevice
+                {
+                    return Err(os_error("result_drive_changed", "invalid"));
+                }
+                let fd = crate::sandbox::reopen_pin(&pinned, OFlags::WRONLY)
+                    .map_err(|e| os_error("open_result_drive", e))?;
+                let mut file = File::from(fd);
+                file.write_all(bytes)
+                    .map_err(|e| os_error("write_result_drive", e))?;
+                return file
+                    .sync_all()
+                    .map_err(|e| os_error("sync_result_drive", e));
+            }
+            Ok(meta) if FileType::from_raw_mode(meta.st_mode) != FileType::RegularFile => {
+                return Err(os_error("result_type", "invalid"))
+            }
+            Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(os_error("result_stat", e)),
         }
-
-        fs::rename(&tmp_path, path).map_err(|e| OsError::Io {
-            operation: "rename_atomic",
-            detail: format!("{} -> {}: {}", tmp_path.display(), path.display(), e),
-        })?;
-        Ok(())
+        let mut temp = std::ffi::OsString::from(".");
+        temp.push(name);
+        temp.push(".tmp");
+        let fd = fs::openat(
+            &parent,
+            &temp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| os_error("create_result", e))?;
+        let mut file = File::from(fd);
+        let result = (|| {
+            fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|e| os_error("mode_result", e))?;
+            file.write_all(bytes)
+                .map_err(|e| os_error("write_result", e))?;
+            file.sync_all().map_err(|e| os_error("sync_result", e))?;
+            fs::renameat(&parent, &temp, &parent, name)
+                .map_err(|e| os_error("rename_result", e))?;
+            fs::fsync(&parent).map_err(|e| os_error("sync_result_parent", e))
+        })();
+        if result.is_err() {
+            let _ = fs::unlinkat(&parent, &temp, AtFlags::empty());
+        }
+        result
     }
 }
 
@@ -787,5 +814,57 @@ impl Os for FakeOs {
         self.written_files
             .insert(path.to_path_buf(), bytes.to_vec());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod real_tests {
+    use super::*;
+    #[test]
+    fn group_kill_stops_background_writers_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("heartbeat");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "while :; do printf x >> \"$MARKER\"; sleep 0.01; done & wait",
+            ])
+            .env_clear()
+            .env("MARKER", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut handle = RealChild {
+            child,
+            pipe: None,
+            init: None,
+            exited: None,
+        };
+        for _ in 0..MAX_DROP_POLLS {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+        assert!(marker.exists());
+        let mut os = RealOs::new();
+        os.kill_process_group(&mut handle).unwrap();
+        let mut exited = false;
+        for _ in 0..MAX_DROP_POLLS {
+            if matches!(
+                os.wait_tree(&mut handle, Duration::from_millis(POLL_INTERVAL_MS))
+                    .unwrap(),
+                TreeStatus::Exited(_)
+            ) {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited);
+        let bytes = std::fs::read(&marker).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read(marker).unwrap(), bytes);
     }
 }
