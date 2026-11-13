@@ -190,10 +190,10 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] First-cut runtime: PID 1 clock setup, fixed eth0 addresses, table DNS, HTTP filter to persistent serialized WorldServer frames (CID 2 port 5001), ingress/egress service-port filter, forwarding and IPv6 off; offline transport/policy tests
   - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver in run spec and trusted harness network commands through execd
   - [ ] Open: automatic eth0 initialization from the AgentVM run spec requires an execd schema/boot change; this cut supplies trusted harness commands and sets the existing resolver field.
-  - [ ] Open: TLS termination, world-CA private-key delivery at boot and leaf minting (TR-NET-1/3/4); 443 currently dropped
-  - [ ] Open: TPROXY (TR-NET-3); first cut owns manifest world addresses as /32s and listens directly on port 80
-  - [ ] Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image
-  - [ ] Open: two-VM boot/network verification; this environment has no /dev/kvm. Run `scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"` on the prepared host with a policy-checked kernel including built-in legacy IPv4 filtering (see BOOT_NOTES.md, Network VM).
+  - [ ] Open: TLS termination, world-CA private-key delivery at boot and leaf minting (TR-NET-1/3/4), AgentVM trust injection in the smoke, and a successful verified HTTPS fetch. The handoff approved rustls but the current task forbids new dependencies; 443 remains dropped. HTTPS denial is smoke-tested; implementation plan in BOOT_NOTES.md.
+  - [x] TR-NET-3 interception fallback: fixed eth0 PREROUTING REDIRECT for TCP 80/443 independent of destination IP, bounded conntrack/fragment state, deny filter installed first. AgentVM /32 plus an explicit peer route sends other link addresses through the filter. 443 remains denied until TLS exists; offline rule/route/failure tests pass, VM verification remains open.
+  - [ ] Open: dm-verity for NetVM (TR-NET-1). No veritysetup tool is installed; pinned kernel has DM_INIT disabled; guest-kernel boot policy requires root=/dev/vda and rejects dm setup arguments. Requires authenticated root-hash metadata and VMM boot wiring; precise plan and corruption checks in BOOT_NOTES.md. Current image is D4-checked read-only ext4.
+  - [ ] Open: two-VM boot/network verification; this environment has no /dev/kvm. Run `scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"` on the prepared host with a policy-checked kernel including built-in legacy IPv4 filtering, NAT, conntrack and REDIRECT (see BOOT_NOTES.md, Network VM).
 - [ ] AgentVM on a CoW world; Mode H through vsock 5000
 - [ ] Mode G: `/opt/agent` volume, model path NetVM → gateway (cut list: optional)
 - [ ] ExtractorVM plus host validator (TR-EXT-*)

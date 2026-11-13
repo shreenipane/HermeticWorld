@@ -55,12 +55,24 @@ environment, discarded output and a five-second deadline, and are always reaped.
 It powers off on failure before starting listeners. The image builder is
 `python/hermetic_slice/netvm.py::build_netvm_image`.
 
-The private link is NetVM `10.0.2.3/24`, AgentVM `10.0.2.15/24`. World A records
+The private link is NetVM `10.0.2.3/24`, AgentVM `10.0.2.15/32`. World A records
 must be in `10/8` outside `10.0.2.0/24`; NetVM owns their sorted unique addresses as
-`/32`s. Its INPUT and OUTPUT filters permit only UDP DNS and TCP HTTP service
-ports; FORWARD drops everything. This includes ICMP addressed to NetVM itself.
+`/32`s. A fixed legacy NAT PREROUTING table redirects eth0 TCP ports 80 and
+443 at every destination address to the same local port. This is the documented
+REDIRECT fallback for TPROXY: policy uses Host (and eventually SNI), never the
+original destination IP. Conntrack reverses the translation for replies; no
+external route is installed. INPUT and OUTPUT permit only UDP DNS and TCP HTTP
+service ports; FORWARD drops everything. Port 443 remains denied pending TLS. This includes ICMP addressed to NetVM itself.
 IPv6 is disabled before eth0 comes up. The filter uses the built-in legacy
-ip_tables TCP/UDP match (built with `CONFIG_NETFILTER_XTABLES=y` in Linux 6.6).
+ip_tables TCP/UDP match, `CONFIG_IP_NF_NAT`, `CONFIG_NF_NAT`,
+`CONFIG_NF_CONNTRACK` and `CONFIG_NETFILTER_XT_TARGET_REDIRECT`, all required
+built-ins in the existing kernel policy. The filter is installed before NAT;
+either failure stops boot before eth0 is up. NAT state is capped by
+`MAX_CONNTRACK_ENTRIES=1024` and `CONNTRACK_IDLE_SECONDS=30`; fragment
+reassembly by `MAX_FRAGMENT_BYTES=262144` and `FRAGMENT_TIMEOUT_SECONDS=5`.
+Boot lowers `ipfrag_low_thresh` before `ipfrag_high_thresh`: Linux 6.6 refuses
+a high watermark below the current low watermark (3 MiB by default).
+These sysctl settings must succeed before networking starts.
 
 `VsockUpstream` connects only to host CID 2, port **5001** (5000 is execd, 5002 is
 reserved for the gateway). It serializes increasing request IDs on a single
@@ -78,9 +90,15 @@ For AgentVM, install `runtime::RESOLV_CONF` in the run spec's `resolv_conf` fiel
 execd publishes it as a regular file. Before starting the agent, the trusted
 harness runs `runtime::agent_commands()` through execd as root (equivalently
 `hermetic_slice.netvm.AGENT_NETWORK_COMMANDS`): static eth0 address, IPv6 off,
-and the sole default route via NetVM. These root commands belong to trusted
+an explicit link route to `10.0.2.3/32`, and the sole default route via NetVM.
+Using a /32 avoids direct ARP for other link addresses. Interception applies to
+IPv4 packets delivered to NetVM; AgentVM loopback and its own local address
+remain local, and unsupported protocols are dropped. These root commands belong to trusted
 harness setup; the existing run-spec schema has no network-effect field.
 
-TLS termination, CA-key boot delivery, TPROXY and dm-verity remain open in
-PHASES.md. The first cut serves plain HTTP only; port 443 is dropped. See
-`scripts/integration/BOOT_NOTES.md` for the two-VM smoke and its prerequisites.
+TLS termination, CA-key boot delivery and dm-verity remain OPEN in PHASES.md.
+The handoff approved rustls, but the current task forbids new dependencies; no TLS
+library was added. HTTPS is denied rather than served with unchecked trust. See
+`scripts/integration/BOOT_NOTES.md` for the remaining implementation plans and
+exact owner-run two-VM commands. The smoke includes an HTTPS denial fetch; a
+successful certificate-verified HTTPS fetch remains OPEN with TLS.

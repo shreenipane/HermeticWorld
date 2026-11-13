@@ -341,11 +341,20 @@ fn run() {
                 "ip",
                 "addr",
                 "add",
-                "10.0.2.15/24",
+                "10.0.2.15/32",
                 "dev",
                 "eth0",
             ],
             &["/bin/busybox", "ip", "link", "set", "eth0", "up"],
+            &[
+                "/bin/busybox",
+                "ip",
+                "route",
+                "add",
+                "10.0.2.3/32",
+                "dev",
+                "eth0",
+            ],
             &[
                 "/bin/busybox",
                 "ip",
@@ -390,6 +399,19 @@ fn run() {
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
         assert!(out.ends_with("hello from the frozen world\n"), "{out}");
 
+        // REDIRECT fallback: destination IP does not select an upstream. These
+        // addresses are absent from the DNS manifest and have no external route.
+        for address in ["1.1.1.1", "192.168.0.1", "169.254.169.254", "10.0.2.2"] {
+            let (_, out) = sh(&socket, &format!("printf 'GET /hello.txt HTTP/1.1\\r\\nHost: files.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
+            assert!(out.starts_with("HTTP/1.1 200"), "{address}: {out}");
+            assert!(
+                out.ends_with("hello from the frozen world\n"),
+                "{address}: {out}"
+            );
+            let (_, out) = sh(&socket, &format!("printf 'GET / HTTP/1.1\\r\\nHost: unknown.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
+            assert!(!out.contains("HTTP/1.1"), "{address}: {out}");
+        }
+
         // 3. POST: 405.
         let post = "printf 'POST /hello.txt HTTP/1.1\\r\\nHost: files.example\\r\\nContent-Length: 0\\r\\n\\r\\n' | /bin/busybox nc -w 5 10.9.0.1 80";
         let (_, out) = sh(&socket, post);
@@ -400,15 +422,11 @@ fn run() {
         let (_, out) = sh(&socket, other);
         assert!(!out.contains("HTTP/1.1 2"), "{out}");
 
-        // 5. No route anywhere else: public addresses, the link's other hosts, other
-        //    NetVM ports. Each connect must fail.
+        // 5. Other ports and unreachable neighbours remain blocked. Off-link
+        //    port 80 destinations are tested above against the sealed fixture.
         for target in [
-            "1.1.1.1 80",
             "8.8.8.8 53",
             "10.0.2.1 22",
-            "10.0.2.2 80",
-            "192.168.0.1 80",
-            "169.254.169.254 80",
             "10.0.2.3 22",
             "10.0.2.3 5001",
             "10.9.0.1 443",
@@ -422,6 +440,14 @@ fn run() {
                 "{target}: {out}"
             );
         }
+        // HTTPS remains OPEN under the no-new-dependencies constraint. Exercise
+        // an actual fetch and assert denial rather than disabling verification.
+        let (code, out) = sh(
+            &socket,
+            "/bin/busybox wget -Y off -T 3 -O - https://files.example/hello.txt 2>&1",
+        );
+        assert_ne!(code, Some(0), "HTTPS unexpectedly available: {out}");
+        assert!(!out.contains("hello from the frozen world"), "{out}");
         // ICMP addressed to NetVM itself must be dropped, independently of routing.
         for address in ["10.0.2.3", "10.9.0.1"] {
             let (code, _) = sh(&socket, &format!("/bin/busybox ping -c 1 -W 2 {address}"));

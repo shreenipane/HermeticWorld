@@ -27,7 +27,8 @@ from hermetic_safe_io import open_parent, open_regular, UnsafePathError
 
 NETVM_ADDRESS = "10.0.2.3"
 AGENT_ADDRESS = "10.0.2.15"
-AGENT_CIDR = "10.0.2.15/24"
+AGENT_CIDR = "10.0.2.15/32"
+NETVM_PEER_ROUTE = "10.0.2.3/32"
 LINK_PREFIX = "10.0.2."
 RESOLV_CONF = "nameserver 10.0.2.3\noptions ndots:0\n"
 NETVM_INIT = "/sbin/hermetic-netvm"
@@ -42,6 +43,7 @@ AGENT_NETWORK_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("/bin/busybox", "ip", "link", "set", "lo", "up"),
     ("/bin/busybox", "ip", "addr", "add", AGENT_CIDR, "dev", "eth0"),
     ("/bin/busybox", "ip", "link", "set", "eth0", "up"),
+    ("/bin/busybox", "ip", "route", "add", NETVM_PEER_ROUTE, "dev", "eth0"),
     ("/bin/busybox", "ip", "route", "add", "default", "via", NETVM_ADDRESS, "dev", "eth0"),
 )
 

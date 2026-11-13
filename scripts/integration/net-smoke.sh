@@ -103,6 +103,8 @@ PY
 chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
 
 # 5. Boot both VMs and run the checks from the agent through execd (owner-run ignored test).
+# Includes known-Host HTTP fetches to non-manifest destinations and an HTTPS
+# fetch that must fail closed until TLS and CA-key boot delivery are implemented.
 umask 077
 if \
 HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/agent.img" \

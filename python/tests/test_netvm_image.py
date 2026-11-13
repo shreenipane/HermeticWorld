@@ -74,12 +74,33 @@ def test_constants_match_rust_runtime() -> None:
 
     assert const("NETVM_ADDRESS") == netvm.NETVM_ADDRESS
     assert const("AGENT_CIDR") == netvm.AGENT_CIDR
+    assert const("NETVM_PEER_ROUTE") == netvm.NETVM_PEER_ROUTE
     assert const("RESOLV_CONF") == netvm.RESOLV_CONF
     assert const("BUSYBOX") == "/sbin/hermetic-busybox"
     for cmd in netvm.AGENT_NETWORK_COMMANDS:
         literal = ", ".join(f'"{a}"' for a in cmd[1:])
-        literal = literal.replace('"10.0.2.15/24"', "AGENT_CIDR").replace('"10.0.2.3"', "NETVM_ADDRESS")
+        literal = literal.replace('"10.0.2.15/32"', "AGENT_CIDR").replace('"10.0.2.3"', "NETVM_ADDRESS").replace('"10.0.2.3/32"', "NETVM_PEER_ROUTE")
         assert literal in src, literal
+
+
+def test_agent_routes_link_neighbours_and_public_addresses_through_filter() -> None:
+    import ipaddress
+    routes = []
+    # Interpret the emitted commands as connected and explicit IPv4 routes.
+    # The former /24 assigned a direct route for 10.0.2.2, bypassing NetVM.
+    for cmd in netvm.AGENT_NETWORK_COMMANDS:
+        if cmd[1:4] == ("ip", "addr", "add"):
+            routes.append((ipaddress.ip_interface(cmd[4]).network, None))
+        elif cmd[1:4] == ("ip", "route", "add"):
+            prefix = "0.0.0.0/0" if cmd[4] == "default" else cmd[4]
+            via = cmd[6] if cmd[5] == "via" else None
+            if via is not None:
+                # The gateway must already have a direct link route.
+                assert any(ipaddress.ip_address(via) in net and hop is None for net, hop in routes)
+            routes.append((ipaddress.ip_network(prefix), via))
+    for addr in ("10.0.2.1", "10.0.2.2", "10.9.0.1", "169.254.169.254", "192.168.0.1", "1.1.1.1"):
+        matching = [(net, via) for net, via in routes if ipaddress.ip_address(addr) in net]
+        assert max(matching, key=lambda r: r[0].prefixlen)[1] == netvm.NETVM_ADDRESS
 
 
 @pytest.mark.parametrize("bad", [

@@ -158,7 +158,11 @@ pub(crate) fn vsock(port: u32, deadline: Instant) -> io::Result<UnixStream> {
 
 /// Install the bounded legacy IPv4 table in this VM's network namespace.
 /// The byte offsets are the x86-64 Linux UAPI (the only supported guest target).
-pub(crate) fn install_filter(table: &crate::firewall::Table) -> io::Result<()> {
+pub(crate) fn install_table(
+    name: &[u8],
+    expected_hooks: u32,
+    table: &crate::firewall::Table,
+) -> io::Result<()> {
     use crate::firewall::{MAX_OLD_RULES, REPLACE_HEADER_BYTES};
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err(io::ErrorKind::Unsupported.into());
@@ -171,7 +175,11 @@ pub(crate) fn install_filter(table: &crate::firewall::Table) -> io::Result<()> {
     // SAFETY: successful socket created a fresh, live descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut info = [0u8; 84];
-    info[..6].copy_from_slice(b"filter");
+    // Only fixed, private callers supply table names and hook masks.
+    let name_buf = info
+        .get_mut(..name.len())
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    name_buf.copy_from_slice(name);
     let mut size = info.len() as u32;
     // SAFETY: IPT_SO_GET_INFO writes at most the initialized buffer's length.
     if unsafe { getsockopt(fd.as_raw_fd(), 0, 64, info.as_mut_ptr().cast(), &mut size) } < 0 {
@@ -187,14 +195,21 @@ pub(crate) fn install_filter(table: &crate::firewall::Table) -> io::Result<()> {
             .try_into()
             .map_err(|_| io::ErrorKind::InvalidData)?,
     );
-    if size != info.len() as u32 || hooks != 14 || count == 0 || count as usize > MAX_OLD_RULES {
+    if size != info.len() as u32
+        || hooks != expected_hooks
+        || count == 0
+        || count as usize > MAX_OLD_RULES
+    {
         return Err(io::ErrorKind::InvalidData.into());
     }
     // The kernel copies old counters out through this pointer. Their number is
     // capped before allocating, and their contents are never exposed.
     let mut counters = vec![[0u64; 2]; count as usize];
     let mut replacement = vec![0u8; REPLACE_HEADER_BYTES];
-    replacement[..6].copy_from_slice(b"filter");
+    replacement
+        .get_mut(..name.len())
+        .ok_or(io::ErrorKind::InvalidInput)?
+        .copy_from_slice(name);
     replacement[32..36].copy_from_slice(&hooks.to_ne_bytes());
     replacement[36..40].copy_from_slice(&table.count.to_ne_bytes());
     replacement[40..44].copy_from_slice(&(table.entries.len() as u32).to_ne_bytes());
