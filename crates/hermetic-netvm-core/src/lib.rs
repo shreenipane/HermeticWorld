@@ -282,6 +282,7 @@ impl Metrics {
 
 /// Canned route specification in [`NetvmConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StaticRouteConfig {
     #[serde(default = "default_get_method")]
     pub method: String,
@@ -335,8 +336,15 @@ where
     }
 }
 
+/// Maximum byte size of a `hermetic-netvm` JSON configuration file.
+pub const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
 /// JSON configuration file schema for `hermetic-netvm`.
+///
+/// Unknown fields are rejected so a misspelled setting fails closed instead of silently
+/// falling back to a default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetvmConfig {
     /// Cutoff timestamp (`T_clock`): `Last-Modified` headers strictly after this instant are dropped.
     #[serde(deserialize_with = "deserialize_t_clock")]

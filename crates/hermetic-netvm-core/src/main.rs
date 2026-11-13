@@ -95,10 +95,26 @@ where
     })
 }
 
+/// Reads the configuration file, refusing anything larger than `MAX_CONFIG_BYTES`.
+fn read_config_bounded(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("failed to read config file: {e}"))?;
+    let mut buf = String::new();
+    file.take(hermetic_netvm_core::MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_string(&mut buf)
+        .map_err(|e| format!("failed to read config file: {e}"))?;
+    if buf.len() as u64 > hermetic_netvm_core::MAX_CONFIG_BYTES {
+        return Err(format!(
+            "config file exceeds {} bytes",
+            hermetic_netvm_core::MAX_CONFIG_BYTES
+        ));
+    }
+    Ok(buf)
+}
+
 fn run() -> Result<(), String> {
     let cli = parse_args(std::env::args()).map_err(|e| e.to_string())?;
-    let config_bytes = std::fs::read_to_string(&cli.config_path)
-        .map_err(|e| format!("failed to read config file: {e}"))?;
+    let config_bytes = read_config_bounded(&cli.config_path)?;
     let config = NetvmConfig::from_json_str(&config_bytes).map_err(|e| e.to_string())?;
     let (dns_responder, filter, upstream) = config
         .build_default_components()

@@ -145,7 +145,7 @@ impl From<Verdict> for RunStatus {
 /// Rules:
 /// - R1 has a mutated test not failing -> `Tampered`
 /// - R2 differs from R0 on a paired test -> `Tampered`
-/// - R0 fails any required test -> `Unresolved`
+/// - R0 fails any required test, or reports no required test at all -> `Unresolved`
 /// - R3 is present with at least one required test and passes all required tests -> `Review`
 /// - Otherwise -> `Resolved`
 pub fn verdict(results: &GraderResults) -> Verdict {
@@ -166,6 +166,11 @@ pub fn verdict(results: &GraderResults) -> Verdict {
 
     let r0_failed_required = results.r0.tests.iter().any(|t| t.required && !t.passed);
     if r0_failed_required {
+        return Verdict::Unresolved;
+    }
+
+    // Fail closed: an R0 run that reports no required test proves nothing about the fix.
+    if !results.r0.tests.iter().any(|t| t.required) {
         return Verdict::Unresolved;
     }
 
@@ -221,6 +226,11 @@ pub fn verdict_reasons(results: &GraderResults) -> Vec<String> {
     }
 
     if !reasons.is_empty() {
+        return reasons;
+    }
+
+    if !results.r0.tests.iter().any(|t| t.required) {
+        reasons.push("unresolved: R0 reported no required tests".to_string());
         return reasons;
     }
 

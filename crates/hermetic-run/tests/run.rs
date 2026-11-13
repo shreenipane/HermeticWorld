@@ -1037,3 +1037,35 @@ fn unclean_shutdown_is_recorded_in_summary_and_step_list() {
     let json: Value = serde_json::from_str(&summary.to_json().unwrap()).unwrap();
     assert_eq!(json["unclean_shutdown"], Value::Bool(true));
 }
+
+#[test]
+fn regression_r0_without_required_tests_is_unresolved_not_resolved() {
+    use hermetic_run::{verdict, verdict_reasons, R0Result, R1Result, R2Result, TestResult};
+    let empty = GraderResults {
+        r0: R0Result { tests: vec![] },
+        r1: R1Result {
+            mutated_tests: vec![],
+        },
+        r2: R2Result {
+            paired_tests: vec![],
+        },
+        r3: None,
+    };
+    assert_eq!(verdict(&empty), Verdict::Unresolved);
+    assert_eq!(
+        verdict_reasons(&empty),
+        vec!["unresolved: R0 reported no required tests".to_string()]
+    );
+
+    let only_optional = GraderResults {
+        r0: R0Result {
+            tests: vec![TestResult::optional("t_opt", true)],
+        },
+        ..empty.clone()
+    };
+    assert_eq!(verdict(&only_optional), Verdict::Unresolved);
+    assert_eq!(
+        hermetic_run::resolve_status(false, false, false, Some(&only_optional)),
+        RunStatus::Unresolved
+    );
+}

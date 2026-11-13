@@ -188,6 +188,11 @@ impl RequestFilter for MethodAllowFilter {
             Err(_) => return FilterDecision::Reject,
         };
 
+        // TR-NET-4: a request without a usable Host is reset, never forwarded.
+        if parsed.host.as_deref().is_none_or(str::is_empty) {
+            return FilterDecision::Reject;
+        }
+
         match parsed.method.as_str() {
             "GET" | "HEAD" => {
                 let req = ForwardedRequest {

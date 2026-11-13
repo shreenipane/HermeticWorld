@@ -829,3 +829,190 @@ fn cli_binary_end_to_end() {
     #[cfg(not(unix))]
     assert!(report.skipped.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn regression_artifact_target_below_symlinked_ancestor_is_not_read() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let work = tmp.path().join("work");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    write_file(&outside.join("secret.txt"), b"OUTSIDE THE WORK TREE");
+    symlink(&outside, work.join("link")).unwrap();
+
+    let mut stream = Vec::new();
+    let report = extract(
+        &base,
+        &work,
+        &TaskClass::Artifact {
+            paths: vec!["link/secret.txt".to_string(), "link/other".to_string()],
+        },
+        &Caps::default(),
+        &mut stream,
+    )
+    .unwrap();
+
+    let records = decode(&stream[..]).unwrap();
+    assert_eq!(records.len(), 1, "only the end record: {records:?}");
+    assert!(matches!(records[0], Record::End { .. }));
+    assert_eq!(
+        report.skipped,
+        vec![SkippedEntry {
+            path: "link".to_string(),
+            kind: SkippedKind::Symlink,
+        }]
+    );
+
+    // Same for a patch repository directory below a symlinked ancestor.
+    write_file(&outside.join("repo/leak.txt"), b"leak");
+    let mut stream = Vec::new();
+    extract(
+        &base,
+        &work,
+        &TaskClass::Patch {
+            repo_dir: "link/repo".to_string(),
+        },
+        &Caps::default(),
+        &mut stream,
+    )
+    .unwrap();
+    let records = decode(&stream[..]).unwrap();
+    assert_eq!(records.len(), 1, "only the end record: {records:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_base_symlink_replaced_by_real_dir_is_not_compared_through_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let work = tmp.path().join("work");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    write_file(&outside.join("f.txt"), b"same bytes");
+    symlink(&outside, base.join("lib")).unwrap();
+    write_file(&work.join("lib/f.txt"), b"same bytes");
+
+    let mut stream = Vec::new();
+    extract(
+        &base,
+        &work,
+        &TaskClass::Patch {
+            repo_dir: ".".to_string(),
+        },
+        &Caps::default(),
+        &mut stream,
+    )
+    .unwrap();
+
+    let records = decode(&stream[..]).unwrap();
+    assert!(
+        records.contains(&Record::File {
+            path: "lib/f.txt".to_string(),
+            mode: 0o644,
+            sha256: Sha256::digest(b"same bytes").into(),
+            data: b"same bytes".to_vec(),
+        }),
+        "new file under a new real directory must be emitted: {records:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_fifo_swapped_in_after_stat_does_not_block() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    write_file(&work.join("target.txt"), b"");
+    let target = work.join("target.txt");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let base_t = base.clone();
+    let work_t = work.clone();
+    let target_t = target.clone();
+    std::thread::spawn(move || {
+        let mut hook = |rel_path: &str| -> std::io::Result<()> {
+            if rel_path == "target.txt" {
+                fs::remove_file(&target_t)?;
+                let status = Command::new("mkfifo").arg(&target_t).status()?;
+                if !status.success() {
+                    return Err(std::io::Error::other("mkfifo failed"));
+                }
+            }
+            Ok(())
+        };
+        let mut stream = Vec::new();
+        let res = extract_with_hook(
+            &base_t,
+            &work_t,
+            &TaskClass::Patch {
+                repo_dir: ".".to_string(),
+            },
+            &Caps::default(),
+            &mut stream,
+            Some(&mut hook),
+        );
+        let _ = tx.send(res.map(|_| ()));
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(res) => assert_eq!(
+            res,
+            Err(ExtractError::FileChangedDuringRead {
+                path: "target.txt".to_string()
+            })
+        ),
+        Err(_) => {
+            // Unblock the reader so the test process can exit, then fail.
+            let _ = fs::OpenOptions::new().write(true).open(&target);
+            panic!("extraction blocked opening a FIFO swapped in after stat");
+        }
+    }
+}
+
+#[test]
+fn regression_cli_failed_extraction_leaves_no_partial_output() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let work = tmp.path().join("work");
+    let out_file = tmp.path().join("out.hext");
+    let report_file = tmp.path().join("report.json");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    // A file over the default per-file cap makes extraction fail after the header was written.
+    let big = fs::File::create(work.join("big.bin")).unwrap();
+    big.set_len(Caps::default().max_file_bytes + 1).unwrap();
+    drop(big);
+
+    let bin = env!("CARGO_BIN_EXE_hermetic-extract-agent");
+    let status = Command::new(bin)
+        .arg("--base")
+        .arg(&base)
+        .arg("--work")
+        .arg(&work)
+        .arg("--class")
+        .arg("patch:.")
+        .arg("--out")
+        .arg(&out_file)
+        .arg("--report")
+        .arg(&report_file)
+        .status()
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(!out_file.exists(), "no partial stream may be left behind");
+    assert!(!report_file.exists());
+    let leftovers: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        2,
+        "only base and work remain: {leftovers:?}"
+    );
+}

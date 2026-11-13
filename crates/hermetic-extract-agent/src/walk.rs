@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,41 @@ enum WorkNode {
     Skipped,
     Dir,
     File(Metadata),
+}
+
+/// Whether a path below the walk position can be inspected in the work tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkReach {
+    /// Every ancestor is a real directory.
+    Reachable,
+    /// An ancestor is missing or a regular file, so the path is absent.
+    Absent,
+    /// An ancestor is a skipped entry (symlink, device, FIFO, socket, hard link).
+    BehindSkipped,
+}
+
+/// Which sides of the comparison may be inspected for a path without resolving any
+/// non-directory ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reach {
+    base: bool,
+    work: WorkReach,
+}
+
+impl Reach {
+    const fn both() -> Self {
+        Self {
+            base: true,
+            work: WorkReach::Reachable,
+        }
+    }
+
+    const fn work_only() -> Self {
+        Self {
+            base: false,
+            work: WorkReach::Reachable,
+        }
+    }
 }
 
 enum ReadFileOutcome {
@@ -90,11 +125,22 @@ where
         Ok(())
     }
 
-    fn ensure_missing_ancestors(&mut self, rel_path: &str) -> Result<(), ExtractError> {
+    /// Emits directory records for ancestors of `rel_path` that are new directories in the
+    /// work tree, and reports whether `rel_path` can be inspected on each side without
+    /// resolving a path through a non-directory (for example a symlink) ancestor.
+    ///
+    /// Once an ancestor on one side is not a real directory, deeper ancestors on that side are
+    /// never inspected: `lstat` only refuses to follow the final path component, so looking up
+    /// a path below a symlinked ancestor would resolve that symlink.
+    fn ensure_missing_ancestors(&mut self, rel_path: &str) -> Result<Reach, ExtractError> {
+        let mut reach = Reach {
+            base: true,
+            work: WorkReach::Reachable,
+        };
         let mut current = String::new();
         let parts: Vec<&str> = rel_path.split('/').collect();
         if parts.len() <= 1 {
-            return Ok(());
+            return Ok(reach);
         }
         let ancestor_count = parts.len().saturating_sub(1);
         for (idx, seg) in parts.iter().take(ancestor_count).enumerate() {
@@ -103,12 +149,23 @@ where
             }
             current.push_str(seg);
             if self.emitted_dirs.contains(&current) {
+                // Emitted directories are real directories in the work tree that are not
+                // directories in the base tree.
+                reach.base = false;
                 continue;
             }
-            let base_fs = join_rel_path(self.base_root, &current);
-            let work_fs = join_rel_path(self.work_root, &current);
-            let base_node = inspect_base_node(&base_fs, &current)?;
-            let work_node = inspect_work_node(&work_fs, &current, &mut self.skipped)?;
+            let base_node = if reach.base {
+                let base_fs = join_rel_path(self.base_root, &current);
+                inspect_base_node(&base_fs, &current)?
+            } else {
+                BaseNode::Absent
+            };
+            let work_node = if reach.work == WorkReach::Reachable {
+                let work_fs = join_rel_path(self.work_root, &current);
+                inspect_work_node(&work_fs, &current, &mut self.skipped)?
+            } else {
+                WorkNode::Absent
+            };
             if matches!(work_node, WorkNode::Dir) && !matches!(base_node, BaseNode::Dir) {
                 let depth = idx.saturating_add(1);
                 self.check_entry_budget(&current, depth)?;
@@ -118,18 +175,48 @@ where
                 self.writer.write_dir(&current)?;
                 self.emitted_dirs.insert(current.clone());
             }
+            if !matches!(base_node, BaseNode::Dir) {
+                reach.base = false;
+            }
+            match work_node {
+                WorkNode::Dir => {}
+                WorkNode::Skipped => reach.work = WorkReach::BehindSkipped,
+                WorkNode::Absent | WorkNode::File(_) => {
+                    if reach.work == WorkReach::Reachable {
+                        reach.work = WorkReach::Absent;
+                    }
+                }
+            }
         }
-        Ok(())
+        Ok(reach)
     }
 
-    fn diff_node(&mut self, rel_path: &str, depth: usize) -> Result<(), ExtractError> {
+    fn diff_node(
+        &mut self,
+        rel_path: &str,
+        depth: usize,
+        reach: Reach,
+    ) -> Result<(), ExtractError> {
+        if reach.work == WorkReach::BehindSkipped {
+            // An ancestor in the work tree is a skipped non-regular entry (already listed in
+            // the report); nothing below it is extracted.
+            return Ok(());
+        }
         self.check_entry_budget(rel_path, depth)?;
 
         let base_fs = join_rel_path(self.base_root, rel_path);
         let work_fs = join_rel_path(self.work_root, rel_path);
 
-        let work_node = inspect_work_node(&work_fs, rel_path, &mut self.skipped)?;
-        let base_node = inspect_base_node(&base_fs, rel_path)?;
+        let work_node = if reach.work == WorkReach::Reachable {
+            inspect_work_node(&work_fs, rel_path, &mut self.skipped)?
+        } else {
+            WorkNode::Absent
+        };
+        let base_node = if reach.base {
+            inspect_base_node(&base_fs, rel_path)?
+        } else {
+            BaseNode::Absent
+        };
 
         match (base_node, work_node) {
             (_, WorkNode::Skipped) => Ok(()),
@@ -142,7 +229,7 @@ where
                     self.writer.write_dir(rel_path)?;
                     self.emitted_dirs.insert(rel_path.to_string());
                 }
-                self.walk_dir(rel_path, depth)
+                self.walk_dir(rel_path, depth, Reach::work_only())
             }
             (BaseNode::File(_), WorkNode::Dir) => {
                 self.writer.write_delete(rel_path)?;
@@ -150,9 +237,9 @@ where
                     self.writer.write_dir(rel_path)?;
                     self.emitted_dirs.insert(rel_path.to_string());
                 }
-                self.walk_dir(rel_path, depth)
+                self.walk_dir(rel_path, depth, Reach::work_only())
             }
-            (BaseNode::Dir, WorkNode::Dir) => self.walk_dir(rel_path, depth),
+            (BaseNode::Dir, WorkNode::Dir) => self.walk_dir(rel_path, depth, Reach::both()),
             (BaseNode::Absent, WorkNode::File(work_meta)) => {
                 self.emit_file_if_changed(&work_fs, None, rel_path, &work_meta)
             }
@@ -173,7 +260,14 @@ where
         }
     }
 
-    fn walk_dir(&mut self, rel_dir: &str, dir_depth: usize) -> Result<(), ExtractError> {
+    /// Diffs the children of `rel_dir`. `reach` states on which sides `rel_dir` is a real
+    /// directory reached only through real directories, so its children may be inspected.
+    fn walk_dir(
+        &mut self,
+        rel_dir: &str,
+        dir_depth: usize,
+        reach: Reach,
+    ) -> Result<(), ExtractError> {
         let base_dir_fs = if rel_dir.is_empty() {
             self.base_root.to_path_buf()
         } else {
@@ -186,8 +280,12 @@ where
         };
 
         let mut names = BTreeSet::new();
-        collect_dir_names_if_real_dir(&base_dir_fs, rel_dir, &mut names)?;
-        collect_dir_names_if_real_dir(&work_dir_fs, rel_dir, &mut names)?;
+        if reach.base {
+            collect_dir_names_if_real_dir(&base_dir_fs, rel_dir, &mut names)?;
+        }
+        if reach.work == WorkReach::Reachable {
+            collect_dir_names_if_real_dir(&work_dir_fs, rel_dir, &mut names)?;
+        }
 
         let child_depth = dir_depth.saturating_add(1);
         for name in names {
@@ -202,7 +300,7 @@ where
                 s.push_str(&name);
                 s
             };
-            self.diff_node(&child_rel, child_depth)?;
+            self.diff_node(&child_rel, child_depth, reach)?;
         }
         Ok(())
     }
@@ -282,7 +380,7 @@ where
         TaskClass::State => {}
         TaskClass::Patch { repo_dir } => {
             if repo_dir == "." {
-                state.walk_dir("", 0)?;
+                state.walk_dir("", 0, Reach::both())?;
             } else {
                 validate_relative_path(repo_dir)?;
                 if path_has_dot_git(repo_dir) {
@@ -291,28 +389,37 @@ where
                     });
                 }
                 let depth = repo_dir.split('/').count();
+                let reach = state.ensure_missing_ancestors(repo_dir)?;
                 let base_fs = join_rel_path(base, repo_dir);
                 let work_fs = join_rel_path(work, repo_dir);
-                let base_exists =
-                    !matches!(inspect_base_node(&base_fs, repo_dir)?, BaseNode::Absent);
-                let work_exists = match fs::symlink_metadata(&work_fs) {
-                    Ok(_) => true,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                    Err(e) => {
-                        return Err(ExtractError::Io {
-                            context: "stat repo_dir",
-                            path: Some(repo_dir.clone()),
-                            kind: e.kind(),
-                        })
-                    }
+                let base_exists = reach.base
+                    && !matches!(inspect_base_node(&base_fs, repo_dir)?, BaseNode::Absent);
+                let work_exists = match reach.work {
+                    WorkReach::Reachable => match fs::symlink_metadata(&work_fs) {
+                        Ok(_) => true,
+                        Err(e)
+                            if e.kind() == io::ErrorKind::NotFound
+                                || e.kind() == io::ErrorKind::NotADirectory =>
+                        {
+                            false
+                        }
+                        Err(e) => {
+                            return Err(ExtractError::Io {
+                                context: "stat repo_dir",
+                                path: Some(repo_dir.clone()),
+                                kind: e.kind(),
+                            })
+                        }
+                    },
+                    WorkReach::BehindSkipped => true,
+                    WorkReach::Absent => false,
                 };
                 if !base_exists && !work_exists {
                     return Err(ExtractError::MissingRepoDir {
                         repo_dir: repo_dir.clone(),
                     });
                 }
-                state.ensure_missing_ancestors(repo_dir)?;
-                state.diff_node(repo_dir, depth)?;
+                state.diff_node(repo_dir, depth, reach)?;
             }
         }
         TaskClass::Artifact { paths } => {
@@ -339,13 +446,15 @@ where
 
             for target in &filtered_targets {
                 let depth = target.split('/').count();
-                state.ensure_missing_ancestors(target)?;
-                state.diff_node(target, depth)?;
+                let reach = state.ensure_missing_ancestors(target)?;
+                state.diff_node(target, depth, reach)?;
             }
         }
     }
 
     state.skipped.sort();
+    // Several declared targets can share one skipped ancestor; list each entry once.
+    state.skipped.dedup();
     let _writer = state.writer.finish()?;
     Ok(ExtractReport {
         skipped: state.skipped,
@@ -601,7 +710,7 @@ where
         })?;
     }
 
-    let mut work_file = File::open(work_fs_path).map_err(|e| ExtractError::Io {
+    let mut work_file = open_nofollow_nonblocking(work_fs_path).map_err(|e| ExtractError::Io {
         context: "open work file",
         path: Some(rel_path.to_string()),
         kind: e.kind(),
@@ -631,7 +740,7 @@ where
 
     let mut base_file_opt: Option<File> = match base_cmp {
         Some((base_path, base_stat)) => {
-            let bf = File::open(base_path).map_err(|e| ExtractError::Io {
+            let bf = open_nofollow_nonblocking(base_path).map_err(|e| ExtractError::Io {
                 context: "open base file",
                 path: Some(rel_path.to_string()),
                 kind: e.kind(),
@@ -641,7 +750,10 @@ where
                 path: Some(rel_path.to_string()),
                 kind: e.kind(),
             })?;
-            if bf_meta.file_type().is_file() && bf_meta.len() == base_stat.len() {
+            if bf_meta.file_type().is_file()
+                && bf_meta.len() == base_stat.len()
+                && same_inode(&bf_meta, base_stat)
+            {
                 Some(bf)
             } else {
                 None
@@ -808,6 +920,28 @@ where
 
     let sha256: [u8; 32] = hasher.finalize().into();
     Ok(ReadFileOutcome::Changed { mode, sha256, data })
+}
+
+/// Opens `path` read-only without following a final symlink and without blocking on a FIFO
+/// or device, so a swapped-in special file can be rejected by the following `fstat` checks.
+fn open_nofollow_nonblocking(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    opts.open(path)
+}
+
+#[cfg(unix)]
+fn same_inode(a: &Metadata, b: &Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_inode(_a: &Metadata, _b: &Metadata) -> bool {
+    true
 }
 
 fn read_exact_base_chunk(file: &mut File, buf: &mut [u8]) -> Result<bool, io::ErrorKind> {

@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hermetic_extract_agent::{extract, parse_task_class, Caps, ExtractError, TaskClass};
@@ -185,29 +186,76 @@ where
     })
 }
 
+/// Returns the hidden sibling path a final output is staged at before its atomic rename.
+fn staging_path(path: &Path) -> Result<PathBuf, CliError> {
+    let name = path.file_name().ok_or(CliError::OutputIo(
+        "output path",
+        io::ErrorKind::InvalidInput,
+    ))?;
+    let mut staged = OsString::from(".");
+    staged.push(name);
+    staged.push(".partial");
+    Ok(path.with_file_name(staged))
+}
+
+/// Creates a new staging file exclusively (never truncating or following an existing entry).
+fn create_staging_file(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)
+}
+
+/// Writes one output through `write`, staged in a sibling file that is fsynced and then renamed
+/// over `dest`, so `dest` only ever appears complete. The staging file is removed on failure.
+fn write_atomically<T, F>(dest: &Path, what: &'static str, write: F) -> Result<T, CliError>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<T, CliError>,
+{
+    let staged = staging_path(dest)?;
+    let file = create_staging_file(&staged).map_err(|e| CliError::OutputIo(what, e.kind()))?;
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        let value = write(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|e| CliError::OutputIo(what, e.kind()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| CliError::OutputIo(what, e.kind()))?;
+        drop(writer);
+        fs::rename(&staged, dest).map_err(|e| CliError::OutputIo(what, e.kind()))?;
+        Ok(value)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
 fn run() -> Result<(), CliError> {
     let args = parse_cli(env::args_os())?;
     let caps = Caps::default();
 
-    let out_file =
-        File::create(&args.out).map_err(|e| CliError::OutputIo("output stream file", e.kind()))?;
-    let out_writer = BufWriter::new(out_file);
-
-    let report_data = extract(&args.base, &args.work, &args.task_class, &caps, out_writer)
-        .map_err(CliError::Extract)?;
+    let report_data = write_atomically(&args.out, "output stream file", |writer| {
+        extract(&args.base, &args.work, &args.task_class, &caps, writer).map_err(CliError::Extract)
+    })?;
 
     let mut json = serde_json::to_string_pretty(&report_data)
         .map_err(|_| CliError::OutputIo("report json", io::ErrorKind::InvalidData))?;
     json.push('\n');
 
-    let mut report_file =
-        File::create(&args.report).map_err(|e| CliError::OutputIo("report file", e.kind()))?;
-    report_file
-        .write_all(json.as_bytes())
-        .map_err(|e| CliError::OutputIo("report file", e.kind()))?;
-    report_file
-        .flush()
-        .map_err(|e| CliError::OutputIo("report file", e.kind()))?;
+    write_atomically(&args.report, "report file", |writer| {
+        writer
+            .write_all(json.as_bytes())
+            .map_err(|e| CliError::OutputIo("report file", e.kind()))
+    })?;
 
     Ok(())
 }

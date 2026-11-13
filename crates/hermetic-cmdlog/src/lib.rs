@@ -88,6 +88,9 @@ pub enum ChainError {
     MaxEntriesExceeded { max: u64 },
     /// Command output stream exceeded `MAX_OUTPUT_BYTES`.
     MaxOutputExceeded { max_bytes: u64 },
+    /// An earlier append failed part-way, so the on-disk tail is unknown and the writer
+    /// refuses further appends (reopening re-verifies the chain).
+    WriterPoisoned,
 }
 
 impl ChainError {
@@ -107,7 +110,8 @@ impl ChainError {
             | ChainError::NotRegularFile { .. }
             | ChainError::InsecurePermissions { .. }
             | ChainError::MaxEntriesExceeded { .. }
-            | ChainError::MaxOutputExceeded { .. } => None,
+            | ChainError::MaxOutputExceeded { .. }
+            | ChainError::WriterPoisoned => None,
         }
     }
 
@@ -128,7 +132,8 @@ impl ChainError {
             | ChainError::SymlinkNotAllowed { .. }
             | ChainError::NotRegularFile { .. }
             | ChainError::InsecurePermissions { .. }
-            | ChainError::MaxOutputExceeded { .. } => false,
+            | ChainError::MaxOutputExceeded { .. }
+            | ChainError::WriterPoisoned => false,
         }
     }
 }
@@ -199,6 +204,10 @@ impl std::fmt::Display for ChainError {
             ChainError::MaxOutputExceeded { max_bytes } => {
                 write!(f, "output stream exceeds maximum cap of {max_bytes} bytes")
             }
+            ChainError::WriterPoisoned => write!(
+                f,
+                "an earlier append failed part-way; reopen the log to re-verify the chain"
+            ),
         }
     }
 }

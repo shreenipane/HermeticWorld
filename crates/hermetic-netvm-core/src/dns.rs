@@ -211,15 +211,18 @@ impl DnsResponder for StaticDnsResponder {
         let qtype = u16::from_be_bytes([packet[qend], packet[qend + 1]]);
         let qclass = u16::from_be_bytes([packet[qend + 2], packet[qend + 3]]);
 
-        // Only IN (1) A (1) queries are answered from the static IPv4 table.
-        if qclass != 1 || qtype != 1 {
-            return None;
-        }
-
-        let ipv4 = self.records.get(&qname)?;
-        let question_wire = &packet[12..(qend + 4)];
-
+        let question_wire = packet.get(12..qend.checked_add(4)?)?;
         let rd = flags & 0x0100;
+
+        // Only IN (1) A (1) queries for names in the fixed table are answered with an address.
+        // Other record types for a known name get an empty NOERROR answer, and every name not
+        // in the table gets NXDOMAIN (TR-NET-2); nothing is ever forwarded upstream.
+        let ipv4 = match self.records.get(&qname) {
+            Some(ip) if qclass == 1 && qtype == 1 => ip,
+            Some(_) => return Some(empty_reply(id, rd, DNS_RCODE_NOERROR, question_wire)),
+            None => return Some(empty_reply(id, rd, DNS_RCODE_NXDOMAIN, question_wire)),
+        };
+
         let resp_flags: u16 = 0x8400 | rd; // QR=1, AA=1, RD copied, RCODE=0
 
         let mut out = Vec::with_capacity(12 + question_wire.len() + 16);
@@ -244,6 +247,26 @@ impl DnsResponder for StaticDnsResponder {
         }
         Some(out)
     }
+}
+
+/// DNS response code for success.
+pub const DNS_RCODE_NOERROR: u16 = 0;
+
+/// DNS response code for a name that does not exist.
+pub const DNS_RCODE_NXDOMAIN: u16 = 3;
+
+/// Builds an authoritative reply with no answer records, echoing the single question.
+fn empty_reply(id: u16, rd: u16, rcode: u16, question_wire: &[u8]) -> Vec<u8> {
+    let resp_flags: u16 = 0x8400 | rd | (rcode & 0x000F); // QR=1, AA=1, RD copied
+    let mut out = Vec::with_capacity(12 + question_wire.len());
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&resp_flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+    out.extend_from_slice(question_wire);
+    out
 }
 
 fn normalize_domain(domain: &str) -> String {

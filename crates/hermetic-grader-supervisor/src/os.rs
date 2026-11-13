@@ -178,9 +178,10 @@ impl Drop for RealChild {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
+        // The reader thread is detached, never joined: a descendant may still hold the write
+        // end of the pipe, or the thread may be blocked sending into the channel whose receiver
+        // is only dropped after this function returns. Joining would hang forever.
+        drop(self.reader_thread.take());
     }
 }
 
@@ -340,10 +341,26 @@ impl Os for RealOs {
                 } else {
                     ExitKind::Crash
                 };
-                child.exited = Some(kind);
+                // The leader has exited, but a descendant that inherited the result pipe keeps
+                // the tree alive until it closes it. Never block on the reader thread here (that
+                // would stall past every deadline); report `Running` until the reader has seen
+                // end-of-file, so the supervisor keeps enforcing its deadline and kill path.
+                let reader_done = child
+                    .reader_thread
+                    .as_ref()
+                    .is_none_or(JoinHandle::is_finished);
+                if !reader_done {
+                    let sleep_for = timeout.min(Duration::from_millis(POLL_INTERVAL_MS));
+                    if !sleep_for.is_zero() {
+                        thread::sleep(sleep_for);
+                    }
+                    return Ok(TreeStatus::Running);
+                }
                 if let Some(handle) = child.reader_thread.take() {
+                    // Already finished, so this returns immediately.
                     let _ = handle.join();
                 }
+                child.exited = Some(kind);
                 Ok(TreeStatus::Exited(kind))
             }
             Ok(None) => {
@@ -361,7 +378,13 @@ impl Os for RealOs {
     }
 
     fn write_file_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), OsError> {
-        let is_special_device = match fs::metadata(path) {
+        let is_special_device = match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(OsError::Io {
+                    operation: "open_result",
+                    detail: format!("{}: refusing to write through a symlink", path.display()),
+                });
+            }
             Ok(meta) => !meta.file_type().is_file(),
             Err(_) => false,
         };
@@ -393,10 +416,16 @@ impl Os for RealOs {
         let tmp_path = parent.join(format!(".{}.tmp", file_name));
 
         {
-            let mut tmp_file = File::create(&tmp_path).map_err(|e| OsError::Io {
-                operation: "create_temp",
-                detail: format!("{}: {}", tmp_path.display(), e),
-            })?;
+            // `create_new` (O_CREAT | O_EXCL) never follows or truncates an entry planted at the
+            // predictable temporary path.
+            let mut tmp_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| OsError::Io {
+                    operation: "create_temp",
+                    detail: format!("{}: {}", tmp_path.display(), e),
+                })?;
             tmp_file.write_all(bytes).map_err(|e| OsError::Io {
                 operation: "write_temp",
                 detail: format!("{}: {}", tmp_path.display(), e),

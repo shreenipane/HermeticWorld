@@ -94,15 +94,30 @@ fn test_dns_round_trip_via_fake() {
     assert_eq!(resp_id, 0x1234);
     assert_eq!(ipv4, [10, 42, 0, 7]);
 
-    // Unknown domain is dropped without forwarding anywhere.
+    // Unknown domain gets an authoritative NXDOMAIN (TR-NET-2), never forwarded anywhere.
     let unknown_query = encode_dns_a_query(0x5678, "unknown.example.com").expect("encode query");
     client
         .send_to(&unknown_query, server.dns_addr())
         .expect("send unknown DNS query");
+    let (n, _) = client
+        .recv_from(&mut reply_buf)
+        .expect("receive NXDOMAIN reply");
+    let reply = &reply_buf[..n];
+    assert_eq!(&reply[0..2], &0x5678u16.to_be_bytes());
+    assert_eq!(reply[3] & 0x0F, 3, "RCODE must be NXDOMAIN");
+    assert_eq!(&reply[6..8], &[0, 0], "no answer records");
+    assert!(decode_dns_a_answer(reply).is_err());
+
+    // A malformed datagram (a response, QR=1) is still dropped without a reply.
+    let mut bogus = encode_dns_a_query(0x5679, "crates.hermetic.local").expect("encode query");
+    bogus[2] |= 0x80;
+    client
+        .send_to(&bogus, server.dns_addr())
+        .expect("send malformed DNS datagram");
     assert!(client.recv_from(&mut reply_buf).is_err());
 
     let snap = server.metrics().snapshot();
-    assert_eq!(snap.dns_answered, 1);
+    assert_eq!(snap.dns_answered, 2);
     assert_eq!(snap.dns_dropped_unanswered, 1);
 
     server.stop();
@@ -677,4 +692,67 @@ fn test_config_parsing_with_http_date_and_integer_t_clock() {
     let cfg = NetvmConfig::from_json_str(cfg_str).expect("parse config");
     assert_eq!(cfg.t_clock, 1_700_006_400);
     let (_dns, _filter, _upstream) = cfg.build_default_components().expect("build components");
+}
+
+#[test]
+fn regression_dns_unknown_name_nxdomain_and_known_name_other_type_nodata() {
+    use hermetic_netvm_core::dns::DnsResponder;
+    let mut dns = StaticDnsResponder::new();
+    dns.insert("crates.hermetic.local", [10, 42, 0, 7]);
+
+    let unknown = encode_dns_a_query(0x0101, "post-cutoff.example").expect("encode");
+    let reply = dns
+        .respond(&unknown)
+        .expect("unknown names must be answered");
+    assert_eq!(&reply[0..2], &0x0101u16.to_be_bytes());
+    assert_ne!(reply[2] & 0x80, 0, "QR bit set");
+    assert_eq!(reply[3] & 0x0F, 3, "NXDOMAIN");
+    assert_eq!(&reply[4..6], &[0, 1]);
+    assert_eq!(&reply[6..8], &[0, 0]);
+    assert_eq!(&reply[12..], &unknown[12..]);
+
+    // AAAA (28) for a known name: NOERROR with no answers.
+    let mut aaaa = encode_dns_a_query(0x0202, "crates.hermetic.local").expect("encode");
+    let len = aaaa.len();
+    aaaa[len - 4..len - 2].copy_from_slice(&28u16.to_be_bytes());
+    let reply = dns
+        .respond(&aaaa)
+        .expect("known name, other type is answered");
+    assert_eq!(reply[3] & 0x0F, 0, "NOERROR");
+    assert_eq!(&reply[6..8], &[0, 0]);
+}
+
+#[test]
+fn regression_missing_or_duplicate_host_is_rejected() {
+    let filter = MethodAllowFilter;
+    assert_eq!(
+        filter.check(b"GET / HTTP/1.1\r\n\r\n", false, None),
+        FilterDecision::Reject
+    );
+    assert_eq!(
+        filter.check(b"GET / HTTP/1.1\r\nHost:\r\n\r\n", false, None),
+        FilterDecision::Reject
+    );
+    assert_eq!(
+        filter.check(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n",
+            false,
+            None
+        ),
+        FilterDecision::Reject
+    );
+    assert!(matches!(
+        filter.check(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n", false, None),
+        FilterDecision::Forward(_)
+    ));
+}
+
+#[test]
+fn regression_config_unknown_field_rejected() {
+    let err = NetvmConfig::from_json_str(r#"{"t_clock": 1700000000, "max_connection": 2}"#);
+    assert!(err.is_err(), "misspelled setting must fail closed");
+    let err = NetvmConfig::from_json_str(
+        r#"{"t_clock": 1700000000, "static_routes": [{"target": "/", "bodyy": "x"}]}"#,
+    );
+    assert!(err.is_err());
 }

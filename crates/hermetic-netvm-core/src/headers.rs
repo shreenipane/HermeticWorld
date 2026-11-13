@@ -177,7 +177,12 @@ pub fn parse_request_head(head: &[u8]) -> Result<ParsedRequestHead, RequestParse
             return Err(RequestParseError::MalformedHeader);
         }
         let lower_name = raw_name.to_ascii_lowercase();
-        if lower_name == "host" && host.is_none() {
+        if lower_name == "host" {
+            // RFC 9112 section 3.2: more than one Host field is invalid; accepting the first
+            // would let the forwarded host and the one the client meant disagree.
+            if host.is_some() {
+                return Err(RequestParseError::MalformedHeader);
+            }
             host = Some(val.to_string());
         }
         headers.push((lower_name, val.to_string()));

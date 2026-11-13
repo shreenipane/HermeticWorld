@@ -623,3 +623,95 @@ fn test_disk_not_written_before_tree_ends() {
         exited_pos
     );
 }
+
+/// Runs `script` under `/bin/sh` through `RealOs` and `run_supervisor` on a worker thread,
+/// returning `None` if the supervisor did not return within `limit`.
+#[cfg(unix)]
+fn run_real_shell(
+    script: &str,
+    deadline_seconds: u64,
+    limit: Duration,
+) -> Option<Result<hermetic_grader_supervisor::RunReport, String>> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut env = BTreeMap::new();
+    env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+    let cfg = RunConfig {
+        argv: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
+        env,
+        cwd: tmp.path().to_string_lossy().into_owned(),
+        deadline_seconds,
+        expected_test_ids: vec!["test_a".to_string()],
+        run: RunName::R0,
+        variant_set: SAMPLE_VARIANT_SHA256.to_string(),
+    };
+    let cfg_path = tmp.path().join("config.json");
+    let disk_path = tmp.path().join("result.disk");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).expect("config json")).expect("config");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut os = RealOs::new();
+        let res = run_supervisor(&mut os, &cfg_path, &disk_path).map_err(|e| e.to_string());
+        let _ = tx.send(res);
+        drop(tmp);
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_real_os_descendant_holding_pipe_cannot_stall_past_deadline() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    // The leader exits at once; a background child keeps the result pipe (fd 2) open past the
+    // 1 s deadline. The deadline must still be enforced and classified as a timeout.
+    let res = run_real_shell("sleep 4 & exit 0", 1, Duration::from_secs(25))
+        .expect("supervisor must return");
+    let report = res.expect("supervisor run");
+    assert_eq!(report.payload.supervisor.exit, SupervisorExit::Timeout);
+    assert_eq!(
+        report.payload.tests.get("test_a"),
+        Some(&FinalTestOutcome::Missing)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_real_os_large_garbage_on_pipe_does_not_deadlock() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    // Far more garbage than the reader channel plus the pipe buffer can hold: after the stream
+    // error the supervisor must keep draining so the writer finishes and the tree ends.
+    let res = run_real_shell("head -c 4000000 /dev/zero >&2", 60, Duration::from_secs(25))
+        .expect("supervisor must not deadlock");
+    let report = res.expect("supervisor run");
+    assert!(report.stream_error.is_some());
+    assert_eq!(report.payload.supervisor.exit, SupervisorExit::Crash);
+    assert_eq!(
+        report.payload.tests.get("test_a"),
+        Some(&FinalTestOutcome::Failed)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_real_os_atomic_write_never_follows_planted_temp_symlink() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"keep me").expect("victim");
+    let disk = tmp.path().join("disk");
+    std::os::unix::fs::symlink(&victim, tmp.path().join(".disk.tmp")).expect("plant symlink");
+
+    let mut os = RealOs::new();
+    assert!(os.write_file_atomic(&disk, b"result bytes").is_err());
+    assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+    assert!(!disk.exists());
+
+    // A symlink at the result path itself is refused as well.
+    let link = tmp.path().join("link_disk");
+    std::os::unix::fs::symlink(&victim, &link).expect("plant symlink");
+    assert!(os.write_file_atomic(&link, b"result bytes").is_err());
+    assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+}

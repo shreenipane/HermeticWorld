@@ -512,10 +512,15 @@ pub fn run_supervisor<O: Os>(
             }
         }
 
-        if !pipe_eof && tracker.stream_error.is_none() && !timed_out {
+        // The pipe keeps being drained after a stream error (the decoder discards the bytes)
+        // so a writer blocked on a full pipe can still finish and the tree can end.
+        if !pipe_eof && !timed_out {
             let remaining = deadline_at.saturating_sub(now);
             let read_timeout = remaining.min(poll_slice);
             match os.read_pipe(&mut child, MAX_PIPE_CHUNK_BYTES, read_timeout)? {
+                PipeRead::Data(chunk) if tracker.stream_error.is_some() => {
+                    drop(chunk);
+                }
                 PipeRead::Data(chunk) => {
                     let (records, err) = decoder.push(&chunk);
                     for rec in records.into_iter().take(MAX_RECORDS_PER_STREAM) {

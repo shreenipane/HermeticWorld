@@ -26,6 +26,22 @@ pub struct CmdLog {
     next_seq: u64,
     head_hash: String,
     has_entries: bool,
+    /// Set when a write or `fsync` failed, leaving the file tail in an unknown state.
+    poisoned: bool,
+}
+
+/// Extra `open(2)` flags: never follow a final symlink and never block opening a FIFO.
+#[cfg(unix)]
+const SAFE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+
+fn safe_open_options() -> OpenOptions {
+    #[allow(unused_mut)]
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        opts.custom_flags(SAFE_OPEN_FLAGS);
+    }
+    opts
 }
 
 impl CmdLog {
@@ -40,7 +56,7 @@ impl CmdLog {
         let mut file = match fs::symlink_metadata(path_ref) {
             Ok(lstat_meta) => {
                 validate_lstat_metadata(&lstat_meta, &path_display)?;
-                let opened = OpenOptions::new()
+                let opened = safe_open_options()
                     .read(true)
                     .append(true)
                     .open(path_ref)
@@ -56,7 +72,7 @@ impl CmdLog {
                 opened
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let mut opts = OpenOptions::new();
+                let mut opts = safe_open_options();
                 opts.read(true).write(true).create_new(true);
                 #[cfg(unix)]
                 {
@@ -117,6 +133,7 @@ impl CmdLog {
                     next_seq,
                     head_hash: head.head,
                     has_entries: true,
+                    poisoned: false,
                 })
             }
             None => Ok(Self {
@@ -124,6 +141,7 @@ impl CmdLog {
                 next_seq: 0,
                 head_hash: GENESIS_PREV.to_string(),
                 has_entries: false,
+                poisoned: false,
             }),
         }
     }
@@ -152,6 +170,9 @@ impl CmdLog {
 
     /// Appends a single canonical JSON entry line (`\n`-terminated) and `fsync`s the file.
     pub fn append(&mut self, payload: EntryPayload) -> Result<Head, ChainError> {
+        if self.poisoned {
+            return Err(ChainError::WriterPoisoned);
+        }
         if self.next_seq >= MAX_LOG_ENTRIES {
             return Err(ChainError::MaxEntriesExceeded {
                 max: MAX_LOG_ENTRIES,
@@ -167,17 +188,23 @@ impl CmdLog {
         line_buf.extend_from_slice(canonical.as_bytes());
         line_buf.push(b'\n');
 
-        self.file
-            .write_all(&line_buf)
-            .map_err(|source| ChainError::Io {
+        // A failed or partial write (or fsync) leaves an unknown tail on disk. Appending after
+        // it would splice a new line onto a partial one, so the writer is poisoned instead.
+        if let Err(source) = self.file.write_all(&line_buf) {
+            self.poisoned = true;
+            return Err(ChainError::Io {
                 context: format!("appending entry seq {seq}"),
                 source,
-            })?;
+            });
+        }
 
-        self.file.sync_all().map_err(|source| ChainError::Io {
-            context: format!("fsyncing entry seq {seq}"),
-            source,
-        })?;
+        if let Err(source) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(ChainError::Io {
+                context: format!("fsyncing entry seq {seq}"),
+                source,
+            });
+        }
 
         self.next_seq = seq.checked_add(1).ok_or(ChainError::MaxEntriesExceeded {
             max: MAX_LOG_ENTRIES,
@@ -206,7 +233,7 @@ pub fn verify<P: AsRef<Path>>(path: P) -> Result<Head, ChainError> {
     })?;
     validate_lstat_metadata(&lstat_meta, &path_display)?;
 
-    let mut file = OpenOptions::new()
+    let mut file = safe_open_options()
         .read(true)
         .open(path_ref)
         .map_err(|source| ChainError::Io {
@@ -406,4 +433,42 @@ fn verify_reader<R: Read>(reader: R, path_display: &str) -> Result<Option<Head>,
     }
 
     Ok(last_head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry::EMPTY_SHA256;
+
+    fn status_payload() -> EntryPayload {
+        EntryPayload::status(Some(0), EMPTY_SHA256, EMPTY_SHA256, 0, 0, false)
+    }
+
+    #[test]
+    fn regression_failed_append_poisons_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmdlog.jsonl");
+        std::fs::write(&path, b"").expect("create log");
+        // A read-only descriptor makes every write fail, standing in for a disk error that
+        // may have left part of a line on disk.
+        let file = File::open(&path).expect("open read-only");
+        let mut log = CmdLog {
+            file,
+            next_seq: 0,
+            head_hash: GENESIS_PREV.to_string(),
+            has_entries: false,
+            poisoned: false,
+        };
+
+        let first = log.append(status_payload()).expect_err("write must fail");
+        assert!(matches!(first, ChainError::Io { .. }), "{first:?}");
+        assert_eq!(log.head(), (0, GENESIS_PREV.to_string()));
+        assert_eq!(log.next_seq(), 0);
+
+        let second = log
+            .append(status_payload())
+            .expect_err("writer is poisoned");
+        assert!(matches!(second, ChainError::WriterPoisoned), "{second:?}");
+        assert!(!second.is_chain_corruption());
+    }
 }
