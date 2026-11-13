@@ -17,19 +17,52 @@ struct GuestStatus {
     kind: String,
     guest_time_unix: u64,
 }
+#[derive(Debug, Deserialize)]
+struct GuestExec {
+    #[serde(rename = "type")]
+    kind: String,
+    code: Option<i32>,
+    output: Vec<u8>,
+    truncated: bool,
+    timed_out: bool,
+}
 fn guest_status(path: &str, end: Instant) -> Result<GuestStatus> {
     let stream = api::connect(path, end)?;
     guest_status_stream(stream, end)
 }
 fn guest_status_stream(
-    mut stream: std::os::unix::net::UnixStream,
+    stream: std::os::unix::net::UnixStream,
     end: Instant,
 ) -> Result<GuestStatus> {
+    let body = guest_call(stream, br#"{"type":"status"}"#, end)?;
+    serde_json::from_slice(&body).map_err(|_| Error::Protocol)
+}
+fn guest_exec(path: &str, argv: &[&str], end: Instant) -> Result<GuestExec> {
+    let stream = api::connect(path, end)?;
+    let request = serde_json::to_vec(&serde_json::json!({
+        "type": "exec", "argv": argv, "tty": false, "timeout_ms": 5000
+    }))
+    .map_err(|_| Error::Protocol)?;
+    let body = guest_call(stream, &request, end)?;
+    serde_json::from_slice(&body).map_err(|_| Error::Protocol)
+}
+/// One execd request over Firecracker's host-initiated vsock handshake.
+fn guest_call(
+    mut stream: std::os::unix::net::UnixStream,
+    request: &[u8],
+    end: Instant,
+) -> Result<Vec<u8>> {
     api::write_deadline(&mut stream, b"CONNECT 5000\n", end)?;
     let mut handshake = Vec::new();
     loop {
         let mut byte = [0];
-        api::read_exact_deadline(&mut stream, &mut byte, end)?;
+        match api::read_exact_deadline(&mut stream, &mut byte, end) {
+            // Firecracker closes the connection without a reply while no guest
+            // listener is bound yet (execd still booting): retryable, not a
+            // protocol violation.
+            Err(Error::Protocol) if handshake.is_empty() => return Err(Error::Io),
+            other => other?,
+        }
         handshake.push(byte[0]);
         if handshake.len() > MAX_HANDSHAKE_BYTES {
             return Err(Error::Protocol);
@@ -46,7 +79,6 @@ fn guest_status_stream(
     {
         return Err(Error::Protocol);
     }
-    let request = br#"{"type":"status"}"#;
     api::write_deadline(&mut stream, &(request.len() as u32).to_le_bytes(), end)?;
     api::write_deadline(&mut stream, request, end)?;
     let mut length = [0; 4];
@@ -57,7 +89,7 @@ fn guest_status_stream(
     }
     let mut body = vec![0; length as usize];
     api::read_exact_deadline(&mut stream, &mut body, end)?;
-    serde_json::from_slice(&body).map_err(|_| Error::Protocol)
+    Ok(body)
 }
 fn environment() -> Option<support::Fixture> {
     let mut vars = Vec::new();
@@ -74,6 +106,11 @@ fn environment() -> Option<support::Fixture> {
     f.spec.jail.firecracker = vars[0].clone();
     f.spec.kernel_image = vars[1].clone();
     f.spec.root_drive.path = vars[2].clone();
+    // First boot goes through the trusted early-proc shim, which execs execd as PID 1.
+    f.spec.boot_args = f
+        .spec
+        .boot_args
+        .replace("init=/sbin/hermetic-execd", "init=/sbin/hermetic-init");
     f.spec.networks.clear();
     // An empty ext4 upper disk, built without mounting anything on the host.
     // The host must provide the project's pinned e2fsprogs >=1.47.1.
@@ -154,6 +191,26 @@ fn boot<R: Runner>(f: support::Fixture, runner: R) {
         status.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS,
         "guest clock outside T_clock tolerance"
     );
+    eprintln!("guest status: guest_time_unix={}", status.guest_time_unix);
+    // One trivial command through execd; static busybox is in the smoke rootfs.
+    let exec = guest_exec(&socket, &["/bin/busybox", "echo", "hermetic-ok"], end)
+        .expect("execd exec failed");
+    assert_eq!(exec.kind, "exec");
+    assert_eq!(exec.code, Some(0));
+    assert!(!exec.truncated && !exec.timed_out);
+    assert_eq!(exec.output, b"hermetic-ok\n");
+    // The command's view of the clock is the faked boot clock, not the host's.
+    let date = guest_exec(&socket, &["/bin/busybox", "date", "-u", "+%s"], end)
+        .expect("execd exec failed");
+    let seconds: u64 = std::str::from_utf8(&date.output)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("date output");
+    assert!(seconds.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+    eprintln!(
+        "guest exec: output={:?} date={seconds}",
+        String::from_utf8_lossy(&exec.output)
+    );
     // This intentionally verifies forced stop rather than execd's graceful
     // freeze protocol, which belongs to the caller/guest integration.
     vm.stop(Duration::from_secs(2)).unwrap();
@@ -230,4 +287,20 @@ fn guest_status_frame_known_answer_and_cap() {
         }
         join.join().unwrap();
     }
+}
+#[test]
+fn guest_not_yet_listening_is_retryable() {
+    // Regression: Firecracker answers CONNECT to an unbound guest port by closing
+    // the stream. That must be retried by the readiness loop, not fail the boot.
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let join = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut s = server;
+        let mut hello = [0; 13];
+        s.read_exact(&mut hello).unwrap();
+        drop(s);
+    });
+    let reply = guest_status_stream(client, deadline(Duration::from_secs(1)).unwrap());
+    assert!(matches!(reply, Err(Error::Io)));
+    join.join().unwrap();
 }

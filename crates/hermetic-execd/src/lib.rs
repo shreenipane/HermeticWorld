@@ -2,6 +2,7 @@
 //! Guest PID 1. Policy is separate from the privileged Linux implementation.
 
 pub mod boot;
+pub mod early;
 pub mod fs;
 pub mod real;
 pub mod rpc;

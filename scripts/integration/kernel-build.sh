@@ -8,7 +8,7 @@ if [ "$#" -ne 2 ]; then
 fi
 
 # All validation and output writes use the same no-follow descriptor helpers as
-# kernel-build. The pinned debian base and hermetic/kernel-builder:6.1-v1 tag
+# kernel-build. The pinned debian base and hermetic/kernel-builder:6.6-v1 tag
 # are defined there; build-record.json is printed only after a verified build.
 # BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \

@@ -577,13 +577,19 @@ impl Sys for Linux {
             }
             Effect::MountProc => self.mount_guest("proc", "/proc", "proc", None)?,
             Effect::MountSys => self.mount_guest("sysfs", "/sys", "sysfs", None)?,
-            Effect::MountPts => self.mount_guest(
-                "devpts",
-                "/dev/pts",
-                "devpts",
-                Some("newinstance,ptmxmode=0666,mode=0620"),
-            )?,
+            Effect::MountPts => {
+                // The kernel's devtmpfs, moved over /dev, hides the base's
+                // /dev/pts and /dev/shm and does not create them itself.
+                ensure_mountpoint(&self.root()?.directory("/dev")?, "pts")?;
+                self.mount_guest(
+                    "devpts",
+                    "/dev/pts",
+                    "devpts",
+                    Some("newinstance,ptmxmode=0666,mode=0620"),
+                )?
+            }
             Effect::MountShm => {
+                ensure_mountpoint(&self.root()?.directory("/dev")?, "shm")?;
                 self.mount_guest("tmpfs", "/dev/shm", "tmpfs", Some("size=64m,mode=1777"))?
             }
             Effect::StampDev(clock) => {
@@ -977,9 +983,45 @@ pub fn serial_failure(
     Ok(())
 }
 
+/// Creates a fixed-name directory beneath an already pinned parent, accepting an
+/// existing one. Symlinks or other file types are refused (never followed).
+pub(crate) fn ensure_mountpoint(parent: &OwnedFd, name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(Error::InvalidInput);
+    }
+    match fs::mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let _ = fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devtmpfs_mountpoints_are_created_without_following_links() {
+        // Regression: /dev/pts and /dev/shm are missing on a moved devtmpfs.
+        let temp = tempfile::tempdir().unwrap();
+        let parent: OwnedFd = std::fs::File::open(temp.path()).unwrap().into();
+        ensure_mountpoint(&parent, "pts").unwrap();
+        assert!(temp.path().join("pts").is_dir());
+        ensure_mountpoint(&parent, "pts").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("pts"), temp.path().join("shm")).unwrap();
+        assert!(ensure_mountpoint(&parent, "shm").is_err());
+        std::fs::write(temp.path().join("file"), b"").unwrap();
+        assert!(ensure_mountpoint(&parent, "file").is_err());
+        for bad in ["", ".", "..", "a/b"] {
+            assert_eq!(ensure_mountpoint(&parent, bad), Err(Error::InvalidInput));
+        }
+    }
     use std::{io::IsTerminal, os::unix::process::CommandExt};
 
     #[test]

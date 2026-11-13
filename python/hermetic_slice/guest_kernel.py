@@ -66,11 +66,14 @@ class Rule:
 RULES: dict[str, Rule] = {}
 for _purpose, _names in (
     ("TR-VMM-4: x86 microVM boot", "64BIT X86_64 SMP HYPERVISOR_GUEST KVM_GUEST PCI BLOCK BLK_DEV MODULES NET NETDEVICES INET UNIX PROC_FS SYSFS TMPFS MULTIUSER TTY SERIAL_8250 SERIAL_8250_CONSOLE PRINTK ELF_CORE BINFMT_ELF BINFMT_SCRIPT UNIX98_PTYS DEVTMPFS FHANDLE"),
+    ("execd boot contract: the kernel mounts devtmpfs at /dev before PID 1", "DEVTMPFS_MOUNT"),
+    ("execd: PID 1 reaps orphans via /proc/<pid>/task/<tid>/children", "PROC_CHILDREN"),
+    ("TR-EXD-6: trusted initramfs support (uncompressed or gzip only)", "BLK_DEV_INITRD RD_GZIP"),
     ("TR-VMM-4: cgroup v2 controllers and device BPF", "CGROUPS CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG CGROUP_PIDS BLK_CGROUP BLK_DEV_THROTTLING IOSCHED_BFQ BFQ_GROUP_IOSCHED CGROUP_WRITEBACK CPUSETS CGROUP_BPF BPF BPF_SYSCALL"),
     ("TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES)", "NAMESPACES USER_NS PID_NS NET_NS UTS_NS IPC_NS SYSVIPC POSIX_MQUEUE"),
     ("TR-VMM-4: root filesystems", "OVERLAY_FS EXT4_FS FS_POSIX_ACL EXT4_FS_POSIX_ACL"),
     ("TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack", "NETFILTER NETFILTER_ADVANCED NETFILTER_XTABLES NF_CONNTRACK NF_NAT NF_TABLES NF_TABLES_INET NFT_CT NFT_NAT NFT_TPROXY NFT_SOCKET NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_SOCKET NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_TARGET_REDIRECT NETFILTER_XT_TARGET_MASQUERADE IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_NAT IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_MANGLE IPV6 NF_TPROXY_IPV4 NF_TPROXY_IPV6 NF_SOCKET_IPV4 NF_SOCKET_IPV6"),
-    ("TR-VMM-5: virtio devices, vsock and entropy", "VIRTIO VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE HW_RANDOM HW_RANDOM_VIRTIO VSOCKETS VIRTIO_VSOCKETS RANDOM_TRUST_CPU"),
+    ("TR-VMM-5: virtio devices, vsock and entropy", "VIRTIO VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE HW_RANDOM HW_RANDOM_VIRTIO VSOCKETS VIRTIO_VSOCKETS"),
     ("TR-VMM-4: dm-verity and seccomp", "MD BLK_DEV_DM DM_VERITY CRYPTO CRYPTO_SHA256 SECCOMP SECCOMP_FILTER"),
 ):
     for _name in _names.split():
@@ -78,13 +81,15 @@ for _purpose, _names in (
 for _purpose, _names in (
     ("TR-VMM-4: prevent accidental host clock reads", "PTP_1588_CLOCK PTP_1588_CLOCK_KVM PTP_1588_CLOCK_VMW RTC_HCTOSYS"),
     ("TR-VMM-4: fixed build identity; config supplied separately", "LOCALVERSION_AUTO IKCONFIG"),
-    ("T3.1: execd mounts devtmpfs after setting time; no time namespace needed", "DEVTMPFS_MOUNT TIME_NS"),
+    ("T3.1: no time namespace needed", "TIME_NS"),
+    ("TR-EXD-6: no initramfs decompressor other than gzip", "RD_BZIP2 RD_LZMA RD_XZ RD_LZO RD_LZ4 RD_ZSTD"),
 ):
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("n", _purpose)
 RULES["CONFIG_LOCALVERSION"] = Rule('""', "TR-VMM-4: no local version or host suffix")
 RULES["CONFIG_BUILD_SALT"] = Rule('""', "TR-VMM-4: no random build salt")
 RULES["CONFIG_DEFAULT_HOSTNAME"] = Rule('"hermetic"', "TR-VMM-4: fixed default guest hostname")
+RULES["CONFIG_INITRAMFS_SOURCE"] = Rule('""', "TR-EXD-6: no initramfs built into the kernel image")
 RULES["CONFIG_DEBUG_INFO"] = Rule("n", "TR-VMM-4: no compiler paths or debug metadata")
 RULES = dict(sorted(RULES.items()))
 
@@ -157,7 +162,7 @@ def check_config(config_text: str | bytes) -> list[Finding]:
     return findings
 
 
-BOOT_FIXED = "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-execd clocksource=tsc tsc=reliable no-kvmclock"
+BOOT_FIXED = "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock"
 
 
 def boot_arguments(t_clock: int) -> str:
@@ -206,8 +211,8 @@ def validate_lock(lock: dict, *, for_build: bool = False) -> dict:
     for field in sorted(fields):
         if for_build and PLACEHOLDER in lock[field]:
             raise KernelError(f"lock placeholder: {field}")
-    if not re.fullmatch(r"6\.1\.[0-9]{1,4}", lock["version"]):
-        raise KernelError("invalid lock field: version (requires 6.1.x)")
+    if not re.fullmatch(r"6\.6\.[0-9]{1,4}", lock["version"]):
+        raise KernelError("invalid lock field: version (requires 6.6.x)")
     if lock["source_url"] != f'https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{lock["version"]}.tar.xz':
         raise KernelError("invalid lock field: source_url")
     if lock["sha256"] != PLACEHOLDER and not re.fullmatch(r"[0-9a-f]{64}", lock["sha256"]):
@@ -612,7 +617,7 @@ def integration_build(tarball: Path, output: Path) -> bytes:
             env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "TZ": "UTC"}
             _run(["/usr/bin/docker", "--config", str(stable / "docker-config"), "build",
                   "--build-arg", "BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
-                  "-t", "hermetic/kernel-builder:6.1-v1", "--iidfile", str(stable / "image-id"),
+                  "-t", "hermetic/kernel-builder:6.6-v1", "--iidfile", str(stable / "image-id"),
                   "-f", str(stable / "Dockerfile"), str(stable)], env=env, stderr_parent=out_fd)
             image = read_file(stable / "image-id", MAX_IMAGE_ID_BYTES).strip()
             if not re.fullmatch(b"sha256:[0-9a-f]{64}", image):
@@ -813,12 +818,17 @@ def container_build(*, incoming: Path = Path("/inputs"), output: Path = Path("/o
     source = _extract_source(incoming / "source.tar.xz", work, lock["version"], lock["sha256"])
     build = work / "objects"
     build.mkdir(mode=0o700)
+    # The container root (and so /tmp) is read-only; with initramfs support the kernel's
+    # usr/gen_initramfs.sh needs mktemp, so give it a private directory on the build tmpfs.
+    scratch = work / "tmp"
+    scratch.mkdir(mode=0o700)
     env = {
         "PATH": "/usr/bin:/bin", "HOME": "/build", "ARCH": "x86_64", "LC_ALL": "C", "TZ": "UTC",
         "KBUILD_BUILD_TIMESTAMP": _banner_date(lock), "KBUILD_BUILD_USER": lock["build_user"],
         "KBUILD_BUILD_HOST": lock["build_host"], "KBUILD_BUILD_VERSION": "1",
         "SOURCE_DATE_EPOCH": str(int(release_datetime(lock).timestamp())),
         "KCONFIG_NOTIMESTAMP": "1", "KCONFIG_CONFIG": str(build / ".config"),
+        "TMPDIR": str(scratch),
     }
     _run(["/bin/bash", str(source / "scripts/kconfig/merge_config.sh"), "-m", "-O", str(build),
           str(incoming / "base-x86_64.config"), str(incoming / "hermetic.config")], env=env, cwd=source)

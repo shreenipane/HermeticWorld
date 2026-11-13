@@ -18,6 +18,19 @@ before its first clock effect. Without it, execd powers off silently. T3.3 must
 verify this handoff; a stock direct `init=hermetic-execd` boot without early proc
 does not satisfy the contract.
 
+On first boot that early proc interface comes from the trusted shim
+`/sbin/hermetic-init` (binary `hermetic-init` in this crate, `src/early.rs`), booted
+with `init=/sbin/hermetic-init`. It lives on the sealed read-only base next to
+execd. As PID 1 it does exactly two things: it mounts procfs read-only (nosuid,
+nodev, noexec) at `/proc` and execs `/sbin/hermetic-execd` with no arguments and
+an empty environment. execd then runs as the same PID 1. The shim reads no clock,
+writes nothing, logs nothing and parses no input. If the mount or the exec fails,
+it powers the VM off. It refuses to run unless it is PID 1. The kernel itself
+mounts the base read-only and devtmpfs at `/dev` (`CONFIG_DEVTMPFS_MOUNT=y`).
+No initramfs is used on first boot, because an initramfs suppresses both of those
+kernel mounts. The trusted initramfs remains the TR-EXD-6 reboot path
+(`hermetic.initramfs=1`).
+
 The base contains ordinary, symlink-free directories `/mnt/hermetic-overlay`,
 `/mnt/hermetic-root`, `/dev`, `/proc`, `/sys`, `/dev/pts`, `/dev/shm`, `/tmp`,
 `/run`, `/etc` and the spec's working directory. `/tmp` and `/run` are sealed

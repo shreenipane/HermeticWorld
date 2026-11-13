@@ -44,7 +44,8 @@ in `spec.rs`. Boot arguments require exactly one each of `clocksource=tsc`,
 keys are refused. Quotes and backslashes are refused so command-line quoting
 cannot hide a required or forbidden token from the guest's whitespace parser.
 The guest contract additionally needs an appropriate root device and
-`init=/sbin/hermetic-execd`; the clock rule table does not prohibit alternative
+`init=/sbin/hermetic-init` (the early read-only proc shim that execs
+`/sbin/hermetic-execd`, see the execd README); the clock rule table does not prohibit alternative
 trusted PID 1 binaries for NetVM or GraderVM.
 
 ## API order and clock

@@ -14,7 +14,7 @@ from hermetic_slice import guest_kernel as k
 from hermetic_slice.__main__ import main
 
 ROOT = Path(__file__).absolute().parents[2] / "images/kernel"
-HEADER = "# Linux/x86 6.1.128 Kernel Configuration\n"
+HEADER = "# Linux/x86 6.6.160 Kernel Configuration\n"
 
 
 def config(values=None):
@@ -26,17 +26,17 @@ def config(values=None):
 def lock():
     value = k.load_lock(ROOT / "kernel.lock.json")
     value.update(sha256=hashlib.sha256(b"source").hexdigest(),
-                 builder_image="hermetic/kernel-builder:6.1-v1@sha256:" + "a" * 64)
+                 builder_image="hermetic/kernel-builder:6.6-v1@sha256:" + "a" * 64)
     return value
 
 
 def test_checked_in_lock_real_pins():
     raw = json.loads((ROOT / "kernel.lock.json").read_text())
-    assert raw["sha256"] == "874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3"
-    assert raw["release_date"] == "2025-02-01T00:00:00Z"
-    assert raw["builder_image"] == "hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER"
-    assert raw["version"] == "6.1.128"
-    assert raw["source_url"] == "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz"
+    assert raw["sha256"] == "b24c40a9e2188695803358567edda51c4080176424a57dbefca45e5ac44ec225"
+    assert raw["release_date"] == "2026-10-21T00:00:00Z"
+    assert raw["builder_image"] == "hermetic/kernel-builder:6.6-v1@sha256:TO-BE-FILLED-BY-OWNER"
+    assert raw["version"] == "6.6.160"
+    assert raw["source_url"] == "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.160.tar.xz"
     assert raw["build_user"] == "hermetic"
     assert raw["build_host"] == "hermetic"
 
@@ -77,7 +77,7 @@ def test_merged_fragments_and_generated_readme_table():
 
 def test_boot_known_answer():
     expected = ("console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro "
-                "init=/sbin/hermetic-execd clocksource=tsc tsc=reliable no-kvmclock hermetic.t=1704067200")
+                "init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock hermetic.t=1704067200")
     assert k.boot_arguments(1704067200) == expected
     assert k.check_boot_arguments(expected) == []
 
@@ -139,7 +139,7 @@ def test_docker_known_answer(lock):
         "--mount", "type=bind,src=/private/in,dst=/inputs,readonly",
         "--mount", "type=bind,src=/private/out,dst=/output",
         "--tmpfs", "/build:rw,exec,nosuid,nodev,size=8g,mode=1777", "--workdir=/build",
-        "--entrypoint=/bin/bash", "hermetic/kernel-builder:6.1-v1@sha256:" + "a" * 64, "/inputs/build.sh"]
+        "--entrypoint=/bin/bash", "hermetic/kernel-builder:6.6-v1@sha256:" + "a" * 64, "/inputs/build.sh"]
 
 
 @pytest.mark.parametrize("path", ["relative", "/tmp/a,readonly", "/tmp/a\n", "/tmp/../a"])
@@ -150,14 +150,14 @@ def test_docker_rejects_bad_mounts(lock, path):
 
 def banner(lock):
     return (f'Linux version {lock["version"]} (hermetic@hermetic) (gcc (Debian) 12.2.0, GNU ld 2.40) '
-            '#1 SMP Sat Feb 01 00:00:00 UTC 2025\n').encode()
+            '#1 SMP Wed Oct 21 00:00:00 UTC 2026\n').encode()
 
 
 @pytest.mark.parametrize("change,option", [(lambda b: b, None),
-    (lambda b: b.replace(b"6.1.128", b"6.1.127"), "banner.identity"),
+    (lambda b: b.replace(b"6.6.160", b"6.1.127"), "banner.identity"),
     (lambda b: b.replace(b"hermetic@hermetic", b"alice@host"), "banner.identity"),
-    (lambda b: b.replace(b"2025", b"2026"), "banner.date"),
-    (lambda b: b"no banner", "banner"), (lambda b: b + b.replace(b"2025", b"2026"), "banner"),
+    (lambda b: b.replace(b"2026", b"2027"), "banner.date"),
+    (lambda b: b"no banner", "banner"), (lambda b: b + b.replace(b"2026", b"2027"), "banner"),
     (lambda b: b"Linux version " + b"x" * 1200 + b"\0", "banner")])
 def test_banner_verifier(tmp_path, lock, change, option):
     path = tmp_path / "kernel"
@@ -221,7 +221,7 @@ def build_inputs(tmp_path, lock):
 def fake_builder(lock, incoming, output):
     (output / "vmlinux").write_bytes(banner(lock))
     (output / ".config").write_text(config())
-    (output / "build-record.json").write_text('{"version":"6.1.128"}\n')
+    (output / "build-record.json").write_text('{"version":"6.6.160"}\n')
 
 
 def test_reproducible_hook_builds_twice_and_compares_all_outputs(build_inputs):
@@ -366,23 +366,23 @@ def archive_fixture(path, members):
 
 def test_source_extraction(tmp_path):
     archive = tmp_path / "source.tar.xz"
-    archive_fixture(archive, [("linux-6.1.128/Makefile", b"source", "file"),
-                              ("linux-6.1.128/scripts/link", "../Makefile", "link")])
+    archive_fixture(archive, [("linux-6.6.160/Makefile", b"source", "file"),
+                              ("linux-6.6.160/scripts/link", "../Makefile", "link")])
     output = tmp_path / "source"
     output.mkdir()
-    root = k._extract_source(archive, output, "6.1.128", k.hash_file(archive))
+    root = k._extract_source(archive, output, "6.6.160", k.hash_file(archive))
     assert (root / "Makefile").read_bytes() == b"source"
     assert (root / "scripts/link").is_symlink()
 
 
 @pytest.mark.parametrize("members", [[("../escape", b"x", "file")], [("/escape", b"x", "file")],
-    [("linux-6.1.128/link", "../../escape", "link")], [("linux-6.1.128/link", "/escape", "link")],
-    [("linux-6.1.128/link", "Makefile", "link"), ("linux-6.1.128/link/evil", b"x", "file")]])
+    [("linux-6.6.160/link", "../../escape", "link")], [("linux-6.6.160/link", "/escape", "link")],
+    [("linux-6.6.160/link", "Makefile", "link"), ("linux-6.6.160/link/evil", b"x", "file")]])
 def test_source_archive_rejects_unsafe_paths(tmp_path, members):
     archive = tmp_path / "source.tar.xz"
     archive_fixture(archive, members)
     with pytest.raises((k.KernelError, OSError)):
-        k._extract_source(archive, tmp_path, "6.1.128", k.hash_file(archive))
+        k._extract_source(archive, tmp_path, "6.6.160", k.hash_file(archive))
 
 
 def test_container_pipeline_checks_before_compile_and_records_inputs(tmp_path, lock, monkeypatch):
@@ -392,7 +392,7 @@ def test_container_pipeline_checks_before_compile_and_records_inputs(tmp_path, l
     for filename in ("build.sh", "Dockerfile", "base-x86_64.config", "hermetic.config"):
         (incoming / filename).write_bytes((ROOT / filename).read_bytes())
     (incoming / "guest_kernel.py").write_bytes(Path(k.__file__).read_bytes())
-    archive_fixture(incoming / "source.tar.xz", [("linux-6.1.128/Makefile", b"kernel source", "file")])
+    archive_fixture(incoming / "source.tar.xz", [("linux-6.6.160/Makefile", b"kernel source", "file")])
     lock["sha256"] = k.hash_file(incoming / "source.tar.xz")
     (incoming / "kernel.lock.json").write_text(json.dumps(lock))
     calls = []
@@ -409,20 +409,25 @@ def test_container_pipeline_checks_before_compile_and_records_inputs(tmp_path, l
     monkeypatch.setattr(k, "_run", run)
     k.container_build(incoming=incoming, output=output, work=work)
     assert [argv[-1] for argv, _, _ in calls] == [str(incoming / "hermetic.config"), "olddefconfig", "vmlinux"]
-    assert calls[0][0] == ["/bin/bash", str(work / "linux-6.1.128/scripts/kconfig/merge_config.sh"),
+    assert calls[0][0] == ["/bin/bash", str(work / "linux-6.6.160/scripts/kconfig/merge_config.sh"),
                            "-m", "-O", str(work / "objects"), str(incoming / "base-x86_64.config"),
                            str(incoming / "hermetic.config")]
     for argv, env, cwd in calls:
         assert env == {
             "PATH": "/usr/bin:/bin", "HOME": "/build", "ARCH": "x86_64", "LC_ALL": "C", "TZ": "UTC",
-            "KBUILD_BUILD_TIMESTAMP": "Sat Feb 01 00:00:00 UTC 2025", "KBUILD_BUILD_USER": "hermetic",
-            "KBUILD_BUILD_HOST": "hermetic", "KBUILD_BUILD_VERSION": "1", "SOURCE_DATE_EPOCH": "1738368000",
-            "KCONFIG_NOTIMESTAMP": "1", "KCONFIG_CONFIG": str(work / "objects/.config")}
+            "KBUILD_BUILD_TIMESTAMP": "Wed Oct 21 00:00:00 UTC 2026", "KBUILD_BUILD_USER": "hermetic",
+            "KBUILD_BUILD_HOST": "hermetic", "KBUILD_BUILD_VERSION": "1", "SOURCE_DATE_EPOCH": "1792540800",
+            "KCONFIG_NOTIMESTAMP": "1", "KCONFIG_CONFIG": str(work / "objects/.config"),
+            "TMPDIR": str(work / "tmp")}
+    # Regression: the container's /tmp is read-only and 6.6 gen_initramfs.sh calls mktemp.
+    assert (work / "tmp").is_dir() and (work / "tmp").stat().st_mode & 0o777 == 0o700
     record = json.loads((output / "build-record.json").read_text())
     assert record["inputs"] == {name: k.hash_file(incoming / name) for name in (
         "source.tar.xz", "kernel.lock.json", "base-x86_64.config", "hermetic.config", "build.sh", "Dockerfile", "guest_kernel.py")}
     assert record["outputs"] == {name: k.hash_file(output / name) for name in ("vmlinux", ".config")}
-    assert "2026" not in json.dumps(record)
+    # No host build date: the lock's release date is the only date in the record.
+    assert record["release_date"] == "2026-10-21T00:00:00Z"
+    assert "2026-" not in json.dumps({key: value for key, value in record.items() if key != "release_date"})
     assert str(tmp_path) not in json.dumps(record)
     # Repeat with olddefconfig silently dropping required options: compile is never reached.
     def broken(argv, *, env, cwd=None):
@@ -505,7 +510,7 @@ def test_subprocess_timeout_kills_process_group(monkeypatch):
 
 def test_bounded_source_entry_bytes_and_xz_limits(tmp_path, monkeypatch):
     archive = tmp_path / "source.tar.xz"
-    archive_fixture(archive, [("linux-6.1.128/file", b"a" * 4096, "file")])
+    archive_fixture(archive, [("linux-6.6.160/file", b"a" * 4096, "file")])
     for cap, value in (("MAX_SOURCE_ENTRIES", 0), ("MAX_SOURCE_BYTES", 1), ("MAX_UNPACKED_BYTES", 1),
                        ("MAX_XZ_MEMORY_BYTES", 1)):
         with monkeypatch.context() as patch:
@@ -513,7 +518,7 @@ def test_bounded_source_entry_bytes_and_xz_limits(tmp_path, monkeypatch):
             output = tmp_path / cap
             output.mkdir()
             with pytest.raises(k.KernelError):
-                k._extract_source(archive, output, "6.1.128", k.hash_file(archive))
+                k._extract_source(archive, output, "6.6.160", k.hash_file(archive))
 
 
 def test_size_caps_and_growth_after_open(tmp_path, monkeypatch):
@@ -556,7 +561,7 @@ def test_integration_kernel_build_script():
     assert "set -euo pipefail" in content
     assert "sudo" not in content
     assert "debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc" in content
-    assert "hermetic/kernel-builder:6.1-v1" in content
+    assert "hermetic/kernel-builder:6.6-v1" in content
     assert "kernel-build" in content
     assert "build-record.json" in content
 
@@ -580,11 +585,11 @@ def test_entrypoint_environment_and_builder_prerequisites():
 
 def test_source_sha256_mismatch_never_unpacks(tmp_path):
     archive = tmp_path / "source.tar.xz"
-    archive_fixture(archive, [("linux-6.1.128/file", b"source", "file")])
+    archive_fixture(archive, [("linux-6.6.160/file", b"source", "file")])
     output = tmp_path / "output"
     output.mkdir()
     with pytest.raises(k.KernelError, match="sha256 mismatch"):
-        k._extract_source(archive, output, "6.1.128", "0" * 64)
+        k._extract_source(archive, output, "6.6.160", "0" * 64)
     assert list(output.iterdir()) == []
 
 
@@ -592,26 +597,26 @@ def test_archive_metadata_and_special_members_are_bounded(tmp_path):
     for kind in (tarfile.FIFOTYPE, tarfile.LNKTYPE, tarfile.GNUTYPE_SPARSE):
         path = tmp_path / ("archive-" + kind.decode("ascii"))
         with tarfile.open(path, "w:xz") as archive:
-            info = tarfile.TarInfo("linux-6.1.128/special")
+            info = tarfile.TarInfo("linux-6.6.160/special")
             info.type = kind
-            info.linkname = "linux-6.1.128/file"
+            info.linkname = "linux-6.6.160/file"
             archive.addfile(info)
         with pytest.raises(k.KernelError):
-            k._extract_source(path, tmp_path, "6.1.128", k.hash_file(path))
+            k._extract_source(path, tmp_path, "6.6.160", k.hash_file(path))
     path = tmp_path / "metadata.tar.xz"
     with tarfile.open(path, "w:xz", format=tarfile.PAX_FORMAT) as archive:
-        info = tarfile.TarInfo("linux-6.1.128/file")
+        info = tarfile.TarInfo("linux-6.6.160/file")
         info.pax_headers = {"comment": "x" * (k.MAX_TAR_METADATA_BYTES + 1)}
         archive.addfile(info)
     with pytest.raises(k.KernelError, match="metadata exceeds"):
-        k._extract_source(path, tmp_path, "6.1.128", k.hash_file(path))
+        k._extract_source(path, tmp_path, "6.6.160", k.hash_file(path))
 
 
 def test_clock_and_identity_do_not_depend_on_host_locale(lock, monkeypatch):
     monkeypatch.setenv("LC_ALL", "invalid_locale")
     monkeypatch.setenv("TZ", "Pacific/Honolulu")
     monkeypatch.setenv("KBUILD_BUILD_HOST", "SECRET-HOST")
-    assert k._banner_date(lock) == "Sat Feb 01 00:00:00 UTC 2025"
+    assert k._banner_date(lock) == "Wed Oct 21 00:00:00 UTC 2026"
     assert k.boot_arguments(0).endswith(" hermetic.t=0")
     assert k.boot_arguments(k.MAX_CLOCK).endswith(" hermetic.t=253402300799")
 
@@ -731,7 +736,7 @@ def integration_inputs(tmp_path, lock, monkeypatch):
     kernel.mkdir()
     for name in ('Dockerfile', 'build.sh', 'base-x86_64.config', 'hermetic.config'):
         (kernel / name).write_bytes((ROOT / name).read_bytes())
-    lock['builder_image'] = 'hermetic/kernel-builder:6.1-v1@sha256:' + k.PLACEHOLDER
+    lock['builder_image'] = 'hermetic/kernel-builder:6.6-v1@sha256:' + k.PLACEHOLDER
     (kernel / 'kernel.lock.json').write_text(json.dumps(lock))
     source = tmp_path / 'source.tar.xz'
     source.write_bytes(b'source')
@@ -811,40 +816,40 @@ def test_integration_hash_mismatch_creates_nothing(integration_inputs, monkeypat
 
 def test_source_symlink_composition_cannot_escape_root(tmp_path):
     archive = tmp_path / 'source.tar.xz'
-    archive_fixture(archive, [('linux-6.1.128/a', '.', 'link'),
-                              ('linux-6.1.128/b', 'a/..', 'link')])
+    archive_fixture(archive, [('linux-6.6.160/a', '.', 'link'),
+                              ('linux-6.6.160/b', 'a/..', 'link')])
     destination = tmp_path / 'build'
     destination.mkdir()
     with pytest.raises(k.KernelError, match='source link escapes tree'):
-        k._extract_source(archive, destination, '6.1.128', k.hash_file(archive))
-    assert not (destination / 'linux-6.1.128/a').is_symlink()
-    assert not (destination / 'linux-6.1.128/b').is_symlink()
+        k._extract_source(archive, destination, '6.6.160', k.hash_file(archive))
+    assert not (destination / 'linux-6.6.160/a').is_symlink()
+    assert not (destination / 'linux-6.6.160/b').is_symlink()
 
 
 def test_source_symlink_cycles_are_bounded(tmp_path):
     archive = tmp_path / 'source.tar.xz'
-    archive_fixture(archive, [('linux-6.1.128/a', 'b', 'link'),
-                              ('linux-6.1.128/b', 'a', 'link')])
+    archive_fixture(archive, [('linux-6.6.160/a', 'b', 'link'),
+                              ('linux-6.6.160/b', 'a', 'link')])
     with pytest.raises(k.KernelError, match='hop cap'):
-        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
+        k._extract_source(archive, tmp_path, '6.6.160', k.hash_file(archive))
 
 
 @pytest.mark.parametrize('ancestor', [False, True])
 def test_source_extraction_refuses_preexisting_symlinks(tmp_path, ancestor):
     archive = tmp_path / 'source.tar.xz'
-    archive_fixture(archive, [('linux-6.1.128/sub/file', b'must stay inside', 'file')])
+    archive_fixture(archive, [('linux-6.6.160/sub/file', b'must stay inside', 'file')])
     destination = tmp_path / 'build'
     destination.mkdir()
     outside = tmp_path / 'outside'
     outside.mkdir()
-    root = destination / 'linux-6.1.128'
+    root = destination / 'linux-6.6.160'
     if ancestor:
         root.mkdir()
         (root / 'sub').symlink_to(outside, target_is_directory=True)
     else:
         root.symlink_to(outside, target_is_directory=True)
     with pytest.raises(k.KernelError, match='source directory must not contain symlinks'):
-        k._extract_source(archive, destination, '6.1.128', k.hash_file(archive))
+        k._extract_source(archive, destination, '6.6.160', k.hash_file(archive))
     assert list(outside.iterdir()) == []
 
 
@@ -860,14 +865,14 @@ def test_cli_defaults_work_in_shallow_package(tmp_path, monkeypatch, capsys):
 def test_source_pax_nul_paths_are_rejected_before_filesystem_use(tmp_path, field):
     archive = tmp_path / 'source.tar.xz'
     with tarfile.open(archive, 'w:xz', format=tarfile.PAX_FORMAT) as tar:
-        info = tarfile.TarInfo('linux-6.1.128/link')
+        info = tarfile.TarInfo('linux-6.6.160/link')
         info.type = tarfile.SYMTYPE
         info.linkname = 'internal'
-        info.pax_headers = {field: 'linux-6.1.128/a\0b' if field == 'path' else 'a\0b'}
+        info.pax_headers = {field: 'linux-6.6.160/a\0b' if field == 'path' else 'a\0b'}
         tar.addfile(info)
     with pytest.raises(k.KernelError, match='NUL'):
-        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
-    assert not (tmp_path / 'linux-6.1.128').exists()
+        k._extract_source(archive, tmp_path, '6.6.160', k.hash_file(archive))
+    assert not (tmp_path / 'linux-6.6.160').exists()
 
 
 @pytest.mark.parametrize('bad_input', ['config', 'shell-symlink', 'source-pin'])
@@ -901,10 +906,10 @@ def test_integration_output_identity_change_prevents_build(build_inputs):
 
 def test_source_root_cannot_be_a_symlink_to_destination(tmp_path):
     archive = tmp_path / 'source.tar.xz'
-    archive_fixture(archive, [('linux-6.1.128', '.', 'link')])
+    archive_fixture(archive, [('linux-6.6.160', '.', 'link')])
     with pytest.raises(k.KernelError, match='unsafe paths'):
-        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
-    assert not (tmp_path / 'linux-6.1.128').exists()
+        k._extract_source(archive, tmp_path, '6.6.160', k.hash_file(archive))
+    assert not (tmp_path / 'linux-6.6.160').exists()
 
 
 def test_config_accepts_real_kconfig_symbols_with_lowercase_letters():
@@ -923,16 +928,62 @@ def test_config_accepts_real_kconfig_symbols_with_lowercase_letters():
 
 def test_base_config_enables_paravirt_for_required_kvm_guest():
     # KVM_GUEST depends on PARAVIRT; without it olddefconfig silently drops KVM_GUEST
-    # and the final-config policy fails (seen in the first real 6.1.128 build).
+    # and the final-config policy fails (seen in the first real 6.6.160 build).
     base = k.parse_config((Path(__file__).resolve().parents[2] / "images/kernel/base-x86_64.config").read_text())
     assert base.get("CONFIG_KVM_GUEST") == "y"
     assert base.get("CONFIG_PARAVIRT") == "y"
 
 
 def test_identical_banner_copies_accepted_but_capped(tmp_path, lock):
-    # A real 6.1.128 vmlinux carries two identical linux_banner copies.
+    # A real 6.6.160 vmlinux carries two identical linux_banner copies.
     path = tmp_path / "kernel"
     path.write_bytes(b"ELF\0" + banner(lock) + b"\0" + banner(lock) + b"\0")
     assert k.verify_vmlinux(path, lock) == []
     path.write_bytes(b"ELF\0" + (banner(lock) + b"\0") * (k.MAX_BANNER_COPIES + 1))
     assert [f.option for f in k.verify_vmlinux(path, lock)] == ["banner"]
+
+
+def _policy(**changes):
+    return {**{name: rule.value for name, rule in k.RULES.items()}, **changes}
+
+
+def test_execd_boot_contract_kernel_policy():
+    # Regression: the 6.1 lock had no initramfs support and no devtmpfs automount, so
+    # execd's documented boot contract (kernel-mounted /dev) could not be met.
+    assert k.RULES["CONFIG_DEVTMPFS_MOUNT"].value == "y"
+    assert k.RULES["CONFIG_BLK_DEV_INITRD"].value == "y"
+    assert k.RULES["CONFIG_RD_GZIP"].value == "y"
+    assert k.RULES["CONFIG_INITRAMFS_SOURCE"].value == '""'
+    for name in ("RD_BZIP2", "RD_LZMA", "RD_XZ", "RD_LZO", "RD_LZ4", "RD_ZSTD"):
+        assert k.RULES["CONFIG_" + name].value == "n"
+        assert [f.option for f in k.check_config(config(_policy(**{"CONFIG_" + name: "y"})))] == ["CONFIG_" + name]
+    assert [f.option for f in k.check_config(config(_policy(CONFIG_DEVTMPFS_MOUNT="n")))] == ["CONFIG_DEVTMPFS_MOUNT"]
+    # Clock hiding stays: PTP KVM clock is still forbidden and no-kvmclock is still a boot argument.
+    assert k.RULES["CONFIG_PTP_1588_CLOCK_KVM"].value == "n"
+    assert "no-kvmclock" in k.BOOT_FIXED.split()
+    assert "init=/sbin/hermetic-init" in k.BOOT_FIXED.split()
+
+
+def test_lock_requires_6_6_series():
+    good = json.loads((ROOT / "kernel.lock.json").read_text())
+    k.validate_lock(good)
+    for version in ("6.1.128", "6.12.1"):
+        bad = dict(good, version=version, source_url=f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{version}.tar.xz")
+        with pytest.raises(k.KernelError):
+            k.validate_lock(bad)
+
+
+def test_policy_has_no_symbols_removed_before_6_6():
+    # Regression: CONFIG_RANDOM_TRUST_CPU was removed in Linux 6.2 (CPU RNG trust is now
+    # the default, random.trust_cpu); requiring it made every 6.6 build fail the policy.
+    assert "CONFIG_RANDOM_TRUST_CPU" not in k.RULES
+    for filename in ("base-x86_64.config", "hermetic.config"):
+        assert "CONFIG_RANDOM_TRUST_CPU" not in k.parse_config((ROOT / filename).read_bytes())
+
+
+def test_policy_requires_proc_children_for_execd_reaper():
+    # Regression: without /proc/<pid>/task/<tid>/children execd's reaper fails and the
+    # guest powers off before serving any vsock request.
+    assert k.RULES["CONFIG_PROC_CHILDREN"].value == "y"
+    assert k.parse_config((ROOT / "hermetic.config").read_bytes())["CONFIG_PROC_CHILDREN"] == "y"
+    assert [f.option for f in k.check_config(config(_policy(CONFIG_PROC_CHILDREN="n")))] == ["CONFIG_PROC_CHILDREN"]

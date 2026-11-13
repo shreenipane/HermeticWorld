@@ -174,7 +174,8 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] Open (T3.3): confirm the status-frame format against `hermetic-execd` (T3.1): execd now emits the guest clock the vmm decoder expects; to be proven end to end at the first VM boot
 - [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
 - [x] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (T3.1, merged 2026-11-13 after review+fix; status frame now carries the guest clock for the vmm decoder)
-  - [ ] Open: direct `init=/sbin/hermetic-execd` boot reads `/proc/cmdline` before procfs is mounted; needs a trusted bootstrap or VMM handoff that keeps clock-first ordering, plus a boot test
+  - [x] Early proc handoff: `init=/sbin/hermetic-init` shim mounts read-only procfs then execs execd (clock-first kept); guest kernel moved to 6.6.160 with devtmpfs automount and initrd support; dev-unjailed boot smoke in `scripts/integration/boot-smoke.sh`
+  - [ ] Open: TR-EXD-6 trusted-reboot initramfs (build it reproducibly, `hermetic.initramfs=1`) and hermetic-vmm initrd wiring; first boot uses the base-resident `init=/sbin/hermetic-init` shim
   - [ ] Open: upload publication can be raced by a guest process replacing the temporary entry before rename; needs a writer-quiescence or owned-inode publication design
   - [ ] Open: synchronous filesystem I/O can stall the single RPC loop; needs isolated filesystem workers
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
