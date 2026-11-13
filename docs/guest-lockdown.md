@@ -13,7 +13,9 @@ this guest policy.
 and root's attempts to undo a runtime modules-disabled setting. `DEVMEM`,
 `X86_MSR`, `X86_CPUID`, `PROC_KCORE`, kexec (both APIs and shared core),
 hibernation, raw x86 I/O privilege syscalls, ACPI custom methods/table upgrades,
-and kprobe/uprobe/perf BPF tracing paths are disabled. `DEVKMEM` has no symbol in
+and kprobe/uprobe BPF tracing paths are disabled. `PERF_EVENTS` cannot be disabled on
+x86 (the architecture selects it); confidentiality lockdown denies its kernel-reading
+uses, and guest PMU exposure is checked by the clock probe as a 3b item. `DEVKMEM` has no symbol in
 6.6; its disabled policy entry also rejects enabling it in another source tree.
 Disabling the CPUID driver removes a device interface; it does not stop the
 userspace CPUID instruction or normalize CPU identity.

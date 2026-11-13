@@ -253,7 +253,6 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_PARAVIRT` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PARAVIRT_CLOCK` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PCI` | `y` | TR-VMM-4: x86 microVM boot |
-| `CONFIG_PERF_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PID_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_POSIX_MQUEUE` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_PRINTK` | `y` | TR-VMM-4: x86 microVM boot |

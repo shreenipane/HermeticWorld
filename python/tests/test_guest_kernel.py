@@ -1005,7 +1005,7 @@ LOCKDOWN_REQUIRED = (
 LOCKDOWN_FORBIDDEN = (
     "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID "
     "PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES "
-    "KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS PERF_EVENTS ACPI_CUSTOM_METHOD "
+    "KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD "
     "ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK"
 ).split()
 
@@ -1036,3 +1036,10 @@ def test_lockdown_retains_builtin_vm_and_grader_support():
                    "EXT4_FS OVERLAY_FS DEVTMPFS CGROUP_BPF BPF_SYSCALL "
                    "NETFILTER_XTABLES NF_TABLES NFT_TPROXY").split():
         assert merged["CONFIG_" + symbol] == "y"
+
+
+def test_policy_does_not_forbid_options_x86_force_selects():
+    # x86 selects PERF_EVENTS unconditionally; forbidding it made every
+    # integration build fail after olddefconfig. Lockdown confidentiality mode
+    # covers its kernel-reading paths instead.
+    assert k.RULES.get("CONFIG_PERF_EVENTS") is None or k.RULES["CONFIG_PERF_EVENTS"].value != "n"
