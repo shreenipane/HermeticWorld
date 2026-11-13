@@ -7,12 +7,8 @@
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
-if [ "$#" -gt 0 ]; then
-  WORK="$1"
-  mkdir -m 0700 -- "$WORK"
-else
-  WORK="$(mktemp -d /tmp/hermetic-grader-smoke.XXXXXX)"
-fi
+smoke_main() {
+WORK="${HERMETIC_SMOKE_WORK:?}"
 export CARGO_TARGET_DIR="${HOME:?}/hermetic/cargo-target/$(basename "$top")"
 FIX="$top/scripts/integration/fixtures/grader-task"
 cargo build --release -q -p hermetic-extract-agent -p hermetic-extract
@@ -33,3 +29,9 @@ done
 HERMETIC_GRADER_PUBLISHED_ROOT="$WORK/published" \
   bash scripts/integration/grader-vm-smoke.sh "$WORK/vm"
 echo "grader smoke: ok (validated extraction, empty patch unresolved, gold patch resolved)"
+
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec /usr/bin/python3 -I "$top/scripts/integration/smoke_work.py" "$top/scripts/integration/grader-smoke.sh" "$@"
+fi

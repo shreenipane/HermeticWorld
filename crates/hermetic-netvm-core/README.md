@@ -59,10 +59,10 @@ The private link is NetVM `10.0.2.3/24`, AgentVM `10.0.2.15/32`. World A records
 must be in `10/8` outside `10.0.2.0/24`; NetVM owns their sorted unique addresses as
 `/32`s. A fixed legacy NAT PREROUTING table redirects eth0 TCP ports 80 and
 443 at every destination address to the same local port. This is the documented
-REDIRECT fallback for TPROXY: policy uses Host (and eventually SNI), never the
+REDIRECT fallback for TPROXY: policy uses Host and TLS SNI, never the
 original destination IP. Conntrack reverses the translation for replies; no
-external route is installed. INPUT and OUTPUT permit only UDP DNS and TCP HTTP
-service ports; FORWARD drops everything. Port 443 remains denied pending TLS. This includes ICMP addressed to NetVM itself.
+external route is installed. INPUT and OUTPUT permit only UDP DNS and TCP HTTP/HTTPS
+service ports; FORWARD drops everything. This includes ICMP addressed to NetVM itself.
 IPv6 is disabled before eth0 comes up. The filter uses the built-in legacy
 ip_tables TCP/UDP match, `CONFIG_IP_NF_NAT`, `CONFIG_NF_NAT`,
 `CONFIG_NF_CONNTRACK` and `CONFIG_NETFILTER_XT_TARGET_REDIRECT`, all required
@@ -87,18 +87,44 @@ fixed x86-64 filter-table ABI. Every other new runtime module forbids unsafe cod
 
 
 For AgentVM, install `runtime::RESOLV_CONF` in the run spec's `resolv_conf` field;
-execd publishes it as a regular file. Before starting the agent, the trusted
-harness runs `runtime::agent_commands()` through execd as root (equivalently
-`hermetic_slice.netvm.AGENT_NETWORK_COMMANDS`): static eth0 address, IPv6 off,
-an explicit link route to `10.0.2.3/32`, and the sole default route via NetVM.
-Using a /32 avoids direct ARP for other link addresses. Interception applies to
-IPv4 packets delivered to NetVM; AgentVM loopback and its own local address
-remain local, and unsupported protocols are dropped. These root commands belong to trusted
-harness setup; the existing run-spec schema has no network-effect field.
+execd publishes it as a regular file. Set the execd run spec's `network` to
+`{"address":"10.0.2.15","prefix":32,"gateway":"10.0.2.3","mtu":1500}`.
+Execd configures eth0 as /32, disables IPv6, installs a peer /32 link route and the default route via NetVM
+before starting the entrypoint or command server. `runtime::agent_commands()`
+and `hermetic_slice.netvm.AGENT_NETWORK_COMMANDS` remain legacy harness helpers;
+the two-VM smoke relies entirely on the run spec.
 
-TLS termination, CA-key boot delivery and dm-verity remain OPEN in PHASES.md.
-The handoff approved rustls, but the current task forbids new dependencies; no TLS
-library was added. HTTPS is denied rather than served with unchecked trust. See
-`scripts/integration/BOOT_NOTES.md` for the remaining implementation plans and
-exact owner-run two-VM commands. The smoke includes an HTTPS denial fetch; a
-successful certificate-verified HTTPS fetch remains OPEN with TLS.
+TLS uses exactly pinned rustls 0.23.46 with its ring provider, already present
+in Cargo.lock through the gateway. No other external crate or crypto provider
+was added; existing `hermetic-trust`, SHA-256 and time support provide deterministic
+certificates and sealed validity. rcgen is unnecessary.
+
+PID 1 requires `WorldConfig.tls`: world ID, DNS SHA-256, public CA DER SHA-256,
+and the SHA-256 of the exact boot frame. Before eth0 comes up it connects once
+to host CID 2 port 5003, on that NetVM's private Firecracker UDS. The host sends
+one little-endian u32 length plus strict JSON `BootMaterial`, then closes its
+write side. This contains the per-world PKCS#8 CA key and derived issuance seed,
+world ID, T_clock and DNS digest; never send the host master seed. The frame is
+capped at 64 KiB and connect/read/EOF share a five-second deadline. Extra frames,
+missing EOF and any sealed-identity mismatch fail boot. Only public identity
+metadata belongs in the image. The image builder requires this identity before
+creating any output and checks that its world ID matches the image world.
+`BootMaterial::encode/identity` support seal-time
+provisioning; host copies containing private material must be mode 0600.
+
+The TLS loop accepts one connection at a time, mints deterministic leaves only
+for manifest SNI, keeps at most 64 cached keys and permits at most 4096 issuances
+per boot. Handshake time is five seconds; ClientHello is capped at 16 KiB, records
+at 18 KiB, total input at 128 KiB and TLS output buffering at 16 KiB. Absolute
+socket deadlines also cover rustls internal I/O loops. Unknown/missing SNI, ECH,
+plaintext on 443, invalid TLS and mismatched Host/SNI fail closed; only HTTP/1.1
+GET/HEAD descriptors reach WorldServer. Session storage and tickets are disabled.
+Certificates and TLS time derive solely from T_clock. Private material remains
+in NetVM memory and is never installed into either image.
+
+Use the existing `hermetic-trust` installer to inject the public CA into the
+AgentVM trust stores before sealing. The owner-run smoke does this and stages a
+static rustls client that verifies HTTPS with world trust and rejects unrelated
+trust at both manifest and arbitrary destination addresses. The fixture's fixed
+seed is public test data. dm-verity and VM execution remain OPEN; see
+`scripts/integration/BOOT_NOTES.md` for the exact smoke and verity plan.

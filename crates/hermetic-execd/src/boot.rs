@@ -131,6 +131,7 @@ pub trait Sys {
     fn freeze(&mut self, handle: &Self::FreezeHandle) -> Result<()>;
     fn load_spec(&mut self, path: &str) -> Result<RunSpec>;
     fn apply(&mut self, spec: &RunSpec) -> Result<()>;
+    fn configure_network(&mut self, spec: &RunSpec) -> Result<()>;
     fn start_entrypoint(&mut self, spec: &RunSpec) -> Result<()>;
     fn execute(
         &mut self,
@@ -192,6 +193,7 @@ pub fn boot<S: Sys>(sys: &mut S, config: &Config) -> Result<Booted<S::FreezeHand
     let spec = sys.load_spec(&config.spec)?;
     spec.validate()?;
     sys.apply(&spec)?;
+    sys.configure_network(&spec)?;
     if !config.initramfs && !spec.initial_argv().is_empty() {
         sys.start_entrypoint(&spec)?;
     }

@@ -17,6 +17,7 @@ import os
 import ctypes
 import errno
 import ipaddress
+import hashlib
 import re
 import shutil
 import stat
@@ -138,6 +139,7 @@ def build_netvm_tree(
     busybox_bin: Path,
     dns_table: Path,
     t_clock: datetime,
+    tls_identity: dict | None = None,
 ) -> Path:
     """Create a fresh NetVM rootfs tree at ``tree`` (which must not exist)."""
     if t_clock.tzinfo is None or t_clock.utcoffset() is None:
@@ -149,11 +151,22 @@ def build_netvm_tree(
     busybox = _read_regular(busybox_bin, MAX_BINARY_BYTES, "busybox binary")
     table = _read_regular(dns_table, MAX_DNS_TABLE_BYTES, "dns table")
     validate_dns_table(table)
+    config: dict = {"t_clock": epoch}
+    if tls_identity is not None:
+        if (not isinstance(tls_identity, dict)
+            or set(tls_identity) != {"world_id", "dns_sha256", "ca_sha256", "material_sha256"}
+            or not isinstance(tls_identity["world_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", tls_identity["world_id"])
+            or any(not isinstance(tls_identity[key], str) or not re.fullmatch(r"[a-f0-9]{64}", tls_identity[key])
+                   for key in ("dns_sha256", "ca_sha256", "material_sha256"))
+            or tls_identity["dns_sha256"] != hashlib.sha256(table).hexdigest()):
+            raise ValueError("invalid TLS identity")
+        config["tls"] = dict(tls_identity)
     files = {
         "sbin/hermetic-netvm": (netvm, 0o755),
         "sbin/hermetic-busybox": (busybox, 0o755),
         "etc/hermetic/dns.json": (table, 0o444),
-        "etc/hermetic/netvm.json": (json.dumps({"t_clock": epoch}).encode(), 0o444),
+        "etc/hermetic/netvm.json": (json.dumps(config, sort_keys=True).encode(), 0o444),
     }
     parent, leaf = open_parent(tree)
     staged = None
@@ -228,11 +241,16 @@ def build_netvm_image(
     world_id: str,
     sealcheck_bin: Path | None = None,
     work_dir: Path | None = None,
+    tls_identity: dict | None = None,
 ) -> dict:
     """Build the NetVM tree and a D4-checked read-only ext4 image from it."""
     from hermetic_slice.rootfs import build_rootfs
 
-    build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock)
+    if tls_identity is None:
+        raise ValueError("TLS identity is required for the NetVM image")
+    if not isinstance(tls_identity, dict) or tls_identity.get("world_id") != world_id:
+        raise ValueError("TLS identity world does not match image world")
+    build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock, tls_identity=tls_identity)
     return build_rootfs(
         tree, out_image, t_clock=t_clock, world_id=world_id, sealcheck_bin=sealcheck_bin, work_dir=work_dir
     )

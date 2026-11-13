@@ -93,6 +93,11 @@ class MissingDispositionError(DispositionsError):
     """Raised when any task in the input set lacks a valid disposition or is missing from input."""
 
 
+def directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    """Include ctime so a deleted directory's reused inode cannot pass a queued check."""
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
 @dataclass(frozen=True)
 class RedactedSpan:
     """Record of a single redacted span in the problem statement.
@@ -170,7 +175,7 @@ class SafeDirectory:
                 raise DispositionsError("Symlink rejected or non-directory component")
             fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
             after = os.fstat(fd)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            if directory_identity(before) != directory_identity(after):
                 os.close(fd)
                 raise DispositionsError("Directory changed during traversal")
             return fd
@@ -608,7 +613,7 @@ MAX_SYMLINK_HOPS = 32
 def open_safe_descendant(
     root_dir: SafeDirectory,
     rel_path: tuple[str, ...],
-    expected_identities: tuple[tuple[int, int], ...] | None = None,
+    expected_identities: tuple[tuple[int, int, int], ...] | None = None,
 ) -> SafeDirectory:
     """Open a descendant directory safely from root_dir, retaining only 1 open descriptor
     and verifying expected directory identities including all ancestors."""
@@ -627,16 +632,16 @@ def open_safe_descendant(
                 raise DispositionsError("Symlink rejected or non-directory component")
             if expected_identities is not None:
                 expected_id = expected_identities[idx]
-                if (before.st_dev, before.st_ino) != expected_id:
+                if directory_identity(before) != expected_id:
                     raise DispositionsError("Directory substituted or changed during traversal")
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
             try:
                 after = os.fstat(next_fd)
-                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                if directory_identity(before) != directory_identity(after):
                     raise DispositionsError("Directory changed during traversal")
                 if expected_identities is not None:
                     expected_id = expected_identities[idx]
-                    if (after.st_dev, after.st_ino) != expected_id:
+                    if directory_identity(after) != expected_id:
                         raise DispositionsError("Directory substituted or changed during traversal")
             except BaseException:
                 os.close(next_fd)
@@ -731,7 +736,7 @@ def verify_symlink_confined(root_fd: int, rel_path: tuple[str, ...], target: str
 def validate_snapshot_symlinks(snap_path: Path) -> None:
     """Validate every link against the completed private snapshot using bounded confined traversal."""
     with SafeDirectory(snap_path) as root_dir:
-        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = [((), ())]
+        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int, int], ...]]] = [((), ())]
         total_entries = 0
         while stack:
             rel_path, id_chain = stack.pop()
@@ -754,7 +759,7 @@ def validate_snapshot_symlinks(snap_path: Path) -> None:
                             raise DispositionsError("Failed to readlink during snapshot validation") from e
                         verify_symlink_confined(root_dir.fd, rel_path, target)
                     elif stat.S_ISDIR(info.st_mode):
-                        child_chain = id_chain + ((info.st_dev, info.st_ino),)
+                        child_chain = id_chain + (directory_identity(info),)
                         stack.append((rel_path + (name,), child_chain))
 
 
@@ -771,7 +776,7 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
         if expected_identity is not None and (root_stat.st_dev, root_stat.st_ino) != tuple(expected_identity):
             raise DispositionsError("Scan tree modified or replaced between validation and execution")
         dir_times.append((dst_path, root_stat.st_atime_ns, root_stat.st_mtime_ns))
-        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = [((), ())]
+        stack: list[tuple[tuple[str, ...], tuple[tuple[int, int, int], ...]]] = [((), ())]
         while stack:
             rel_path, id_chain = stack.pop()
             if len(rel_path) > MAX_PATH_COMPONENTS:
@@ -808,7 +813,7 @@ def snapshot_tree_safely(src_path: Path, dst_path: Path, max_bytes: int = MAX_SN
                     elif stat.S_ISDIR(info.st_mode):
                         child_dst = curr_dst / name
                         dir_times.append((child_dst, info.st_atime_ns, info.st_mtime_ns))
-                        child_chain = id_chain + ((info.st_dev, info.st_ino),)
+                        child_chain = id_chain + (directory_identity(info),)
                         stack.append((rel_path + (name,), child_chain))
                     elif stat.S_ISREG(info.st_mode):
                         if total_bytes + info.st_size > max_bytes:

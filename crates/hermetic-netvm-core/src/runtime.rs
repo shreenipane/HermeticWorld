@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! First-cut NetVM boot policy: only static DNS and intercepted plain HTTP.
+//! NetVM boot policy: static DNS and sealed HTTP/HTTPS host filtering.
 use crate::{
     dns::DnsResponder,
     http::{FilterDecision, RequestFilter},
@@ -43,6 +43,8 @@ pub fn write_ready_status(mut out: impl std::io::Write) -> std::io::Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct WorldConfig {
     pub t_clock: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::tls::TlsIdentity>,
 }
 impl WorldConfig {
     pub fn parse(reader: impl Read) -> Result<Self, &'static str> {
@@ -57,6 +59,9 @@ impl WorldConfig {
         let config: Self = serde_json::from_slice(&data).map_err(|_| "invalid_config")?;
         if !(MIN_CLOCK..=MAX_CLOCK).contains(&config.t_clock) {
             return Err("invalid_config");
+        }
+        if let Some(tls) = &config.tls {
+            tls.validate().map_err(|_| "invalid_config")?;
         }
         Ok(config)
     }
@@ -78,10 +83,7 @@ impl WorldFilter {
     }
 }
 impl RequestFilter for WorldFilter {
-    fn check(&self, head: &[u8], tls: bool, _sni: Option<&str>) -> FilterDecision {
-        if tls {
-            return FilterDecision::Reject;
-        }
+    fn check(&self, head: &[u8], tls: bool, sni: Option<&str>) -> FilterDecision {
         let parsed = match parse_request_head(head) {
             Ok(p) => p,
             Err(_) => return FilterDecision::Reject,
@@ -90,10 +92,14 @@ impl RequestFilter for WorldFilter {
         let method = parsed.method.clone();
         let mut policy_head = parsed;
         policy_head.method = "GET".into();
-        match decide(&policy_head, &self.hosts, Scheme::Http) {
+        let scheme = if tls { Scheme::Https } else { Scheme::Http };
+        match decide(&policy_head, &self.hosts, scheme) {
             Decision::MethodNotAllowed => FilterDecision::NotAllowed,
             Decision::Reject(_) => FilterDecision::Reject,
             Decision::Forward(mut req) => {
+                if tls && sni.is_none_or(|sni| !sni.eq_ignore_ascii_case(&req.host)) {
+                    return FilterDecision::Reject;
+                }
                 if method != "GET" && method != "HEAD" {
                     return FilterDecision::NotAllowed;
                 }

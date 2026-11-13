@@ -1,6 +1,61 @@
 use crate::*;
 use hermetic_common::world_manifest::Resources;
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+
+pub const MIN_NETWORK_PREFIX: u8 = 1;
+pub const MAX_NETWORK_PREFIX: u8 = 30;
+pub const MIN_NETWORK_MTU: u16 = 576;
+pub const MAX_NETWORK_MTU: u16 = 1500;
+
+/// The gateway is the NetVM's address on the isolated IPv4 link.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+    pub gateway: Ipv4Addr,
+    pub mtu: u16,
+}
+
+impl Network {
+    pub fn validate(&self) -> Result<()> {
+        if (!(MIN_NETWORK_PREFIX..=MAX_NETWORK_PREFIX).contains(&self.prefix) && self.prefix != 32)
+            || !(MIN_NETWORK_MTU..=MAX_NETWORK_MTU).contains(&self.mtu)
+        {
+            return Err(Error::InvalidInput);
+        }
+        if self.prefix == 32 {
+            return if self.address.is_private()
+                && self.gateway.is_private()
+                && self.address != self.gateway
+            {
+                Ok(())
+            } else {
+                Err(Error::InvalidInput)
+            };
+        }
+        // The range check precedes the shift. Both ends must be usable private
+        // unicast addresses in the same subnet, with distinct host portions.
+        let mask = u32::MAX
+            .checked_shl(u32::from(
+                32_u8.checked_sub(self.prefix).ok_or(Error::InvalidInput)?,
+            ))
+            .ok_or(Error::InvalidInput)?;
+        let address = u32::from(self.address);
+        let gateway = u32::from(self.gateway);
+        for ip in [self.address, self.gateway] {
+            let host = u32::from(ip) & !mask;
+            if !ip.is_private() || host == 0 || host == !mask {
+                return Err(Error::InvalidInput);
+            }
+        }
+        if address == gateway || address & mask != gateway & mask {
+            return Err(Error::InvalidInput);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +69,9 @@ pub struct RunSpec {
     pub command: Vec<String>,
     pub hostname: String,
     pub resolv_conf: String,
+    /// Omission/null keeps networkless images compatible with the guest schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
     pub resources: Resources,
 }
 
@@ -68,6 +126,9 @@ impl RunSpec {
         Ok(spec)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(network) = &self.network {
+            network.validate()?;
+        }
         path(&self.workdir)?;
         args(&self.entrypoint, true)?;
         // Command is appended to the entry point, so only its first element needs

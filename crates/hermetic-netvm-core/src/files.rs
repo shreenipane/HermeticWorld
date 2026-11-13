@@ -94,6 +94,21 @@ pub fn regular(path: &Path, cap: u64) -> io::Result<File> {
     Ok(readable)
 }
 
+/// Pin a directory for private fixture publication. All ancestors are checked
+/// without following symlinks, and callers operate through the held descriptor.
+pub fn private_directory(path: &Path) -> io::Result<File> {
+    let pinned = pin(path)?;
+    let meta = pinned.metadata()?;
+    if !meta.is_dir() || meta.mode() & 0o022 != 0 {
+        return Err(invalid());
+    }
+    let directory = File::open(fd_path(&pinned))?;
+    if !same(&meta, &directory.metadata()?) {
+        return Err(invalid());
+    }
+    Ok(directory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

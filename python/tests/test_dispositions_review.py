@@ -891,7 +891,8 @@ def test_regression_snapshot_escaping_symlinks_rejected_without_reading_canary(t
     assert os.readlink(dst_snap / "subdir" / "safe_link") == "../inside_target.txt"
 
 
-def test_regression_snapshot_unsupported_entries_and_failures_fail_closed(task_world, tmp_path, monkeypatch):
+@pytest.mark.parametrize("socket_directory_name", ["", "socket_parent_" * 10])
+def test_regression_snapshot_unsupported_entries_and_failures_fail_closed(task_world, tmp_path, monkeypatch, socket_directory_name):
     """Defect 5: FIFO/socket entries and injected metadata/readlink failures fail closed; task artifacts unchanged."""
     import socket
 
@@ -916,10 +917,16 @@ def test_regression_snapshot_unsupported_entries_and_failures_fail_closed(task_w
         fifo_path.unlink()
 
     # 2. Socket entry in root
-    sock_path = root / "special_sock"
+    sock_parent = root / socket_directory_name
+    sock_parent.mkdir(exist_ok=True)
+    sock_path = sock_parent / "special_sock"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.bind(str(sock_path))
+        directory_fd = os.open(sock_parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            sock.bind(f"/proc/self/fd/{directory_fd}/{sock_path.name}")
+        finally:
+            os.close(directory_fd)
         with pytest.raises(d.DispositionsError, match="Unsupported file system entry type"):
             d.run_real_sealcheck(task, binary, scan_config=initial["scan_config"])
         assert_artifacts_unchanged()
@@ -1153,6 +1160,49 @@ def test_regression_queued_directory_substitution_rejected(task_world, monkeypat
     assert (task / "agent/problem_statement.md").read_bytes() == statement_before
     assert (task / "manifest.json").read_bytes() == manifest_before
     assert count_open_fds() == initial_fds
+
+
+@pytest.mark.parametrize("validate_only", [False, True])
+def test_queued_directory_reused_inode_rejected(tmp_path, monkeypatch, validate_only):
+    """Simulate inode reuse without depending on the filesystem's allocator."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "source"
+    (root / "a").mkdir(parents=True)
+    (root / "a/leak.txt").write_text("must not disappear from the scan\n")
+    (root / "z").mkdir()
+    original = (root / "a").stat()
+    real_stat, real_fstat = os.stat, os.fstat
+    real_open = d.open_safe_descendant
+    replacement = None
+
+    def reused_identity(info):
+        if replacement is not None and (info.st_dev, info.st_ino) == replacement:
+            fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            fields.update(st_ino=original.st_ino, st_ctime_ns=original.st_ctime_ns + 1)
+            return SimpleNamespace(**fields)
+        return info
+
+    def replace_queued(root_dir, rel_path, *args, **kwargs):
+        nonlocal replacement
+        if replacement is None and rel_path == ("z",):
+            (root / "a").rename(tmp_path / "retired")
+            (root / "a").mkdir()
+            info = real_stat(root / "a")
+            replacement = (info.st_dev, info.st_ino)
+        return real_open(root_dir, rel_path, *args, **kwargs)
+
+    monkeypatch.setattr(d, "open_safe_descendant", replace_queued)
+    monkeypatch.setattr(os, "stat", lambda *a, **kw: reused_identity(real_stat(*a, **kw)))
+    monkeypatch.setattr(os, "fstat", lambda fd: reused_identity(real_fstat(fd)))
+    initial_fds = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(d.DispositionsError, match="Directory substituted or changed during traversal"):
+        if validate_only:
+            d.validate_snapshot_symlinks(root)
+        else:
+            d.snapshot_tree_safely(root, tmp_path / "snapshot")
+    assert replacement is not None
+    assert len(os.listdir("/proc/self/fd")) == initial_fds
 
 
 def test_regression_destination_utime_failure_fails_closed(task_world, monkeypatch):

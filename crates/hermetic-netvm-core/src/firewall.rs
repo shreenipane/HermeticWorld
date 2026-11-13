@@ -81,7 +81,7 @@ fn entry(protocol: u16, port: Option<(bool, u16)>, verdict: i32) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn table() -> Table {
+pub(crate) fn table(tls: bool) -> Table {
     let mut t = Table {
         entries: Vec::new(),
         hooks: [0; 5],
@@ -92,7 +92,10 @@ pub(crate) fn table() -> Table {
     for hook in [1, 2, 3] {
         t.hooks[hook] = t.entries.len() as u32;
         if hook != 2 {
-            for (protocol, port) in [(17, 53), (6, 80)] {
+            for (protocol, port) in [(17, 53), (6, 80)]
+                .into_iter()
+                .chain(tls.then_some((6, 443)))
+            {
                 t.entries
                     .extend(entry(protocol, Some((hook == 3, port)), ACCEPT));
                 t.count += 1;
@@ -125,7 +128,7 @@ pub fn install() -> io::Result<()> {
 
 fn install_with(mut replace: impl FnMut(&[u8], u32, &Table) -> io::Result<()>) -> io::Result<()> {
     // Denial policy first, then interception, always before eth0 comes up.
-    replace(b"filter", 14, &table())?;
+    replace(b"filter", 14, &table(true))?;
     replace(b"nat", 27, &nat_table())
 }
 
@@ -200,6 +203,37 @@ mod tests {
     }
 
     #[test]
+    fn tls_filter_opens_443_only_in_service_directions() {
+        let t = table(true);
+        assert_eq!(t.count, 10);
+        let mut permits = Vec::new();
+        for hook in [1, 2, 3] {
+            let mut offset = t.hooks[hook] as usize;
+            while offset < t.underflows[hook] as usize {
+                let e = &t.entries[offset..];
+                let target = u16_at(e, 88) as usize;
+                assert_eq!(i32_at(e, target + 32), ACCEPT);
+                let port_at = if hook == 3 { 144 } else { 148 };
+                permits.push((hook, u16_at(e, 80), u16_at(e, port_at)));
+                offset += u16_at(e, 90) as usize;
+            }
+            let e = &t.entries[offset..];
+            assert_eq!(i32_at(e, u16_at(e, 88) as usize + 32), DROP);
+        }
+        assert_eq!(
+            permits,
+            [
+                (1, 17, 53),
+                (1, 6, 80),
+                (1, 6, 443),
+                (3, 17, 53),
+                (3, 6, 80),
+                (3, 6, 443)
+            ]
+        );
+    }
+
+    #[test]
     fn interception_installation_is_ordered_and_fails_closed() {
         for failure in [None, Some(0), Some(1)] {
             let mut seen = Vec::new();
@@ -213,13 +247,13 @@ mod tests {
                 }
             });
             assert_eq!(result.is_err(), failure.is_some());
-            assert_eq!(seen[0], (b"filter".to_vec(), 14, 8));
+            assert_eq!(seen[0], (b"filter".to_vec(), 14, 10));
             if failure == Some(0) {
                 assert_eq!(seen.len(), 1);
             } else {
                 assert_eq!(
                     seen,
-                    [(b"filter".to_vec(), 14, 8), (b"nat".to_vec(), 27, 7)]
+                    [(b"filter".to_vec(), 14, 10), (b"nat".to_vec(), 27, 7)]
                 );
             }
         }
@@ -227,7 +261,7 @@ mod tests {
 
     #[test]
     fn filter_drops_icmp_forwarding_and_every_non_service_port() {
-        let t = table();
+        let t = table(false);
         assert_eq!(t.hooks, [0, 0, 552, 704, 0]);
         assert_eq!(t.underflows, [0, 400, 552, 1104, 0]);
         assert_eq!((t.count, t.entries.len()), (8, 1432));

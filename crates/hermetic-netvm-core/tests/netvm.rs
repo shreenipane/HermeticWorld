@@ -393,9 +393,18 @@ fn test_http_reject_closes_silently() {
         Arc::new(StaticUpstream::new()),
     );
 
-    let reply = send_http_and_read_all(
-        server.http_addr(),
-        b"GET /anything HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    let mut stream = TcpStream::connect(server.http_addr()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /anything HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .unwrap();
+    let mut reply = Vec::new();
+    // TR-NET-4 requires an abortive close, so graceful EOF is insufficient.
+    assert_eq!(
+        stream.read_to_end(&mut reply).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionReset
     );
     assert!(
         reply.is_empty(),

@@ -240,3 +240,31 @@ pub(crate) fn install_table(
     }
     Ok(())
 }
+
+/// Abort an untrusted TCP connection without emitting a protocol response.
+pub(crate) fn reset_tcp(stream: &std::net::TcpStream) -> io::Result<()> {
+    #[repr(C)]
+    struct Linger {
+        enabled: c_int,
+        seconds: c_int,
+    }
+    let linger = Linger {
+        enabled: 1,
+        seconds: 0,
+    };
+    // SAFETY: SO_LINGER reads one initialized Linux linger structure from a
+    // live TCP descriptor. Zero timeout requests an abortive close on drop.
+    if unsafe {
+        setsockopt(
+            stream.as_raw_fd(),
+            1,
+            13,
+            (&linger as *const Linger).cast(),
+            std::mem::size_of_val(&linger) as u32,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

@@ -9,42 +9,12 @@
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
+smoke_main() {
+WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
 FC="$U/.hermetic/tools/firecracker-1.18.0/firecracker"
 FC_SHA=b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba
-# Check boot access before creating artifacts or starting any process.
-/usr/bin/python3 -I - <<'CHECK'
-import os
-try:
-    for path in ("/dev/kvm", "/dev/net/tun"):
-        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-        os.close(fd)
-except OSError:
-    raise SystemExit("OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host")
-CHECK
-# A supplied work path must be new. Never chmod or remove caller-owned trees.
-if [ "$#" -gt 1 ]; then echo "usage: net-smoke.sh [NEW_WORK_DIR]" >&2; exit 2; fi
-if [ "$#" -eq 1 ]; then
-  WORK="$(/usr/bin/python3 -I - "$1" "$top/python" <<'WORKDIR'
-import sys, os
-from pathlib import Path
-sys.path.insert(0, sys.argv[2])
-from hermetic_safe_io import open_parent
-path = Path(sys.argv[1]).absolute()
-parent, leaf = open_parent(path)
-try:
-    if os.fstat(parent).st_mode & 0o022:
-        raise SystemExit("work parent must not be writable by other users")
-    os.mkdir(leaf, 0o700, dir_fd=parent)
-finally:
-    os.close(parent)
-print(path)
-WORKDIR
-)"
-else
-  WORK="$(mktemp -d /tmp/hermetic-net-smoke.XXXXXX)"
-fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/target/net-smoke}"
 T=1700000000
 FIX="$top/scripts/integration/net-fixture"
@@ -57,7 +27,10 @@ echo "$FC_SHA  $FC" | sha256sum -c --quiet
 # 1. Static guest binaries, sealcheck and the host WorldServer.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q --target x86_64-unknown-linux-gnu \
   -p hermetic-execd -p hermetic-sealcheck -p hermetic-netvm-core
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q --target x86_64-unknown-linux-gnu \
+  -p hermetic-netvm-core --example netvm_fetch
 cargo build --release -q -p hermetic-world-server
+cargo build --release -q -p hermetic-netvm-core --example netvm_tls_fixture
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 umask 022
 install -m 0700 "$BIN/hermetic-sealcheck" "$WORK/sealcheck"
@@ -68,7 +41,7 @@ rm -rf "$WORK/store" "$WORK/world-log"; cp -r "$FIX/store" "$WORK/store"
 find "$WORK/store" -type d -exec chmod 0700 {} +; find "$WORK/store" -type f -exec chmod 0600 {} +
 mkdir -m 0700 "$WORK/world-log"
 
-# 3. AgentVM rootfs: execd + early-proc shim + static busybox; resolv.conf points at NetVM.
+# 3. AgentVM rootfs: execd configures eth0 and the resolver before readiness.
 TREE="$WORK/agent-tree"; rm -rf "$TREE"
 for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
          mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
@@ -78,8 +51,13 @@ install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
 {"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,
  "entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.2.3\noptions ndots:0\n",
+ "network":{"address":"10.0.2.15","prefix":32,"gateway":"10.0.2.3","mtu":1500},
  "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}
 JSON
+install -m 0755 "$BIN/examples/netvm_fetch" "$TREE/bin/hermetic-https-fetch"
+"$CARGO_TARGET_DIR/release/examples/netvm_tls_fixture" "$WORK" "$TREE" "$FIX/dns.json"
+install -m 0444 "$WORK/ca.der" "$TREE/etc/hermetic/ca.der"
+install -m 0444 "$WORK/unrelated.der" "$TREE/etc/hermetic/unrelated.der"
 find "$TREE" -exec touch -h -d @$T {} +
 
 # 4. Both images (D4-checked ext4; the NetVM image from hermetic_slice.netvm).
@@ -96,7 +74,7 @@ a = build_rootfs(work / "agent-tree", work / "agent.img", t_clock=t, world_id="n
                  sealcheck_bin=work / "sealcheck", work_dir=work)
 n = build_netvm_image(work / "netvm-tree", work / "netvm.img", netvm_bin=Path(sys.argv[3]),
                       busybox_bin=Path("/usr/bin/busybox"), dns_table=Path(sys.argv[4]), t_clock=t,
-                      world_id="net-smoke-netvm", sealcheck_bin=work / "sealcheck", work_dir=work)
+                      world_id="net-smoke-netvm", tls_identity=json.loads((work / "tls-identity.json").read_text()), sealcheck_bin=work / "sealcheck", work_dir=work)
 for r in (a, n):
     print(json.dumps({k: r[k] for k in ("image", "sha256", "d4")}))
 PY
@@ -104,7 +82,7 @@ chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
 
 # 5. Boot both VMs and run the checks from the agent through execd (owner-run ignored test).
 # Includes known-Host HTTP fetches to non-manifest destinations and an HTTPS
-# fetch that must fail closed until TLS and CA-key boot delivery are implemented.
+# certificate-verified HTTPS fetch with world trust and failure with unrelated trust.
 umask 077
 if \
 HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/agent.img" \
@@ -119,4 +97,20 @@ else
   cat "$WORK/net-smoke-test.log" >&2
   echo "Smoke failed; test log and VM/execd diagnostics retained in $WORK" >&2
   exit "$result"
+fi
+
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# Check boot access before creating artifacts or starting any process.
+/usr/bin/python3 -I - <<'CHECK'
+import os
+try:
+    for path in ("/dev/kvm", "/dev/net/tun"):
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        os.close(fd)
+except OSError:
+    raise SystemExit("OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host")
+CHECK
+  exec /usr/bin/python3 -I "$top/scripts/integration/smoke_work.py" "$top/scripts/integration/net-smoke.sh" "$@"
 fi

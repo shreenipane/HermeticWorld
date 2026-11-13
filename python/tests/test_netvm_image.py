@@ -170,7 +170,10 @@ def test_image_builder_preserves_existing_tree_on_invalid_input(tmp_path: Path) 
     tree.mkdir()
     (tree / "keep").write_bytes(b"untouched")
     with pytest.raises(ValueError):
-        netvm.build_netvm_image(tree, tmp_path / "out.img", world_id="test", **args)
+        import hashlib
+        identity = {"world_id": "test", "dns_sha256": hashlib.sha256(args["dns_table"].read_bytes()).hexdigest(),
+                    "ca_sha256": "a" * 64, "material_sha256": "b" * 64}
+        netvm.build_netvm_image(tree, tmp_path / "out.img", world_id="test", tls_identity=identity, **args)
     assert (tree / "keep").read_bytes() == b"untouched"
 
 
@@ -214,7 +217,7 @@ def test_smoke_boot_probe_fails_before_building_when_kvm_is_missing(tmp_path: Pa
         pytest.skip("this regression exercises the missing-KVM path")
     target = tmp_path / "unused"
     result = subprocess.run(
-        [str(ROOT / "scripts/integration/net-smoke.sh"), str(target)],
+        ["bash", str(ROOT / "scripts/integration/net-smoke.sh"), str(target)],
         cwd=ROOT, capture_output=True, timeout=10,
     )
     assert result.returncode != 0
@@ -237,7 +240,7 @@ def test_smoke_preserves_and_prints_test_diagnostics(tmp_path: Path, exit_code: 
     # Run the script's actual test invocation with an offline cargo stand-in;
     # image building and VM boot are deliberately outside this regression.
     script = (ROOT / "scripts/integration/net-smoke.sh").read_text()
-    tail = script[script.index("# 5. Boot both VMs"):]
+    tail = script[script.index("# 5. Boot both VMs"):].split("\n}\n", 1)[0]
     setup = '''
 set -euo pipefail
 WORK=$1
@@ -260,3 +263,56 @@ cargo() {
     assert b"ip addr; ip route; ip neigh; /etc/resolv.conf" in saved
     printed = run.stderr if exit_code else run.stdout
     assert saved in printed
+
+
+def test_tls_identity_is_validated_before_output_and_no_secrets_enter_tree(tmp_path):
+    import hashlib
+    args = _inputs(tmp_path)
+    identity = {"world_id": "test-world", "dns_sha256": hashlib.sha256(args["dns_table"].read_bytes()).hexdigest(),
+                "ca_sha256": "a" * 64, "material_sha256": "b" * 64}
+    for bad in ({**identity, "dns_sha256": "0" * 64}, {**identity, "ca_key_pem": "PRIVATE KEY"},
+                {**identity, "world_id": "../host"}, {**identity, "material_sha256": "x" * 64}):
+        with pytest.raises(ValueError, match="invalid TLS identity"):
+            netvm.build_netvm_tree(tmp_path / "bad-tree", **args, tls_identity=bad)
+        assert not (tmp_path / "bad-tree").exists()
+        assert not list(tmp_path.glob(".netvm-tree.*"))
+    tree = netvm.build_netvm_tree(tmp_path / "tls-tree", **args, tls_identity=identity)
+    config = json.loads((tree / "etc/hermetic/netvm.json").read_bytes())
+    assert config == {"t_clock": 1700000000, "tls": identity}
+    for path in tree.rglob("*"):
+        if path.is_file():
+            assert b"PRIVATE KEY" not in path.read_bytes()
+            assert b"ca_seed" not in path.read_bytes()
+
+
+def test_merge_preserves_run_spec_point_to_point_network_and_verified_https():
+    smoke = (ROOT / "scripts/integration/net-smoke.sh").read_text()
+    assert '"prefix":32' in smoke
+    assert '"prefix":24' not in smoke
+    assert "netvm_tls_fixture" in smoke and "netvm_fetch" in smoke
+    probe = (ROOT / "crates/hermetic-vmm/tests/net_guest.rs").read_text()
+    assert "hermetic-https-fetch /etc/hermetic/ca.der" in probe
+    assert "hermetic-https-fetch /etc/hermetic/unrelated.der" in probe
+    for relative in ("PHASES.md", "crates/hermetic-netvm-core/README.md", "crates/hermetic-vmm/tests/net_guest.rs", "scripts/integration/BOOT_NOTES.md"):
+        source = (ROOT / relative).read_text()
+        assert "<<<<<<<" not in source and ">>>>>>>" not in source
+    assert "cd /home/flingboot/.hermetic/worktrees/netvm-tls" not in (ROOT / "scripts/integration/BOOT_NOTES.md").read_text()
+
+
+def test_tls_image_world_mismatch_has_no_filesystem_effects(tmp_path):
+    args = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="does not match image world"):
+        netvm.build_netvm_image(tmp_path / "tree", tmp_path / "image", **args, world_id="world-a",
+                               tls_identity={"world_id": "world-b"})
+    assert not (tmp_path / "tree").exists()
+    assert not (tmp_path / "image").exists()
+
+
+def test_image_builder_requires_tls_identity_before_filesystem_effects(tmp_path, monkeypatch):
+    from hermetic_slice import rootfs
+    monkeypatch.setattr(rootfs, "build_rootfs", lambda *a, **kw: pytest.fail("building an unbootable TLS image"))
+    args = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="TLS identity is required"):
+        netvm.build_netvm_image(tmp_path / "tree", tmp_path / "image", **args, world_id="test")
+    assert not (tmp_path / "tree").exists()
+    assert not (tmp_path / "image").exists()

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 const SAMPLE_VARIANT_SHA256: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn make_config_json(deadline_seconds: u64, expected: &[&str], run: RunName) -> Vec<u8> {
+fn make_config_json(deadline_seconds: u64, expected: &[&str]) -> Vec<u8> {
     let mut env = BTreeMap::new();
     env.insert("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string());
     let cfg = RunConfig {
@@ -27,7 +27,6 @@ fn make_config_json(deadline_seconds: u64, expected: &[&str], run: RunName) -> V
         sandbox: Default::default(),
         deadline_seconds,
         expected_test_ids: expected.iter().map(|s| (*s).to_string()).collect(),
-        run,
         variant_set: SAMPLE_VARIANT_SHA256.to_string(),
     };
     serde_json::to_vec(&cfg).expect("serialize RunConfig")
@@ -106,11 +105,11 @@ fn test_normal_run() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(
-            30,
-            &["test_alpha", "test_beta", "test_gamma", "test_delta"],
-            RunName::R1,
-        ),
+        make_config_json(30, &["test_alpha", "test_beta", "test_gamma", "test_delta"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R1),
     );
 
     let stream = encode_records(&[
@@ -207,7 +206,11 @@ fn test_os_exit_simulation_never_finishes() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(30, &["test_1", "test_2", "test_3"], RunName::R0),
+        make_config_json(30, &["test_1", "test_2", "test_3"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R0),
     );
 
     // Emit START+FINISH for test_1, START for test_2, then abruptly close pipe and exit (os._exit).
@@ -260,7 +263,11 @@ fn test_deadline_expiry_kills_and_marks_timeout() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(2, &["test_fast", "test_hang", "test_later"], RunName::R2),
+        make_config_json(2, &["test_fast", "test_hang", "test_later"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R2),
     );
 
     let prefix = encode_records(&[
@@ -311,7 +318,11 @@ fn test_garbage_on_pipe_keeps_valid_prefix_marks_rest_failed() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(10, &["test_ok", "test_mid", "test_unreached"], RunName::R3),
+        make_config_json(10, &["test_ok", "test_mid", "test_unreached"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R3),
     );
 
     let mut corrupted = encode_records(&[
@@ -365,7 +376,11 @@ fn test_oversized_record_rejected_and_marks_rest_failed() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(10, &["test_first", "test_second"], RunName::R0),
+        make_config_json(10, &["test_first", "test_second"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R0),
     );
 
     let mut stream = encode_records(&[
@@ -414,7 +429,11 @@ fn test_unexpected_ids_ignored_and_counted() {
 
     os.insert_file(
         cfg_path,
-        make_config_json(10, &["expected_a", "expected_b"], RunName::R1),
+        make_config_json(10, &["expected_a", "expected_b"]),
+    );
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R1),
     );
 
     let stream = encode_records(&[
@@ -557,7 +576,11 @@ fn test_disk_not_written_before_tree_ends() {
     let cfg_path = Path::new("/run/config.json");
     let disk_path = Path::new("/run/result.disk");
 
-    os.insert_file(cfg_path, make_config_json(10, &["test_only"], RunName::R0));
+    os.insert_file(cfg_path, make_config_json(10, &["test_only"]));
+    os.insert_file(
+        disk_path,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R0),
+    );
 
     let stream = encode_records(&[
         DecodedRecord::Start(StartRecord {
@@ -757,12 +780,16 @@ fn privileged_real_shell_worker() {
             .parse()
             .unwrap(),
         expected_test_ids: vec!["test_a".into()],
-        run: RunName::R0,
         variant_set: SAMPLE_VARIANT_SHA256.into(),
     };
     let config = tmp.path().join("config");
     std::fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
     let mut os = RealOs::with_launcher(std::env::var_os("HERMETIC_SHELL_BINARY").unwrap().into());
+    std::fs::write(
+        tmp.path().join("disk"),
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R0),
+    )
+    .unwrap();
     let report = run_supervisor(&mut os, &config, &tmp.path().join("disk")).expect("supervisor");
     println!("REPORT {}", serde_json::to_string(&serde_json::json!({"payload": report.payload, "stream_error": report.stream_error.map(|e| format!("{e:?}"))})).unwrap());
 }

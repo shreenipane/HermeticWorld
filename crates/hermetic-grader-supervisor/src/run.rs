@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::disk::{
-    encode_result_disk, DiskError, FinalTestOutcome, ResultPayload, RunName, SupervisorExit,
+    encode_result_disk, DiskError, FinalTestOutcome, ResultPayload, SupervisorExit,
     SupervisorSummary,
 };
 use crate::os::{ExitKind, Os, OsError, PipeRead, SpawnSpec, TreeStatus, MAX_PIPE_CHUNK_BYTES};
@@ -66,8 +66,6 @@ pub struct RunConfig {
     pub deadline_seconds: u64,
     #[serde(alias = "expected_tests")]
     pub expected_test_ids: Vec<String>,
-    #[serde(alias = "run_name")]
-    pub run: RunName,
     #[serde(alias = "variant_set_sha256")]
     pub variant_set: String,
 }
@@ -466,7 +464,8 @@ impl StreamTracker {
 
 /// Executes a complete grading run through `os`:
 /// 1. Reads and validates the run configuration JSON.
-/// 2. Spawns the test process with `argv`, `env`, `cwd`, and the result pipe.
+/// 2. Validates the supervisor-only run label on the result drive, then spawns
+///    the test process with `argv`, `env`, `cwd`, and the result pipe.
 /// 3. Streams and strictly decodes per-test records while enforcing the overall deadline.
 /// 4. On deadline expiry, kills the entire process group and marks exit `"timeout"`.
 /// 5. Waits until the entire test process tree has exited.
@@ -491,6 +490,10 @@ pub fn run_supervisor<O: Os>(
         operation: "validate_sandbox",
         detail: "invalid sandbox configuration".into(),
     })?;
+
+    // The image and helper input must contain no per-run identity. Only this
+    // supervisor reads the host-initialized result drive, before any tests run.
+    let run = os.read_run_label(result_disk_path)?;
 
     let start_time = os.now_monotonic();
     let deadline_at = start_time.saturating_add(Duration::from_secs(config.deadline_seconds));
@@ -626,7 +629,7 @@ pub fn run_supervisor<O: Os>(
     };
 
     let payload = ResultPayload {
-        run: config.run,
+        run,
         variant_set: config.variant_set,
         tests: tests_map,
         supervisor: SupervisorSummary {

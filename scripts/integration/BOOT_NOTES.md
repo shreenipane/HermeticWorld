@@ -3,7 +3,7 @@
 Command, from the worktree root:
 
 ```
-scripts/integration/boot-smoke.sh /tmp/hermetic-boot-smoke
+scripts/integration/boot-smoke.sh
 ```
 
 The script runs these steps:
@@ -137,7 +137,7 @@ firecracker --no-api --config-file cfg.json > serial.log 2>&1
 Command, from the worktree root:
 
 ```
-scripts/integration/grader-smoke.sh /tmp/hermetic-grader-smoke
+scripts/integration/grader-smoke.sh
 ```
 
 Fixture task: `scripts/integration/fixtures/grader-task/`.
@@ -149,7 +149,8 @@ Fixture task: `scripts/integration/fixtures/grader-task/`.
 For each variant the script applies the patch to a fixture work tree, emits a
 HEXT v1 stream with `hermetic-extract-agent`, and publishes the validated result
 with `hermetic-extract-validate`. It then passes those published trees to
-`grader-vm-smoke.sh`, which builds and boots one image per run. This preserves the
+`grader-vm-smoke.sh`, which builds and boots byte-identical images for the three
+runs of each variant. This preserves the
 full extraction, grading and host verdict checks. A supplied work directory must
 be fresh; symlinks are refused before any chmod.
 
@@ -185,18 +186,54 @@ smoke entry points now use the VM, whose initializer sets the sealed clock.
 Command, from the worktree root:
 
 ```
-scripts/integration/grader-vm-smoke.sh /tmp/hermetic-grader-vm-smoke
+bash scripts/integration/grader-vm-smoke.sh
 ```
 
 For each variant (empty, gold) and each run (R0, R1, R2), the script:
 
-1. Builds the grader tree from the "Grader smoke" section. The patch is applied on the host. The tree adds static `/sbin/hermetic-grader-init` and has one fixed config, `/etc/hermetic/grader/run.json`. Every run gets its own D4-checked image, and the kernel command line is the same for all of them.
+1. Builds the grader tree from the "Grader smoke" section. The patch is applied on the host. The tree adds static `/sbin/hermetic-grader-init` and has one fixed config, `/etc/hermetic/grader/run.json`, with no run label. Every run gets its own D4-checked image. Before any boot, the script compares all three images byte for byte and records their equal SHA-256 hashes in `<variant>/host/image-sha256.txt`. The kernel command line is also identical.
 2. Boots the image with hermetic-vmm's `dev-unjailed` runner through `tests/guest.rs::boots_grader_and_collects_result_drive`.
    - Firecracker 1.18.0, kernel `kernel-out-20261113-6.6b`.
    - Boot arguments: `init=/sbin/hermetic-grader-init`, `hermetic.t=1700000000`, `reboot=k panic=-1`.
-   - Drives: root `vda` read-only, then `result` `vdb`, which is writable and exactly 1 MiB. No vsock and no network.
+   - Drives: root `vda` read-only, then `result` `vdb`, which is writable and exactly 1 MiB. No vsock and no network. The host test reads `HERMETIC_GRADER_RUN` and initializes only the result drive with HGRL v1 boot input: bytes `48 47 52 4c 00 01`, two ASCII run bytes (`R0` through `R3`), then zero padding through byte 1,048,575. It does not forward that host environment variable into the guest.
 3. Waits for the VM to exit (`Vmm::wait_exit`) and checks the serial line `grader-init SECONDS clock` against `hermetic.t`. It then copies the jail's result drive out.
 4. Runs `hermetic-grader-verdict` over R0/R1/R2.
+
+The supervisor validates the entire fixed-size HGRL image before spawning tests.
+Missing, malformed, oversized or nonzero-padded input fails closed. `run` and
+`run_name` in the image config are rejected. The label stays in supervisor memory;
+it never enters helper input, argv, environment, cmdline or a rootfs file. No
+per-run nonce is used. After the process tree exits, the supervisor overwrites
+the result drive with the usual HGRD output; the host verdict validates its label.
+
+The sandbox has a fresh proc mount in its own PID namespace and a non-recursive
+root bind, minimal `/dev`, no inherited result descriptor, no administrative or
+MKNOD capabilities, and block-device denial. Thus tests cannot access `/dev/vdb`
+or supervisor memory, file descriptors, argv or environment. The mandatory smoke
+plugin `hermetic_run_probe` asserts the label-free config, cmdline, argv and
+environment, PID isolation, absent block devices, and exactly the three null
+stdio descriptors plus the write-only record pipe. It runs on plugin import,
+before pytest capture and repository imports, and a probe failure fails the
+host verdict.
+
+Offline regressions: `tests/run_label.rs` in hermetic-grader-supervisor checks
+strict transport, safe opens, label-free sandbox input and correct output labels;
+`test_all_run_images_hash_equal_and_contain_no_run_label` and
+`test_image_difference_fails_before_any_vm_boot` execute the shell harness with
+offline builders. Existing test fixtures now place labels on result drives
+instead of in configs; their original behavior assertions are retained.
+
+For the real six-boot check on the prepared KVM host, from this worktree root,
+let the script allocate a fresh work directory:
+
+```sh
+bash scripts/integration/grader-vm-smoke.sh
+```
+
+The script requires the three hashes within each variant to match before boot
+and removes the images on success. This also executes the sandbox
+probe in all six VMs and requires the empty/gold verdicts below. These VM checks
+cannot run in the review sandbox because `/dev/kvm` is unavailable.
 
 The interrupted implementation recorded the following result. The current review
 environment has no `/dev/kvm`, so these six boots have not been independently
@@ -243,10 +280,10 @@ Any failure ends the VM. The clock check uses the serial line because the HGRD r
 Run from the worktree root on the prepared host:
 
 ```sh
-scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"
+scripts/integration/net-smoke.sh
 ```
 
-The work directory must be new, with a parent not writable by other users. The
+An optional work directory must be new, with a parent not writable by other users. The
 script uses `$HOME` for the pinned Firecracker and kernel locations;
 `HERMETIC_KERNEL` can select another policy-checked kernel. It builds static
 NetVM/execd/init binaries, copies the offline fixture in `net-fixture`, builds two
@@ -276,7 +313,7 @@ drop-only FORWARD chain, disables forwarding and IPv6, then brings up eth0 as
 `10.0.2.3:53` and plain HTTP on port 80. Before eth0 is up it also installs a
 fixed NAT table: PREROUTING REDIRECT on eth0 TCP 80/443 preserves the port
 while changing every destination address to the local NetVM address. This is
-the TPROXY fallback; the deny filter still drops 443 pending TLS. Conntrack
+the TPROXY fallback; the service filter permits only DNS, HTTP and HTTPS. Conntrack
 restores the original source address on replies. There is no external route.
 Boot caps conntrack at 1024 entries, established idle time at 30 seconds,
 SYN-receive/time-wait at 5 seconds, fragment reassembly at 256 KiB and 5 seconds.
@@ -292,68 +329,67 @@ persistent vsock connection to CID 2 port 5001. Firecracker forwards that port t
 is execd; 5002 is reserved for the gateway.
 
 AgentVM boots execd through `hermetic-init`. The run spec installs a regular
-`/etc/resolv.conf` pointing at NetVM. Before starting the agent, the trusted
-harness runs the fixed busybox setup through execd as root: IPv6 off, eth0
-`10.0.2.15/32`, a link route to `10.0.2.3/32`, and the sole default route via
-`10.0.2.3`. The /32 prevents direct ARP to other addresses on the private link;
-those connections also reach NetVM. AgentVM loopback and its own address stay
-local. Only packets delivered to NetVM are intercepted. The existing run-spec
-schema has no network-effect field; automatic eth0 initialization requires an
-execd schema/boot change and remains open in PHASES.md.
+`/etc/resolv.conf` pointing at NetVM and includes
+`"network":{"address":"10.0.2.15","prefix":32,"gateway":"10.0.2.3","mtu":1500}`.
+The /32 address plus an explicit peer link route sends other link destinations
+through NetVM; local AgentVM addresses remain local.
+Execd applies it after setting the clock and assembling the root, before either
+the entrypoint or vsock readiness: IPv6 off, loopback up, eth0 MTU 1500 and
+`10.0.2.15/32`, default route via NetVM `10.0.2.3`. It executes fixed busybox
+`ip`/`sysctl` argv with an empty environment and a 5-second per-command deadline,
+discarding output and powering off on failure. The static busybox is pinned from
+the sealed base before root switch, including on trusted-initramfs reboot.
+No harness command configures the agent network. Immediately after
+readiness, the smoke inspects the address, MTU, route and IPv6 settings before
+testing DNS and HTTP.
 
 The test checks allowed DNS, exact GET fixture bytes, POST 405, NXDOMAIN for
 unknown DNS, sealed fixture responses for known Host requests sent to
 `1.1.1.1`, `192.168.0.1`, `169.254.169.254` and `10.0.2.2`, rejection of unknown
 HTTP hosts at those same destinations, blocked unrelated ports, an actual
-HTTPS fetch denied on 443, no public DNS answer, ICMP blocked at NetVM itself, and a regular resolver
+certificate-verified HTTPS fetch on 443 with world trust and unrelated-trust rejection, no public DNS answer, ICMP blocked at NetVM itself, and a regular resolver
 file. Missing explicit smoke inputs fail. Owning guards kill and reap both VMs
 and WorldServer on success or panic.
 
 **Boot status: OPEN here.** The exact command above stops before creating images
 or services with `OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host`.
-TLS termination, CA-key boot delivery, successful HTTPS and NetVM dm-verity
-remain OPEN in PHASES.md. This cut drops 443 and uses D4-checked read-only ext4.
-The REDIRECT rule encoder is checked against the pinned Linux 6.6 UAPI with
-offline byte interpretation and known-answer layout tests. Kernel installation
-and two-VM packet delivery have not been run here.
+NetVM dm-verity and the owner-run VM check remain OPEN in PHASES.md. The
+current root is D4-checked read-only ext4. Offline rule byte interpretation,
+TLS exchange, boot-protocol validation and route tests pass; they do not replace
+the two-VM packet-delivery check.
 
-### OPEN: TLS and successful HTTPS
+### TLS and successful HTTPS
 
-The task handoff approves rustls, but the current review instruction prohibits
-new dependencies and explicitly leaves dependency-requiring work OPEN. The
-workspace has certificate minting and trust injection in `hermetic-trust`, and
-rustls already appears transitively through the gateway HTTP client. NetVM has
-no direct dependency on either TLS or trust minting; adding those dependencies
-is prohibited by the current instruction. Implementing a new TLS stack here
-is unsuitable.
-The HTTPS fetch in the current smoke asserts denial and does not close TR-NET-3.
+The dependency override authorizes pinned rustls 0.23.46. Its single ring crypto
+provider and all transitive crates were already locked through the gateway.
+The existing `hermetic-trust` implementation provides CA restoration and
+leaf minting; rcgen and additional external dependencies are unnecessary.
 
-To finish with dependency authorization:
+Before networking, NetVM connects to CID 2 port 5003. The host binds only the
+NetVM's private Firecracker `<vsock UDS>_5003` endpoint and supplies one bounded
+`BootMaterial` frame, then EOF. The sealed config binds the world ID, T_clock,
+DNS bytes, CA DER and exact boot frame by SHA-256. The host sends the per-world
+CA private key and derived leaf seed, never its master secret. The boot transfer
+has a 64 KiB cap and one five-second connect/read/EOF deadline. Keys live only in
+NetVM memory; neither VM image includes private material.
 
-1. Pin the TLS library and its crypto provider to exact versions; audit the
-   resulting lockfile before adding any other crates. Keep the guest static.
-2. Add a host-to-NetVM boot protocol on a separate vsock port, bound to that
-   VM's private Firecracker UDS. Deliver only its per-world CA material, never
-   the host master secret. Authenticate world ID, clock, DNS-table digest and
-   public CA digest against the sealed manifest. Cap the frame (64 KiB), time
-   (5 seconds), and connection count (one); reject truncation, extra frames and
-   mismatches before eth0 starts. Keep secrets in memory only, redact errors,
-   and never copy the private key into either image or AgentVM.
-3. Reuse `hermetic-trust` for deterministic leaf minting with validity from
-   T_clock - 7 days to T_clock + 365 days. Bound issuance, cache size and concurrent
-   handshakes; accept only table SNI, reject missing/unknown SNI and ECH, enforce
-   matching Host and SNI, permit only HTTP/1.1 GET/HEAD, and reset malformed TLS.
-   Inject only the matching public CA into the AgentVM tree using the existing
-   trust installer before building its image. Open 443 only after all setup works.
-4. Add offline TLS client/server tests with fixed world certificates: successful
-   verified GET/HEAD, deterministic DER/validity, unknown or missing SNI/Host,
-   mismatched Host, ECH, plaintext on 443, invalid frames, timeout and resource
-   limits; inspect both image trees to prove no private key is present.
-5. Stage a certificate-verifying static client in the smoke AgentVM. Require a
-   successful HTTPS fixture fetch with the installed world CA and a failure with
-   an unrelated CA; no insecure verification flags. Test both manifest and
-   non-manifest destinations. Replace the current denial expectation only when
-   those tests pass.
+The smoke prepares a public test CA with `netvm_tls_fixture`, installs its public
+certificate through `hermetic-trust` into the AgentVM trust stores, and seals
+only the public TLS identity into NetVM. The host-only `ca.boot` is mode 0600.
+The static `netvm_fetch` client uses only that CA and sealed time, verifies SNI,
+and fetches the exact fixture over HTTPS at both manifest and arbitrary IPs.
+The smoke requires failure with an unrelated CA and a successful HEAD with no
+body. No insecure verification option is used. The previous HTTPS-denial check
+was replaced because TLS availability is now required by the brief.
+
+The runtime accepts one TLS connection at a time, caps the leaf cache at 64 and
+issuances at 4096, bounds ClientHello/record/input bytes at 16/18/128 KiB, and
+uses a five-second absolute handshake deadline. HTTP head, body and response
+deadlines/caps apply unchanged through TLS. Unknown/missing SNI, ECH, plaintext,
+unknown/missing Host and Host/SNI mismatch are rejected before forwarding.
+Offline tests cover verified GET/HEAD, 405, these rejection paths, unrelated
+trust, deterministic certificate DER/validity, malformed/truncated/extra boot
+frames, identity mismatch, silent peers and byte/deadline caps.
 
 ### OPEN: NetVM dm-verity
 
@@ -389,13 +425,12 @@ A complete path needs coordinated builder/kernel/VMM work:
 The current exact VM check (fresh work directory; no KVM in this sandbox) is:
 
 ```sh
-cd /home/flingboot/.hermetic/worktrees/netvm-tls
+# From the worktree root:
 scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-tls-smoke"
 ```
 
-It checks interception and HTTPS denial, not successful TLS or verity. Run the
-same command after the TLS/verity extensions with their positive and corruption
-assertions before marking those items complete.
+It checks interception and verified HTTPS. Run the verity corruption checks
+after the coordinated builder/kernel/VMM work before marking verity complete.
 
 
 ## Running the isolation checks
@@ -428,3 +463,35 @@ sealed grader kernel policy requires cgroup v2 and device BPF, so the expected V
 path includes the filter. The privileged test independently opens a planted
 block node to verify denial, and tests namespace identity, mount permissions,
 capabilities, environment, fd handoff and teardown on both exit and timeout.
+
+
+## Smoke work storage and cleanup
+
+All four integration smoke scripts (`boot-smoke.sh`, `net-smoke.sh`,
+`grader-smoke.sh`, `grader-vm-smoke.sh`) allocate fresh work directories under
+`${HERMETIC_SMOKE_DIR:-$HOME/.cache/hermetic-smoke}` by default. Choose a disk-backed
+location with enough free space for the images. The host's RAM-backed `/tmp` is
+not used for these work directories. Missing cache directories and each work
+directory are created with mode 0700, and symlink components are refused.
+
+A single optional `NEW_WORK_DIR` argument selects an exact fresh path instead;
+its parent must exist, be owned by the caller and not be writable by other users.
+Existing directories, files and symlinks are refused without chmod or deletion.
+The shared `smoke_work.py` runner removes only the work directory it created,
+using held directory descriptors and bounded cleanup that never follows links.
+It refuses cleanup if the directory entry has been replaced.
+
+A successful run removes its work directory, including images and logs. Failure
+(including INT, TERM or HUP) retains the work and prints its path on stderr for
+inspection. The nested grader VM work follows the same rule; a failed full grader
+smoke retains the outer extraction artifacts as well. The network script checks
+KVM/TUN access before allocating work. Cleanup failures return a nonzero status.
+No script sweeps or deletes artifacts from earlier runs.
+
+Rootfs Python tests place their sealcheck copy, staging files and image outputs
+under pytest's per-test `tmp_path`, and discard that tree after assertions, even
+on test failure. This avoids retaining large images in pytest's recent-run cache.
+Offline regressions in `test_smoke_work.py` exercise cleanup, failure retention,
+symlink rejection, directory substitution and signal handling on small fixtures.
+The grader shell tests snapshot their fixture artifacts before successful cleanup
+so the existing image, extraction and verdict assertions remain in place.

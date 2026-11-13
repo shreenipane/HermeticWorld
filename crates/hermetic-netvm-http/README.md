@@ -17,7 +17,8 @@ Strict HTTP/1.1 request head parser and forwarding policy filter for the Hermeti
 `hermetic-netvm-core::runtime::WorldFilter` uses this parser and policy with the
 manifest DNS host set. Only permitted GET/HEAD descriptors reach its vsock
 upstream; methods on unknown hosts are rejected before the 405 decision. The
-listener serves plain HTTP only. NetVM uses the documented REDIRECT fallback
-for arbitrary IPv4 destination addresses on TCP 80/443; Host policy still selects
-only the sealed world. TLS, CA-key boot delivery and a successful HTTPS smoke
-fetch remain OPEN in PHASES.md; port 443 stays denied.
+listener serves HTTP and certificate-verified HTTPS through NetVM's rustls
+listener. NetVM uses the documented REDIRECT fallback for arbitrary IPv4
+destination addresses on TCP 80/443. Both listeners enforce sealed Host policy;
+HTTPS additionally requires a matching manifest SNI and rejects ECH. CA material
+arrives over the private boot vsock channel before network initialization.
