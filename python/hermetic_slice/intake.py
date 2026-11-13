@@ -20,6 +20,8 @@ from hermetic_slice.thread_scrub import process_thread_scrub_and_revision
 
 
 MAX_TASK_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_TASK_CLEANUP_ENTRIES = 100_000
+MAX_TASK_CLEANUP_DEPTH = 128
 MAX_REFERENCE_DIGITS = 18
 MAX_REFERENCE_NUMBER = (1 << 63) - 1
 
@@ -307,22 +309,33 @@ def repo_dates(
     return (base_commit_time, repo_first_commit_time)
 
 
-def _secure_rmdir_contents_at(dir_fd: int) -> None:
-    """Recursively delete all entries within dir_fd without following symlinks."""
-    for entry in list(os.scandir(dir_fd)):
-        try:
-            st = os.stat(entry.name, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            sub_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+def _secure_rmdir_contents_at(dir_fd: int, *, depth: int = 0, remaining: list[int] | None = None) -> None:
+    """Delete stale entries without following links, under per-tree entry/depth caps."""
+    if depth >= MAX_TASK_CLEANUP_DEPTH:
+        raise IntakeError("task_cleanup_depth_limit")
+    if remaining is None:
+        remaining = [MAX_TASK_CLEANUP_ENTRIES]
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            if remaining[0] <= 0:
+                raise IntakeError("task_cleanup_entry_limit")
+            remaining[0] -= 1
             try:
-                _secure_rmdir_contents_at(sub_fd)
-            finally:
-                os.close(sub_fd)
-            os.rmdir(entry.name, dir_fd=dir_fd)
-        else:
-            os.unlink(entry.name, dir_fd=dir_fd)
+                st = os.stat(entry.name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                sub_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                try:
+                    opened = os.fstat(sub_fd)
+                    if (st.st_dev, st.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise IntakeError("task_cleanup_directory_swapped")
+                    _secure_rmdir_contents_at(sub_fd, depth=depth + 1, remaining=remaining)
+                finally:
+                    os.close(sub_fd)
+                os.rmdir(entry.name, dir_fd=dir_fd)
+            else:
+                os.unlink(entry.name, dir_fd=dir_fd)
 
 
 def atomic_write_bytes_at(parent_fd: int, filename: str, data: bytes) -> None:
@@ -600,6 +613,8 @@ def intake_task(
 
         if "task.json" in encoded:
             atomic_write_bytes_at(task_fd, "task.json", encoded["task.json"])
+    except IntakeError:
+        raise
     except Exception:
         raise IntakeError("task_publication_failed") from None
     finally:

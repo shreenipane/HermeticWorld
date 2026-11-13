@@ -103,6 +103,7 @@ def test_repaired_manifest_loads_and_root_recomputes(task_world, tmp_path):
     tasks, task, _, initial, binary = task_world
     original = json.loads((task / "manifest.json").read_text(encoding="utf-8"))
     old_root = d.compute_real_world_version(original)
+    statement_mode = (task / "agent/problem_statement.md").stat().st_mode & 0o777
     entries, _ = d.process_dispositions([initial], tasks_dir=tasks, sealcheck_bin=binary)
     saved = json.loads((task / "manifest.json").read_text(encoding="utf-8"))
     assert "world_root" not in saved
@@ -112,7 +113,7 @@ def test_repaired_manifest_loads_and_root_recomputes(task_world, tmp_path):
     detail = json.loads(saved["dispositions"][-1]["detail"])
     assert detail["problem_statement_redacted"]
     assert LEAK not in json.dumps(saved)
-    assert (task / "agent/problem_statement.md").stat().st_mode & 0o777 == 0o600
+    assert (task / "agent/problem_statement.md").stat().st_mode & 0o777 == statement_mode
     assert (task / "problem_statement_redacted.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -368,7 +369,10 @@ def test_mixed_dispositions_are_recorded_in_rust_loadable_manifests(task_world):
     assert {entry["disposition"] for entry in entries} == {"clean", "repaired", "excluded"}
     for entry in entries:
         manifest = json.loads((tasks / entry["task_id"] / "manifest.json").read_text(encoding="utf-8"))
-        assert manifest["dispositions"][-1]["kind"] == entry["disposition"]
+        if entry["disposition"] == "clean":
+            assert manifest["dispositions"] == []
+        else:
+            assert manifest["dispositions"][-1]["kind"] == entry["disposition"]
         assert d.compute_real_world_version(manifest) == entry["world_version"]
 
 

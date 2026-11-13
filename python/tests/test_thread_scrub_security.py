@@ -1119,11 +1119,15 @@ def test_defect4_secret_markers_never_in_exceptions_or_cli_output(tmp_path, secr
     verified_file.write_text(json.dumps(verified_row) + "\n", encoding="utf-8")
 
     capsys.readouterr()
-    with patch("hermetic_slice.__main__.intake_task", side_effect=exc_info3.value):
-        cli_main.main(["intake", "--tasks-dir", str(tasks_dir), "--cache-dir", str(cache_dir), "--only", "test-org__test-repo-50"])
+    tasks_file = tmp_path / "tasks.txt"
+    tasks_file.write_text("test-org__test-repo-50\n", encoding="utf-8")
+    with patch("hermetic_slice.__main__.load_verified", return_value={"test-org__test-repo-50": verified_row}), patch("hermetic_slice.__main__.intake_task", side_effect=exc_info3.value) as mocked_intake:
+        assert cli_main.main(["intake", "--tasks", str(tasks_file), "--out", str(tasks_dir), "--cache", str(cache_dir)]) == 1
+    mocked_intake.assert_called_once()
     captured = capsys.readouterr()
     assert marker not in captured.err
     assert marker not in captured.out
+    assert "Error processing test-org__test-repo-50:" in captured.err
 
 
 def test_defect5_cumulative_nodes_enforcement_fails_if_cumulative_check_removed(tmp_path):

@@ -267,7 +267,8 @@ def test_http_body_reads_are_bounded(tmp_path: Path, method: str, source: str) -
     cache = tmp_path / "cache"
     url = "https://api.github.com/graphql"
     cache_file = (cache / "http" / (hashlib.sha256(url.encode()).hexdigest() + ".body")) if method == "get" else _post_cache_file(cache)
-    oversized = b"x" * 65
+    # Cache stat passes; the read itself must detect growth past the cap.
+    oversized = b"x" * (64 if source == "cache" else 65)
     if source == "cache":
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(oversized)
@@ -276,12 +277,18 @@ def test_http_body_reads_are_bounded(tmp_path: Path, method: str, source: str) -
         def read(self, size=-1):
             assert size == 65, "response reads must use the named byte cap"
             return super().read(size)
+    real_bounded_read = module.bounded_read
+    def cache_grew(stream):
+        with cache_file.open("ab") as writer:
+            writer.write(b"x")
+        return real_bounded_read(stream)
     factory = make_http_get if method == "get" else make_http_post_json
     options = {} if method == "get" else {"snapshot_id": "snapshot"}
     client = factory(cache, **options)
-    with patch.object(module, "MAX_HTTP_BODY_BYTES", 64), patch("urllib.request.urlopen", return_value=Transport(oversized)) as network:
+    with patch.object(module, "MAX_HTTP_BODY_BYTES", 64), patch("urllib.request.urlopen", return_value=Transport(oversized)) as network, patch.object(module, "bounded_read", side_effect=cache_grew if source == "cache" else real_bounded_read) as read:
         with pytest.raises(ValueError, match="http_body_limit|invalid_cache_file"):
             client(url) if method == "get" else client(url, {"query": "q"})
+    read.assert_called_once()
     assert network.call_count == (1 if source == "network" else 0)
     if source == "network":
         assert not cache_file.exists()

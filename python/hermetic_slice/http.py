@@ -36,7 +36,11 @@ MAX_SNAPSHOT_ID_BYTES = 1024
 
 
 def open_secure_directory(path: Path) -> int:
-    """Open/create a directory through checked, no-follow directory descriptors."""
+    """Open/create a directory through checked, no-follow directory descriptors.
+
+    Operator roots follow the same fail-closed policy as their descendants: callers
+    must supply a physical path with no symlink components, including trusted prefixes.
+    """
     path = Path(path).absolute()
     parts = path.parts[1:]
     if len(parts) > MAX_CACHE_PATH_PARTS or any(p in (".", "..") for p in parts):
