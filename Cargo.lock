@@ -649,6 +649,7 @@ dependencies = [
 name = "hermetic-grader-supervisor"
 version = "0.1.0"
 dependencies = [
+ "hermetic-grader-result",
  "serde",
  "serde_json",
  "sha2",

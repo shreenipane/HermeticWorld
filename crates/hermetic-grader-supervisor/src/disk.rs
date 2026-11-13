@@ -14,7 +14,7 @@ pub const RESULT_DISK_VERSION: u16 = 1;
 pub const RESULT_DISK_FLAGS: u16 = 0;
 
 /// Result disk fixed header size in bytes:
-/// `magic (4) + version u16 LE (2) + flags u16 LE (2) + payload_len u32 LE (4) + sha256 (32) = 44`.
+/// `magic (4) + version u16 BE (2) + flags u16 BE (2) + payload_len u32 BE (4) + sha256 (32) = 44`.
 pub const RESULT_DISK_HEADER_BYTES: usize = 44;
 
 /// Exact total size of the serialized result disk image: 1 MiB (`1,048,576` bytes).
@@ -123,21 +123,21 @@ impl fmt::Display for DiskError {
 
 impl std::error::Error for DiskError {}
 
-/// Serializes `payload` into compact canonical JSON with lexicographically sorted keys
-/// at every object nesting level and zero extraneous whitespace.
+/// Serializes `payload` into the compact canonical JSON the host parser
+/// (`hermetic-grader-result`) requires: keys in schema field order (`run`, `variant_set`,
+/// `tests`, `supervisor` with `exit`, `tests_started`, `tests_finished`), `tests` sorted by
+/// node ID, and no extraneous whitespace. The host re-serializes and rejects any other form.
 pub fn canonical_payload_json(payload: &ResultPayload) -> Result<Vec<u8>, DiskError> {
-    let value =
-        serde_json::to_value(payload).map_err(|e| DiskError::SerializeJson(e.to_string()))?;
-    serde_json::to_vec(&value).map_err(|e| DiskError::SerializeJson(e.to_string()))
+    serde_json::to_vec(payload).map_err(|e| DiskError::SerializeJson(e.to_string()))
 }
 
 /// Encodes `payload` into an exact 1 MiB (`1,048,576` byte) `HGRD` result disk image.
 ///
 /// Layout:
 /// - `0..4`: `b"HGRD"`
-/// - `4..6`: `version = 1u16` (little-endian)
-/// - `6..8`: `flags = 0u16` (little-endian)
-/// - `8..12`: `payload_len` (`u32` little-endian)
+/// - `4..6`: `version = 1u16` (big-endian)
+/// - `6..8`: `flags = 0u16` (big-endian)
+/// - `8..12`: `payload_len` (`u32` big-endian)
 /// - `12..44`: SHA-256 digest of `payload`
 /// - `44..(44 + payload_len)`: canonical JSON bytes
 /// - `(44 + payload_len)..1_048_576`: `0x00` padding
@@ -163,13 +163,13 @@ pub fn encode_result_disk(payload: &ResultPayload) -> Result<Vec<u8>, DiskError>
         magic_slot.copy_from_slice(RESULT_DISK_MAGIC);
     }
     if let Some(ver_slot) = image.get_mut(4..6) {
-        ver_slot.copy_from_slice(&RESULT_DISK_VERSION.to_le_bytes());
+        ver_slot.copy_from_slice(&RESULT_DISK_VERSION.to_be_bytes());
     }
     if let Some(flags_slot) = image.get_mut(6..8) {
-        flags_slot.copy_from_slice(&RESULT_DISK_FLAGS.to_le_bytes());
+        flags_slot.copy_from_slice(&RESULT_DISK_FLAGS.to_be_bytes());
     }
     if let Some(len_slot) = image.get_mut(8..12) {
-        len_slot.copy_from_slice(&payload_len_u32.to_le_bytes());
+        len_slot.copy_from_slice(&payload_len_u32.to_be_bytes());
     }
     if let Some(hash_slot) = image.get_mut(12..44) {
         hash_slot.copy_from_slice(digest.as_slice());
@@ -200,7 +200,7 @@ pub fn decode_result_disk(image: &[u8]) -> Result<ResultPayload, DiskError> {
         (Some(b0), Some(b1)) => [b0, b1],
         _ => return Err(DiskError::InvalidMagic),
     };
-    let version = u16::from_le_bytes(version_bytes);
+    let version = u16::from_be_bytes(version_bytes);
     if version != RESULT_DISK_VERSION {
         return Err(DiskError::UnsupportedVersion(version));
     }
@@ -209,7 +209,7 @@ pub fn decode_result_disk(image: &[u8]) -> Result<ResultPayload, DiskError> {
         (Some(b0), Some(b1)) => [b0, b1],
         _ => return Err(DiskError::InvalidMagic),
     };
-    let flags = u16::from_le_bytes(flags_bytes);
+    let flags = u16::from_be_bytes(flags_bytes);
     if flags != RESULT_DISK_FLAGS {
         return Err(DiskError::UnsupportedFlags(flags));
     }
@@ -223,7 +223,7 @@ pub fn decode_result_disk(image: &[u8]) -> Result<ResultPayload, DiskError> {
         (Some(b0), Some(b1), Some(b2), Some(b3)) => [b0, b1, b2, b3],
         _ => return Err(DiskError::InvalidMagic),
     };
-    let payload_len_u32 = u32::from_le_bytes(len_bytes);
+    let payload_len_u32 = u32::from_be_bytes(len_bytes);
     let payload_len = payload_len_u32 as usize;
     if payload_len > MAX_RESULT_PAYLOAD_BYTES {
         return Err(DiskError::InvalidPayloadLength {

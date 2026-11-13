@@ -470,6 +470,32 @@ def test_synthetic_tree_mtimes_clamped_passes_d4(tmp_path: Path) -> None:
     assert res["skipped_special"] == []
 
 
+def test_regression_mke2fs_runs_under_utf8_locale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """mke2fs must get a UTF-8 locale; under LANG=C libarchive rejects non-ASCII PAX names."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f").write_text("x")
+    calls, _ = _mock_toolchain(monkeypatch)
+    build_rootfs(src=src, out_image=tmp_path / "o.img", t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                 world_id="w", work_dir=tmp_path)
+    _, build_kwargs = next((c, k) for c, k in calls if "-d" in c)
+    assert build_kwargs["env"]["LANG"] == "C.UTF-8"
+
+
+@requires_mke2fs
+@requires_sealcheck
+def test_regression_non_ascii_names_and_link_targets_build(tmp_path: Path) -> None:
+    """A tree with a non-ASCII file name and symlink target (as in Alpine's CA store) builds."""
+    src = tmp_path / "src"
+    (src / "certs").mkdir(parents=True)
+    (src / "certs" / "Főtanúsítvány.crt").write_text("cert\n")
+    os.symlink("../certs/Főtanúsítvány.crt", src / "certs" / "link-to-cert.pem")
+    os.symlink("Főtanúsítvány.crt", src / "certs" / "ca-cert-Főtanúsítvány.pem")
+    res = build_rootfs(src=src, out_image=tmp_path / "out" / "r.ext4",
+                       t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc), world_id="w-utf8", size_mib=64)
+    assert res["d4"] == "pass"
+
+
 @requires_mke2fs
 @requires_sealcheck
 def test_reproducibility_tr_seal_12(tmp_path: Path) -> None:
@@ -1108,6 +1134,7 @@ def test_finding2_mke2fs_gets_pinned_config_and_explicit_options(
     assert env["MKE2FS_CONFIG"] == str(MKE2FS_CONFIG_PATH)
     assert MKE2FS_CONFIG_PATH.is_file() and not MKE2FS_CONFIG_PATH.is_symlink()
     assert set(env) == {"PATH", "LANG", "TZ", "MKE2FS_CONFIG", "SOURCE_DATE_EPOCH", "E2FSPROGS_FAKE_TIME"}
+    assert env["LANG"] == "C.UTF-8"
 
     def opt(flag: str) -> str:
         return build_cmd[build_cmd.index(flag) + 1]

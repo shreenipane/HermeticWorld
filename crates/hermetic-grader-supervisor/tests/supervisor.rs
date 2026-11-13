@@ -519,9 +519,10 @@ fn test_result_disk_known_answer_bytes_and_hash() {
 
     let canonical = canonical_payload_json(&payload).expect("canonical json");
     let expected_json = concat!(
-        r#"{"run":"R0","supervisor":{"exit":"clean","tests_finished":2,"tests_started":2},"#,
+        r#"{"run":"R0","#,
+        r#""variant_set":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
         r#""tests":{"test_a":"passed","test_b":"failed"},"#,
-        r#""variant_set":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        r#""supervisor":{"exit":"clean","tests_started":2,"tests_finished":2}}"#,
     );
     assert_eq!(
         std::str::from_utf8(&canonical).expect("utf8"),
@@ -531,10 +532,10 @@ fn test_result_disk_known_answer_bytes_and_hash() {
     let disk = encode_result_disk(&payload).expect("encode disk");
     assert_eq!(disk.len(), 1_048_576);
     assert_eq!(&disk[0..4], RESULT_DISK_MAGIC);
-    assert_eq!(u16::from_le_bytes([disk[4], disk[5]]), 1);
-    assert_eq!(u16::from_le_bytes([disk[6], disk[7]]), 0);
+    assert_eq!(u16::from_be_bytes([disk[4], disk[5]]), 1);
+    assert_eq!(u16::from_be_bytes([disk[6], disk[7]]), 0);
     assert_eq!(
-        u32::from_le_bytes([disk[8], disk[9], disk[10], disk[11]]) as usize,
+        u32::from_be_bytes([disk[8], disk[9], disk[10], disk[11]]) as usize,
         expected_json.len()
     );
 
@@ -552,7 +553,7 @@ fn test_result_disk_known_answer_bytes_and_hash() {
     let full_disk_sha_hex = format!("{:x}", Sha256::digest(&disk));
     assert_eq!(
         full_disk_sha_hex,
-        "a85313efa7901069b4df7d05ff1dcfc8998bd539ba4b47df3e126888bf3b8ef0"
+        "5f65a9efa33e669f50a02f3ca30b42ff7a39504a9d4c9f9bd05225a4589267c9"
     );
 
     // Tampering with a single byte must fail SHA-256 verification.

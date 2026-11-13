@@ -131,3 +131,66 @@ arguments with `init=/sbin/hermetic-init`, the two drives and vsock:
 ```
 firecracker --no-api --config-file cfg.json > serial.log 2>&1
 ```
+
+# Grader smoke (development, offline, VM not booted yet)
+
+Command, from the worktree root:
+
+```
+scripts/integration/grader-smoke.sh /tmp/hermetic-grader-smoke
+```
+
+Fixture task: `scripts/integration/fixtures/grader-task/`.
+- `repo/` is a two-function module with `tests/test_calc.py`.
+- `test_double` passes on base (P2P); `test_add` fails on base (F2P).
+- `gold.patch` fixes `add`, and `empty.patch` is the empty patch.
+- `plan.json` is the grading plan (no mutants, no equivalents).
+
+For each variant, the script:
+
+1. Builds a grader tree.
+   - Base userland: the local `python:3.12-alpine` image, exported with `--pull never`.
+   - pytest 9.2.0 and its pure-Python dependencies, copied from the project venv.
+   - The `hermetic_grader_records` plugin.
+   - The repo with the patch applied, under `/work/repo`.
+   - Static `/sbin/hermetic-grader-supervisor`.
+   - One run config per run in `/etc/hermetic/grader/run-R{0,1,2}.json`.
+2. Builds a D4-checked grader image of that tree with `hermetic_slice.rootfs.build_rootfs`. Both variants give 95420416 bytes, and the build is reproducible across runs.
+3. Runs the real grading chain from the same tree, in a container with no network, read-only, no capabilities, no-new-privileges and a non-root user. The chain is: supervisor, then `python -s -m pytest -p hermetic_grader_records.plugin` with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, then HGR1 records, then a 1 MiB HGRD result disk. It runs once per run: R0, R1, R2.
+4. Validates the disks on the host with `hermetic-grader-verdict`: strict parser, then the differential verdict.
+
+Result:
+
+```
+empty: verdict rc=2 {"status":"unresolved","reasons":["f2p_failed"], ... passed 1, failed 1 ...}
+gold:  verdict rc=0 {"status":"resolved","reasons":[], ... passed 2 ...}
+```
+
+## Why the grader VM is not booted
+
+There is no grader-mode PID 1. Nothing was bypassed to get around that:
+
+- `hermetic-vmm` refuses vsock for `Role::Grader` (TR-GR-1), and it refuses a standalone `--` in boot arguments.
+- execd binds vsock 5000 as its last boot step and powers off if that fails. So execd cannot be the grader's PID 1.
+- `hermetic-init` only execs execd.
+- The supervisor needs `--config` and `--result-disk` flags. It neither sets the clock nor mounts anything, and it does not power off.
+
+Because the VM is not booted, two things are not checked yet:
+
+- that the grader clock equals `T_clock`;
+- that the supervisor applies the `hermetic-grader-sandbox` plan. Nothing calls that crate yet, and the supervisor's `RealOs` has no namespaces, capability drop or device cgroup (see its README).
+
+## What broke and how it was fixed
+
+1. **Result disk header endianness.** The supervisor wrote the HGRD header integers little-endian. The host parser reads them big-endian, so every real result disk was classified as tampered. The supervisor now writes big-endian.
+2. **Canonical JSON mismatch.** The supervisor sorted keys. The host re-serializes in schema field order and rejects anything else (`non_canonical_json`). The supervisor now serializes in schema order.
+   - Test for 1 and 2: `supervisor_result_disk_is_accepted_by_host_parser` (`crates/hermetic-grader-supervisor/tests/host_format.rs`). It checks that the host accepts the supervisor's image and that the two encoders' images are byte-identical. The supervisor's known-answer image hash was updated.
+3. **`build_rootfs` failed on non-ASCII names.** mke2fs ran with `LANG=C`, and libarchive refuses PAX names and link targets that are not ASCII under an ASCII locale. Alpine's CA store has such names. mke2fs now runs with `LANG=C.UTF-8`.
+   - Tests: `test_regression_mke2fs_runs_under_utf8_locale` and `test_regression_non_ascii_names_and_link_targets_build`.
+4. **Script detail.** Docker's `--tmpfs /tmp` is not world-writable by default, so a non-root test run had no temporary directory. The supervisor then correctly reported `supervisor_crash` and `infra_error`. The script mounts it with `mode=1777`.
+
+## Known gaps (not fixed here)
+
+- **Result fd hand-over.** The supervisor's `RealOs` hands the record pipe over on fd 2 and advertises `HERMETIC_RESULT_FD=2`. The plugin requires an fd of 3 or higher. The smoke bridges this with `sh -c 'exec 3>&2 2>/dev/null; exec python ...'` and `HERMETIC_RESULT_FD=3`.
+- **HEXT v1 mismatch.** `hermetic-extract-agent` and `hermetic-extract`'s validator implement two incompatible HEXT v1 formats. The agent uses a u16 version, a variable record prefix and an end record holding the stream SHA-256. The validator uses a u32 version, a fixed 60-byte header and an end record holding the total byte count. The validator rejects every agent stream. So the smoke applies the patch on the host, not through extract and validate.
+- **Config path conventions differ.** The extractor config takes an empty `repo_dir` for the root. The agent CLI takes `patch:.`.
