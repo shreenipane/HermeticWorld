@@ -343,7 +343,8 @@ Host prerequisites, configured by the owner beforehand:
   on it, and the host does not forward traffic outside. No physical NIC belongs
   to the bridge. The script never configures host networking or loads modules.
 - A policy-checked 6.6 guest kernel with built-in `NETFILTER_XTABLES`,
-  `IP_NF_IPTABLES` and `IP_NF_FILTER`. Linux 6.6 builds `xt_tcpudp.o` with
+  `IP_NF_IPTABLES`, `IP_NF_FILTER`, `IP_NF_NAT`, `NF_NAT`, `NF_CONNTRACK`
+  and `NETFILTER_XT_TARGET_REDIRECT`. Linux 6.6 builds `xt_tcpudp.o` with
   `NETFILTER_XTABLES`; no separate TCP/UDP-match option exists. These options are
   already required. No clock, timer, RTC, PTP or paravirtual clock feature is added.
 
@@ -351,17 +352,32 @@ NetVM runs `/sbin/hermetic-netvm` as PID 1. It mounts proc for pinned config rea
 sets the guest clock, installs fixed INPUT/OUTPUT service-port filters and a
 drop-only FORWARD chain, disables forwarding and IPv6, then brings up eth0 as
 `10.0.2.3/24`. It owns the fixture's `10.9.0.1/32`, serves table DNS on
-`10.0.2.3:53` and plain HTTP on port 80, and forwards bounded frames over one
+`10.0.2.3:53` and plain HTTP on port 80. Before eth0 is up it also installs a
+fixed NAT table: PREROUTING REDIRECT on eth0 TCP 80/443 preserves the port
+while changing every destination address to the local NetVM address. This is
+the TPROXY fallback; the service filter permits only DNS, HTTP and HTTPS. Conntrack
+restores the original source address on replies. There is no external route.
+Boot caps conntrack at 1024 entries, established idle time at 30 seconds,
+SYN-receive/time-wait at 5 seconds, fragment reassembly at 256 KiB and 5 seconds.
+It lowers the fragment low watermark to 256 KiB before lowering the high
+watermark. Linux 6.6 enforces low <= high on both writes; the former high-only
+write failed against the default 3 MiB low watermark, halted NetVM before eth0
+came up, and caused the owner-run DNS timeout. The offline regression
+`fragment_watermarks_boot_with_linux_defaults` checks these kernel constraints
+while replaying the actual boot commands. The two-VM rerun remains required.
+Any filter, NAT or sysctl failure prevents networking. NetVM forwards bounded frames over one
 persistent vsock connection to CID 2 port 5001. Firecracker forwards that port to
 `<NetVM vsock UDS>_5001`, where the sandboxed host WorldServer listens. Port 5000
 is execd; 5002 is reserved for the gateway.
 
 AgentVM boots execd through `hermetic-init`. The run spec installs a regular
 `/etc/resolv.conf` pointing at NetVM and includes
-`"network":{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500}`.
+`"network":{"address":"10.0.2.15","prefix":32,"gateway":"10.0.2.3","mtu":1500}`.
+The /32 address plus an explicit peer link route sends other link destinations
+through NetVM; local AgentVM addresses remain local.
 Execd applies it after setting the clock and assembling the root, before either
 the entrypoint or vsock readiness: IPv6 off, loopback up, eth0 MTU 1500 and
-`10.0.2.15/24`, default route via NetVM `10.0.2.3`. It executes fixed busybox
+`10.0.2.15/32`, default route via NetVM `10.0.2.3`. It executes fixed busybox
 `ip`/`sysctl` argv with an empty environment and a 5-second per-command deadline,
 discarding output and powering off on failure. The static busybox is pinned from
 the sealed base before root switch, including on trusted-initramfs reboot.
@@ -370,16 +386,93 @@ readiness, the smoke inspects the address, MTU, route and IPv6 settings before
 testing DNS and HTTP.
 
 The test checks allowed DNS, exact GET fixture bytes, POST 405, NXDOMAIN for
-unknown DNS, rejection of unknown HTTP hosts, blocked unrelated addresses and
-ports, no public DNS answer, ICMP blocked at NetVM itself, and a regular resolver
+unknown DNS, sealed fixture responses for known Host requests sent to
+`1.1.1.1`, `192.168.0.1`, `169.254.169.254` and `10.0.2.2`, rejection of unknown
+HTTP hosts at those same destinations, blocked unrelated ports, an actual
+certificate-verified HTTPS fetch on 443 with world trust and unrelated-trust rejection, no public DNS answer, ICMP blocked at NetVM itself, and a regular resolver
 file. Missing explicit smoke inputs fail. Owning guards kill and reap both VMs
 and WorldServer on success or panic.
 
 **Boot status: OPEN here.** The exact command above stops before creating images
 or services with `OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host`.
-TLS termination, CA-key boot delivery, TPROXY and NetVM dm-verity remain open in
-PHASES.md. This cut drops 443 and uses D4-checked read-only ext4. It intercepts
-plain HTTP by owning the manifest addresses, without a redirect rule.
+NetVM dm-verity and the owner-run VM check remain OPEN in PHASES.md. The
+current root is D4-checked read-only ext4. Offline rule byte interpretation,
+TLS exchange, boot-protocol validation and route tests pass; they do not replace
+the two-VM packet-delivery check.
+
+### TLS and successful HTTPS
+
+The dependency override authorizes pinned rustls 0.23.46. Its single ring crypto
+provider and all transitive crates were already locked through the gateway.
+The existing `hermetic-trust` implementation provides CA restoration and
+leaf minting; rcgen and additional external dependencies are unnecessary.
+
+Before networking, NetVM connects to CID 2 port 5003. The host binds only the
+NetVM's private Firecracker `<vsock UDS>_5003` endpoint and supplies one bounded
+`BootMaterial` frame, then EOF. The sealed config binds the world ID, T_clock,
+DNS bytes, CA DER and exact boot frame by SHA-256. The host sends the per-world
+CA private key and derived leaf seed, never its master secret. The boot transfer
+has a 64 KiB cap and one five-second connect/read/EOF deadline. Keys live only in
+NetVM memory; neither VM image includes private material.
+
+The smoke prepares a public test CA with `netvm_tls_fixture`, installs its public
+certificate through `hermetic-trust` into the AgentVM trust stores, and seals
+only the public TLS identity into NetVM. The host-only `ca.boot` is mode 0600.
+The static `netvm_fetch` client uses only that CA and sealed time, verifies SNI,
+and fetches the exact fixture over HTTPS at both manifest and arbitrary IPs.
+The smoke requires failure with an unrelated CA and a successful HEAD with no
+body. No insecure verification option is used. The previous HTTPS-denial check
+was replaced because TLS availability is now required by the brief.
+
+The runtime accepts one TLS connection at a time, caps the leaf cache at 64 and
+issuances at 4096, bounds ClientHello/record/input bytes at 16/18/128 KiB, and
+uses a five-second absolute handshake deadline. HTTP head, body and response
+deadlines/caps apply unchanged through TLS. Unknown/missing SNI, ECH, plaintext,
+unknown/missing Host and Host/SNI mismatch are rejected before forwarding.
+Offline tests cover verified GET/HEAD, 405, these rejection paths, unrelated
+trust, deterministic certificate DER/validity, malformed/truncated/extra boot
+frames, identity mismatch, silent peers and byte/deadline caps.
+
+### OPEN: NetVM dm-verity
+
+Verified prerequisites: `veritysetup` is absent, the pinned kernel's `.config`
+has `CONFIG_DM_INIT` disabled, and `hermetic_slice.guest_kernel` requires
+`root=/dev/vda` and rejects unapproved dm arguments. The VMM boot validator
+also rejects quotes, so it cannot currently carry a quoted `dm-mod.create`
+table. No builder or VMM artifact binds a verity root hash to the sealed world.
+`CONFIG_DM_VERITY=y` alone does not enforce integrity on the ext4 root.
+
+A complete path needs coordinated builder/kernel/VMM work:
+
+1. Pin and stage veritysetup in the offline build toolchain, or approve and test
+   a bounded SHA-256 verity-tree encoder. Use 4096-byte data/hash blocks, a
+   world-derived fixed salt, read-only data and hash images, fixed metadata
+   times, descriptor-based no-follow reads, checked sizes and atomic outputs.
+   Authenticate root hash, block count and salt in the sealed manifest.
+2. Enable built-in `CONFIG_DM_INIT=y` in the pinned kernel and policy. Extend
+   both boot validators with an explicit NetVM-only grammar for a read-only
+   `dm-mod.create` verity table and `root=/dev/dm-0`. Keep all clock-hiding
+   arguments. Bind `/dev/vda` to data and a separate read-only `/dev/vdb` to
+   hashes, use verity version 1/SHA-256, and fail boot on corruption. Do not
+   provide an unverified fallback root or allow AgentVM-controlled root hashes.
+3. Extend VMM sealed-artifact validation to check authenticated metadata and
+   both images before boot. Retain current ext4 as explicitly unverified until
+   the complete verified boot path passes; do not describe read-only as verity.
+4. Add offline known-answer tree/root-hash tests, reproducible-build equality,
+   invalid sizes/metadata and symlink/race rejection. On the prepared VM host,
+   boot a correct pair, then independently corrupt one data block and one hash
+   block in private copies: neither corrupt image may reach `netvm_ready` or
+   serve bytes. Check read-only remount/write denial and the live dm table.
+
+The current exact VM check (fresh work directory; no KVM in this sandbox) is:
+
+```sh
+# From the worktree root:
+scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-tls-smoke"
+```
+
+It checks interception and verified HTTPS. Run the verity corruption checks
+after the coordinated builder/kernel/VMM work before marking verity complete.
 
 
 ## Running the isolation checks

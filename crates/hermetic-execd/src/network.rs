@@ -31,7 +31,8 @@ pub fn configure(
     let mtu = network.mtu.to_string();
     // /proc is the procfs mounted by PID 1 before this step. sysctl touches
     // only these fixed kernel entries. Disable IPv6 before bringing links up.
-    for args in [
+    let peer = format!("{}/32", network.gateway);
+    let mut commands: Vec<Vec<&str>> = [
         &["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"][..],
         &["sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=1"],
         &["ip", "link", "set", "lo", "up"],
@@ -41,7 +42,17 @@ pub fn configure(
         &[
             "ip", "route", "add", "default", "via", &gateway, "dev", "eth0",
         ],
-    ] {
+    ]
+    .iter()
+    .map(|args| args.to_vec())
+    .collect();
+    if network.prefix == 32 {
+        commands.insert(
+            commands.len() - 1,
+            vec!["ip", "route", "add", &peer, "dev", "eth0"],
+        );
+    }
+    for args in commands {
         let argv = std::iter::once(NETWORK_PROGRAM)
             .chain(args.iter().copied())
             .map(str::to_owned)

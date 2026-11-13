@@ -20,10 +20,20 @@ pub struct Network {
 
 impl Network {
     pub fn validate(&self) -> Result<()> {
-        if !(MIN_NETWORK_PREFIX..=MAX_NETWORK_PREFIX).contains(&self.prefix)
+        if (!(MIN_NETWORK_PREFIX..=MAX_NETWORK_PREFIX).contains(&self.prefix) && self.prefix != 32)
             || !(MIN_NETWORK_MTU..=MAX_NETWORK_MTU).contains(&self.mtu)
         {
             return Err(Error::InvalidInput);
+        }
+        if self.prefix == 32 {
+            return if self.address.is_private()
+                && self.gateway.is_private()
+                && self.address != self.gateway
+            {
+                Ok(())
+            } else {
+                Err(Error::InvalidInput)
+            };
         }
         // The range check precedes the shift. Both ends must be usable private
         // unicast addresses in the same subnet, with distinct host portions.

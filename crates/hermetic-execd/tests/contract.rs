@@ -1125,7 +1125,7 @@ fn network_spec_strict_schema_subnet_hosts_and_numeric_caps() {
         RunSpec::parse(networkless.to_string().as_bytes()).unwrap(),
         spec()
     );
-    for prefix in [0, 31, 32, 33, u8::MAX] {
+    for prefix in [0, 31, 33, u8::MAX] {
         let mut bad = network.clone();
         bad.prefix = prefix;
         assert_eq!(bad.validate(), Err(Error::InvalidInput));
@@ -1416,4 +1416,60 @@ fn network_argv_uses_declared_address_prefix_gateway_and_mtu() {
             "/bin/busybox ip route add default via 172.16.0.2 dev eth0",
         ]
     );
+}
+
+#[test]
+fn network_point_to_point_routes_neighbours_via_netvm() {
+    let mut s = spec();
+    s.network = Some(spec::Network {
+        prefix: 32,
+        ..network_spec()
+    });
+    assert_eq!(
+        RunSpec::parse(serde_json::to_vec(&s).unwrap().as_slice()).unwrap(),
+        s
+    );
+    let mut commands = Vec::new();
+    network::configure(&s, |_, argv| {
+        commands.push(argv.join(" "));
+        Ok(rpc::ExecReply {
+            code: Some(0),
+            output: Vec::new(),
+            truncated: false,
+            timed_out: false,
+        })
+    })
+    .unwrap();
+    assert!(commands
+        .iter()
+        .any(|c| c == "/bin/busybox ip addr add 10.0.2.15/32 dev eth0"));
+    let routes: Vec<_> = commands.iter().filter(|c| c.contains("ip route")).collect();
+    assert_eq!(
+        routes,
+        [
+            "/bin/busybox ip route add 10.0.2.3/32 dev eth0",
+            "/bin/busybox ip route add default via 10.0.2.3 dev eth0"
+        ]
+    );
+    for fail in 0..commands.len() {
+        let mut seen = 0;
+        assert_eq!(
+            network::configure(&s, |_, _| {
+                let i = seen;
+                seen += 1;
+                if i == fail {
+                    Err(Error::Network)
+                } else {
+                    Ok(rpc::ExecReply {
+                        code: Some(0),
+                        output: Vec::new(),
+                        truncated: false,
+                        timed_out: false,
+                    })
+                }
+            }),
+            Err(Error::Network)
+        );
+        assert_eq!(seen, fail + 1);
+    }
 }

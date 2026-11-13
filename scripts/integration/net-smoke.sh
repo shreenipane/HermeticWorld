@@ -27,7 +27,10 @@ echo "$FC_SHA  $FC" | sha256sum -c --quiet
 # 1. Static guest binaries, sealcheck and the host WorldServer.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q --target x86_64-unknown-linux-gnu \
   -p hermetic-execd -p hermetic-sealcheck -p hermetic-netvm-core
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q --target x86_64-unknown-linux-gnu \
+  -p hermetic-netvm-core --example netvm_fetch
 cargo build --release -q -p hermetic-world-server
+cargo build --release -q -p hermetic-netvm-core --example netvm_tls_fixture
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 umask 022
 install -m 0700 "$BIN/hermetic-sealcheck" "$WORK/sealcheck"
@@ -48,9 +51,13 @@ install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
 {"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,
  "entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.2.3\noptions ndots:0\n",
- "network":{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500},
+ "network":{"address":"10.0.2.15","prefix":32,"gateway":"10.0.2.3","mtu":1500},
  "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}
 JSON
+install -m 0755 "$BIN/examples/netvm_fetch" "$TREE/bin/hermetic-https-fetch"
+"$CARGO_TARGET_DIR/release/examples/netvm_tls_fixture" "$WORK" "$TREE" "$FIX/dns.json"
+install -m 0444 "$WORK/ca.der" "$TREE/etc/hermetic/ca.der"
+install -m 0444 "$WORK/unrelated.der" "$TREE/etc/hermetic/unrelated.der"
 find "$TREE" -exec touch -h -d @$T {} +
 
 # 4. Both images (D4-checked ext4; the NetVM image from hermetic_slice.netvm).
@@ -67,13 +74,15 @@ a = build_rootfs(work / "agent-tree", work / "agent.img", t_clock=t, world_id="n
                  sealcheck_bin=work / "sealcheck", work_dir=work)
 n = build_netvm_image(work / "netvm-tree", work / "netvm.img", netvm_bin=Path(sys.argv[3]),
                       busybox_bin=Path("/usr/bin/busybox"), dns_table=Path(sys.argv[4]), t_clock=t,
-                      world_id="net-smoke-netvm", sealcheck_bin=work / "sealcheck", work_dir=work)
+                      world_id="net-smoke-netvm", tls_identity=json.loads((work / "tls-identity.json").read_text()), sealcheck_bin=work / "sealcheck", work_dir=work)
 for r in (a, n):
     print(json.dumps({k: r[k] for k in ("image", "sha256", "d4")}))
 PY
 chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
 
 # 5. Boot both VMs and run the checks from the agent through execd (owner-run ignored test).
+# Includes known-Host HTTP fetches to non-manifest destinations and an HTTPS
+# certificate-verified HTTPS fetch with world trust and failure with unrelated trust.
 umask 077
 if \
 HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/agent.img" \

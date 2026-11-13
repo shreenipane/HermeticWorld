@@ -16,7 +16,7 @@ pub mod jks;
 pub use cert::{
     atomic_write_file, check_not_alias, compute_ca_validity, compute_leaf_validity,
     compute_serial_number, derive_ca_seed, generate_rsa_key_from_seed, mint_ca, mint_leaf,
-    read_cert_file_bounded, read_seed_file, validate_dns_name, validate_output_path,
+    read_cert_file_bounded, read_seed_file, restore_ca, validate_dns_name, validate_output_path,
     write_private_key_file, Ca, LeafCert, MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES,
 };
 pub use error::TrustError;

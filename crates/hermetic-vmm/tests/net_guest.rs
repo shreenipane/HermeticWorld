@@ -318,8 +318,47 @@ fn run() {
             assert!(Instant::now() < end, "world server did not bind its socket");
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The host supplies only this world's CA material through the NetVM's
+        // private UDS; the guest validates it against its sealed identity.
+        let ca_socket = world_socket.with_file_name("vsock_5003");
+        let ca_listener = std::os::unix::net::UnixListener::bind(&ca_socket).unwrap();
+        ca_listener.set_nonblocking(true).unwrap();
+        let material = {
+            use std::io::Read;
+            let file = hermetic_netvm_core::files::regular(
+                &work.join("ca.boot"),
+                (hermetic_netvm_core::tls::MAX_BOOT_BYTES + 4) as u64,
+            )
+            .unwrap();
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            let mut bytes = Vec::new();
+            file.take((hermetic_netvm_core::tls::MAX_BOOT_BYTES + 5) as u64)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= hermetic_netvm_core::tls::MAX_BOOT_BYTES + 4);
+            bytes
+        };
+        let ca_sender = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(30);
+            loop {
+                match ca_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(true).unwrap();
+                        api::write_deadline(&mut stream, &material, end).unwrap();
+                        stream.shutdown(std::net::Shutdown::Write).unwrap();
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < end, "NetVM did not request CA material");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => panic!("CA transfer failed"),
+                }
+            }
+        });
         net_vm.start(Duration::from_secs(10)).unwrap();
         net_vm.wait_ready(Duration::from_secs(30)).unwrap();
+        ca_sender.join().unwrap();
 
         agent_vm.prepare(Duration::from_secs(120)).unwrap();
         agent_socket = agent_vm.jail().map(|j| j.root.descriptor_path("vsock"));
@@ -332,11 +371,15 @@ fn run() {
         for (argv, expected) in [
             (
                 &["/bin/busybox", "ip", "addr", "show", "dev", "eth0"][..],
-                "10.0.2.15/24",
+                "10.0.2.15/32",
             ),
             (
                 &["/bin/busybox", "ip", "link", "show", "dev", "eth0"][..],
                 "mtu 1500",
+            ),
+            (
+                &["/bin/busybox", "ip", "route", "show", "10.0.2.3/32"][..],
+                "10.0.2.3 dev eth0",
             ),
             (
                 &["/bin/busybox", "ip", "route", "show", "default"][..],
@@ -388,6 +431,19 @@ fn run() {
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
         assert!(out.ends_with("hello from the frozen world\n"), "{out}");
 
+        // REDIRECT fallback: destination IP does not select an upstream. These
+        // addresses are absent from the DNS manifest and have no external route.
+        for address in ["1.1.1.1", "192.168.0.1", "169.254.169.254", "10.0.2.2"] {
+            let (_, out) = sh(&socket, &format!("printf 'GET /hello.txt HTTP/1.1\\r\\nHost: files.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
+            assert!(out.starts_with("HTTP/1.1 200"), "{address}: {out}");
+            assert!(
+                out.ends_with("hello from the frozen world\n"),
+                "{address}: {out}"
+            );
+            let (_, out) = sh(&socket, &format!("printf 'GET / HTTP/1.1\\r\\nHost: unknown.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
+            assert!(!out.contains("HTTP/1.1"), "{address}: {out}");
+        }
+
         // 3. POST: 405.
         let post = "printf 'POST /hello.txt HTTP/1.1\\r\\nHost: files.example\\r\\nContent-Length: 0\\r\\n\\r\\n' | /bin/busybox nc -w 5 10.9.0.1 80";
         let (_, out) = sh(&socket, post);
@@ -398,19 +454,9 @@ fn run() {
         let (_, out) = sh(&socket, other);
         assert!(!out.contains("HTTP/1.1 2"), "{out}");
 
-        // 5. No route anywhere else: public addresses, the link's other hosts, other
-        //    NetVM ports. Each connect must fail.
-        for target in [
-            "1.1.1.1 80",
-            "8.8.8.8 53",
-            "10.0.2.1 22",
-            "10.0.2.2 80",
-            "192.168.0.1 80",
-            "169.254.169.254 80",
-            "10.0.2.3 22",
-            "10.0.2.3 5001",
-            "10.9.0.1 443",
-        ] {
+        // 5. Other ports and unreachable neighbours remain blocked. Off-link
+        //    port 80 destinations are tested above against the sealed fixture.
+        for target in ["8.8.8.8 53", "10.0.2.1 22", "10.0.2.3 22", "10.0.2.3 5001"] {
             let (code, out) = sh(
                 &socket,
                 &format!("echo x | /bin/busybox nc -w 3 {target} && echo CONNECTED"),
@@ -420,6 +466,26 @@ fn run() {
                 "{target}: {out}"
             );
         }
+        // Certificate verification uses only the injected world CA, including
+        // when the destination IP is absent from the manifest.
+        for address in [
+            "10.9.0.1",
+            "1.1.1.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "10.0.2.2",
+        ] {
+            let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/ca.der {address} files.example /hello.txt GET 1700000000"));
+            assert_eq!(code, Some(0), "{address}: {out}");
+            assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+            assert!(out.ends_with("hello from the frozen world\n"), "{out}");
+            let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/unrelated.der {address} files.example /hello.txt GET 1700000000"));
+            assert_ne!(code, Some(0), "unrelated CA accepted: {out}");
+            assert!(!out.contains("hello from the frozen world"), "{out}");
+        }
+        let (code, out) = sh(&socket, "/bin/hermetic-https-fetch /etc/hermetic/ca.der 10.9.0.1 files.example /hello.txt HEAD 1700000000");
+        assert_eq!(code, Some(0), "{out}");
+        assert!(!out.contains("hello from the frozen world"), "{out}");
         // ICMP addressed to NetVM itself must be dropped, independently of routing.
         for address in ["10.0.2.3", "10.9.0.1"] {
             let (code, _) = sh(&socket, &format!("/bin/busybox ping -c 1 -W 2 {address}"));

@@ -20,7 +20,11 @@ hermetic-common = { workspace = true }
 hermetic-netvm-dns = { path = "../hermetic-netvm-dns" }
 hermetic-netvm-http = { path = "../hermetic-netvm-http" }
 
+hermetic-trust = { path = "../hermetic-trust" }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+sha2 = { workspace = true }
+time = { workspace = true }
+
 [dev-dependencies]
 hermetic-world-server = { path = "../hermetic-world-server" }
 tempfile = { workspace = true }
-time = { workspace = true }

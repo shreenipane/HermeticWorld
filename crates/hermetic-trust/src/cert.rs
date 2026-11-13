@@ -4,8 +4,9 @@ use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::EncodePrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rsa::signature::{SignatureEncoding, Signer};
+use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -200,13 +201,45 @@ pub fn mint_ca(
     ca_seed_secret: &[u8; 32],
 ) -> Result<Ca, TrustError> {
     // 1. Validity check before generating keys
-    let (not_before, not_after) = compute_ca_validity(t_clock)?;
+    compute_ca_validity(t_clock)?;
 
     // 2. Derive seed
     let ca_seed = derive_ca_seed(ca_seed_secret, world_id)?;
 
     // 3. Deterministic RSA-2048 key
     let private_key = generate_rsa_key_from_seed(ca_seed)?;
+    ca_from_key(world_id, t_clock, ca_seed, private_key)
+}
+
+/// Restore only per-world CA material delivered to the isolated NetVM. The
+/// caller binds the regenerated certificate to the sealed public CA digest.
+pub fn restore_ca(
+    world_id: &str,
+    t_clock: OffsetDateTime,
+    ca_seed: [u8; 32],
+    key_pem: &str,
+) -> Result<Ca, TrustError> {
+    if world_id.is_empty() || world_id.len() > 256 || key_pem.len() > 4096 {
+        return Err(TrustError::Cert("invalid CA material".into()));
+    }
+    let private_key = RsaPrivateKey::from_pkcs8_pem(key_pem)
+        .map_err(|_| TrustError::Cert("invalid CA material".into()))?;
+    if private_key.n().bits() != 2048 || private_key.e() != &rsa::BigUint::from(65537u32) {
+        return Err(TrustError::Cert("invalid CA material".into()));
+    }
+    private_key
+        .validate()
+        .map_err(|_| TrustError::Cert("invalid CA material".into()))?;
+    ca_from_key(world_id, t_clock, ca_seed, private_key)
+}
+
+fn ca_from_key(
+    world_id: &str,
+    t_clock: OffsetDateTime,
+    ca_seed: [u8; 32],
+    private_key: RsaPrivateKey,
+) -> Result<Ca, TrustError> {
+    let (not_before, not_after) = compute_ca_validity(t_clock)?;
     let public_key = private_key.to_public_key();
 
     // 4. Subject and Issuer: CN=Hermetic World CA <first 16 hex of BLAKE3(world_id)>, O=Hermetic World
