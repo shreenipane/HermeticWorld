@@ -1,0 +1,19 @@
+[package]
+name = "hermetic-vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+dev-unjailed = []
+
+[dependencies]
+hermetic-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event", "mount", "thread"] }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
