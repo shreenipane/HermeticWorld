@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -16,7 +15,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 import threading
 import time
 import uuid
@@ -82,8 +80,8 @@ def _locate_test_sealcheck() -> tuple[Path | None, str]:
 
     The builder itself never searches (review finding 5); the tests look in this worktree's
     cargo target dirs (and $HERMETIC_SEALCHECK_BIN), then in the owner's other cargo target
-    dirs, and copy the binary into a private 0700 directory with mode 0755 so it passes the
-    builder's owner/mode checks (cargo leaves binaries group-writable under umask 002).
+    dirs. The per-test fixture copies it under tmp_path with mode 0755 so it passes
+    the builder's owner/mode checks (cargo leaves binaries group-writable under umask 002).
     """
     candidates: list[Path] = []
     env_bin = os.environ.get("HERMETIC_SEALCHECK_BIN")
@@ -106,8 +104,6 @@ def _locate_test_sealcheck() -> tuple[Path | None, str]:
     found_other.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     candidates += found_own + found_other
 
-    private = Path(tempfile.mkdtemp(prefix="hermetic-sealcheck-test-"))
-    atexit.register(shutil.rmtree, private, True)
     for cand in candidates:
         try:
             proc = subprocess.run(
@@ -120,10 +116,7 @@ def _locate_test_sealcheck() -> tuple[Path | None, str]:
         except (OSError, subprocess.TimeoutExpired):
             continue
         if proc.returncode == 0:
-            dest = private / "hermetic-sealcheck"
-            shutil.copyfile(cand, dest)
-            os.chmod(dest, 0o755)
-            return dest, ""
+            return cand, ""
     return None, "no hermetic-sealcheck build with d4-image found (run rust-gate or set HERMETIC_SEALCHECK_BIN)"
 
 
@@ -140,11 +133,25 @@ requires_debugfs = pytest.mark.skipif(DEBUGFS is None, reason="debugfs not found
 
 
 @pytest.fixture(autouse=True)
-def _sealcheck_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _sealcheck_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     if SEALCHECK_BIN is not None:
-        monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(SEALCHECK_BIN))
+        tools = tmp_path / "sealcheck-tools"
+        tools.mkdir(mode=0o700)
+        binary = tools / "hermetic-sealcheck"
+        shutil.copyfile(SEALCHECK_BIN, binary)
+        binary.chmod(0o755)
+        monkeypatch.setenv("HERMETIC_SEALCHECK_BIN", str(binary))
     else:
         monkeypatch.delenv("HERMETIC_SEALCHECK_BIN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _rootfs_test_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Both staging and outputs belong to this test, including CLI builds.
+    monkeypatch.setattr(rootfs.tempfile, "tempdir", str(tmp_path))
+    yield
+    # pytest retains recent tmp_path trees; discard large images after assertions.
+    shutil.rmtree(tmp_path)
 
 
 def hash_directory_tree(root: Path) -> str:
@@ -1862,3 +1869,11 @@ def test_b4_cross_filesystem_publish_copies_held_image(tmp_path: Path, monkeypat
     assert out.read_bytes() == b"GOOD-IMAGE"
     assert res["sha256"] == hashlib.sha256(b"GOOD-IMAGE").hexdigest()
     assert sorted(p.name for p in out_dir.iterdir()) == ["r.img"]
+
+
+def test_image_work_defaults_to_per_test_directory(tmp_path: Path) -> None:
+    assert rootfs.tempfile.gettempdir() == str(tmp_path)
+    if SEALCHECK_BIN is not None:
+        binary = Path(os.environ["HERMETIC_SEALCHECK_BIN"])
+        assert binary.is_relative_to(tmp_path)
+        assert stat.S_IMODE(binary.parent.stat().st_mode) == 0o700

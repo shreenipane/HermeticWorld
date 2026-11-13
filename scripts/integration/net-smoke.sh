@@ -9,42 +9,12 @@
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
+smoke_main() {
+WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
 FC="$U/.hermetic/tools/firecracker-1.18.0/firecracker"
 FC_SHA=b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba
-# Check boot access before creating artifacts or starting any process.
-/usr/bin/python3 -I - <<'CHECK'
-import os
-try:
-    for path in ("/dev/kvm", "/dev/net/tun"):
-        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-        os.close(fd)
-except OSError:
-    raise SystemExit("OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host")
-CHECK
-# A supplied work path must be new. Never chmod or remove caller-owned trees.
-if [ "$#" -gt 1 ]; then echo "usage: net-smoke.sh [NEW_WORK_DIR]" >&2; exit 2; fi
-if [ "$#" -eq 1 ]; then
-  WORK="$(/usr/bin/python3 -I - "$1" "$top/python" <<'WORKDIR'
-import sys, os
-from pathlib import Path
-sys.path.insert(0, sys.argv[2])
-from hermetic_safe_io import open_parent
-path = Path(sys.argv[1]).absolute()
-parent, leaf = open_parent(path)
-try:
-    if os.fstat(parent).st_mode & 0o022:
-        raise SystemExit("work parent must not be writable by other users")
-    os.mkdir(leaf, 0o700, dir_fd=parent)
-finally:
-    os.close(parent)
-print(path)
-WORKDIR
-)"
-else
-  WORK="$(mktemp -d /tmp/hermetic-net-smoke.XXXXXX)"
-fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/target/net-smoke}"
 T=1700000000
 FIX="$top/scripts/integration/net-fixture"
@@ -118,4 +88,20 @@ else
   cat "$WORK/net-smoke-test.log" >&2
   echo "Smoke failed; test log and VM/execd diagnostics retained in $WORK" >&2
   exit "$result"
+fi
+
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# Check boot access before creating artifacts or starting any process.
+/usr/bin/python3 -I - <<'CHECK'
+import os
+try:
+    for path in ("/dev/kvm", "/dev/net/tun"):
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        os.close(fd)
+except OSError:
+    raise SystemExit("OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host")
+CHECK
+  exec /usr/bin/python3 -I "$top/scripts/integration/smoke_work.py" "$top/scripts/integration/net-smoke.sh" "$@"
 fi
