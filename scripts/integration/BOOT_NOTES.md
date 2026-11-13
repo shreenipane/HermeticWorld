@@ -58,8 +58,8 @@ The smallest design that matches the contract exactly is a shim:
   powers the VM off. It refuses to run unless it is PID 1.
 - execd's root switch covers the early proc.
 
-`BLK_DEV_INITRD` is enabled for the TR-EXD-6 trusted-reboot initramfs, which is not
-built yet. hermetic-vmm therefore has no initrd wiring yet.
+`BLK_DEV_INITRD` is enabled for the TR-EXD-6 trusted-reboot initramfs. Its builder
+and hermetic-vmm initrd wiring are described in the trusted reboot section below.
 
 ## Verified on the serial console (manual capture, below)
 
@@ -121,7 +121,49 @@ test result: ok. 1 passed
    powered off with `Io` (`execd 1700000000 Io` on serial). Added to the policy and
    `hermetic.config`. Test: `test_policy_requires_proc_children_for_execd_reaper`.
 
-Still open (PHASES.md): the TR-EXD-6 trusted-reboot initramfs and hermetic-vmm initrd wiring.
+Still open (PHASES.md): owner-run KVM verification of the trusted reboot path.
+
+## Trusted reboot from a touched disk (TR-EXD-6)
+
+Exact command from the worktree root, on a KVM-capable host with the pinned
+Firecracker, kernel, static busybox and e2fsprogs inputs used above:
+
+```
+bash scripts/integration/reboot-smoke.sh /tmp/hermetic-reboot-smoke
+```
+
+The work directory must not exist. No downloads are performed. This is the
+development runner, without jailer/namespace/cgroup isolation. The script first
+runs the existing first-boot smoke, then builds `trusted.cpio` from the static
+execd and early shim with `hermetic_slice.initramfs`. The static executables are
+built by `scripts/build-trusted-execd.sh`, with workspace and
+Cargo source paths remapped to fixed prefixes. The archive uses sorted
+uncompressed cpio newc, uid/gid 0, deterministic inode numbers, T_clock mtimes and
+zero padding. `/init` mounts only early read-only proc and execs the archive's
+`/sbin/hermetic-execd` with an empty environment. A generated `/dev/console` 5:1
+node supports the kernel console handoff. Execd sets the clock, mounts fresh
+devtmpfs, mounts sealed vda read-only, and assembles the touched vdb upper.
+
+The ignored test `reboots_touched_disk_with_trusted_initramfs` then:
+
+1. Boots a fresh disk, uploads poison bytes over all disk PID 1 candidates and
+   execd, writes a persistence marker and an initial command that would create
+   `/work/unauthorized`, and obtains a frozen shutdown.
+2. Copies the touched upper disk and boots it with the trusted initrd through
+   the VMM's actual preparation and boot-source API. No disk `init=` is passed.
+3. Checks T_clock, `locked:true`, denied exec, the persistence marker, and the
+   absence of the unauthorized startup marker before authorization.
+4. Authorizes and runs a command using the retained trusted execd helper even
+   though `/sbin/hermetic-execd` on disk contains poison. It writes the host's
+   boot path and archive hash to private `reboot-record.json`, verifies that hash
+   against the jail's archive bytes, and performs frozen shutdown.
+
+Expected final test output includes `trusted reboot: touched disk, locked
+startup, authorization, trusted child helper, boot record passed` and one passing
+test. This check has **not** been run in the review sandbox, which lacks
+`/dev/kvm`. Offline tests cover archive contents/hash, hostile inputs and bounds,
+VMM pinning and snapshots, boot record serialization, every reboot effect
+failure, and lock reset. No VM pass is claimed here.
 
 ## Manual serial capture
 

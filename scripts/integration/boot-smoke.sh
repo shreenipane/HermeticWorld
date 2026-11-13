@@ -26,7 +26,8 @@ echo "$FC_SHA  $FC_DIR/firecracker" | sha256sum -c --quiet
 
 # 1. Static execd + sealcheck, rootfs tree, image with D4.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q \
-  -p hermetic-execd -p hermetic-sealcheck --target x86_64-unknown-linux-gnu
+  -p hermetic-sealcheck --target x86_64-unknown-linux-gnu
+bash scripts/build-trusted-execd.sh
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 umask 022
 install -m 0700 "$BIN/hermetic-sealcheck" "$WORK/sealcheck"

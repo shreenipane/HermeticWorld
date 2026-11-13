@@ -535,6 +535,16 @@ impl Sys for Linux {
                 self.guest_clock_set = true;
                 self.root = Some(Root::open_root("/")?);
             }
+            Effect::MountDev => {
+                let target = self.root()?.directory("/dev")?;
+                rustix::mount::mount(
+                    "devtmpfs",
+                    fd_path(&target),
+                    "devtmpfs",
+                    rustix::mount::MountFlags::NOSUID,
+                    Some(c"mode=0755"),
+                )?;
+            }
             Effect::MountBaseReadOnly => {
                 let source = self.root()?.node("/dev/vda", fs::FileType::BlockDevice)?;
                 let target = self.root()?.directory("/mnt/hermetic-base")?;

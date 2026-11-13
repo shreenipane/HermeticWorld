@@ -670,9 +670,10 @@ fn initramfs_exec_is_locked_until_explicit_authorize() {
     cfg.initramfs = true;
     let boot = boot::boot(&mut fake, &cfg).unwrap();
     assert_eq!(
-        &fake.events[..3],
+        &fake.events[..4],
         [
             "Clock(1700000000)",
+            "MountDev",
             "MountBaseReadOnly",
             "MountDisk(\"/dev/vdb\")"
         ]
@@ -705,6 +706,37 @@ fn initramfs_exec_is_locked_until_explicit_authorize() {
         1
     );
     assert!(matches!(ask(&mut server, exec(false, 1)), Reply::Exec(_)));
+}
+
+#[test]
+fn trusted_reboot_clock_dev_base_order_and_every_failure_stops_boot() {
+    let mut cfg = config();
+    cfg.initramfs = true;
+    let mut good = Fake::default();
+    assert!(boot::boot(&mut good, &cfg).unwrap().locked);
+    let mut expected = boot_answer();
+    expected.insert(1, "MountDev".into());
+    expected.insert(2, "MountBaseReadOnly".into());
+    expected.retain(|e| !e.starts_with("entry:"));
+    assert_eq!(good.events, expected);
+    for failure in 0..expected.len() {
+        let mut sys = Fake {
+            fail: Some(failure),
+            ..Fake::default()
+        };
+        assert!(boot::start(
+            &mut sys,
+            b"hermetic.t=1700000000 hermetic.initramfs=1".as_slice()
+        )
+        .is_err());
+        let mut prefix = expected[..=failure].to_vec();
+        prefix.push("PowerOff(Io)".into());
+        assert_eq!(sys.events, prefix);
+    }
+    // Authorization is volatile: a second boot always starts locked again.
+    let mut first = server(true);
+    assert_eq!(ask(&mut first, Request::Authorize {}), Reply::Ok);
+    assert!(boot::boot(&mut Fake::default(), &cfg).unwrap().locked);
 }
 
 #[test]

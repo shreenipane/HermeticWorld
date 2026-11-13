@@ -268,7 +268,25 @@ comes from the initramfs. Pass `hermetic.initramfs=1`, `hermetic.t=...`, and the
 appropriate overlay/spec options. The sealed base is `/dev/vda`, separate from
 the writable upper `/dev/vdb` by default.
 
-This mode sets the clock first, mounts `/dev/vda` read-only as the overlay lower,
+Build the archive with `python -m hermetic_slice.initramfs --execd EXECD
+--early-init HERMETIC_INIT --t-clock 1700000000 --output trusted.cpio` (set
+`PYTHONPATH=python` from the worktree root). Both inputs must be static ELF64
+x86-64 binaries, built with `bash scripts/build-trusted-execd.sh`. This offline,
+locked build remaps workspace and Cargo source paths to fixed `/src` and `/cargo`
+prefixes, so compiler panic locations do not expose host usernames or paths.
+The builder checks
+the ELF program headers and rejects interpreters and dynamic dependencies.
+It emits uncompressed `newc`, sorted names, fixed inode numbers, uid/gid 0,
+T_clock mtimes, zero device metadata except the generated 5:1 console, and zero
+padding. It reads no host directory contents or metadata into the archive.
+`/init` is the early proc shim; `/sbin/hermetic-execd` is the trusted daemon.
+Publication is atomic and mode 0600 in a caller-owned, private directory.
+The printed SHA-256 must be pinned in the trusted VMM specification, independently
+of anything on the touched disk. Identical binary inputs and T_clock produce
+identical archives; binary toolchain reproducibility remains a build input.
+
+This mode sets the clock first, mounts fresh devtmpfs (the kernel skips its
+devtmpfs automount when running an initramfs), mounts `/dev/vda` read-only as the overlay lower,
 and then performs the ordinary assembly. Status reports `locked:true`.
 Neither the image's entry point nor any exec request is started until host CID 2
 sends `authorize`. Status, upload, download and shutdown work while locked.
@@ -277,6 +295,12 @@ unlocks RPC execution. The host must authorize based on its trusted task policy,
 not on any value read from a touched disk. A fresh boot never remembers a prior
 authorization. The executable used for child helpers is retained from the trusted
 initramfs; it is not rediscovered on the overlay.
+
+The builder caps each executable at `MAX_BINARY_BYTES` (24 MiB), the archive at
+`MAX_INITRD_BYTES` (64 MiB), ELF program headers at `MAX_PROGRAM_HEADERS` (128),
+dynamic entries at `MAX_DYNAMIC_ENTRIES` (4096), and publication attempts at
+`MAX_PUBLICATION_ATTEMPTS` (16). Only trusted regular input files are opened,
+through pinned descriptors; symlink components, FIFOs and devices are refused.
 
 ## Caps
 

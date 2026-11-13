@@ -131,7 +131,9 @@ fn valid_body(req: &ApiRequest) -> bool {
                     .is_some_and(|v| (64..=u64::from(MAX_MEMORY_MIB)).contains(&v))
         }
         ("PUT", "/boot-source") => {
-            fields(b, &["kernel_image_path", "boot_args"])
+            (fields(b, &["kernel_image_path", "boot_args"])
+                || (fields(b, &["kernel_image_path", "boot_args", "initrd_path"])
+                    && path("initrd_path")))
                 && path("kernel_image_path")
                 && b.get("boot_args")
                     .and_then(|v| v.as_str())

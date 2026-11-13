@@ -1,10 +1,10 @@
-//! Trusted early-boot handoff (`/sbin/hermetic-init`, first boot only).
+//! Trusted early-boot handoff (`/sbin/hermetic-init` or initramfs `/init`).
 //!
 //! The execd boot contract needs `/proc/cmdline` and the kernel's
 //! `/proc/self/{exe,fd}` readable when execd starts as PID 1, but execd itself
 //! never mounts anything before setting the clock. This shim closes that gap
 //! and does nothing else: it mounts procfs read-only at `/proc` of the sealed
-//! read-only base, then replaces itself (same PID 1) with
+//! read-only base or trusted initramfs, then replaces itself (same PID 1) with
 //! `/sbin/hermetic-execd`, passing no arguments and an empty environment.
 //! It reads no clock, writes nothing, logs nothing and parses no input.
 //! The early proc mount is covered by execd's root switch.
