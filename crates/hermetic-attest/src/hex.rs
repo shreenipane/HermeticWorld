@@ -1,6 +1,6 @@
 //! Safe hex encoding and decoding routines with no external dependencies.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HexError {
     OddLength(usize),
     InvalidChar(char),
@@ -10,12 +10,13 @@ impl std::fmt::Display for HexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OddLength(len) => write!(f, "Hex string has odd length: {len}"),
-            Self::InvalidChar(c) => write!(f, "Invalid hex character: {c}"),
+            Self::InvalidChar(_) => write!(f, "Invalid hex character"),
         }
     }
 }
 
 impl std::error::Error for HexError {}
+redacted_debug!(HexError);
 
 const HEX_CHARS_LOWER: &[u8; 16] = b"0123456789abcdef";
 

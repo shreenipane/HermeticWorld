@@ -1,6 +1,6 @@
 //! Safe, strict RFC 4648 Base64 encoding and decoding without external dependencies.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Base64Error {
     InvalidLength,
     InvalidChar(char),
@@ -13,7 +13,7 @@ impl std::fmt::Display for Base64Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidLength => write!(f, "Base64 input length is invalid"),
-            Self::InvalidChar(c) => write!(f, "Invalid base64 character: '{c}'"),
+            Self::InvalidChar(_) => write!(f, "Invalid base64 character"),
             Self::InvalidPadding => write!(f, "Invalid base64 padding"),
             Self::NonZeroTrailingBits => {
                 write!(f, "Base64 non-zero trailing bits in final quantum")
@@ -29,8 +29,10 @@ impl std::fmt::Display for Base64Error {
 }
 
 impl std::error::Error for Base64Error {}
+redacted_debug!(Base64Error);
 
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+pub const MAX_BASE64_BYTES: usize = 16 * 1024 * 1024;
 
 /// Encodes binary data into standard base64 with padding.
 pub fn base64_encode(data: &[u8]) -> String {
@@ -74,7 +76,9 @@ fn decode_b64_char(c: u8) -> Result<u8, Base64Error> {
 
 /// Decodes standard base64 string with strict RFC 4648 validation.
 pub fn base64_decode(input: &str, max_bytes: usize) -> Result<Vec<u8>, Base64Error> {
-    if input.len() > max_bytes {
+    let max_bytes = max_bytes.min(MAX_BASE64_BYTES);
+    let encoded_limit = max_bytes.div_ceil(3).saturating_mul(4);
+    if input.len() > encoded_limit {
         return Err(Base64Error::InputTooLarge {
             size: input.len(),
             limit: max_bytes,
@@ -90,7 +94,21 @@ pub fn base64_decode(input: &str, max_bytes: usize) -> Result<Vec<u8>, Base64Err
         return Err(Base64Error::InvalidLength);
     }
 
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let padding = bytes
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|&&b| b == b'=')
+        .count();
+    let decoded_len = bytes.len() / 4 * 3 - padding;
+    if decoded_len > max_bytes {
+        return Err(Base64Error::InputTooLarge {
+            size: decoded_len,
+            limit: max_bytes,
+        });
+    }
+
+    let mut out = Vec::with_capacity(decoded_len);
     let (chunks, _) = bytes.as_chunks::<4>();
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {

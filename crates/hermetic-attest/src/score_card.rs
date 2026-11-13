@@ -4,15 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::canonical::{to_canonical_json_bytes, CanonicalJsonError};
+use crate::canonical::{
+    bounded_json_bytes, to_canonical_json_bytes, CanonicalJsonError, MAX_CANONICAL_BYTES,
+};
+use crate::run::{valid_record_text, MAX_RUN_RECORD_SIZE};
 use crate::run::{
     AgentMode, ClockLevel, GraderIsolation, RunRecord, RunStatus, SealLevel, SubstrateAtT,
     TaskClass, VersionTuple,
 };
 
 pub const MAX_SCORE_CARD_RECORDS: usize = 10_000;
+pub const MAX_SCORE_CARD_TASKS: usize = 10_000;
+pub const MAX_SCORE_CARD_DETAIL_BYTES: usize = 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ScoreCardError {
     EmptyRecords,
     RecordCountExceeded {
@@ -40,11 +45,17 @@ pub enum ScoreCardError {
         index: usize,
     },
     CanonicalJson(CanonicalJsonError),
+    InvalidRecord {
+        index: usize,
+    },
+    InvalidMetadata,
 }
 
 impl fmt::Display for ScoreCardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRecord { index } => write!(f, "Invalid run record at index {index}"),
+            Self::InvalidMetadata => write!(f, "Invalid or oversized score card metadata"),
             Self::EmptyRecords => {
                 write!(f, "Cannot generate score card from empty run records list")
             }
@@ -55,13 +66,13 @@ impl fmt::Display for ScoreCardError {
                 )
             }
             Self::VersionTupleMismatch {
-                expected,
-                actual,
+                expected: _,
+                actual: _,
                 index,
             } => {
                 write!(
                     f,
-                    "Refusing to mix records with different version tuples at index {index}: expected {expected:?}, got {actual:?}"
+                    "Refusing to mix records with different version tuples at index {index}"
                 )
             }
             Self::SealLevelMismatch {
@@ -100,6 +111,7 @@ impl fmt::Display for ScoreCardError {
 }
 
 impl std::error::Error for ScoreCardError {}
+redacted_debug!(ScoreCardError);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +180,36 @@ pub fn generate_score_card(
         });
     }
 
+    if !valid_record_text(benchmark)
+        || !valid_record_text(benchmark_version)
+        || excluded_tasks.len() > MAX_SCORE_CARD_TASKS
+        || repaired_tasks.len() > MAX_SCORE_CARD_TASKS
+    {
+        return Err(ScoreCardError::InvalidMetadata);
+    }
+    for (task_id, detector, detail) in excluded_tasks
+        .iter()
+        .map(|t| (&t.task_id, &t.detector, &t.reason))
+        .chain(
+            repaired_tasks
+                .iter()
+                .map(|t| (&t.task_id, &t.detector, &t.detail)),
+        )
+    {
+        if !valid_record_text(task_id)
+            || !valid_record_text(detector)
+            || detail.as_ref().is_some_and(|s| {
+                s.len() > MAX_SCORE_CARD_DETAIL_BYTES || s.chars().any(char::is_control)
+            })
+        {
+            return Err(ScoreCardError::InvalidMetadata);
+        }
+    }
+
+    records[0]
+        .validate()
+        .map_err(|_| ScoreCardError::InvalidRecord { index: 0 })?;
+
     let first = &records[0];
     let version_tuple = first.version_tuple.clone();
     let seal_level = first.seal_level;
@@ -199,6 +241,8 @@ pub fn generate_score_card(
     substrate_at_t_spread.insert("none".to_string(), 0u64);
 
     for (idx, record) in records.iter().enumerate() {
+        bounded_json_bytes(record, MAX_RUN_RECORD_SIZE)
+            .map_err(|_| ScoreCardError::InvalidRecord { index: idx })?;
         // Enforce version tuple identity
         if record.version_tuple != version_tuple {
             return Err(ScoreCardError::VersionTupleMismatch {
@@ -231,6 +275,9 @@ pub fn generate_score_card(
                 index: idx,
             });
         }
+        record
+            .validate()
+            .map_err(|_| ScoreCardError::InvalidRecord { index: idx })?;
 
         // Aggregate status count
         let status_key = match record.run_status {
@@ -281,7 +328,7 @@ pub fn generate_score_card(
     sorted_repaired.sort();
     sorted_repaired.dedup();
 
-    Ok(ScoreCard {
+    let card = ScoreCard {
         benchmark: benchmark.to_string(),
         benchmark_version: benchmark_version.to_string(),
         version_tuple,
@@ -295,5 +342,7 @@ pub fn generate_score_card(
         substrate_at_t_spread,
         excluded_tasks: sorted_excluded,
         repaired_tasks: sorted_repaired,
-    })
+    };
+    bounded_json_bytes(&card, MAX_CANONICAL_BYTES).map_err(ScoreCardError::CanonicalJson)?;
+    Ok(card)
 }

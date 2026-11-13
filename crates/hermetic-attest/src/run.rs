@@ -3,11 +3,15 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::canonical::{bounded_json_bytes, json_error};
 use crate::digest::Digest;
 
 pub const MAX_RUN_RECORD_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const MAX_RECORD_TEXT_BYTES: usize = 256;
+pub const MAX_SUBSTRATE_ITEMS: usize = 1024;
+pub const MAX_TEE_QUOTE_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RunValidationError {
     SizeCapExceeded {
         size: usize,
@@ -44,11 +48,15 @@ pub enum RunValidationError {
         task_class: TaskClass,
         grader_isolation: GraderIsolation,
     },
+    InvalidField(&'static str),
+    WorldVersionMismatch,
 }
 
 impl fmt::Display for RunValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidField(field) => write!(f, "Invalid or oversized {field}"),
+            Self::WorldVersionMismatch => write!(f, "world_version must equal world_root"),
             Self::SizeCapExceeded { size, limit } => {
                 write!(f, "Run record size {size} bytes exceeds limit {limit}")
             }
@@ -60,25 +68,16 @@ impl fmt::Display for RunValidationError {
             Self::InvalidBaseCommit(msg) => write!(f, "base_commit is invalid: {msg}"),
             Self::InvalidTimestamp {
                 field,
-                value,
-                reason,
+                value: _,
+                reason: _,
             } => {
-                write!(
-                    f,
-                    "Timestamp field '{field}' value '{value}' is invalid: {reason}"
-                )
+                write!(f, "Timestamp field '{field}' is invalid")
             }
-            Self::ClockBeforeWorld { t_clock, t_world } => {
-                write!(f, "t_clock ({t_clock}) cannot precede t_world ({t_world})")
+            Self::ClockBeforeWorld { .. } => {
+                write!(f, "t_clock cannot precede t_world")
             }
-            Self::PkgCutoffBeforeWorld {
-                pkg_cutoff,
-                t_world,
-            } => {
-                write!(
-                    f,
-                    "pkg_cutoff ({pkg_cutoff}) cannot precede t_world ({t_world})"
-                )
+            Self::PkgCutoffBeforeWorld { .. } => {
+                write!(f, "pkg_cutoff cannot precede t_world")
             }
             Self::StrictCarriesD5bWarning => {
                 write!(f, "Seal level 'strict' must not carry a D5b warning list")
@@ -124,6 +123,7 @@ impl fmt::Display for RunValidationError {
 }
 
 impl std::error::Error for RunValidationError {}
+redacted_debug!(RunValidationError);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -319,18 +319,56 @@ impl RunRecord {
             });
         }
         let record: Self =
-            serde_json::from_str(s).map_err(|e| RunValidationError::JsonParse(e.to_string()))?;
+            serde_json::from_str(s).map_err(|e| RunValidationError::JsonParse(json_error(e)))?;
         record.validate()?;
         Ok(record)
     }
 
     /// Full validation of all statement constraints.
     pub fn validate(&self) -> Result<(), RunValidationError> {
+        for (field, text) in [
+            ("spec_version", self.version_tuple.spec_version.as_str()),
+            (
+                "sealcheck_version",
+                self.version_tuple.sealcheck_version.as_str(),
+            ),
+        ] {
+            if !valid_record_text(text) {
+                return Err(RunValidationError::InvalidField(field));
+            }
+        }
+        if let Some(version) = &self.gateway_adapter_version {
+            if !valid_record_text(version) {
+                return Err(RunValidationError::InvalidField("gateway_adapter_version"));
+            }
+        }
+        for (field, list) in [
+            ("exemption_list", Some(&self.exemption_list)),
+            ("d5b_warning_list", self.d5b_warning_list.as_ref()),
+        ] {
+            if let Some(list) = list {
+                if list.len() > MAX_SUBSTRATE_ITEMS || list.iter().any(|s| !valid_record_text(s)) {
+                    return Err(RunValidationError::InvalidField(field));
+                }
+            }
+        }
+        if self
+            .tee_quote
+            .as_ref()
+            .is_some_and(|q| q.quote.is_empty() || q.quote.len() > MAX_TEE_QUOTE_BYTES)
+        {
+            return Err(RunValidationError::InvalidField("tee_quote"));
+        }
+        bounded_json_bytes(self, MAX_RUN_RECORD_SIZE)
+            .map_err(|_| RunValidationError::InvalidField("run record size"))?;
+        if self.version_tuple.world_version != self.world_root {
+            return Err(RunValidationError::WorldVersionMismatch);
+        }
         // 1. Task ID
         if self.task_id.trim().is_empty() {
             return Err(RunValidationError::EmptyTaskId);
         }
-        if self.task_id.len() > 256 {
+        if self.task_id.len() > MAX_RECORD_TEXT_BYTES {
             return Err(RunValidationError::TaskIdTooLong(self.task_id.len()));
         }
         if self.task_id.chars().any(|c| c.is_control()) {
@@ -343,9 +381,14 @@ impl RunRecord {
         if self.base_commit.trim().is_empty() {
             return Err(RunValidationError::EmptyBaseCommit);
         }
-        if !self.base_commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !matches!(self.base_commit.len(), 40 | 64)
+            || !self
+                .base_commit
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
             return Err(RunValidationError::InvalidBaseCommit(
-                "base_commit must be hexadecimal".into(),
+                "base_commit must be a full lowercase Git object ID".into(),
             ));
         }
 
@@ -377,10 +420,8 @@ impl RunRecord {
         // Strict seal level must not carry D5b warnings
         match self.seal_level {
             SealLevel::Strict => {
-                if let Some(ref warnings) = self.d5b_warning_list {
-                    if !warnings.is_empty() {
-                        return Err(RunValidationError::StrictCarriesD5bWarning);
-                    }
+                if self.d5b_warning_list.is_some() {
+                    return Err(RunValidationError::StrictCarriesD5bWarning);
                 }
             }
             SealLevel::RepoOnly => {
@@ -449,6 +490,12 @@ impl RunRecord {
     }
 }
 
+pub(crate) fn valid_record_text(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.len() <= MAX_RECORD_TEXT_BYTES
+        && !text.chars().any(char::is_control)
+}
+
 fn is_strictly_sorted_and_unique(list: &[String]) -> bool {
     list.windows(2).all(|w| w[0] < w[1])
 }
@@ -491,12 +538,24 @@ fn parse_rfc3339_utc(field: &str, s: &str) -> Result<ParsedUtcDateTime, RunValid
         reason: reason.to_string(),
     };
 
+    // Bound splitting and reject numeric parser extensions such as '+1' or short fields.
+    if s.len() > 35 || !s.is_ascii() {
+        return Err(err("invalid RFC 3339 timestamp"));
+    }
+
     let (date_part, time_and_tz) = s
         .split_once(['T', 't'])
         .ok_or_else(|| err("missing 'T' separator"))?;
     let date_parts: Vec<&str> = date_part.split('-').collect();
     if date_parts.len() != 3 {
         return Err(err("date must have format YYYY-MM-DD"));
+    }
+    if !date_parts
+        .iter()
+        .zip([4, 2, 2])
+        .all(|(part, len)| part.len() == len && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(err("invalid date field width"));
     }
     let year: i32 = date_parts[0].parse().map_err(|_| err("invalid year"))?;
     let month: u32 = date_parts[1].parse().map_err(|_| err("invalid month"))?;
@@ -511,19 +570,13 @@ fn parse_rfc3339_utc(field: &str, s: &str) -> Result<ParsedUtcDateTime, RunValid
     }
 
     // Time & timezone
-    let (time_part, tz_part) = if let Some(stripped) = time_and_tz.strip_suffix(['Z', 'z']) {
-        (stripped, "Z")
-    } else if let Some((t, tz)) = time_and_tz.split_once('+') {
-        (t, tz)
-    } else if let Some((t, tz)) = time_and_tz.split_once('-') {
-        (t, tz)
+    let time_part = if let Some(stripped) = time_and_tz.strip_suffix(['Z', 'z']) {
+        stripped
+    } else if let Some(stripped) = time_and_tz.strip_suffix("+00:00") {
+        stripped
     } else {
         return Err(err("missing UTC timezone designator"));
     };
-
-    if tz_part != "Z" && tz_part != "00:00" {
-        return Err(err("timestamp must be in UTC timezone (Z or +00:00)"));
-    }
 
     let (hms_part, frac_part) = if let Some((hms, frac)) = time_part.split_once('.') {
         (hms, Some(frac))
@@ -534,6 +587,12 @@ fn parse_rfc3339_utc(field: &str, s: &str) -> Result<ParsedUtcDateTime, RunValid
     let hms_parts: Vec<&str> = hms_part.split(':').collect();
     if hms_parts.len() != 3 {
         return Err(err("time must have format HH:MM:SS"));
+    }
+    if !hms_parts
+        .iter()
+        .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(err("invalid time field width"));
     }
     let hour: u32 = hms_parts[0].parse().map_err(|_| err("invalid hour"))?;
     let min: u32 = hms_parts[1].parse().map_err(|_| err("invalid minute"))?;

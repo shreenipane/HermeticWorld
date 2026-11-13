@@ -5,12 +5,14 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::canonical::{bounded_json_bytes, json_error};
 use crate::digest::Digest;
+use crate::run::valid_record_text;
 
 pub const MAX_AUDIT_RECORD_SIZE: usize = 512 * 1024; // 512 KiB
 pub const MAX_EVIDENCE_SPANS: usize = 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuditValidationError {
     SizeCapExceeded { size: usize, limit: usize },
     JsonParse(String),
@@ -19,11 +21,17 @@ pub enum AuditValidationError {
     EmptyLogName { index: usize },
     InvalidEvidenceSpanRange { index: usize, start: u64, end: u64 },
     UnsortedEvidenceSpans,
+    InvalidLogName { index: usize },
+    InvalidRunDigestAlgorithm,
 }
 
 impl fmt::Display for AuditValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidLogName { index } => {
+                write!(f, "Invalid or oversized log name at index {index}")
+            }
+            Self::InvalidRunDigestAlgorithm => write!(f, "run_digest must use sha256"),
             Self::SizeCapExceeded { size, limit } => {
                 write!(f, "Audit record size {size} bytes exceeds limit {limit}")
             }
@@ -54,6 +62,7 @@ impl fmt::Display for AuditValidationError {
 }
 
 impl std::error::Error for AuditValidationError {}
+redacted_debug!(AuditValidationError);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,7 +85,7 @@ pub struct EvidenceSpan {
 pub struct TranscriptAuditRecord {
     /// Subject = the run digest (validated `sha256:` + 64 hex).
     pub run_digest: Digest,
-    /// Derived (agent solved it) or retrieved (copied from test/gold).
+    /// Classifier label: derived or retrieved from an answer source (§5.6).
     pub label: AuditLabel,
     /// Bounded integer per-mille (0..=1000), never a float.
     pub confidence: u32,
@@ -95,13 +104,16 @@ impl TranscriptAuditRecord {
             });
         }
         let record: Self =
-            serde_json::from_str(s).map_err(|e| AuditValidationError::JsonParse(e.to_string()))?;
+            serde_json::from_str(s).map_err(|e| AuditValidationError::JsonParse(json_error(e)))?;
         record.validate()?;
         Ok(record)
     }
 
     /// Full validation of transcript audit statement constraints.
     pub fn validate(&self) -> Result<(), AuditValidationError> {
+        if self.run_digest.algorithm() != "sha256" {
+            return Err(AuditValidationError::InvalidRunDigestAlgorithm);
+        }
         if self.confidence > 1000 {
             return Err(AuditValidationError::ConfidenceOutOfBounds(self.confidence));
         }
@@ -117,6 +129,9 @@ impl TranscriptAuditRecord {
             if span.log_name.trim().is_empty() {
                 return Err(AuditValidationError::EmptyLogName { index: idx });
             }
+            if !valid_record_text(&span.log_name) {
+                return Err(AuditValidationError::InvalidLogName { index: idx });
+            }
             if span.start > span.end {
                 return Err(AuditValidationError::InvalidEvidenceSpanRange {
                     index: idx,
@@ -125,6 +140,13 @@ impl TranscriptAuditRecord {
                 });
             }
         }
+
+        bounded_json_bytes(self, MAX_AUDIT_RECORD_SIZE).map_err(|_| {
+            AuditValidationError::SizeCapExceeded {
+                size: MAX_AUDIT_RECORD_SIZE + 1,
+                limit: MAX_AUDIT_RECORD_SIZE,
+            }
+        })?;
 
         // Must be sorted and deduplicated
         if !self.evidence_spans.windows(2).all(|w| w[0] < w[1]) {

@@ -4,6 +4,11 @@ use tempfile::tempdir;
 #[test]
 fn test_safe_read_and_atomic_write() {
     let dir = tempdir().expect("tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let file_path = dir.path().join("record.json");
 
     let payload = b"{\"hello\":\"world\"}";

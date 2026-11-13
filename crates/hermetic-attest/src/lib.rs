@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 
+// Error diagnostics must never expose supplied text or signer backend details.
+macro_rules! redacted_debug {
+    ($error:ty) => {
+        impl std::fmt::Debug for $error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(self, f)
+            }
+        }
+    };
+}
+
 pub mod audit;
 pub mod base64;
 pub mod canonical;

@@ -11,7 +11,9 @@ use std::fmt;
 
 use crate::audit::TranscriptAuditRecord;
 use crate::base64::{base64_decode, base64_encode, Base64Error};
-use crate::canonical::{compute_run_digest, to_canonical_json_bytes, CanonicalJsonError};
+use crate::canonical::{
+    bounded_json_bytes, compute_run_digest, json_error, to_canonical_json_bytes, CanonicalJsonError,
+};
 use crate::digest::Digest;
 use crate::run::RunRecord;
 
@@ -23,8 +25,10 @@ pub const DSSE_PAYLOAD_TYPE_IN_TOTO: &str = "application/vnd.in-toto+json";
 pub const MAX_ENVELOPE_JSON_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const MAX_PAYLOAD_BYTES: usize = 512 * 1024; // 512 KiB
 pub const MAX_SIGNATURES: usize = 16;
+pub const MAX_SIGNATURE_BYTES: usize = 64 * 1024;
+pub const MAX_KEY_ID_BYTES: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SignatureError {
     SigningFailed(String),
     VerificationFailed(String),
@@ -33,13 +37,14 @@ pub enum SignatureError {
 impl fmt::Display for SignatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SigningFailed(msg) => write!(f, "Signing failed: {msg}"),
-            Self::VerificationFailed(msg) => write!(f, "Signature verification failed: {msg}"),
+            Self::SigningFailed(_) => write!(f, "Signing failed"),
+            Self::VerificationFailed(_) => write!(f, "Signature verification failed"),
         }
     }
 }
 
 impl std::error::Error for SignatureError {}
+redacted_debug!(SignatureError);
 
 /// Trait for signing PAE bytes.
 pub trait Signer {
@@ -57,7 +62,7 @@ pub trait Verifier {
     ) -> Result<(), SignatureError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DsseError {
     SizeCapExceeded { size: usize, limit: usize },
     JsonParse(String),
@@ -83,26 +88,20 @@ impl fmt::Display for DsseError {
             }
             Self::JsonParse(msg) => write!(f, "JSON parse error: {msg}"),
             Self::Base64(e) => write!(f, "Base64 decoding error: {e}"),
-            Self::UnknownPayloadType(pt) => write!(f, "Unknown or disallowed payloadType: '{pt}'"),
+            Self::UnknownPayloadType(_) => write!(f, "Unknown or disallowed payloadType"),
             Self::NoSignatures => write!(f, "Envelope contains no signatures"),
             Self::TooManySignatures { count, limit } => {
                 write!(f, "Signature count {count} exceeds limit {limit}")
             }
             Self::SignatureVerification(e) => write!(f, "Signature verification error: {e}"),
-            Self::InvalidStatementType(st) => {
-                write!(f, "Invalid in-toto statement _type: expected '{IN_TOTO_STATEMENT_V1_TYPE}', got '{st}'")
+            Self::InvalidStatementType(_) => {
+                write!(f, "Invalid in-toto statement _type")
             }
-            Self::InvalidPredicateType { expected, actual } => {
-                write!(
-                    f,
-                    "Predicate type mismatch: expected '{expected}', got '{actual}'"
-                )
+            Self::InvalidPredicateType { .. } => {
+                write!(f, "Predicate type mismatch")
             }
-            Self::SubjectDigestMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "Subject digest mismatch: expected '{expected}', actual '{actual}'"
-                )
+            Self::SubjectDigestMismatch { .. } => {
+                write!(f, "Subject digest mismatch")
             }
             Self::MissingSubject => write!(f, "Statement subject list is empty"),
             Self::CanonicalJson(e) => write!(f, "Canonical JSON error: {e}"),
@@ -113,6 +112,7 @@ impl fmt::Display for DsseError {
 }
 
 impl std::error::Error for DsseError {}
+redacted_debug!(DsseError);
 
 /// Compute DSSE Pre-Authentication Encoding (PAE).
 ///
@@ -149,7 +149,35 @@ pub fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 #[serde(deny_unknown_fields)]
 pub struct StatementSubject {
     pub name: String,
+    #[serde(deserialize_with = "unique_digest_map")]
     pub digest: BTreeMap<String, String>,
+}
+
+fn unique_digest_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct UniqueDigests;
+    impl<'de> serde::de::Visitor<'de> for UniqueDigests {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a digest map without duplicate algorithms")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut digests = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if digests.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate digest algorithm"));
+                }
+            }
+            Ok(digests)
+        }
+    }
+    deserializer.deserialize_map(UniqueDigests)
 }
 
 impl StatementSubject {
@@ -165,7 +193,7 @@ impl StatementSubject {
     /// Check whether this subject carries a matching digest.
     pub fn matches_digest(&self, expected: &Digest) -> bool {
         if let Some(val) = self.digest.get(expected.algorithm()) {
-            val.eq_ignore_ascii_case(expected.hex())
+            self.digest.len() == 1 && val == expected.hex()
         } else {
             false
         }
@@ -249,24 +277,48 @@ impl DsseEnvelope {
         signer: &dyn Signer,
     ) -> Result<Self, DsseError> {
         let payload_bytes = to_canonical_json_bytes(statement).map_err(DsseError::CanonicalJson)?;
+        if payload_bytes.len() > MAX_PAYLOAD_BYTES {
+            return Err(DsseError::SizeCapExceeded {
+                size: payload_bytes.len(),
+                limit: MAX_PAYLOAD_BYTES,
+            });
+        }
+        let keyid = signer.key_id();
+        if keyid
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_KEY_ID_BYTES || s.chars().any(char::is_control))
+        {
+            return Err(DsseError::SizeCapExceeded {
+                size: MAX_KEY_ID_BYTES + 1,
+                limit: MAX_KEY_ID_BYTES,
+            });
+        }
         let pae = dsse_pae(DSSE_PAYLOAD_TYPE_IN_TOTO, &payload_bytes);
         let sig_bytes = signer
             .sign(&pae)
             .map_err(DsseError::SignatureVerification)?;
+        if sig_bytes.len() > MAX_SIGNATURE_BYTES {
+            return Err(DsseError::SizeCapExceeded {
+                size: sig_bytes.len(),
+                limit: MAX_SIGNATURE_BYTES,
+            });
+        }
 
         let envelope = Self {
             payload: base64_encode(&payload_bytes),
             payload_type: DSSE_PAYLOAD_TYPE_IN_TOTO.to_string(),
             signatures: vec![DsseSignature {
-                keyid: signer.key_id(),
+                keyid,
                 sig: base64_encode(&sig_bytes),
             }],
         };
+        bounded_json_bytes(&envelope, MAX_ENVELOPE_JSON_BYTES).map_err(DsseError::CanonicalJson)?;
         Ok(envelope)
     }
 
     /// Strictly verify signatures and return decoded payload bytes.
     pub fn verify_and_decode(&self, verifier: &dyn Verifier) -> Result<Vec<u8>, DsseError> {
+        bounded_json_bytes(self, MAX_ENVELOPE_JSON_BYTES).map_err(DsseError::CanonicalJson)?;
         // Enforce allowed payloadType
         if self.payload_type != DSSE_PAYLOAD_TYPE_IN_TOTO {
             return Err(DsseError::UnknownPayloadType(self.payload_type.clone()));
@@ -288,9 +340,24 @@ impl DsseEnvelope {
             base64_decode(&self.payload, MAX_PAYLOAD_BYTES).map_err(DsseError::Base64)?;
         let pae = dsse_pae(&self.payload_type, &payload_bytes);
 
-        // Verify all signatures
+        // Validate every signature before calling a verifier.
+        let mut signatures = Vec::with_capacity(self.signatures.len());
         for sig_entry in &self.signatures {
-            let sig_bytes = base64_decode(&sig_entry.sig, 64 * 1024).map_err(DsseError::Base64)?;
+            if sig_entry
+                .keyid
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_KEY_ID_BYTES || s.chars().any(char::is_control))
+            {
+                return Err(DsseError::SizeCapExceeded {
+                    size: MAX_KEY_ID_BYTES + 1,
+                    limit: MAX_KEY_ID_BYTES,
+                });
+            }
+            signatures.push(
+                base64_decode(&sig_entry.sig, MAX_SIGNATURE_BYTES).map_err(DsseError::Base64)?,
+            );
+        }
+        for (sig_entry, sig_bytes) in self.signatures.iter().zip(signatures) {
             verifier
                 .verify(sig_entry.keyid.as_deref(), &pae, &sig_bytes)
                 .map_err(DsseError::SignatureVerification)?;
@@ -322,12 +389,12 @@ pub fn verify_run_envelope(
     }
 
     let envelope: DsseEnvelope =
-        serde_json::from_str(envelope_json).map_err(|e| DsseError::JsonParse(e.to_string()))?;
+        serde_json::from_str(envelope_json).map_err(|e| DsseError::JsonParse(json_error(e)))?;
 
     let payload_bytes = envelope.verify_and_decode(verifier)?;
 
     let statement: Statement<RunRecord> =
-        serde_json::from_slice(&payload_bytes).map_err(|e| DsseError::JsonParse(e.to_string()))?;
+        serde_json::from_slice(&payload_bytes).map_err(|e| DsseError::JsonParse(json_error(e)))?;
 
     if statement.statement_type != IN_TOTO_STATEMENT_V1_TYPE {
         return Err(DsseError::InvalidStatementType(statement.statement_type));
@@ -353,12 +420,13 @@ pub fn verify_run_envelope(
         return Err(DsseError::MissingSubject);
     }
 
-    let matches_subject = statement
-        .subject
-        .iter()
-        .any(|s| s.matches_digest(&computed_digest));
+    let matches_subject = statement.subject.len() == 1
+        && statement
+            .subject
+            .iter()
+            .any(|s| s.matches_digest(&computed_digest));
     if !matches_subject {
-        let actual_subject = format!("{:?}", statement.subject);
+        let actual_subject = "invalid subject".to_string();
         return Err(DsseError::SubjectDigestMismatch {
             expected: computed_digest.as_str().to_string(),
             actual: actual_subject,
@@ -398,12 +466,12 @@ pub fn verify_audit_envelope(
     }
 
     let envelope: DsseEnvelope =
-        serde_json::from_str(envelope_json).map_err(|e| DsseError::JsonParse(e.to_string()))?;
+        serde_json::from_str(envelope_json).map_err(|e| DsseError::JsonParse(json_error(e)))?;
 
     let payload_bytes = envelope.verify_and_decode(verifier)?;
 
     let statement: Statement<TranscriptAuditRecord> =
-        serde_json::from_slice(&payload_bytes).map_err(|e| DsseError::JsonParse(e.to_string()))?;
+        serde_json::from_slice(&payload_bytes).map_err(|e| DsseError::JsonParse(json_error(e)))?;
 
     if statement.statement_type != IN_TOTO_STATEMENT_V1_TYPE {
         return Err(DsseError::InvalidStatementType(statement.statement_type));
@@ -426,12 +494,13 @@ pub fn verify_audit_envelope(
         return Err(DsseError::MissingSubject);
     }
 
-    let matches_subject = statement
-        .subject
-        .iter()
-        .any(|s| s.matches_digest(expected_run_digest));
+    let matches_subject = statement.subject.len() == 1
+        && statement
+            .subject
+            .iter()
+            .any(|s| s.matches_digest(expected_run_digest));
     if !matches_subject {
-        let actual_subject = format!("{:?}", statement.subject);
+        let actual_subject = "invalid subject".to_string();
         return Err(DsseError::SubjectDigestMismatch {
             expected: expected_run_digest.as_str().to_string(),
             actual: actual_subject,

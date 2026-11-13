@@ -73,6 +73,34 @@ The transcript audit record documents the offline retrieval classifier's finding
 | `confidence` | u32 | Bounded integer confidence score in per-mille (0..=1000, never a float). |
 | `evidence_spans` | Vec<EvidenceSpan> | Sorted spans (`log_name`, `start`, `end`) identifying evidence locations. |
 
+Retrieval means obtaining an answer from an answer source; it is not restricted to
+copying from hidden tests or gold files. These are classifier labels, not proofs
+of how the answer was obtained.
+
+Record validation applies to both parsed and directly constructed values. Text
+fields are capped by `MAX_RECORD_TEXT_BYTES`, substrate lists by
+`MAX_SUBSTRATE_ITEMS`, and quotes by `MAX_TEE_QUOTE_BYTES`. `world_version` must
+equal `world_root`; run digests use SHA-256. Digest algorithms are limited to
+SHA-256, SHA-512 and BLAKE3, with fixed lengths. Strict records omit the D5b list,
+including an empty list.
+
+Canonical serialization has `MAX_CANONICAL_BYTES` and `MAX_CANONICAL_DEPTH`
+limits. DSSE applies separate payload, signature, key ID and envelope limits
+when signing and verifying; base64 decoding caps decoded bytes. Each verified
+statement has exactly one subject with exactly one canonical digest. Duplicate
+digest keys are rejected. Score cards validate records and bound both task lists
+and their metadata before copying them. Error diagnostics omit supplied text and
+signer backend details.
+
+File helpers require Linux x86_64 or aarch64 and a trusted procfs. They pin each
+directory and file without following supplied symlinks, and refuse parent
+traversal and special files. Reads and writes have a `MAX_FILE_BYTES` ceiling;
+paths and temporary-name attempts have separate named caps. Atomic writes require
+the output directory to belong to the process's effective user and have no group
+or other write permission. Published files have mode 0600, and both file data and
+the containing directory are synced. The helpers cannot protect against a hostile
+process running as the same host user or host root.
+
 ---
 
 ## 3. What the Records Prove and Do Not Prove (§12.5)

@@ -9,7 +9,7 @@ use std::fmt;
 
 use crate::hex::{hex_decode, hex_encode, is_strict_lowercase_hex, HexError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DigestError {
     MissingPrefix,
     EmptyAlgorithm,
@@ -30,9 +30,9 @@ impl fmt::Display for DigestError {
         match self {
             Self::MissingPrefix => write!(f, "Digest is missing ':' algorithm separator"),
             Self::EmptyAlgorithm => write!(f, "Digest algorithm prefix is empty"),
-            Self::InvalidAlgorithm(a) => write!(f, "Invalid algorithm prefix: '{a}'"),
+            Self::InvalidAlgorithm(_) => write!(f, "Invalid or unsupported digest algorithm"),
             Self::EmptyHex => write!(f, "Digest hex string is empty"),
-            Self::InvalidHexChar(c) => write!(f, "Invalid character in digest hex: '{c}'"),
+            Self::InvalidHexChar(_) => write!(f, "Invalid character in digest hex"),
             Self::UppercaseHexNotAllowed => {
                 write!(f, "Uppercase characters not allowed in digest hex")
             }
@@ -52,6 +52,9 @@ impl fmt::Display for DigestError {
 }
 
 impl std::error::Error for DigestError {}
+redacted_debug!(DigestError);
+
+pub const MAX_DIGEST_TEXT_BYTES: usize = 135;
 
 /// A validated digest with algorithm prefix and lowercase hexadecimal value.
 ///
@@ -62,6 +65,9 @@ pub struct Digest(String);
 impl Digest {
     /// Parse and validate a digest string.
     pub fn parse(s: &str) -> Result<Self, DigestError> {
+        if s.len() > MAX_DIGEST_TEXT_BYTES {
+            return Err(DigestError::InvalidAlgorithm("unsupported".into()));
+        }
         let (algo, hex_str) = s.split_once(':').ok_or(DigestError::MissingPrefix)?;
         if algo.is_empty() {
             return Err(DigestError::EmptyAlgorithm);
@@ -70,7 +76,7 @@ impl Digest {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         {
-            return Err(DigestError::InvalidAlgorithm(algo.to_string()));
+            return Err(DigestError::InvalidAlgorithm("invalid".into()));
         }
         if hex_str.is_empty() {
             return Err(DigestError::EmptyHex);
@@ -110,13 +116,7 @@ impl Digest {
                 }
             }
             _ => {
-                if hex_str.len() % 2 != 0 || hex_str.len() < 32 {
-                    return Err(DigestError::InvalidLength {
-                        algo: algo.to_string(),
-                        expected: 64,
-                        actual: hex_str.len(),
-                    });
-                }
+                return Err(DigestError::InvalidAlgorithm("unsupported".into()));
             }
         }
 
