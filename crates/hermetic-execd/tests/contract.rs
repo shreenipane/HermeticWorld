@@ -1258,7 +1258,8 @@ fn network_boot_order_fixed_argv_root_environment_and_every_failure() {
             vec!["exec".to_owned(); expected_commands.len()],
         );
         if initramfs {
-            expected.insert(1, "MountBaseReadOnly".into());
+            expected.insert(1, "MountDev".into());
+            expected.insert(2, "MountBaseReadOnly".into());
             expected.retain(|e| !e.starts_with("entry:"));
         }
         assert_eq!(fake.events, expected);
