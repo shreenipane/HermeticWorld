@@ -6,6 +6,12 @@ members = [
     "crates/vendor/tiny_http",
     "crates/hermetic-trust",
     "crates/hermetic-world-server",
+    "crates/hermetic-netvm-dns",
+    "crates/hermetic-extract",
+    "crates/hermetic-netvm-http",
+    "crates/hermetic-grader-sandbox",
+    "crates/hermetic-execd",
+    "crates/hermetic-vmm",
 ]
 resolver = "2"
 

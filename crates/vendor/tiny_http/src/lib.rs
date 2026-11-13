@@ -220,6 +220,31 @@ pub struct SslConfig {
     pub private_key: Vec<u8>,
 }
 
+pub fn is_recoverable_accept_error(err: &IoError) -> bool {
+    if matches!(
+        err.kind(),
+        IoErrorKind::Interrupted | IoErrorKind::ConnectionAborted
+    ) {
+        return true;
+    }
+    if let Some(code) = err.raw_os_error() {
+        if code == 4 || code == 23 || code == 24 || code == 53 || code == 103 {
+            return true;
+        }
+        #[cfg(windows)]
+        if code == 10004 || code == 10024 || code == 10053 {
+            return true;
+        }
+    }
+    false
+}
+
+static INJECT_ACCEPT_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn inject_accept_error_once(code: i32) {
+    INJECT_ACCEPT_ERROR.store(code, Ordering::SeqCst);
+}
+
 impl Server {
     /// Shortcut for a simple server on a specific address.
     #[inline]
@@ -329,7 +354,19 @@ impl Server {
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
-                let new_client = match server.accept() {
+                let inject_code = INJECT_ACCEPT_ERROR.swap(0, Ordering::SeqCst);
+                let accept_res = if inject_code != 0 {
+                    Err(IoError::from_raw_os_error(inject_code))
+                } else {
+                    let mut res = server.accept();
+                    let inject_code = INJECT_ACCEPT_ERROR.swap(0, Ordering::SeqCst);
+                    if inject_code != 0 {
+                        res = Err(IoError::from_raw_os_error(inject_code));
+                    }
+                    res
+                };
+
+                let new_client = match accept_res {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
                         // HERMETIC PATCH: refuse connections over the cap by closing them.
@@ -397,6 +434,17 @@ impl Server {
                     }
 
                     Err(e) => {
+                        if is_recoverable_accept_error(&e) {
+                            log::warn!("Recoverable error accepting new client: {}", e);
+                            if inside_close_trigger.load(Relaxed) {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                            if inside_close_trigger.load(Relaxed) {
+                                break;
+                            }
+                            continue;
+                        }
                         log::error!("Error accepting new client: {}", e);
                         inside_messages.push(e.into());
                         break;
