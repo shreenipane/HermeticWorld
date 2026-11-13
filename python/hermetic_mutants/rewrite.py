@@ -30,8 +30,8 @@ READ_CHUNK_BYTES: int = 65536
 MAX_MUTATION_SALTS: int = 16
 
 # Calls that expose or evaluate a function's local namespace by name. A test
-# function that uses any of them is never renamed and gets no inserted no-op,
-# because either rewrite would change what the call observes.
+# function that uses any of them is never renamed, because renaming would
+# change what the call observes.
 DYNAMIC_SCOPE_CALLS: frozenset[str] = frozenset(
     {"locals", "vars", "dir", "eval", "exec"}
 )
@@ -591,11 +591,6 @@ def collect_identifiers(tree: ast.AST) -> set[str]:
     return names
 
 
-def can_insert_noop(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """A no-op local is safe unless the function observes its locals by name."""
-    return not uses_dynamic_scope(func_node)
-
-
 def module_level_names(tree: ast.AST) -> frozenset[str]:
     """Names imported, defined or assigned by plain assignment at module level."""
     names: set[str] = set()
@@ -779,54 +774,6 @@ def apply_rename_local(
     target_func.func_node.body = [
         renamer.visit(stmt) for stmt in target_func.func_node.body
     ]
-    if not in_place:
-        ast.fix_missing_locations(new_tree)
-    return new_tree
-
-
-def apply_insert_noop(
-    tree: ast.AST,
-    func_qualname: str,
-    noop_name: str,
-    *,
-    in_place: bool = False,
-    taken_names: set[str] | None = None,
-) -> ast.AST:
-    """Insert a no-op local assignment with a derived name at the start of a test function.
-
-    The assignment goes after the docstring, if any, so __doc__ is unchanged.
-    """
-    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
-    new_tree = tree if in_place else copy.deepcopy(tree)
-    tfuncs = find_test_functions(new_tree)
-    target_func = next((f for f in tfuncs if f.qualname == func_qualname), None)
-    if target_func is None:
-        raise MutantError(f"Test function {func_qualname} not found")
-    if not can_insert_noop(target_func.func_node):
-        raise MutantError(f"Test function {func_qualname} observes its locals")
-    taken = collect_identifiers(new_tree) if taken_names is None else taken_names
-    if noop_name in taken:
-        raise MutantError(f"No-op name {noop_name} already used in module")
-
-    noop_stmt = ast.Assign(
-        targets=[ast.Name(id=noop_name, ctx=ast.Store())],
-        value=ast.Constant(value=None),
-    )
-    if target_func.func_node.body:
-        ast.copy_location(noop_stmt, target_func.func_node.body[0])
-    else:
-        ast.copy_location(noop_stmt, target_func.func_node)
-    ast.fix_missing_locations(noop_stmt)
-    body = target_func.func_node.body
-    insert_at = 0
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        insert_at = 1
-    body.insert(insert_at, noop_stmt)
     if not in_place:
         ast.fix_missing_locations(new_tree)
     return new_tree

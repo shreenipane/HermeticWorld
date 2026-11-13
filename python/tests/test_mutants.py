@@ -15,7 +15,6 @@ from hermetic_mutants import (
     MutantError,
     ParseError,
     apply_assert_eq_to_not_ne,
-    apply_insert_noop,
     apply_mutant_rewrite,
     apply_rename_local,
     apply_swap_assert_equal,
@@ -115,14 +114,19 @@ def test_rewrite_rename_local_variables() -> None:
     assert out.strip() == expected
 
 
-def test_rewrite_insert_noop_assignment() -> None:
-    """Insert a no-op local assignment with a derived name."""
+def test_noop_only_rewrite_reports_shortfall() -> None:
+    """A function with no permitted rewrite gets no artificial assignments (§11.2)."""
     src = "def test_run():\n    assert True\n"
-    tree = parse_test_source(src)
-    new_tree = apply_insert_noop(tree, "test_run", "_hw_noop_test")
-    out = ast.unparse(new_tree)
-    expected = "def test_run():\n    _hw_noop_test = None\n    assert True"
-    assert out.strip() == expected
+    pool = build_pool(src, seed="ab")
+    assert pool.variants == ()
+    assert pool.pairs == ()
+    assert pool.shortfalls == {
+        "requested_equivalents": 4,
+        "actual_equivalents": 0,
+        "requested_mutants": 4,
+        "actual_mutants": 0,
+    }
+    assert pool.shortfall_reason is not None
 
 
 @pytest.mark.parametrize(
@@ -746,7 +750,7 @@ def test_in_container_mutant_never_contains_an_original_element() -> None:
 
 
 def test_mutant_text_carries_no_fixed_marker() -> None:
-    """Mutated str, bytes and None values contain no constant marker a forger could grep for."""
+    """Neither variant kind carries a fixed mutation marker or inserted no-op."""
     src = (
         "def test_m():\n"
         "    assert s == 'abc'\n"
@@ -756,9 +760,9 @@ def test_mutant_text_carries_no_fixed_marker() -> None:
     for k in range(8):
         pool = build_pool(src, seed=f"{k:x}1", n_equivalents=3, n_mutants=3)
         for v in pool.variants:
-            if v.kind == "mutant":
-                low = v.source.lower()
-                assert "mut" not in low and "sentinel" not in low and "hermetic" not in low
+            low = v.source.lower()
+            assert all(marker not in low for marker in ("mut", "sentinel", "hermetic", "noop"))
+            assert "insert_noop" not in v.rewrites
 
 
 def test_seed_must_be_plain_hex(tmp_path: Path) -> None:
@@ -818,28 +822,30 @@ def test_dynamic_scope_functions_are_not_renamed_or_padded() -> None:
     src = "def test_dyn():\n    x = 1\n    assert locals() == {'x': 1}\n"
     tree = parse_test_source(src)
     assert get_renamable_locals(tree.body[0], tree) == []  # type: ignore[arg-type]
-    with pytest.raises(MutantError):
-        apply_insert_noop(tree, "test_dyn", "_hw_noop_x")
     pool = build_pool(src, seed="ab", n_equivalents=4, n_mutants=0)
+    assert pool.variants == ()
     for v in pool.variants:
         assert _run_fixture(v.source) == {"test_dyn": True}
 
 
-def test_noop_goes_after_docstring() -> None:
-    """The inserted no-op keeps the function docstring in place."""
+def test_variants_preserve_docstring_without_padding() -> None:
+    """Rewritten functions retain their docstring and contain no added statements."""
     src = 'def test_doc():\n    """Doc."""\n    assert x == 1\n'
-    out = ast.unparse(apply_insert_noop(parse_test_source(src), "test_doc", "_hw_n"))
-    assert out == "def test_doc():\n    \"\"\"Doc.\"\"\"\n    _hw_n = None\n    assert x == 1"
+    pool = build_pool(src, seed="ab", n_equivalents=2, n_mutants=2)
+    assert len(pool.variants) == 4
+    for variant in pool.variants:
+        func = ast.parse(variant.source).body[0]
+        assert ast.get_docstring(func) == "Doc."
+        assert len(func.body) == 2
+        assert isinstance(func.body[1], ast.Assert)
 
 
 def test_new_names_never_collide_with_existing_identifiers() -> None:
-    """A rename or no-op whose derived name already exists in the module is refused."""
+    """A rename whose derived name already exists in the module is refused."""
     src = "_hw_res = 5\ndef test_c():\n    result = 1\n    assert result == _hw_res - 4\n"
     tree = parse_test_source(src)
     with pytest.raises(MutantError):
         apply_rename_local(tree, "test_c", "result", "_hw_res")
-    with pytest.raises(MutantError):
-        apply_insert_noop(tree, "test_c", "_hw_res")
 
 
 def test_rebound_test_names_are_skipped() -> None:
@@ -997,12 +1003,12 @@ def test_known_answer_manifest_and_variants() -> None:
     src = "def test_kat():\n    val = 100\n    assert val == 100\n"
     pool = build_pool(src, seed="0123456789abcdef", n_equivalents=2, n_mutants=2)
     assert [v.source for v in pool.variants] == [
-        "def test_kat():\n    _hw_noop_ee6cf3 = None\n    val = 100\n    assert val == 100",
         "def test_kat():\n    val = 100\n    assert 100 == val",
-        "def test_kat():\n    _hw_noop_ee6cf3 = None\n    val = 100\n    assert val == 631",
+        "def test_kat():\n    val = 100\n    assert not val != 100",
         "def test_kat():\n    val = 100\n    assert 631 == val",
+        "def test_kat():\n    val = 100\n    assert not val != 631",
     ]
     manifest = build_manifest_bytes(pool, "0123456789abcdef")
     assert hashlib.sha256(manifest).hexdigest() == (
-        "8ace8d45d43510ae560ce4f0ccff1aa120a79b51a6935ddaa6e52985fdb1270d"
+        "1ea947eac721084b9b88925e3a3b4489b81f899e14f17abbc0f6355dc72ce238"
     )

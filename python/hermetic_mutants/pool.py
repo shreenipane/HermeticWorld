@@ -17,11 +17,9 @@ from typing import Any, Sequence
 from hermetic_mutants.rewrite import (
     AssertionSite,
     MutantError,
-    can_insert_noop,
     collect_identifiers,
     module_level_names,
     apply_assert_eq_to_not_ne,
-    apply_insert_noop,
     apply_mutant_rewrite,
     apply_rename_local,
     apply_swap_assert_equal,
@@ -203,8 +201,6 @@ def build_pool(
         renamable = get_renamable_locals(f.func_node, base_tree, module_names)
         for var in renamable:
             raw_ops.append(("rename_local", f.qualname, var))
-        if can_insert_noop(f.func_node):
-            raw_ops.append(("insert_noop", f.qualname))
 
     # Deterministic sorting of candidate atomic operations
     raw_ops.sort(key=lambda op: (op[0], op[1], op[2] if len(op) > 2 else ""))
@@ -250,17 +246,6 @@ def build_pool(
                     )
                     taken_names.add(new_var)
                     applied_rewrites.append(f"rename_local:{var}")
-                elif op_kind == "insert_noop":
-                    qualname = op[1]
-                    h_val = hashlib.sha256(
-                        f"{seed}:{qualname}:noop:{len(applied_rewrites)}".encode("utf-8")
-                    ).hexdigest()[:6]
-                    noop_name = f"_hw_noop_{h_val}"
-                    cur_tree = apply_insert_noop(
-                        cur_tree, qualname, noop_name, in_place=True, taken_names=taken_names
-                    )
-                    taken_names.add(noop_name)
-                    applied_rewrites.append("insert_noop")
                 else:
                     raise MutantError(f"Unknown rewrite {op_kind}")
             ast.fix_missing_locations(cur_tree)
