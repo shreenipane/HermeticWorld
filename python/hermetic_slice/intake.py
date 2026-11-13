@@ -17,6 +17,7 @@ from hermetic_slice.cutoffs import Cutoffs, FixCommit, compute_cutoffs, ensure_u
 from hermetic_slice.gitutil import GitError, run_git
 from hermetic_slice.http import HttpError, HttpGet, HttpPostJson, atomic_write_bytes, open_secure_directory
 from hermetic_slice.thread_scrub import process_thread_scrub_and_revision
+from hermetic_slice.test_services import declared_services
 
 
 MAX_TASK_ARTIFACT_BYTES = 32 * 1024 * 1024
@@ -549,6 +550,7 @@ def intake_task(
             "issue_refs": issue_refs_meta,
             "pr_url": pr_url,
         },
+        "test_services": declared_services(repo, row["base_commit"]),
         "tests": {
             "FAIL_TO_PASS": row.get("FAIL_TO_PASS", []),
             "PASS_TO_PASS": row.get("PASS_TO_PASS", []),

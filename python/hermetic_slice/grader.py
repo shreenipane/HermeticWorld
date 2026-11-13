@@ -24,6 +24,7 @@ from .eval_spec import (
     prepare_eval_script,
 )
 from .log_parsers import get_log_parser
+from .test_services import load_test_services, service_source
 
 
 class PatchRejected(Exception):
@@ -384,7 +385,6 @@ def grade(
     """Grade a patch in a fresh container with no network, logging results to out_dir."""
     task_dir = Path(task_dir)
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     patch_sha256 = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
@@ -410,6 +410,9 @@ def grade(
     script_for_grader, removed_eval_lines = prepare_eval_script(eval_sh_bytes.decode("utf-8"))
 
     task_json = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+    services = load_test_services(task_dir, task_json)
+    source = service_source() if services.names else None
+    out_dir.mkdir(parents=True, exist_ok=True)
     instance_id = task_json["instance_id"]
     f2p_targets = task_json.get("tests", {}).get("FAIL_TO_PASS", [])
     p2p_targets = task_json.get("tests", {}).get("PASS_TO_PASS", [])
@@ -558,7 +561,8 @@ def grade(
         try:
             # check=False: the eval script's own exit status is not the verdict.
             out = run_docker(
-                ["exec", cid_name, "/bin/bash", "/eval.sh"],
+                services.command(cid_name),
+                **({"input": source} if source is not None else {}),
                 check=False,
                 timeout=timeout,
                 combine_output=True,
@@ -626,6 +630,7 @@ def grade(
             "schema": "hermetic-slice-grade/v1",
             "status": status,
             "test_exit_code": exit_code,
+            "test_services": list(services.names),
         }
         (out_dir / "grade.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return result

@@ -62,6 +62,7 @@ fn sample_manifest() -> WorldManifest {
         world_ca_cert_sha256:
             "sha256:0000000000000000000000000000000000000000000000000000000000000007".to_string(),
         trust_store_paths: vec!["/etc/ssl/certs/ca-certificates.crt".to_string()],
+        test_services: Vec::new(),
         run_spec: RunSpec {
             env,
             workdir: "/workspace".to_string(),
@@ -82,6 +83,47 @@ fn sample_manifest() -> WorldManifest {
             detail: "scrubbed".to_string(),
         }],
     }
+}
+
+#[test]
+fn test_service_declaration_is_committed_by_world_root() {
+    use hermetic_common::world_manifest::TestService;
+    let mut manifest = sample_manifest();
+    let old_root = manifest.world_root().unwrap();
+    manifest.test_services.push(TestService::HttpbinV1);
+    manifest.validate().unwrap();
+    let json = serde_json::to_string(&manifest).unwrap();
+    let restored = WorldManifest::from_json_str(&json).unwrap();
+    assert_eq!(restored.test_services, vec![TestService::HttpbinV1]);
+    let root = restored.world_root().unwrap();
+    assert_ne!(root, old_root);
+    let (value, proof) = restored.inclusion_proof("/test_services/0").unwrap();
+    assert_eq!(value, "\"httpbin-v1\"");
+    assert!(verify_inclusion(&root, "/test_services/0", &value, &proof).unwrap());
+}
+
+#[test]
+fn test_unknown_or_duplicate_test_services_are_rejected() {
+    use hermetic_common::world_manifest::TestService;
+    let mut manifest = sample_manifest();
+    manifest.test_services = vec![TestService::HttpbinV1, TestService::HttpbinV1];
+    assert!(manifest.validate().is_err());
+    let mut json = serde_json::to_value(sample_manifest()).unwrap();
+    json["test_services"] = serde_json::json!(["arbitrary-command"]);
+    assert!(WorldManifest::from_json_str(&json.to_string()).is_err());
+}
+
+#[test]
+fn test_absent_and_empty_test_services_preserve_legacy_root() {
+    let original = sample_manifest();
+    let mut json = serde_json::to_value(&original).unwrap();
+    assert!(json.get("test_services").is_none());
+    json["test_services"] = serde_json::json!([]);
+    let restored = WorldManifest::from_json_str(&json.to_string()).unwrap();
+    assert_eq!(
+        restored.world_root().unwrap(),
+        original.world_root().unwrap()
+    );
 }
 
 #[test]

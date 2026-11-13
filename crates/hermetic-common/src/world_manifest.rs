@@ -143,6 +143,16 @@ pub struct Disposition {
     pub detail: String,
 }
 
+/// Built-in, versioned test services; never arbitrary executables or URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestService {
+    #[serde(rename = "httpbin-v1")]
+    HttpbinV1,
+}
+
+/// One reviewed built-in service is currently supported per task.
+pub const MAX_TEST_SERVICES: usize = 1;
+
 /// Canonical World Manifest describing a sealed world (§13.1, TR-SEAL-11, TR-SEAL-12).
 ///
 /// Hashing and leaf canonicalization rules:
@@ -188,6 +198,8 @@ pub struct WorldManifest {
     pub world_ca_cert_sha256: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trust_store_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_services: Vec<TestService>,
 
     // Run spec
     pub run_spec: RunSpec,
@@ -537,6 +549,9 @@ impl WorldManifest {
         }
 
         // 5. Network
+        if self.test_services.len() > MAX_TEST_SERVICES {
+            errors.push("test_services exceeds supported service count".to_string());
+        }
         for i in 1..self.dns_table.len() {
             if self.dns_table[i - 1].as_bytes() >= self.dns_table[i].as_bytes() {
                 errors.push(
