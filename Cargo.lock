@@ -524,6 +524,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-execd"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "hermetic-extract"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hermetic-gateway"
 version = "0.1.0"
 dependencies = [
@@ -542,7 +566,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-grader-sandbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hermetic-netvm-dns"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hermetic-netvm-http"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -593,6 +633,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "hermetic-vmm"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
