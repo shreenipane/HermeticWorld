@@ -7,6 +7,8 @@ members = [
     "crates/hermetic-trust",
     "crates/hermetic-world-server",
     "crates/hermetic-attest",
+    "crates/hermetic-extract-walk",
+    "crates/hermetic-cli",
     "crates/hermetic-netvm-dns",
     "crates/hermetic-extract",
     "crates/hermetic-netvm-http",
