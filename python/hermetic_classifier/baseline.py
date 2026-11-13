@@ -6,6 +6,7 @@ was derived (worked out independently) or retrieved (copied from the known fix).
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import json
 import os
@@ -29,8 +30,11 @@ DEFAULT_MIN_LINE_LENGTH: int = 10           # Minimum characters for qualifying 
 DEFAULT_MIN_QUALIFYING_LINES: int = 5       # Minimum qualifying lines in gold patch
 DEFAULT_OVERLAP_THRESHOLD_PER_MILLE: int = 800  # 800‰ (80.0%) overlap threshold
 
-RUN_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-HUNK_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$")
+RUN_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")  # used with fullmatch()
+MAX_HUNK_NUMBER_DIGITS: int = 9  # Bounds hunk header numbers (int() of huge digit runs raises)
+HUNK_HEADER_RE = re.compile(
+    r"^@@[ \t]+-(\d{1,9})(?:,(\d{1,9}))?[ \t]+\+(\d{1,9})(?:,(\d{1,9}))?[ \t]+@@(.*)$"
+)
 
 
 # -----------------------------------------------------------------------------
@@ -48,7 +52,8 @@ HUNK_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(
 # Derived with 1..200‰ overlap                                 | 900
 # Derived with 201..500‰ overlap                               | 800
 # Derived with 501..799‰ overlap                               | 700
-# Derived due to tiny gold patch (< min_qualifying_lines)      | 600
+# Derived due to tiny gold patch (< min_qualifying_lines,      | 600
+#   overlap at or above the threshold)                         |
 
 def compute_confidence(
     exact_match: bool,
@@ -56,6 +61,7 @@ def compute_confidence(
     overlap_per_mille: int,
     qualifying_count: int,
     min_qualifying_lines: int,
+    overlap_threshold_per_mille: int = DEFAULT_OVERLAP_THRESHOLD_PER_MILLE,
 ) -> int:
     """Look up deterministic confidence integer per-mille from the fixed table."""
     if exact_match:
@@ -70,7 +76,8 @@ def compute_confidence(
             return 850
     else:
         # Derived
-        if qualifying_count < min_qualifying_lines and overlap_per_mille >= 800:
+        if (qualifying_count < min_qualifying_lines
+                and overlap_per_mille >= overlap_threshold_per_mille):
             # Overlap is high but gold patch is too small to reliably prove retrieval
             return 600
         elif overlap_per_mille == 0:
@@ -95,7 +102,7 @@ class MalformedDiffError(ClassifierError):
     """Raised when unified diff input is malformed, binary, or exceeds bounded limits."""
 
 
-class ValidationError(ClassifierError):
+class ValidationError(ClassifierError, ValueError):
     """Raised when input parameters (e.g. run digest or labels) fail validation."""
 
 
@@ -150,212 +157,367 @@ class NormalizedFilePatch:
 # Normalisation & Parsing
 # -----------------------------------------------------------------------------
 
-def normalize_line(line: str) -> str | None:
+PYTHON_SUFFIXES: tuple[str, ...] = (".py", ".pyi")
+
+
+def is_python_path(path: str) -> bool:
+    """True when ``path`` names a Python source file (comment dropping applies)."""
+    return path.endswith(PYTHON_SUFFIXES)
+
+
+def normalize_line(line: str, *, python: bool = True) -> str | None:
     """Normalise a single line from a unified diff.
 
     1. Drop blank lines.
-    2. Drop pure comment lines for Python (`#`).
+    2. Drop pure comment lines (``#``), only when ``python`` is true; for other
+       languages a leading ``#`` is code (``#include``, ``#define``) and is kept.
     3. Strip trailing whitespace.
     4. Collapse runs of spaces and tabs.
     5. Keep everything else exactly.
 
     Returns the normalised line string, or None if the line is dropped.
     """
-    stripped = line.strip()
+    stripped = line.strip(" \t\r\n\f\v")
     if not stripped:
         return None
-    if stripped.startswith("#"):
+    if python and stripped.startswith("#"):
         return None
 
     # Strip trailing whitespace
-    res = line.rstrip(" \t\r\n")
+    res = line.rstrip(" \t\r\n\f\v")
     # Collapse runs of spaces and tabs
-    res = re.sub(r"[ \t]+", " ", res)
+    res = _WS_RUN_RE.sub(" ", res)
     return res
 
 
+_WS_RUN_RE = re.compile(r"[ \t]+")
+
+# Git's C-style quoting of path names (core.quotePath).
+_C_ESCAPES: dict[str, int] = {
+    "a": 0x07, "b": 0x08, "t": 0x09, "n": 0x0A, "v": 0x0B, "f": 0x0C, "r": 0x0D,
+    '"': 0x22, "\\": 0x5C,
+}
+_OCTAL_DIGITS = "01234567"
+
+
+def _unquote_git_path(quoted: str) -> str:
+    """Decode a Git C-quoted path (including the surrounding quotes)."""
+    if len(quoted) < 2 or quoted[0] != '"' or quoted[-1] != '"':
+        raise MalformedDiffError("Malformed quoted path")
+    body = quoted[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\":
+            nxt = body[i + 1] if i + 1 < len(body) else ""
+            if nxt in _C_ESCAPES:
+                out.append(_C_ESCAPES[nxt])
+                i += 2
+            elif nxt and nxt in "0123":
+                digits = body[i + 1:i + 4]
+                if len(digits) != 3 or any(d not in _OCTAL_DIGITS for d in digits):
+                    raise MalformedDiffError("Malformed octal escape in quoted path")
+                out.append(int(digits, 8))
+                i += 4
+            else:
+                raise MalformedDiffError("Malformed escape in quoted path")
+        elif c == '"':
+            raise MalformedDiffError("Unescaped quote in quoted path")
+        else:
+            out.extend(c.encode("utf-8", "surrogatepass"))
+            i += 1
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise MalformedDiffError("Quoted path is not valid UTF-8") from e
+
+
+def _split_quoted_prefix(text: str) -> str:
+    """Return the leading Git-quoted token of ``text`` (quotes included)."""
+    i = 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return text[:i + 1]
+        i += 1
+    raise MalformedDiffError("Unterminated quoted path")
+
+
+def _header_path(rest: str) -> str:
+    """Path named by a ``---``/``+++`` header, without any trailing timestamp."""
+    if rest.startswith('"'):
+        return _unquote_git_path(_split_quoted_prefix(rest))
+    # GNU diff separates the file name from its modification time with a TAB; Git
+    # appends a TAB after names that contain spaces.
+    return rest.split("\t", 1)[0].strip(" ")
+
+
+def _ext_header_path(rest: str) -> str:
+    """Path named by an extended header (``rename to``); no ``a/``/``b/`` prefix."""
+    rest = rest.strip(" ")
+    if rest.startswith('"'):
+        return _unquote_git_path(rest)
+    return rest
+
+
+def _strip_diff_prefix(path: str) -> str:
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def _check_repo_path(path: str) -> str:
+    """Validate a repository-relative path; fail closed on anything else."""
+    path = path.replace("\\", "/")
+    if not path or path.startswith("/"):
+        raise MalformedDiffError("Diff file path must be a non-empty relative path")
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        raise MalformedDiffError("Diff file path has an empty, '.' or '..' component")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
+        raise MalformedDiffError("Diff file path contains control characters")
+    return path
+
+
 def _clean_path(raw_path: str) -> str:
-    """Sanitize and normalize a diff file path."""
-    clean = raw_path.strip().strip('"')
-    if clean.startswith("a/") or clean.startswith("b/"):
-        clean = clean[2:]
-    return clean.replace("\\", "/").strip()
+    """Sanitize and normalize a ``---``/``+++``/``diff --git`` path (prefix removed)."""
+    return _check_repo_path(_strip_diff_prefix(raw_path))
+
+
+class _FileState:
+    """Mutable parser state for one file section of a diff."""
+
+    __slots__ = ("git_path", "minus", "plus", "rename_to", "seen_pair", "hunks", "path",
+                 "python", "added", "removed", "entries")
+
+    def __init__(self, git_path: str | None) -> None:
+        self.git_path = git_path
+        self.minus: str | None = None
+        self.plus: str | None = None
+        self.rename_to: str | None = None
+        self.seen_pair = False
+        self.hunks = 0
+        self.path: str | None = None
+        self.python = False
+        self.added: list[str] = []
+        self.removed: list[str] = []
+        self.entries: list[tuple[int, str]] = []
+
+    def resolve_path(self) -> str:
+        if self.path is None:
+            if self.plus is not None and self.plus != DEV_NULL:
+                self.path = _clean_path(self.plus)
+            elif self.rename_to is not None:
+                self.path = _check_repo_path(self.rename_to)
+            elif self.minus is not None and self.minus != DEV_NULL:
+                self.path = _clean_path(self.minus)
+            elif self.git_path is not None:
+                self.path = _clean_path(self.git_path)
+            else:
+                raise MalformedDiffError("Could not determine file path from diff chunk")
+            self.python = is_python_path(self.path)
+        return self.path
+
+
+DEV_NULL = "/dev/null"
+
+
+def _git_header_fallback(line: str) -> str | None:
+    """Best-effort path from ``diff --git a/X b/X`` (used only without other headers)."""
+    parts = line.split()
+    if len(parts) >= 4 and parts[3].startswith("b/"):
+        return parts[3]
+    if len(parts) >= 3 and parts[2].startswith("a/"):
+        return parts[2]
+    return None
 
 
 def parse_patch(diff_text: str) -> dict[str, NormalizedFilePatch]:
     """Parse unified diff into per-file lists of added and removed lines.
 
     Enforces bounds on input size, line length, hunk count, and file count.
-    Rejects NUL bytes, binary diffs, and malformed structures.
+    Rejects NUL bytes, binary diffs, truncated or overlong hunks (declared line
+    counts must match the body), and malformed structures. File headers and binary
+    markers are recognised only outside hunk bodies.
     """
+    if not isinstance(diff_text, str):
+        raise MalformedDiffError("Diff must be text")
+    if len(diff_text) > MAX_PATCH_BYTES:
+        raise MalformedDiffError(
+            f"Patch size {len(diff_text)} exceeds limit of {MAX_PATCH_BYTES} bytes"
+        )
+    try:
+        diff_size = len(diff_text.encode("utf-8"))
+    except UnicodeEncodeError as e:
+        raise MalformedDiffError("Diff is not encodable as UTF-8") from e
+    if diff_size > MAX_PATCH_BYTES:
+        raise MalformedDiffError(
+            f"Patch size {diff_size} exceeds limit of {MAX_PATCH_BYTES} bytes"
+        )
     if "\x00" in diff_text:
         raise MalformedDiffError("Diff contains NUL byte")
-
-    diff_bytes = diff_text.encode("utf-8")
-    if len(diff_bytes) > MAX_PATCH_BYTES:
-        raise MalformedDiffError(
-            f"Patch size {len(diff_bytes)} exceeds limit of {MAX_PATCH_BYTES} bytes"
-        )
-
-    # Check for binary diff indicators
-    if "GIT binary patch" in diff_text or re.search(r"(?m)^Binary files\s+", diff_text):
-        raise MalformedDiffError("Binary diffs are not supported")
-
-    lines = diff_text.splitlines()
-    for line in lines:
-        if len(line) > MAX_LINE_LENGTH:
-            raise MalformedDiffError(
-                f"Line length {len(line)} exceeds limit of {MAX_LINE_LENGTH} chars"
-            )
 
     # Empty patch produces empty dictionary
     if not diff_text.strip():
         return {}
 
-    # Identify file chunks
-    has_git_diff = bool(re.search(r"(?m)^diff --git\s+", diff_text))
-    has_std_diff = bool(re.search(r"(?m)^---\s+", diff_text) and re.search(r"(?m)^\+\+\+\s+", diff_text))
-
-    if not has_git_diff and not has_std_diff:
-        raise MalformedDiffError("No diff headers found in patch")
-
-    file_chunks: list[list[str]] = []
-    if has_git_diff:
-        starts = [i for i, line in enumerate(lines) if line.startswith("diff --git ")]
-        for idx, start_idx in enumerate(starts):
-            end_idx = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
-            file_chunks.append(lines[start_idx:end_idx])
-    else:
-        # Standard diff: split on '--- ' headers that are followed by '+++ '
-        starts = []
-        for i, line in enumerate(lines):
-            if line.startswith("--- ") and (i + 1 < len(lines) and lines[i + 1].startswith("+++ ")):
-                starts.append(i)
-        if not starts:
-            raise MalformedDiffError("No valid diff headers found in standard diff")
-        for idx, start_idx in enumerate(starts):
-            end_idx = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
-            file_chunks.append(lines[start_idx:end_idx])
-
-    if len(file_chunks) > MAX_FILES:
-        raise MalformedDiffError(
-            f"File count {len(file_chunks)} exceeds limit of {MAX_FILES}"
-        )
+    # Split only at LF record boundaries: U+2028, U+2029 and form feeds are payload.
+    lines = diff_text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
 
     parsed_files: dict[str, NormalizedFilePatch] = {}
+    file_count = 0
     total_hunk_count = 0
+    current: _FileState | None = None
+    old_rem = 0
+    new_rem = 0
+    curr_old = 0
+    curr_new = 0
 
-    for chunk in file_chunks:
-        if not chunk:
-            continue
-
-        # Extract file path from headers
-        path: str | None = None
-        hunk_start_indices: list[int] = []
-
-        # Check for rename/copy headers
-        rename_to = None
-        minus_path = None
-        plus_path = None
-
-        for idx, line in enumerate(chunk):
-            if line.startswith("@@"):
-                hunk_start_indices.append(idx)
-            elif line.startswith("rename to "):
-                rename_to = line[len("rename to "):].strip()
-            elif line.startswith("+++ "):
-                target = line[4:].strip()
-                if not target.startswith("/dev/null"):
-                    plus_path = target
-            elif line.startswith("--- "):
-                target = line[4:].strip()
-                if not target.startswith("/dev/null"):
-                    minus_path = target
-
-        if rename_to:
-            path = _clean_path(rename_to)
-        elif plus_path:
-            path = _clean_path(plus_path)
-        elif minus_path:
-            path = _clean_path(minus_path)
-        elif chunk[0].startswith("diff --git "):
-            parts = chunk[0].split()
-            if len(parts) >= 4 and parts[3].startswith("b/"):
-                path = _clean_path(parts[3])
-            elif len(parts) >= 3 and parts[2].startswith("a/"):
-                path = _clean_path(parts[2])
-
-        if not path:
-            raise MalformedDiffError("Could not determine file path from diff chunk")
-
-        total_hunk_count += len(hunk_start_indices)
-        if total_hunk_count > MAX_HUNKS:
-            raise MalformedDiffError(
-                f"Hunk count exceeds limit of {MAX_HUNKS}"
-            )
-
-        added_lines: list[str] = []
-        removed_lines: list[str] = []
-        added_entries: list[tuple[int, str]] = []
-
-        # Parse hunks
-        for h_i, h_start in enumerate(hunk_start_indices):
-            h_end = hunk_start_indices[h_i + 1] if h_i + 1 < len(hunk_start_indices) else len(chunk)
-            header_line = chunk[h_start]
-            m = HUNK_HEADER_RE.match(header_line)
-            if not m:
-                raise MalformedDiffError(f"Malformed hunk header: {header_line[:60]}")
-
-            old_start = int(m.group(1))
-            new_start = int(m.group(3))
-            curr_old = old_start
-            curr_new = new_start
-
-            for line in chunk[h_start + 1:h_end]:
-                if line.startswith("+"):
-                    raw = line[1:]
-                    norm = normalize_line(raw)
-                    if norm is not None:
-                        added_lines.append(norm)
-                        added_entries.append((curr_new, norm))
-                    curr_new += 1
-                elif line.startswith("-"):
-                    raw = line[1:]
-                    norm = normalize_line(raw)
-                    if norm is not None:
-                        removed_lines.append(norm)
-                    curr_old += 1
-                elif line.startswith(" ") or line == "":
-                    curr_old += 1
-                    curr_new += 1
-                elif line.startswith("\\"):
-                    # e.g. "\ No newline at end of file"
-                    continue
-                else:
-                    raise MalformedDiffError(
-                        f"Malformed line in hunk body: {line[:50]}"
-                    )
-
-        if path in parsed_files:
+    def flush(state: _FileState | None) -> None:
+        if state is None:
+            return
+        path = state.resolve_path()
+        existing = parsed_files.get(path)
+        if existing is not None:
             # Merge if the same file appeared in multiple sections
-            existing = parsed_files[path]
-            existing.added_lines.extend(added_lines)
-            existing.removed_lines.extend(removed_lines)
-            existing.added_line_entries.extend(added_entries)
+            existing.added_lines.extend(state.added)
+            existing.removed_lines.extend(state.removed)
+            existing.added_line_entries.extend(state.entries)
         else:
             parsed_files[path] = NormalizedFilePatch(
                 path=path,
-                added_lines=added_lines,
-                removed_lines=removed_lines,
-                added_line_entries=added_entries,
+                added_lines=state.added,
+                removed_lines=state.removed,
+                added_line_entries=state.entries,
             )
 
+    def new_file(git_path: str | None) -> _FileState:
+        nonlocal file_count
+        file_count += 1
+        if file_count > MAX_FILES:
+            raise MalformedDiffError(f"File count exceeds limit of {MAX_FILES}")
+        return _FileState(git_path)
+
+    i = 0
+    n_lines = len(lines)
+    while i < n_lines:
+        line = lines[i]
+        if line.endswith("\r"):
+            line = line[:-1]
+        lineno = i + 1
+        i += 1
+        if len(line) > MAX_LINE_LENGTH:
+            raise MalformedDiffError(
+                f"Line length {len(line)} exceeds limit of {MAX_LINE_LENGTH} chars"
+            )
+
+        if old_rem > 0 or new_rem > 0:
+            # Inside a hunk body: every line is content, never a header.
+            if current is None:  # unreachable: counts are only set with a file
+                raise MalformedDiffError("Hunk without a file header")
+            if line.startswith("+"):
+                if new_rem <= 0:
+                    raise MalformedDiffError(f"Hunk body longer than declared at line {lineno}")
+                norm = normalize_line(line[1:], python=current.python)
+                if norm is not None:
+                    current.added.append(norm)
+                    current.entries.append((curr_new, norm))
+                curr_new += 1
+                new_rem -= 1
+            elif line.startswith("-"):
+                if old_rem <= 0:
+                    raise MalformedDiffError(f"Hunk body longer than declared at line {lineno}")
+                norm = normalize_line(line[1:], python=current.python)
+                if norm is not None:
+                    current.removed.append(norm)
+                curr_old += 1
+                old_rem -= 1
+            elif line.startswith(" ") or line == "":
+                if old_rem <= 0 or new_rem <= 0:
+                    raise MalformedDiffError(f"Hunk body longer than declared at line {lineno}")
+                curr_old += 1
+                curr_new += 1
+                old_rem -= 1
+                new_rem -= 1
+            elif line.startswith("\\"):
+                # e.g. "\ No newline at end of file"
+                continue
+            else:
+                raise MalformedDiffError(f"Malformed or truncated hunk body at line {lineno}")
+            continue
+
+        # Outside any hunk body.
+        if line.startswith("diff --git "):
+            flush(current)
+            current = new_file(_git_header_fallback(line))
+        elif line.startswith("--- ") and i < n_lines and lines[i].startswith("+++ "):
+            if current is None or current.seen_pair or current.hunks > 0:
+                flush(current)
+                current = new_file(None)
+            plus_line = lines[i]
+            if plus_line.endswith("\r"):
+                plus_line = plus_line[:-1]
+            if len(plus_line) > MAX_LINE_LENGTH:
+                raise MalformedDiffError(
+                    f"Line length {len(plus_line)} exceeds limit of {MAX_LINE_LENGTH} chars"
+                )
+            i += 1
+            current.minus = _header_path(line[4:])
+            current.plus = _header_path(plus_line[4:])
+            current.seen_pair = True
+        elif line.startswith("@@"):
+            if current is None:
+                raise MalformedDiffError(f"Hunk without a file header at line {lineno}")
+            m = HUNK_HEADER_RE.match(line)
+            if not m:
+                raise MalformedDiffError(f"Malformed hunk header at line {lineno}")
+            total_hunk_count += 1
+            if total_hunk_count > MAX_HUNKS:
+                raise MalformedDiffError(f"Hunk count exceeds limit of {MAX_HUNKS}")
+            current.resolve_path()
+            current.hunks += 1
+            old_start = int(m.group(1))
+            old_rem = int(m.group(2)) if m.group(2) is not None else 1
+            new_start = int(m.group(3))
+            new_rem = int(m.group(4)) if m.group(4) is not None else 1
+            if old_rem == 0 and new_rem == 0:
+                raise MalformedDiffError(f"Empty hunk at line {lineno}")
+            if (old_rem > 0 and old_start == 0) or (new_rem > 0 and new_start == 0):
+                raise MalformedDiffError(f"Invalid hunk start at line {lineno}")
+            curr_old = old_start
+            curr_new = new_start
+        elif line.startswith("rename to "):
+            if current is not None:
+                current.rename_to = _ext_header_path(line[len("rename to "):])
+        elif line == "GIT binary patch" or line.startswith("Binary files "):
+            raise MalformedDiffError("Binary diffs are not supported")
+        elif current is not None and line[:1] in ("+", "-", " ") and line != "-- ":
+            # Content-like line outside any hunk: a hunk body longer than its
+            # declared counts, or a stray header. ("-- " is the mail signature.)
+            raise MalformedDiffError(f"Diff line outside any hunk at line {lineno}")
+        # Anything else outside a hunk (extended headers such as "index", mode lines,
+        # mail preamble) carries no added or removed content and is ignored.
+
+    if old_rem > 0 or new_rem > 0:
+        raise MalformedDiffError("Truncated hunk at end of diff")
+    if current is None:
+        raise MalformedDiffError("No diff headers found in patch")
+    flush(current)
     return parsed_files
 
 
 # -----------------------------------------------------------------------------
 # Classifier
 # -----------------------------------------------------------------------------
+
+def _check_param(name: str, value: Any, low: int, high: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
+        raise ValidationError(f"{name} must be an integer in {low}..{high}")
+
 
 def classify(
     agent_patch: str,
@@ -374,6 +536,10 @@ def classify(
     - confidence: integer per-mille
     - evidence: sorted list of EvidenceSpan
     """
+    _check_param("min_line_length", min_line_length, 0, MAX_LINE_LENGTH)
+    _check_param("min_qualifying_lines", min_qualifying_lines, 0, MAX_PATCH_BYTES)
+    _check_param("overlap_threshold_per_mille", overlap_threshold_per_mille, 0, 1000)
+
     agent_parsed = parse_patch(agent_patch)
     gold_parsed = parse_patch(gold_patch)
 
@@ -402,28 +568,26 @@ def classify(
 
     for path, g_file in gold_parsed.items():
         a_file = agent_parsed.get(path)
-        a_entries = a_file.added_line_entries if a_file is not None else []
-        used_agent_indices: set[int] = set()
+        # Index the agent's added lines: normalised text -> queue of line numbers in
+        # patch order. Each gold line consumes the first unused agent occurrence, so
+        # matching stays one-to-one and runs in linear time.
+        available: dict[str, deque[int]] = {}
+        if a_file is not None:
+            for a_line_num, a_norm in a_file.added_line_entries:
+                available.setdefault(a_norm, deque()).append(a_line_num)
 
         for g_line_num, g_norm in g_file.added_line_entries:
             if len(g_norm) < min_line_length:
                 continue
             total_qualifying += 1
 
-            # Check if this qualifying line occurs in agent's added lines for this file
-            match_idx = None
-            for idx, (a_line_num, a_norm) in enumerate(a_entries):
-                if idx not in used_agent_indices and a_norm == g_norm:
-                    match_idx = idx
-                    break
-
-            if match_idx is not None:
-                used_agent_indices.add(match_idx)
+            queue = available.get(g_norm)
+            if queue:
                 matched_qualifying += 1
                 evidence.append(
                     EvidenceSpan(
                         file=path,
-                        agent_line=a_entries[match_idx][0],
+                        agent_line=queue.popleft(),
                         gold_line=g_line_num,
                     )
                 )
@@ -455,6 +619,7 @@ def classify(
         overlap_per_mille=added_line_overlap,
         qualifying_count=total_qualifying,
         min_qualifying_lines=min_qualifying_lines,
+        overlap_threshold_per_mille=overlap_threshold_per_mille,
     )
 
     return Result(
@@ -482,7 +647,9 @@ def run_status_hint(
     otherwise None.
     """
     if label not in ("derived", "retrieved"):
-        raise ValueError(f"Invalid label: {label!r}; expected 'derived' or 'retrieved'")
+        raise ValidationError("Invalid label; expected 'derived' or 'retrieved'")
+    if not isinstance(world_sealed, bool) or not isinstance(gate_says_leak, bool):
+        raise ValidationError("world_sealed and gate_says_leak must be booleans")
 
     classifier_says_leak = (label == "retrieved")
 
@@ -501,9 +668,9 @@ def run_status_hint(
 
 def validate_run_digest(digest: str) -> None:
     """Validate that run digest is 'sha256:' followed by 64 lowercase hex characters."""
-    if not isinstance(digest, str) or not RUN_DIGEST_RE.match(digest):
+    if not isinstance(digest, str) or not RUN_DIGEST_RE.fullmatch(digest):
         raise ValidationError(
-            f"Invalid run_digest: {digest!r}. Must start with 'sha256:' followed by 64 lowercase hex digits."
+            "Invalid run_digest: must be 'sha256:' followed by 64 lowercase hex digits."
         )
 
 
@@ -536,16 +703,20 @@ def build_audit_predicate(
     validate_run_digest(run_digest)
 
     if label_val not in ("derived", "retrieved"):
-        raise ValidationError(f"Invalid label: {label_val!r}")
+        raise ValidationError("Invalid label; expected 'derived' or 'retrieved'")
 
     if isinstance(conf_val, bool) or not isinstance(conf_val, int) or not (0 <= conf_val <= 1000):
         raise ValidationError(f"Invalid confidence: {conf_val!r}. Must be an integer in 0..1000.")
 
+    if not isinstance(ev_val, (list, tuple)):
+        raise ValidationError("Evidence must be a list")
     formatted_spans: list[dict[str, Any]] = []
-    for item in ev_val:
+    for count, item in enumerate(ev_val):
+        if count >= MAX_EVIDENCE_COUNT:
+            raise ValidationError(f"Evidence exceeds limit of {MAX_EVIDENCE_COUNT} spans")
         if isinstance(item, (tuple, list)):
             if len(item) < 3:
-                raise ValidationError(f"Evidence tuple must have 3 elements: {item!r}")
+                raise ValidationError("Evidence tuple must have 3 elements")
             f, a, g = item[0], item[1], item[2]
         elif isinstance(item, dict):
             f = item.get("file")
@@ -557,14 +728,15 @@ def build_audit_predicate(
             g = getattr(item, "gold_line", None)
 
         if f is None or a is None or g is None:
-            raise ValidationError(f"Malformed evidence item: {item!r}")
+            raise ValidationError("Malformed evidence item")
 
-        f_str = str(f)
-        try:
-            a_int = int(a)
-            g_int = int(g)
-        except (ValueError, TypeError) as e:
-            raise ValidationError(f"Evidence line numbers must be integers: {e}") from e
+        if not isinstance(f, str) or not f:
+            raise ValidationError("Evidence file must be a non-empty string")
+        if isinstance(a, bool) or isinstance(g, bool) or not isinstance(a, int) or not isinstance(g, int):
+            raise ValidationError("Evidence line numbers must be integers")
+        f_str = f
+        a_int = a
+        g_int = g
 
         if a_int < 1 or g_int < 1:
             raise ValidationError(f"Evidence line numbers must be >= 1: agent={a_int}, gold={g_int}")
@@ -577,8 +749,6 @@ def build_audit_predicate(
 
     # Sort deterministically by (file, agent_line, gold_line)
     formatted_spans.sort(key=lambda x: (x["file"], x["agent_line"], x["gold_line"]))
-    if len(formatted_spans) > MAX_EVIDENCE_COUNT:
-        formatted_spans = formatted_spans[:MAX_EVIDENCE_COUNT]
 
     return {
         "confidence": conf_val,
@@ -603,39 +773,99 @@ audit_record_payload = build_audit_predicate
 # Safe File I/O
 # -----------------------------------------------------------------------------
 
+MAX_PATH_COMPONENTS: int = 256  # Maximum directory depth walked by safe_read_file
+READ_CHUNK_BYTES: int = 65_536   # Read size per os.read call
+
+_DIR_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                   | getattr(os, "O_CLOEXEC", 0))
+_FILE_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0))
+
+
+def _open_parent_dir(parts: tuple[str, ...]) -> int:
+    """Open the directory chain ``parts`` from ``/`` without following any symlink."""
+    fd = os.open("/", _DIR_OPEN_FLAGS)
+    try:
+        for part in parts:
+            try:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except OSError as e:
+                raise ClassifierError(f"Cannot stat path component: {e.strerror}") from e
+            if stat.S_ISLNK(info.st_mode):
+                raise ClassifierError("Symlinks are rejected in path components")
+            if not stat.S_ISDIR(info.st_mode):
+                raise ClassifierError("Path component is not a directory")
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
+            except OSError as e:
+                raise ClassifierError(f"Cannot open path component: {e.strerror}") from e
+            try:
+                opened = os.fstat(next_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise ClassifierError("Path component swapped during open")
+            except BaseException:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def safe_read_file(path_str: str | Path, *, max_bytes: int = MAX_PATCH_BYTES) -> str:
     """Safely open and read a regular file without following symlinks.
 
     Verifies:
-    - Path exists and is not a symlink (via lstat).
-    - Opens with O_NOFOLLOW | O_NONBLOCK to prevent symlink traversal and FIFO hangs.
-    - fstat confirms opened descriptor is regular and matches lstat dev/inode.
+    - Every directory component is opened relative to its parent with
+      O_NOFOLLOW | O_DIRECTORY, so no symlink anywhere in the path is followed.
+    - The final component is not a symlink (lstat), is a regular file (FIFOs,
+      sockets and devices are refused) and is opened with O_NOFOLLOW | O_NONBLOCK.
+    - fstat confirms the opened descriptor is regular and matches lstat dev/inode.
     - File size and read stream bounded by max_bytes cap.
     - Decodes valid UTF-8 and rejects NUL bytes.
     """
-    path = Path(path_str)
-
-    # 1. lstat verification
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not (0 <= max_bytes <= MAX_PATCH_BYTES):
+        raise ValidationError(f"max_bytes must be an integer in 0..{MAX_PATCH_BYTES}")
     try:
-        lst = os.lstat(path)
-    except OSError as e:
-        raise ClassifierError(f"Cannot stat file {path}: {e}") from e
-
-    if stat.S_ISLNK(lst.st_mode):
-        raise ClassifierError(f"Symlinks are rejected: {path}")
-    if not stat.S_ISREG(lst.st_mode):
+        path = Path(path_str).absolute()
+    except (OSError, TypeError, ValueError) as e:
+        raise ClassifierError("Invalid file path") from e
+    parts = path.parts[1:]
+    if not parts:
         raise ClassifierError(f"Not a regular file: {path}")
-    if lst.st_size > max_bytes:
-        raise ClassifierError(
-            f"File size {lst.st_size} exceeds cap of {max_bytes} bytes: {path}"
-        )
+    if len(parts) > MAX_PATH_COMPONENTS:
+        raise ClassifierError(f"Path has more than {MAX_PATH_COMPONENTS} components")
+    name = parts[-1]
 
-    # 2. Open with O_NOFOLLOW and O_NONBLOCK
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(path, flags)
+        parent_fd = _open_parent_dir(parts[:-1])
     except OSError as e:
-        raise ClassifierError(f"Cannot open file {path}: {e}") from e
+        raise ClassifierError(f"Cannot open parent directory of {path}: {e.strerror}") from e
+    try:
+        # 1. lstat verification
+        try:
+            lst = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as e:
+            raise ClassifierError(f"Cannot stat file {path}: {e.strerror}") from e
+
+        if stat.S_ISLNK(lst.st_mode):
+            raise ClassifierError(f"Symlinks are rejected: {path}")
+        if not stat.S_ISREG(lst.st_mode):
+            raise ClassifierError(f"Not a regular file: {path}")
+        if lst.st_size > max_bytes:
+            raise ClassifierError(
+                f"File size {lst.st_size} exceeds cap of {max_bytes} bytes: {path}"
+            )
+
+        # 2. Open with O_NOFOLLOW and O_NONBLOCK
+        try:
+            fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
+        except OSError as e:
+            raise ClassifierError(f"Cannot open file {path}: {e.strerror}") from e
+    finally:
+        os.close(parent_fd)
 
     try:
         # 3. fstat verification against TOCTOU race
@@ -652,7 +882,7 @@ def safe_read_file(path_str: str | Path, *, max_bytes: int = MAX_PATCH_BYTES) ->
         # 4. Bounded read
         content_bytes = bytearray()
         while len(content_bytes) <= max_bytes:
-            chunk = os.read(fd, min(65536, max_bytes - len(content_bytes) + 1))
+            chunk = os.read(fd, min(READ_CHUNK_BYTES, max_bytes - len(content_bytes) + 1))
             if not chunk:
                 break
             content_bytes.extend(chunk)
@@ -671,5 +901,7 @@ def safe_read_file(path_str: str | Path, *, max_bytes: int = MAX_PATCH_BYTES) ->
             raise MalformedDiffError(f"File contains NUL byte: {path}")
 
         return content_str
+    except OSError as e:
+        raise ClassifierError(f"Cannot read file {path}: {e.strerror}") from e
     finally:
         os.close(fd)

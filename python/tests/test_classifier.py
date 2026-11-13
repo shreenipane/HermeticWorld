@@ -99,7 +99,7 @@ def test_exact_match_reordered_files_and_shifted_hunks():
         "diff --git a/pkg/beta.py b/pkg/beta.py\n"
         "--- a/pkg/beta.py\n"
         "+++ b/pkg/beta.py\n"
-        "@@ -5,1 +5,2 @@\n"
+        "@@ -5,1 +5,1 @@\n"
         "-    pass\n"
         "+    return 42\n"
     )
@@ -138,7 +138,7 @@ def test_whitespace_and_comment_only_differences_still_match():
         "diff --git a/pkg/mod.py b/pkg/mod.py\n"
         "--- a/pkg/mod.py\n"
         "+++ b/pkg/mod.py\n"
-        "@@ -1,3 +1,5 @@\n"
+        "@@ -1,1 +1,4 @@\n"
         " def run():\n"
         "+    # Gold explanation comment\n"
         "+    result = 42\n"
@@ -148,7 +148,7 @@ def test_whitespace_and_comment_only_differences_still_match():
         "diff --git a/pkg/mod.py b/pkg/mod.py\n"
         "--- a/pkg/mod.py\n"
         "+++ b/pkg/mod.py\n"
-        "@@ -1,3 +1,6 @@\n"
+        "@@ -1,1 +1,5 @@\n"
         " def run():\n"
         "+    # Agent wrote a totally different comment\n"
         "+    \n"
@@ -362,11 +362,11 @@ def test_hostile_many_hunks_raises():
     # Generate hunks exceeding MAX_HUNKS (10,000)
     hunk_block = ["diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py"]
     for i in range(10_005):
-        hunk_block.append(f"@@ -{i},1 +{i},1 @@\n+x = {i}")
+        hunk_block.append(f"@@ -{i},0 +{i + 1},1 @@\n+x = {i}")
     massive_diff = "\n".join(hunk_block) + "\n"
 
     with pytest.raises(MalformedDiffError, match="Hunk count exceeds limit"):
-        classify(massive_diff, "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n+x = 1\n")
+        classify(massive_diff, "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -0,0 +1,1 @@\n+x = 1\n")
 
 
 # -----------------------------------------------------------------------------
@@ -379,7 +379,7 @@ def test_determinism_known_answer():
         "diff --git a/pkg/calc.py b/pkg/calc.py\n"
         "--- a/pkg/calc.py\n"
         "+++ b/pkg/calc.py\n"
-        "@@ -10,3 +10,6 @@\n"
+        "@@ -10,1 +10,4 @@\n"
         " def solve():\n"
         "+    init_state = True\n"
         "+    accumulate = 100\n"
@@ -389,7 +389,7 @@ def test_determinism_known_answer():
         "diff --git a/pkg/calc.py b/pkg/calc.py\n"
         "--- a/pkg/calc.py\n"
         "+++ b/pkg/calc.py\n"
-        "@@ -10,3 +10,6 @@\n"
+        "@@ -10,1 +10,4 @@\n"
         " def solve():\n"
         "+    init_state = True\n"
         "+    accumulate = 100\n"
@@ -562,7 +562,7 @@ def test_cli_success(tmp_path: Path, capsys: pytest.CaptureFixture):
         "diff --git a/pkg/mod.py b/pkg/mod.py\n"
         "--- a/pkg/mod.py\n"
         "+++ b/pkg/mod.py\n"
-        "@@ -1,2 +1,3 @@\n"
+        "@@ -1,1 +1,2 @@\n"
         " def foo():\n"
         "+    return 42\n"
     )
@@ -674,7 +674,7 @@ def test_parse_patch_standard_diff():
     standard_diff = (
         "--- a/simple.py\n"
         "+++ b/simple.py\n"
-        "@@ -1,2 +1,3 @@\n"
+        "@@ -1,1 +1,2 @@\n"
         " def foo():\n"
         "+    return 999\n"
     )
@@ -747,3 +747,363 @@ def test_subprocess_cli_module_execution(tmp_path: Path):
     assert "status_hint: None" in proc.stdout
     assert VALID_DIGEST in proc.stdout
 
+
+
+# -----------------------------------------------------------------------------
+# 16. Regression tests from review
+# -----------------------------------------------------------------------------
+
+def _git_file(path: str, body: list[str], header: str) -> str:
+    return "\n".join([f"diff --git a/{path} b/{path}", f"--- a/{path}", f"+++ b/{path}", header, *body]) + "\n"
+
+
+def test_run_digest_rejects_trailing_newline():
+    """'$' would accept a trailing newline; the digest must match the whole string."""
+    with pytest.raises(ValidationError, match="Invalid run_digest"):
+        validate_run_digest(VALID_DIGEST + "\n")
+    with pytest.raises(ValidationError):
+        build_audit_predicate(VALID_DIGEST + "\n", label="derived", confidence=900)
+
+
+def test_rename_to_keeps_real_directory_prefix():
+    """'rename to' paths carry no a/ b/ prefix; a real 'b/' directory must be kept."""
+    pure_rename = (
+        "diff --git a/old.py b/b/mod.py\n"
+        "similarity index 100%\n"
+        "rename from old.py\n"
+        "rename to b/mod.py\n"
+    )
+    assert list(parse_patch(pure_rename)) == ["b/mod.py"]
+
+    rename_with_hunk = (
+        "diff --git a/old.py b/b/mod.py\n"
+        "similarity index 90%\n"
+        "rename from old.py\n"
+        "rename to b/mod.py\n"
+        "--- a/old.py\n"
+        "+++ b/b/mod.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-value_before = 1\n"
+        "+value_after = 2\n"
+    )
+    modify = _git_file("b/mod.py", ["-value_before = 1", "+value_after = 2"], "@@ -1,1 +1,1 @@")
+    assert list(parse_patch(rename_with_hunk)) == ["b/mod.py"]
+    assert classify(rename_with_hunk, modify).exact_match is True
+
+
+def test_overlap_matching_is_linear_in_duplicate_lines():
+    """Many identical qualifying lines must not trigger quadratic matching."""
+    import time
+
+    count = 40_000
+    body = [f"+repeated_value = 1" for _ in range(count)]
+    diff = _git_file("pkg/mod.py", body, f"@@ -0,0 +1,{count} @@")
+    started = time.monotonic()
+    result = classify(diff, diff)
+    elapsed = time.monotonic() - started
+    assert result.added_line_overlap == 1000
+    assert len(result.evidence) == 1000  # MAX_EVIDENCE_COUNT
+    # One-to-one matching in order: agent line i pairs with gold line i.
+    assert all(span.agent_line == span.gold_line for span in result.evidence)
+    assert elapsed < 15.0
+
+
+def test_git_quoted_path_escapes_are_decoded():
+    """core.quotePath output must resolve to the same key as the raw UTF-8 name."""
+    quoted = (
+        'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+        '--- "a/caf\\303\\251.py"\n'
+        '+++ "b/caf\\303\\251.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+menu_item = 'espresso'\n"
+    )
+    raw = _git_file("café.py", ["+menu_item = 'espresso'"], "@@ -0,0 +1,1 @@")
+    assert list(parse_patch(quoted)) == ["café.py"]
+    assert classify(quoted, raw).exact_match is True
+
+    bad_escape = quoted.replace("\\303\\251", "\\9")
+    with pytest.raises(MalformedDiffError):
+        parse_patch(bad_escape)
+
+
+def test_hunk_counts_must_match_body():
+    """Truncated or overlong hunks (declared counts vs body) raise the typed error."""
+    truncated = _git_file("a.py", ["+only_one_line = 1"], "@@ -0,0 +1,5 @@")
+    with pytest.raises(MalformedDiffError, match="Truncated hunk"):
+        parse_patch(truncated)
+
+    truncated_mid = _git_file("a.py", ["+only_one_line = 1"], "@@ -0,0 +1,5 @@") + _git_file(
+        "b.py", ["+x_value = 2"], "@@ -0,0 +1,1 @@"
+    )
+    with pytest.raises(MalformedDiffError):
+        parse_patch(truncated_mid)
+
+    too_long = _git_file("a.py", ["-old_value = 0", "+new_value = 1", "+extra_value = 2"], "@@ -1,1 +1,1 @@")
+    with pytest.raises(MalformedDiffError):
+        parse_patch(too_long)
+
+    with pytest.raises(MalformedDiffError, match="Empty hunk"):
+        parse_patch(_git_file("a.py", [], "@@ -1,0 +1,0 @@"))
+
+
+def test_header_like_content_inside_hunk_is_content():
+    """Added '++ x' / removed '-- y' lines are hunk content, never file headers."""
+    git_diff = _git_file("pkg/mod.py", ["+++ counter_value", "+other_line = 2"], "@@ -0,0 +1,2 @@")
+    parsed = parse_patch(git_diff)
+    assert list(parsed) == ["pkg/mod.py"]
+    assert parsed["pkg/mod.py"].added_lines == ["++ counter_value", "other_line = 2"]
+
+    std_diff = (
+        "--- a/doc.txt\n"
+        "+++ b/doc.txt\n"
+        "@@ -1,2 +1,2 @@\n"
+        "--- old heading text\n"
+        "+++ new heading text\n"
+        " context line\n"
+    )
+    parsed_std = parse_patch(std_diff)
+    assert list(parsed_std) == ["doc.txt"]
+    assert parsed_std["doc.txt"].removed_lines == ["-- old heading text"]
+    assert parsed_std["doc.txt"].added_lines == ["++ new heading text"]
+
+
+def test_unicode_line_separators_are_payload():
+    """U+2028, U+2029 and form feed inside a line do not split diff records."""
+    diff = _git_file("pkg/mod.py", ["+text_value = 'a b c\x0cd'"], "@@ -0,0 +1,1 @@")
+    parsed = parse_patch(diff)
+    assert parsed["pkg/mod.py"].added_lines == ["text_value = 'a b c\x0cd'"]
+
+
+def test_audit_evidence_rejects_non_integral_line_numbers():
+    """Fractional, boolean or string line numbers are rejected, not truncated."""
+    for bad in (7.9, 7.0, True, "7"):
+        with pytest.raises(ValidationError, match="integers"):
+            build_audit_predicate(
+                VALID_DIGEST, label="derived", confidence=900,
+                evidence=[{"file": "a.py", "agent_line": bad, "gold_line": 1}],
+            )
+    with pytest.raises(ValidationError):
+        build_audit_predicate(
+            VALID_DIGEST, label="derived", confidence=900,
+            evidence=[{"file": 5, "agent_line": 1, "gold_line": 1}],
+        )
+
+
+def test_binary_marker_text_inside_hunk_is_not_binary():
+    """Marker text added as content does not make a text diff binary."""
+    diff = _git_file(
+        "pkg/mod.py",
+        ['+message = "GIT binary patch"', "+GIT binary patch", "+Binary files a and b differ"],
+        "@@ -0,0 +1,3 @@",
+    )
+    parsed = parse_patch(diff)
+    assert len(parsed["pkg/mod.py"].added_lines) == 3
+
+
+def test_standard_diff_timestamps_are_not_part_of_path():
+    """GNU diff header timestamps (after a TAB) are separated from the file name."""
+    with_ts = (
+        "--- a/simple.py\t2026-11-01 12:00:00.000000000 +0000\n"
+        "+++ b/simple.py\t2026-11-02 08:30:00.000000000 +0000\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+return_value = 999\n"
+    )
+    other_ts = with_ts.replace("2026-11-02 08:30", "2025-01-01 00:00")
+    assert list(parse_patch(with_ts)) == ["simple.py"]
+    assert classify(other_ts, with_ts).exact_match is True
+
+
+def test_hash_lines_are_code_outside_python_files():
+    """Comment dropping applies to Python only; '#include' in C is code."""
+    gold = _git_file("src/main.c", ["+#include <alpha_header.h>"], "@@ -0,0 +1,1 @@")
+    agent = _git_file("src/main.c", ["+#include <bravo_header.h>"], "@@ -0,0 +1,1 @@")
+    assert classify(agent, gold).exact_match is False
+    assert parse_patch(gold)["src/main.c"].added_lines == ["#include <alpha_header.h>"]
+    # Python comments are still dropped.
+    py = _git_file("src/main.py", ["+# just a comment"], "@@ -0,0 +1,1 @@")
+    assert parse_patch(py)["src/main.py"].added_lines == []
+    assert normalize_line("#include <x.h>", python=False) == "#include <x.h>"
+
+
+def test_hostile_inputs_raise_typed_error_only():
+    """Huge hunk numbers, unencodable text and non-text inputs give MalformedDiffError."""
+    ok = make_diff("a.py", [], ["x_value = 1"])
+    huge = _git_file("a.py", ["+x_value = 1"], "@@ -" + "9" * 5000 + " +1 @@")
+    with pytest.raises(MalformedDiffError):
+        classify(huge, ok)
+    with pytest.raises(MalformedDiffError):
+        classify("diff --git a/a b/a\n\ud800\n", ok)
+    with pytest.raises(MalformedDiffError):
+        classify(b"diff --git a/a b/a\n", ok)  # type: ignore[arg-type]
+    with pytest.raises(MalformedDiffError):
+        classify(None, ok)  # type: ignore[arg-type]
+    with pytest.raises(MalformedDiffError, match="Hunk without a file header"):
+        parse_patch("@@ -0,0 +1,1 @@\n+x_value = 1\n--- a/a.py\n+++ b/a.py\n")
+    with pytest.raises(MalformedDiffError, match="Invalid hunk start"):
+        parse_patch(_git_file("a.py", ["+x_value = 1"], "@@ -0,0 +0,1 @@"))
+
+
+def test_hostile_100000_hunks_raise():
+    """The brief's 100000-hunk diff raises the typed error."""
+    parts = ["diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py"]
+    for i in range(100_000):
+        parts.append(f"@@ -{i},0 +{i + 1},1 @@")
+        parts.append("+x")
+    with pytest.raises(MalformedDiffError, match="Hunk count exceeds limit"):
+        parse_patch("\n".join(parts) + "\n")
+
+
+def test_hostile_file_count_raises():
+    """More than MAX_FILES file sections raise the typed error."""
+    diff = "".join(_git_file(f"f{i}.py", ["+x_value = 1"], "@@ -0,0 +1,1 @@") for i in range(1_001))
+    with pytest.raises(MalformedDiffError, match="File count"):
+        parse_patch(diff)
+
+
+def test_absolute_and_traversal_paths_rejected():
+    """Absolute or '..' file paths (possible host paths) fail closed."""
+    for target in ("/home/someone/repo/x.py", "b/../../etc/passwd"):
+        diff = f"--- a/x.py\n+++ {target}\n@@ -0,0 +1,1 @@\n+x_value = 1\n"
+        with pytest.raises(MalformedDiffError, match="path"):
+            parse_patch(diff)
+
+
+def test_parse_errors_do_not_echo_patch_content():
+    """Error messages name line numbers, never gold or agent patch text."""
+    secret = "SECRET_GOLD_TOKEN_42"
+    bodies = [
+        _git_file("a.py", [secret], "@@ -0,0 +1,1 @@"),
+        _git_file("a.py", ["+x"], f"@@ bogus {secret} @@"),
+    ]
+    for diff in bodies:
+        with pytest.raises(MalformedDiffError) as info:
+            parse_patch(diff)
+        assert secret not in str(info.value)
+
+
+def test_status_hint_rejects_non_boolean_flags():
+    """Truthy strings must not be mistaken for booleans."""
+    with pytest.raises(ValidationError):
+        run_status_hint("derived", "false", False)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        run_status_hint("retrieved", False, 1)  # type: ignore[arg-type]
+
+
+def test_classify_rejects_invalid_parameters():
+    """Thresholds and minima are validated integers in range."""
+    ok = make_diff("a.py", [], ["x_value = 1"])
+    for kwargs in (
+        {"overlap_threshold_per_mille": 1001},
+        {"overlap_threshold_per_mille": -1},
+        {"overlap_threshold_per_mille": True},
+        {"overlap_threshold_per_mille": 0.8},
+        {"min_line_length": -1},
+        {"min_qualifying_lines": -1},
+    ):
+        with pytest.raises(ValidationError):
+            classify(ok, ok, **kwargs)
+
+
+def test_tiny_gold_confidence_follows_configured_threshold():
+    """The tiny-gold confidence row applies at or above the configured threshold."""
+    assert compute_confidence(False, False, 850, 2, 5, overlap_threshold_per_mille=900) == 700
+    gold_lines = [f"tiny_patch_line_{i} = {i}" for i in range(4)]
+    agent_lines = gold_lines[:3] + ["something_else_entirely = 9"]
+    gold = make_diff("pkg/mod.py", [], gold_lines)
+    agent = make_diff("pkg/mod.py", [], agent_lines)
+    result = classify(agent, gold, overlap_threshold_per_mille=700)
+    assert result.added_line_overlap == 750
+    assert result.label == "derived"
+    assert result.confidence == 600
+
+
+def test_audit_evidence_count_is_bounded():
+    """More than MAX_EVIDENCE_COUNT evidence spans are refused by the payload builder."""
+    spans = [{"file": "a.py", "agent_line": i + 1, "gold_line": i + 1} for i in range(1_001)]
+    with pytest.raises(ValidationError, match="limit"):
+        build_audit_predicate(VALID_DIGEST, label="retrieved", confidence=900, evidence=spans)
+
+
+def test_audit_predicate_known_answer_bytes():
+    """Fixed input gives fixed JSON bytes (sorted keys, sorted spans, no floats)."""
+    agent = (
+        "diff --git a/z.py b/z.py\n--- a/z.py\n+++ b/z.py\n@@ -0,0 +1,1 @@\n+zulu_value = 26\n"
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -3,0 +4,2 @@\n+alpha_value = 1\n+bravo_value = 2\n"
+    )
+    gold = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -0,0 +1,2 @@\n+bravo_value = 2\n+alpha_value = 1\n"
+        "diff --git a/z.py b/z.py\n--- a/z.py\n+++ b/z.py\n@@ -0,0 +1,1 @@\n+zulu_value = 26\n"
+    )
+    result = classify(agent, gold)
+    predicate = build_audit_predicate("sha256:" + "0123456789abcdef" * 4, result)
+    assert audit_predicate_to_json(predicate, indent=None) == (
+        '{"confidence":600,"evidence_spans":['
+        '{"agent_line":4,"file":"a.py","gold_line":2},'
+        '{"agent_line":5,"file":"a.py","gold_line":1},'
+        '{"agent_line":1,"file":"z.py","gold_line":1}],'
+        '"label":"derived",'
+        '"run_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}'
+    )
+
+
+def test_safe_read_file_rejects_symlinked_parent_directory(tmp_path: Path):
+    """No symlink anywhere in the path is followed, not only the last component."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "p.diff").write_text("x", encoding="utf-8")
+    link_dir = tmp_path / "linkdir"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+    with pytest.raises(ClassifierError, match="Symlinks are rejected"):
+        safe_read_file(link_dir / "p.diff")
+
+
+def test_safe_read_file_rejects_fifo_and_device(tmp_path: Path):
+    """FIFOs and character devices are refused without blocking."""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(ClassifierError, match="Not a regular file"):
+        safe_read_file(fifo)
+    with pytest.raises(ClassifierError, match="Not a regular file"):
+        safe_read_file("/dev/null")
+
+
+def test_safe_read_file_detects_swap_between_lstat_and_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A file replaced between lstat and open is refused (dev/ino check)."""
+    import hermetic_classifier.baseline as baseline
+
+    target = tmp_path / "p.diff"
+    target.write_text("original", encoding="utf-8")
+    other = tmp_path / "other.diff"
+    other.write_text("swapped", encoding="utf-8")
+    real_open = os.open
+
+    def swapping_open(path, flags, *args, **kwargs):
+        if str(path).endswith("p.diff"):
+            os.replace(other, target)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(baseline.os, "open", swapping_open)
+    with pytest.raises(ClassifierError, match="swapped"):
+        safe_read_file(target)
+
+
+def test_safe_read_file_rejects_invalid_utf8_and_nul(tmp_path: Path):
+    """Undecodable or NUL-containing files raise the typed error."""
+    bad = tmp_path / "bad.diff"
+    bad.write_bytes(b"\xff\xfe")
+    with pytest.raises(MalformedDiffError, match="UTF-8"):
+        safe_read_file(bad)
+    nul = tmp_path / "nul.diff"
+    nul.write_bytes(b"a\x00b")
+    with pytest.raises(MalformedDiffError, match="NUL"):
+        safe_read_file(nul)
+
+
+def test_cli_rejects_fifo_and_trailing_newline_digest(tmp_path: Path):
+    """CLI exits 1 on a FIFO patch path and on a digest with a trailing newline."""
+    gold = tmp_path / "gold.patch"
+    gold.write_text(make_diff("a.py", [], ["x_value = 1"]), encoding="utf-8")
+    fifo = tmp_path / "agent.fifo"
+    os.mkfifo(fifo)
+    assert main(["--agent-patch", str(fifo), "--gold-patch", str(gold), "--run-digest", VALID_DIGEST]) == 1
+    assert main(["--agent-patch", str(gold), "--gold-patch", str(gold), "--run-digest", VALID_DIGEST + "\n"]) == 1
