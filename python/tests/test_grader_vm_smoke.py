@@ -40,7 +40,8 @@ def smoke_environment(tmp_path):
     (package / "__init__.py").touch()
     (package / "rootfs.py").write_text(
         "def build_rootfs(tree, image, **kwargs):\n"
-        "    image.write_bytes(b'fixture image')\n"
+        "    import os\n"
+        "    image.write_bytes((tree / 'etc/hermetic/grader/run.json').read_bytes() + (tree / 'work/repo/calc.py').read_bytes() + (tree / 'usr/local/lib/python3.12/site-packages/hermetic_run_probe.py').read_bytes() + (image.parent.parent.name.encode() if os.environ.get('FIXTURE_IMAGE_LEAK') else b''))\n"
         "    image.with_suffix('.run.json').write_bytes((tree / 'etc/hermetic/grader/run.json').read_bytes())\n"
         "    image.with_suffix('.calc.py').write_bytes((tree / 'work/repo/calc.py').read_bytes())\n"
         "    return {'d4': 'pass'}\n"
@@ -102,7 +103,11 @@ def smoke_environment(tmp_path):
         f"    verdict.write_text({verdict_script!r})\n"
         "    verdict.chmod(0o700)\n"
         "elif '--no-run' not in sys.argv:\n"
-        "    Path(os.environ['HERMETIC_GRADER_RESULT_OUT']).write_bytes(bytes(1048576))\n"
+        "    label = os.environ['HERMETIC_GRADER_RUN']\n"
+        "    assert label in ('R0', 'R1', 'R2')\n"
+        "    result = Path(os.environ['HERMETIC_GRADER_RESULT_OUT'])\n"
+        "    result.with_suffix('.label').write_text(label)\n"
+        "    result.write_bytes(bytes(1048576))\n"
         "    code = int(os.environ['FIXTURE_VM_EXIT'])\n"
         "    print('test result: FAILED' if code else 'test result: ok')\n"
         "    sys.exit(code)\n",
@@ -157,8 +162,9 @@ def test_vm_configs_apply_the_sealed_runner_without_a_shell_bridge(tmp_path, smo
                                       "-p", "no:cacheprovider", "-q",
                                       "tests/test_calc.py::test_add", "tests/test_calc.py::test_double"]
             assert config["env"] == {}
-            assert config["sandbox"] == {"t_clock": 1700000000, "required_pytest_plugins": []}
-            assert config["run"] == run
+            assert config["sandbox"] == {"t_clock": 1700000000, "required_pytest_plugins": ["hermetic_run_probe"]}
+            assert "run" not in config and "run_name" not in config
+            assert (work / variant / "host" / f"{run}.label").read_text() == run
 
 
 def test_full_smoke_keeps_validated_extraction_and_uses_vm_clock(tmp_path, smoke_environment):
@@ -184,3 +190,28 @@ def test_boot_notes_describe_the_booted_grader_and_current_fd_transport():
     assert "There is no grader-mode PID 1" not in notes
     assert "dedicated fd 3" in notes
     assert "bash scripts/integration/grader-vm-smoke.sh" in notes
+
+
+def test_all_run_images_hash_equal_and_contain_no_run_label(tmp_path, smoke_environment):
+    import hashlib
+    work = tmp_path / "work"
+    result = subprocess.run(["bash", str(SCRIPT), str(work)], env=smoke_environment,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for variant in ("empty", "gold"):
+        images = [(work / variant / run / "img/grader.img").read_bytes()
+                  for run in ("R0", "R1", "R2")]
+        assert len({hashlib.sha256(image).hexdigest() for image in images}) == 1
+        recorded = (work / variant / "host/image-sha256.txt").read_text().splitlines()
+        assert len(recorded) == 3
+        assert {line.split()[0] for line in recorded} == {hashlib.sha256(images[0]).hexdigest()}
+        assert b'"run":' not in images[0] and b'"run_name":' not in images[0]
+
+
+def test_image_difference_fails_before_any_vm_boot(tmp_path, smoke_environment):
+    smoke_environment["FIXTURE_IMAGE_LEAK"] = "1"
+    work = tmp_path / "work"
+    result = subprocess.run(["bash", str(SCRIPT), str(work)], env=smoke_environment,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not list(work.glob("*/host/*.img"))

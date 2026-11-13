@@ -149,7 +149,8 @@ Fixture task: `scripts/integration/fixtures/grader-task/`.
 For each variant the script applies the patch to a fixture work tree, emits a
 HEXT v1 stream with `hermetic-extract-agent`, and publishes the validated result
 with `hermetic-extract-validate`. It then passes those published trees to
-`grader-vm-smoke.sh`, which builds and boots one image per run. This preserves the
+`grader-vm-smoke.sh`, which builds and boots byte-identical images for the three
+runs of each variant. This preserves the
 full extraction, grading and host verdict checks. A supplied work directory must
 be fresh; symlinks are refused before any chmod.
 
@@ -185,18 +186,54 @@ smoke entry points now use the VM, whose initializer sets the sealed clock.
 Command, from the worktree root:
 
 ```
-scripts/integration/grader-vm-smoke.sh /tmp/hermetic-grader-vm-smoke
+bash scripts/integration/grader-vm-smoke.sh /tmp/hermetic-grader-vm-smoke
 ```
 
 For each variant (empty, gold) and each run (R0, R1, R2), the script:
 
-1. Builds the grader tree from the "Grader smoke" section. The patch is applied on the host. The tree adds static `/sbin/hermetic-grader-init` and has one fixed config, `/etc/hermetic/grader/run.json`. Every run gets its own D4-checked image, and the kernel command line is the same for all of them.
+1. Builds the grader tree from the "Grader smoke" section. The patch is applied on the host. The tree adds static `/sbin/hermetic-grader-init` and has one fixed config, `/etc/hermetic/grader/run.json`, with no run label. Every run gets its own D4-checked image. Before any boot, the script compares all three images byte for byte and records their equal SHA-256 hashes in `<variant>/host/image-sha256.txt`. The kernel command line is also identical.
 2. Boots the image with hermetic-vmm's `dev-unjailed` runner through `tests/guest.rs::boots_grader_and_collects_result_drive`.
    - Firecracker 1.18.0, kernel `kernel-out-20261113-6.6b`.
    - Boot arguments: `init=/sbin/hermetic-grader-init`, `hermetic.t=1700000000`, `reboot=k panic=-1`.
-   - Drives: root `vda` read-only, then `result` `vdb`, which is writable and exactly 1 MiB. No vsock and no network.
+   - Drives: root `vda` read-only, then `result` `vdb`, which is writable and exactly 1 MiB. No vsock and no network. The host test reads `HERMETIC_GRADER_RUN` and initializes only the result drive with HGRL v1 boot input: bytes `48 47 52 4c 00 01`, two ASCII run bytes (`R0` through `R3`), then zero padding through byte 1,048,575. It does not forward that host environment variable into the guest.
 3. Waits for the VM to exit (`Vmm::wait_exit`) and checks the serial line `grader-init SECONDS clock` against `hermetic.t`. It then copies the jail's result drive out.
 4. Runs `hermetic-grader-verdict` over R0/R1/R2.
+
+The supervisor validates the entire fixed-size HGRL image before spawning tests.
+Missing, malformed, oversized or nonzero-padded input fails closed. `run` and
+`run_name` in the image config are rejected. The label stays in supervisor memory;
+it never enters helper input, argv, environment, cmdline or a rootfs file. No
+per-run nonce is used. After the process tree exits, the supervisor overwrites
+the result drive with the usual HGRD output; the host verdict validates its label.
+
+The sandbox has a fresh proc mount in its own PID namespace and a non-recursive
+root bind, minimal `/dev`, no inherited result descriptor, no administrative or
+MKNOD capabilities, and block-device denial. Thus tests cannot access `/dev/vdb`
+or supervisor memory, file descriptors, argv or environment. The mandatory smoke
+plugin `hermetic_run_probe` asserts the label-free config, cmdline, argv and
+environment, PID isolation, absent block devices, and exactly the three null
+stdio descriptors plus the write-only record pipe. It runs on plugin import,
+before pytest capture and repository imports, and a probe failure fails the
+host verdict.
+
+Offline regressions: `tests/run_label.rs` in hermetic-grader-supervisor checks
+strict transport, safe opens, label-free sandbox input and correct output labels;
+`test_all_run_images_hash_equal_and_contain_no_run_label` and
+`test_image_difference_fails_before_any_vm_boot` execute the shell harness with
+offline builders. Existing test fixtures now place labels on result drives
+instead of in configs; their original behavior assertions are retained.
+
+For the real six-boot check on the prepared KVM host, from this worktree root,
+use a fresh output directory:
+
+```sh
+bash scripts/integration/grader-vm-smoke.sh /tmp/hermetic-run-label-check
+sha256sum /tmp/hermetic-run-label-check/{empty,gold}/R{0,1,2}/img/grader.img
+```
+
+The three hashes within each variant must match. This also executes the sandbox
+probe in all six VMs and requires the empty/gold verdicts below. These VM checks
+cannot run in the review sandbox because `/dev/kvm` is unavailable.
 
 The interrupted implementation recorded the following result. The current review
 environment has no `/dev/kvm`, so these six boots have not been independently

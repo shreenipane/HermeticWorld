@@ -259,6 +259,32 @@ fn grader_clock_line_is_strict() {
         assert_eq!(grader_clock_line(bad), None);
     }
 }
+/// Host-only HGRL v1 input, identical layout/size for every run. Never placed in
+/// boot arguments, VM identity, rootfs or any sandbox-visible descriptor.
+fn grader_run_input(run: &str) -> Option<Vec<u8>> {
+    if !matches!(run, "R0" | "R1" | "R2" | "R3") {
+        return None;
+    }
+    let mut image = b"HGRL\0\x01".to_vec();
+    image.extend_from_slice(run.as_bytes());
+    image.resize(1024 * 1024, 0);
+    Some(image)
+}
+
+#[test]
+fn grader_run_input_known_answer_and_strict_labels() {
+    for run in ["R0", "R1", "R2", "R3"] {
+        let image = grader_run_input(run).unwrap();
+        assert_eq!(image.len() as u64, hermetic_vmm::spec::GRADER_RESULT_BYTES);
+        assert_eq!(&image[..6], b"HGRL\0\x01");
+        assert_eq!(&image[6..8], run.as_bytes());
+        assert!(image[8..].iter().all(|b| *b == 0));
+    }
+    for bad in ["", "R4", "r0", "R0\n", "R0 secret", "R0\0"] {
+        assert!(grader_run_input(bad).is_none());
+    }
+}
+
 /// Boots a grader image with `init=/sbin/hermetic-grader-init` (no vsock, no
 /// network), waits for the guest to power off, checks the guest clock line and
 /// copies the 1 MiB result drive to HERMETIC_GRADER_RESULT_OUT for the host verdict.
@@ -283,6 +309,9 @@ fn boots_grader_and_collects_result_drive() {
             }
         }
         let mut f = support::Fixture::grader();
+        let run = std::env::var("HERMETIC_GRADER_RUN").expect("set HERMETIC_GRADER_RUN");
+        let input = grader_run_input(&run).expect("invalid grader run label");
+        std::fs::write(&f.spec.drives[0].path, input).unwrap();
         f.spec.jail.firecracker = vars[0].clone();
         f.spec.kernel_image = vars[1].clone();
         f.spec.root_drive.path = vars[2].clone();
