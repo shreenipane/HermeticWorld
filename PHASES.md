@@ -13,7 +13,7 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 | 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | In progress |
 | 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
 | 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
-| 3b | Clock hiding | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Not started |
+| 3b | Clock hiding | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Source audit/proposal; nested tests open |
 | 4 | Extensions | Linux x86 + KVM | E2 Track B; E5 | Not started |
 
 ```
@@ -219,21 +219,37 @@ The oracle passes on every slice task, and one agent run is graded.
 
 ## Phase 3b: Clock hiding
 
-**Goal.** Reach `clock: hidden`, or prove it can't be done here and ship `faked`.
+**Goal.** Reach `clock: hidden`, or record the remaining channels and ship `faked`.
 
-### Deliverables
-- [ ] Compile and apply `firecracker-enforce-pv-cpuid.patch`; confirm #GP on the masked MSRs
-- [ ] Apply the `hide-kvmclock.cpu-template.json` CPU template
-- [ ] Block the clock-pairing hypercall on the host. Try in order:
-  1. a non-TSC host clocksource (`hpet` / `acpi_pm`)
-  2. Xen hypercall interception (a second patch plus `CONFIG_KVM_XEN`)
-  3. a host kernel patch (only on hardware you control)
-- [ ] Check TSC stability without kvmclock
-- [ ] Add the eighth check to `clock-leak-probe.md`: the hypercall from a guest kernel module
-- [ ] Run the probe, plus a control run on unpatched Firecracker
+- [x] Import and audit the clock analysis against Linux 6.6.160 and Firecracker
+  v1.18.0; [source evidence and corrected claims](docs/clock-3b-analysis.md).
+- [x] Add the std-only, read-only `hermetic-clockprobe` workspace crate with
+  bounded descriptor-based inspection and offline classification/regression fixtures.
+  `unavailable` is incomplete coverage, even with exit 0.
+- [x] Keep the kernel/CPU proposals separate in `images/kernel/clock-3b.config`
+  and `vmm/clock-3b.cpu-template.json`; active settings are unchanged.
+- [x] Document the exact [execd baseline command and nested test matrix](docs/clock-3b-config-and-test-plan.md).
+- [ ] Manager: run today's AgentVM baseline and the nested kernel/VMM tests.
+- [ ] Close root clock channels: CPUID clearing alone does not deny the wall/system
+  MSRs with stock Firecracker. Per-vCPU PV enforcement gates these MSRs, but in
+  the inspected KVM it does **not** gate CLOCK_PAIRING. Hypercall 9 rejects CPL3
+  and exposes real UTC to a CPL0 caller when the host clocksource supports it.
+  EXIT_HYPERCALL cannot filter number 9 in this kernel. Host/VMM denial and the
+  proposed guest restriction policy require an owner decision and runtime tests.
+- [ ] Resolve CPU identity: stock Firecracker normalization restores host vendor
+  and overwrites Intel brand modifiers, potentially retaining a host frequency.
+  Full cutoff-specific CPUID normalization is not established by the proposal.
+- [ ] Resolve reported PIT/TSC boot stall: `tsc=reliable` supplies no frequency;
+  zeroing .15/.16 can remove calibration routes. Test accurate `tsc_early_khz`
+  (frequency exposed, so `faked`); a fixed hidden rate needs actual KVM TSC scaling
+  and consistent calibration, not an invented number. Firecracker does create a PIT.
+- [ ] Complete safe CLOCK_TAI/absolute CLOCK_MONOTONIC/RTC ioctl sampling; the
+  std-only and CPUID/RDTSC-only unsafe constraints need a wrapper/design decision.
+- [ ] Decide residual timing/identity risks; validate device ABIs, payloads,
+  images, boot/serial strings, all vCPUs and snapshot history before `hidden`.
 
-### Exit
-The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`.
+**Exit.** Retain `clock: faked` until the missing denial tests and complete
+channel coverage pass. This source audit and diagnostic do not attest `hidden`.
 
 ---
 
