@@ -1,31 +1,33 @@
 # Shared x86_64 guest kernel
 
 This is the T3.2 offline build harness for TR-VMM-4 and the guest side of
-TR-VMM-5. The candidate source is Linux **6.1.128**: the 6.1 long-term series is
-supported by Firecracker's x86_64 microVM platform. This selects an explicit
+TR-VMM-5. The candidate source is Linux **6.6.160** (6.6 long-term series, released
+2026-10-21; the newest 6.6.y at least two weeks old when pinned). execd needs
+6.6 or later for `utimensat(AT_EMPTY_PATH)`. The 6.6 series is supported by
+Firecracker's x86_64 microVM platform. This selects an explicit
 substrate, not the newest stable release. Runtime compatibility still needs the
 owner's pinned Firecracker integration test.
 
 ## Pinned values in `kernel.lock.json`
 
 The lock file `kernel.lock.json` contains verified upstream pin values:
-- `version`: `6.1.128`
-- `source_url`: `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz`
-- `sha256`: `874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3` (verified against kernel.org sha256sums.asc)
-- `release_date`: `2025-02-01T00:00:00Z` (the 6.1.128 tarball release date)
-- `builder_image`: `hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER` (unresolved template; the integration script replaces this field with the local `sha256:<image ID>` after building)
+- `version`: `6.6.160`
+- `source_url`: `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.160.tar.xz`
+- `sha256`: `b24c40a9e2188695803358567edda51c4080176424a57dbefca45e5ac44ec225` (verified against kernel.org `v6.x/sha256sums.asc`, whose signature verified with the kernel.org checksum autosigner key B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1)
+- `release_date`: `2026-10-21T00:00:00Z` (the 6.6.160 tarball release date)
+- `builder_image`: `hermetic/kernel-builder:6.6-v1@sha256:TO-BE-FILLED-BY-OWNER` (unresolved template; the integration script replaces this field with the local `sha256:<image ID>` after building)
 - Builder base image: `debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` (debian:bookworm-slim).
 
 ## Running the integration build
 
-Run the integration build script `scripts/integration/kernel-build.sh` from the repository root with two arguments: the path of the downloaded Linux 6.1.128 source tarball and an output directory:
+Run the integration build script `scripts/integration/kernel-build.sh` from the repository root with two arguments: the path of the downloaded Linux 6.6.160 source tarball and an output directory:
 
 ```sh
-./scripts/integration/kernel-build.sh /path/to/linux-6.1.128.tar.xz /path/to/kernel-output
+./scripts/integration/kernel-build.sh /path/to/linux-6.6.160.tar.xz /path/to/kernel-output
 ```
 
 The script:
-1. Validates the source hash and output directory, then builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.1-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
+1. Validates the source hash and output directory, then builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.6-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
 2. Reads the image ID from Docker’s `--iidfile` and uses `sha256:<image ID>` as the immutable local builder reference. A local image ID is not a registry manifest digest and must not be appended to a repository name with `@`. Registry references with genuine manifest digests remain supported. After the builder image is built, the kernel build runs with `--network=none` and `--pull=never`.
 3. Prints the resulting `build-record.json` from the output directory.
 
@@ -36,7 +38,7 @@ Direct CLI invocation from repository root (after builder image is built):
 ```sh
 PYTHONPATH=python python -m hermetic_slice kernel-check-config --config final.config
 PYTHONPATH=python python -m hermetic_slice kernel-build \
-  --tarball /absolute/path/linux-6.1.128.tar.xz --out /absolute/path/kernel-output \
+  --tarball /absolute/path/linux-6.6.160.tar.xz --out /absolute/path/kernel-output \
   --verify-reproducible
 ```
 
@@ -55,7 +57,7 @@ build record. The pure argv helper defaults these transport IDs to 1000:1000.
 The daemon runs an already-cached digest pinned image with `--pull=never`,
 `--network=none`, a read-only container root, dropped capabilities, no new
 privileges, two CPUs, 4 GiB RAM and 512 processes. Input staging is private and
-read-only; compilation uses `/build/linux-6.1.128` and `/build/objects` on a
+read-only; compilation uses `/build/linux-6.6.160` and `/build/objects` on a
 size-capped 8 GiB tmpfs. `/output` is the only persistent writable mount.
 `build.sh` clears its environment. There are no accepted build variables.
 
@@ -103,13 +105,14 @@ module signing bypass analysis is outside this task. No signing keys are generat
 the boot checker checks the caller's arguments before those VMM additions.
 PTP is disabled entirely, including KVM and VMware host clocks; RTC does not
 initialize wall time. Mount namespaces are inherent in NAMESPACES; cgroup
-namespaces are inherent in CGROUPS, without separate Linux 6.1 switches.
+namespaces are inherent in CGROUPS, without separate Linux 6.6 switches.
 Time namespaces are disabled: execd sets CLOCK_REALTIME before writes, and time
 namespaces virtualize monotonic/boottime rather than wall time. Device rules
 use cgroup BPF, not the obsolete cgroup-v1 devices controller. BFQ plus block
-throttling supplies io weight/max controls. Linux 6.1 x86_64 supplies the
+throttling supplies io weight/max controls. Linux 6.6 x86_64 supplies the
 architectural RDRAND implementation when
-CPUID advertises it; `RANDOM_TRUST_CPU` permits its entropy contribution.
+CPUID advertises it; since Linux 6.2 its entropy contribution is trusted by
+default (`random.trust_cpu`), so the removed `RANDOM_TRUST_CPU` switch is not requested.
 No obsolete `X86_RDRAND` switch is requested.
 `IKCONFIG` is disabled; the exact audited config is a separate artifact.
 Devtmpfs is enabled but `DEVTMPFS_MOUNT` is disabled: execd must explicitly
@@ -153,6 +156,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_BLK_CGROUP` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_BLK_DEV` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_BLK_DEV_DM` | `y` | TR-VMM-4: dm-verity and seccomp |
+| `CONFIG_BLK_DEV_INITRD` | `y` | TR-EXD-6: trusted initramfs support (uncompressed or gzip only) |
 | `CONFIG_BLK_DEV_THROTTLING` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_BLOCK` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_BPF` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
@@ -170,7 +174,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_DEBUG_INFO` | `n` | TR-VMM-4: no compiler paths or debug metadata |
 | `CONFIG_DEFAULT_HOSTNAME` | `"hermetic"` | TR-VMM-4: fixed default guest hostname |
 | `CONFIG_DEVTMPFS` | `y` | TR-VMM-4: x86 microVM boot |
-| `CONFIG_DEVTMPFS_MOUNT` | `n` | T3.1: execd mounts devtmpfs after setting time; no time namespace needed |
+| `CONFIG_DEVTMPFS_MOUNT` | `y` | execd boot contract: the kernel mounts devtmpfs at /dev before PID 1 |
 | `CONFIG_DM_VERITY` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_ELF_CORE` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_EXT4_FS` | `y` | TR-VMM-4: root filesystems |
@@ -183,6 +187,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_HYPERVISOR_GUEST` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_IKCONFIG` | `n` | TR-VMM-4: fixed build identity; config supplied separately |
 | `CONFIG_INET` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_INITRAMFS_SOURCE` | `""` | TR-EXD-6: no initramfs built into the kernel image |
 | `CONFIG_IOSCHED_BFQ` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_IP6_NF_FILTER` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP6_NF_IPTABLES` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
@@ -229,11 +234,18 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_PID_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_POSIX_MQUEUE` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_PRINTK` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_PROC_CHILDREN` | `y` | execd: PID 1 reaps orphans via /proc/<pid>/task/<tid>/children |
 | `CONFIG_PROC_FS` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_PTP_1588_CLOCK` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_PTP_1588_CLOCK_KVM` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_PTP_1588_CLOCK_VMW` | `n` | TR-VMM-4: prevent accidental host clock reads |
-| `CONFIG_RANDOM_TRUST_CPU` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
+| `CONFIG_RD_BZIP2` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
+| `CONFIG_RD_GZIP` | `y` | TR-EXD-6: trusted initramfs support (uncompressed or gzip only) |
+| `CONFIG_RD_LZ4` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
+| `CONFIG_RD_LZMA` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
+| `CONFIG_RD_LZO` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
+| `CONFIG_RD_XZ` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
+| `CONFIG_RD_ZSTD` | `n` | TR-EXD-6: no initramfs decompressor other than gzip |
 | `CONFIG_RTC_HCTOSYS` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_SECCOMP` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_SECCOMP_FILTER` | `y` | TR-VMM-4: dm-verity and seccomp |
@@ -242,7 +254,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_SMP` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_SYSFS` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_SYSVIPC` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
-| `CONFIG_TIME_NS` | `n` | T3.1: execd mounts devtmpfs after setting time; no time namespace needed |
+| `CONFIG_TIME_NS` | `n` | T3.1: no time namespace needed |
 | `CONFIG_TMPFS` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_TTY` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_UNIX` | `y` | TR-VMM-4: x86 microVM boot |
