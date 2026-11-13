@@ -42,8 +42,8 @@ import zlib
 MAX_FILES: int = 10_000
 MAX_TOTAL_BYTES_READ: int = 256 * 1024 * 1024  # 256 MiB across an entire tree scan
 MAX_FILE_BYTES: int = 32 * 1024 * 1024         # 32 MiB per regular file on disk
-MAX_DECOMPRESSED_BYTES: int = 32 * 1024 * 1024 # 32 MiB per archive / decompressed stream
-MAX_ARCHIVE_MEMBERS: int = 10_000              # Max members inspected per zip/tar archive
+MAX_DECOMPRESSED_BYTES: int = 32 * 1024 * 1024 # 32 MiB across all carriers in one input
+MAX_ARCHIVE_MEMBERS: int = 10_000              # Max members/streams across one input
 MAX_NESTING_DEPTH: int = 3                     # Max archive nesting depth (e.g. zip in tar in gzip)
 MAX_METADATA_BYTES: int = 1 * 1024 * 1024      # 1 MiB cap for METADATA / PKG-INFO / MANIFEST.MF
 MAX_METADATA_LINES: int = 5_000                # Max lines parsed in text metadata headers
@@ -136,6 +136,41 @@ class ScanCaps:
     max_dir_depth: int = MAX_DIR_DEPTH
     max_dir_entries: int = MAX_DIR_ENTRIES
     max_tree_entries: int = MAX_TREE_ENTRIES
+
+
+@dataclass
+class _InspectionBudget:
+    """Monotonic accounting shared by every carrier in one top-level input.
+
+    Each extracted member and each decompressed stream charges its output bytes,
+    including bytes that are subsequently inspected as another carrier. Empty and
+    skipped members still charge the member/stream limit.
+    """
+
+    caps: ScanCaps
+    decompressed_bytes: int = 0
+    members: int = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return self.caps.max_decompressed_bytes - self.decompressed_bytes
+
+    def check_members(self, count: int) -> None:
+        if count > self.caps.max_archive_members - self.members:
+            raise CapExceededError(
+                f"Input member/stream count exceeds cap ({self.caps.max_archive_members})."
+            )
+
+    def consume_member(self) -> None:
+        self.check_members(1)
+        self.members += 1
+
+    def consume_bytes(self, count: int) -> None:
+        if count > self.remaining_bytes:
+            raise CapExceededError(
+                f"Input decompressed output exceeds cap ({self.caps.max_decompressed_bytes})."
+            )
+        self.decompressed_bytes += count
 
 
 @dataclass(frozen=True)
@@ -644,12 +679,16 @@ def inspect_zip_bytes(
     t_clock: datetime,
     caps: ScanCaps,
     depth: int,
+    *,
+    budget: _InspectionBudget | None = None,
 ) -> list[Finding]:
     """Inspect a ZIP/JAR/WHL archive for DOS timestamps, 0x5455 fields, and nested content."""
     if depth > caps.max_nesting_depth:
         raise CapExceededError(
             f"Archive nesting depth ({depth}) exceeds cap ({caps.max_nesting_depth})."
         )
+    if budget is None:
+        budget = _InspectionBudget(caps)
     try:
         zf = zipfile.ZipFile(io.BytesIO(data), mode="r")
     except (
@@ -663,18 +702,11 @@ def inspect_zip_bytes(
         raise MalformedArchiveError(f"Invalid ZIP archive: {type(exc).__name__}") from exc
 
     findings: list[Finding] = []
-    total_decompressed = 0
     with zf:
         infolist = zf.infolist()
-        if len(infolist) > caps.max_archive_members:
-            raise CapExceededError(
-                f"ZIP member count ({len(infolist)}) exceeds cap ({caps.max_archive_members})."
-            )
-        for idx, info in enumerate(infolist):
-            if idx >= caps.max_archive_members:
-                raise CapExceededError(
-                    f"ZIP member count exceeds cap ({caps.max_archive_members})."
-                )
+        budget.check_members(len(infolist))
+        for info in infolist:
+            budget.consume_member()
             cur_chain = member_chain + [info.filename]
 
             # 1. DOS timestamp (central directory / local header)
@@ -743,12 +775,12 @@ def inspect_zip_bytes(
                     f"ZIP member {info.filename!r} uncompressed size ({info.file_size}) "
                     f"exceeds cap ({caps.max_decompressed_bytes})."
                 )
-            if total_decompressed + info.file_size > caps.max_decompressed_bytes:
+            if info.file_size > budget.remaining_bytes:
                 raise CapExceededError(
                     f"Cumulative ZIP decompressed size exceeds cap ({caps.max_decompressed_bytes})."
                 )
 
-            remaining_budget = caps.max_decompressed_bytes - total_decompressed
+            remaining_budget = budget.remaining_bytes
             try:
                 with zf.open(info, mode="r") as member_fp:
                     member_bytes = _read_stream_bounded(
@@ -771,7 +803,7 @@ def inspect_zip_bytes(
                     f"Corrupt or unsupported ZIP member {info.filename!r}: {type(exc).__name__}"
                 ) from exc
 
-            total_decompressed += len(member_bytes)
+            budget.consume_bytes(len(member_bytes))
             findings.extend(
                 inspect_payload_bytes(
                     rel_path=rel_path,
@@ -781,6 +813,7 @@ def inspect_zip_bytes(
                     t_clock=t_clock,
                     caps=caps,
                     depth=depth,
+                    budget=budget,
                 )
             )
     return findings
@@ -800,21 +833,23 @@ def inspect_tar_bytes(
     t_clock: datetime,
     caps: ScanCaps,
     depth: int,
+    *,
+    budget: _InspectionBudget | None = None,
 ) -> list[Finding]:
     """Inspect a TAR archive for member mtimes and nested regular file members."""
     if depth > caps.max_nesting_depth:
         raise CapExceededError(
             f"Archive nesting depth ({depth}) exceeds cap ({caps.max_nesting_depth})."
         )
+    if budget is None:
+        budget = _InspectionBudget(caps)
     try:
         tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
     except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
         raise MalformedArchiveError(f"Invalid TAR archive: {exc}") from exc
 
     findings: list[Finding] = []
-    total_extracted = 0
     with tf:
-        member_count = 0
         while True:
             try:
                 member = tf.next()
@@ -822,11 +857,7 @@ def inspect_tar_bytes(
                 raise MalformedArchiveError(f"Corrupt TAR stream: {exc}") from exc
             if member is None:
                 break
-            member_count += 1
-            if member_count > caps.max_archive_members:
-                raise CapExceededError(
-                    f"TAR member count ({member_count}) exceeds cap ({caps.max_archive_members})."
-                )
+            budget.consume_member()
 
             cur_chain = member_chain + [member.name]
             mtime_dt = _tar_time_to_dt(member.mtime)
@@ -860,12 +891,12 @@ def inspect_tar_bytes(
                     f"TAR member {member.name!r} size ({member.size}) "
                     f"exceeds cap ({caps.max_decompressed_bytes})."
                 )
-            if total_extracted + member.size > caps.max_decompressed_bytes:
+            if member.size > budget.remaining_bytes:
                 raise CapExceededError(
                     f"Cumulative TAR extracted size exceeds cap ({caps.max_decompressed_bytes})."
                 )
 
-            remaining_budget = caps.max_decompressed_bytes - total_extracted
+            remaining_budget = budget.remaining_bytes
             try:
                 extracted_fp = tf.extractfile(member)
                 if extracted_fp is None:
@@ -881,7 +912,7 @@ def inspect_tar_bytes(
                 raise MalformedArchiveError(
                     f"Corrupt TAR member {member.name!r}: {type(exc).__name__}"
                 ) from exc
-            total_extracted += len(member_bytes)
+            budget.consume_bytes(len(member_bytes))
             findings.extend(
                 inspect_payload_bytes(
                     rel_path=rel_path,
@@ -891,6 +922,7 @@ def inspect_tar_bytes(
                     t_clock=t_clock,
                     caps=caps,
                     depth=depth,
+                    budget=budget,
                 )
             )
     return findings
@@ -908,12 +940,16 @@ def inspect_gzip_bytes(
     t_clock: datetime,
     caps: ScanCaps,
     depth: int,
+    *,
+    budget: _InspectionBudget | None = None,
 ) -> list[Finding]:
     """Inspect GZIP header MTIME(s) and bounded decompressed payload."""
     if depth > caps.max_nesting_depth:
         raise CapExceededError(
             f"Archive nesting depth ({depth}) exceeds cap ({caps.max_nesting_depth})."
         )
+    if budget is None:
+        budget = _InspectionBudget(caps)
     if len(data) < 10 or data[:2] != _GZIP_MAGIC:
         raise MalformedArchiveError("Truncated or invalid GZIP header.")
 
@@ -921,14 +957,8 @@ def inspect_gzip_bytes(
     offset = 0
     stream_idx = 0
     view = memoryview(data)
-    # The decompression cap is archive-wide: it is shared by every concatenated stream.
-    total_out = 0
-
     while offset < len(data):
-        if stream_idx >= caps.max_archive_members:
-            raise CapExceededError(
-                f"Concatenated GZIP stream count exceeds cap ({caps.max_archive_members})."
-            )
+        budget.consume_member()
         remaining_slice = view[offset:]
         if len(remaining_slice) < 10 or bytes(remaining_slice[:2]) != _GZIP_MAGIC:
             raise MalformedArchiveError("Invalid concatenated GZIP member header.")
@@ -947,30 +977,21 @@ def inspect_gzip_bytes(
         out_buf = bytearray()
         pos = 0
         try:
-            while pos < len(remaining_slice) and not decompressor.eof:
-                chunk = remaining_slice[pos : pos + caps.read_chunk_size]
-                pos += len(chunk)
-                remaining_budget = caps.max_decompressed_bytes - total_out - len(out_buf)
-                if remaining_budget <= 0:
-                    raise CapExceededError(
-                        f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                    )
-                piece = decompressor.decompress(chunk, max_length=remaining_budget)
+            while not decompressor.eof:
+                if decompressor.unconsumed_tail:
+                    chunk = decompressor.unconsumed_tail
+                elif pos < len(remaining_slice):
+                    chunk = remaining_slice[pos : pos + caps.read_chunk_size]
+                    pos += len(chunk)
+                else:
+                    raise MalformedArchiveError("Truncated GZIP stream (missing trailer).")
+                # One sentinel byte distinguishes exhaustion from a trailer or an
+                # empty stream. A zero max_length would permit unlimited output.
+                piece = decompressor.decompress(
+                    chunk, max_length=min(caps.read_chunk_size, budget.remaining_bytes + 1)
+                )
+                budget.consume_bytes(len(piece))
                 out_buf.extend(piece)
-                if (
-                    decompressor.unconsumed_tail
-                    and total_out + len(out_buf) >= caps.max_decompressed_bytes
-                ):
-                    raise CapExceededError(
-                        f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                    )
-            if not decompressor.eof:
-                remaining_budget = caps.max_decompressed_bytes - total_out - len(out_buf)
-                if remaining_budget <= 0:
-                    raise CapExceededError(
-                        f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                    )
-                out_buf.extend(decompressor.flush(remaining_budget))
         except zlib.error as exc:
             raise MalformedArchiveError(f"Corrupt GZIP deflate stream: {exc}") from exc
 
@@ -981,7 +1002,6 @@ def inspect_gzip_bytes(
         if consumed <= 0:
             raise MalformedArchiveError("GZIP decompressor made zero progress.")
         offset += consumed
-        total_out += len(out_buf)
 
         inner_name = _derive_gzip_inner_name(
             outer_name, bytes(remaining_slice[:_GZIP_NAME_HEADER_PROBE]), stream_idx
@@ -996,6 +1016,7 @@ def inspect_gzip_bytes(
                 t_clock=t_clock,
                 caps=caps,
                 depth=depth,
+                budget=budget,
             )
         )
         stream_idx += 1
@@ -1011,33 +1032,32 @@ def _decompress_streams_bounded(
     errors: tuple[type[BaseException], ...],
     *,
     skip_null_padding: bool = False,
+    budget: _InspectionBudget | None = None,
 ) -> bytes:
     """Decompress every concatenated stream in ``data`` within the decompression cap."""
+    if budget is None:
+        budget = _InspectionBudget(caps)
     out_buf = bytearray()
     pending = data
     try:
         for _ in range(MAX_COMPRESSED_STREAMS):
+            budget.consume_member()
             decompressor = make_decompressor()  # type: ignore[operator]
             pos = 0
             while pos < len(pending) and not decompressor.eof:
                 chunk = pending[pos : pos + caps.read_chunk_size]
                 pos += len(chunk)
-                remaining_budget = caps.max_decompressed_bytes - len(out_buf)
-                if remaining_budget <= 0:
-                    raise CapExceededError(
-                        f"{label} decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                    )
-                piece = decompressor.decompress(chunk, max_length=remaining_budget)
+                piece = decompressor.decompress(
+                    chunk, max_length=min(caps.read_chunk_size, budget.remaining_bytes + 1)
+                )
+                budget.consume_bytes(len(piece))
                 out_buf.extend(piece)
                 # Drain output held back by max_length before feeding more input.
                 while not decompressor.eof and not decompressor.needs_input:
-                    remaining_budget = caps.max_decompressed_bytes - len(out_buf)
-                    if remaining_budget <= 0:
-                        raise CapExceededError(
-                            f"{label} decompressed output exceeds cap "
-                            f"({caps.max_decompressed_bytes})."
-                        )
-                    piece = decompressor.decompress(b"", max_length=remaining_budget)
+                    piece = decompressor.decompress(
+                        b"", max_length=min(caps.read_chunk_size, budget.remaining_bytes + 1)
+                    )
+                    budget.consume_bytes(len(piece))
                     if not piece:
                         break
                     out_buf.extend(piece)
@@ -1058,13 +1078,17 @@ def _decompress_streams_bounded(
         raise MalformedArchiveError(f"Corrupt {label} stream: {type(exc).__name__}") from exc
 
 
-def _decompress_bz2_bounded(data: bytes, caps: ScanCaps) -> bytes:
+def _decompress_bz2_bounded(
+    data: bytes, caps: ScanCaps, *, budget: _InspectionBudget | None = None
+) -> bytes:
     return _decompress_streams_bounded(
-        data, caps, "BZ2", bz2.BZ2Decompressor, (OSError, EOFError, ValueError)
+        data, caps, "BZ2", bz2.BZ2Decompressor, (OSError, EOFError, ValueError), budget=budget
     )
 
 
-def _decompress_xz_bounded(data: bytes, caps: ScanCaps) -> bytes:
+def _decompress_xz_bounded(
+    data: bytes, caps: ScanCaps, *, budget: _InspectionBudget | None = None
+) -> bytes:
     return _decompress_streams_bounded(
         data,
         caps,
@@ -1072,6 +1096,7 @@ def _decompress_xz_bounded(data: bytes, caps: ScanCaps) -> bytes:
         lzma.LZMADecompressor,
         (lzma.LZMAError, EOFError, ValueError),
         skip_null_padding=True,
+        budget=budget,
     )
 
 
@@ -1083,8 +1108,12 @@ def inspect_payload_bytes(
     t_clock: datetime,
     caps: ScanCaps,
     depth: int,
+    *,
+    budget: _InspectionBudget | None = None,
 ) -> list[Finding]:
     """Dispatch a file or extracted member payload to matching date carrier inspectors."""
+    if budget is None:
+        budget = _InspectionBudget(caps)
     posix_lower = PurePosixPath(filename).as_posix().lower()
     basename_lower = PurePosixPath(filename).name.lower()
 
@@ -1109,6 +1138,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     if _is_bz2_bytes(filename, data):
@@ -1116,7 +1146,7 @@ def inspect_payload_bytes(
             raise CapExceededError(
                 f"Archive nesting depth ({depth + 1}) exceeds cap ({caps.max_nesting_depth})."
             )
-        decompressed = _decompress_bz2_bounded(data, caps)
+        decompressed = _decompress_bz2_bounded(data, caps, budget=budget)
         inner_name = filename[:-4] if basename_lower.endswith(".bz2") else "<bz2>"
         return inspect_payload_bytes(
             rel_path=rel_path,
@@ -1126,6 +1156,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     if _is_xz_bytes(filename, data):
@@ -1133,7 +1164,7 @@ def inspect_payload_bytes(
             raise CapExceededError(
                 f"Archive nesting depth ({depth + 1}) exceeds cap ({caps.max_nesting_depth})."
             )
-        decompressed = _decompress_xz_bounded(data, caps)
+        decompressed = _decompress_xz_bounded(data, caps, budget=budget)
         inner_name = filename[:-3] if basename_lower.endswith(".xz") else "<xz>"
         return inspect_payload_bytes(
             rel_path=rel_path,
@@ -1143,6 +1174,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     if _is_zip_bytes(filename, data):
@@ -1153,6 +1185,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     if _is_tar_bytes(filename, data):
@@ -1163,6 +1196,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     if _has_zip_eocd(data):
@@ -1182,6 +1216,7 @@ def inspect_payload_bytes(
             t_clock=t_clock,
             caps=caps,
             depth=depth + 1,
+            budget=budget,
         )
 
     return []
