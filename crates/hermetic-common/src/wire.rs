@@ -31,6 +31,9 @@
 //! | headers          | ...    | each: name_len u16, name, value_len u16, value|
 //! | body             | bytes  | `body_len` bytes                              |
 
+/// Validated response metadata, with no body allocation.
+pub type ResponseHead = (u64, u16, Vec<ResponseHeader>, u64);
+
 pub const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024 * 1024;
 
 use std::io::{self, Read, Write};
@@ -651,8 +654,12 @@ impl ResponseFrame {
         })
     }
 
-    /// Read exactly one response frame from a `Read` source.
-    pub fn read_from<R: Read>(reader: &mut R, max_body_len: u64) -> Result<Self, WireError> {
+    /// Read and validate only the bounded response head, leaving the body unread.
+    /// Returns request id, status, headers and declared body length.
+    pub fn read_head_from<R: Read>(
+        reader: &mut R,
+        max_body_len: u64,
+    ) -> Result<ResponseHead, WireError> {
         let mut header = [0u8; RESPONSE_HEADER_SIZE];
         let mut n = 0;
         while n < RESPONSE_HEADER_SIZE {
@@ -790,6 +797,13 @@ impl ResponseFrame {
             });
         }
 
+        Ok((request_id, status, headers, body_len))
+    }
+
+    /// Read a capped response including its body. Streaming callers should use
+    /// `read_head_from` and enforce the returned body length on their reader.
+    pub fn read_from<R: Read>(reader: &mut R, max_body_len: u64) -> Result<Self, WireError> {
+        let (request_id, status, headers, body_len) = Self::read_head_from(reader, max_body_len)?;
         // Read body
         let body_size = usize::try_from(body_len)
             .map_err(|_| WireError::Malformed("body allocation limit".into()))?;
@@ -1198,6 +1212,35 @@ mod review_regressions {
             let mut header = base.clone();
             header[20..28].copy_from_slice(&length.to_le_bytes());
             assert!(ResponseFrame::read_from(&mut std::io::Cursor::new(header), u64::MAX).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod streaming_head_tests {
+    use super::*;
+    #[test]
+    fn streaming_response_head_leaves_body_unread_and_enforces_cap() {
+        let frame = ResponseFrame {
+            request_id: 42,
+            status: 200,
+            headers: vec![ResponseHeader {
+                name: "content-length".into(),
+                value: "4".into(),
+            }],
+            body: b"body".to_vec(),
+        };
+        let encoded = frame.encode(4).unwrap();
+        let mut cursor = std::io::Cursor::new(&encoded);
+        let (id, status, headers, length) = ResponseFrame::read_head_from(&mut cursor, 4).unwrap();
+        assert_eq!((id, status, length), (42, 200, 4));
+        assert_eq!(headers, frame.headers);
+        let mut body = Vec::new();
+        cursor.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"body");
+        assert!(ResponseFrame::read_head_from(&mut &encoded[..], 3).is_err());
+        for end in 0..encoded.len() - 4 {
+            assert!(ResponseFrame::read_head_from(&mut &encoded[..end], 4).is_err());
         }
     }
 }

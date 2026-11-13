@@ -254,3 +254,61 @@ Any failure ends the VM. The clock check uses the serial line because the HGRD r
 - Supervisor isolation (task B).
 - The read-only work or patch drive. The patch is baked into the image for now.
 - The fd 3 bridge.
+
+## Network VM
+
+Run from the worktree root on the prepared host:
+
+```sh
+scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"
+```
+
+The work directory must be new, with a parent not writable by other users. The
+script uses `$HOME` for the pinned Firecracker and kernel locations;
+`HERMETIC_KERNEL` can select another policy-checked kernel. It builds static
+NetVM/execd/init binaries, copies the offline fixture in `net-fixture`, builds two
+D4-checked read-only rootfs images, then runs the ignored
+`netvm_serves_world_to_agent_and_drops_everything_else` test with `dev-unjailed`.
+Build prerequisites match `boot-smoke.sh`: Cargo, static busybox and the rootfs
+builder's pinned e2fsprogs container through Docker. This development runner has
+no jailer isolation.
+
+Host prerequisites, configured by the owner beforehand:
+
+- `/dev/kvm` and `/dev/net/tun` accessible to the invoking user.
+- Taps `hwtap-agent` and `hwtap-net` owned by uid 1000, up, and attached only to
+  bridge `hwbr0`. The bridge is up, has no IPv4 or IPv6 address, IPv6 is disabled
+  on it, and the host does not forward traffic outside. No physical NIC belongs
+  to the bridge. The script never configures host networking or loads modules.
+- A policy-checked 6.6 guest kernel with built-in `NETFILTER_XTABLES`,
+  `IP_NF_IPTABLES` and `IP_NF_FILTER`. Linux 6.6 builds `xt_tcpudp.o` with
+  `NETFILTER_XTABLES`; no separate TCP/UDP-match option exists. These options are
+  already required. No clock, timer, RTC, PTP or paravirtual clock feature is added.
+
+NetVM runs `/sbin/hermetic-netvm` as PID 1. It mounts proc for pinned config reads,
+sets the guest clock, installs fixed INPUT/OUTPUT service-port filters and a
+drop-only FORWARD chain, disables forwarding and IPv6, then brings up eth0 as
+`10.0.2.3/24`. It owns the fixture's `10.9.0.1/32`, serves table DNS on
+`10.0.2.3:53` and plain HTTP on port 80, and forwards bounded frames over one
+persistent vsock connection to CID 2 port 5001. Firecracker forwards that port to
+`<NetVM vsock UDS>_5001`, where the sandboxed host WorldServer listens. Port 5000
+is execd; 5002 is reserved for the gateway.
+
+AgentVM boots execd through `hermetic-init`. The run spec installs a regular
+`/etc/resolv.conf` pointing at NetVM. Before starting the agent, the trusted
+harness runs the fixed busybox setup through execd as root: IPv6 off, eth0
+`10.0.2.15/24`, and the sole default route via `10.0.2.3`. The existing run-spec
+schema has no network-effect field; automatic eth0 initialization requires an
+execd schema/boot change and remains open in PHASES.md.
+
+The test checks allowed DNS, exact GET fixture bytes, POST 405, NXDOMAIN for
+unknown DNS, rejection of unknown HTTP hosts, blocked unrelated addresses and
+ports, no public DNS answer, ICMP blocked at NetVM itself, and a regular resolver
+file. Missing explicit smoke inputs fail. Owning guards kill and reap both VMs
+and WorldServer on success or panic.
+
+**Boot status: OPEN here.** The exact command above stops before creating images
+or services with `OPEN: cannot open /dev/kvm or /dev/net/tun; run on the prepared host`.
+TLS termination, CA-key boot delivery, TPROXY and NetVM dm-verity remain open in
+PHASES.md. This cut drops 443 and uses D4-checked read-only ext4. It intercepts
+plain HTTP by owning the manifest addresses, without a redirect rule.

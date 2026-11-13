@@ -180,6 +180,11 @@ impl DnsTable {
         self.records.len()
     }
 
+    /// Canonical manifest host names in stable byte order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.records.keys().map(String::as_str)
+    }
+
     /// Returns `true` if the table has no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()

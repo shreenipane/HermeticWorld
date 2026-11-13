@@ -16,5 +16,11 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+hermetic-common = { workspace = true }
+hermetic-netvm-dns = { path = "../hermetic-netvm-dns" }
+hermetic-netvm-http = { path = "../hermetic-netvm-http" }
 
-
+[dev-dependencies]
+hermetic-world-server = { path = "../hermetic-world-server" }
+tempfile = { workspace = true }
+time = { workspace = true }

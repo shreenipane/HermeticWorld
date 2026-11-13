@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Hermetic World network VM core library.
 //!
@@ -6,8 +6,13 @@
 //! isolated benchmark environment and a frozen upstream world server.
 
 pub mod dns;
+pub mod files;
+pub mod firewall;
 pub mod headers;
 pub mod http;
+pub mod runtime;
+mod sys;
+pub mod upstream;
 
 use std::collections::BTreeMap;
 use std::fmt;

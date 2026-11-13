@@ -11,3 +11,10 @@ Strict HTTP/1.1 request head parser and forwarding policy filter for the Hermeti
 - Filters forwarded headers to a strict allow-list in canonical order and serialises `ForwardRequest` as deterministic sorted-key JSON.
 
 
+
+## Runtime integration
+
+`hermetic-netvm-core::runtime::WorldFilter` uses this parser and policy with the
+manifest DNS host set. Only permitted GET/HEAD descriptors reach its vsock
+upstream; methods on unknown hosts are rejected before the 405 decision. The
+first-cut listener serves plain HTTP only. TLS and TPROXY remain open in PHASES.md.

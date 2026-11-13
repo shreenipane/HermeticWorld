@@ -98,22 +98,42 @@ where
 /// Reads the configuration file, refusing anything larger than `MAX_CONFIG_BYTES`.
 fn read_config_bounded(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| format!("failed to read config file: {e}"))?;
+    let file = hermetic_netvm_core::files::regular(path, hermetic_netvm_core::MAX_CONFIG_BYTES)
+        .map_err(|_| "invalid_config".to_string())?;
     let mut buf = String::new();
-    file.take(hermetic_netvm_core::MAX_CONFIG_BYTES.saturating_add(1))
+    file.take(hermetic_netvm_core::MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut buf)
-        .map_err(|e| format!("failed to read config file: {e}"))?;
+        .map_err(|_| "invalid_config".to_string())?;
     if buf.len() as u64 > hermetic_netvm_core::MAX_CONFIG_BYTES {
-        return Err(format!(
-            "config file exceeds {} bytes",
-            hermetic_netvm_core::MAX_CONFIG_BYTES
-        ));
+        return Err("invalid_config".into());
     }
     Ok(buf)
 }
 
 fn run() -> Result<(), String> {
-    let cli = parse_args(std::env::args()).map_err(|e| e.to_string())?;
+    let args: Vec<String> = std::env::args_os()
+        .take(MAX_CLI_ARGS + 1)
+        .map(|arg| {
+            let value = arg.into_string().map_err(|_| "invalid_arguments")?;
+            if value.len() > MAX_CLI_ARG_BYTES {
+                return Err("invalid_arguments");
+            }
+            Ok(value)
+        })
+        .collect::<Result<_, _>>()?;
+    if args.len() > MAX_CLI_ARGS {
+        return Err("invalid_arguments".into());
+    }
+    if std::process::id() == 1 || args.get(1).is_some_and(|a| a == "--pid1") {
+        if std::process::id() != 1 || args.len() != 1 {
+            return Err("pid1_required".into());
+        }
+        return run_world(true, &args);
+    }
+    if args.get(1).is_some_and(|a| a == "serve") {
+        return run_world(false, &args);
+    }
+    let cli = parse_args(args).map_err(|_| "invalid_arguments")?;
     let config_bytes = read_config_bounded(&cli.config_path)?;
     let config = NetvmConfig::from_json_str(&config_bytes).map_err(|e| e.to_string())?;
     let (dns_responder, filter, upstream) = config
@@ -149,8 +169,194 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            eprintln!("netvm_start_failed: {msg}");
+            if std::process::id() == 1 {
+                // PID 1 must never exit (kernel panic); power the VM off instead.
+                let _ = run_command("/sbin/hermetic-busybox", &["poweroff", "-f"]);
+                loop {
+                    std::thread::sleep(IDLE_SLEEP);
+                }
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+const MAX_CLI_ARGS: usize = 16;
+const MAX_CLI_ARG_BYTES: usize = 4096;
+
+fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
+    use hermetic_netvm_core::runtime::{BOOT_COMMAND_TIMEOUT_MS, BOOT_POLL_MS};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let mut child = Command::new(program)
+        // BusyBox dispatches by basename; the sealed executable has a project name.
+        .arg0("busybox")
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "boot_failed".to_string())?;
+    let end = Instant::now() + Duration::from_millis(BOOT_COMMAND_TIMEOUT_MS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("boot_failed".into())
+                }
+            }
+            Ok(None) if Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(BOOT_POLL_MS))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("boot_failed".into());
+            }
+        }
+    }
+}
+
+fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
+    use hermetic_netvm_core::{
+        files,
+        runtime::{self, WorldConfig, WorldDns, WorldFilter},
+        upstream::VsockUpstream,
+    };
+    use hermetic_netvm_dns::DnsTable;
+    let mut flags = std::collections::BTreeMap::new();
+    if !pid1 {
+        let mut iter = args.iter().skip(2);
+        while let Some(key) = iter.next() {
+            if !matches!(
+                key.as_str(),
+                "--config" | "--dns-table" | "--world-socket" | "--dns" | "--http"
+            ) {
+                return Err("invalid_arguments".into());
+            }
+            let value = iter.next().ok_or("invalid_arguments")?;
+            if flags.insert(key.as_str(), value.as_str()).is_some() {
+                return Err("invalid_arguments".into());
+            }
+        }
+        if flags.len() != 5 {
+            return Err("invalid_arguments".into());
+        }
+    } else {
+        // The sealed image and PID check make this single bootstrap executable trusted.
+        run_command(
+            "/sbin/hermetic-busybox",
+            &[
+                "mount",
+                "-t",
+                "proc",
+                "-o",
+                "nosuid,nodev,noexec",
+                "proc",
+                "/proc",
+            ],
+        )?;
+    }
+    let config_path = if pid1 {
+        "/etc/hermetic/netvm.json"
+    } else {
+        *flags.get("--config").ok_or("invalid_arguments")?
+    };
+    let dns_path = if pid1 {
+        "/etc/hermetic/dns.json"
+    } else {
+        *flags.get("--dns-table").ok_or("invalid_arguments")?
+    };
+    let config = WorldConfig::parse(
+        files::regular(
+            std::path::Path::new(config_path),
+            runtime::MAX_RUNTIME_CONFIG_BYTES,
+        )
+        .map_err(|_| "invalid_config")?,
+    )
+    .map_err(str::to_owned)?;
+    let table = DnsTable::from_file(std::path::Path::new(dns_path)).map_err(|_| "invalid_dns")?;
+    runtime::world_addresses(&table).map_err(str::to_owned)?;
+    let filter = WorldFilter::new(&table);
+    let upstream = if pid1 {
+        VsockUpstream::guest()
+    } else {
+        VsockUpstream::unix(flags.get("--world-socket").ok_or("invalid_arguments")?)
+    };
+    let dns_addr = if pid1 {
+        format!("{}:53", runtime::NETVM_ADDRESS)
+    } else {
+        flags.get("--dns").ok_or("invalid_arguments")?.to_string()
+    };
+    let http_addr = if pid1 {
+        "0.0.0.0:80".to_string()
+    } else {
+        flags.get("--http").ok_or("invalid_arguments")?.to_string()
+    };
+    let dns_addr: SocketAddr = dns_addr.parse().map_err(|_| "invalid_arguments")?;
+    let http_addr: SocketAddr = http_addr.parse().map_err(|_| "invalid_arguments")?;
+    if pid1 {
+        let epoch = format!("@{}", config.t_clock);
+        run_command("/sbin/hermetic-busybox", &["date", "-u", "-s", &epoch])?;
+        hermetic_netvm_core::firewall::install().map_err(|_| "boot_failed")?;
+        runtime::configure(&table, |command| {
+            let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
+            run_command(command.program, &args).map_err(|_| "boot_failed")
+        })
+        .map_err(str::to_owned)?;
+    }
+    let dns = UdpSocket::bind(dns_addr).map_err(|_| "bind_failed")?;
+    let http = TcpListener::bind(http_addr).map_err(|_| "bind_failed")?;
+    let server = RunningNetvm::start(
+        dns,
+        http,
+        hermetic_netvm_core::http::HttpRuntimeConfig::bounded(
+            64,
+            5000,
+            2000,
+            30000,
+            config.t_clock,
+        ),
+        Arc::new(WorldDns(table)),
+        Arc::new(filter),
+        Arc::new(upstream),
+        Arc::new(StderrLogSink),
+    )
+    .map_err(|_| "start_failed")?;
+    if pid1 {
+        runtime::write_ready_status(std::io::stderr()).map_err(|_| "status_failed")?;
+    }
+    let shutdown = server.shutdown_flag();
+    while !shutdown.load(Ordering::Acquire) {
+        std::thread::sleep(IDLE_SLEEP);
+    }
+    server.stop();
+    Ok(())
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    #[test]
+    fn renamed_busybox_dispatches_boot_applets() {
+        let temp = tempfile::tempdir().unwrap();
+        let renamed = temp.path().join("hermetic-busybox");
+        std::fs::copy("/usr/bin/busybox", &renamed).unwrap();
+        // Exercise the same renamed executable and dispatcher as PID 1 without
+        // mounting filesystems, changing the clock or configuring host networking.
+        assert_eq!(run_command(renamed.to_str().unwrap(), &["true"]), Ok(()));
+        assert_eq!(
+            run_command(
+                renamed.to_str().unwrap(),
+                &["date", "-u", "-d", "@1700000000", "+%s"]
+            ),
+            Ok(())
+        );
     }
 }
