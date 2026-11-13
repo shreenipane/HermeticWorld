@@ -13,7 +13,7 @@ The lock file `kernel.lock.json` contains verified upstream pin values:
 - `source_url`: `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.128.tar.xz`
 - `sha256`: `874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3` (verified against kernel.org sha256sums.asc)
 - `release_date`: `2025-02-01T00:00:00Z` (the 6.1.128 tarball release date)
-- `builder_image`: `hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER` (local tag `hermetic/kernel-builder:6.1-v1` plus the builder image ID filled after local build)
+- `builder_image`: `hermetic/kernel-builder:6.1-v1@sha256:TO-BE-FILLED-BY-OWNER` (unresolved template; the integration script replaces this field with the local `sha256:<image ID>` after building)
 - Builder base image: `debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` (debian:bookworm-slim).
 
 ## Running the integration build
@@ -25,11 +25,11 @@ Run the integration build script `scripts/integration/kernel-build.sh` from the 
 ```
 
 The script:
-1. Builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.1-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
-2. Runs the offline kernel build CLI (`python -m hermetic_slice kernel-build --tarball ... --out ...`). After the builder image is built, all network access is denied (`--network=none`, `--pull=never`).
+1. Validates the source hash and output directory, then builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.1-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
+2. Reads the image ID from Docker’s `--iidfile` and uses `sha256:<image ID>` as the immutable local builder reference. A local image ID is not a registry manifest digest and must not be appended to a repository name with `@`. Registry references with genuine manifest digests remain supported. After the builder image is built, the kernel build runs with `--network=none` and `--pull=never`.
 3. Prints the resulting `build-record.json` from the output directory.
 
-The script runs without `sudo` and never writes outside the specified output directory and the Docker image store.
+The script runs without `sudo` and stages files inside the specified output directory. Missing directories are created with mode 0700; an existing output directory must be caller-owned with mode 0700. Symlinked paths and special files are refused, and existing directories are never chmodded. The resolved `kernel.lock.json` is published atomically with mode 0600 after a successful build. Docker writes to its image store during builder preparation.
 
 Direct CLI invocation from repository root (after builder image is built):
 
@@ -60,8 +60,10 @@ size-capped 8 GiB tmpfs. `/output` is the only persistent writable mount.
 `build.sh` clears its environment. There are no accepted build variables.
 
 The source hash is checked before unpacking. Extraction caps source entries and
-bytes, rejects absolute/traversing paths and special files, and creates internal
-relative symlinks only after all archive writes. Base plus fragment are merged
+bytes, rejects absolute/traversing paths and special files, and writes through
+held directory descriptors without following preexisting symlinks. It resolves
+composed symlink targets with a 40-hop cap and rejects escapes and cycles before
+creating internal relative symlinks after all archive writes. Base plus fragment are merged
 with upstream `merge_config.sh -m`, followed by `make olddefconfig`. The checker
 must pass the **final** config before `make vmlinux`. The build fixes timestamp,
 user, host, build version (`1`), SOURCE_DATE_EPOCH, locale, timezone and paths.
@@ -75,8 +77,14 @@ temporary file, fsync, rename and directory fsync. The record is published last;
 a filesystem failure can interrupt the set, so consumers must verify its hashes.
 Existing outputs survive validation/build/reproducibility failures. Two-build
 verification uses distinct output directories and compares every artifact hash.
-Tool stdout/stderr are discarded to avoid accidentally reporting host-derived
-text or secrets; failures return fixed, bounded errors.
+Tool stdout is discarded. Container build steps inherit stderr so the host can
+retain its last 64 KiB in `kernel-build.stderr.log` in the output directory,
+including on build failure or timeout. The log is written atomically through the
+held output descriptor with mode 0600 and replaces any existing log symlink
+without following it. It is a private diagnostic file containing raw tool output,
+separate from the reproducible artifacts and their hashes; do not include it in
+sealed worlds. CLI errors remain fixed and never quote tool output. Each run
+replaces the preceding log, including the builder preparation log.
 
 The canonical command line uses `clocksource=tsc tsc=reliable no-kvmclock`,
 `hermetic.t=<bounded decimal Unix seconds>`, `root=/dev/vda rootfstype=ext4 ro`,
@@ -109,7 +117,8 @@ mount it after clock setup, then move `/dev` when switching root. T3.1 must
 honor that ordering; the kernel does not automatically provide `/dev`.
 
 Limits are named in `guest_kernel.py`: config 2 MiB, lines 4096 bytes, lock and
-record 16 KiB, command line 2048 bytes, paths 4096 bytes/128 components, tarball
+record 16 KiB, stderr tail 64 KiB, image ID 72 bytes, command line 2048 bytes,
+paths 4096 bytes/128 components, symlink resolution 40 hops, tarball
 256 MiB, source 4 GiB/150,000 entries, vmlinux 1 GiB, banner 1024 bytes,
 individual compiler output file 2 GiB, XZ dictionary memory 128 MiB,
 unpacked stream 5 GiB, extended tar metadata 16 KiB, each build subprocess

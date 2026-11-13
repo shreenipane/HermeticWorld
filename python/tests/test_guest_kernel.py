@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -450,7 +451,8 @@ def test_container_hash_mismatch_before_unpack(tmp_path, lock, monkeypatch):
 
 def test_build_uses_exact_docker_argv_and_clean_environment(build_inputs, monkeypatch):
     calls = []
-    def run(argv, *, env, cwd=None):
+    def run(argv, *, env, cwd=None, stderr_parent=None):
+        assert stderr_parent is not None
         calls.append((argv, env))
         incoming = Path(argv[argv.index("--mount") + 1].split("src=", 1)[1].split(",dst=", 1)[0])
         output = Path(next(value for value in argv if "dst=/output" in value).split("src=", 1)[1].split(",dst=", 1)[0])
@@ -643,3 +645,263 @@ def test_failed_atomic_copy_leaves_old_artifact_and_no_temporary(tmp_path):
             k._atomic_copy(source, parent, "target", 1)
     assert target.read_bytes() == b"old"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["source", "target"]
+
+
+@pytest.mark.parametrize("entrypoint", [False, True])
+def test_standalone_module_at_shallow_staging_path(entrypoint):
+    # Compile with the container's filename: reproducing /inputs needs no root
+    # privileges or files outside the test directory.
+    code = '''
+import sys, types
+source = open(sys.argv[1], 'rb').read()
+name = '__main__' if sys.argv[2] == 'True' else 'staged'
+module = types.ModuleType(name)
+module.__file__ = '/inputs/guest_kernel.py'
+sys.modules[name] = module
+exec(compile(source, module.__file__, 'exec'), module.__dict__)
+assert module.boot_arguments(0).endswith(' hermetic.t=0')
+'''
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', code, k.__file__, str(entrypoint)],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    if entrypoint:
+        assert result.returncode == 1
+        assert result.stderr == b'kernel container build failed\n'
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == b''
+    assert b'IndexError' not in result.stderr
+
+
+@pytest.mark.parametrize("status", [0, 1])
+def test_run_saves_bounded_stderr_tail_atomically(tmp_path, status):
+    outside = tmp_path / 'outside'
+    outside.write_bytes(b'unchanged')
+    log = tmp_path / k.STDERR_LOG
+    log.symlink_to(outside)
+    code = 'import os, sys; os.write(2, b"x" * 300000); os.write(2, b"last diagnostic\\n"); sys.exit(int(sys.argv[1]))'
+    with k.directory(tmp_path) as parent:
+        if status:
+            with pytest.raises(k.KernelError, match='^kernel build subprocess failed$'):
+                k._run([sys.executable, '-I', '-B', '-c', code, str(status)], env={}, stderr_parent=parent)
+        else:
+            k._run([sys.executable, '-I', '-B', '-c', code, str(status)], env={}, stderr_parent=parent)
+    assert outside.read_bytes() == b'unchanged'
+    assert not log.is_symlink()
+    assert log.stat().st_mode & 0o777 == 0o600
+    expected = (b'x' * k.MAX_STDERR_BYTES + b'last diagnostic\n')[-k.MAX_STDERR_BYTES:]
+    assert log.read_bytes() == expected
+    assert sorted(p.name for p in tmp_path.iterdir()) == [k.STDERR_LOG, 'outside']
+
+
+def test_inner_build_stderr_reaches_outer_log(tmp_path):
+    code = '''
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from hermetic_slice.guest_kernel import _run
+_run([sys.executable, '-I', '-B', '-c', 'import os; os.write(2, b"compiler failure\\n"); raise SystemExit(1)'], env={})
+'''
+    with k.directory(tmp_path) as parent:
+        with pytest.raises(k.KernelError, match='subprocess failed'):
+            k._run([sys.executable, '-I', '-B', '-c', code, str(Path(k.__file__).parent.parent)],
+                   env={}, stderr_parent=parent)
+    assert b'compiler failure\n' in (tmp_path / k.STDERR_LOG).read_bytes()
+
+
+def test_run_timeout_keeps_stderr_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(k, 'BUILD_TIMEOUT_S', 0.5)
+    code = 'import os, time; os.write(2, b"before timeout\\n"); time.sleep(30)'
+    with k.directory(tmp_path) as parent:
+        with pytest.raises(k.KernelError, match='timed out'):
+            k._run([sys.executable, '-I', '-B', '-c', code], env={}, stderr_parent=parent)
+    assert (tmp_path / k.STDERR_LOG).read_bytes() == b'before timeout\n'
+
+
+def test_local_builder_image_id_is_not_a_registry_digest(lock):
+    lock['builder_image'] = 'sha256:' + 'b' * 64
+    assert k.validate_lock(lock, for_build=True) == lock
+    argv = k.docker_arguments(lock, Path('/in'), Path('/out'))
+    assert argv[-2] == 'sha256:' + 'b' * 64
+    assert '--pull=never' in argv
+
+
+@pytest.fixture
+def integration_inputs(tmp_path, lock, monkeypatch):
+    kernel = tmp_path / 'kernel'
+    kernel.mkdir()
+    for name in ('Dockerfile', 'build.sh', 'base-x86_64.config', 'hermetic.config'):
+        (kernel / name).write_bytes((ROOT / name).read_bytes())
+    lock['builder_image'] = 'hermetic/kernel-builder:6.1-v1@sha256:' + k.PLACEHOLDER
+    (kernel / 'kernel.lock.json').write_text(json.dumps(lock))
+    source = tmp_path / 'source.tar.xz'
+    source.write_bytes(b'source')
+    monkeypatch.setattr(k, 'DEFAULT_KERNEL_DIR', kernel)
+    return source, tmp_path / 'out'
+
+
+def test_integration_resolves_local_id_and_uses_private_output(integration_inputs, monkeypatch):
+    source, output = integration_inputs
+    output.mkdir(mode=0o700)
+    outside = output.parent / 'outside-lock'
+    outside.write_bytes(b'unchanged')
+    (output / 'kernel.lock.json').symlink_to(outside)
+    calls = []
+
+    def run(argv, *, env, stderr_parent):
+        assert env == {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C', 'TZ': 'UTC'}
+        assert os.fstat(stderr_parent).st_ino == output.stat().st_ino
+        assert argv[:5] == ['/usr/bin/docker', '--config', argv[2], 'build', '--build-arg']
+        assert argv[5] == 'BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc'
+        image_file = Path(argv[argv.index('--iidfile') + 1])
+        assert image_file.is_relative_to(output)
+        image_file.write_text('sha256:' + 'c' * 64 + '\n')
+        calls.append('image')
+
+    def build(lock_path, tarball, out, *, work_dir, output_identity, kernel_dir):
+        assert calls == ['image']
+        assert tarball == source and out == output
+        assert work_dir.is_relative_to(output)
+        assert kernel_dir == k.DEFAULT_KERNEL_DIR
+        info = output.stat()
+        assert output_identity == (info.st_dev, info.st_ino)
+        effective = k.load_lock(lock_path, for_build=True)
+        assert effective['builder_image'] == 'sha256:' + 'c' * 64
+        (out / 'build-record.json').write_bytes(b'{"verified": true}\n')
+        calls.append('kernel')
+
+    monkeypatch.setattr(k, '_run', run)
+    monkeypatch.setattr(k, 'build_kernel', build)
+    assert k.integration_build(source, output) == b'{"verified": true}\n'
+    assert calls == ['image', 'kernel']
+    assert outside.read_bytes() == b'unchanged'
+    assert k.load_lock(output / 'kernel.lock.json', for_build=True)['builder_image'] == 'sha256:' + 'c' * 64
+    assert (output / 'kernel.lock.json').stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in output.iterdir()) == ['build-record.json', 'kernel.lock.json']
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'ancestor-symlink', 'shared', 'fifo'])
+def test_integration_rejects_unsafe_output_before_docker(integration_inputs, monkeypatch, kind):
+    source, output = integration_inputs
+    outside = output.parent / 'outside'
+    outside.mkdir(mode=0o755)
+    if kind == 'symlink':
+        output.symlink_to(outside, target_is_directory=True)
+    elif kind == 'ancestor-symlink':
+        output.symlink_to(outside, target_is_directory=True)
+        output = output / 'child'
+    elif kind == 'shared':
+        output.mkdir(mode=0o755)
+    else:
+        os.mkfifo(output)
+    monkeypatch.setattr(k, '_run', lambda *a, **kw: pytest.fail('Docker before validation'))
+    with pytest.raises((k.KernelError, OSError)):
+        k.integration_build(source, output)
+    assert outside.stat().st_mode & 0o777 == 0o755
+    assert list(outside.iterdir()) == []
+
+
+def test_integration_hash_mismatch_creates_nothing(integration_inputs, monkeypatch):
+    source, output = integration_inputs
+    source.write_bytes(b'wrong')
+    monkeypatch.setattr(k, '_run', lambda *a, **kw: pytest.fail('Docker before validation'))
+    with pytest.raises(k.KernelError, match='sha256 mismatch'):
+        k.integration_build(source, output)
+    assert not output.exists()
+
+
+def test_source_symlink_composition_cannot_escape_root(tmp_path):
+    archive = tmp_path / 'source.tar.xz'
+    archive_fixture(archive, [('linux-6.1.128/a', '.', 'link'),
+                              ('linux-6.1.128/b', 'a/..', 'link')])
+    destination = tmp_path / 'build'
+    destination.mkdir()
+    with pytest.raises(k.KernelError, match='source link escapes tree'):
+        k._extract_source(archive, destination, '6.1.128', k.hash_file(archive))
+    assert not (destination / 'linux-6.1.128/a').is_symlink()
+    assert not (destination / 'linux-6.1.128/b').is_symlink()
+
+
+def test_source_symlink_cycles_are_bounded(tmp_path):
+    archive = tmp_path / 'source.tar.xz'
+    archive_fixture(archive, [('linux-6.1.128/a', 'b', 'link'),
+                              ('linux-6.1.128/b', 'a', 'link')])
+    with pytest.raises(k.KernelError, match='hop cap'):
+        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
+
+
+@pytest.mark.parametrize('ancestor', [False, True])
+def test_source_extraction_refuses_preexisting_symlinks(tmp_path, ancestor):
+    archive = tmp_path / 'source.tar.xz'
+    archive_fixture(archive, [('linux-6.1.128/sub/file', b'must stay inside', 'file')])
+    destination = tmp_path / 'build'
+    destination.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    root = destination / 'linux-6.1.128'
+    if ancestor:
+        root.mkdir()
+        (root / 'sub').symlink_to(outside, target_is_directory=True)
+    else:
+        root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(k.KernelError, match='source directory must not contain symlinks'):
+        k._extract_source(archive, destination, '6.1.128', k.hash_file(archive))
+    assert list(outside.iterdir()) == []
+
+
+def test_cli_defaults_work_in_shallow_package(tmp_path, monkeypatch, capsys):
+    path = tmp_path / 'config'
+    path.write_text(config())
+    monkeypatch.setitem(main.__globals__, '__file__', '/hermetic_slice/__main__.py')
+    assert main(['kernel-check-config', '--config', str(path)]) == 0
+    assert capsys.readouterr().out == '{"findings": []}\n'
+
+
+@pytest.mark.parametrize('field', ['path', 'linkpath'])
+def test_source_pax_nul_paths_are_rejected_before_filesystem_use(tmp_path, field):
+    archive = tmp_path / 'source.tar.xz'
+    with tarfile.open(archive, 'w:xz', format=tarfile.PAX_FORMAT) as tar:
+        info = tarfile.TarInfo('linux-6.1.128/link')
+        info.type = tarfile.SYMTYPE
+        info.linkname = 'internal'
+        info.pax_headers = {field: 'linux-6.1.128/a\0b' if field == 'path' else 'a\0b'}
+        tar.addfile(info)
+    with pytest.raises(k.KernelError, match='NUL'):
+        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
+    assert not (tmp_path / 'linux-6.1.128').exists()
+
+
+@pytest.mark.parametrize('bad_input', ['config', 'shell-symlink', 'source-pin'])
+def test_integration_validates_inputs_before_output_or_docker(integration_inputs, monkeypatch, bad_input):
+    source, output = integration_inputs
+    if bad_input == 'config':
+        (k.DEFAULT_KERNEL_DIR / 'hermetic.config').write_text('CONFIG_UNSAFE=$(command)\n')
+    elif bad_input == 'shell-symlink':
+        script = k.DEFAULT_KERNEL_DIR / 'build.sh'
+        script.unlink()
+        script.symlink_to(ROOT / 'build.sh')
+    else:
+        path = k.DEFAULT_KERNEL_DIR / 'kernel.lock.json'
+        lock = k.load_lock(path)
+        lock['sha256'] = k.PLACEHOLDER
+        path.write_text(json.dumps(lock))
+    monkeypatch.setattr(k, '_run', lambda *a, **kw: pytest.fail('Docker before validation'))
+    with pytest.raises(k.KernelError):
+        k.integration_build(source, output)
+    assert not output.exists()
+
+
+def test_integration_output_identity_change_prevents_build(build_inputs):
+    lock, tarball, output = build_inputs
+    info = output.stat()
+    with pytest.raises(k.KernelError, match='output directory changed'):
+        k.build_kernel(lock, tarball, output, output_identity=(info.st_dev, info.st_ino + 1),
+                       builder=lambda *args: pytest.fail('build into substituted directory'))
+    assert list(output.iterdir()) == []
+
+
+def test_source_root_cannot_be_a_symlink_to_destination(tmp_path):
+    archive = tmp_path / 'source.tar.xz'
+    archive_fixture(archive, [('linux-6.1.128', '.', 'link')])
+    with pytest.raises(k.KernelError, match='unsafe paths'):
+        k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
+    assert not (tmp_path / 'linux-6.1.128').exists()

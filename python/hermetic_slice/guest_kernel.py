@@ -11,17 +11,20 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import resource
+import selectors
 import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_LINE_BYTES = 4096
 MAX_LOCK_BYTES = 16384
 MAX_PATH_BYTES = 4096
 MAX_PATH_DEPTH = 128
+MAX_SYMLINK_HOPS = 40
 MAX_BOOT_BYTES = 2048
 MAX_CLOCK = 253402300799  # Last second of year 9999; shared decimal Unix-seconds contract.
 MAX_IMAGE_BYTES = 1024 * 1024 * 1024
@@ -36,8 +39,11 @@ MAX_BUILD_FILE_BYTES = 2 * 1024**3
 CLEANUP_TIMEOUT_S = 30
 BUILD_TIMEOUT_S = 7200
 CHUNK_BYTES = 1024 * 1024
+MAX_STDERR_BYTES = 64 * 1024
+MAX_IMAGE_ID_BYTES = 72
+STDERR_LOG = "kernel-build.stderr.log"
 PLACEHOLDER = "TO-BE-FILLED-BY-OWNER"
-DEFAULT_KERNEL_DIR = Path(__file__).absolute().parents[2] / "images" / "kernel"
+DEFAULT_KERNEL_DIR = Path(__file__).absolute().parent.parent.parent / "images" / "kernel"
 
 
 class KernelError(ValueError):
@@ -206,7 +212,7 @@ def validate_lock(lock: dict, *, for_build: bool = False) -> dict:
         raise KernelError("invalid lock field: source_url")
     if lock["sha256"] != PLACEHOLDER and not re.fullmatch(r"[0-9a-f]{64}", lock["sha256"]):
         raise KernelError("invalid lock field: sha256")
-    if not re.fullmatch(r"[a-z0-9./:_-]+@sha256:(?:[0-9a-f]{64}|TO-BE-FILLED-BY-OWNER)", lock["builder_image"]):
+    if not re.fullmatch(r"(?:sha256:[0-9a-f]{64}|[a-z0-9./:_-]+@sha256:(?:[0-9a-f]{64}|TO-BE-FILLED-BY-OWNER))", lock["builder_image"]):
         raise KernelError("invalid lock field: builder_image")
     for field in ("build_user", "build_host"):
         if lock[field] != "hermetic":
@@ -232,7 +238,7 @@ def release_datetime(lock: dict) -> datetime:
 
 
 @contextmanager
-def directory(path: Path):
+def directory(path: Path, *, create: bool = False):
     """Walk without symlinks, retaining an anchor for subsequent descriptor operations."""
     raw = os.fspath(path)
     if len(os.fsencode(raw)) > MAX_PATH_BYTES or ".." in raw.split("/") or "\0" in raw:
@@ -243,6 +249,11 @@ def directory(path: Path):
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
             before = os.stat(part, dir_fd=fd, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode):
                 raise KernelError("directory must not contain symlinks")
@@ -259,33 +270,42 @@ def directory(path: Path):
 
 
 @contextmanager
+def _regular_at(parent: int, name: str, cap: int):
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise KernelError("input must be a regular file")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise KernelError("input changed while opening")
+        if opened.st_size > cap:
+            raise KernelError("file exceeds byte cap")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
 def regular(path: Path, cap: int):
     path = Path(path)
-    with directory(path.parent) as parent:
-        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode):
-            raise KernelError("input must be a regular file")
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
-        try:
-            opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-                raise KernelError("input changed while opening")
-            if opened.st_size > cap:
-                raise KernelError("file exceeds byte cap")
-            yield fd
-        finally:
-            os.close(fd)
+    with directory(path.parent) as parent, _regular_at(parent, path.name, cap) as fd:
+        yield fd
+
+
+def _read_bytes(fd: int, cap: int) -> bytes:
+    result = bytearray()
+    while len(result) <= cap:
+        chunk = os.read(fd, min(CHUNK_BYTES, cap + 1 - len(result)))
+        if not chunk:
+            return bytes(result)
+        result.extend(chunk)
+    raise KernelError("file exceeds byte cap")
 
 
 def read_file(path: Path, cap: int) -> bytes:
     with regular(path, cap) as fd:
-        result = bytearray()
-        while len(result) <= cap:
-            chunk = os.read(fd, min(CHUNK_BYTES, cap + 1 - len(result)))
-            if not chunk:
-                return bytes(result)
-            result.extend(chunk)
-        raise KernelError("file exceeds byte cap")
+        return _read_bytes(fd, cap)
 
 
 def load_lock(path: Path, *, for_build: bool = False) -> dict:
@@ -381,18 +401,47 @@ def docker_arguments(lock: dict, input_dir: Path, output_dir: Path, *, uid: int 
     ]
 
 
-def _run(argv: list[str], *, env: dict[str, str], cwd: Path | None = None) -> None:
+def _wait_with_tail(process, tail: bytearray) -> int:
+    """Drain a pipe without buffering its full contents or waiting past the deadline."""
+    deadline = time.monotonic() + BUILD_TIMEOUT_S
+    with selectors.DefaultSelector() as poll:
+        poll.register(process.stderr, selectors.EVENT_READ)
+        while poll.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("kernel build", BUILD_TIMEOUT_S)
+            for key, _events in poll.select(remaining):
+                chunk = os.read(key.fd, MAX_STDERR_BYTES)
+                if not chunk:
+                    poll.unregister(key.fileobj)
+                else:
+                    tail.extend(chunk)
+                    del tail[:-MAX_STDERR_BYTES]
+        return process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
+def _run(argv: list[str], *, env: dict[str, str], cwd: Path | None = None,
+         stderr_parent: int | None = None) -> None:
+    tail = bytearray()
     try:
         with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, env=env, cwd=cwd, start_new_session=True) as process:
+                              stderr=subprocess.PIPE if stderr_parent is not None else None,
+                              env=env, cwd=cwd, start_new_session=True) as process:
             try:
-                status = process.wait(timeout=BUILD_TIMEOUT_S)
+                status = (_wait_with_tail(process, tail) if stderr_parent is not None
+                          else process.wait(timeout=BUILD_TIMEOUT_S))
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait(timeout=10)
                 raise KernelError("kernel build subprocess timed out") from None
     except OSError:
         raise KernelError("kernel build subprocess unavailable") from None
+    finally:
+        if stderr_parent is not None:
+            _atomic_bytes(stderr_parent, STDERR_LOG, bytes(tail))
     if status:
         raise KernelError("kernel build subprocess failed")
 
@@ -428,53 +477,70 @@ def _atomic_copy(source: Path, parent: int, name: str, cap: int) -> None:
             pass
 
 
-def _write_json(path: Path, value: dict) -> None:
+def _atomic_bytes(parent: int, name: str, raw: bytes) -> None:
+    temp = ".record-" + os.urandom(16).hex()
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise KernelError("short record write")
+            view = view[written:]
+        os.fsync(fd)
+        os.replace(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(temp, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+
+
+def _json_bytes(value: dict) -> bytes:
     raw = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("ascii")
     if len(raw) > MAX_LOCK_BYTES:
         raise KernelError("record exceeds byte cap")
+    return raw
+
+
+def _write_json(path: Path, value: dict) -> None:
+    raw = _json_bytes(value)
     with directory(path.parent) as parent:
-        temp = ".record-" + os.urandom(16).hex()
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-        try:
-            view = memoryview(raw)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise KernelError("short record write")
-                view = view[written:]
-            os.fsync(fd)
-            os.replace(temp, path.name, src_dir_fd=parent, dst_dir_fd=parent)
-            os.fsync(parent)
-        finally:
-            os.close(fd)
-            try:
-                os.unlink(temp, dir_fd=parent)
-            except FileNotFoundError:
-                pass
+        _atomic_bytes(parent, path.name, raw)
 
 
 ARTIFACTS = {"vmlinux": MAX_IMAGE_BYTES, ".config": MAX_CONFIG_BYTES, "build-record.json": MAX_LOCK_BYTES}
 
 
-def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Path = DEFAULT_KERNEL_DIR,
-                 verify_reproducible: bool = False, builder=None) -> dict:
-    lock = load_lock(lock_path, for_build=True)
-    # Validate every small input before creating staging files.
+def _build_inputs(kernel_dir: Path) -> dict[str, bytes]:
     inputs = {name: read_file(kernel_dir / name, MAX_CONFIG_BYTES)
               for name in ("base-x86_64.config", "hermetic.config", "build.sh", "Dockerfile")}
     parse_config(inputs["base-x86_64.config"])
     parse_config(inputs["hermetic.config"])
-    module = read_file(Path(__file__).absolute(), MAX_CONFIG_BYTES)
+    inputs["guest_kernel.py"] = read_file(Path(__file__).absolute(), MAX_CONFIG_BYTES)
+    return inputs
+
+
+def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Path = DEFAULT_KERNEL_DIR,
+                 verify_reproducible: bool = False, builder=None, work_dir: Path | None = None,
+                 output_identity: tuple[int, int] | None = None) -> dict:
+    lock = load_lock(lock_path, for_build=True)
+    # Validate every small input before creating staging files.
+    inputs = _build_inputs(kernel_dir)
     with directory(output) as out_fd:
         out_st = os.fstat(out_fd)
+        if output_identity is not None and (out_st.st_dev, out_st.st_ino) != output_identity:
+            raise KernelError("integration output directory changed")
         if out_st.st_uid != os.geteuid() or out_st.st_mode & 0o022:
             raise KernelError("output directory must be owned by caller and not shared writable")
-        with tempfile.TemporaryDirectory(prefix="hermetic-kernel-", dir="/tmp") as scratch:
+        with tempfile.TemporaryDirectory(prefix="hermetic-kernel-", dir=work_dir or "/tmp") as scratch:
             stable = Path(scratch)
             incoming = stable / "inputs"
             incoming.mkdir(mode=0o700)
             (incoming / "docker-config").mkdir(mode=0o700)
-            for name, data in {**inputs, "guest_kernel.py": module}.items():
+            for name, data in inputs.items():
                 (incoming / name).write_bytes(data)
             _write_json(incoming / "kernel.lock.json", lock)
             with directory(incoming) as incoming_fd:
@@ -492,7 +558,7 @@ def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Pa
                                             uid=os.geteuid(), gid=os.getegid(), name=name)
                     docker_env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "TZ": "UTC"}
                     try:
-                        _run(argv, env=docker_env)
+                        _run(argv, env=docker_env, stderr_parent=out_fd)
                     except KernelError:
                         # A killed Docker client does not kill its daemon-side container.
                         try:
@@ -516,6 +582,44 @@ def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Pa
             for name, cap in ARTIFACTS.items():
                 _atomic_copy(stable / "run-0" / name, out_fd, name, cap)
             return {"version": lock["version"], "sha256": hashes[0], "reproducible": verify_reproducible}
+
+
+def integration_build(tarball: Path, output: Path) -> bytes:
+    """Prepare a local builder, then build offline using its immutable image ID."""
+    lock = load_lock(DEFAULT_KERNEL_DIR / "kernel.lock.json")
+    # Only the builder pin may be unresolved, and all inputs precede output creation.
+    validate_lock({**lock, "builder_image": "sha256:" + "0" * 64}, for_build=True)
+    inputs = _build_inputs(DEFAULT_KERNEL_DIR)
+    if hash_file(tarball, MAX_TARBALL_BYTES) != lock["sha256"]:
+        raise KernelError("source tarball sha256 mismatch")
+    output = output.absolute()
+    with directory(output, create=True) as out_fd:
+        info = os.fstat(out_fd)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise KernelError("integration output directory must be private and owned by caller")
+        # Anchor creation to the held inode; expose its actual path only to Docker.
+        with tempfile.TemporaryDirectory(prefix=".kernel-integration-", dir=f"/proc/self/fd/{out_fd}") as scratch:
+            stable = output / Path(scratch).name
+            with directory(stable) as staging:
+                _atomic_bytes(staging, "Dockerfile", inputs["Dockerfile"])
+                os.mkdir("docker-config", mode=0o700, dir_fd=staging)
+            env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "TZ": "UTC"}
+            _run(["/usr/bin/docker", "--config", str(stable / "docker-config"), "build",
+                  "--build-arg", "BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+                  "-t", "hermetic/kernel-builder:6.1-v1", "--iidfile", str(stable / "image-id"),
+                  "-f", str(stable / "Dockerfile"), str(stable)], env=env, stderr_parent=out_fd)
+            image = read_file(stable / "image-id", MAX_IMAGE_ID_BYTES).strip()
+            if not re.fullmatch(b"sha256:[0-9a-f]{64}", image):
+                raise KernelError("invalid local builder image ID")
+            lock["builder_image"] = image.decode("ascii")
+            validate_lock(lock, for_build=True)
+            _write_json(stable / "kernel.lock.json", lock)
+            # Keep all integration staging inside the requested output directory.
+            build_kernel(stable / "kernel.lock.json", tarball, output, work_dir=stable,
+                         output_identity=(info.st_dev, info.st_ino), kernel_dir=DEFAULT_KERNEL_DIR)
+            _atomic_bytes(out_fd, "kernel.lock.json", _json_bytes(lock))
+            with _regular_at(out_fd, "build-record.json", MAX_LOCK_BYTES) as record:
+                return _read_bytes(record, MAX_LOCK_BYTES)
 
 
 class _BoundedXZ:
@@ -569,10 +673,59 @@ class _BoundedTarInfo(tarfile.TarInfo):
         raise KernelError("sparse source archive members are unsupported")
 
 
+@contextmanager
+def _source_directory(parent: int, parts: tuple[str, ...]):
+    fd = os.dup(parent)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, mode=0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            before = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise KernelError("source directory must not contain symlinks")
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            info = os.fstat(child)
+            if (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
+                os.close(child)
+                raise KernelError("source directory changed")
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _validate_source_links(links: list[tuple[Path, str]], root: Path) -> None:
+    targets = {target.relative_to(root).parts: PurePosixPath(link).parts for target, link in links}
+    for target, link in links:
+        resolved = list(target.relative_to(root).parts[:-1])
+        pending = list(reversed(PurePosixPath(link).parts))
+        hops = 0
+        while pending:
+            part = pending.pop()
+            if part == "..":
+                if not resolved:
+                    raise KernelError("source link escapes tree")
+                resolved.pop()
+            else:
+                resolved.append(part)
+                expansion = targets.get(tuple(resolved))
+                if expansion is not None:
+                    hops += 1
+                    if hops > MAX_SYMLINK_HOPS:
+                        raise KernelError("source link exceeds hop cap")
+                    resolved.pop()
+                    pending.extend(reversed(expansion))
+            if len(resolved) + len(pending) > MAX_PATH_DEPTH:
+                raise KernelError("source link exceeds depth cap")
+
+
 def _extract_source(archive: Path, destination: Path, version: str, expected_sha256: str) -> Path:
     """Extract a hash-verified source with bounded members and no link traversal."""
     root = "linux-" + version
-    with regular(archive, MAX_TARBALL_BYTES) as fd, os.fdopen(os.dup(fd), "rb") as raw:
+    with directory(destination) as destination_fd, regular(archive, MAX_TARBALL_BYTES) as fd, os.fdopen(os.dup(fd), "rb") as raw:
         digest = hashlib.sha256()
         total_compressed = 0
         while total_compressed <= MAX_TARBALL_BYTES:
@@ -591,30 +744,36 @@ def _extract_source(archive: Path, destination: Path, version: str, expected_sha
             for member in tar:
                 count += 1
                 total += member.size
+                _text(member.name, MAX_PATH_BYTES)
                 parts = PurePosixPath(member.name).parts
                 if (count > MAX_SOURCE_ENTRIES or total > MAX_SOURCE_BYTES or member.size < 0
                         or len(member.name) > MAX_PATH_BYTES or len(parts) > MAX_PATH_DEPTH
-                        or not parts or parts[0] != root or ".." in parts or member.name.startswith("/")):
+                        or not parts or parts[0] != root or ".." in parts or member.name.startswith("/")
+                        or (len(parts) == 1 and not member.isdir())):
                     raise KernelError("source archive exceeds limits or contains unsafe paths")
                 target = destination.joinpath(*parts)
                 if member.isdir():
-                    target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    with _source_directory(destination_fd, parts):
+                        pass
                 elif member.isfile():
-                    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
                     source = tar.extractfile(member)
                     if source is None:
                         raise KernelError("source archive member unavailable")
-                    with source, target.open("xb") as handle:
-                        remaining = member.size
-                        while remaining:
-                            chunk = source.read(min(CHUNK_BYTES, remaining))
-                            if not chunk:
-                                raise KernelError("truncated source archive")
-                            handle.write(chunk)
-                            remaining -= len(chunk)
-                        os.fchmod(handle.fileno(), 0o755 if member.mode & 0o111 else 0o644)
+                    with source, _source_directory(destination_fd, parts[:-1]) as parent:
+                        file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                          0o600, dir_fd=parent)
+                        with os.fdopen(file_fd, "wb") as handle:
+                            remaining = member.size
+                            while remaining:
+                                chunk = source.read(min(CHUNK_BYTES, remaining))
+                                if not chunk:
+                                    raise KernelError("truncated source archive")
+                                handle.write(chunk)
+                                remaining -= len(chunk)
+                            os.fchmod(handle.fileno(), 0o755 if member.mode & 0o111 else 0o644)
                 elif member.issym():
                     # Defer all symlinks until no writes remain; permit internal relative targets only.
+                    _text(member.linkname, MAX_PATH_BYTES)
                     link = PurePosixPath(member.linkname)
                     if link.is_absolute() or len(member.linkname) > MAX_PATH_BYTES:
                         raise KernelError("unsafe source link")
@@ -628,10 +787,12 @@ def _extract_source(archive: Path, destination: Path, version: str, expected_sha
                     raise KernelError("source archive contains special file or hard link")
                 # Streaming mode otherwise retains every TarInfo in memory.
                 tar.members.clear()
+            _validate_source_links(links, destination / root)
             for target, _link in links:
-                target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                with _source_directory(destination_fd, target.relative_to(destination).parts[:-1]):
+                    pass
             for target, link in links:
-                with directory(target.parent) as parent:
+                with _source_directory(destination_fd, target.relative_to(destination).parts[:-1]) as parent:
                     os.symlink(link, target.name, dir_fd=parent)
     return destination / root
 

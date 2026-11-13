@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     kernel_check = subparsers.add_parser("kernel-check-config", help="Check final guest kernel config")
     kernel_check.add_argument("--config", type=Path, required=True)
     kernel_build = subparsers.add_parser("kernel-build", help="Build pinned guest kernel offline")
-    kernel_build.add_argument("--lock", type=Path, default=Path(__file__).absolute().parents[2] / "images/kernel/kernel.lock.json")
+    kernel_build.add_argument("--lock", type=Path, default=Path(__file__).absolute().parent.parent.parent / "images/kernel/kernel.lock.json")
     kernel_build.add_argument("--tarball", type=Path, required=True)
     kernel_build.add_argument("--out", type=Path, required=True, help="Existing private output directory")
     kernel_build.add_argument("--verify-reproducible", action="store_true")
