@@ -516,3 +516,64 @@ def test_hostile_inputs_never_raise_unhandled_exceptions() -> None:
         CalibrationConfig(stability_numerator=90, stability_denominator=100)
 
 
+
+
+def _call_with_deadline(func: Any, deadline_s: float = 10.0) -> BaseException | None:
+    """Run func in a daemon thread; fail the test if it blocks past the deadline."""
+    import threading
+
+    outcome: list[BaseException | None] = []
+
+    def _target() -> None:
+        try:
+            func()
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    assert not worker.is_alive(), "file read blocked (FIFO opened without O_NONBLOCK)"
+    return outcome[0] if outcome else None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_regression_fifo_swapped_in_after_lstat_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text('{"samples": []}', encoding="utf-8")
+    decoy_stat = os.lstat(decoy)
+    fifo_path = tmp_path / "swapped.json"
+    os.mkfifo(fifo_path)
+    real_lstat = os.lstat
+
+    def fake_lstat(p: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(p) == os.fspath(fifo_path):
+            return decoy_stat
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(cal_mod.os, "lstat", fake_lstat)
+    err = _call_with_deadline(lambda: calibrate_file(fifo_path))
+    assert isinstance(err, InputFileError)
+
+
+def test_regression_file_swapped_after_lstat_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text('{"samples": []}', encoding="utf-8")
+    target = tmp_path / "target.json"
+    target.write_text('{"samples": []}', encoding="utf-8")
+    decoy_stat = os.lstat(decoy)
+    real_lstat = os.lstat
+
+    def fake_lstat(p: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(p) == os.fspath(target):
+            return decoy_stat
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(cal_mod.os, "lstat", fake_lstat)
+    with pytest.raises(InputFileError, match="changed between"):
+        calibrate_file(target)

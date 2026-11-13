@@ -181,9 +181,13 @@ def read_regular_file(path: str | os.PathLike[str]) -> bytes:
             f"Input file size {lstat_res.st_size} exceeds {MAX_INPUT_BYTES} bytes"
         )
 
+    # O_NONBLOCK: a path swapped for a FIFO after the lstat must not block the
+    # open; O_NOFOLLOW refuses a swapped-in symlink.
     open_flags = (
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_BINARY", 0)
     )
     try:
@@ -199,6 +203,11 @@ def read_regular_file(path: str | os.PathLike[str]) -> bytes:
 
         if not stat.S_ISREG(fstat_res.st_mode):
             raise InputFileError("Opened file descriptor is not a regular file")
+        if (
+            fstat_res.st_dev != lstat_res.st_dev
+            or fstat_res.st_ino != lstat_res.st_ino
+        ):
+            raise InputFileError("Input file changed between lstat and open")
         if fstat_res.st_size > MAX_INPUT_BYTES:
             raise InputFileError(
                 f"Input file size {fstat_res.st_size} exceeds {MAX_INPUT_BYTES} bytes"

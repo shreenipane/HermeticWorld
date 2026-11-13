@@ -4,10 +4,12 @@
 Documented Matching & Validation Rules
 --------------------------------------
 1. File Safety & Caps:
-   - Symlinks are never followed (checked via ``os.path.islink`` and opened with
+   - Symlinks are never followed (checked via ``os.lstat`` and opened with
      ``os.O_NOFOLLOW``).
    - Non-regular files (directories, FIFOs/named pipes, sockets, device nodes)
-     are refused after ``os.fstat`` verification via ``stat.S_ISREG``.
+     are refused from ``os.lstat`` before any open, the open uses
+     ``os.O_NONBLOCK``, and ``os.fstat`` must show the same regular file
+     (``st_dev``/``st_ino``) as the ``lstat``.
    - File size is capped at ``MAX_FILE_BYTES`` (16 MiB), read in bounded chunks
      of ``READ_CHUNK_BYTES`` up to ``MAX_READ_CHUNKS`` iterations.
    - Entry lists (``leaks`` and ``findings``) are each capped at ``MAX_ENTRIES``
@@ -158,12 +160,24 @@ def _read_regular_file_bytes(path: str | os.PathLike[str]) -> bytes:
         raise FileSecurityError("File path must be a non-empty valid string")
 
     try:
-        if os.path.islink(path_str):
-            raise FileSecurityError(f"Refusing symlink path: {path_str!r}")
+        pre = os.lstat(path_str)
     except OSError as exc:
         raise FileSecurityError(f"Cannot inspect path {path_str!r}: {exc}") from exc
+    if stat.S_ISLNK(pre.st_mode):
+        raise FileSecurityError(f"Refusing symlink path: {path_str!r}")
+    if not stat.S_ISREG(pre.st_mode):
+        # Refuse FIFOs, sockets, devices and directories before any open(2):
+        # opening a FIFO without a writer would block forever.
+        raise FileSecurityError(f"Refusing non-regular file: {path_str!r}")
 
-    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK guards against the path being swapped for a FIFO between the
+    # lstat above and this open; O_NOFOLLOW refuses a swapped-in symlink.
+    open_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
         fd = os.open(path_str, open_flags)
     except OSError as exc:
@@ -173,6 +187,8 @@ def _read_regular_file_bytes(path: str | os.PathLike[str]) -> bytes:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise FileSecurityError(f"Refusing non-regular file: {path_str!r}")
+        if st.st_dev != pre.st_dev or st.st_ino != pre.st_ino:
+            raise FileSecurityError(f"File changed between lstat and open: {path_str!r}")
         if st.st_size > MAX_FILE_BYTES:
             raise SizeLimitError(
                 f"File {path_str!r} size ({st.st_size} bytes) exceeds {MAX_FILE_BYTES} bytes"

@@ -12,7 +12,7 @@ pub use args::{
     parse_args, validate_command, AgentMode, ClockMode, ParseError, ParseErrorKind, ProbeRequest,
     RawCommand, RawProbeArgs, RawRunArgs, RawSealArgs, RawVerifyArgs, RawVerifyBundleArgs,
     RunRequest, SealLevel, SealRequest, SubcommandKind, ValidatedCommand, ValidationError,
-    VerifyBundleRequest, VerifyRequest,
+    VerifyBundleRequest, VerifyRequest, MAX_ARGS, MAX_ARG_BYTES,
 };
 pub use dispatch::{
     dispatch, Backend, BackendError, DispatchError, DispatchedOutput, NotImplementedBackend,

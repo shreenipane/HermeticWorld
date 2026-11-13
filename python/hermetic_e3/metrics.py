@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 from hermetic_e3 import (
     DEFAULT_BOOTSTRAP_ITERATIONS,
+    MAX_BOOTSTRAP_DRAWS,
     MAX_BOOTSTRAP_ITERATIONS,
     MAX_ENTRIES,
     PERMILLE_SCALE,
@@ -329,6 +330,12 @@ def bootstrap_confidence_interval(
             task_count=0,
             recall=zero_range,
             precision=zero_range,
+        )
+
+    if valid_b * task_count > MAX_BOOTSTRAP_DRAWS:
+        raise RangeError(
+            f"bootstrap work ({valid_b} iterations x {task_count} tasks) exceeds cap "
+            f"{MAX_BOOTSTRAP_DRAWS} draws"
         )
 
     task_triples: tuple[tuple[int, int, int], ...] = tuple(

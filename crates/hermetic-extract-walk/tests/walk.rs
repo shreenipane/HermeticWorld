@@ -216,7 +216,7 @@ fn test_type_change_file_to_dir_and_dir_to_file() {
             mode: Some("0644".to_string()),
             path: "was_dir".to_string(),
             sha256: Some(
-                "3e52a1675021f41a21b9d9e0f2d9f8b37338dc97e3f45fa7b64a6c94d2f99cc0".to_string()
+                "92af885f330ed4b19948c1dd44dbed553840556063d5061346be12d7a06476d0".to_string()
             ),
             size: Some(10),
         }

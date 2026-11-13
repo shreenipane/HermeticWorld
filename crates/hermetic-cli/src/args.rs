@@ -4,6 +4,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of argument tokens accepted after `argv[0]`.
+pub const MAX_ARGS: usize = 64;
+
+/// Maximum byte length of any single argument token.
+pub const MAX_ARG_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubcommandKind {
@@ -234,6 +240,13 @@ pub enum ParseErrorKind {
     NonUtf8Argument {
         position: usize,
     },
+    TooManyArguments {
+        limit: usize,
+    },
+    ArgumentTooLong {
+        position: usize,
+        limit: usize,
+    },
     MissingSubcommand,
     UnknownSubcommand {
         name: String,
@@ -280,6 +293,12 @@ impl fmt::Display for ParseError {
         match &self.kind {
             ParseErrorKind::NonUtf8Argument { position } => {
                 write!(f, "argument at position {position} is not valid UTF-8")
+            }
+            ParseErrorKind::TooManyArguments { limit } => {
+                write!(f, "too many arguments (at most {limit})")
+            }
+            ParseErrorKind::ArgumentTooLong { position, limit } => {
+                write!(f, "argument at position {position} exceeds {limit} bytes")
             }
             ParseErrorKind::MissingSubcommand => f.write_str("missing subcommand"),
             ParseErrorKind::UnknownSubcommand { name } => {
@@ -388,28 +407,27 @@ fn scan_tokens(
     let mut after_double_dash = false;
     let mut i = 0;
 
-    while i < tokens.len() {
-        let token = &tokens[i];
+    while let Some(token) = tokens.get(i) {
         if after_double_dash {
             positionals.push(token.clone());
-            i += 1;
+            i = i.saturating_add(1);
             continue;
         }
 
         if token == "--" {
             after_double_dash = true;
-            i += 1;
+            i = i.saturating_add(1);
             continue;
         }
 
         if let Some(rest) = token.strip_prefix("--") {
             if rest.is_empty() {
                 after_double_dash = true;
-                i += 1;
+                i = i.saturating_add(1);
                 continue;
             }
-            let (flag_name, inline_value) = match token.find('=') {
-                Some(eq_idx) => (&token[..eq_idx], Some(&token[eq_idx + 1..])),
+            let (flag_name, inline_value) = match token.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
                 None => (token.as_str(), None),
             };
 
@@ -444,14 +462,14 @@ fn scan_tokens(
                         });
                     }
                     flags.push((flag_name.to_string(), None));
-                    i += 1;
+                    i = i.saturating_add(1);
                 }
                 FlagSpec::Value => {
                     if let Some(val) = inline_value {
                         flags.push((flag_name.to_string(), Some(val.to_string())));
-                        i += 1;
+                        i = i.saturating_add(1);
                     } else {
-                        let next = tokens.get(i + 1).ok_or_else(|| ParseError {
+                        let next = tokens.get(i.saturating_add(1)).ok_or_else(|| ParseError {
                             subcommand: Some(subcommand),
                             kind: ParseErrorKind::MissingFlagValue {
                                 flag: flag_name.to_string(),
@@ -466,7 +484,7 @@ fn scan_tokens(
                             });
                         }
                         flags.push((flag_name.to_string(), Some(next.clone())));
-                        i += 2;
+                        i = i.saturating_add(2);
                     }
                 }
             }
@@ -483,7 +501,7 @@ fn scan_tokens(
         }
 
         positionals.push(token.clone());
-        i += 1;
+        i = i.saturating_add(1);
     }
 
     Ok(ParsedTokens { flags, positionals })
@@ -535,9 +553,25 @@ where
 {
     let mut tokens = Vec::new();
     for (idx, os_arg) in args.into_iter().enumerate() {
+        if idx >= MAX_ARGS {
+            return Err(ParseError {
+                subcommand: None,
+                kind: ParseErrorKind::TooManyArguments { limit: MAX_ARGS },
+            });
+        }
+        let position = idx.saturating_add(1);
+        if os_arg.len() > MAX_ARG_BYTES {
+            return Err(ParseError {
+                subcommand: None,
+                kind: ParseErrorKind::ArgumentTooLong {
+                    position,
+                    limit: MAX_ARG_BYTES,
+                },
+            });
+        }
         let utf8 = os_arg.into_string().map_err(|_| ParseError {
             subcommand: None,
-            kind: ParseErrorKind::NonUtf8Argument { position: idx + 1 },
+            kind: ParseErrorKind::NonUtf8Argument { position },
         })?;
         tokens.push(utf8);
     }
@@ -584,14 +618,13 @@ where
         },
     })?;
 
-    let rest = &tokens[1..];
+    let rest = tokens.get(1..).unwrap_or(&[]);
 
     match subcommand {
         SubcommandKind::Help => {
-            if rest.is_empty() {
+            let Some(target_raw) = rest.first() else {
                 return Ok(RawCommand::Help(None));
-            }
-            let target_raw = &rest[0];
+            };
             if target_raw.starts_with("--") {
                 return Err(ParseError {
                     subcommand: Some(SubcommandKind::Help),
@@ -878,28 +911,34 @@ pub fn validate_rfc3339_utc(value: &str) -> Result<(), ValidationError> {
     };
 
     let bytes = value.as_bytes();
+    let fmt_err = "expected format YYYY-MM-DDTHH:MM:SS[.frac]Z";
     // Minimum length: YYYY-MM-DDTHH:MM:SSZ = 20 bytes
     if bytes.len() < 20 {
-        return Err(err("expected format YYYY-MM-DDTHH:MM:SS[.frac]Z"));
+        return Err(err(fmt_err));
     }
-    if *bytes.last().unwrap_or(&0) != b'Z' {
+    let Some((&last, body)) = bytes.split_last() else {
+        return Err(err(fmt_err));
+    };
+    if last != b'Z' {
         return Err(err("timestamp must end with uppercase 'Z'"));
     }
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
+    let at = |idx: usize| bytes.get(idx).copied();
+    if at(4) != Some(b'-')
+        || at(7) != Some(b'-')
+        || at(10) != Some(b'T')
+        || at(13) != Some(b':')
+        || at(16) != Some(b':')
     {
-        return Err(err("expected format YYYY-MM-DDTHH:MM:SS[.frac]Z"));
+        return Err(err(fmt_err));
     }
 
-    let year = parse_digits(&bytes[0..4]).ok_or_else(|| err("invalid year"))?;
-    let month = parse_digits(&bytes[5..7]).ok_or_else(|| err("invalid month"))?;
-    let day = parse_digits(&bytes[8..10]).ok_or_else(|| err("invalid day"))?;
-    let hour = parse_digits(&bytes[11..13]).ok_or_else(|| err("invalid hour"))?;
-    let minute = parse_digits(&bytes[14..16]).ok_or_else(|| err("invalid minute"))?;
-    let second = parse_digits(&bytes[17..19]).ok_or_else(|| err("invalid second"))?;
+    let field = |range: std::ops::Range<usize>| bytes.get(range).and_then(parse_digits);
+    let year = field(0..4).ok_or_else(|| err("invalid year"))?;
+    let month = field(5..7).ok_or_else(|| err("invalid month"))?;
+    let day = field(8..10).ok_or_else(|| err("invalid day"))?;
+    let hour = field(11..13).ok_or_else(|| err("invalid hour"))?;
+    let minute = field(14..16).ok_or_else(|| err("invalid minute"))?;
+    let second = field(17..19).ok_or_else(|| err("invalid second"))?;
 
     if !(1..=12).contains(&month) {
         return Err(err("month out of range 01..=12"));
@@ -918,9 +957,9 @@ pub fn validate_rfc3339_utc(value: &str) -> Result<(), ValidationError> {
         return Err(err("second out of range 00..=60"));
     }
 
-    let tail = &bytes[19..bytes.len() - 1];
-    if !tail.is_empty() {
-        if tail[0] != b'.' || tail.len() < 2 || !tail[1..].iter().all(|b| b.is_ascii_digit()) {
+    let tail = body.get(19..).unwrap_or(&[]);
+    if let Some((&first, digits)) = tail.split_first() {
+        if first != b'.' || digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
             return Err(err("invalid fractional seconds"));
         }
     }
@@ -934,13 +973,13 @@ fn parse_digits(slice: &[u8]) -> Option<u32> {
         if !b.is_ascii_digit() {
             return None;
         }
-        acc = acc * 10 + u32::from(b - b'0');
+        acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
     }
     Some(acc)
 }
 
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn days_in_month(year: u32, month: u32) -> u32 {

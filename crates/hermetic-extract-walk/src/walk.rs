@@ -654,10 +654,7 @@ fn compare_node(
                 path: rel_path.to_string(),
             });
         }
-        (
-            EntryProbe::Absent | EntryProbe::Refused(_),
-            EntryProbe::Absent | EntryProbe::Refused(_),
-        ) => {}
+        (EntryProbe::Absent | EntryProbe::Refused(_), EntryProbe::Absent) => {}
         (EntryProbe::Absent | EntryProbe::Refused(_), EntryProbe::File(w_info)) => {
             let Some(wp) = work_path else {
                 return Ok(());
@@ -1013,7 +1010,7 @@ fn hash_regular_file(
 ) -> Result<String, WalkError> {
     state.check_file_size(expected_lstat.len())?;
 
-    let mut file = File::open(path).map_err(|e| WalkError::Io {
+    let mut file = open_no_follow(path).map_err(|e| WalkError::Io {
         path: rel_path.to_string(),
         kind: e.kind().to_string(),
     })?;
@@ -1086,6 +1083,23 @@ fn hash_regular_file(
     Ok(encode_hex_lower(digest.as_slice()))
 }
 
+/// Opens `path` read-only without following a symlink and without blocking on a FIFO,
+/// in case the entry was swapped after its `symlink_metadata` probe. The caller then
+/// checks that the descriptor is the same regular file (`dev`, `ino`) as the probe.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
 fn encode_hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
@@ -1096,4 +1110,69 @@ fn encode_hex_lower(bytes: &[u8]) -> String {
         out.push(lo as char);
     }
     out
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+    }
+
+    /// Regression: an entry swapped for a FIFO between its probe and the open must be
+    /// refused without blocking (the open needs O_NONBLOCK) and without hashing.
+    #[test]
+    fn regression_fifo_swapped_after_probe_does_not_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let decoy = dir.path().join("decoy");
+        std::fs::write(&decoy, b"x").expect("write decoy");
+        let decoy_meta = fs::symlink_metadata(&decoy).expect("lstat decoy");
+        let fifo = dir.path().join("fifo");
+        mkfifo(&fifo);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let caps = Caps::default();
+            let mut state = WalkState::new(&caps);
+            let res = hash_regular_file(&fifo, "fifo", &decoy_meta, &mut state);
+            let _ = tx.send(res);
+        });
+        let res = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("hash_regular_file blocked on a FIFO");
+        assert_eq!(
+            res,
+            Err(WalkError::MetadataMismatch {
+                path: "fifo".to_string()
+            })
+        );
+    }
+
+    /// Regression: an entry swapped for a symlink between its probe and the open must
+    /// not be followed.
+    #[test]
+    fn regression_symlink_swapped_after_probe_is_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"secret").expect("write target");
+        let target_meta = fs::symlink_metadata(&target).expect("lstat target");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let caps = Caps::default();
+        let mut state = WalkState::new(&caps);
+        let res = hash_regular_file(&link, "link", &target_meta, &mut state);
+        assert!(
+            matches!(res, Err(WalkError::Io { .. })),
+            "symlink was followed: {res:?}"
+        );
+        assert_eq!(state.total_bytes_hashed, 0);
+    }
 }

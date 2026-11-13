@@ -932,3 +932,54 @@ OPTIONS:
     assert_eq!(SubcommandKind::VerifyBundle.as_str(), "verify-bundle");
     assert!(backend.calls().is_empty());
 }
+
+#[test]
+fn regression_argument_count_is_capped() {
+    use hermetic_cli::MAX_ARGS;
+    let mut args = vec!["probe".to_string(), "--world".to_string(), "w".to_string()];
+    while args.len() <= MAX_ARGS {
+        args.push("--json".to_string());
+    }
+    let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let err = parse_args(os).expect_err("must refuse");
+    assert_eq!(
+        err.kind,
+        ParseErrorKind::TooManyArguments { limit: MAX_ARGS }
+    );
+    let backend = RecordingBackend::new();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, _out, _err) = exec(&backend, &refs);
+    assert_eq!(code, ExitCode::USAGE_ERROR);
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn regression_argument_length_is_capped() {
+    use hermetic_cli::MAX_ARG_BYTES;
+    let long_world = "w".repeat(MAX_ARG_BYTES + 1);
+    let err = parse_args(os_args(&["probe", "--world", &long_world])).expect_err("must refuse");
+    assert_eq!(
+        err.kind,
+        ParseErrorKind::ArgumentTooLong {
+            position: 3,
+            limit: MAX_ARG_BYTES
+        }
+    );
+    let exact = "w".repeat(MAX_ARG_BYTES);
+    assert!(parse_args(os_args(&["probe", "--world", &exact])).is_ok());
+}
+
+#[test]
+fn regression_timestamp_fraction_and_leap_years() {
+    use hermetic_cli::args::validate_rfc3339_utc;
+    assert!(validate_rfc3339_utc("2024-02-29T00:00:00Z").is_ok());
+    assert!(validate_rfc3339_utc("2000-02-29T00:00:00Z").is_ok());
+    assert!(validate_rfc3339_utc("1900-02-29T00:00:00Z").is_err());
+    assert!(validate_rfc3339_utc("2023-02-29T00:00:00Z").is_err());
+    assert!(validate_rfc3339_utc("2024-01-01T00:00:00.5Z").is_ok());
+    assert!(validate_rfc3339_utc("2024-01-01T00:00:00.Z").is_err());
+    assert!(validate_rfc3339_utc("2024-01-01T00:00:00xZ").is_err());
+    // Multi-byte UTF-8 at a separator position must be refused, never panic.
+    assert!(validate_rfc3339_utc("2024\u{e9}01-01T00:00:00Z").is_err());
+    assert!(validate_rfc3339_utc("2024-01-01T00:00:00\u{e9}Z").is_err());
+}
