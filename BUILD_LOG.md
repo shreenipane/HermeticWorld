@@ -29,6 +29,32 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-13: review-and-fix of every written branch; first real guest kernel build (Phases 1, 2, 3)
+
+- **Phase:** 1, 2, 3
+- **Type:** build | decision
+- **Requirements:** TR-EXD-*, TR-VMM-4, TR-GR-1..9, TR-NET-2..4, TR-EXT-2..5, TR-SC-7, TR-SEAL-12
+
+### Built and merged
+- One review-and-fix round per branch: the reviewer fixes every verified defect with a regression test that fails on the old code, then the gate runs. Merged: t3.1 execd, hydrogen (netvm-http, grader-sandbox, pytest_env), t3.5 extract validator, t3.6 classifier, t3.7 mutants, gemini-web (G1-G3), gemini-web2 (G4-G6), argon-a1 grader result, argon-a2 bundle, int-1 (T3.2 guest kernel tooling), t3.4 attest, hydrogen2 (E3, calibrate, extract-walk, cli), flash-a (G7-G9), flash-b (G10-G12). Between 7 and about 30 defects were fixed per branch.
+- Most frequent defect class: file opens that followed symlinks or blocked on a FIFO. Fixed per component; a shared Python helper `hermetic_safe_io` now exists. A shared Rust helper is still to do.
+- First real guest kernel build: Linux 6.1.128, offline in the pinned builder container, source sha256 874d67d3...7c50f3. vmlinux sha256 31484d96a1826f8daa2c122232b2f65d2443a32f556f397a4f961bf1a25fd8c6. Banner `Linux version 6.1.128 (hermetic@hermetic) ... Sat Feb 01 00:00:00 UTC 2025`. Four build bugs were found only by the real build: the module crashed when staged alone, Kconfig names with lowercase letters were refused, KVM_GUEST was dropped for lack of PARAVIRT, and the two identical banner copies were refused.
+
+### Decisions
+- Reviewers fix in the same session (owner, 2026-11-13). The owner approved widening the codex sandbox and the rustls dependency.
+- Next phase: a complete integration run (real VM boot with execd, one task end to end), fixing what breaks, before building new components.
+
+### Open (for the owner)
+- Grader result pipe: test code can forge FINISH/END records; the design relies on R1/R2 to catch it.
+- T3.7 brief requires an inserted no-op; the architecture (11.2) forbids it.
+- T3.6: should lines reordered within a file count as an exact match? Not yet.
+- flash-b: Ubuntu arm64 snapshot URL (`ubuntu-ports`?); apt rules 1 and 5 conflict when no snapshot exists.
+- D10 covers archive and metadata timestamps only; WARC capture-time detection is still to do.
+
+### Test-infrastructure issues found
+- tests/test_world.py::test_world_probe_cli uses a fixed Docker network name and fails when two gates run at once.
+- hermetic-trust test_defect1_handle_anchoring_and_swap_race_protection uses a process-wide hook that interferes with parallel tests.
+
 ## 2026-11-12: seven review branches merged, Phase 3 started, CodeRabbit pass on main (Phases 1, 2, 3)
 
 - **Phase:** 1, 2, 3
