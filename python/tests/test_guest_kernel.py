@@ -157,7 +157,7 @@ def banner(lock):
     (lambda b: b.replace(b"6.1.128", b"6.1.127"), "banner.identity"),
     (lambda b: b.replace(b"hermetic@hermetic", b"alice@host"), "banner.identity"),
     (lambda b: b.replace(b"2025", b"2026"), "banner.date"),
-    (lambda b: b"no banner", "banner"), (lambda b: b * 2, "banner"),
+    (lambda b: b"no banner", "banner"), (lambda b: b + b.replace(b"2025", b"2026"), "banner"),
     (lambda b: b"Linux version " + b"x" * 1200 + b"\0", "banner")])
 def test_banner_verifier(tmp_path, lock, change, option):
     path = tmp_path / "kernel"
@@ -905,3 +905,34 @@ def test_source_root_cannot_be_a_symlink_to_destination(tmp_path):
     with pytest.raises(k.KernelError, match='unsafe paths'):
         k._extract_source(archive, tmp_path, '6.1.128', k.hash_file(archive))
     assert not (tmp_path / 'linux-6.1.128').exists()
+
+
+def test_config_accepts_real_kconfig_symbols_with_lowercase_letters():
+    # Linux 6.1 olddefconfig emits symbols such as CONFIG_CRYPTO_DEV_QAT_DH895xCC.
+    parsed = k.parse_config(
+        "# CONFIG_CRYPTO_DEV_QAT_DH895xCC is not set\n"
+        "# CONFIG_CRYPTO_DEV_QAT_DH895xCCVF is not set\n"
+        "CONFIG_EXAMPLE_x86=y\n"
+    )
+    assert parsed["CONFIG_CRYPTO_DEV_QAT_DH895xCC"] == "n"
+    assert parsed["CONFIG_CRYPTO_DEV_QAT_DH895xCCVF"] == "n"
+    assert parsed["CONFIG_EXAMPLE_x86"] == "y"
+    with pytest.raises(k.KernelError):
+        k.parse_config("# CONFIG_BAD-NAME is not set\n")
+
+
+def test_base_config_enables_paravirt_for_required_kvm_guest():
+    # KVM_GUEST depends on PARAVIRT; without it olddefconfig silently drops KVM_GUEST
+    # and the final-config policy fails (seen in the first real 6.1.128 build).
+    base = k.parse_config((Path(__file__).resolve().parents[2] / "images/kernel/base-x86_64.config").read_text())
+    assert base.get("CONFIG_KVM_GUEST") == "y"
+    assert base.get("CONFIG_PARAVIRT") == "y"
+
+
+def test_identical_banner_copies_accepted_but_capped(tmp_path, lock):
+    # A real 6.1.128 vmlinux carries two identical linux_banner copies.
+    path = tmp_path / "kernel"
+    path.write_bytes(b"ELF\0" + banner(lock) + b"\0" + banner(lock) + b"\0")
+    assert k.verify_vmlinux(path, lock) == []
+    path.write_bytes(b"ELF\0" + (banner(lock) + b"\0") * (k.MAX_BANNER_COPIES + 1))
+    assert [f.option for f in k.verify_vmlinux(path, lock)] == ["banner"]

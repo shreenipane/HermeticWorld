@@ -119,7 +119,7 @@ def parse_config(config_text: str | bytes) -> dict[str, str]:
         if any(ord(ch) < 32 or ord(ch) > 126 for ch in line):
             raise KernelError("config must contain printable ASCII lines")
         if not line or line.startswith("#"):
-            match = re.fullmatch(r"# (CONFIG_[A-Z0-9_]+) is not set", line)
+            match = re.fullmatch(r"# (CONFIG_[A-Za-z0-9_]+) is not set", line)
             if match:
                 name, value = match.group(1), "n"
             elif line.startswith("# CONFIG_"):
@@ -127,7 +127,7 @@ def parse_config(config_text: str | bytes) -> dict[str, str]:
             else:
                 continue
         else:
-            match = re.fullmatch(r'(CONFIG_[A-Z0-9_]+)=(y|m|n|-?[0-9]+|0x[0-9a-fA-F]+|"(?:[^"\\\x00-\x1f]|\\["\\])*")', line)
+            match = re.fullmatch(r'(CONFIG_[A-Za-z0-9_]+)=(y|m|n|-?[0-9]+|0x[0-9a-fA-F]+|"(?:[^"\\\x00-\x1f]|\\["\\])*")', line)
             if not match:
                 raise KernelError("invalid config assignment")
             name, value = match.groups()
@@ -337,6 +337,9 @@ def _banner_date(lock: dict) -> str:
     return f"{days[date.weekday()]} {months[date.month - 1]} {date.day:02d} {date.hour:02d}:{date.minute:02d}:{date.second:02d} UTC {date.year}"
 
 
+MAX_BANNER_COPIES = 8
+
+
 def verify_vmlinux(path: Path, lock: dict) -> list[Finding]:
     validate_lock(lock, for_build=True)
     banners: list[bytes] = []
@@ -358,8 +361,11 @@ def verify_vmlinux(path: Path, lock: dict) -> list[Finding]:
                     data = data[start:]
                     break
                 banner = data[start:start + end.start()]
-                if len(banner) > MAX_BANNER_BYTES or banners:
+                # A real vmlinux carries identical copies of linux_banner; differing copies are ambiguous.
+                if len(banner) > MAX_BANNER_BYTES or (banners and banner != banners[0]):
                     return [Finding("banner", "ambiguous or oversized banner")]
+                if len(banners) >= MAX_BANNER_COPIES:
+                    return [Finding("banner", "too many banner copies")]
                 banners.append(banner)
                 data = data[start + end.end():]
             tail = data[-MAX_BANNER_BYTES:]
