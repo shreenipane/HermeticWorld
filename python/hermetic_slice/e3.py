@@ -135,10 +135,11 @@ def apply_patch_in_temp_dir(base_tree_dir: Path, patch_text: str, touched_files:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
-        # Apply patch with git apply
+        # Stop repository discovery at this private tree, including under a worktree-local TMPDIR.
         patch_file = temp_path / "patch.diff"
         patch_file.write_text(patch_text, encoding="utf-8", newline="")
-        run_git(["apply", str(patch_file)], cwd=temp_path)
+        run_git(["apply", str(patch_file)], cwd=temp_path,
+                env={"GIT_CEILING_DIRECTORIES": str(temp_path.resolve().parent)})
 
         post_fix_contents: dict[str, str] = {}
         for rel in touched_files:
