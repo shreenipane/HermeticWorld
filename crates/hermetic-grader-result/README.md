@@ -28,12 +28,34 @@ The differential verdict evaluates all rules and selects the final status using 
 4. `review`: R3 (when present) passing all F2P tests (reason `"fix_removal_passed"`).
 5. `resolved`: all checks pass.
 
+## File Handling
+The crate targets Linux x86_64 only and refuses to build elsewhere: std has no named open(2) flag constants, so the Linux x86_64 values of `O_NOFOLLOW` (0o400000), `O_NONBLOCK` (0o4000), `O_NOCTTY` (0o400), `O_DIRECTORY` (0o200000) and `ELOOP` (40) are written as named constants in `src/disk.rs`.
+
+Reading (`read_disk`, `read_bounded_regular_file`):
+1. Every ancestor of the path (each prefix of its parent) is checked with `symlink_metadata`; any symlink is refused. Relative paths are checked from the current directory, which is trusted.
+2. `symlink_metadata` of the path itself must be a regular file.
+3. The file is opened once with `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`, so a symlink swapped in fails with `ELOOP` and a FIFO swapped in opens without waiting.
+4. `fstat` of the opened handle must be a regular file with the same dev/ino as step 2.
+5. Ancestors and the entry are checked again after the open; any change is refused.
+For result disks every refusal is classified as tampering.
+
+Writing (`write_disk`):
+1. The destination's ancestors must not be symlinks and the destination, if present, must be a regular file.
+2. A temporary file is created in the same directory with `O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600. Its dev/ino is recorded from the handle, and the handle stays open until return so the inode number cannot be reused.
+3. The image is written and fsynced through that handle.
+4. Before the rename the temporary name must still hold that inode; then it is renamed over the destination.
+5. After the rename the destination must hold the same dev/ino, otherwise an error is returned and no digest.
+6. The parent directory is opened with `O_DIRECTORY | O_NOFOLLOW`, must have the dev/ino recorded at the start, and is fsynced.
+Cleanup unlinks a temporary name only while it still holds the owned inode; a foreign entry is never removed.
+
+Residual races (documented, not closed): the checks are path-based because std offers no descriptor-relative `openat`/`renameat` without unsafe code or another dependency. An attacker who can write to an ancestor directory and swaps a component to a symlink and back between two checks can still redirect one open or rename; the re-checks narrow the window and detect any swap still in place. Between the final identity check and the unlink during cleanup the name could be replaced, so in that window a foreign entry could be unlinked. A device node swapped in after the type check is opened (non-blocking, without becoming a controlling terminal) before `fstat` refuses it. Result disks must therefore be read from, and written to, directories that no untrusted party can write.
+
 ## CLI Usage
 ```
 hermetic-grader-verdict --r0 PATH --r1 PATH --r2 PATH [--r3 PATH] --plan PATH
 ```
 
-Plan collections are bounded and reject duplicate test IDs and equivalent-pair keys. R3 passing all F2P tests also includes an empty F2P set. Non-regular result files are classified as tampering. Result files are created with mode 0600 on Unix; failures to sync the parent directory are returned as I/O errors.
+Plan collections are bounded and reject duplicate test IDs and equivalent-pair keys. R3 passing all F2P tests also includes an empty F2P set. Non-regular result files are classified as tampering. Result files are created with mode 0600; failures to sync the parent directory are returned as I/O errors.
 
 Exit codes:
 * `0`: verdict status is "resolved"

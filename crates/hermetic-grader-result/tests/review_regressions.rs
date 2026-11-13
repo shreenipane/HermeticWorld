@@ -408,3 +408,114 @@ fn verdict_json_has_literal_hashes_counts_and_slot_order() {
     let expected = r#"{"status":"resolved","reasons":[],"runs":{"R0":{"disk_sha256":"7b2653c4fb4dd8747fa054a82f0781247a0ba63cff6c9fdb04fb6b89940c8e8b","tests_total":1,"tests_started":1,"tests_finished":1,"passed":1,"failed":0,"skipped":0,"error":0,"missing":0},"R1":{"disk_sha256":"51faf5b4c720f75f36fa84227f9a2d3addf1ccf55e225a15c4647f18361f992a","tests_total":1,"tests_started":1,"tests_finished":1,"passed":0,"failed":1,"skipped":0,"error":0,"missing":0},"R2":{"disk_sha256":"f5484105e6b2b781457b4a58dd8b87b2840dbeaefe800077bbd53ecbcb5b820b","tests_total":1,"tests_started":1,"tests_finished":1,"passed":1,"failed":0,"skipped":0,"error":0,"missing":0}}}"#;
     assert_eq!(serde_json::to_string(&out).unwrap(), expected);
 }
+
+#[test]
+fn every_tamper_source_beats_every_combination_of_lower_statuses() {
+    #[derive(Debug, Clone, Copy)]
+    enum Tamper {
+        None,
+        MutantPassed,
+        EquivalenceMismatch,
+        RunIdMismatch,
+        BadDisk,
+    }
+    #[derive(Debug, Clone, Copy)]
+    enum Infra {
+        None,
+        Timeout,
+        Crash,
+        R3DiskIo,
+    }
+    for tamper in [
+        Tamper::None,
+        Tamper::MutantPassed,
+        Tamper::EquivalenceMismatch,
+        Tamper::RunIdMismatch,
+        Tamper::BadDisk,
+    ] {
+        for infra in [Infra::None, Infra::Timeout, Infra::Crash, Infra::R3DiskIo] {
+            for unresolved in [false, true] {
+                for review in [false, true] {
+                    if review && matches!(infra, Infra::R3DiskIo) {
+                        continue; // R3 cannot both be unreadable and pass.
+                    }
+                    let mut r0 = run(RunId::R0, TestStatus::Passed);
+                    let mut r1 = run(RunId::R1, TestStatus::Failed);
+                    let mut r2 = run(RunId::R2, TestStatus::Passed);
+                    let mut r3 = run(RunId::R3, TestStatus::Failed);
+                    if unresolved {
+                        r0.tests.insert("test".into(), TestStatus::Failed);
+                        r2.tests.insert("test".into(), TestStatus::Failed);
+                    }
+                    if review {
+                        r3.tests.insert("test".into(), TestStatus::Passed);
+                    }
+                    match infra {
+                        Infra::Timeout => r0.supervisor.exit = SupervisorExit::Timeout,
+                        Infra::Crash => r0.supervisor.exit = SupervisorExit::Crash,
+                        Infra::None | Infra::R3DiskIo => {}
+                    }
+                    let mut r1_res = Ok(r1.clone());
+                    match tamper {
+                        Tamper::MutantPassed => {
+                            r1.tests.insert("test".into(), TestStatus::Passed);
+                            r1_res = Ok(r1.clone());
+                        }
+                        Tamper::EquivalenceMismatch => {
+                            r2.tests.insert("test".into(), TestStatus::Skipped);
+                        }
+                        Tamper::RunIdMismatch => r2.run = RunId::R0,
+                        Tamper::BadDisk => {
+                            r1_res = Err(DiskError::Tamper(TamperReason::BadMagic));
+                        }
+                        Tamper::None => {}
+                    }
+                    let r3_res = if matches!(infra, Infra::R3DiskIo) {
+                        Err(DiskError::Io(io::ErrorKind::NotFound))
+                    } else {
+                        Ok(r3)
+                    };
+                    let (expected, reason) = if !matches!(tamper, Tamper::None) {
+                        (
+                            VerdictStatus::Tampered,
+                            match tamper {
+                                Tamper::MutantPassed => "mutant_passed",
+                                Tamper::EquivalenceMismatch => "equivalence_mismatch",
+                                Tamper::RunIdMismatch => "run_id_mismatch",
+                                _ => "disk_tamper",
+                            },
+                        )
+                    } else if !matches!(infra, Infra::None) {
+                        (
+                            VerdictStatus::InfraError,
+                            match infra {
+                                Infra::Timeout => "supervisor_timeout",
+                                Infra::Crash => "supervisor_crash",
+                                _ => "disk_io_error",
+                            },
+                        )
+                    } else if unresolved {
+                        (VerdictStatus::Unresolved, "f2p_failed")
+                    } else if review {
+                        (VerdictStatus::Review, "fix_removal_passed")
+                    } else {
+                        (VerdictStatus::Resolved, "")
+                    };
+                    let out = verdict(Ok(r0), r1_res, Ok(r2), Some(r3_res), &plan());
+                    let case =
+                        format!("{tamper:?} {infra:?} unresolved={unresolved} review={review}");
+                    assert_eq!(out.status, expected, "{case}");
+                    if reason.is_empty() {
+                        assert!(out.reasons.is_empty(), "{case}: {:?}", out.reasons);
+                    } else {
+                        assert!(
+                            out.reasons.iter().any(|r| r == reason),
+                            "{case}: {:?}",
+                            out.reasons
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
