@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
+import gzip
 import os
 import stat
 import tarfile
 import zipfile
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
@@ -39,6 +41,7 @@ MAX_DIFF_INPUT_LINES: int = 50_000
 # Cap on a single tar extended header (pax or GNU long name/link). tarfile reads
 # these fully into memory before any member cap applies.
 MAX_TAR_EXTENDED_HEADER_BYTES: int = 1024 * 1024
+MAX_ARTIFACT_BYTES: int = 256 * 1024 * 1024
 
 
 class HermeticD7Error(Exception):
@@ -75,6 +78,12 @@ class ResourceLimits:
     max_record_lines: int = MAX_RECORD_LINES
     max_metadata_lines: int = MAX_METADATA_LINES
     max_diff_input_lines: int = MAX_DIFF_INPUT_LINES
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if type(value) is not int or value < 0 or (field.name == "read_chunk_size" and value == 0):
+                raise ResourceLimitError(f"Invalid resource cap: {field.name}")
 
 
 @dataclass(frozen=True)
@@ -347,7 +356,7 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
 
         raw_entries: list[os.DirEntry[str]] = []
         try:
-            with os.scandir(current_dir) as it:
+            with hermetic_safe_io.scandir(current_dir) as it:
                 # Bounded: a directory with more entries than the member cap is refused
                 # before its listing is held in memory.
                 for scanned in it:
@@ -393,7 +402,7 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
                         f"Directory nesting depth exceeds cap ({next_depth} > {limits.max_nesting_depth})"
                     )
                 validate_member_path(rel_path, is_dir=True, max_depth=limits.max_nesting_depth)
-                stack.append((Path(entry.path), rel_path, next_depth))
+                stack.append((current_dir / entry.name, rel_path, next_depth))
             elif stat.S_ISREG(est.st_mode):
                 norm_path = validate_member_path(
                     rel_path, is_dir=False, max_depth=limits.max_nesting_depth
@@ -411,19 +420,22 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
                 try:
                     # Descriptor-anchored, no-follow, non-blocking: a member swapped for a
                     # symlink or FIFO after the stat above is refused, never followed.
-                    fd = hermetic_safe_io.open_regular(entry.path, limits.max_member_bytes)
+                    fd = hermetic_safe_io.open_regular(current_dir / entry.name, limits.max_member_bytes)
                 except (OSError, ValueError) as exc:
                     raise SecurityViolationError(
                         f"Failed to open {norm_path!r} safely: {type(exc).__name__}"
                     ) from exc
                 with os.fdopen(fd, "rb") as fobj:
+                    opened = os.fstat(fobj.fileno())
+                    if opened.st_nlink > 1:
+                        raise SecurityViolationError("Hardlinked file refused")
                     raw_bytes, total_bytes = _read_bounded_stream(
                         fobj, norm_path, limits, total_bytes
                     )
                 members[norm_path] = _build_member(
                     norm_path,
                     raw_bytes,
-                    normalise_executable(est.st_mode),
+                    normalise_executable(opened.st_mode),
                     limits,
                 )
             else:
@@ -444,7 +456,7 @@ def _read_zip(archive_path: Path, limits: ResourceLimits) -> dict[str, Normalise
     total_bytes = 0
 
     try:
-        zf_ctx = zipfile.ZipFile(archive_path, mode="r")
+        zf_ctx = zipfile.ZipFile(_archive_stream(archive_path), mode="r")
     except (zipfile.BadZipFile, OSError, EOFError, zlib.error) as exc:
         raise InvalidArtifactError(f"Invalid ZIP/wheel archive {archive_path}: {exc}") from exc
 
@@ -545,7 +557,14 @@ def _read_tar(
     total_bytes = 0
 
     try:
-        tf_ctx = tarfile.open(archive_path, mode=tar_mode, tarinfo=_CappedTarInfo)
+        stream = _archive_stream(archive_path)
+        if tar_mode == "r:gz":
+            with gzip.GzipFile(fileobj=stream) as compressed:
+                unpacked = compressed.read(MAX_ARTIFACT_BYTES + 1)
+            if len(unpacked) > MAX_ARTIFACT_BYTES:
+                raise ResourceLimitError("TAR stream byte cap exceeded")
+            stream = io.BytesIO(unpacked)
+        tf_ctx = tarfile.open(fileobj=stream, mode="r:", tarinfo=_CappedTarInfo)
     except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
         raise InvalidArtifactError(f"Invalid TAR archive {archive_path}: {exc}") from exc
 
@@ -604,6 +623,21 @@ def _read_tar(
             raise InvalidArtifactError(f"Corrupt TAR stream in {archive_path}: {exc}") from exc
 
     return members
+
+
+def _archive_stream(path: Path) -> io.BytesIO:
+    """Pin and bound the archive before any parser can reopen the supplied path."""
+    try:
+        fd = hermetic_safe_io.open_regular(path, MAX_ARTIFACT_BYTES)
+        with os.fdopen(fd, "rb") as stream:
+            if os.fstat(stream.fileno()).st_nlink > 1:
+                raise SecurityViolationError("Hardlinked archive refused")
+            data = stream.read(MAX_ARTIFACT_BYTES + 1)
+        if len(data) > MAX_ARTIFACT_BYTES:
+            raise ResourceLimitError("Archive input byte cap exceeded")
+        return io.BytesIO(data)
+    except (OSError, ValueError) as exc:
+        raise SecurityViolationError(f"Unsafe archive input: {type(exc).__name__}") from exc
 
 
 def load_artifact(

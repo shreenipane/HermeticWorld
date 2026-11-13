@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -71,7 +70,7 @@ pub fn check_pyc_bytecode(
     pyc_path: &Path,
     visibility: Visibility,
 ) -> Result<Vec<Finding>, std::io::Error> {
-    let mut file = File::open(pyc_path)?;
+    let mut file = crate::safe_fs::open_regular(pyc_path)?;
     let mut buf = Vec::new();
     file.by_ref().take(16).read_to_end(&mut buf)?;
     let display_path = pyc_path.display().to_string();
@@ -126,20 +125,23 @@ pub fn check_pyc_bytecode(
         }
     };
 
-    if !source_path.exists() {
-        return Ok(vec![Finding {
-            detector: "D3".into(),
-            channel: "pyc_orphan".into(),
-            path: display_path,
-            visibility,
-            severity: Severity::Gate,
-            confidence: 1.0,
-            hunk: None,
-            evidence: vec![format!("missing source file: {}", source_path.display())],
-        }]);
-    }
-
-    let meta = source_path.metadata()?;
+    let meta = match crate::safe_fs::metadata(&source_path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return Err(std::io::Error::other("source is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vec![Finding {
+                detector: "D3".into(),
+                channel: "pyc_orphan".into(),
+                path: display_path,
+                visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec![format!("missing source file: {}", source_path.display())],
+            }]);
+        }
+        Err(error) => return Err(error),
+    };
     let src_mtime = meta
         .modified()
         .ok()

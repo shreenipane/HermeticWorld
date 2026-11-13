@@ -17,6 +17,7 @@ pub mod gitstore;
 pub mod index;
 pub mod normalize;
 pub mod pyc_marshal;
+pub mod safe_fs;
 pub mod sarif;
 pub mod scan;
 pub mod tier2;

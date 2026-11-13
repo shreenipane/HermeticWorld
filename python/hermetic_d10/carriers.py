@@ -24,7 +24,7 @@ Out of scope (intentionally ignored):
 from __future__ import annotations
 
 import bz2
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from email.parser import HeaderParser
 from email.utils import parsedate_to_datetime
@@ -137,6 +137,12 @@ class ScanCaps:
     max_dir_entries: int = MAX_DIR_ENTRIES
     max_tree_entries: int = MAX_TREE_ENTRIES
 
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if type(value) is not int or value < 0 or (field.name == "read_chunk_size" and value == 0):
+                raise CapExceededError(f"Invalid resource cap: {field.name}")
+
 
 @dataclass
 class _InspectionBudget:
@@ -230,14 +236,17 @@ def parse_rfc3339_utc(value: str) -> datetime:
         raise InvalidTimestampError(f"Invalid RFC 3339 timestamp {value!r}: {exc}") from exc
     if dt.tzinfo is None:
         raise InvalidTimestampError(f"RFC 3339 timestamp must include timezone offset: {value!r}")
-    return dt.astimezone(timezone.utc)
+    try:
+        return dt.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise InvalidTimestampError("Timestamp cannot be represented in UTC") from exc
 
 
 def format_rfc3339_utc(dt: datetime) -> str:
     """Format a timezone-aware datetime as canonical RFC 3339 UTC."""
     utc_dt = dt.astimezone(timezone.utc)
     if utc_dt.microsecond == 0:
-        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return utc_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
     return utc_dt.isoformat().replace("+00:00", "Z")
 
 
@@ -1100,6 +1109,78 @@ def _decompress_xz_bounded(
     )
 
 
+def inspect_warc_bytes(
+    rel_path: str,
+    member_chain: list[str],
+    data: bytes,
+    t_clock: datetime,
+    caps: ScanCaps,
+    budget: _InspectionBudget,
+) -> list[Finding]:
+    """Inspect every WARC/1.0 or 1.1 record, including non-response records.
+
+    Content-Length frames opaque payloads, so body text cannot impersonate headers.
+    Missing, duplicate, folded, invalid or truncated framing fails closed. Header
+    bytes/lines use the metadata caps; records share the archive member budget.
+    """
+    findings: list[Finding] = []
+    offset = 0
+    record = 0
+    while offset < len(data):
+        budget.consume_member()
+        record += 1
+        header_end = data.find(b"\r\n\r\n", offset, offset + caps.max_metadata_bytes + 4)
+        if header_end < 0:
+            if len(data) - offset > caps.max_metadata_bytes:
+                raise CapExceededError("WARC record header byte cap exceeded")
+            raise MalformedArchiveError("Truncated WARC record headers")
+        if header_end + 4 - offset > caps.max_metadata_bytes:
+            raise CapExceededError("WARC record header byte cap exceeded")
+        lines = data[offset:header_end].split(b"\r\n")
+        if len(lines) > caps.max_metadata_lines:
+            raise CapExceededError("WARC record header line cap exceeded")
+        if lines[0] not in (b"WARC/1.0", b"WARC/1.1"):
+            raise MalformedArchiveError("Invalid WARC version")
+        headers: dict[bytes, bytes] = {}
+        for line in lines[1:]:
+            key, separator, value = line.partition(b":")
+            if (not separator or not key or any(c <= 32 or c >= 127 for c in key)):
+                raise MalformedArchiveError("Invalid WARC record header")
+            key = key.lower()
+            if key in headers:
+                raise MalformedArchiveError("Duplicate WARC record header")
+            headers[key] = value.strip(b" \t")
+        raw_length = headers.get(b"content-length", b"")
+        normalized_length = raw_length.lstrip(b"0") or b"0"
+        # A decimal longer than the input length's decimal representation cannot fit.
+        if (not raw_length.isdigit() or len(normalized_length) > len(str(len(data)))):
+            raise MalformedArchiveError("Invalid WARC Content-Length")
+        length = int(normalized_length)
+        raw_date = headers.get(b"warc-date", b"")
+        try:
+            date_text = raw_date.decode("ascii")
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", date_text):
+                raise InvalidTimestampError("Invalid WARC-Date")
+            capture = parse_rfc3339_utc(date_text)
+        except (UnicodeError, HermeticD10Error, OverflowError) as exc:
+            raise MalformedArchiveError("Missing or invalid WARC-Date") from exc
+        body_start = header_end + 4
+        body_end = body_start + length
+        if data[body_end:body_end + 4] != b"\r\n\r\n":
+            raise MalformedArchiveError("Truncated WARC payload or record separator")
+        findings.append(Finding(
+            path=rel_path,
+            member_chain=member_chain + [f"<warc:{record}>"],
+            carrier="warc_date",
+            found_date=format_rfc3339_utc(capture),
+            severity="gate" if capture > t_clock else "info",
+        ))
+        offset = body_end + 4
+    if not record:
+        raise MalformedArchiveError("Empty WARC archive")
+    return findings
+
+
 def inspect_payload_bytes(
     rel_path: str,
     filename: str,
@@ -1116,6 +1197,9 @@ def inspect_payload_bytes(
         budget = _InspectionBudget(caps)
     posix_lower = PurePosixPath(filename).as_posix().lower()
     basename_lower = PurePosixPath(filename).name.lower()
+
+    if basename_lower.endswith(".warc") or data.startswith(b"WARC/"):
+        return inspect_warc_bytes(rel_path, member_chain, data, t_clock, caps, budget)
 
     if basename_lower.endswith(".pyc"):
         return inspect_pyc_bytes(rel_path, member_chain, data, t_clock)

@@ -9,6 +9,10 @@
 use crate::diff::{parse_patch, DiffLineType};
 use crate::scan::{Finding, Severity, Visibility};
 
+pub const MAX_PATCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PATCH_LINES: usize = 100_000;
+const MAX_OPTION_ITEMS: usize = 10_000;
+
 /// Options for detector D11.
 #[derive(Debug, Clone, Default)]
 pub struct D11Options {
@@ -16,6 +20,22 @@ pub struct D11Options {
     pub benchmark_test_files: Vec<String>,
     /// Packages installed in the environment that must not be shadowed.
     pub installed_packages: Vec<String>,
+}
+
+impl D11Options {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.benchmark_test_files.len() > MAX_OPTION_ITEMS
+            || self.installed_packages.len() > MAX_OPTION_ITEMS
+            || self
+                .benchmark_test_files
+                .iter()
+                .chain(&self.installed_packages)
+                .any(|s| s.len() > crate::safe_fs::MAX_PATH_BYTES)
+        {
+            return Err("D11 option cap exceeded");
+        }
+        Ok(())
+    }
 }
 
 /// Built-in list of Python standard-library top-level module names.
@@ -465,6 +485,21 @@ fn is_pkg_match(pkg: &str, module_name: &str) -> bool {
 
 /// Check an agent's unified diff for test-infrastructure changes (Detector D11).
 pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
+    if agent_patch.len() > MAX_PATCH_BYTES
+        || agent_patch.lines().take(MAX_PATCH_LINES + 1).count() > MAX_PATCH_LINES
+        || opts.validate().is_err()
+    {
+        return vec![Finding {
+            detector: "D11".into(),
+            channel: "patch_error".into(),
+            path: String::new(),
+            visibility: Visibility::AgentVisible,
+            severity: Severity::Info,
+            confidence: 0.0,
+            hunk: None,
+            evidence: vec!["patch or option cap exceeded".into()],
+        }];
+    }
     let patch = match parse_patch(agent_patch) {
         Ok(p) => {
             if p.files.is_empty() && !agent_patch.trim().is_empty() {
@@ -607,7 +642,7 @@ pub fn check_d11(agent_patch: &str, opts: &D11Options) -> Vec<Finding> {
         // a newly added file that creates a top-level module or package (path with no directory,
         // e.g. json.py, or a new top-level dir/__init__.py) whose name is in a built-in list of
         // Python standard-library top-level module names or in opts.installed_packages.
-        let is_new_file = file.old_path.is_none() && file.new_path.is_some();
+        let is_new_file = file.new_path.is_some() && file.old_path != file.new_path;
         if is_new_file {
             let top_level_module = if !path.contains('/') && path.ends_with(".py") {
                 path.strip_suffix(".py")

@@ -1892,5 +1892,6 @@ pub fn query_reader_with_limit<R: Read>(
         merger.push(rec)?;
     }
     merger.finish()?;
+    crate::scan::relative_d4_paths(&mut findings, Path::new(&root));
     Ok(findings)
 }
