@@ -198,3 +198,26 @@ fn checked_in_policy_and_probe_agree() {
         .collect::<String>();
     assert!(lockdown::config_sealed(&text).unwrap());
 }
+
+// The probe's lists must match the build policy in python/hermetic_slice/guest_kernel.py.
+// A drift (PERF_EVENTS, which x86 force-selects) made the real lockdown kernel
+// report ring0_paths "leak" in the nested-VM smoke on 2026-11-14.
+#[test]
+fn lockdown_lists_match_kernel_build_policy() {
+    let py = include_str!("../../../python/hermetic_slice/guest_kernel.py");
+    let line = py
+        .lines()
+        .find(|l| l.contains("Phase 3b: deny guest root access") && l.contains("\"MODULES "))
+        .expect("forbidden policy line");
+    let policy: std::collections::BTreeSet<&str> = line
+        .rsplit_once(", \"")
+        .unwrap()
+        .1
+        .trim_end_matches("\"),")
+        .split_ascii_whitespace()
+        .collect();
+    let probe: std::collections::BTreeSet<&str> =
+        hermetic_clockprobe::lockdown::FORBIDDEN.iter().copied().collect();
+    assert_eq!(probe, policy);
+    assert!(!probe.contains("PERF_EVENTS"));
+}

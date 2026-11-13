@@ -779,6 +779,13 @@ fn boots_guest_and_checks_root_lockdown() {
             end,
         )
         .unwrap();
+        eprintln!(
+            "clockprobe code={:?} truncated={} timed_out={} output:\n{}",
+            reply.code,
+            reply.truncated,
+            reply.timed_out,
+            String::from_utf8_lossy(&reply.output[..reply.output.len().min(4096)])
+        );
         assert!(
             lockdown_reply_passes(&reply),
             "module_load and ring0_paths must both report blocked"

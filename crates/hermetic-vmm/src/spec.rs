@@ -186,6 +186,13 @@ pub fn validate_boot_args(args: &str) -> Result<()> {
                 }
                 required[2] = true;
             }
+            _ if arg.starts_with("tsc_early_khz=") => {
+                // Only the VMM appends this (host CPUID 0x15); specs may not set it.
+                let value = arg.strip_prefix("tsc_early_khz=").unwrap_or("");
+                if !crate::plan::valid_tsc_khz_text(value) {
+                    return Err(Error::Validation("tsc_early_khz range/encoding"));
+                }
+            }
             _ if arg.starts_with("rw=")
                 || arg.starts_with("ip=")
                 || arg.starts_with("clocksource=")
@@ -261,6 +268,13 @@ impl VmSpec {
             ));
         }
         validate_boot_args(&self.boot_args)?;
+        if self
+            .boot_args
+            .split_ascii_whitespace()
+            .any(|a| a.starts_with("tsc_early_khz="))
+        {
+            return Err(Error::Validation("tsc_early_khz is set by the VMM"));
+        }
         let words: Vec<_> = self.boot_args.split_ascii_whitespace().collect();
         if let Some(initrd) = &self.initrd {
             if self.role != Role::Agent

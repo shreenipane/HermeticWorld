@@ -3,6 +3,71 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const VMM_OVERHEAD_MIB: u64 = 128;
+/// Accepted guest TSC frequency range in kHz (100 MHz to 10 GHz).
+pub const TSC_KHZ_RANGE: std::ops::RangeInclusive<u64> = 100_000..=10_000_000;
+
+/// The host TSC frequency from CPUID leaf 0x15 (crystal Hz * EBX / EAX), in kHz.
+/// The guest kernel has no kvmclock, PIT, HPET or ACPI PM timer to calibrate
+/// against, so the VMM passes this exact value as `tsc_early_khz=`. Returns
+/// None when the leaf is absent or incomplete; nothing is guessed.
+pub fn host_tsc_khz() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        if __cpuid(0).eax < 0x15 {
+            return None;
+        }
+        let r = __cpuid(0x15);
+        tsc_khz_from_leaf15(r.eax, r.ebx, r.ecx)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// Pure leaf-0x15 arithmetic, separated for tests.
+pub fn tsc_khz_from_leaf15(eax: u32, ebx: u32, ecx: u32) -> Option<u64> {
+    if eax == 0 || ebx == 0 || ecx == 0 {
+        return None;
+    }
+    let khz = u64::from(ecx) * u64::from(ebx) / u64::from(eax) / 1000;
+    TSC_KHZ_RANGE.contains(&khz).then_some(khz)
+}
+
+pub(crate) fn valid_tsc_khz_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 8
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && !value.starts_with('0')
+        && value
+            .parse::<u64>()
+            .is_ok_and(|v| TSC_KHZ_RANGE.contains(&v))
+}
+
+/// CPUID leaf 0x15 wins. Hosts without it (AMD, nested QEMU) need the operator
+/// to set HERMETIC_TSC_KHZ to the host kernel's own "tsc: Detected" value.
+/// An invalid override is an error even when CPUID is available.
+pub fn resolve_tsc_khz(cpuid: Option<u64>, operator: Option<&str>) -> crate::Result<u64> {
+    let operator = match operator {
+        Some(v) if valid_tsc_khz_text(v) => v.parse::<u64>().ok(),
+        Some(_) => return Err(crate::Error::Validation("HERMETIC_TSC_KHZ range/encoding")),
+        None => None,
+    };
+    cpuid.or(operator).ok_or(crate::Error::Validation(
+        "host TSC frequency unavailable: no CPUID leaf 0x15 and no HERMETIC_TSC_KHZ",
+    ))
+}
+
+/// Append the VMM-owned TSC frequency to a `/boot-source` request.
+pub fn with_tsc_khz(mut req: ApiRequest, khz: u64) -> ApiRequest {
+    if req.path == "/boot-source" {
+        if let Some(Value::String(args)) = req.body.get_mut("boot_args") {
+            args.push_str(&format!(" tsc_early_khz={khz}"));
+        }
+    }
+    req
+}
 pub const CPU_TEMPLATE: &str = include_str!("../../../vmm/hide-kvmclock.cpu-template.json");
 /// The template is embedded so a plan cannot depend on a mutable host file.
 pub fn cpu_template() -> Value {

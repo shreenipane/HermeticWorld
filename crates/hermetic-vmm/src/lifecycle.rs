@@ -147,7 +147,12 @@ impl<R: Runner> Vmm<R> {
                     Err(e) => return Err(e),
                 }
             }
+            let tsc_khz = crate::plan::resolve_tsc_khz(
+                crate::plan::host_tsc_khz(),
+                std::env::var("HERMETIC_TSC_KHZ").ok().as_deref(),
+            )?;
             for req in crate::api_requests(&self.spec) {
+                let req = crate::plan::with_tsc_khz(req, tsc_khz);
                 let step = match req.path.as_str() {
                     "/machine-config" => "configure machine",
                     "/cpu-config" => "configure CPU template",

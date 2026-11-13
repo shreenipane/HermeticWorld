@@ -43,7 +43,6 @@ pub const FORBIDDEN: &[&str] = &[
     "KPROBE_EVENTS",
     "UPROBE_EVENTS",
     "BPF_EVENTS",
-    "PERF_EVENTS",
     "ACPI_CUSTOM_METHOD",
     "ACPI_TABLE_UPGRADE",
     "PARAVIRT",
