@@ -130,6 +130,7 @@ pub struct DevUnjailed {
     process: Option<OwnedProcess>,
     root: String,
     launcher: Option<ExecLauncher>,
+    console: std::sync::Arc<std::sync::Mutex<CaptureData>>,
 }
 #[cfg(feature = "dev-unjailed")]
 impl DevUnjailed {
@@ -138,6 +139,13 @@ impl DevUnjailed {
             launcher: Some(ExecLauncher::open(python)?),
             ..Self::default()
         })
+    }
+
+    /// Development diagnostics only: bounded stdout (serial) and stderr captures.
+    /// Retained after lifecycle failure cleanup kills and drops the process.
+    pub fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        let data = self.console.lock().unwrap_or_else(|e| e.into_inner());
+        (data.stdout.clone(), data.stderr.clone())
     }
 }
 #[cfg(feature = "dev-unjailed")]
@@ -157,7 +165,7 @@ impl Runner for DevUnjailed {
             .root
             .replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1);
         let args = vec!["--api-sock".into(), format!("{}api.socket", self.root)];
-        self.process = Some(OwnedProcess::spawn(
+        let process = OwnedProcess::spawn(
             jail.executable()?,
             &args,
             spec,
@@ -165,7 +173,9 @@ impl Runner for DevUnjailed {
                 .as_ref()
                 .ok_or(Error::Validation("configure pinned exec launcher"))?,
             end,
-        )?);
+        )?;
+        self.console = process.output._data.clone();
+        self.process = Some(process);
         Ok(())
     }
     fn request(&mut self, socket: &str, request: &ApiRequest, end: Instant) -> Result<()> {

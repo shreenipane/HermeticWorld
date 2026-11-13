@@ -987,3 +987,10 @@ def test_policy_requires_proc_children_for_execd_reaper():
     assert k.RULES["CONFIG_PROC_CHILDREN"].value == "y"
     assert k.parse_config((ROOT / "hermetic.config").read_bytes())["CONFIG_PROC_CHILDREN"] == "y"
     assert [f.option for f in k.check_config(config(_policy(CONFIG_PROC_CHILDREN="n")))] == ["CONFIG_PROC_CHILDREN"]
+
+
+def test_netvm_filter_requires_builtin_legacy_tables():
+    for option in ("CONFIG_NETFILTER_XTABLES", "CONFIG_IP_NF_IPTABLES", "CONFIG_IP_NF_FILTER"):
+        assert k.RULES[option].value == "y"
+        assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
+        assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
