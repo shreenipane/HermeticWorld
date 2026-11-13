@@ -383,7 +383,7 @@ where
     match task_class {
         TaskClass::State => {}
         TaskClass::Patch { repo_dir } => {
-            if repo_dir == "." {
+            if repo_dir.is_empty() {
                 state.walk_dir("", 0, Reach::both())?;
             } else {
                 validate_relative_path(repo_dir)?;

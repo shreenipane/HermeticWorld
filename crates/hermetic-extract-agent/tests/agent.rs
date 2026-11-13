@@ -15,6 +15,25 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+/// Builds one fixed 60-byte little-endian record header (flags and reserved bytes zero).
+fn record_header(
+    record_type: u8,
+    path_len: u32,
+    mode: u32,
+    size: u64,
+    record_count: u64,
+    sha256: &[u8; 32],
+) -> Vec<u8> {
+    let mut h = vec![record_type, 0, 0, 0];
+    h.extend_from_slice(&path_len.to_le_bytes());
+    h.extend_from_slice(&mode.to_le_bytes());
+    h.extend_from_slice(&size.to_le_bytes());
+    h.extend_from_slice(&record_count.to_le_bytes());
+    h.extend_from_slice(sha256);
+    assert_eq!(h.len(), 60);
+    h
+}
+
 fn write_file(path: &Path, content: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -210,7 +229,7 @@ fn round_trip_verifies_end_record_and_task_classes() {
             },
             Record::End {
                 record_count: 1,
-                stream_sha256: Sha256::digest(&patch_stream[..patch_stream.len() - 47]).into(),
+                total_bytes: 2,
             }
         ]
     );
@@ -266,7 +285,7 @@ fn round_trip_verifies_end_record_and_task_classes() {
         state_records,
         vec![Record::End {
             record_count: 0,
-            stream_sha256: Sha256::digest(b"HEXT\x01\x00").into(),
+            total_bytes: 0,
         }]
     );
 }
@@ -300,7 +319,7 @@ fn git_ignored_at_any_depth() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &caps,
         &mut stream,
@@ -389,7 +408,7 @@ fn skipped_kinds_listed_in_report_and_never_followed() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut stream,
@@ -442,7 +461,7 @@ fn file_changed_during_read_fails_closed() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut stream,
@@ -476,7 +495,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps {
             max_entries: 1,
@@ -494,7 +513,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
     ));
     assert!(err.to_string().contains("entries"));
     // Directory collection exceeds the budget before emitting any records.
-    assert_eq!(out_entries, b"HEXT\x01\x00");
+    assert_eq!(out_entries, b"HEXT\x01\x00\x00\x00");
 
     // 2. Depth cap
     let mut out_depth = Vec::new();
@@ -502,7 +521,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps {
             max_depth: 2,
@@ -526,7 +545,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps {
             max_path_len: 8,
@@ -550,7 +569,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps {
             max_file_bytes: 6,
@@ -569,7 +588,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
     assert!(err.to_string().contains("per_file_bytes"));
     // "a.txt" (5 bytes) was emitted, then "b.txt" (10 bytes > 6) aborted before emitting anything further
     let len_after_a = out_file_bytes.len();
-    assert_eq!(len_after_a, 6 + 47 + 5 + 5);
+    assert_eq!(len_after_a, 8 + 60 + 5 + 5);
 
     // 5. Total bytes cap
     let mut out_total_bytes = Vec::new();
@@ -577,7 +596,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps {
             max_total_bytes: 12,
@@ -594,18 +613,14 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         }
     ));
     assert!(err.to_string().contains("total_bytes"));
-    assert_eq!(out_total_bytes.len(), 6 + 47 + 5 + 5);
+    assert_eq!(out_total_bytes.len(), 8 + 60 + 5 + 5);
 
     // Decoder also enforces caps before allocating untrusted lengths
     let mut crafted = Vec::new();
     crafted.extend_from_slice(b"HEXT");
-    crafted.extend_from_slice(&1u16.to_le_bytes());
-    crafted.push(1); // file
-    crafted.extend_from_slice(&5u16.to_le_bytes());
+    crafted.extend_from_slice(&1u32.to_le_bytes());
+    crafted.extend_from_slice(&record_header(1, 5, 0o644, u64::MAX, 0, &[0u8; 32]));
     crafted.extend_from_slice(b"x.txt");
-    crafted.extend_from_slice(&0o644u32.to_le_bytes());
-    crafted.extend_from_slice(&u64::MAX.to_le_bytes());
-    crafted.extend_from_slice(&[0u8; 32]);
     let dec_err = decode(&crafted[..]).unwrap_err();
     assert!(matches!(
         dec_err,
@@ -617,7 +632,7 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
 }
 
 #[test]
-fn end_record_hash_and_count_checked() {
+fn end_record_count_and_total_bytes_checked() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path().join("base");
     let work = tmp.path().join("work");
@@ -632,7 +647,7 @@ fn end_record_hash_and_count_checked() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut stream,
@@ -640,28 +655,38 @@ fn end_record_hash_and_count_checked() {
     .unwrap();
 
     let records = decode(&stream[..]).unwrap();
-    let end_offset = stream.len() - 47;
-    let expected_digest: [u8; 32] = Sha256::digest(&stream[..end_offset]).into();
+    let end_offset = stream.len() - 60;
     assert_eq!(
         records.last().unwrap(),
         &Record::End {
             record_count: 2,
-            stream_sha256: expected_digest,
+            total_bytes: 9,
         }
     );
 
-    // Corrupting the end-record stream hash fails with StreamHashMismatch
+    // Corrupting the end-record total bytes fails with EndTotalBytesMismatch
+    let mut bad_total = stream.clone();
+    bad_total[end_offset + 12] = 99;
+    assert_eq!(
+        decode(&bad_total[..]).unwrap_err(),
+        DecodeError::EndTotalBytesMismatch {
+            expected: 9,
+            actual: 99,
+        }
+    );
+
+    // A nonzero end-record hash field is refused
     let mut bad_hash = stream.clone();
     let last_idx = bad_hash.len() - 1;
     bad_hash[last_idx] ^= 0xff;
     assert_eq!(
         decode(&bad_hash[..]).unwrap_err(),
-        DecodeError::StreamHashMismatch
+        DecodeError::NonZeroHash { record_type: 4 }
     );
 
     // Corrupting the end-record count fails with EndRecordCountMismatch
     let mut bad_count = stream.clone();
-    let count_offset = end_offset + 1 + 2 + 4;
+    let count_offset = end_offset + 20;
     bad_count[count_offset] = 99;
     assert_eq!(
         decode(&bad_count[..]).unwrap_err(),
@@ -688,7 +713,7 @@ fn truncated_stream_at_every_offset_fails_without_panic() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut stream,
@@ -732,7 +757,7 @@ fn known_answer_stream_bytes_for_tiny_tree() {
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut actual_stream,
@@ -741,35 +766,22 @@ fn known_answer_stream_bytes_for_tiny_tree() {
 
     // Hand-construct exact wire format bytes:
     let mut expected = Vec::new();
-    // Header: magic b"HEXT", version u16 = 1 LE
+    // Header: magic b"HEXT", version u32 = 1 LE
     expected.extend_from_slice(b"HEXT");
-    expected.extend_from_slice(&1u16.to_le_bytes());
+    expected.extend_from_slice(&1u32.to_le_bytes());
 
     // Record 0: File "hi.txt" (6 bytes), mode 0o644, size 3, sha256("hi\n"), bytes b"hi\n"
     let hi_sha: [u8; 32] = Sha256::digest(b"hi\n").into();
-    expected.push(1u8);
-    expected.extend_from_slice(&6u16.to_le_bytes());
+    expected.extend_from_slice(&record_header(1, 6, 0o644, 3, 0, &hi_sha));
     expected.extend_from_slice(b"hi.txt");
-    expected.extend_from_slice(&0o644u32.to_le_bytes());
-    expected.extend_from_slice(&3u64.to_le_bytes());
-    expected.extend_from_slice(&hi_sha);
     expected.extend_from_slice(b"hi\n");
 
     // Record 1: Delete "old.txt" (7 bytes), mode 0, size 0, sha256 = [0; 32]
-    expected.push(3u8);
-    expected.extend_from_slice(&7u16.to_le_bytes());
+    expected.extend_from_slice(&record_header(3, 7, 0, 0, 0, &[0u8; 32]));
     expected.extend_from_slice(b"old.txt");
-    expected.extend_from_slice(&0u32.to_le_bytes());
-    expected.extend_from_slice(&0u64.to_le_bytes());
-    expected.extend_from_slice(&[0u8; 32]);
 
-    // Record 2: End, path_len = 0, mode = 0, size = 2 (preceding records), sha256(all preceding bytes)
-    let preceding_sha: [u8; 32] = Sha256::digest(&expected).into();
-    expected.push(4u8);
-    expected.extend_from_slice(&0u16.to_le_bytes());
-    expected.extend_from_slice(&0u32.to_le_bytes());
-    expected.extend_from_slice(&2u64.to_le_bytes());
-    expected.extend_from_slice(&preceding_sha);
+    // Record 2: End, path_len 0, mode 0, size = total file bytes (3), record_count = 2
+    expected.extend_from_slice(&record_header(4, 0, 0, 3, 2, &[0u8; 32]));
 
     assert_eq!(actual_stream, expected);
 }
@@ -900,7 +912,7 @@ fn regression_base_symlink_replaced_by_real_dir_is_not_compared_through_symlink(
         &base,
         &work,
         &TaskClass::Patch {
-            repo_dir: ".".to_string(),
+            repo_dir: String::new(),
         },
         &Caps::default(),
         &mut stream,
@@ -950,7 +962,7 @@ fn regression_fifo_swapped_in_after_stat_does_not_block() {
             &base_t,
             &work_t,
             &TaskClass::Patch {
-                repo_dir: ".".to_string(),
+                repo_dir: String::new(),
             },
             &Caps::default(),
             &mut stream,
@@ -995,7 +1007,7 @@ fn regression_cli_failed_extraction_leaves_no_partial_output() {
         .arg("--work")
         .arg(&work)
         .arg("--class")
-        .arg("patch:.")
+        .arg("patch:")
         .arg("--out")
         .arg(&out_file)
         .arg("--report")
@@ -1074,6 +1086,6 @@ fn review_mode_change_between_probe_and_read_is_rejected() {
         |_: &str| fs::set_permissions(work.path().join("x"), fs::Permissions::from_mode(0o755));
     let mut stream = Vec::new();
     assert!(
-        matches!(extract_with_hook(base.path(), work.path(), &TaskClass::Patch { repo_dir: ".".into() }, &Caps::default(), &mut stream, Some(&mut hook)), Err(ExtractError::FileChangedDuringRead { path }) if path == "x")
+        matches!(extract_with_hook(base.path(), work.path(), &TaskClass::Patch { repo_dir: String::new() }, &Caps::default(), &mut stream, Some(&mut hook)), Err(ExtractError::FileChangedDuringRead { path }) if path == "x")
     );
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Development grader smoke test (offline). For a tiny fixture task it builds one grader
 # tree and one D4-checked grader image per variant (empty patch, gold patch), runs the
-# real grading chain in that tree with no network:
+# real grading chain in that tree with no network. The variant's change reaches the tree
+# through hermetic-extract-agent (HEXT v1 stream) and the hermetic-extract validator:
 #   hermetic-grader-supervisor -> pytest + hermetic_grader_records plugin (HGR1 records)
 #   -> 1 MiB HGRD result disk
 # for runs R0, R1 and R2, and validates the result disks on the host with
@@ -35,6 +36,9 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q \
   --target x86_64-unknown-linux-gnu
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 install -m 0700 "$BIN/hermetic-sealcheck" "$WORK/sealcheck"
+# Change extraction (agent) and host-side validation (validator), run on the host here.
+cargo build --release -q -p hermetic-extract-agent -p hermetic-extract
+HBIN="$CARGO_TARGET_DIR/release"
 SP="$(ls -d "$VENV"/lib/python3*/site-packages)"
 
 # Base userland: the local python:3.12-alpine image, exported offline.
@@ -56,10 +60,19 @@ for v in empty gold; do
   cp python/hermetic_grader_records/{__init__,plugin,record,supervisor}.py "$GSP/hermetic_grader_records/"
   cp python/hermetic_safe_io.py "$GSP/"
   find "$GSP" -name __pycache__ -type d -prune -exec rm -r {} +
-  # The work under test: base repo plus the variant's patch, tests baked in.
+  # The work under test: the variant's patch is applied to a copy of the base repo, the
+  # agent extracts the changes as a HEXT v1 stream, and the host validator publishes
+  # base + changes (tests restored from base) into the grader tree.
+  X="$D/extract"; mkdir "$X"
+  cp -r "$FIX/repo" "$X/base"; cp -r "$FIX/repo" "$X/work"
+  (cd "$X/work" && patch -s -p1 < "$FIX/$v.patch")
+  "$HBIN/hermetic-extract-agent" --base "$X/base" --work "$X/work" --class patch: \
+    --out "$X/changes.hext" --report "$X/agent-report.json"
+  "$HBIN/hermetic-extract-validate" --stream "$X/changes.hext" --base "$X/base" \
+    --out "$X/published" --class patch --config "$FIX/extract-config.json" > "$X/validate-report.json"
   mkdir -p "$TREE/work" "$TREE/etc/hermetic/grader"
-  cp -r "$FIX/repo" "$TREE/work/repo"
-  (cd "$TREE/work/repo" && patch -s -p1 < "$FIX/$v.patch")
+  cp -r "$X/published" "$TREE/work/repo"
+  chmod 0755 "$TREE/work/repo"
   install -m 0755 "$BIN/hermetic-grader-supervisor" "$TREE/sbin/hermetic-grader-supervisor"
   # Runner settings (TR-GR-4): python -s, plugin autoload off, result plugin via -p.
   # The plugin requires a result fd >= 3, while the supervisor hands the pipe over on

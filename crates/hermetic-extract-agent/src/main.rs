@@ -13,7 +13,7 @@ use hermetic_extract_agent::{extract, parse_task_class, Caps, ExtractError, Task
 const MAX_CLI_ARGS: usize = 64;
 const MAX_CLI_ARG_BYTES: usize = 16 * 1024;
 
-const USAGE: &str = "Usage: hermetic-extract-agent --base DIR --work DIR --class patch:REPO|artifact:P1,P2|state --out FILE --report FILE";
+const USAGE: &str = "Usage: hermetic-extract-agent --base DIR --work DIR --class patch:REPO|patch:|artifact:P1,P2|state --out FILE --report FILE";
 
 #[derive(Debug)]
 struct CliArgs {

@@ -11,8 +11,10 @@ use crate::{
 
 /// Magic header identifying a Hermetic Extract (`HEXT`) stream.
 pub const STREAM_MAGIC: &[u8; 4] = b"HEXT";
-/// Current wire format version.
-pub const STREAM_VERSION: u16 = 1;
+/// Current wire format version (`u32` little-endian on the wire).
+pub const STREAM_VERSION: u32 = 1;
+/// Fixed size of every record header.
+pub const RECORD_HEADER_SIZE: usize = 60;
 
 pub const RECORD_TYPE_FILE: u8 = 1;
 pub const RECORD_TYPE_DIR: u8 = 2;
@@ -24,8 +26,7 @@ pub const MODE_FILE_EXEC: u32 = 0o755;
 pub const MODE_DIR: u32 = 0o755;
 pub const MODE_ZERO: u32 = 0;
 
-const STREAM_HEADER_LEN: usize = 6;
-const RECORD_FIXED_HEADER_LEN: usize = 1 + 2 + 4 + 8 + 32;
+const STREAM_HEADER_LEN: usize = 8;
 
 /// Decoded stream record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,33 +45,64 @@ pub enum Record {
         path: String,
     },
     End {
+        /// Number of records preceding the end record.
         record_count: u64,
-        stream_sha256: [u8; 32],
+        /// Sum of all file payload byte lengths in the stream.
+        total_bytes: u64,
     },
 }
 
-/// Streaming writer that tracks record count and cumulative SHA-256 of preceding bytes.
+/// Fixed-width record header fields (all integers little-endian on the wire).
+struct RecordFields<'a> {
+    record_type: u8,
+    path: &'a [u8],
+    mode: u32,
+    size: u64,
+    record_count: u64,
+    sha256: &'a [u8; 32],
+}
+
+fn encode_header(f: &RecordFields<'_>) -> Result<[u8; RECORD_HEADER_SIZE], ExtractError> {
+    let path_len = u32::try_from(f.path.len()).map_err(|_| ExtractError::CapExceeded {
+        cap: CapName::PathLength,
+        limit: HARD_MAX_PATH_LEN as u64,
+        actual: f.path.len() as u64,
+    })?;
+    let mut buf = [0u8; RECORD_HEADER_SIZE];
+    buf[0] = f.record_type;
+    // buf[1] flags and buf[2..4] reserved stay zero.
+    buf[4..8].copy_from_slice(&path_len.to_le_bytes());
+    buf[8..12].copy_from_slice(&f.mode.to_le_bytes());
+    buf[12..20].copy_from_slice(&f.size.to_le_bytes());
+    buf[20..28].copy_from_slice(&f.record_count.to_le_bytes());
+    buf[28..60].copy_from_slice(f.sha256);
+    Ok(buf)
+}
+
+/// Streaming writer that tracks the record count and cumulative file payload bytes.
 pub(crate) struct StreamWriter<W: Write> {
     writer: W,
-    hasher: Sha256,
     record_count: u64,
+    total_bytes: u64,
 }
 
 impl<W: Write> StreamWriter<W> {
     pub(crate) fn new(mut writer: W) -> Result<Self, ExtractError> {
         let mut header = [0u8; STREAM_HEADER_LEN];
         header[0..4].copy_from_slice(STREAM_MAGIC);
-        header[4..6].copy_from_slice(&STREAM_VERSION.to_le_bytes());
-
-        let mut hasher = Sha256::new();
+        header[4..8].copy_from_slice(&STREAM_VERSION.to_le_bytes());
         write_all_bounded(&mut writer, &header, "stream header", None)?;
-        hasher.update(header);
-
         Ok(Self {
             writer,
-            hasher,
             record_count: 0,
+            total_bytes: 0,
         })
+    }
+
+    fn next_count(&self) -> Result<u64, ExtractError> {
+        self.record_count
+            .checked_add(1)
+            .ok_or(ExtractError::RecordCountOverflow)
     }
 
     pub(crate) fn write_file(
@@ -86,23 +118,25 @@ impl<W: Write> StreamWriter<W> {
                 reason: "invalid file mode",
             });
         }
-        let path_len = u16::try_from(path.len()).map_err(|_| ExtractError::CapExceeded {
-            cap: CapName::PathLength,
-            limit: u16::MAX as u64,
-            actual: path.len() as u64,
-        })?;
-        let next_count = self
-            .record_count
-            .checked_add(1)
-            .ok_or(ExtractError::RecordCountOverflow)?;
+        let next_count = self.next_count()?;
+        let next_total =
+            self.total_bytes
+                .checked_add(data.len() as u64)
+                .ok_or(ExtractError::CapExceeded {
+                    cap: CapName::TotalBytes,
+                    limit: HARD_MAX_TOTAL_BYTES,
+                    actual: u64::MAX,
+                })?;
 
-        self.write_record_prefix(
-            RECORD_TYPE_FILE,
-            path_len,
-            path.as_bytes(),
-            mode,
-            data.len() as u64,
-            &sha256,
+        self.write_record_header(
+            &RecordFields {
+                record_type: RECORD_TYPE_FILE,
+                path: path.as_bytes(),
+                mode,
+                size: data.len() as u64,
+                record_count: 0,
+                sha256: &sha256,
+            },
             Some(path),
         )?;
 
@@ -115,76 +149,59 @@ impl<W: Write> StreamWriter<W> {
             let end = offset.saturating_add(MAX_CHUNK_BYTES).min(data.len());
             if let Some(slice) = data.get(offset..end) {
                 write_all_bounded(&mut self.writer, slice, "file payload", Some(path))?;
-                self.hasher.update(slice);
             }
             offset = end;
         }
 
         self.record_count = next_count;
+        self.total_bytes = next_total;
         Ok(())
     }
 
     pub(crate) fn write_dir(&mut self, path: &str) -> Result<(), ExtractError> {
-        let path_len = u16::try_from(path.len()).map_err(|_| ExtractError::CapExceeded {
-            cap: CapName::PathLength,
-            limit: u16::MAX as u64,
-            actual: path.len() as u64,
-        })?;
-        let next_count = self
-            .record_count
-            .checked_add(1)
-            .ok_or(ExtractError::RecordCountOverflow)?;
-
-        self.write_record_prefix(
-            RECORD_TYPE_DIR,
-            path_len,
-            path.as_bytes(),
-            MODE_DIR,
-            0,
-            &[0u8; 32],
+        let next_count = self.next_count()?;
+        self.write_record_header(
+            &RecordFields {
+                record_type: RECORD_TYPE_DIR,
+                path: path.as_bytes(),
+                mode: MODE_DIR,
+                size: 0,
+                record_count: 0,
+                sha256: &[0u8; 32],
+            },
             Some(path),
         )?;
-
         self.record_count = next_count;
         Ok(())
     }
 
     pub(crate) fn write_delete(&mut self, path: &str) -> Result<(), ExtractError> {
-        let path_len = u16::try_from(path.len()).map_err(|_| ExtractError::CapExceeded {
-            cap: CapName::PathLength,
-            limit: u16::MAX as u64,
-            actual: path.len() as u64,
-        })?;
-        let next_count = self
-            .record_count
-            .checked_add(1)
-            .ok_or(ExtractError::RecordCountOverflow)?;
-
-        self.write_record_prefix(
-            RECORD_TYPE_DELETE,
-            path_len,
-            path.as_bytes(),
-            MODE_ZERO,
-            0,
-            &[0u8; 32],
+        let next_count = self.next_count()?;
+        self.write_record_header(
+            &RecordFields {
+                record_type: RECORD_TYPE_DELETE,
+                path: path.as_bytes(),
+                mode: MODE_ZERO,
+                size: 0,
+                record_count: 0,
+                sha256: &[0u8; 32],
+            },
             Some(path),
         )?;
-
         self.record_count = next_count;
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<W, ExtractError> {
-        let digest: [u8; 32] = self.hasher.clone().finalize().into();
-        self.write_record_prefix(
-            RECORD_TYPE_END,
-            0,
-            &[],
-            MODE_ZERO,
-            self.record_count,
-            &digest,
-            None,
-        )?;
+        let fields = RecordFields {
+            record_type: RECORD_TYPE_END,
+            path: &[],
+            mode: MODE_ZERO,
+            size: self.total_bytes,
+            record_count: self.record_count,
+            sha256: &[0u8; 32],
+        };
+        self.write_record_header(&fields, None)?;
         self.writer.flush().map_err(|e| ExtractError::Io {
             context: "stream flush",
             path: None,
@@ -193,36 +210,16 @@ impl<W: Write> StreamWriter<W> {
         Ok(self.writer)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_record_prefix(
+    fn write_record_header(
         &mut self,
-        record_type: u8,
-        path_len: u16,
-        path_bytes: &[u8],
-        mode: u32,
-        size: u64,
-        sha256: &[u8; 32],
+        fields: &RecordFields<'_>,
         path_ctx: Option<&str>,
     ) -> Result<(), ExtractError> {
-        let mut head = [0u8; 3];
-        head[0] = record_type;
-        head[1..3].copy_from_slice(&path_len.to_le_bytes());
-
-        let mut tail = [0u8; 4 + 8 + 32];
-        tail[0..4].copy_from_slice(&mode.to_le_bytes());
-        tail[4..12].copy_from_slice(&size.to_le_bytes());
-        tail[12..44].copy_from_slice(sha256);
-
+        let head = encode_header(fields)?;
         write_all_bounded(&mut self.writer, &head, "record header", path_ctx)?;
-        self.hasher.update(head);
-
-        if !path_bytes.is_empty() {
-            write_all_bounded(&mut self.writer, path_bytes, "record path", path_ctx)?;
-            self.hasher.update(path_bytes);
+        if !fields.path.is_empty() {
+            write_all_bounded(&mut self.writer, fields.path, "record path", path_ctx)?;
         }
-
-        write_all_bounded(&mut self.writer, &tail, "record metadata", path_ctx)?;
-        self.hasher.update(tail);
         Ok(())
     }
 }
@@ -290,7 +287,9 @@ pub enum DecodeError {
     },
     Truncated,
     InvalidMagic,
-    UnsupportedVersion(u16),
+    UnsupportedVersion(u32),
+    InvalidFlags(u8),
+    InvalidReserved([u8; 2]),
     InvalidRecordType(u8),
     InvalidUtf8,
     InvalidPath {
@@ -311,6 +310,9 @@ pub enum DecodeError {
     NonZeroHash {
         record_type: u8,
     },
+    NonZeroRecordCount {
+        record_type: u8,
+    },
     CapExceeded {
         cap: CapName,
         limit: u64,
@@ -324,7 +326,10 @@ pub enum DecodeError {
         expected: u64,
         actual: u64,
     },
-    StreamHashMismatch,
+    EndTotalBytesMismatch {
+        expected: u64,
+        actual: u64,
+    },
     TrailingBytes,
     Io(io::ErrorKind),
 }
@@ -338,6 +343,17 @@ impl fmt::Display for DecodeError {
             DecodeError::Truncated => write!(f, "unexpected end of stream (truncated)"),
             DecodeError::InvalidMagic => write!(f, "invalid stream magic (expected HEXT)"),
             DecodeError::UnsupportedVersion(v) => write!(f, "unsupported stream version: {}", v),
+            DecodeError::InvalidFlags(v) => write!(f, "nonzero record flags: {}", v),
+            DecodeError::InvalidReserved(r) => {
+                write!(f, "nonzero reserved bytes: {:02x}{:02x}", r[0], r[1])
+            }
+            DecodeError::NonZeroRecordCount { record_type } => {
+                write!(
+                    f,
+                    "expected zero record_count for record type {}",
+                    record_type
+                )
+            }
             DecodeError::InvalidRecordType(t) => write!(f, "invalid record type: {}", t),
             DecodeError::InvalidUtf8 => write!(f, "record path is not valid UTF-8"),
             DecodeError::InvalidPath { path, reason } => {
@@ -381,8 +397,12 @@ impl fmt::Display for DecodeError {
                     expected, actual
                 )
             }
-            DecodeError::StreamHashMismatch => {
-                write!(f, "end record stream SHA-256 mismatch")
+            DecodeError::EndTotalBytesMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "end record total bytes mismatch: expected {}, got {}",
+                    expected, actual
+                )
             }
             DecodeError::TrailingBytes => {
                 write!(f, "unexpected trailing bytes after end record")
@@ -415,14 +435,10 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
     if header.get(0..4) != Some(STREAM_MAGIC.as_slice()) {
         return Err(DecodeError::InvalidMagic);
     }
-    let ver_bytes = [header[4], header[5]];
-    let version = u16::from_le_bytes(ver_bytes);
+    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if version != STREAM_VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
     }
-
-    let mut stream_hasher = Sha256::new();
-    stream_hasher.update(header);
 
     let mut records: Vec<Record> = Vec::new();
     let mut non_end_count: u64 = 0;
@@ -431,51 +447,41 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
     let max_loop_records = caps.max_entries.min(HARD_MAX_ENTRIES).saturating_add(1);
 
     for _ in 0..max_loop_records {
-        let mut type_and_len = [0u8; 3];
-        read_exact_or_truncated(&mut reader, &mut type_and_len)?;
+        let mut head = [0u8; RECORD_HEADER_SIZE];
+        read_exact_or_truncated(&mut reader, &mut head)?;
 
-        let record_type = type_and_len[0];
+        let record_type = head[0];
         if !(RECORD_TYPE_FILE..=RECORD_TYPE_END).contains(&record_type) {
             return Err(DecodeError::InvalidRecordType(record_type));
         }
+        if head[1] != 0 {
+            return Err(DecodeError::InvalidFlags(head[1]));
+        }
+        if head[2] != 0 || head[3] != 0 {
+            return Err(DecodeError::InvalidReserved([head[2], head[3]]));
+        }
+        let path_len_u32 = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let mode = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
+        let size = u64::from_le_bytes([
+            head[12], head[13], head[14], head[15], head[16], head[17], head[18], head[19],
+        ]);
+        let record_count = u64::from_le_bytes([
+            head[20], head[21], head[22], head[23], head[24], head[25], head[26], head[27],
+        ]);
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&head[28..60]);
 
-        let path_len = u16::from_le_bytes([type_and_len[1], type_and_len[2]]) as usize;
+        let path_len = usize::try_from(path_len_u32).unwrap_or(usize::MAX);
         if path_len > caps.max_path_len || path_len > HARD_MAX_PATH_LEN {
             return Err(DecodeError::CapExceeded {
                 cap: CapName::PathLength,
                 limit: caps.max_path_len as u64,
-                actual: path_len as u64,
+                actual: u64::from(path_len_u32),
             });
         }
 
-        let mut path_buf: Vec<u8> = Vec::new();
-        if path_len > 0 {
-            path_buf
-                .try_reserve_exact(path_len)
-                .map_err(|_| DecodeError::AllocationFailed)?;
-            path_buf.resize(path_len, 0);
-            read_exact_or_truncated(&mut reader, &mut path_buf)?;
-        }
-
-        let mut fixed_tail = [0u8; RECORD_FIXED_HEADER_LEN - 3];
-        read_exact_or_truncated(&mut reader, &mut fixed_tail)?;
-
-        let mode = u32::from_le_bytes([fixed_tail[0], fixed_tail[1], fixed_tail[2], fixed_tail[3]]);
-        let size = u64::from_le_bytes([
-            fixed_tail[4],
-            fixed_tail[5],
-            fixed_tail[6],
-            fixed_tail[7],
-            fixed_tail[8],
-            fixed_tail[9],
-            fixed_tail[10],
-            fixed_tail[11],
-        ]);
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&fixed_tail[12..44]);
-
         if record_type == RECORD_TYPE_END {
-            if !path_buf.is_empty() {
+            if path_len != 0 {
                 return Err(DecodeError::InvalidEndRecord {
                     reason: "end record path must be empty",
                 });
@@ -486,15 +492,22 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
                     mode,
                 });
             }
-            if size != non_end_count {
-                return Err(DecodeError::EndRecordCountMismatch {
-                    expected: non_end_count,
-                    actual: size,
+            if sha256 != [0u8; 32] {
+                return Err(DecodeError::NonZeroHash {
+                    record_type: RECORD_TYPE_END,
                 });
             }
-            let expected_stream_digest: [u8; 32] = stream_hasher.finalize().into();
-            if expected_stream_digest != sha256 {
-                return Err(DecodeError::StreamHashMismatch);
+            if record_count != non_end_count {
+                return Err(DecodeError::EndRecordCountMismatch {
+                    expected: non_end_count,
+                    actual: record_count,
+                });
+            }
+            if size != total_file_bytes {
+                return Err(DecodeError::EndTotalBytesMismatch {
+                    expected: total_file_bytes,
+                    actual: size,
+                });
             }
 
             // Ensure no trailing bytes exist after the end record.
@@ -508,11 +521,22 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
                 .try_reserve_exact(1)
                 .map_err(|_| DecodeError::AllocationFailed)?;
             records.push(Record::End {
-                record_count: size,
-                stream_sha256: sha256,
+                record_count,
+                total_bytes: size,
             });
             return Ok(records);
         }
+
+        if record_count != 0 {
+            return Err(DecodeError::NonZeroRecordCount { record_type });
+        }
+
+        let mut path_buf: Vec<u8> = Vec::new();
+        path_buf
+            .try_reserve_exact(path_len)
+            .map_err(|_| DecodeError::AllocationFailed)?;
+        path_buf.resize(path_len, 0);
+        read_exact_or_truncated(&mut reader, &mut path_buf)?;
 
         // Non-end record: enforce entry count cap.
         let next_entries = non_end_count
@@ -550,11 +574,6 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
                 actual: depth as u64,
             });
         }
-
-        // Update stream hasher with this record's header fields.
-        stream_hasher.update(type_and_len);
-        stream_hasher.update(path.as_bytes());
-        stream_hasher.update(fixed_tail);
 
         match record_type {
             RECORD_TYPE_FILE => {
@@ -608,7 +627,6 @@ pub fn decode_with_caps<R: Read>(mut reader: R, caps: &Caps) -> Result<Vec<Recor
                     if let Some(buf_slice) = chunk.get_mut(..to_read) {
                         read_exact_or_truncated(&mut reader, buf_slice)?;
                         file_hasher.update(&*buf_slice);
-                        stream_hasher.update(&*buf_slice);
                         data.extend_from_slice(buf_slice);
                     }
                     remaining = remaining.saturating_sub(to_read);
