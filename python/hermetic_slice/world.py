@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import secrets
 from pathlib import Path
 import subprocess
 import time
@@ -28,6 +29,16 @@ ENV_ACTIVATE = (
     "    conda activate testbed 2>/dev/null || true\n"
     "fi\n"
 )
+
+
+def world_probe_name(instance_id: str) -> str:
+    """Return a per-run world name for probing a task.
+
+    A random suffix keeps concurrent probes of the same task from colliding on
+    container and network names, so each run only tears down what it created.
+    """
+    slug = instance_id.replace("__", "-").replace("_", "-")
+    return f"hermetic-world-{slug}-{secrets.token_hex(4)}"
 
 
 def start_world(

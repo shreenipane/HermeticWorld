@@ -17,7 +17,7 @@ from hermetic_slice.image_sealer import seal_image
 from hermetic_slice.intake import IntakeError, intake_task, load_verified
 from hermetic_slice.pkg_index import build_index, env_info
 from hermetic_slice.repo_sealer import VerificationError, rmtree_force, seal_repo
-from hermetic_slice.world import probe, start_world, stop_world
+from hermetic_slice.world import probe, start_world, stop_world, world_probe_name
 import time
 
 
@@ -443,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
 
                 sealed_image = args.image_tag_format.format(id=instance_id)
-                world_name = f"hermetic-world-{instance_id.replace('__', '-').replace('_', '-')}"
+                world_name = world_probe_name(instance_id)
 
                 world = start_world(task, sealed_image, index_dir, name=world_name)
                 probe_res = probe(world, task, report)

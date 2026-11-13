@@ -11,8 +11,8 @@ use hermetic_trust::{
     compute_ca_validity, compute_leaf_validity, create_empty_jks, install_ca_with_options, mint_ca,
     mint_leaf, open_dir_handle, parse_jks, read_cert_file_bounded, read_seed_file,
     validate_dns_name, validate_output_path, write_private_key_file, GuestOwner, InstallOptions,
-    InstallReport, JksEntry, TrustError, BEFORE_USE_HOOK, MAX_CA_CERT_INPUT_BYTES,
-    MAX_HOSTNAME_BYTES, MAX_LEAF_HOSTNAMES, NEW_DIR_MODE, NEW_FILE_MODE,
+    InstallReport, JksEntry, TrustError, MAX_CA_CERT_INPUT_BYTES, MAX_HOSTNAME_BYTES,
+    MAX_LEAF_HOSTNAMES, NEW_DIR_MODE, NEW_FILE_MODE,
 };
 
 /// Owner (uid, gid) that files created by this test process receive.
@@ -1445,10 +1445,10 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
     {
         let bundle_clone = bundle_path.clone();
         let victim_clone = outside_victim.clone();
-        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+        let hook_guard = hermetic_trust::set_before_use_hook_guard(move || {
             let _ = fs::remove_file(&bundle_clone);
             let _ = std::os::unix::fs::symlink(&victim_clone, &bundle_clone);
-        }));
+        });
 
         let root = open_dir_handle(&rootfs).expect("open rootfs");
         let res = atomic_write_in_root(
@@ -1458,7 +1458,7 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             NEW_FILE_MODE,
             current_owner(),
         );
-        *BEFORE_USE_HOOK.write().unwrap() = None;
+        drop(hook_guard);
 
         assert!(res.is_err(), "Must reject final-component symlink swap");
         let victim_content = fs::read(&outside_victim).expect("read victim");
@@ -1488,10 +1488,10 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
         fs::write(&bundle_clone, b"BUNDLE2").expect("write");
 
         let bundle_hook = bundle_clone.clone();
-        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+        let hook_guard = hermetic_trust::set_before_use_hook_guard(move || {
             let _ = fs::remove_file(&bundle_hook);
             let _ = fs::rename(&fifo_clone, &bundle_hook);
-        }));
+        });
 
         let root = open_dir_handle(&rootfs).expect("open rootfs");
         let _ = atomic_write_in_root(
@@ -1501,7 +1501,7 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             NEW_FILE_MODE,
             current_owner(),
         );
-        *BEFORE_USE_HOOK.write().unwrap() = None;
+        drop(hook_guard);
     }
 
     // Case 3: Ancestor swapped with symlink to outside before use
@@ -1522,11 +1522,11 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
         let ssl_moved = rootfs2.join("etc/ssl_old");
         let outside_clone = outside_dir2.clone();
 
-        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+        let hook_guard = hermetic_trust::set_before_use_hook_guard(move || {
             if fs::rename(&ssl_clone, &ssl_moved).is_ok() {
                 let _ = std::os::unix::fs::symlink(&outside_clone, &ssl_clone);
             }
-        }));
+        });
 
         let root2 = open_dir_handle(&rootfs2).expect("open rootfs2");
         let _ = atomic_write_in_root(
@@ -1536,7 +1536,7 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
             NEW_FILE_MODE,
             current_owner(),
         );
-        *BEFORE_USE_HOOK.write().unwrap() = None;
+        drop(hook_guard);
 
         let canary_content = fs::read(&canary_file).expect("read canary");
         assert_eq!(
@@ -1558,10 +1558,10 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
 
         let target_clone = read_target.clone();
         let secret_clone = outside_secret.clone();
-        *BEFORE_USE_HOOK.write().unwrap() = Some(Box::new(move || {
+        let hook_guard = hermetic_trust::set_before_use_hook_guard(move || {
             let _ = fs::remove_file(&target_clone);
             let _ = std::os::unix::fs::symlink(&secret_clone, &target_clone);
-        }));
+        });
 
         let (parent_handle, file_name) = hermetic_trust::open_parent_dir_handle(
             &rootfs,
@@ -1570,7 +1570,7 @@ fn test_defect1_handle_anchoring_and_swap_race_protection() {
         .expect("parent");
         let read_res =
             hermetic_trust::read_file_capped_from_parent(&parent_handle, &file_name, 1024);
-        *BEFORE_USE_HOOK.write().unwrap() = None;
+        drop(hook_guard);
 
         assert!(
             read_res.is_err(),
