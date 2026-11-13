@@ -338,7 +338,17 @@ fn test_reject_non_empty_output_dir() {
         &config,
     )
     .unwrap_err();
-    assert!(err.is_rejection());
+    assert!(!err.is_rejection());
+    assert!(matches!(
+        err,
+        ExtractError::FsSecurity(hermetic_extract::error::FsSecurityError::OutputDirNotEmpty(
+            _
+        ))
+    ));
+    assert_eq!(
+        fs::read(out.path().join("preexisting.txt")).unwrap(),
+        b"dirty"
+    );
 }
 
 #[test]

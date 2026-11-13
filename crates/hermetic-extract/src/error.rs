@@ -20,6 +20,9 @@ impl ExtractError {
     /// if it is a host/configuration/operational failure (exit status 1).
     pub fn is_rejection(&self) -> bool {
         match self {
+            Self::FsSecurity(
+                FsSecurityError::OutputDirNotEmpty(_) | FsSecurityError::OutputDirNotOwned(_),
+            ) => false,
             Self::Format(_)
             | Self::PathValidation(_)
             | Self::Quota(_)

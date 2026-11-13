@@ -572,7 +572,7 @@ fn diff_scoped_target(
                         kind: rkind,
                         path: rel_so_far.clone(),
                     });
-                    work_alive = false;
+                    return Ok(());
                 }
                 EntryProbe::Absent | EntryProbe::File(_) => {
                     work_alive = false;
@@ -602,11 +602,13 @@ fn diff_scoped_target(
         return Ok(());
     };
     let base_target = if base_alive {
+        state.record_entry()?;
         Some(cur_base.join(target_name))
     } else {
         None
     };
     let work_target = if work_alive {
+        state.record_entry()?;
         Some(cur_work.join(target_name))
     } else {
         None
@@ -632,18 +634,12 @@ fn compare_node(
     state.check_path_len(rel_path)?;
 
     let base_probe = match base_path {
-        Some(p) => {
-            state.record_entry()?;
-            probe_entry(p, rel_path, TreeSide::Base, state.cfg)?
-        }
+        Some(p) => probe_entry(p, rel_path, TreeSide::Base, state.cfg)?,
         None => EntryProbe::Absent,
     };
 
     let work_probe = match work_path {
-        Some(p) => {
-            state.record_entry()?;
-            probe_entry(p, rel_path, TreeSide::Work, state.cfg)?
-        }
+        Some(p) => probe_entry(p, rel_path, TreeSide::Work, state.cfg)?,
         None => EntryProbe::Absent,
     };
 
@@ -865,6 +861,8 @@ fn collect_dir_entries(
 
         match raw_name.to_str() {
             Some(name_str) => {
+                state.record_entry()?;
+                state.check_path_len(&join_rel_path(rel_prefix, name_str))?;
                 let entry_flags = children
                     .entry(name_str.to_string())
                     .or_insert((false, false));
@@ -1020,7 +1018,10 @@ fn hash_regular_file(
         kind: e.kind().to_string(),
     })?;
 
-    if !opened_meta.file_type().is_file() {
+    if !opened_meta.file_type().is_file()
+        || opened_meta.len() != expected_lstat.len()
+        || file_mode_str(&opened_meta) != file_mode_str(expected_lstat)
+    {
         return Err(WalkError::MetadataMismatch {
             path: rel_path.to_string(),
         });
@@ -1117,6 +1118,71 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn review_directory_collection_charges_before_insertion() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let caps = Caps {
+            max_entries_walked: 1,
+            ..Caps::default()
+        };
+        let mut state = WalkState::new(&caps);
+        let mut children = BTreeMap::new();
+        assert!(matches!(
+            collect_dir_entries(dir.path(), "", 1, TreeSide::Work, &mut state, &mut children),
+            Err(WalkError::CapExceeded {
+                cap: CapKind::MaxEntriesWalked,
+                ..
+            })
+        ));
+        assert_eq!(children.len(), 1);
+
+        let caps = Caps {
+            max_entries_walked: 3,
+            ..Caps::default()
+        };
+        let mut state = WalkState::new(&caps);
+        walk_dir_children(None, Some(dir.path()), "", 1, &mut state).unwrap();
+        assert_eq!(state.entries_walked, 3);
+        assert_eq!(state.changes.len(), 3);
+
+        let caps = Caps {
+            max_entries_walked: 6,
+            ..Caps::default()
+        };
+        let mut state = WalkState::new(&caps);
+        walk_dir_children(Some(dir.path()), Some(dir.path()), "", 1, &mut state).unwrap();
+        assert_eq!(state.entries_walked, 6);
+        assert!(state.changes.is_empty());
+    }
+
+    #[test]
+    fn review_hash_rejects_size_and_mode_changes_after_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        for change_mode in [false, true] {
+            fs::write(&path, b"x").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let before = fs::symlink_metadata(&path).unwrap();
+            if change_mode {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                fs::write(&path, b"xx").unwrap();
+            }
+            let caps = Caps::default();
+            let mut state = WalkState::new(&caps);
+            assert_eq!(
+                hash_regular_file(&path, "file", &before, &mut state),
+                Err(WalkError::MetadataMismatch {
+                    path: "file".into()
+                })
+            );
+            assert_eq!(state.total_bytes_hashed, 0);
+        }
+    }
 
     fn mkfifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")

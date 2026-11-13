@@ -100,3 +100,42 @@ fn test_cli_exit_codes_and_report_output() {
 
     assert_eq!(output_error.status.code(), Some(1));
 }
+
+#[test]
+fn review_output_setup_errors_are_operational() {
+    use hermetic_extract::error::{ExtractError, FsSecurityError};
+    for err in [
+        FsSecurityError::OutputDirNotEmpty("out".into()),
+        FsSecurityError::OutputDirNotOwned("out".into()),
+    ] {
+        assert!(!ExtractError::FsSecurity(err).is_rejection());
+    }
+    assert!(
+        ExtractError::FsSecurity(FsSecurityError::SymlinkRejected("entry".into())).is_rejection()
+    );
+    let tmp = tempdir().unwrap();
+    let base = tmp.path().join("base");
+    let out = tmp.path().join("out");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"existing").unwrap();
+    let mut stream = Vec::new();
+    StreamEncoder::write_stream_header(&mut stream).unwrap();
+    StreamEncoder::write_end(&mut stream, 0, 0).unwrap();
+    fs::write(tmp.path().join("stream"), stream).unwrap();
+    fs::write(tmp.path().join("config"), b"{}").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_hermetic-extract-validate"))
+        .arg("--base")
+        .arg(&base)
+        .arg("--out")
+        .arg(&out)
+        .arg("--stream")
+        .arg(tmp.path().join("stream"))
+        .arg("--config")
+        .arg(tmp.path().join("config"))
+        .args(["--class", "patch"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"existing");
+}

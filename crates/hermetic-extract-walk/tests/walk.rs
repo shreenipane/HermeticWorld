@@ -656,3 +656,42 @@ fn test_cli_binary_exit_codes() {
     assert_eq!(out_err.status.code(), Some(1));
     assert!(out_err.stdout.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn review_refused_ancestor_never_becomes_deletion() {
+    let base = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    write_file(base.path(), "dir/file", b"keep");
+    symlink(base.path().join("dir"), work.path().join("dir")).unwrap();
+    for class in [
+        TaskClass::Artifact {
+            paths: vec![PathBuf::from("dir/file")],
+        },
+        TaskClass::Patch {
+            repo_dir: PathBuf::from("dir/file"),
+        },
+    ] {
+        let result = diff_trees(base.path(), work.path(), class, &Caps::default()).unwrap();
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+        assert_eq!(
+            result.refused,
+            vec![RefusedEntry {
+                kind: RefusedKind::Symlink,
+                path: "dir".into()
+            }]
+        );
+    }
+    fs::remove_file(work.path().join("dir")).unwrap();
+    let absent = diff_trees(
+        base.path(),
+        work.path(),
+        TaskClass::Artifact {
+            paths: vec![PathBuf::from("dir/file")],
+        },
+        &Caps::default(),
+    )
+    .unwrap();
+    assert_eq!(absent.changes.len(), 1);
+    assert_eq!(absent.changes[0].change, ChangeKind::Deleted);
+}

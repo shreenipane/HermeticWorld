@@ -778,3 +778,45 @@ fn cli_closed_output_streams_return_error_without_panicking() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
 }
+
+#[test]
+fn review_search_only_ancestor_allows_seal_and_verify() {
+    const CHILD: &str = "HERMETIC_BUNDLE_SEARCH_ONLY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let executable_dir = TempDir::new().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if fs::metadata("/proc/self").unwrap().uid() == 0 {
+            use std::os::unix::process::CommandExt;
+            let executable = executable_dir.path().join("bundle-tests");
+            fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            fs::set_permissions(executable_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o555)).unwrap();
+            command = Command::new(executable);
+            command.uid(65534).gid(65534);
+        }
+        command
+            .args([
+                "--exact",
+                "review_search_only_ancestor_allows_seal_and_verify",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    assert_ne!(fs::metadata("/proc/self").unwrap().uid(), 0);
+    let tmp = TempDir::new().unwrap();
+    let ancestor = tmp.path().join("search");
+    let root = ancestor.join("bundle");
+    fs::create_dir_all(&root).unwrap();
+    write_file(&root.join("file"), b"payload", 0o644);
+    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+    let result = seal(&root).and_then(|manifest| verify(&root, Some(&manifest.root)));
+    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(result.unwrap().verdict, Verdict::Ok);
+}

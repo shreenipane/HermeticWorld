@@ -503,7 +503,7 @@ pub(crate) fn open_root(path: &Path) -> Result<File, BundleError> {
     let meta = fs::symlink_metadata(base).map_err(|_| BundleError::InvalidRootDir {
         reason: "cannot stat bundle root",
     })?;
-    let mut handle = open_directory(base, &meta, ".")?;
+    let mut handle = pin_directory(base, &meta, ".", true)?;
     for component in path.components() {
         let name = match component {
             Component::Normal(name) => name,
@@ -519,12 +519,22 @@ pub(crate) fn open_root(path: &Path) -> Result<File, BundleError> {
         let meta = fs::symlink_metadata(&child).map_err(|_| BundleError::InvalidRootDir {
             reason: "cannot stat bundle root",
         })?;
-        handle = open_directory(&child, &meta, ".")?;
+        handle = pin_directory(&child, &meta, ".", true)?;
     }
-    Ok(handle)
+    // Reopen the pinned root through trusted procfs for enumeration and sync.
+    File::open(handle_path(&handle)).map_err(|e| io_error(".", e))
 }
 
 fn open_directory(path: &Path, meta: &fs::Metadata, rel: &str) -> Result<File, BundleError> {
+    pin_directory(path, meta, rel, false)
+}
+
+fn pin_directory(
+    path: &Path,
+    meta: &fs::Metadata,
+    rel: &str,
+    path_only: bool,
+) -> Result<File, BundleError> {
     if meta.is_symlink() {
         return Err(BundleError::RefusedObject {
             path: rel.to_string(),
@@ -538,7 +548,15 @@ fn open_directory(path: &Path, meta: &fs::Metadata, rel: &str) -> Result<File, B
     }
     let handle = OpenOptions::new()
         .read(true)
-        .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
+        .custom_flags(
+            O_DIRECTORY
+                | O_NONBLOCK
+                | if path_only {
+                    O_PATH | O_NOFOLLOW
+                } else {
+                    O_NOFOLLOW
+                },
+        )
         .open(path)
         .map_err(|e| io_error(rel, e))?;
     let opened = handle.metadata().map_err(|e| io_error(rel, e))?;
