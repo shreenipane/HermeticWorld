@@ -28,7 +28,8 @@ MAX_LINE_LEN = 4096
 MAX_JSON_DEPTH = 16
 MAX_JSON_TOKENS = 500_000
 MAX_OBJECT_KEYS = 50_000
-MAX_UID_GID = 4_294_967_295
+# (uid_t)-1 is reserved: setresuid/setresgid read it as "leave unchanged".
+MAX_UID_GID = 4_294_967_294
 MAX_VCPUS = 256
 MAX_MEMORY_MIB = 1_048_576
 MAX_DISK_MIB = 10_485_760
@@ -403,7 +404,9 @@ def _resolve_user_and_groups(
                     raise UserResolutionError(f"Unresolvable group name: {g_part}")
                 gid = group_by_name[g_part]
 
-    if resolved_username is not None and resolved_username in user_groups:
+    # OCI image-spec: when the group is given explicitly, supplementary groups are ignored.
+    explicit_group = ":" in user_spec
+    if not explicit_group and resolved_username is not None and resolved_username in user_groups:
         supp = sorted(g for g in user_groups[resolved_username] if g != gid)
     else:
         supp = []

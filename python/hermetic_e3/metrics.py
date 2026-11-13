@@ -11,6 +11,7 @@ from hermetic_e3 import (
     DEFAULT_BOOTSTRAP_ITERATIONS,
     MAX_BOOTSTRAP_DRAWS,
     MAX_BOOTSTRAP_ITERATIONS,
+    MAX_DETECTOR_LEAK_WORK,
     MAX_ENTRIES,
     PERMILLE_SCALE,
     RangeError,
@@ -231,6 +232,12 @@ def compute_all_metrics(
             f"Detector count ({len(all_detectors)}) exceeds cap {MAX_ENTRIES}"
         )
 
+    if len(all_detectors) * len(leaks) > MAX_DETECTOR_LEAK_WORK:
+        raise SizeLimitError(
+            f"Per-detector work ({len(all_detectors)} detectors x {len(leaks)} leaks) "
+            f"exceeds cap {MAX_DETECTOR_LEAK_WORK}"
+        )
+
     per_detector: dict[str, ScopeMetrics] = {}
     for detector in sorted(all_detectors)[:MAX_ENTRIES]:
         det_matched = frozenset(
@@ -308,7 +315,9 @@ def bootstrap_confidence_interval(
             fn_by_task[leak.task] = fn_by_task.get(leak.task, 0) + 1
 
     for fn in findings[:MAX_ENTRIES]:
-        task_set.add(fn.task)
+        # Information-only findings are ignored: they do not add a task to the population.
+        if fn.severity in ACTIVE_SEVERITIES:
+            task_set.add(fn.task)
 
     for fn in resolved.unmatched_active_findings[:MAX_ENTRIES]:
         if fn.severity not in ACTIVE_SEVERITIES:

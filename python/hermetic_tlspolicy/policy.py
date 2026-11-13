@@ -103,6 +103,10 @@ class Decision:
             return self.decision == other.decision and self.reason == other.reason
         return False
 
+    def __hash__(self) -> int:
+        # Consistent with __eq__: a Decision equals its action string, so it hashes like it.
+        return hash(self.decision)
+
     def __str__(self) -> str:
         return self.decision
 

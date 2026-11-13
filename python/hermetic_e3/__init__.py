@@ -63,6 +63,10 @@ DEFAULT_BOOTSTRAP_ITERATIONS: int = 1_000
 MAX_BOOTSTRAP_ITERATIONS: int = 100_000
 # Total task draws (iterations x task count) allowed in one bootstrap run.
 MAX_BOOTSTRAP_DRAWS: int = 50_000_000
+# Total finding-against-leak candidate checks allowed in one matching pass.
+MAX_MATCH_CHECKS: int = 20_000_000
+# Total detector x leak work (and missed-ID report entries) allowed for per-detector metrics.
+MAX_DETECTOR_LEAK_WORK: int = 20_000_000
 MAX_CLI_ARGS: int = 64
 MAX_VALIDATION_DEPTH: int = 16
 PERMILLE_SCALE: int = 1_000

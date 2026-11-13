@@ -896,6 +896,10 @@ def inspect_tar_bytes(
     return findings
 
 
+# Header bytes inspected for the FNAME field: fixed header, FEXTRA length and body, name cap.
+_GZIP_NAME_HEADER_PROBE = 10 + 2 + 0xFFFF + 1024
+
+
 def inspect_gzip_bytes(
     rel_path: str,
     outer_name: str,
@@ -916,14 +920,17 @@ def inspect_gzip_bytes(
     findings: list[Finding] = []
     offset = 0
     stream_idx = 0
+    view = memoryview(data)
+    # The decompression cap is archive-wide: it is shared by every concatenated stream.
+    total_out = 0
 
     while offset < len(data):
         if stream_idx >= caps.max_archive_members:
             raise CapExceededError(
                 f"Concatenated GZIP stream count exceeds cap ({caps.max_archive_members})."
             )
-        remaining_slice = data[offset:]
-        if len(remaining_slice) < 10 or remaining_slice[:2] != _GZIP_MAGIC:
+        remaining_slice = view[offset:]
+        if len(remaining_slice) < 10 or bytes(remaining_slice[:2]) != _GZIP_MAGIC:
             raise MalformedArchiveError("Invalid concatenated GZIP member header.")
 
         (mtime_ts,) = struct.unpack_from("<I", remaining_slice, 4)
@@ -943,19 +950,22 @@ def inspect_gzip_bytes(
             while pos < len(remaining_slice) and not decompressor.eof:
                 chunk = remaining_slice[pos : pos + caps.read_chunk_size]
                 pos += len(chunk)
-                remaining_budget = caps.max_decompressed_bytes - len(out_buf)
+                remaining_budget = caps.max_decompressed_bytes - total_out - len(out_buf)
                 if remaining_budget <= 0:
                     raise CapExceededError(
                         f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
                     )
                 piece = decompressor.decompress(chunk, max_length=remaining_budget)
                 out_buf.extend(piece)
-                if decompressor.unconsumed_tail and len(out_buf) >= caps.max_decompressed_bytes:
+                if (
+                    decompressor.unconsumed_tail
+                    and total_out + len(out_buf) >= caps.max_decompressed_bytes
+                ):
                     raise CapExceededError(
                         f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
                     )
             if not decompressor.eof:
-                remaining_budget = caps.max_decompressed_bytes - len(out_buf)
+                remaining_budget = caps.max_decompressed_bytes - total_out - len(out_buf)
                 if remaining_budget <= 0:
                     raise CapExceededError(
                         f"GZIP decompressed output exceeds cap ({caps.max_decompressed_bytes})."
@@ -971,8 +981,11 @@ def inspect_gzip_bytes(
         if consumed <= 0:
             raise MalformedArchiveError("GZIP decompressor made zero progress.")
         offset += consumed
+        total_out += len(out_buf)
 
-        inner_name = _derive_gzip_inner_name(outer_name, remaining_slice, stream_idx)
+        inner_name = _derive_gzip_inner_name(
+            outer_name, bytes(remaining_slice[:_GZIP_NAME_HEADER_PROBE]), stream_idx
+        )
         inner_chain = member_chain + [inner_name]
         findings.extend(
             inspect_payload_bytes(
@@ -1030,7 +1043,9 @@ def _decompress_streams_bounded(
                     out_buf.extend(piece)
             if not decompressor.eof:
                 raise MalformedArchiveError(f"Truncated {label} stream.")
-            pending = decompressor.unused_data
+            # Bytes after the end of this stream: the decompressor's unused input plus
+            # any input that was never fed to it.
+            pending = decompressor.unused_data + bytes(pending[pos:])
             if skip_null_padding:
                 # xz permits NUL stream padding between and after streams.
                 pending = pending.lstrip(b"\x00")

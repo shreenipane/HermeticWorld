@@ -231,25 +231,39 @@ def test_precondition_globals_and_nonlocals_not_renamed() -> None:
 
 
 def _count_ast_node_differences(node1: ast.AST, node2: ast.AST) -> int:
-    """Count how many nodes differ between two ASTs of identical structure."""
+    """Count how many nodes differ between two ASTs, comparing every field.
+
+    Scalar fields (such as ``Name.id`` or ``Constant.value``) and list positions are
+    compared too, not just child nodes.
+    """
     if type(node1) is not type(node2):
         return 1
 
     diff_count = 0
-    if isinstance(node1, ast.Constant) and isinstance(node2, ast.Constant):
-        if node1.value != node2.value:
-            return 1
-
-    children1 = list(ast.iter_child_nodes(node1))
-    children2 = list(ast.iter_child_nodes(node2))
-
-    if len(children1) != len(children2):
-        return 1
-
-    for c1, c2 in zip(children1, children2):
-        diff_count += _count_ast_node_differences(c1, c2)
-
+    for (_name1, value1), (_name2, value2) in zip(ast.iter_fields(node1), ast.iter_fields(node2)):
+        diff_count += _count_ast_field_differences(value1, value2)
     return diff_count
+
+
+def _count_ast_field_differences(value1: object, value2: object) -> int:
+    if isinstance(value1, ast.AST) and isinstance(value2, ast.AST):
+        return _count_ast_node_differences(value1, value2)
+    if isinstance(value1, list) and isinstance(value2, list):
+        if len(value1) != len(value2):
+            return 1
+        return sum(_count_ast_field_differences(a, b) for a, b in zip(value1, value2))
+    if isinstance(value1, ast.AST) or isinstance(value2, ast.AST):
+        return 1
+    if isinstance(value1, list) or isinstance(value2, list):
+        return 1
+    return 0 if (type(value1) is type(value2) and value1 == value2) else 1
+
+
+def test_regression_ast_difference_count_includes_scalar_fields() -> None:
+    a = ast.parse("assert a == 1")
+    b = ast.parse("assert b == 2")
+    assert _count_ast_node_differences(a, b) == 2
+    assert _count_ast_node_differences(a, ast.parse("assert a == 1")) == 0
 
 
 def test_mutant_changes_exactly_one_site() -> None:

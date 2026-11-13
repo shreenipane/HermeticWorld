@@ -660,8 +660,11 @@ def oracle_check(
     empty_grade = grade(task_dir, "", image=image, out_dir=empty_out, timeout=timeout)
 
     gold_resolved = bool(gold_grade.get("resolved", False))
+    # Only a completed empty-patch grade shows that the base fails: a timeout, apply failure
+    # or rejected run lists every target as failing without having run them.
+    empty_graded = empty_grade.get("status") == "graded"
     empty_f2p_success = empty_grade.get("f2p", {}).get("success", [])
-    empty_f2p_all_fail = (len(empty_f2p_success) == 0)
+    empty_f2p_all_fail = empty_graded and len(empty_f2p_success) == 0
     empty_f2p_failures = empty_grade.get("f2p", {}).get("failure", [])
 
     empty_p2p_failures = empty_grade.get("p2p", {}).get("failure", [])
@@ -672,10 +675,11 @@ def oracle_check(
     # (django__django-11099 lists test_help_text). The task still discriminates as long as
     # the empty patch is not resolved; those tests are recorded, not hidden.
     empty_resolved = bool(empty_grade.get("resolved", False))
-    oracle_ok = bool(gold_resolved and not empty_resolved and empty_f2p_failures)
+    oracle_ok = bool(empty_graded and gold_resolved and not empty_resolved and empty_f2p_failures)
 
     oracle_result = {
         "empty_f2p_all_fail": empty_f2p_all_fail,
+        "empty_graded": empty_graded,
         "empty_resolved": empty_resolved,
         "f2p_pass_without_fix": sorted(empty_f2p_success),
         "empty_p2p_failures": empty_p2p_failures,

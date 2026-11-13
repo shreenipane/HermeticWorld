@@ -164,7 +164,10 @@ def _assert_clean_headers(headers: dict[str, str], allowed: set[str]) -> None:
     assert "date" not in lower_keys
     assert "server" not in lower_keys
     assert "last-modified" not in lower_keys
-    assert lower_keys <= allowed
+    # The server closes every connection after one response and must say so (RFC 9112 9.6).
+    connection = [v for k, v in headers.items() if k.lower() == "connection"]
+    assert connection == ["close"]
+    assert lower_keys <= allowed | {"connection"}
 
 
 def test_root_and_project_pages_html_and_json(running_server: dict[str, object]) -> None:
@@ -401,7 +404,9 @@ def test_methods_405_and_unknown_paths_404(running_server: dict[str, object]) ->
             body=b"{}",
         )
         assert status == 405
-        _assert_clean_headers(headers, {"content-type", "content-length"})
+        _assert_clean_headers(headers, {"content-type", "content-length", "allow"})
+        # RFC 9110 15.5.6: a 405 response carries Allow with the supported methods.
+        assert {k.lower(): v for k, v in headers.items()}.get("allow") == "GET, HEAD"
 
     for unknown in ("/", "/simple", "/simple/demo-pkg", "/files/", "/files/abc/def"):
         status, headers, _ = _http_request(host, port, "GET", unknown)

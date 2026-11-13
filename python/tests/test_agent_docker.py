@@ -23,6 +23,24 @@ requires_docker = pytest.mark.skipif(
 )
 
 
+class _RecordingSecrets:
+    """Stands in for a module's ``secrets`` and records every token it hands out."""
+
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+
+    def token_hex(self, nbytes: int | None = None) -> str:
+        token = secrets.token_hex(nbytes)
+        self.tokens.append(token)
+        return token
+
+
+def _owned_containers_left(prefix: str, tokens: list[str]) -> list[str]:
+    """Containers named ``prefix...<token>...`` for this test's tokens (others are ignored)."""
+    names = run_docker(["ps", "-a", "--format", "{{.Names}}"]).decode("utf-8").split()
+    return [n for n in names if n.startswith(prefix) and any(t in n for t in tokens)]
+
+
 @pytest.fixture(scope="module")
 def fake_sealed_image():
     """Build a fake sealed image hermetic-t06-test-img-<random> with git repo at /testbed."""
@@ -59,7 +77,13 @@ def fake_sealed_image():
 
 
 @pytest.mark.docker
-def test_extract_patch_docker(tmp_path: Path, fake_sealed_image: str) -> None:
+def test_extract_patch_docker(
+    tmp_path: Path, fake_sealed_image: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermetic_slice.extract as extract_mod
+
+    recorder = _RecordingSecrets()
+    monkeypatch.setattr(extract_mod, "secrets", recorder)
     rand_name = secrets.token_hex(4)
     agent_container = f"hermetic-t06-test-agent-{rand_name}"
 
@@ -119,8 +143,9 @@ def test_extract_patch_docker(tmp_path: Path, fake_sealed_image: str) -> None:
         assert report["sha256"] == hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
 
         # Extractor container must be gone
-        ps_out = run_docker(["ps", "-a", "--filter", "name=hermetic-extract-"]).decode("utf-8")
-        assert "hermetic-extract-" not in ps_out
+        # Only this test's extractor is checked, so concurrent runs cannot cause false failures.
+        assert recorder.tokens
+        assert _owned_containers_left("hermetic-extract-", recorder.tokens) == []
 
     finally:
         run_docker(["rm", "-f", agent_container], check=False)
@@ -155,7 +180,13 @@ class FakeDockerModel:
 
 
 @pytest.mark.docker
-def test_run_task_docker_end_to_end(tmp_path: Path, fake_sealed_image: str) -> None:
+def test_run_task_docker_end_to_end(
+    tmp_path: Path, fake_sealed_image: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermetic_slice.runner as runner_mod
+
+    recorder = _RecordingSecrets()
+    monkeypatch.setattr(runner_mod, "secrets", recorder)
     task_dir = tmp_path / "task"
     (task_dir / "agent").mkdir(parents=True, exist_ok=True)
     (task_dir / "index").mkdir(parents=True, exist_ok=True)
@@ -267,8 +298,9 @@ def test_run_task_docker_end_to_end(tmp_path: Path, fake_sealed_image: str) -> N
     assert "return 99" in patch_text
 
     # 4. The world is torn down
-    ps_out = run_docker(["ps", "-a", "--filter", "name=hermetic-run-"]).decode("utf-8")
-    assert "hermetic-run-" not in ps_out
+    # Only this test's world is checked, so concurrent runs cannot cause false failures.
+    assert recorder.tokens
+    assert _owned_containers_left("hermetic-run-", recorder.tokens) == []
 
     # 5. Fake key appears in no file under run_dir
     for fpath in run_dir.rglob("*"):

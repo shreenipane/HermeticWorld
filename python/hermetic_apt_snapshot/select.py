@@ -49,8 +49,15 @@ DEBIAN_RELATIVE_SUITE_ALIASES = frozenset(
         "testing",
         "unstable",
         "experimental",
+        # Codenames of unstable/experimental: they have no -updates or -security suites.
+        "sid",
+        "rc-buggy",
     }
 )
+
+# Ubuntu publishes amd64/i386 in the "ubuntu" archive and every other architecture in
+# "ubuntu-ports".
+UBUNTU_PRIMARY_ARCHITECTURES = frozenset({"amd64", "i386"})
 
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _RFC3339_RE = re.compile(
@@ -208,18 +215,21 @@ def select_apt_snapshot(
     snapshot_id = _format_snapshot_id_floor_second(cutoff_nanos)
 
     if dist == "ubuntu":
-        uri = f"https://snapshot.ubuntu.com/ubuntu/{snapshot_id}"
         suites = [clean_suite, f"{clean_suite}-updates", f"{clean_suite}-security"]
-        sources = (
+        primary = [a for a in clean_architectures if a in UBUNTU_PRIMARY_ARCHITECTURES]
+        ports = [a for a in clean_architectures if a not in UBUNTU_PRIMARY_ARCHITECTURES]
+        stanzas = [
             _render_deb822_stanza(
-                uri=uri,
+                uri=f"https://snapshot.ubuntu.com/{archive}/{snapshot_id}",
                 suites=suites,
                 components=clean_components,
-                architectures=clean_architectures,
+                architectures=archs,
                 signed_by=clean_signed_by,
             )
-            + "\n"
-        )
+            for archive, archs in (("ubuntu", primary), ("ubuntu-ports", ports))
+            if archs
+        ]
+        sources = "\n\n".join(stanzas) + "\n"
     else:
         main_uri = f"https://snapshot.debian.org/archive/debian/{snapshot_id}"
         sec_uri = f"https://snapshot.debian.org/archive/debian-security/{snapshot_id}"

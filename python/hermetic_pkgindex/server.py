@@ -692,6 +692,11 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
         self.wfile.flush()
 
+    def send_response_only(self, code: int, message: str | None = None) -> None:
+        """Start a response; every response closes the connection, so say so (RFC 9112 9.6)."""
+        super().send_response_only(code, message)
+        self.send_header("Connection", "close")
+
     def _send_bytes_response(
         self,
         status: HTTPStatus,
@@ -730,6 +735,9 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         if content_range is not None:
             self.send_header("Content-Range", content_range)
+        if status == HTTPStatus.METHOD_NOT_ALLOWED:
+            # RFC 9110 15.5.6: a 405 response must list the supported methods.
+            self.send_header("Allow", "GET, HEAD")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
