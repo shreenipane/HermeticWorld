@@ -1,0 +1,215 @@
+{
+  "cpuid_modifiers": [
+    {
+      "leaf": "0x40000001",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0bxxxxxxx0xxxxxxxxxxxxxxxxxx0x0xx0"
+        }
+      ]
+    },
+    {
+      "leaf": "0x00000001",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000001000000011011110001"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0bxxxxxxxxxxxxx0xx00xxx0x0000x00xx"
+        }
+      ]
+    },
+    {
+      "leaf": "0x00000007",
+      "subleaf": "0x0",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00000000000xxx0000000xxxx0x0x0xx"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x00000007",
+      "subleaf": "0x1",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x0000000a",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x00000015",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x00000016",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000000000000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x80000002",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b01100101011101000110111001001001"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00101001010100100010100001101100"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b01101111011001010101100000100000"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00101001010100100010100001101110"
+        }
+      ]
+    },
+    {
+      "leaf": "0x80000003",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b01010101010100000100001100100000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b00101101001101010100010100100000"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00110000001110000011011000110010"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00100000001101000111011000100000"
+        }
+      ]
+    },
+    {
+      "leaf": "0x80000004",
+      "subleaf": "0x0",
+      "flags": 0,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "0b00101110001100100010000001000000"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "0b01001000010001110011000000110100"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "0b00000000000000000000000001111010"
+        },
+        {
+          "register": "edx",
+          "bitmap": "0b00000000000000000000000000000000"
+        }
+      ]
+    }
+  ],
+  "msr_modifiers": []
+}

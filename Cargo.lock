@@ -539,6 +539,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-clockprobe"
+version = "0.1.0"
+
+[[package]]
 name = "hermetic-cmdlog"
 version = "0.1.0"
 dependencies = [
