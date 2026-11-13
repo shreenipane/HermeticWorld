@@ -62,6 +62,8 @@ pub enum WireError {
         max: usize,
     },
     UnexpectedResponsePacket,
+    InvalidQueryFlags,
+    InvalidResponseStructure,
     TruncatedQuery,
     UnsupportedOpcode {
         opcode: u8,
@@ -117,6 +119,8 @@ impl fmt::Display for WireError {
             WireError::PacketTooLong { len, max } => {
                 write!(f, "DNS UDP packet length {len} exceeds maximum {max}")
             }
+            WireError::InvalidQueryFlags => write!(f, "unsupported DNS query flags"),
+            WireError::InvalidResponseStructure => write!(f, "inconsistent DNS response sections"),
             WireError::UnexpectedResponsePacket => {
                 write!(f, "received DNS packet with QR=1 (response) instead of QR=0 (query)")
             }
@@ -299,6 +303,14 @@ impl DnsResponse {
             });
         }
 
+        if self.header.ancount as usize != self.answers.len()
+            || self.header.nscount != 0
+            || self.header.arcount != 0
+            || (!self.answers.is_empty() && self.question.is_none())
+            || !self.header.qr
+        {
+            return Err(WireError::InvalidResponseStructure);
+        }
         let mut out = Vec::with_capacity(MAX_UDP_PAYLOAD_BYTES);
         self.header.encode_into(&mut out);
 
@@ -357,6 +369,11 @@ pub fn parse_query(packet: &[u8]) -> Result<DnsQuery, WireError> {
     let header = DnsHeader::parse(packet)?;
     if header.qr {
         return Err(WireError::UnexpectedResponsePacket);
+    }
+    // This responder supports standard queries with only RD set. DNSSEC and
+    // response-only flags are unsupported; in particular the reserved Z bit is zero.
+    if header.z != 0 || header.aa || header.ra || header.rcode != 0 {
+        return Err(WireError::InvalidQueryFlags);
     }
     if header.tc {
         return Err(WireError::TruncatedQuery);

@@ -1,4 +1,4 @@
-"""Flow-sensitive may-taint data-flow analysis for base-failing assertion eligibility."""
+"""Flow-sensitive proven-dependency data-flow analysis for base-failing assertion eligibility."""
 
 from __future__ import annotations
 
@@ -42,12 +42,14 @@ class _PathState:
     tainted: set[str]
     started: bool
     terminated: bool = False
+    control: str | None = None
 
     def clone(self) -> _PathState:
         return _PathState(
             tainted=set(self.tainted),
             started=self.started,
             terminated=self.terminated,
+            control=self.control,
         )
 
 
@@ -83,7 +85,7 @@ def _check_give_up(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | Non
 def _find_raising_statement(
     fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
     raising_line: int,
-) -> ast.stmt:
+) -> ast.stmt | None:
     """Find the innermost statement inside fn_node covering raising_line."""
     fn_start = fn_node.lineno
     fn_end = fn_node.end_lineno or fn_start
@@ -150,24 +152,68 @@ def _find_raising_statement(
             -s.col_offset,
         )
     )
-    return candidates[0]
+    first = candidates[0]
+    # Line-only traceback data cannot distinguish adjacent statements on one line.
+    peers = [item for item in candidates if item.lineno == first.lineno
+             and (item.end_lineno or item.lineno) == (first.end_lineno or first.lineno)]
+    if len(peers) != 1:
+        return None
+    return first
 
 
-def _extract_base_name(target: ast.expr) -> str | None:
-    """Resolve the root variable Name for Attribute/Subscript chains, or None if non-name root."""
-    cur: ast.expr = target
-    depth = 0
-    while isinstance(cur, (ast.Attribute, ast.Subscript)):
-        depth += 1
-        if depth > MAX_EXPR_DEPTH:
-            raise FlowError(
-                f"Target expression depth exceeds cap of {MAX_EXPR_DEPTH}",
-                code="EXPR_TOO_DEEP",
-            )
-        cur = cur.value
-    if isinstance(cur, ast.Name):
-        return cur.id
+def _field_key(expr: ast.expr) -> str | None:
+    """Identify only exact named attributes and constant-index fields."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        base = _field_key(expr.value)
+        return None if base is None else base + "." + expr.attr
+    if isinstance(expr, ast.Subscript):
+        value = expr.slice
+        if isinstance(value, ast.Constant):
+            constant = value.value
+        elif (isinstance(value, ast.UnaryOp) and isinstance(value.operand, ast.Constant)
+              and isinstance(value.operand.value, (int, float, complex))
+              and isinstance(value.op, (ast.USub, ast.UAdd))):
+            constant = -value.operand.value if isinstance(value.op, ast.USub) else +value.operand.value
+        else:
+            return None
+        # Python dictionary keys with equal numeric values name the same field.
+        if isinstance(constant, complex) and constant.imag == 0:
+            constant = constant.real
+        if isinstance(constant, bool) or (isinstance(constant, float) and constant.is_integer()):
+            constant = int(constant)
+        base = _field_key(expr.value)
+        suffix = repr(constant)
+        if base is not None and len(suffix) <= MAX_IDENTIFIER_LENGTH:
+            return base + "[" + suffix + "]"
     return None
+
+
+def _truth(expr: ast.expr) -> bool | None:
+    if isinstance(expr, ast.Constant):
+        return bool(expr.value)
+    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+        return None if any(isinstance(item, ast.Starred) for item in expr.elts) else bool(expr.elts)
+    if isinstance(expr, ast.Dict):
+        return bool(expr.keys)
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        value = _truth(expr.operand)
+        return None if value is None else not value
+    return None
+
+
+def _forget_fields(tainted: set[str], expr: ast.expr) -> None:
+    names = {node.id for node in ast.walk(expr) if isinstance(node, ast.Name)}
+    tainted.difference_update({item for item in tainted
+                               if any(item.startswith(name + ".") or item.startswith(name + "[")
+                                      for name in names)})
+
+
+def _clear_target(tainted: set[str], name: str) -> None:
+    tainted.difference_update({item for item in tainted
+                               if item == name or item.startswith(name + ".")
+                               or item.startswith(name + "[")})
 
 
 def _add_taint(tainted: set[str], name: str) -> None:
@@ -204,19 +250,17 @@ def _eval_expr_taint(
     if isinstance(expr, ast.NamedExpr):
         val_tainted = _eval_expr_taint(expr.value, tainted, active=active, depth=depth + 1)
         if active:
+            _clear_target(tainted, expr.target.id)
             if val_tainted:
                 _add_taint(tainted, expr.target.id)
             else:
                 tainted.discard(expr.target.id)
         return val_tainted
 
-    if isinstance(expr, ast.Attribute):
-        return _eval_expr_taint(expr.value, tainted, active=active, depth=depth + 1)
-
-    if isinstance(expr, ast.Subscript):
-        val_t = _eval_expr_taint(expr.value, tainted, active=active, depth=depth + 1)
-        slc_t = _eval_expr_taint(expr.slice, tainted, active=active, depth=depth + 1)
-        return val_t or slc_t
+    if isinstance(expr, (ast.Attribute, ast.Subscript)):
+        key = _field_key(expr)
+        # A dependency of a container does not prove a dependency of each field.
+        return active and key is not None and key in tainted
 
     if isinstance(expr, ast.Slice):
         low_t = _eval_expr_taint(expr.lower, tainted, active=active, depth=depth + 1)
@@ -226,6 +270,8 @@ def _eval_expr_taint(
 
     if isinstance(expr, ast.Call):
         func_t = _eval_expr_taint(expr.func, tainted, active=active, depth=depth + 1)
+        if isinstance(expr.func, ast.Attribute):
+            func_t |= _eval_expr_taint(expr.func.value, tainted, active=active, depth=depth + 1)
         args_t = False
         for arg in expr.args:
             if _eval_expr_taint(arg, tainted, active=active, depth=depth + 1):
@@ -233,6 +279,11 @@ def _eval_expr_taint(
         for kw in expr.keywords:
             if _eval_expr_taint(kw.value, tainted, active=active, depth=depth + 1):
                 args_t = True
+        # An opaque call can mutate referenced objects. Field dependencies cannot
+        # survive it unless a later explicit store establishes them again.
+        if is_supported_self_assert_call(expr) is not None:
+            return False  # Supported unittest assertions return None on success.
+        _forget_fields(tainted, expr)
         return func_t or args_t
 
     if isinstance(expr, ast.UnaryOp):
@@ -244,24 +295,42 @@ def _eval_expr_taint(
         return left_t or right_t
 
     if isinstance(expr, ast.BoolOp):
-        result = False
-        for val in expr.values:
-            if _eval_expr_taint(val, tainted, active=active, depth=depth + 1):
-                result = True
-        return result
+        possible: list[bool] = []
+        incoming = set(tainted)
+        optional = False
+        for index, val in enumerate(expr.values):
+            value_t = _eval_expr_taint(val, tainted, active=active, depth=depth + 1)
+            truth = _truth(val)
+            stops = truth is not None and (truth != isinstance(expr.op, ast.And))
+            if index == len(expr.values) - 1 or stops:
+                possible.append(value_t)
+                break
+            if truth is None:
+                possible.append(value_t)
+                optional = True
+        if optional:
+            tainted.intersection_update(incoming)
+        return bool(possible) and all(possible)
 
     if isinstance(expr, ast.Compare):
-        result = _eval_expr_taint(expr.left, tainted, active=active, depth=depth + 1)
-        for comp in expr.comparators:
-            if _eval_expr_taint(comp, tainted, active=active, depth=depth + 1):
-                result = True
-        return result
+        # Only the first comparison is guaranteed to execute in a chain.
+        left_t = _eval_expr_taint(expr.left, tainted, active=active, depth=depth + 1)
+        right_t = _eval_expr_taint(expr.comparators[0], tainted, active=active, depth=depth + 1)
+        return left_t or right_t
 
     if isinstance(expr, ast.IfExp):
-        test_t = _eval_expr_taint(expr.test, tainted, active=active, depth=depth + 1)
-        body_t = _eval_expr_taint(expr.body, tainted, active=active, depth=depth + 1)
-        else_t = _eval_expr_taint(expr.orelse, tainted, active=active, depth=depth + 1)
-        return test_t or body_t or else_t
+        _eval_expr_taint(expr.test, tainted, active=active, depth=depth + 1)
+        truth = _truth(expr.test)
+        if truth is not None:
+            return _eval_expr_taint(expr.body if truth else expr.orelse, tainted,
+                                    active=active, depth=depth + 1)
+        body_state = set(tainted)
+        else_state = set(tainted)
+        body_t = _eval_expr_taint(expr.body, body_state, active=active, depth=depth + 1)
+        else_t = _eval_expr_taint(expr.orelse, else_state, active=active, depth=depth + 1)
+        tainted.clear()
+        tainted.update(body_state & else_state)
+        return body_t and else_t
 
     if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
         result = False
@@ -305,9 +374,13 @@ def _eval_expr_taint(
         any_gen_tainted = False
         for gen in expr.generators:
             iter_t = _eval_expr_taint(gen.iter, comp_tainted, active=active, depth=depth + 1)
+            if _truth(gen.iter) is False:
+                return False
             if active:
                 _assign_target(gen.target, iter_t, comp_tainted, rhs_expr=None, depth=depth + 1)
             for cond in gen.ifs:
+                if _truth(cond) is False:
+                    return False
                 if _eval_expr_taint(cond, comp_tainted, active=active, depth=depth + 1):
                     any_gen_tainted = True
         elt_t = _eval_expr_taint(expr.elt, comp_tainted, active=active, depth=depth + 1)
@@ -318,9 +391,13 @@ def _eval_expr_taint(
         any_gen_tainted = False
         for gen in expr.generators:
             iter_t = _eval_expr_taint(gen.iter, comp_tainted, active=active, depth=depth + 1)
+            if _truth(gen.iter) is False:
+                return False
             if active:
                 _assign_target(gen.target, iter_t, comp_tainted, rhs_expr=None, depth=depth + 1)
             for cond in gen.ifs:
+                if _truth(cond) is False:
+                    return False
                 if _eval_expr_taint(cond, comp_tainted, active=active, depth=depth + 1):
                     any_gen_tainted = True
         key_t = _eval_expr_taint(expr.key, comp_tainted, active=active, depth=depth + 1)
@@ -336,6 +413,20 @@ def _eval_expr_taint(
     return result
 
 
+def _rhs_dependencies(expr: ast.expr, tainted: set[str], active: bool) -> dict[int, bool]:
+    values: dict[int, bool] = {}
+    def evaluate(node: ast.expr) -> bool:
+        if isinstance(node, (ast.Tuple, ast.List)):
+            dependencies = [evaluate(item) for item in node.elts]
+            dependency = any(dependencies)
+        else:
+            dependency = _eval_expr_taint(node, tainted, active=active)
+        values[id(node)] = dependency
+        return dependency
+    evaluate(expr)
+    return values
+
+
 def _assign_target(
     target: ast.expr,
     rhs_tainted: bool,
@@ -343,6 +434,8 @@ def _assign_target(
     *,
     rhs_expr: ast.expr | None = None,
     depth: int = 1,
+    rhs_state: set[str] | None = None,
+    rhs_values: dict[int, bool] | None = None,
 ) -> None:
     """Apply assignment taint semantics to a store target."""
     if depth > MAX_EXPR_DEPTH:
@@ -351,7 +444,11 @@ def _assign_target(
             code="EXPR_TOO_DEEP",
         )
 
+    if rhs_state is None:
+        rhs_state = set(tainted)
+
     if isinstance(target, ast.Name):
+        _clear_target(tainted, target.id)
         if rhs_tainted:
             _add_taint(tainted, target.id)
         else:
@@ -371,13 +468,16 @@ def _assign_target(
             and not any(isinstance(e, ast.Starred) for e in rhs_expr.elts)
         ):
             for sub_target, sub_rhs in zip(target.elts, rhs_expr.elts):
-                sub_tainted = _eval_expr_taint(sub_rhs, tainted, active=True, depth=depth + 1)
+                sub_tainted = (rhs_values.get(id(sub_rhs), False) if rhs_values is not None
+                               else _eval_expr_taint(sub_rhs, set(rhs_state), active=True, depth=depth + 1))
                 _assign_target(
                     sub_target,
                     sub_tainted,
                     tainted,
                     rhs_expr=sub_rhs,
                     depth=depth + 1,
+                    rhs_state=rhs_state,
+                    rhs_values=rhs_values,
                 )
             return
 
@@ -385,51 +485,23 @@ def _assign_target(
             _assign_target(sub_target, rhs_tainted, tainted, rhs_expr=None, depth=depth + 1)
         return
 
-    if isinstance(target, ast.Attribute):
-        _eval_expr_taint(target.value, tainted, active=True, depth=depth + 1)
-        if rhs_tainted:
-            base = _extract_base_name(target)
-            if base is not None:
-                _add_taint(tainted, base)
-        return
-
-    if isinstance(target, ast.Subscript):
-        _eval_expr_taint(target.value, tainted, active=True, depth=depth + 1)
-        slice_tainted = _eval_expr_taint(target.slice, tainted, active=True, depth=depth + 1)
-        if rhs_tainted or slice_tainted:
-            base = _extract_base_name(target)
-            if base is not None:
-                _add_taint(tainted, base)
+    if isinstance(target, (ast.Attribute, ast.Subscript)):
+        key = _field_key(target)
+        if key is not None:
+            _clear_target(tainted, key)
+            if rhs_tainted:
+                _add_taint(tainted, key)
+        else:
+            _forget_fields(tainted, target)
         return
 
 
-def _apply_aug_assign(
-    target: ast.expr,
-    rhs_tainted: bool,
-    tainted: set[str],
-) -> None:
-    """Apply augmented assignment (x += rhs, obj.attr += rhs, arr[i] += rhs) taint semantics."""
-    if isinstance(target, ast.Name):
-        if rhs_tainted or (target.id in tainted):
-            _add_taint(tainted, target.id)
-        return
-
-    if isinstance(target, ast.Attribute):
-        base_t = _eval_expr_taint(target.value, tainted, active=True)
-        if rhs_tainted or base_t:
-            base = _extract_base_name(target)
-            if base is not None:
-                _add_taint(tainted, base)
-        return
-
-    if isinstance(target, ast.Subscript):
-        base_t = _eval_expr_taint(target.value, tainted, active=True)
-        slice_t = _eval_expr_taint(target.slice, tainted, active=True)
-        if rhs_tainted or base_t or slice_t:
-            base = _extract_base_name(target)
-            if base is not None:
-                _add_taint(tainted, base)
-        return
+def _apply_aug_assign(target: ast.expr, rhs_tainted: bool, tainted: set[str]) -> None:
+    key = _field_key(target)
+    if key is not None:
+        _assign_target(target, rhs_tainted or key in tainted, tainted)
+    else:
+        _forget_fields(tainted, target)
 
 
 def _bind_match_pattern(
@@ -449,12 +521,14 @@ def _bind_match_pattern(
         if pattern.pattern is not None:
             _bind_match_pattern(pattern.pattern, subject_tainted, tainted, depth + 1)
         if pattern.name is not None:
+            _clear_target(tainted, pattern.name)
             if subject_tainted:
                 _add_taint(tainted, pattern.name)
             else:
                 tainted.discard(pattern.name)
     elif isinstance(pattern, ast.MatchStar):
         if pattern.name is not None:
+            _clear_target(tainted, pattern.name)
             if subject_tainted:
                 _add_taint(tainted, pattern.name)
             else:
@@ -466,6 +540,7 @@ def _bind_match_pattern(
         for p in pattern.patterns:
             _bind_match_pattern(p, subject_tainted, tainted, depth + 1)
         if pattern.rest is not None:
+            _clear_target(tainted, pattern.rest)
             if subject_tainted:
                 _add_taint(tainted, pattern.rest)
             else:
@@ -486,7 +561,7 @@ def analyze_flow(
     raising_line: int,
     reached_site_ids: Sequence[str] = (),
 ) -> FlowResult:
-    """Run flow-sensitive may-taint analysis for a test function starting at raising_line."""
+    """Run flow-sensitive proven-dependency analysis for a test function starting at raising_line."""
     if isinstance(raising_line, bool) or not isinstance(raising_line, int):
         raise FlowError("raising_line must be an integer", code="INVALID_RAISING_LINE")
     if raising_line < 1 or raising_line > MAX_LINE_NUMBER:
@@ -495,6 +570,8 @@ def analyze_flow(
             code="INVALID_RAISING_LINE",
         )
 
+    if not isinstance(reached_site_ids, Sequence) or isinstance(reached_site_ids, (str, bytes)):
+        raise FlowError("Invalid reached site sequence", code="INVALID_SITE_ID")
     if len(reached_site_ids) > MAX_REACHED_ARGS:
         raise FlowError(
             f"Number of reached site IDs exceeds cap of {MAX_REACHED_ARGS}",
@@ -521,7 +598,21 @@ def analyze_flow(
 
     reached_set = set(reached_list)
     raising_stmt = _find_raising_statement(fn_node, raising_line)
+    if raising_stmt is None:
+        return FlowResult([s.site_id for s in sites if s.site_id in reached_set], True,
+                          "ambiguous raising statement position")
     raising_pos = (raising_stmt.lineno, raising_stmt.col_offset)
+    if (isinstance(raising_stmt, (ast.Assign, ast.AnnAssign))
+            and isinstance(raising_stmt.value, (ast.Tuple, ast.List, ast.Dict, ast.Set))):
+        return FlowResult([site.site_id for site in sites if site.site_id in reached_set], True,
+                          "raising aggregate requires an exact expression position")
+    raising_expressions = [node for node in ast.iter_child_nodes(raising_stmt) if isinstance(node, ast.expr)]
+    raising_walruses = [node for expr in raising_expressions for node in ast.walk(expr)
+                       if isinstance(node, ast.NamedExpr)]
+    if raising_walruses and (len(raising_walruses) != 1
+                            or raising_walruses[0] not in raising_expressions):
+        return FlowResult([site.site_id for site in sites if site.site_id in reached_set], True,
+                          "ambiguous raising assignment expression")
 
     # Check give-up conditions (nested functions, classes, lambdas, global, nonlocal).
     give_up_reason = _check_give_up(fn_node)
@@ -530,11 +621,28 @@ def analyze_flow(
         return FlowResult(eligible=reached_eligible, gave_up=True, reason=give_up_reason)
 
     eligible_set: set[str] = {s.site_id for s in sites if s.site_id in reached_set}
+    independent_sites: set[str] = set()
     site_by_pos: dict[tuple[int, int, str], AssertionSite] = {
         (s.lineno, s.col_offset, s.kind): s for s in sites
     }
 
     stmt_count = 0
+    loop_stack: list[tuple[list[_PathState], list[_PathState]]] = []
+
+    def merge_states(state: _PathState, branches: list[_PathState]) -> None:
+        live = [branch for branch in branches if not branch.terminated]
+        selected = live or branches
+        # Paths which never reached the supplied raising statement cannot explain
+        # that traceback and must not contribute a speculative dependency.
+        started = [branch for branch in selected if branch.started]
+        selected = started or selected
+        if not selected:
+            state.terminated = True
+            return
+        state.tainted = set.intersection(*(branch.tainted for branch in selected))
+        state.started = all(branch.started for branch in selected)
+        state.terminated = not live
+        state.control = selected[0].control if state.terminated else None
 
     def check_site_node(node: ast.AST, kind: str, state: _PathState) -> None:
         key = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), kind)
@@ -550,10 +658,14 @@ def analyze_flow(
         )
         if not (state.started and is_after):
             return
-        for checked_expr in site.checked_exprs:
-            if _eval_expr_taint(checked_expr, state.tainted, active=True):
-                eligible_set.add(site.site_id)
-                break
+        checked_state = set(state.tainted)
+        dependencies = [_eval_expr_taint(expr, checked_state, active=True)
+                        for expr in site.checked_exprs]
+        dependent = any(dependencies)
+        if dependent:
+            eligible_set.add(site.site_id)
+        else:
+            independent_sites.add(site.site_id)
 
     def scan_expr_for_assert_calls(expr: ast.expr | None, state: _PathState) -> None:
         if expr is None:
@@ -572,7 +684,24 @@ def analyze_flow(
                 calls.append(
                     (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), node, method)
                 )
-            for child in reversed(list(ast.iter_child_nodes(node))):
+            children = list(ast.iter_child_nodes(node))
+            if isinstance(node, ast.BoolOp):
+                children = []
+                for value in node.values:
+                    children.append(value)
+                    truth = _truth(value)
+                    if truth is not None and truth != isinstance(node.op, ast.And):
+                        break
+            elif isinstance(node, ast.IfExp):
+                truth = _truth(node.test)
+                children = [node.test]
+                if truth is not False:
+                    children.append(node.body)
+                if truth is not True:
+                    children.append(node.orelse)
+            elif isinstance(node, ast.GeneratorExp):
+                children = [node.generators[0].iter]
+            for child in reversed(children):
                 stack.append((child, depth + 1))
 
         calls.sort(key=lambda item: (item[0], item[1]))
@@ -594,10 +723,14 @@ def analyze_flow(
             if not (state.started and is_after):
                 continue
             checked_exprs = extract_checked_exprs_from_call(call_node, method_name)
-            for checked_expr in checked_exprs:
-                if _eval_expr_taint(checked_expr, state.tainted, active=True):
-                    eligible_set.add(site.site_id)
-                    break
+            checked_state = set(state.tainted)
+            dependencies = [_eval_expr_taint(expr, checked_state, active=True)
+                            for expr in checked_exprs]
+            dependent = any(dependencies)
+            if dependent:
+                eligible_set.add(site.site_id)
+            else:
+                independent_sites.add(site.site_id)
 
     def exec_stmts(stmts: list[ast.stmt], state: _PathState) -> None:
         nonlocal stmt_count
@@ -618,11 +751,24 @@ def analyze_flow(
             state.started = True
 
         active = state.started
+        walruses: list[ast.NamedExpr] = []
+        if is_raising:
+            expressions = [node for node in ast.iter_child_nodes(stmt) if isinstance(node, ast.expr)]
+            walruses = [node for expr in expressions for node in ast.walk(expr)
+                        if isinstance(node, ast.NamedExpr)]
+            if len(walruses) == 1:
+                _add_taint(state.tainted, walruses[0].target.id)
 
         if isinstance(stmt, ast.Assign):
-            rhs_t = _eval_expr_taint(stmt.value, state.tainted, active=active)
+            rhs_values = _rhs_dependencies(stmt.value, state.tainted, active)
+            rhs_t = rhs_values[id(stmt.value)]
+            if isinstance(stmt.value, (ast.Name, ast.Attribute, ast.Subscript)):
+                _forget_fields(state.tainted, stmt.value)
+            if len(walruses) == 1:
+                _add_taint(state.tainted, walruses[0].target.id)
             if is_raising:
                 rhs_t = True
+            rhs_state = set(state.tainted)
             for target in stmt.targets:
                 scan_expr_for_assert_calls(target, state)
                 if active:
@@ -635,7 +781,7 @@ def analyze_flow(
                         )
                         else None
                     )
-                    _assign_target(target, rhs_t, state.tainted, rhs_expr=use_literal_rhs)
+                    _assign_target(target, rhs_t, state.tainted, rhs_expr=use_literal_rhs, rhs_state=rhs_state, rhs_values=rhs_values)
             scan_expr_for_assert_calls(stmt.value, state)
 
         elif isinstance(stmt, ast.AnnAssign):
@@ -643,6 +789,8 @@ def analyze_flow(
             scan_expr_for_assert_calls(stmt.annotation, state)
             if stmt.value is not None:
                 rhs_t = _eval_expr_taint(stmt.value, state.tainted, active=active)
+                if len(walruses) == 1:
+                    _add_taint(state.tainted, walruses[0].target.id)
                 if is_raising:
                     rhs_t = True
                 if active:
@@ -682,94 +830,94 @@ def analyze_flow(
         elif isinstance(stmt, ast.Expr):
             scan_expr_for_assert_calls(stmt.value, state)
             _eval_expr_taint(stmt.value, state.tainted, active=active)
+            if len(walruses) == 1:
+                _add_taint(state.tainted, walruses[0].target.id)
 
         elif isinstance(stmt, ast.If):
             _eval_expr_taint(stmt.test, state.tainted, active=active)
+            if len(walruses) == 1:
+                _add_taint(state.tainted, walruses[0].target.id)
             scan_expr_for_assert_calls(stmt.test, state)
+            truth = _truth(stmt.test)
+            branches = []
+            for feasible, body in ((truth is not False, stmt.body), (truth is not True, stmt.orelse)):
+                if feasible:
+                    branch = state.clone()
+                    exec_stmts(body, branch)
+                    branches.append(branch)
+            merge_states(state, branches)
 
-            then_state = state.clone()
-            else_state = state.clone()
-            exec_stmts(stmt.body, then_state)
-            exec_stmts(stmt.orelse, else_state)
-
-            state.started = then_state.started or else_state.started
-            if then_state.terminated and else_state.terminated:
-                state.terminated = True
-                state.tainted = then_state.tainted | else_state.tainted
-            elif then_state.terminated:
-                state.terminated = False
-                state.tainted = else_state.tainted
-            elif else_state.terminated:
-                state.terminated = False
-                state.tainted = then_state.tainted
-            else:
-                state.terminated = False
-                state.tainted = then_state.tainted | else_state.tainted
-
-        elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-            scan_expr_for_assert_calls(stmt.target, state)
-            scan_expr_for_assert_calls(stmt.iter, state)
-
-            entry = state.clone()
-            for _ in range(MAX_LOOP_FIXPOINT_ITERATIONS):
-                iter_state = entry.clone()
-                iter_t = _eval_expr_taint(stmt.iter, iter_state.tainted, active=iter_state.started)
-                if is_raising:
-                    iter_t = True
-                if iter_state.started:
-                    _assign_target(stmt.target, iter_t, iter_state.tainted)
-                exec_stmts(stmt.body, iter_state)
-
-                next_tainted = entry.tainted | iter_state.tainted
-                next_started = entry.started or iter_state.started
-                if next_tainted == entry.tainted and next_started == entry.started:
-                    break
-                entry.tainted = next_tainted
-                entry.started = next_started
-            else:
-                raise FlowError(
-                    f"Loop fixpoint exceeded {MAX_LOOP_FIXPOINT_ITERATIONS} iterations",
-                    code="LOOP_FIXPOINT_EXCEEDED",
-                )
-
-            if stmt.orelse:
-                else_state = entry.clone()
-                exec_stmts(stmt.orelse, else_state)
-                state.tainted = entry.tainted | else_state.tainted
-                state.started = entry.started or else_state.started
-            else:
-                state.tainted = entry.tainted
-                state.started = entry.started
-
-        elif isinstance(stmt, ast.While):
-            entry = state.clone()
-            for _ in range(MAX_LOOP_FIXPOINT_ITERATIONS):
-                iter_state = entry.clone()
-                _eval_expr_taint(stmt.test, iter_state.tainted, active=iter_state.started)
-                scan_expr_for_assert_calls(stmt.test, iter_state)
-                exec_stmts(stmt.body, iter_state)
-
-                next_tainted = entry.tainted | iter_state.tainted
-                next_started = entry.started or iter_state.started
-                if next_tainted == entry.tainted and next_started == entry.started:
-                    break
-                entry.tainted = next_tainted
-                entry.started = next_started
-            else:
-                raise FlowError(
-                    f"Loop fixpoint exceeded {MAX_LOOP_FIXPOINT_ITERATIONS} iterations",
-                    code="LOOP_FIXPOINT_EXCEEDED",
-                )
-
-            if stmt.orelse:
-                else_state = entry.clone()
-                _eval_expr_taint(stmt.test, else_state.tainted, active=else_state.started)
-                exec_stmts(stmt.orelse, else_state)
-                state.tainted = entry.tainted | else_state.tainted
-                state.started = entry.started or else_state.started
-            else:
-                state.tainted = entry.tainted
-                state.started = entry.started
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            loop_entry = state.clone()
+            breaks: list[_PathState] = []
+            continues: list[_PathState] = []
+            loop_stack.append((breaks, continues))
+            try:
+                if isinstance(stmt, ast.While):
+                    iterable = None
+                    truth = _truth(stmt.test)
+                else:
+                    iterable = stmt.iter
+                    truth = _truth(iterable)
+                    scan_expr_for_assert_calls(iterable, state)
+                # Literal finite loops have an exact iteration count. Otherwise include
+                # the zero-iteration path and intersect dependencies at the fixed point.
+                exact_count = (len(iterable.elts) if isinstance(iterable, (ast.Tuple, ast.List))
+                               and not any(isinstance(item, ast.Starred) for item in iterable.elts) else None)
+                if exact_count is not None and exact_count > MAX_LOOP_FIXPOINT_ITERATIONS:
+                    exact_count = None
+                entry = state.clone()
+                iterations = exact_count if exact_count is not None else MAX_LOOP_FIXPOINT_ITERATIONS
+                if truth is False:
+                    iterations = 0
+                normal_exit = True
+                for index in range(iterations):
+                    body_state = entry.clone()
+                    if isinstance(stmt, ast.While):
+                        _eval_expr_taint(stmt.test, body_state.tainted, active=body_state.started)
+                        scan_expr_for_assert_calls(stmt.test, body_state)
+                    else:
+                        value = (iterable.elts[index] if exact_count is not None else iterable)
+                        iter_t = _eval_expr_taint(value, body_state.tainted, active=body_state.started)
+                        if is_raising:
+                            iter_t = True
+                        if body_state.started:
+                            _assign_target(stmt.target, iter_t, body_state.tainted)
+                    exec_stmts(stmt.body, body_state)
+                    outgoing = [] if body_state.terminated else [body_state]
+                    outgoing.extend(item for item in continues if item.control == "continue")
+                    continues.clear()
+                    for item in outgoing:
+                        item.terminated = False
+                        item.control = None
+                    if not outgoing:
+                        normal_exit = False
+                        break
+                    if exact_count is None:
+                        outgoing.append(loop_entry.clone())
+                    updated = entry.clone()
+                    merge_states(updated, outgoing)
+                    stable = (updated.tainted, updated.started) == (entry.tainted, entry.started)
+                    entry = updated
+                    if exact_count is None and stable:
+                        break
+                exits = []
+                if isinstance(stmt, ast.While) and truth is True:
+                    normal_exit = False
+                if normal_exit:
+                    exec_stmts(stmt.orelse, entry)
+                    exits.append(entry)
+                elif exact_count is None and truth is not True:
+                    exits.append(loop_entry)
+                for item in breaks:
+                    if item.control != "break":
+                        continue
+                    item.terminated = False
+                    item.control = None
+                    exits.append(item)
+                merge_states(state, exits)
+            finally:
+                loop_stack.pop()
 
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
@@ -784,100 +932,110 @@ def analyze_flow(
             exec_stmts(stmt.body, state)
 
         elif isinstance(stmt, (ast.Try, ast.TryStar)):
+            exit_lists = [(items, len(items)) for pair in loop_stack for items in pair]
             body_state = state.clone()
             exec_stmts(stmt.body, body_state)
-
-            merged_tainted = set(body_state.tainted)
-            merged_started = body_state.started
-            all_terminated = body_state.terminated
-
+            if not body_state.terminated:
+                exec_stmts(stmt.orelse, body_state)
+            branches = [body_state]
             for handler in stmt.handlers:
-                h_state = body_state.clone()
-                h_state.terminated = False
-                type_t = False
-                if handler.type is not None:
-                    scan_expr_for_assert_calls(handler.type, h_state)
-                    type_t = _eval_expr_taint(
-                        handler.type,
-                        h_state.tainted,
-                        active=h_state.started,
-                    )
-                if handler.name is not None and h_state.started:
-                    if type_t:
-                        _add_taint(h_state.tainted, handler.name)
-                    else:
-                        h_state.tainted.discard(handler.name)
-                exec_stmts(handler.body, h_state)
-                merged_tainted |= h_state.tainted
-                merged_started = merged_started or h_state.started
-                all_terminated = all_terminated and h_state.terminated
-
-            if stmt.orelse:
-                else_state = body_state.clone()
-                exec_stmts(stmt.orelse, else_state)
-                merged_tainted |= else_state.tainted
-                merged_started = merged_started or else_state.started
-
-            state.tainted = merged_tainted
-            state.started = merged_started
-            state.terminated = all_terminated if stmt.handlers else body_state.terminated
-
+                handler_state = state.clone()
+                # A handler may run before any body statement; only shared
+                # dependencies can be proven without exception-site information.
+                handler_state.tainted.intersection_update(body_state.tainted)
+                handler_state.started = state.started and body_state.started
+                if handler.name is not None:
+                    _clear_target(handler_state.tainted, handler.name)
+                exec_stmts(handler.body, handler_state)
+                branches.append(handler_state)
             if stmt.finalbody:
-                exec_stmts(stmt.finalbody, state)
+                # Loop transfers also execute finally, even when another branch
+                # falls through the try body. Keep their exit states separate.
+                final_states = list(branches)
+                for items, previous_count in exit_lists:
+                    for pending_state in items[previous_count:]:
+                        if not any(pending_state is item for item in final_states):
+                            final_states.append(pending_state)
+                for branch in final_states:
+                    pending = branch.terminated
+                    control = branch.control
+                    branch.terminated = False
+                    branch.control = None
+                    exec_stmts(stmt.finalbody, branch)
+                    if not branch.terminated:
+                        branch.terminated = pending
+                        branch.control = control
+            merge_states(state, branches)
 
         elif isinstance(stmt, ast.Match):
             scan_expr_for_assert_calls(stmt.subject, state)
-            subj_t = _eval_expr_taint(stmt.subject, state.tainted, active=active)
-            if is_raising:
-                subj_t = True
-
-            merged_tainted = set(state.tainted)
-            merged_started = state.started
+            subj_t = _eval_expr_taint(stmt.subject, state.tainted, active=active) or is_raising
+            branches = []
+            exhaustive = False
             for case in stmt.cases:
-                c_state = state.clone()
-                if c_state.started:
-                    _bind_match_pattern(case.pattern, subj_t, c_state.tainted)
+                if (isinstance(stmt.subject, ast.Constant) and isinstance(case.pattern, ast.MatchValue)
+                        and isinstance(case.pattern.value, ast.Constant)
+                        and stmt.subject.value != case.pattern.value.value):
+                    continue
+                case_state = state.clone()
+                if case_state.started:
+                    _bind_match_pattern(case.pattern, subj_t, case_state.tainted)
+                guard_truth = True if case.guard is None else _truth(case.guard)
+                if guard_truth is False:
+                    continue
                 if case.guard is not None:
-                    scan_expr_for_assert_calls(case.guard, c_state)
-                    _eval_expr_taint(case.guard, c_state.tainted, active=c_state.started)
-                exec_stmts(case.body, c_state)
-                merged_tainted |= c_state.tainted
-                merged_started = merged_started or c_state.started
+                    _eval_expr_taint(case.guard, case_state.tainted, active=case_state.started)
+                    scan_expr_for_assert_calls(case.guard, case_state)
+                exec_stmts(case.body, case_state)
+                branches.append(case_state)
+                if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and guard_truth is True:
+                    exhaustive = True
+                    break
+            if not exhaustive:
+                branches.append(state.clone())
+            merge_states(state, branches)
 
-            state.tainted = merged_tainted
-            state.started = merged_started
+        elif isinstance(stmt, (ast.Break, ast.Continue)):
+            state.terminated = True
+            state.control = "break" if isinstance(stmt, ast.Break) else "continue"
+            if loop_stack:
+                target = loop_stack[-1][0 if isinstance(stmt, ast.Break) else 1]
+                target.append(state)
 
         elif isinstance(stmt, ast.Delete):
             for target in stmt.targets:
                 scan_expr_for_assert_calls(target, state)
-                if active and isinstance(target, ast.Name):
-                    state.tainted.discard(target.id)
+                if active:
+                    key = _field_key(target)
+                    if key is not None:
+                        _clear_target(state.tainted, key)
+                    else:
+                        _forget_fields(state.tainted, target)
 
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             if active:
                 for alias in stmt.names:
                     bound = alias.asname if alias.asname else alias.name.split(".")[0]
-                    state.tainted.discard(bound)
+                    _clear_target(state.tainted, bound)
 
         elif isinstance(stmt, ast.Return):
             scan_expr_for_assert_calls(stmt.value, state)
             _eval_expr_taint(stmt.value, state.tainted, active=active)
-            if active:
-                state.terminated = True
+            state.terminated = True
 
         elif isinstance(stmt, ast.Raise):
             scan_expr_for_assert_calls(stmt.exc, state)
             scan_expr_for_assert_calls(stmt.cause, state)
             _eval_expr_taint(stmt.exc, state.tainted, active=active)
             _eval_expr_taint(stmt.cause, state.tainted, active=active)
-            if active:
-                state.terminated = True
+            state.terminated = True
 
     initial_state = _PathState(tainted=set(), started=False, terminated=False)
     exec_stmts(fn_node.body, initial_state)
 
     # Return eligible site IDs in deterministic source order.
-    ordered_eligible = [s.site_id for s in sites if s.site_id in eligible_set]
+    ordered_eligible = [s.site_id for s in sites if s.site_id in reached_set
+                        or (s.site_id in eligible_set and s.site_id not in independent_sites)]
     return FlowResult(eligible=ordered_eligible, gave_up=False, reason=None)
 
 

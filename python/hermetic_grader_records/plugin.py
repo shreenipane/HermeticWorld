@@ -45,8 +45,10 @@ def _validate_orig_fd(fd: int) -> int:
 
 
 def _parse_env_fd(raw_value: str) -> int:
+    if len(raw_value) > MAX_FD_ENV_LEN:
+        raise PluginError("Invalid HERMETIC_RESULT_FD value")
     stripped = raw_value.strip()
-    if len(stripped) == 0 or len(stripped) > MAX_FD_ENV_LEN or not stripped.isdigit():
+    if len(stripped) == 0 or len(stripped) > MAX_FD_ENV_LEN or not stripped.isascii() or not stripped.isdigit():
         raise PluginError("Invalid HERMETIC_RESULT_FD value")
     return _validate_orig_fd(int(stripped, 10))
 

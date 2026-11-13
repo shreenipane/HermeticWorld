@@ -17,7 +17,9 @@ MAX_RECORD: int = 64 * 1024  # 64 KiB maximum payload length per record
 READ_CHUNK_SIZE: int = 4096  # Maximum bytes read per single fileobj.read() call
 MAX_RECORDS: int = 100_000  # Maximum records allowed in a single stream
 MAX_NODEID_LEN: int = 4096  # Maximum UTF-8 character length of a pytest nodeid
-MAX_CHUNK_READS_PER_ITEM: int = (MAX_RECORD // READ_CHUNK_SIZE) + 16
+MAX_CHUNK_READS_PER_ITEM: int = MAX_RECORD + 1
+MAX_JSON_DEPTH: int = 32
+MAX_STREAM_BYTES: int = MAGIC_LEN + (MAX_RECORDS + 1) * (HEADER_LEN + MAX_RECORD)
 
 VALID_OUTCOMES: frozenset[str] = frozenset({"passed", "failed", "skipped", "error"})
 
@@ -262,6 +264,25 @@ def _parse_payload_object(payload_bytes: bytes) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise RecordError("Invalid UTF-8 in record payload") from exc
 
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == chr(92):
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecordError("JSON nesting exceeds MAX_JSON_DEPTH")
+        elif char in "]}":
+            depth -= 1
     try:
         parsed = json.loads(
             text,
@@ -270,7 +291,7 @@ def _parse_payload_object(payload_bytes: bytes) -> dict[str, Any]:
         )
     except RecordError:
         raise
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (ValueError, RecursionError, MemoryError) as exc:
         raise RecordError("Invalid JSON in record payload") from exc
 
     if not isinstance(parsed, dict):
@@ -359,18 +380,8 @@ def iter_records(fileobj: BinaryIO) -> Iterator[Record]:
     expected_seq: int = 0
     active_nodeid: str | None = None
     seen_nodeids: set[str] = set()
-    saw_end: bool = False
 
     for _ in range(MAX_RECORDS + 1):
-        if saw_end:
-            try:
-                trailing = fileobj.read(1)
-            except OSError as exc:
-                raise RecordError("I/O failure after END record") from exc
-            if trailing:
-                raise RecordError("Trailing bytes after END record")
-            return
-
         header_bytes = _read_exact(fileobj, HEADER_LEN, allow_clean_eof=True)
         raw_type, payload_len = HEADER_STRUCT.unpack(header_bytes)
 
@@ -419,8 +430,14 @@ def iter_records(fileobj: BinaryIO) -> Iterator[Record]:
                 raise RecordError("END received while test still active")
             if record.count != expected_seq:
                 raise RecordError("END record count does not match stream length")
-            saw_end = True
+            try:
+                trailing = fileobj.read(1)
+            except OSError as exc:
+                raise RecordError("I/O failure after END record") from exc
+            if not isinstance(trailing, (bytes, bytearray)) or trailing:
+                raise RecordError("Trailing bytes after END record")
             yield record
+            return
 
     raise RecordError("Stream exceeds MAX_RECORDS")
 

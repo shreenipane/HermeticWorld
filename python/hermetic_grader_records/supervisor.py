@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import errno
-import fcntl
 import json
 import os
-import stat
 from typing import Any, BinaryIO
+
+from hermetic_safe_io import UnsafePathError, atomic_write, open_regular, validate_path
 
 from hermetic_grader_records.record import (
     EndRecord,
     FinishRecord,
     HermeticGraderError,
     MAX_NODEID_LEN,
+    MAX_STREAM_BYTES,
     PrematureEOFError,
     RecordError,
     StartRecord,
@@ -23,11 +23,6 @@ from hermetic_grader_records.record import (
 
 MAX_EXPECTED_NODEIDS: int = 100_000
 MAX_REPORT_BYTES: int = 16 * 1024 * 1024  # 16 MiB
-WRITE_CHUNK_SIZE: int = 65536
-MAX_WRITE_ITERATIONS: int = (MAX_REPORT_BYTES // WRITE_CHUNK_SIZE) + 16
-MAX_TEMP_ATTEMPTS: int = 64
-
-_TEMP_COUNTER: int = 0
 
 
 class SupervisorError(HermeticGraderError):
@@ -117,7 +112,7 @@ def evaluate_stream(fileobj: BinaryIO, expected_nodeids: list[str]) -> Superviso
                 else:
                     unexpected_set.add(record.nodeid)
             elif isinstance(record, EndRecord):
-                break
+                continue
     except PrematureEOFError as exc:
         stream_error = str(exc)
         corrupt_error = False
@@ -153,7 +148,50 @@ def read_results(fileobj: BinaryIO, expected_nodeids: list[str]) -> dict[str, st
 
 def format_report_json(report: SupervisorReport) -> str:
     """Serialize a SupervisorReport into deterministic JSON (sorted keys, sorted lists)."""
-    return json.dumps(report.to_dict(), sort_keys=True, indent=2, allow_nan=False) + "\n"
+    _validate_report_budget(report)
+    chunks: list[str] = []
+    total = 1  # final newline
+    encoder = json.JSONEncoder(sort_keys=True, indent=2, allow_nan=False)
+    for chunk in encoder.iterencode(report.to_dict()):
+        total += len(chunk)  # ensure_ascii=True: characters equal encoded bytes
+        if total > MAX_REPORT_BYTES:
+            raise SupervisorError("Report exceeds MAX_REPORT_BYTES")
+        chunks.append(chunk)
+    return "".join(chunks) + "\n"
+
+
+def _validate_report_budget(report: SupervisorReport) -> None:
+    # Bound strings before sorting or JSON escaping allocates copies.
+    if len(report.outcomes) + len(report.unexpected) > MAX_EXPECTED_NODEIDS * 2:
+        raise SupervisorError("Report item cap exceeded")
+    total = 0
+
+    def account(value: str) -> None:
+        nonlocal total
+        if not isinstance(value, str) or len(value) > MAX_REPORT_BYTES:
+            raise SupervisorError("Invalid report string")
+        for char in value:
+            point = ord(char)
+            if point > 0xffff:
+                total += 12
+            elif char in "\b\f\n\r\t":
+                total += 2
+            elif point < 32 or point > 126:
+                total += 6
+            elif char in ('"', chr(92)):
+                total += 2
+            else:
+                total += 1
+            if total > MAX_REPORT_BYTES:
+                raise SupervisorError("Report exceeds MAX_REPORT_BYTES")
+
+    for key, value in report.outcomes.items():
+        account(key)
+        account(value)
+    for value in report.unexpected:
+        account(value)
+    if report.error is not None:
+        account(report.error)
 
 
 def read_results_json(fileobj: BinaryIO, expected_nodeids: list[str]) -> str:
@@ -164,162 +202,33 @@ def read_results_json(fileobj: BinaryIO, expected_nodeids: list[str]) -> str:
 def open_regular_file_ro(path: str | os.PathLike[str]) -> BinaryIO:
     """Open a regular file read-only without following symlinks or blocking on FIFOs."""
     try:
-        raw_path = os.fspath(path)
-    except TypeError as exc:
-        raise SupervisorError("Invalid file path") from exc
-
-    if not raw_path:
-        raise SupervisorError("Empty file path")
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-
-    try:
-        fd = os.open(raw_path, flags)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.EMLINK):
-            raise UnsafeFileError("Refusing symlink when opening regular file") from exc
-        raise SupervisorError("Failed to open input file") from exc
-
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise UnsafeFileError("Refusing non-regular file (FIFO, device, directory, or socket)")
-
-        if hasattr(fcntl, "F_GETFL") and hasattr(fcntl, "F_SETFL") and hasattr(os, "O_NONBLOCK"):
-            cur_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, cur_flags & ~os.O_NONBLOCK)
-
-        return os.fdopen(fd, "rb")
-    except Exception as exc:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        if isinstance(exc, SupervisorError):
-            raise
-        raise SupervisorError("Failed to validate regular input file") from exc
+        validate_path(path)
+        return os.fdopen(open_regular(path, MAX_STREAM_BYTES), "rb")
+    except UnsafePathError as exc:
+        raise UnsafeFileError("Unsafe regular input path") from exc
+    except (OSError, TypeError, ValueError) as exc:
+        raise SupervisorError("Unable to open regular input file") from exc
 
 
 def read_results_from_file(
     path: str | os.PathLike[str], expected_nodeids: list[str]
 ) -> SupervisorReport:
     """Safely open a regular result file (no symlinks/FIFOs/devices) and evaluate it."""
+    validated = _validate_expected_nodeids(expected_nodeids)
     with open_regular_file_ro(path) as stream:
-        return evaluate_stream(stream, expected_nodeids)
+        return evaluate_stream(stream, validated)
 
 
 def write_report_atomic(path: str | os.PathLike[str], report: SupervisorReport) -> None:
     """Atomically write a deterministic JSON report to a regular file path."""
-    global _TEMP_COUNTER
-
     try:
-        raw_path = os.fspath(path)
-    except TypeError as exc:
+        validate_path(path)
+    except (TypeError, ValueError) as exc:
         raise SupervisorError("Invalid destination path") from exc
-
-    if isinstance(raw_path, bytes):
-        raise SupervisorError("Destination path must be str")
-    if not raw_path:
-        raise SupervisorError("Empty destination path")
-
     payload = report.to_json().encode("utf-8")
-    if len(payload) > MAX_REPORT_BYTES:
-        raise SupervisorError("Report exceeds MAX_REPORT_BYTES")
-
     try:
-        dest_st = os.lstat(raw_path)
-    except FileNotFoundError:
-        dest_st = None
+        atomic_write(path, payload)
+    except UnsafePathError as exc:
+        raise UnsafeFileError("Unsafe report destination") from exc
     except OSError as exc:
-        raise SupervisorError("Failed to inspect destination path") from exc
-
-    if dest_st is not None:
-        if stat.S_ISLNK(dest_st.st_mode):
-            raise UnsafeFileError("Refusing to overwrite symlink")
-        if not stat.S_ISREG(dest_st.st_mode):
-            raise UnsafeFileError("Refusing to overwrite non-regular file")
-
-    parent_dir = os.path.dirname(raw_path) or "."
-    try:
-        parent_st = os.lstat(parent_dir)
-    except OSError as exc:
-        raise SupervisorError("Parent directory does not exist") from exc
-
-    if stat.S_ISLNK(parent_st.st_mode) or not stat.S_ISDIR(parent_st.st_mode):
-        raise UnsafeFileError("Refusing symlink or non-directory parent")
-
-    pid = os.getpid()
-    open_flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-
-    for attempt in range(MAX_TEMP_ATTEMPTS):
-        _TEMP_COUNTER += 1
-        tmp_name = f".tmp.hgr.{pid}.{_TEMP_COUNTER}.{attempt}"
-        tmp_path = os.path.join(parent_dir, tmp_name)
-
-        try:
-            fd = os.open(tmp_path, open_flags, 0o600)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise SupervisorError("Failed to create temporary report file") from exc
-
-        try:
-            tmp_st = os.fstat(fd)
-            if not stat.S_ISREG(tmp_st.st_mode):
-                raise UnsafeFileError("Temporary file is not a regular file")
-
-            view = memoryview(payload)
-            offset = 0
-            for _ in range(MAX_WRITE_ITERATIONS):
-                if offset >= len(payload):
-                    break
-                chunk = view[offset : offset + WRITE_CHUNK_SIZE]
-                written = os.write(fd, chunk)
-                if written <= 0:
-                    raise SupervisorError("Zero-byte write while saving report")
-                offset += written
-            else:
-                raise SupervisorError("Exceeded MAX_WRITE_ITERATIONS while saving report")
-
-            os.fsync(fd)
-            os.close(fd)
-            fd = -1
-
-            os.replace(tmp_path, raw_path)
-
-            # Best-effort directory fsync for crash durability
-            dir_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-            if hasattr(os, "O_DIRECTORY"):
-                dir_flags |= os.O_DIRECTORY
-            try:
-                dir_fd = os.open(parent_dir, dir_flags)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-            return
-        except Exception as exc:
-            if fd != -1:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            if isinstance(exc, SupervisorError):
-                raise
-            raise SupervisorError("Atomic report write failed") from exc
-
-    raise SupervisorError("Exhausted MAX_TEMP_ATTEMPTS creating temporary file")
+        raise SupervisorError("Atomic report write failed") from exc

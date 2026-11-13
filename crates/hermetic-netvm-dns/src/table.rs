@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::safe_io;
 
 /// Maximum JSON manifest size accepted for DNS table loading (1 MiB).
 pub const MAX_TABLE_JSON_BYTES: usize = 1024 * 1024;
@@ -74,38 +76,22 @@ impl fmt::Display for TableError {
             TableError::InputTooLarge { size, max } => {
                 write!(f, "table JSON input size {size} exceeds cap {max}")
             }
-            TableError::JsonParse(msg) => write!(f, "invalid table JSON: {msg}"),
+            TableError::JsonParse(_) => write!(f, "invalid table JSON"),
             TableError::TooManyRecords { count, max } => {
                 write!(f, "table record count {count} exceeds cap {max}")
             }
-            TableError::InvalidName(name) => write!(f, "invalid DNS name in table: {name:?}"),
-            TableError::DuplicateName(name) => write!(f, "duplicate DNS name in table: {name:?}"),
-            TableError::TooManyAddresses { name, count, max } => {
-                write!(
-                    f,
-                    "record {name:?} has {count} A addresses, exceeding cap {max}"
-                )
+            TableError::InvalidName(_) => write!(f, "invalid DNS name in table"),
+            TableError::DuplicateName(_) => write!(f, "duplicate DNS name in table"),
+            TableError::TooManyAddresses { count, max, .. } => {
+                write!(f, "A address count {count} exceeds cap {max}")
             }
-            TableError::InvalidIpv4 { name, address } => {
-                write!(f, "record {name:?} has invalid IPv4 address {address:?}")
+            TableError::InvalidIpv4 { .. } => write!(f, "invalid IPv4 address"),
+            TableError::AddressOutOfWorldRange { .. } => {
+                write!(f, "IPv4 address outside world range")
             }
-            TableError::AddressOutOfWorldRange { name, address } => {
-                write!(
-                    f,
-                    "record {name:?} has IPv4 address {address} outside 10.0.0.0/8"
-                )
-            }
-            TableError::DuplicateAddress { name, address } => {
-                write!(
-                    f,
-                    "record {name:?} contains duplicate IPv4 address {address}"
-                )
-            }
-            TableError::NonEmptyAaaa { name, count } => {
-                write!(
-                    f,
-                    "record {name:?} has {count} AAAA addresses; AAAA list must be empty"
-                )
+            TableError::DuplicateAddress { .. } => write!(f, "duplicate IPv4 address"),
+            TableError::NonEmptyAaaa { count, .. } => {
+                write!(f, "AAAA list must be empty (count {count})")
             }
             TableError::SymlinkNotAllowed => {
                 write!(f, "refusing to open or overwrite a symbolic link")
@@ -159,6 +145,22 @@ struct SerializedRecord<'a> {
     aaaa: [&'static str; 0],
 }
 
+struct CappedJsonWriter(Vec<u8>);
+
+impl Write for CappedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_TABLE_JSON_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Table output cap exceeded"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Deterministic, bounded in-memory DNS manifest table for NetVM.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DnsTable {
@@ -192,8 +194,8 @@ impl DnsTable {
             });
         }
 
-        let raw: RawManifest =
-            serde_json::from_slice(bytes).map_err(|e| TableError::JsonParse(e.to_string()))?;
+        let raw: RawManifest = serde_json::from_slice(bytes)
+            .map_err(|_| TableError::JsonParse("InvalidJson".into()))?;
 
         if raw.records.len() > MAX_TABLE_RECORDS {
             return Err(TableError::TooManyRecords {
@@ -208,19 +210,19 @@ impl DnsTable {
             validate_table_name(&rec.name)?;
 
             if records.contains_key(&rec.name) {
-                return Err(TableError::DuplicateName(rec.name));
+                return Err(TableError::DuplicateName(String::new()));
             }
 
             if !rec.aaaa.is_empty() {
                 return Err(TableError::NonEmptyAaaa {
-                    name: rec.name,
+                    name: String::new(),
                     count: rec.aaaa.len(),
                 });
             }
 
             if rec.a.len() > MAX_A_RECORDS_PER_NAME {
                 return Err(TableError::TooManyAddresses {
-                    name: rec.name,
+                    name: String::new(),
                     count: rec.a.len(),
                     max: MAX_A_RECORDS_PER_NAME,
                 });
@@ -229,14 +231,14 @@ impl DnsTable {
             let mut ipv4s = Vec::with_capacity(rec.a.len());
             for addr_str in rec.a {
                 let ip: Ipv4Addr = addr_str.parse().map_err(|_| TableError::InvalidIpv4 {
-                    name: rec.name.clone(),
-                    address: addr_str,
+                    name: String::new(),
+                    address: String::new(),
                 })?;
 
                 if ip.octets()[0] != 10 {
                     return Err(TableError::AddressOutOfWorldRange {
-                        name: rec.name,
-                        address: ip,
+                        name: String::new(),
+                        address: Ipv4Addr::UNSPECIFIED,
                     });
                 }
 
@@ -244,10 +246,10 @@ impl DnsTable {
             }
 
             ipv4s.sort();
-            if let Some(dup) = ipv4s.windows(2).find(|w| w[0] == w[1]) {
+            if ipv4s.windows(2).any(|w| w[0] == w[1]) {
                 return Err(TableError::DuplicateAddress {
-                    name: rec.name,
-                    address: dup[0],
+                    name: String::new(),
+                    address: Ipv4Addr::UNSPECIFIED,
                 });
             }
 
@@ -284,31 +286,7 @@ impl DnsTable {
     /// Opens a regular file without following symlinks, refusing FIFOs/devices/directories,
     /// and loads a [`DnsTable`] bounded by [`MAX_TABLE_JSON_BYTES`].
     pub fn from_file(path: &Path) -> Result<Self, TableError> {
-        let meta =
-            fs::symlink_metadata(path).map_err(|e| TableError::Io(format!("{:?}", e.kind())))?;
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            return Err(TableError::SymlinkNotAllowed);
-        }
-        if !file_type.is_file() {
-            return Err(TableError::NotRegularFile);
-        }
-        if meta.len() > MAX_TABLE_JSON_BYTES as u64 {
-            return Err(TableError::InputTooLarge {
-                size: usize::try_from(meta.len()).unwrap_or(usize::MAX),
-                max: MAX_TABLE_JSON_BYTES,
-            });
-        }
-
-        let file = File::open(path).map_err(|e| TableError::Io(format!("{:?}", e.kind())))?;
-        let opened_meta = file
-            .metadata()
-            .map_err(|e| TableError::Io(format!("{:?}", e.kind())))?;
-        if !opened_meta.file_type().is_file() {
-            return Err(TableError::NotRegularFile);
-        }
-
-        Self::from_reader(file)
+        Self::from_reader(safe_io::open_regular(path, MAX_TABLE_JSON_BYTES)?)
     }
 
     /// Serializes the table deterministically as canonical JSON bytes.
@@ -324,21 +302,27 @@ impl DnsTable {
             .collect();
 
         let manifest = SerializedManifest { records };
-        let bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| TableError::JsonParse(e.to_string()))?;
-        if bytes.len() > MAX_TABLE_JSON_BYTES {
-            return Err(TableError::InputTooLarge {
-                size: bytes.len(),
+        let mut writer = CappedJsonWriter(Vec::new());
+        serde_json::to_writer_pretty(&mut writer, &manifest).map_err(|_| {
+            TableError::InputTooLarge {
+                size: MAX_TABLE_JSON_BYTES + 1,
                 max: MAX_TABLE_JSON_BYTES,
-            });
-        }
-        Ok(bytes)
+            }
+        })?;
+        Ok(writer.0)
     }
 
     /// Atomically writes the serialized JSON table to `path` using a temporary file in the same
     /// directory, `fsync`, and `rename`, refusing symlinks and non-regular files.
     pub fn write_atomic(&self, path: &Path) -> Result<(), TableError> {
-        let parent = path.parent().ok_or(TableError::InvalidDestinationPath)?;
+        self.write_atomic_after_parent(path, || {})
+    }
+
+    fn write_atomic_after_parent(
+        &self,
+        path: &Path,
+        after_parent: impl FnOnce(),
+    ) -> Result<(), TableError> {
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -347,64 +331,31 @@ impl DnsTable {
             return Err(TableError::InvalidDestinationPath);
         }
 
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                return Err(TableError::SymlinkNotAllowed);
-            }
-            if !ft.is_file() {
-                return Err(TableError::NotRegularFile);
-            }
-        }
-
         let payload = self.to_json_bytes()?;
-
+        let (directory, leaf) = safe_io::open_parent(path)?;
+        after_parent();
+        let destination = safe_io::child_path(&directory, &leaf);
+        safe_io::inspect_regular(&destination)?;
         for attempt in 0..MAX_ATOMIC_TMP_ATTEMPTS {
             let tmp_name = format!(".{file_name}.tmp.{attempt}");
-            let tmp_path = parent.join(tmp_name);
-
-            if let Ok(meta) = fs::symlink_metadata(&tmp_path) {
-                if meta.file_type().is_symlink() {
-                    return Err(TableError::SymlinkNotAllowed);
-                }
-                continue;
-            }
-
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-            {
+            let tmp_path = safe_io::child_path(&directory, std::ffi::OsStr::new(&tmp_name));
+            match safe_io::create_private(&tmp_path) {
                 Ok(mut tmp_file) => {
-                    let write_res = (|| -> Result<(), TableError> {
-                        tmp_file
-                            .write_all(&payload)
-                            .map_err(|e| TableError::Io(format!("{:?}", e.kind())))?;
-                        tmp_file
-                            .sync_all()
-                            .map_err(|e| TableError::Io(format!("{:?}", e.kind())))?;
-                        Ok(())
+                    let result = (|| {
+                        tmp_file.write_all(&payload).map_err(safe_io::io_error)?;
+                        tmp_file.sync_all().map_err(safe_io::io_error)?;
+                        fs::rename(&tmp_path, &destination).map_err(safe_io::io_error)?;
+                        directory.sync_all().map_err(safe_io::io_error)
                     })();
-
-                    drop(tmp_file);
-
-                    if let Err(err) = write_res {
+                    if result.is_err() {
                         let _ = fs::remove_file(&tmp_path);
-                        return Err(err);
                     }
-
-                    if let Err(err) = fs::rename(&tmp_path, path) {
-                        let _ = fs::remove_file(&tmp_path);
-                        return Err(TableError::Io(format!("{:?}", err.kind())));
-                    }
-
-                    return Ok(());
+                    return result;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(TableError::Io(format!("{:?}", e.kind()))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(safe_io::io_error(error)),
             }
         }
-
         Err(TableError::AtomicWriteExhausted)
     }
 
@@ -438,41 +389,80 @@ impl DnsTable {
 /// - No wildcards, no uppercase, no trailing or leading dots
 pub fn validate_table_name(name: &str) -> Result<(), TableError> {
     if name.is_empty() || name.len() > MAX_DNS_NAME_LEN {
-        return Err(TableError::InvalidName(name.to_string()));
+        return Err(TableError::InvalidName(String::new()));
     }
 
     let mut label_count: usize = 0;
     for label in name.split('.') {
         label_count += 1;
         if label_count > MAX_DNS_LABELS {
-            return Err(TableError::InvalidName(name.to_string()));
+            return Err(TableError::InvalidName(String::new()));
         }
 
         let len = label.len();
         if !(MIN_DNS_LABEL_LEN..=MAX_DNS_LABEL_LEN).contains(&len) {
-            return Err(TableError::InvalidName(name.to_string()));
+            return Err(TableError::InvalidName(String::new()));
         }
 
         let bytes = label.as_bytes();
         let first = match bytes.first() {
             Some(&b) => b,
-            None => return Err(TableError::InvalidName(name.to_string())),
+            None => return Err(TableError::InvalidName(String::new())),
         };
         let last = match bytes.last() {
             Some(&b) => b,
-            None => return Err(TableError::InvalidName(name.to_string())),
+            None => return Err(TableError::InvalidName(String::new())),
         };
 
         if first == b'-' || last == b'-' {
-            return Err(TableError::InvalidName(name.to_string()));
+            return Err(TableError::InvalidName(String::new()));
         }
 
         for &b in bytes {
             if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
-                return Err(TableError::InvalidName(name.to_string()));
+                return Err(TableError::InvalidName(String::new()));
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn manifest_parent_exchange_does_not_redirect_publication() {
+        let root = std::env::temp_dir().join(format!("dns-manifest-swap-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        let outside = root.join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("output"), b"secret").unwrap();
+        DnsTable::empty()
+            .write_atomic_after_parent(&parent.join("output"), || {
+                fs::rename(&parent, &moved).unwrap();
+                symlink(&outside, &parent).unwrap();
+            })
+            .unwrap();
+        assert_eq!(fs::read(outside.join("output")).unwrap(), b"secret");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(
+            DnsTable::from_file(&moved.join("output")).unwrap(),
+            DnsTable::empty()
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serialization_never_extends_buffer_past_cap() {
+        let mut writer = CappedJsonWriter(Vec::new());
+        writer.write_all(&vec![b'x'; MAX_TABLE_JSON_BYTES]).unwrap();
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.0.len(), MAX_TABLE_JSON_BYTES);
+    }
 }

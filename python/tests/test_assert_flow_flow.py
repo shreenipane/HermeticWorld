@@ -68,10 +68,9 @@ def test_branches(cond):
     # line 3: `x = failing_op()`
     # In `if`: y becomes tainted, x becomes untainted.
     # In `else`: y stays untainted, x becomes untainted.
-    # Join after `if/else`: y is tainted on `if` path (may-taint -> eligible),
-    # x is untainted on ALL paths (not eligible).
+    # Neither assertion has a dependency on every feasible path.
     result = eligible_sites(src, "test_branches", raising_line=3, reached_site_ids=[])
-    assert result == ["test_branches#0"]
+    assert result == []
 
 
 def test_branch_partial_overwrite_preserves_may_taint() -> None:
@@ -82,9 +81,9 @@ def test_partial_overwrite(cond):
         x = 10
     assert x == 10
 """
-    # On the implicit else path, x is still tainted -> may-taint -> eligible.
+    # The overwrite path supplies an independent value, so dependency is unproven.
     result = eligible_sites(src, "test_partial_overwrite", raising_line=3, reached_site_ids=[])
-    assert result == ["test_partial_overwrite#0"]
+    assert result == []
 
 
 def test_loop_target_and_body_fixpoint() -> None:
@@ -96,9 +95,9 @@ def test_loop():
         total = total + item
     assert total > 0
 """
-    # line 3: `items = failing_items()` -> items tainted -> item tainted -> total tainted
+    # The iterable might be empty; total is then independent of items.
     result = eligible_sites(src, "test_loop", raising_line=3, reached_site_ids=[])
-    assert result == ["test_loop#0"]
+    assert result == []
 
 
 def test_tuple_unpacking() -> None:
@@ -142,9 +141,9 @@ def test_stores(self):
     self.assertIn(2, arr)
 """
     # line 3: `bad = failing_value()`
-    # `cfg.endpoint = bad` taints base `cfg`; `arr[0] = bad` taints base `arr`.
+    # cfg.port is independent; membership may be decided by an unchanged item.
     result = eligible_sites(src, "test_stores", raising_line=3, reached_site_ids=[])
-    assert result == ["test_stores#0", "test_stores#1"]
+    assert result == []
 
 
 def test_augmented_assignment_with_as_and_walrus() -> None:

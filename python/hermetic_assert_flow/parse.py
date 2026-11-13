@@ -23,6 +23,14 @@ def parse_source(
 
     Never imports, compiles bytecode, or executes the parsed source.
     """
+    for value, minimum, maximum in (
+        (max_bytes, 0, MAX_SOURCE_BYTES),
+        (max_depth, 1, MAX_AST_DEPTH),
+        (max_nodes, 1, MAX_AST_NODES),
+    ):
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise FlowError("Invalid parser limit", code="INVALID_LIMIT")
+
     if not isinstance(source, bytes):
         raise FlowError("Source must be bytes", code="INVALID_SOURCE_TYPE")
 

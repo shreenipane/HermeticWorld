@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod respond;
+mod safe_io;
 pub mod table;
 pub mod wire;
 
