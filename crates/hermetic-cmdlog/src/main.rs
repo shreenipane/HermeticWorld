@@ -15,8 +15,11 @@ use std::process::ExitCode;
 
 use hermetic_cmdlog::verify;
 
+// Include one extra argument so excess arguments are rejected without collecting them all.
+const MAX_CLI_ARGS: usize = 4;
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<_> = env::args_os().take(MAX_CLI_ARGS).collect();
     match args.as_slice() {
         [_, subcommand, file_path] if subcommand == "verify" => match verify(file_path) {
             Ok(head) => match serde_json::to_string(&head) {

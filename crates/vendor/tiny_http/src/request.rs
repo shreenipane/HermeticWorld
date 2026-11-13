@@ -457,15 +457,19 @@ impl Request {
 
         let do_not_send_body = self.method == Method::Head;
 
-        Self::ignore_client_closing_errors(response.raw_print(
+        let result = response.raw_print(
             writer.by_ref(),
             self.http_version.clone(),
             &self.headers,
             do_not_send_body,
             None,
-        ))?;
-
-        Self::ignore_client_closing_errors(writer.flush())
+        ).and_then(|()| writer.flush());
+        if result.is_err() {
+            // Close before releasing the sequential writer: otherwise a later response
+            // could be emitted in place of this failed or partial response.
+            self.shutdown_without_response();
+        }
+        Self::ignore_client_closing_errors(result)
     }
 
     fn ignore_client_closing_errors(result: io::Result<()>) -> io::Result<()> {
@@ -587,6 +591,35 @@ impl<T> ReadWrite for T where T: Read + Write {}
 #[cfg(test)]
 mod tests {
     use super::Request;
+
+    #[test]
+    fn failed_response_flush_shuts_down_connection() {
+        use std::io::{self, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        struct FlushFails;
+        impl Write for FlushFails {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected flush failure"))
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        // A pipelined request can still own another handle after this Request is dropped.
+        let _retained = socket.try_clone().unwrap();
+        let request = super::new_request(false, crate::Method::Get, "/".into(),
+            crate::HTTPVersion(1, 1), vec![], None, io::empty(), FlushFails)
+            .unwrap().with_peer_probe(Some(crate::connection::Connection::from(socket)));
+        assert!(request.respond(crate::Response::from_string("body")).is_err());
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0, "flush failure must close the connection");
+    }
 
     #[test]
     fn must_be_send() {

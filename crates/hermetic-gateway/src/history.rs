@@ -28,7 +28,7 @@ pub struct HistoryLog {
 
 struct HistoryState {
     seen_tips: HashSet<String>,
-    /// Insertion order of `seen_tips` (may hold stale entries already removed from the set).
+    /// Insertion order of `seen_tips`.
     order: VecDeque<String>,
     rewrites_count: u64,
 }
@@ -45,11 +45,6 @@ impl HistoryState {
                 }
                 None => break,
             }
-        }
-        // Drop stale order entries so `order` stays bounded too.
-        if self.order.len() > capacity.saturating_mul(2).max(16) {
-            let seen = &self.seen_tips;
-            self.order.retain(|t| seen.contains(t));
         }
     }
 }
@@ -150,6 +145,7 @@ impl HistoryLog {
             if let Some(old_tip) = matched_tip {
                 // Extends a conversation already seen
                 state.seen_tips.remove(&old_tip);
+                state.order.retain(|tip| tip != &old_tip);
                 state.insert(full_tip, self.capacity);
                 (false, state.rewrites_count)
             } else {

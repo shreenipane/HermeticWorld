@@ -50,6 +50,14 @@ impl CmdLog {
     /// Refuses to open symlinks, non-regular files, or files writable by group or others, and
     /// verifies the entire existing chain before allowing any appends.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ChainError> {
+        Self::open_with_sync(path, File::sync_all)
+    }
+
+    fn open_with_sync<P, S>(path: P, mut sync: S) -> Result<Self, ChainError>
+    where
+        P: AsRef<Path>,
+        S: FnMut(&File) -> std::io::Result<()>,
+    {
         let path_ref = path.as_ref();
         let path_display = path_ref.display().to_string();
 
@@ -72,13 +80,66 @@ impl CmdLog {
                 opened
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let parent_path = path_ref
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let parent_meta =
+                    fs::symlink_metadata(parent_path).map_err(|source| ChainError::Io {
+                        context: "inspecting log parent directory".to_string(),
+                        source,
+                    })?;
+                if !parent_meta.is_dir() {
+                    return Err(ChainError::NotRegularFile {
+                        path: parent_path.display().to_string(),
+                    });
+                }
+                let mut parent_opts = safe_open_options();
+                parent_opts.read(true);
+                #[cfg(unix)]
+                parent_opts.custom_flags(SAFE_OPEN_FLAGS | libc::O_DIRECTORY);
+                let parent = parent_opts
+                    .open(parent_path)
+                    .map_err(|source| ChainError::Io {
+                        context: "opening log parent directory for synchronization".to_string(),
+                        source,
+                    })?;
+                #[cfg(unix)]
+                {
+                    let opened_meta = parent.metadata().map_err(|source| ChainError::Io {
+                        context: "inspecting opened log parent directory".to_string(),
+                        source,
+                    })?;
+                    if parent_meta.dev() != opened_meta.dev()
+                        || parent_meta.ino() != opened_meta.ino()
+                    {
+                        return Err(ChainError::Io {
+                            context: "opening log parent directory".to_string(),
+                            source: std::io::Error::other("log parent directory changed"),
+                        });
+                    }
+                }
+                // On Linux, create relative to the held parent, so a directory rename
+                // cannot make us sync a different directory from the one we wrote into.
+                #[cfg(target_os = "linux")]
+                let create_path = {
+                    use std::os::fd::AsRawFd;
+                    let name = path_ref.file_name().ok_or_else(|| ChainError::Io {
+                        context: "creating command log".to_string(),
+                        source: std::io::Error::other("log path has no filename"),
+                    })?;
+                    std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+                        .join(name)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let create_path = path_ref;
                 let mut opts = safe_open_options();
-                opts.read(true).write(true).create_new(true);
+                opts.read(true).append(true).create_new(true);
                 #[cfg(unix)]
                 {
                     opts.mode(0o600);
                 }
-                let created = opts.open(path_ref).map_err(|source| ChainError::Io {
+                let created = opts.open(create_path).map_err(|source| ChainError::Io {
                     context: format!("creating new log file '{path_display}'"),
                     source,
                 })?;
@@ -87,8 +148,12 @@ impl CmdLog {
                     source,
                 })?;
                 validate_fstat_metadata(&fstat_meta, &path_display)?;
-                created.sync_all().map_err(|source| ChainError::Io {
+                sync(&created).map_err(|source| ChainError::Io {
                     context: format!("fsyncing newly created log '{path_display}'"),
+                    source,
+                })?;
+                sync(&parent).map_err(|source| ChainError::Io {
+                    context: "fsyncing log parent directory".to_string(),
                     source,
                 })?;
                 created
@@ -100,6 +165,13 @@ impl CmdLog {
                 });
             }
         };
+
+        // Append placement alone cannot protect the cached sequence and hash. Keep this
+        // nonblocking descriptor lock until the writer is dropped, and verify only after it.
+        file.try_lock().map_err(|source| ChainError::Io {
+            context: "acquiring exclusive command log writer ownership".to_string(),
+            source: source.into(),
+        })?;
 
         file.seek(SeekFrom::Start(0))
             .map_err(|source| ChainError::Io {
@@ -216,6 +288,14 @@ impl CmdLog {
             seq,
             head: entry_hash,
         })
+    }
+}
+
+impl Drop for CmdLog {
+    fn drop(&mut self) {
+        // Release ownership even if a concurrent process spawn briefly inherited a
+        // duplicate descriptor before exec closed it.
+        let _ = self.file.unlock();
     }
 }
 
@@ -382,8 +462,9 @@ fn verify_reader<R: Read>(reader: R, path_display: &str) -> Result<Option<Head>,
         })?;
 
         let entry: Entry = serde_json::from_str(line_str).map_err(|err| {
-            let detail = err.to_string();
-            if detail.contains("unknown field") {
+            let unknown_field = err.to_string().contains("unknown field");
+            let detail = format!("invalid entry JSON at column {}", err.column());
+            if unknown_field {
                 ChainError::UnknownField {
                     line: line_num,
                     detail,
@@ -442,6 +523,73 @@ mod tests {
 
     fn status_payload() -> EntryPayload {
         EntryPayload::status(Some(0), EMPTY_SHA256, EMPTY_SHA256, 0, 0, false)
+    }
+
+    #[test]
+    fn new_log_syncs_file_then_parent_and_propagates_directory_sync_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("synced.jsonl");
+        let mut synced = Vec::new();
+        let log = CmdLog::open_with_sync(&path, |file| {
+            synced.push(file.metadata()?.is_dir());
+            file.sync_all()
+        })
+        .expect("sync new file and parent");
+        assert_eq!(synced, [false, true]);
+        drop(log);
+
+        let path = dir.path().join("failed.jsonl");
+        let result = CmdLog::open_with_sync(&path, |file| {
+            if file.metadata()?.is_dir() {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            file.sync_all()
+        });
+        assert!(
+            matches!(result, Err(ChainError::Io { context, .. }) if context == "fsyncing log parent directory")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_log_syncs_held_parent_after_directory_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        fs::create_dir(&parent).expect("parent directory");
+        let expected = fs::metadata(&parent).expect("parent metadata");
+        let mut parent_synced = false;
+        let log = CmdLog::open_with_sync(parent.join("log.jsonl"), |file| {
+            let meta = file.metadata()?;
+            if meta.is_file() {
+                fs::rename(&parent, &moved)?;
+                fs::create_dir(&parent)?;
+            } else {
+                assert_eq!((meta.dev(), meta.ino()), (expected.dev(), expected.ino()));
+                parent_synced = true;
+            }
+            file.sync_all()
+        })
+        .expect("sync original parent");
+        assert!(parent_synced);
+        assert!(moved.join("log.jsonl").is_file());
+        assert!(!parent.join("log.jsonl").exists());
+        drop(log);
+    }
+
+    #[test]
+    fn newly_created_log_keeps_append_semantics_after_seek() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("append.jsonl");
+        let mut log = CmdLog::open(&path).expect("new log");
+        log.append(status_payload()).expect("first append");
+        let prefix = fs::read(&path).expect("read first entry");
+        log.file
+            .seek(SeekFrom::Start(0))
+            .expect("rewind descriptor");
+        let head = log.append(status_payload()).expect("second append");
+        assert!(fs::read(&path).expect("read chain").starts_with(&prefix));
+        assert_eq!(verify(&path).expect("both records remain valid"), head);
     }
 
     #[test]

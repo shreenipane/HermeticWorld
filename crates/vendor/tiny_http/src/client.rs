@@ -155,11 +155,28 @@ impl ClientConnection {
         }
     }
 
+    fn prepare_head_deadline(&mut self, after: Option<std::time::Duration>) {
+        // Each request gets its own cell: a retained Request may still change its body
+        // deadline after the stream has already moved on to the next header reader.
+        self.read_deadline = Arc::new(Mutex::new(None));
+        let cell = self.read_deadline.clone();
+        // The previous request can still own the body reader. Arm the next header
+        // deadline only when the existing sequential hand-off grants us the stream.
+        self.next_header_source.on_start(move |reader| {
+            let value = after.map(|d| Instant::now() + d);
+            match cell.lock() {
+                Ok(mut g) => *g = value,
+                Err(p) => *p.into_inner() = value,
+            }
+            reader.get_mut().set_deadline_cell(cell);
+        });
+    }
+
     fn read(&mut self) -> Result<Request, ReadError> {
         // HERMETIC PATCH: the request line and headers (including any idle wait before them)
         // must arrive within `head`.
         let deadlines = self.current_deadlines();
-        self.set_read_deadline(deadlines.head);
+        self.prepare_head_deadline(deadlines.head);
         let (method, path, version, headers) = {
             // reading the request line
             let (method, path, version) = {
@@ -330,6 +347,56 @@ fn parse_request_line(line: &str) -> Result<(Method, String, HTTPVersion), ReadE
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn next_header_deadline_waits_for_body_reader_handoff() {
+        use super::*;
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        for head in [None, Some(Duration::from_secs(1))] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let probe = Connection::from(socket.try_clone().unwrap());
+            let (read, write) = RefinedTcpStream::new(Connection::from(socket));
+            let deadlines = Arc::new(Mutex::new(RequestDeadlines {
+                head,
+                body: Some(Duration::from_secs(60)),
+            }));
+            let mut connection = ClientConnection::new(write, read, Some(probe), deadlines);
+            peer.write_all(b"POST /body HTTP/1.1\r\nContent-Length: 2048\r\n\r\n").unwrap();
+            peer.write_all(&[b'x'; 2048]).unwrap();
+            peer.write_all(b"GET /next HTTP/1.1\r\n\r\n").unwrap();
+            let mut request = connection.next().unwrap();
+            let body_cell = connection.read_deadline.clone();
+            let body_deadline = *body_cell.lock().unwrap();
+            assert!(body_deadline.is_some());
+
+            connection.prepare_head_deadline(head);
+            assert_eq!(*body_cell.lock().unwrap(), body_deadline,
+                "preparing the next head must neither remove nor shorten the body deadline");
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body).unwrap();
+            assert_eq!(body, [b'x'; 2048]);
+            // Reading the body to EOF releases its sequential stream while the Request
+            // (and its response writer) remains alive.
+            let before_head = Instant::now();
+            let mut byte = [0];
+            connection.next_header_source.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [b'G']);
+            let armed = *connection.read_deadline.lock().unwrap();
+            match head {
+                None => assert_eq!(armed, None),
+                Some(duration) => assert!(armed.unwrap() >= before_head + duration),
+            }
+            request.set_read_deadline(None);
+            assert_eq!(*connection.read_deadline.lock().unwrap(), armed,
+                "a completed request must not clear the successor header deadline");
+            request.close_without_response();
+        }
+    }
+
     #[test]
     fn test_parse_request_line() {
         let (method, path, ver) = super::parse_request_line("GET /hello HTTP/1.1").unwrap();
