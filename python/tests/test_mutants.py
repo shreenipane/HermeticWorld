@@ -133,7 +133,7 @@ def test_rewrite_insert_noop_assignment() -> None:
         (b"abc", "5678", lambda orig, mut: isinstance(mut, bytes) and mut.startswith(orig) and len(mut) > len(orig)),
         (True, "9999", lambda orig, mut: mut is False),
         (False, "9999", lambda orig, mut: mut is True),
-        (None, "beef", lambda orig, mut: isinstance(mut, str) and "SENTINEL" in mut),
+        (None, "beef", lambda orig, mut: isinstance(mut, str) and len(mut) > 0),
         ((1, 2), "cafe", lambda orig, mut: isinstance(mut, tuple) and mut != orig and len(mut) == len(orig)),
         ([3, 4], "feed", lambda orig, mut: isinstance(mut, list) and mut != orig and len(mut) == len(orig)),
     ],
@@ -577,3 +577,418 @@ def test_shortfall_reporting() -> None:
     assert pool.shortfall_reason is not None
     assert "Requested 20 equivalents" in pool.shortfall_reason
 
+
+
+# ---------------------------------------------------------------------------
+# 9. Review regressions
+# ---------------------------------------------------------------------------
+
+_RICH_FIXTURE = (
+    "import unittest\n"
+    "\n"
+    "def test_eq():\n"
+    "    a = 10\n"
+    "    b = 20\n"
+    "    assert a + b == 30\n"
+    "    assert a == 10\n"
+    "\n"
+    "def test_ne_and_order():\n"
+    "    x = 5\n"
+    "    assert x != 20\n"
+    "    assert x < 10\n"
+    "    assert not (x == 6)\n"
+    "\n"
+    "def test_none_and_float():\n"
+    "    r = None\n"
+    "    f = 1.5\n"
+    "    big = 1e20\n"
+    "    assert r is None\n"
+    "    assert f == 1.5\n"
+    "    assert big == 1e20\n"
+    "\n"
+    "def test_membership():\n"
+    "    n = 1\n"
+    "    assert n in [0, 1]\n"
+    "    assert 'a' in 'abc'\n"
+    "\n"
+    "class TestMethods(unittest.TestCase):\n"
+    "    def test_methods(self):\n"
+    "        v = 'hermetic'\n"
+    "        self.assertEqual(v, 'hermetic')\n"
+    "        self.assertIn(1, [0, 1])\n"
+    "        self.assertIn('a', 'abc')\n"
+    "        self.assertTrue(True)\n"
+    "        self.assertTrue(1)\n"
+    "        self.assertFalse(0)\n"
+    "        self.assertIs(None, None)\n"
+)
+
+
+def _run_fixture(code_str: str) -> dict[str, bool]:
+    """Run every test function and Test* method of a hand-written fixture."""
+    import unittest
+
+    ns: dict[str, object] = {}
+    exec(code_str, ns)  # noqa: S102
+    results: dict[str, bool] = {}
+    for name, obj in sorted(ns.items()):
+        if name.startswith("test_") and callable(obj):
+            try:
+                obj()  # type: ignore[operator]
+                results[name] = True
+            except AssertionError:
+                results[name] = False
+        elif name.startswith("Test") and isinstance(obj, type) and issubclass(obj, unittest.TestCase):
+            for meth in sorted(vars(obj)):
+                if meth.startswith("test"):
+                    inst = obj(meth)
+                    try:
+                        getattr(inst, meth)()
+                        results[f"{name}.{meth}"] = True
+                    except AssertionError:
+                        results[f"{name}.{meth}"] = False
+    return results
+
+
+def test_semantic_rich_fixture_every_mutant_fails_every_equivalent_agrees() -> None:
+    """Across many seeds, equivalents agree with the original and every mutant fails its test."""
+    orig = _run_fixture(_RICH_FIXTURE)
+    assert all(orig.values()) and len(orig) == 5
+    total_mutants = 0
+    for k in range(24):
+        seed = f"{k:02x}c0ffee"
+        pool = build_pool(_RICH_FIXTURE, seed=seed, n_equivalents=4, n_mutants=6)
+        for v in pool.variants:
+            ast.parse(v.source)
+        for pair in pool.pairs:
+            assert _run_fixture(pair.equivalent.source) == orig, (seed, pair.equivalent.source)
+            if pair.mutant is None:
+                continue
+            total_mutants += 1
+            target = pair.mutant.site_ids[0].rsplit(":", 1)[0]
+            assert _run_fixture(pair.mutant.source)[target] is False, (seed, pair.mutant.source)
+    assert total_mutants > 0
+
+
+def test_float_literal_sites_are_mutated_without_error() -> None:
+    """A float expected value yields a mutant instead of aborting the pool."""
+    pool = build_pool("def test_f():\n    x = 1.5\n    assert x == 1.5\n", seed="ab")
+    assert pool.shortfalls["actual_mutants"] > 0
+    for val in (1.5, 0.0, 1e20, float("inf"), float("nan")):
+        mut = mutate_literal_value(val, seed="ab", site_id="t:0")
+        assert isinstance(mut, float)
+        assert mut != val
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        ("assert x == 1", True),
+        ("assert x is None", True),
+        ("assert not (x != 1)", True),
+        ("assert not (x is not None)", True),
+        ("assert x in [0, 1]", True),
+        ("assert x != 1", False),
+        ("assert x < 10", False),
+        ("assert x is not None", False),
+        ("assert not (x == 1)", False),
+        ("assert 'a' in 'abc'", False),
+        ("assert 1 in xs", False),
+        ("assert x not in [0, 1]", False),
+        ("self.assertEqual(x, 1)", True),
+        ("self.assertIs(x, None)", True),
+        ("self.assertIn(x, [0, 1])", True),
+        ("self.assertIn('a', 'abc')", False),
+        ("self.assertIn(1, xs)", False),
+        ("self.assertTrue(True)", True),
+        ("self.assertFalse(0)", True),
+        ("self.assertFalse(None)", True),
+        ("self.assertTrue(1)", False),
+        ("self.assertTrue('x')", False),
+        ("self.assertEqual(*pair, 1)", False),
+    ],
+)
+def test_mutation_eligibility_requires_guaranteed_failure(src: str, expected: bool) -> None:
+    """Only sites whose mutated form must fail are eligible for mutation."""
+    tree = parse_test_source(f"class TestK:\n    def test_k(self):\n        {src}\n")
+    sites = find_assertion_sites(tree)
+    assert len(sites) == 1
+    assert can_mutate_site(sites[0]) is expected
+    if not expected:
+        with pytest.raises(MutantError):
+            apply_mutant_rewrite(tree, sites[0].site_id, seed="ab")
+
+
+def test_in_container_mutant_never_contains_an_original_element() -> None:
+    """A membership mutant's container shares no element with the original container."""
+    src = "class TestK:\n    def test_k(self):\n        self.assertIn(x, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])\n"
+    tree = parse_test_source(src)
+    site_id = find_assertion_sites(tree)[0].site_id
+    for k in range(200):
+        new_tree, _ = apply_mutant_rewrite(tree, site_id, seed=f"{k:x}")
+        call = find_assertion_sites(new_tree)[0].node.value  # type: ignore[attr-defined]
+        new_elts = [e.value for e in call.args[1].elts]
+        assert not set(new_elts) & set(range(10)), k
+
+
+def test_mutant_text_carries_no_fixed_marker() -> None:
+    """Mutated str, bytes and None values contain no constant marker a forger could grep for."""
+    src = (
+        "def test_m():\n"
+        "    assert s == 'abc'\n"
+        "    assert b == b'abc'\n"
+        "    assert r is None\n"
+    )
+    for k in range(8):
+        pool = build_pool(src, seed=f"{k:x}1", n_equivalents=3, n_mutants=3)
+        for v in pool.variants:
+            if v.kind == "mutant":
+                low = v.source.lower()
+                assert "mut" not in low and "sentinel" not in low and "hermetic" not in low
+
+
+def test_seed_must_be_plain_hex(tmp_path: Path) -> None:
+    """Seeds with prefixes, signs, underscores, whitespace or excess length are rejected."""
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text("def test_ok():\n    assert x == 1\n", encoding="utf-8")
+    for i, bad in enumerate(["0xab", "a_b", " ab ", "+ab", "-ab", "ab\n", "a" * 257]):
+        rc = main(["--test-file", str(test_file), "--seed", bad, "--out", str(tmp_path / f"o{i}")])
+        assert rc == 1, bad
+        assert not (tmp_path / f"o{i}").exists()
+    assert main(["--test-file", str(test_file), "--seed", "AB", "--out", str(tmp_path / "ok")]) == 0
+    manifest = json.loads((tmp_path / "ok" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["seed"] == "ab"
+
+
+def test_candidate_combinations_are_bounded() -> None:
+    """Rewrite combinations stay within named caps however many sites a file has."""
+    from hermetic_mutants import pool as pool_mod
+
+    ops = [("swap_compare", f"test_x:{i:04d}") for i in range(300)]
+    combos = pool_mod._generate_candidate_combos(ops, "ab", 4)
+    assert len(combos) <= pool_mod.MAX_CANDIDATE_COMBOS
+    assert len(combos) <= pool_mod.MAX_REWRITE_OPS * 3
+    with pytest.raises(MutantError):
+        build_pool("def test_a():\n    assert x == 1\n", "ab", n_equivalents=pool_mod.MAX_VARIANTS_PER_KIND + 1)
+    with pytest.raises(MutantError):
+        build_pool("def test_a():\n    assert x == 1\n", "ab", n_mutants=-1)
+
+
+def test_names_bound_without_name_nodes_are_not_renamed() -> None:
+    """except-as names, match captures, nested def names and local imports are never renamed."""
+    src = (
+        "def test_bind():\n"
+        "    e = None\n"
+        "    try:\n"
+        "        raise ValueError('x')\n"
+        "    except ValueError as e:\n"
+        "        assert str(e) == 'x'\n"
+        "    m = 0\n"
+        "    match [1]:\n"
+        "        case [m]:\n"
+        "            pass\n"
+        "    helper = 1\n"
+        "    def helper():\n"
+        "        return 2\n"
+        "    os = 3\n"
+        "    import os\n"
+        "    keep = 4\n"
+        "    assert keep == 4\n"
+    )
+    tree = parse_test_source(src)
+    assert get_renamable_locals(tree.body[0], tree) == ["keep"]  # type: ignore[arg-type]
+
+
+def test_dynamic_scope_functions_are_not_renamed_or_padded() -> None:
+    """A test using locals() gets neither a rename nor an inserted no-op."""
+    src = "def test_dyn():\n    x = 1\n    assert locals() == {'x': 1}\n"
+    tree = parse_test_source(src)
+    assert get_renamable_locals(tree.body[0], tree) == []  # type: ignore[arg-type]
+    with pytest.raises(MutantError):
+        apply_insert_noop(tree, "test_dyn", "_hw_noop_x")
+    pool = build_pool(src, seed="ab", n_equivalents=4, n_mutants=0)
+    for v in pool.variants:
+        assert _run_fixture(v.source) == {"test_dyn": True}
+
+
+def test_noop_goes_after_docstring() -> None:
+    """The inserted no-op keeps the function docstring in place."""
+    src = 'def test_doc():\n    """Doc."""\n    assert x == 1\n'
+    out = ast.unparse(apply_insert_noop(parse_test_source(src), "test_doc", "_hw_n"))
+    assert out == "def test_doc():\n    \"\"\"Doc.\"\"\"\n    _hw_n = None\n    assert x == 1"
+
+
+def test_new_names_never_collide_with_existing_identifiers() -> None:
+    """A rename or no-op whose derived name already exists in the module is refused."""
+    src = "_hw_res = 5\ndef test_c():\n    result = 1\n    assert result == _hw_res - 4\n"
+    tree = parse_test_source(src)
+    with pytest.raises(MutantError):
+        apply_rename_local(tree, "test_c", "result", "_hw_res")
+    with pytest.raises(MutantError):
+        apply_insert_noop(tree, "test_c", "_hw_res")
+
+
+def test_rebound_test_names_are_skipped() -> None:
+    """A redefined test function or class is skipped, so site ids are unique and live."""
+    src = (
+        "def test_a():\n    assert x == 1\n"
+        "def test_a():\n    assert x == 2\n"
+        "class TestK:\n"
+        "    def test_m(self):\n        assert y == 1\n"
+        "    test_m = None\n"
+        "def test_b():\n    assert z == 3\n"
+    )
+    sites = find_assertion_sites(parse_test_source(src))
+    assert [s.site_id for s in sites] == ["test_b:0"]
+
+
+def test_starred_assert_equal_not_swapped() -> None:
+    """assertEqual with a starred argument is not operand-swapped."""
+    tree = parse_test_source("class TestK:\n    def test_k(self):\n        self.assertEqual(*pair, x)\n")
+    sites = find_assertion_sites(tree)
+    assert len(sites) == 1
+    assert not can_swap_assert_equal(sites[0])
+
+
+def test_only_self_assert_calls_are_sites() -> None:
+    """Assert-method calls on other objects or bare names are not assertion sites."""
+    src = (
+        "class TestK:\n"
+        "    def test_k(self):\n"
+        "        other.assertEqual(x, 1)\n"
+        "        assertEqual(x, 1)\n"
+        "        self.assertEqual(x, 1)\n"
+    )
+    sites = find_assertion_sites(parse_test_source(src))
+    assert [s.site_id for s in sites] == ["TestK.test_k:0"]
+
+
+def test_more_mutants_than_equivalents_are_generated_and_paired() -> None:
+    """Mutant requests beyond the equivalent count reuse equivalents as paired bases."""
+    src = "def test_m():\n    assert a == 1\n    assert b == 2\n    assert c == 3\n"
+    pool = build_pool(src, seed="ab", n_equivalents=1, n_mutants=3)
+    mutants = [v for v in pool.variants if v.kind == "mutant"]
+    assert len(mutants) == 3
+    assert pool.shortfall_reason is None
+    hashes = [v.sha256 for v in pool.variants]
+    assert len(set(hashes)) == len(hashes)
+    for pair in pool.pairs:
+        assert pair.mutant is not None
+        assert pair.equivalent.name == "variant_eq_0.py"
+        diffs = _count_ast_node_differences(
+            ast.parse(pair.equivalent.source), ast.parse(pair.mutant.source)
+        )
+        assert diffs == 1
+
+
+def test_eligible_sites_string_rejected() -> None:
+    """A bare string for eligible_sites is refused instead of silently matching nothing."""
+    with pytest.raises(MutantError):
+        build_pool("def test_a():\n    assert x == 1\n", "ab", eligible_sites="test_a:0")
+
+
+def test_builtin_named_locals_are_renamable() -> None:
+    """Renaming does not depend on the interpreter's builtin name list."""
+    src = "def test_s():\n    sum = 3\n    assert sum == 3\n"
+    tree = parse_test_source(src)
+    assert get_renamable_locals(tree.body[0], tree) == ["sum"]  # type: ignore[arg-type]
+
+
+def test_string_annotation_identifiers_not_renamed() -> None:
+    """Identifiers inside a compound string annotation are not renamed."""
+    src = "def test_a():\n    Thing = 1\n    x: 'list[Thing]' = [1]\n    assert x == [1]\n"
+    tree = parse_test_source(src)
+    assert "Thing" not in get_renamable_locals(tree.body[0], tree)  # type: ignore[arg-type]
+
+
+def test_cli_invalid_input_touches_no_files(tmp_path: Path) -> None:
+    """Invalid test syntax is reported before the output directory is created."""
+    test_file = tmp_path / "test_bad.py"
+    test_file.write_text("def test_(:\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    assert main(["--test-file", str(test_file), "--seed", "ab", "--out", str(out_dir)]) == 1
+    assert not out_dir.exists()
+
+
+def test_cli_usage_error_exits_1(tmp_path: Path) -> None:
+    """Missing or malformed arguments exit 1, not argparse's 2."""
+    assert main(["--seed", "ab"]) == 1
+    assert main(["--test-file", "x", "--seed", "ab", "--out", "y", "--equivalents", "many"]) == 1
+
+
+def test_cli_out_symlink_refused(tmp_path: Path) -> None:
+    """A symlinked output directory is refused and nothing is written through it."""
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text("def test_ok():\n    assert x == 1\n", encoding="utf-8")
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert main(["--test-file", str(test_file), "--seed", "ab", "--out", str(link)]) == 1
+    assert list(real.iterdir()) == []
+
+
+def test_fifo_test_file_refused_without_blocking(tmp_path: Path) -> None:
+    """A FIFO is refused before any open, so the read never blocks."""
+    fifo = tmp_path / "test_fifo.py"
+    os.mkfifo(fifo)
+    with pytest.raises(ParseError):
+        read_test_file(fifo)
+
+
+def test_atomic_write_survives_short_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Variant files are complete even when os.write writes only part of a buffer."""
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text("def test_ok():\n    value = 1\n    assert value == 1\n", encoding="utf-8")
+    real_write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        return real_write(fd, bytes(data[:7]))
+
+    monkeypatch.setattr(os, "write", short_write)
+    rc = main(["--test-file", str(test_file), "--seed", "ab", "--out", str(tmp_path / "out")])
+    monkeypatch.undo()
+    assert rc == 0
+    import hashlib
+
+    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
+    for v in manifest["variants"]:
+        data = (tmp_path / "out" / v["file"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == v["sha256"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == sorted(
+        [v["file"] for v in manifest["variants"]] + ["manifest.json"]
+    )
+
+
+def test_identity_none_mutant_compiles_without_warning() -> None:
+    """`x is None` mutates to a bool, so compiling the mutant emits no SyntaxWarning."""
+    import warnings
+
+    tree = parse_test_source("def test_n():\n    assert r is None\n")
+    for k in range(8):
+        new_tree, _ = apply_mutant_rewrite(tree, "test_n:0", seed=f"{k:x}")
+        text = ast.unparse(new_tree)
+        assert text != ast.unparse(tree)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile(text, "<mutant>", "exec")
+
+
+def test_known_answer_manifest_and_variants() -> None:
+    """Fixed source and seed give exactly these variant texts and manifest bytes."""
+    import hashlib
+
+    from hermetic_mutants.__main__ import build_manifest_bytes
+
+    src = "def test_kat():\n    val = 100\n    assert val == 100\n"
+    pool = build_pool(src, seed="0123456789abcdef", n_equivalents=2, n_mutants=2)
+    assert [v.source for v in pool.variants] == [
+        "def test_kat():\n    _hw_noop_ee6cf3 = None\n    val = 100\n    assert val == 100",
+        "def test_kat():\n    val = 100\n    assert 100 == val",
+        "def test_kat():\n    _hw_noop_ee6cf3 = None\n    val = 100\n    assert val == 631",
+        "def test_kat():\n    val = 100\n    assert 631 == val",
+    ]
+    manifest = build_manifest_bytes(pool, "0123456789abcdef")
+    assert hashlib.sha256(manifest).hexdigest() == (
+        "8ace8d45d43510ae560ce4f0ccff1aa120a79b51a6935ddaa6e52985fdb1270d"
+    )

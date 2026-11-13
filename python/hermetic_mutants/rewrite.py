@@ -11,7 +11,9 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import math
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,21 @@ from typing import Any, Sequence
 MAX_FILE_SIZE_BYTES: int = 2 * 1024 * 1024  # 2 MiB
 MAX_AST_DEPTH: int = 200
 MAX_AST_NODES: int = 50_000
+# Read chunk size for test files
+READ_CHUNK_BYTES: int = 65536
+# Bounded number of re-derivations tried for an in-container mutant whose new
+# elements must not collide with any original element
+MAX_MUTATION_SALTS: int = 16
+
+# Calls that expose or evaluate a function's local namespace by name. A test
+# function that uses any of them is never renamed and gets no inserted no-op,
+# because either rewrite would change what the call observes.
+DYNAMIC_SCOPE_CALLS: frozenset[str] = frozenset(
+    {"locals", "vars", "dir", "eval", "exec"}
+)
+DYNAMIC_SCOPE_ATTRS: frozenset[str] = frozenset({"f_locals"})
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Standard assertion methods in unittest.TestCase
 ASSERT_METHODS: frozenset[str] = frozenset(
@@ -90,6 +107,7 @@ def read_test_file(path: str | Path) -> bytes:
 
     if stat.S_ISLNK(st.st_mode):
         raise ParseError(f"Refusing to read symlink: {resolved_str}")
+    # Regular-file check before any open, so a FIFO or device is never opened
     if not stat.S_ISREG(st.st_mode):
         raise ParseError(f"Refusing to read non-regular file: {resolved_str}")
     if st.st_size > MAX_FILE_SIZE_BYTES:
@@ -97,7 +115,8 @@ def read_test_file(path: str | Path) -> bytes:
             f"File size {st.st_size} exceeds cap of {MAX_FILE_SIZE_BYTES} bytes"
         )
 
-    flags = os.O_RDONLY
+    # O_NONBLOCK: if the path is swapped for a FIFO after lstat, open must not block
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
 
@@ -110,10 +129,12 @@ def read_test_file(path: str | Path) -> bytes:
         fst = os.fstat(fd)
         if not stat.S_ISREG(fst.st_mode):
             raise ParseError(f"File descriptor is not a regular file: {resolved_str}")
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            raise ParseError(f"File changed between check and open: {resolved_str}")
 
         data = bytearray()
         while True:
-            chunk = os.read(fd, 65536)
+            chunk = os.read(fd, READ_CHUNK_BYTES)
             if not chunk:
                 break
             data.extend(chunk)
@@ -169,7 +190,7 @@ def parse_test_source(source: str, filename: str = "<test>") -> ast.AST:
         )
     try:
         tree = ast.parse(source, filename=filename)
-    except (SyntaxError, RecursionError, MemoryError) as exc:
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as exc:
         raise ParseError(f"Failed to parse Python syntax: {exc}") from exc
 
     validate_ast_bounds(tree)
@@ -182,20 +203,79 @@ def parse_test_file(path: str | Path) -> ast.AST:
     return parse_test_bytes(data, filename=str(path))
 
 
-def find_test_functions(tree: ast.AST) -> list[TestFunctionInfo]:
-    """Find test functions at module level (def test_*) or inside class Test*."""
-    test_funcs: list[TestFunctionInfo] = []
+_SCOPE_NODES: tuple[type[ast.AST], ...] = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+)
 
-    for stmt in getattr(tree, "body", []):
+
+def _binding_names(node: ast.AST) -> list[str]:
+    """Names a single node binds in its scope (not counting nested scopes' bodies)."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, ast.alias):
+        return [(node.asname or node.name).split(".")[0]]
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return [node.name]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+        return [node.name]
+    if isinstance(node, ast.MatchMapping) and node.rest:
+        return [node.rest]
+    return []
+
+
+def _scope_binding_counts(body: Sequence[ast.stmt]) -> dict[str, int]:
+    """Count how often each name is bound directly in a scope body.
+
+    Nested function, class and lambda bodies are not entered (their own name is
+    counted). A test whose name is bound more than once is shadowed or replaced
+    at run time, so a rewrite of it could target dead code.
+    """
+    counts: dict[str, int] = {}
+    stack: list[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        for name in _binding_names(node):
+            counts[name] = counts.get(name, 0) + 1
+        if isinstance(node, _SCOPE_NODES):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return counts
+
+
+def find_test_functions(tree: ast.AST) -> list[TestFunctionInfo]:
+    """Find test functions at module level (def test_*) or inside class Test*.
+
+    A function or class whose name is bound more than once in its scope
+    (redefinition, reassignment, deletion) is skipped entirely: its site ids
+    would be ambiguous and the definition that runs is not knowable statically.
+    """
+    test_funcs: list[TestFunctionInfo] = []
+    module_body = getattr(tree, "body", [])
+    module_counts = _scope_binding_counts(module_body)
+
+    for stmt in module_body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if stmt.name.startswith("test"):
+            if stmt.name.startswith("test") and module_counts.get(stmt.name) == 1:
                 test_funcs.append(
                     TestFunctionInfo(qualname=stmt.name, func_node=stmt, class_name=None)
                 )
-        elif isinstance(stmt, ast.ClassDef) and stmt.name.startswith("Test"):
+        elif (
+            isinstance(stmt, ast.ClassDef)
+            and stmt.name.startswith("Test")
+            and module_counts.get(stmt.name) == 1
+        ):
+            class_counts = _scope_binding_counts(stmt.body)
             for class_stmt in stmt.body:
                 if isinstance(class_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if class_stmt.name.startswith("test"):
+                    if (
+                        class_stmt.name.startswith("test")
+                        and class_counts.get(class_stmt.name) == 1
+                    ):
                         qualname = f"{stmt.name}.{class_stmt.name}"
                         test_funcs.append(
                             TestFunctionInfo(
@@ -239,15 +319,17 @@ def find_assertion_sites(tree: ast.AST) -> list[AssertionSite]:
                     is_site = True
                     kind = "assert_not_compare"
             elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                # Only self.<assertMethod>(...): an unknown object's or bare
+                # function's assert method has unknown meaning
                 call = node.value
-                if isinstance(call.func, ast.Attribute):
-                    if call.func.attr in ASSERT_METHODS:
-                        is_site = True
-                        kind = "call_assert"
-                elif isinstance(call.func, ast.Name):
-                    if call.func.id in ASSERT_METHODS:
-                        is_site = True
-                        kind = "call_assert"
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                    and call.func.attr in ASSERT_METHODS
+                ):
+                    is_site = True
+                    kind = "call_assert"
 
             if is_site:
                 site_id = f"{tfunc.qualname}:{site_idx}"
@@ -361,9 +443,12 @@ def can_swap_compare_operands(site: AssertionSite) -> bool:
     return is_side_effect_free(comp.left) and is_side_effect_free(comp.comparators[0])
 
 
-def apply_swap_compare_operands(tree: ast.AST, site_id: str) -> ast.AST:
+def apply_swap_compare_operands(
+    tree: ast.AST, site_id: str, *, in_place: bool = False
+) -> ast.AST:
     """Swap left and right operands of == or != in plain assert."""
-    new_tree = copy.deepcopy(tree)
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     sites = find_assertion_sites(new_tree)
     target = next((s for s in sites if s.site_id == site_id), None)
     if target is None:
@@ -373,7 +458,8 @@ def apply_swap_compare_operands(tree: ast.AST, site_id: str) -> ast.AST:
     right = comp.comparators[0]
     comp.left = right
     comp.comparators[0] = left
-    ast.fix_missing_locations(new_tree)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree
 
 
@@ -397,9 +483,12 @@ def can_assert_eq_to_not_ne(site: AssertionSite) -> bool:
     return is_literal_or_name(comp.left) and is_literal_or_name(comp.comparators[0])
 
 
-def apply_assert_eq_to_not_ne(tree: ast.AST, site_id: str) -> ast.AST:
+def apply_assert_eq_to_not_ne(
+    tree: ast.AST, site_id: str, *, in_place: bool = False
+) -> ast.AST:
     """Rewrite 'assert a == b' to 'assert not (a != b)'."""
-    new_tree = copy.deepcopy(tree)
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     sites = find_assertion_sites(new_tree)
     target = next((s for s in sites if s.site_id == site_id), None)
     if target is None:
@@ -415,7 +504,8 @@ def apply_assert_eq_to_not_ne(tree: ast.AST, site_id: str) -> ast.AST:
         ),
     )
     assert_node.test = new_test  # type: ignore[attr-defined]
-    ast.fix_missing_locations(new_tree)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree
 
 
@@ -436,12 +526,18 @@ def can_swap_assert_equal(site: AssertionSite) -> bool:
         return False
     if len(call.args) < 2:
         return False
+    # A starred argument hides which positions hold first, second and msg
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
+        return False
     return is_side_effect_free(call.args[0]) and is_side_effect_free(call.args[1])
 
 
-def apply_swap_assert_equal(tree: ast.AST, site_id: str) -> ast.AST:
+def apply_swap_assert_equal(
+    tree: ast.AST, site_id: str, *, in_place: bool = False
+) -> ast.AST:
     """Rewrite self.assertEqual(a, b) to self.assertEqual(b, a)."""
-    new_tree = copy.deepcopy(tree)
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     sites = find_assertion_sites(new_tree)
     target = next((s for s in sites if s.site_id == site_id), None)
     if target is None:
@@ -452,12 +548,74 @@ def apply_swap_assert_equal(tree: ast.AST, site_id: str) -> ast.AST:
     arg1 = call.args[1]  # type: ignore[attr-defined]
     call.args[0] = arg1  # type: ignore[attr-defined]
     call.args[1] = arg0  # type: ignore[attr-defined]
-    ast.fix_missing_locations(new_tree)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree
 
 
+def uses_dynamic_scope(func_node: ast.AST) -> bool:
+    """True if the function may observe its locals by name.
+
+    Detected: calls to locals(), vars(), dir(), eval(), exec() by bare name,
+    and any access to an attribute named f_locals (frame inspection).
+    """
+    for node in ast.walk(func_node):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in DYNAMIC_SCOPE_CALLS
+        ):
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in DYNAMIC_SCOPE_ATTRS:
+            return True
+    return False
+
+
+def collect_identifiers(tree: ast.AST) -> set[str]:
+    """Every identifier spelled anywhere in the tree (names, args, attributes, aliases)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        names.update(_binding_names(node))
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.alias):
+            names.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.keyword) and node.arg:
+            names.add(node.arg)
+    return names
+
+
+def can_insert_noop(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """A no-op local is safe unless the function observes its locals by name."""
+    return not uses_dynamic_scope(func_node)
+
+
+def module_level_names(tree: ast.AST) -> frozenset[str]:
+    """Names imported, defined or assigned by plain assignment at module level."""
+    names: set[str] = set()
+    for stmt in getattr(tree, "body", []):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            for alias in stmt.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    return frozenset(names)
+
+
 def get_renamable_locals(
-    func_node: ast.FunctionDef | ast.AsyncFunctionDef, tree: ast.AST
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    tree: ast.AST,
+    module_names: frozenset[str] | None = None,
 ) -> list[str]:
     """Find local variable names eligible for consistent renaming.
 
@@ -473,6 +631,10 @@ def get_renamable_locals(
     """
     excluded: set[str] = {"self", "cls"}
 
+    # A function that inspects or evaluates its local namespace by name is never renamed
+    if uses_dynamic_scope(func_node):
+        return []
+
     # Exclude function parameters (fixtures)
     for arg in (
         func_node.args.posonlyargs
@@ -485,25 +647,12 @@ def get_renamable_locals(
     if func_node.args.kwarg:
         excluded.add(func_node.args.kwarg.arg)
 
-    # Builtins
-    import builtins
+    # Builtin names are not excluded: a name assigned in the function is local
+    # throughout it, so renaming every occurrence is consistent. Excluding them
+    # would make the output depend on the interpreter version.
 
-    excluded.update(dir(builtins))
-
-    # Module-level imports, functions, classes
-    for stmt in getattr(tree, "body", []):
-        if isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                excluded.add(alias.asname or alias.name)
-        elif isinstance(stmt, ast.ImportFrom):
-            for alias in stmt.names:
-                excluded.add(alias.asname or alias.name)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            excluded.add(stmt.name)
-        elif isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name):
-                    excluded.add(t.id)
+    # Module-level imports, functions, classes (module_names: precomputed cache)
+    excluded.update(module_level_names(tree) if module_names is None else module_names)
 
     # Scan inside the function for global, nonlocal, attributes, annotations, and nested scopes
     for node in ast.walk(func_node):
@@ -514,12 +663,18 @@ def get_renamable_locals(
         elif isinstance(node, ast.Attribute):
             excluded.add(node.attr)
         elif isinstance(node, ast.AnnAssign):
-            # Exclude names in type annotations (including string annotations)
+            # Exclude names in type annotations (including every identifier
+            # inside string annotations such as 'list[Thing]')
             for sub in ast.walk(node.annotation):
                 if isinstance(sub, ast.Name):
                     excluded.add(sub.id)
                 elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                    excluded.add(sub.value)
+                    excluded.update(_IDENTIFIER_RE.findall(sub.value))
+        elif not isinstance(node, ast.Name) and node is not func_node:
+            # Names bound without an ast.Name node (except ... as e, match
+            # captures, imports, nested def/class names) are never renamed,
+            # since the rename only rewrites ast.Name nodes
+            excluded.update(_binding_names(node))
 
     # Exclude any name used in nested scopes
     for child in ast.walk(func_node):
@@ -569,14 +724,26 @@ def get_renamable_locals(
 
 
 def apply_rename_local(
-    tree: ast.AST, func_qualname: str, old_name: str, new_name: str
+    tree: ast.AST,
+    func_qualname: str,
+    old_name: str,
+    new_name: str,
+    *,
+    in_place: bool = False,
+    taken_names: set[str] | None = None,
 ) -> ast.AST:
     """Rename a local variable consistently throughout a test function."""
-    new_tree = copy.deepcopy(tree)
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     tfuncs = find_test_functions(new_tree)
     target_func = next((f for f in tfuncs if f.qualname == func_qualname), None)
     if target_func is None:
         raise MutantError(f"Test function {func_qualname} not found")
+    taken = collect_identifiers(new_tree) if taken_names is None else taken_names
+    if new_name in taken:
+        raise MutantError(f"Rename target {new_name} already used in module")
+    if old_name not in get_renamable_locals(target_func.func_node, new_tree):
+        raise MutantError(f"Name {old_name} is not renamable in {func_qualname}")
 
     class LocalRenamer(ast.NodeTransformer):
         def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
@@ -612,19 +779,34 @@ def apply_rename_local(
     target_func.func_node.body = [
         renamer.visit(stmt) for stmt in target_func.func_node.body
     ]
-    ast.fix_missing_locations(new_tree)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree
 
 
 def apply_insert_noop(
-    tree: ast.AST, func_qualname: str, noop_name: str
+    tree: ast.AST,
+    func_qualname: str,
+    noop_name: str,
+    *,
+    in_place: bool = False,
+    taken_names: set[str] | None = None,
 ) -> ast.AST:
-    """Insert a no-op local assignment with a derived name at the start of a test function."""
-    new_tree = copy.deepcopy(tree)
+    """Insert a no-op local assignment with a derived name at the start of a test function.
+
+    The assignment goes after the docstring, if any, so __doc__ is unchanged.
+    """
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     tfuncs = find_test_functions(new_tree)
     target_func = next((f for f in tfuncs if f.qualname == func_qualname), None)
     if target_func is None:
         raise MutantError(f"Test function {func_qualname} not found")
+    if not can_insert_noop(target_func.func_node):
+        raise MutantError(f"Test function {func_qualname} observes its locals")
+    taken = collect_identifiers(new_tree) if taken_names is None else taken_names
+    if noop_name in taken:
+        raise MutantError(f"No-op name {noop_name} already used in module")
 
     noop_stmt = ast.Assign(
         targets=[ast.Name(id=noop_name, ctx=ast.Store())],
@@ -635,90 +817,149 @@ def apply_insert_noop(
     else:
         ast.copy_location(noop_stmt, target_func.func_node)
     ast.fix_missing_locations(noop_stmt)
-    target_func.func_node.body.insert(0, noop_stmt)
-    ast.fix_missing_locations(new_tree)
+    body = target_func.func_node.body
+    insert_at = 0
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        insert_at = 1
+    body.insert(insert_at, noop_stmt)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree
 
 
 # --- Mutant Rewrites ---
+#
+# A mutant must make its assertion fail whenever the original passes. Rules:
+# - compare sites: `a == L`, `a is L`, `not (a != L)`, `not (a is not L)` mutate
+#   the literal L (right side preferred); for `is`, None becomes a bool. Given a == L, a cannot equal a value
+#   L' != L, and given a is L, a cannot be a distinct object L'.
+# - membership sites: `a in C`, `not (a not in C)`, `assertIn(a, C)` only when C
+#   is a tuple/list literal; every element is mutated and no new element may
+#   equal any original element (a equals some original element, so it then
+#   equals no new one).
+# - assertEqual/assertIs: like == and is.
+# - assertTrue/assertFalse: only a literal whose truth value the mutation flips
+#   (a bool, or a falsy literal, which always mutates to a truthy value).
+# - anything else (!=, <, `in` on strings, starred arguments, ...) is ineligible,
+#   because the mutated assertion could still pass.
+
+
+def _call_method_name(call: ast.Call) -> str:
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    return ""
+
+
+def _compare_mutation_mode(node: ast.Assert) -> tuple[ast.Compare, str] | None:
+    """Return the compare node and its mutation mode ('eq', 'is' or 'in'), or None."""
+    test = node.test
+    negated = False
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        test = test.operand
+        negated = True
+    if not isinstance(test, ast.Compare):
+        return None
+    if len(test.ops) != 1 or len(test.comparators) != 1:
+        return None
+    op = test.ops[0]
+    if negated:
+        modes = {ast.NotEq: "eq", ast.IsNot: "is", ast.NotIn: "in"}
+    else:
+        modes = {ast.Eq: "eq", ast.Is: "is", ast.In: "in"}
+    mode = modes.get(type(op))
+    if mode is None:
+        return None
+    return test, mode
+
+
+def _is_literal_container(node: ast.AST) -> bool:
+    return isinstance(node, (ast.Tuple, ast.List)) and is_supported_literal(node)
+
+
+def _is_flippable_truth_literal(node: ast.AST) -> bool:
+    if not is_supported_literal(node):
+        return False
+    val = extract_literal_value(node)
+    return isinstance(val, bool) or not val
 
 
 def can_mutate_site(site: AssertionSite) -> bool:
-    """Check if an assertion site has a literal expected operand eligible for mutation."""
+    """Check if a site has a literal operand whose mutation must make it fail."""
     node = site.node
     if site.kind in ("assert_compare", "assert_not_compare") and isinstance(node, ast.Assert):
-        comp = (
-            node.test
-            if isinstance(node.test, ast.Compare)
-            else node.test.operand  # type: ignore[attr-defined]
-        )
-        if isinstance(comp, ast.Compare) and len(comp.ops) == 1 and len(comp.comparators) == 1:
-            return is_supported_literal(comp.comparators[0]) or is_supported_literal(
-                comp.left
-            )
-    elif site.kind == "call_assert":
+        found = _compare_mutation_mode(node)
+        if found is None:
+            return False
+        comp, mode = found
+        if mode == "in":
+            return _is_literal_container(comp.comparators[0])
+        return is_supported_literal(comp.comparators[0]) or is_supported_literal(comp.left)
+    if site.kind == "call_assert":
         call = node.value if isinstance(node, ast.Expr) else node
-        if isinstance(call, ast.Call):
-            attr_name = ""
-            if isinstance(call.func, ast.Attribute):
-                attr_name = call.func.attr
-            elif isinstance(call.func, ast.Name):
-                attr_name = call.func.id
-
-            if attr_name in ("assertEqual", "assertIs"):
-                return (
-                    len(call.args) >= 2
-                    and (
-                        is_supported_literal(call.args[1])
-                        or is_supported_literal(call.args[0])
-                    )
-                )
-            if attr_name in ("assertTrue", "assertFalse"):
-                return len(call.args) >= 1 and is_supported_literal(call.args[0])
-            if attr_name == "assertIn":
-                return (
-                    len(call.args) >= 2
-                    and (
-                        is_supported_literal(call.args[1])
-                        or is_supported_literal(call.args[0])
-                    )
-                )
-
+        if not isinstance(call, ast.Call):
+            return False
+        if any(isinstance(arg, ast.Starred) for arg in call.args):
+            return False
+        attr_name = _call_method_name(call)
+        if attr_name in ("assertEqual", "assertIs"):
+            return len(call.args) >= 2 and (
+                is_supported_literal(call.args[1]) or is_supported_literal(call.args[0])
+            )
+        if attr_name in ("assertTrue", "assertFalse"):
+            return len(call.args) >= 1 and _is_flippable_truth_literal(call.args[0])
+        if attr_name == "assertIn":
+            return len(call.args) >= 2 and _is_literal_container(call.args[1])
     return False
 
 
 def mutate_literal_value(val: Any, seed: str, site_id: str) -> Any:
-    """Replace a literal value with a deterministic third value differing from the original."""
+    """Replace a literal value with a deterministic third value differing from the original.
+
+    Derived values carry no fixed marker text, so a mutant cannot be told
+    apart from an equivalent by searching for a constant token.
+    """
     h = hashlib.sha256(f"{seed}:{site_id}:{val!r}".encode("utf-8")).digest()
+    offset = (int.from_bytes(h[:4], "big") % 1000) + 1
 
     if isinstance(val, bool):
         # bool is an int subclass; check bool first: assertion negated
         return not val
     if isinstance(val, int):
         # ints: original + nonzero offset
-        offset = (int.from_bytes(h[:4], "big") % 1000) + 1
         return val + offset
+    if isinstance(val, float):
+        # floats: original + nonzero offset, unless that leaves the value
+        # unchanged (inf, nan, or magnitudes where the offset is below precision)
+        candidate = val + float(offset)
+        if not math.isfinite(val) or candidate == val:
+            candidate = float(offset)
+        return candidate
     if isinstance(val, str):
         # str: original with derived suffix
-        suffix = f"_mut_{h[:4].hex()}"
-        return val + suffix
+        return val + h[4:8].hex()
     if isinstance(val, bytes):
         # bytes: original with derived suffix
-        suffix = f"_mut_{h[:4].hex()}".encode("ascii")
-        return val + suffix
+        return val + h[4:8].hex().encode("ascii")
     if val is None:
-        # None: a sentinel string
-        return f"__HERMETIC_SENTINEL_{h[:4].hex()}__"
+        # None: a derived sentinel string
+        return h[4:10].hex()
     if isinstance(val, tuple):
         if not val:
-            return ((int.from_bytes(h[:4], "big") % 1000) + 1,)
+            return (offset,)
         return tuple(
             mutate_literal_value(x, seed, f"{site_id}:{idx}")
             for idx, x in enumerate(val)
         )
     if isinstance(val, list):
         if not val:
-            return [(int.from_bytes(h[:4], "big") % 1000) + 1]
+            return [offset]
         return [
             mutate_literal_value(x, seed, f"{site_id}:{idx}")
             for idx, x in enumerate(val)
@@ -727,84 +968,85 @@ def mutate_literal_value(val: Any, seed: str, site_id: str) -> Any:
     raise MutantError(f"Unsupported literal type for mutation: {type(val)}")
 
 
+def _mutate_node(node: ast.AST, seed: str, site_id: str) -> ast.AST:
+    orig_val = extract_literal_value(node)
+    return value_to_literal_node(mutate_literal_value(orig_val, seed=seed, site_id=site_id))
+
+
+def _mutate_identity_node(node: ast.AST, seed: str, site_id: str) -> ast.AST:
+    """Mutate the literal of an `is` compare.
+
+    `x is None` becomes `x is True` or `x is False` (derived from the seed)
+    rather than `x is '<str>'`: comparing identity with a str, bytes or number
+    literal makes the compiler warn, and that warning would mark the mutant.
+    """
+    if isinstance(node, ast.Constant) and node.value is None:
+        h = hashlib.sha256(f"{seed}:{site_id}:is-none".encode("utf-8")).digest()
+        return ast.Constant(value=bool(h[0] & 1))
+    return _mutate_node(node, seed, site_id)
+
+
+def _mutate_container_node(node: ast.AST, seed: str, site_id: str) -> ast.AST:
+    """Mutate a membership container so that no new element equals an original one."""
+    orig_val = extract_literal_value(node)
+    for salt in range(MAX_MUTATION_SALTS):
+        salted = seed if salt == 0 else f"{seed}:in:{salt}"
+        new_val = mutate_literal_value(orig_val, seed=salted, site_id=site_id)
+        if not any(new == old for new in new_val for old in orig_val):
+            return value_to_literal_node(new_val)
+    raise MutantError(f"Site {site_id}: no collision-free container mutation")
+
+
 def apply_mutant_rewrite(
-    tree: ast.AST, site_id: str, seed: str
+    tree: ast.AST, site_id: str, seed: str, *, in_place: bool = False
 ) -> tuple[ast.AST, str]:
     """Mutate exactly one assertion site's expected literal value.
 
-    Returns the new mutated AST and the rewrite description.
+    Returns the new mutated AST and the rewrite description. Raises MutantError
+    for a site that can_mutate_site rejects.
     """
-    new_tree = copy.deepcopy(tree)
+    # in_place: the caller owns tree, and calls ast.fix_missing_locations itself
+    new_tree = tree if in_place else copy.deepcopy(tree)
     sites = find_assertion_sites(new_tree)
     target = next((s for s in sites if s.site_id == site_id), None)
     if target is None:
         raise MutantError(f"Assertion site {site_id} not found")
+    if not can_mutate_site(target):
+        raise MutantError(f"Site {site_id} is not eligible for mutation")
 
     node = target.node
     if target.kind in ("assert_compare", "assert_not_compare") and isinstance(node, ast.Assert):
-        comp = (
-            node.test
-            if isinstance(node.test, ast.Compare)
-            else node.test.operand  # type: ignore[attr-defined]
-        )
-        if not isinstance(comp, ast.Compare):
-            raise MutantError(f"Site {site_id} is not an assert compare")
-        # Standard convention: right side is expected
-        if is_supported_literal(comp.comparators[0]):
-            orig_val = extract_literal_value(comp.comparators[0])
-            new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-            comp.comparators[0] = value_to_literal_node(new_val)
-        elif is_supported_literal(comp.left):
-            orig_val = extract_literal_value(comp.left)
-            new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-            comp.left = value_to_literal_node(new_val)
+        found = _compare_mutation_mode(node)
+        if found is None:
+            raise MutantError(f"Site {site_id} is not a mutable compare")
+        comp, mode = found
+        mutate = _mutate_identity_node if mode == "is" else _mutate_node
+        if mode == "in":
+            comp.comparators[0] = _mutate_container_node(comp.comparators[0], seed, site_id)
+        elif is_supported_literal(comp.comparators[0]):
+            # Standard convention: right side is expected
+            comp.comparators[0] = mutate(comp.comparators[0], seed, site_id)
         else:
-            raise MutantError(f"Site {site_id} has no literal expected operand")
-
+            comp.left = mutate(comp.left, seed, site_id)
     elif target.kind == "call_assert":
-        expr_node = node
-        call = expr_node.value if isinstance(expr_node, ast.Expr) else expr_node
+        call = node.value if isinstance(node, ast.Expr) else node
         if not isinstance(call, ast.Call):
             raise MutantError(f"Site {site_id} is not a call")
-        attr_name = ""
-        if isinstance(call.func, ast.Attribute):
-            attr_name = call.func.attr
-        elif isinstance(call.func, ast.Name):
-            attr_name = call.func.id
-
+        attr_name = _call_method_name(call)
         if attr_name in ("assertEqual", "assertIs"):
-            if len(call.args) >= 2 and is_supported_literal(call.args[1]):
-                orig_val = extract_literal_value(call.args[1])
-                new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-                call.args[1] = value_to_literal_node(new_val)
-            elif len(call.args) >= 1 and is_supported_literal(call.args[0]):
-                orig_val = extract_literal_value(call.args[0])
-                new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-                call.args[0] = value_to_literal_node(new_val)
+            if is_supported_literal(call.args[1]):
+                call.args[1] = _mutate_node(call.args[1], seed, site_id)
             else:
-                raise MutantError(f"Site {site_id} has no literal operand")
+                call.args[0] = _mutate_node(call.args[0], seed, site_id)
         elif attr_name in ("assertTrue", "assertFalse"):
-            if len(call.args) >= 1 and is_supported_literal(call.args[0]):
-                orig_val = extract_literal_value(call.args[0])
-                new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-                call.args[0] = value_to_literal_node(new_val)
-            else:
-                raise MutantError(f"Site {site_id} has no literal operand")
+            call.args[0] = _mutate_node(call.args[0], seed, site_id)
         elif attr_name == "assertIn":
-            if len(call.args) >= 2 and is_supported_literal(call.args[1]):
-                orig_val = extract_literal_value(call.args[1])
-                new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-                call.args[1] = value_to_literal_node(new_val)
-            elif len(call.args) >= 1 and is_supported_literal(call.args[0]):
-                orig_val = extract_literal_value(call.args[0])
-                new_val = mutate_literal_value(orig_val, seed=seed, site_id=site_id)
-                call.args[0] = value_to_literal_node(new_val)
-            else:
-                raise MutantError(f"Site {site_id} has no literal operand")
+            call.args[1] = _mutate_container_node(call.args[1], seed, site_id)
         else:
             raise MutantError(f"Unsupported assertion method: {attr_name}")
     else:
         raise MutantError(f"Unsupported site kind: {target.kind}")
 
-    ast.fix_missing_locations(new_tree)
+    if not in_place:
+        ast.fix_missing_locations(new_tree)
     return new_tree, f"mutate_literal:{site_id}"

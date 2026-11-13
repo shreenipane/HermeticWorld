@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -20,68 +21,94 @@ from pathlib import Path
 from hermetic_mutants.pool import Pool, build_pool
 from hermetic_mutants.rewrite import MutantError, read_test_file
 
+# Longest accepted seed, in hex digits
+MAX_SEED_HEX_CHARS: int = 256
+_HEX_SEED_RE = re.compile(r"[0-9A-Fa-f]+")
+
 
 def _validate_hex_seed(seed_str: str) -> str:
-    """Validate that the seed is a non-empty hexadecimal string."""
+    """Validate that the seed is a non-empty string of plain hexadecimal digits.
+
+    Prefixes (0x), signs, underscores and whitespace are rejected, so each seed
+    value has exactly one accepted spelling up to letter case.
+    """
     if not seed_str:
         raise MutantError("Seed cannot be empty")
-    try:
-        int(seed_str, 16)
-    except ValueError as exc:
-        raise MutantError(f"Seed must be a valid hex string, got: {seed_str!r}") from exc
+    if len(seed_str) > MAX_SEED_HEX_CHARS:
+        raise MutantError(f"Seed longer than {MAX_SEED_HEX_CHARS} hex digits")
+    if _HEX_SEED_RE.fullmatch(seed_str) is None:
+        raise MutantError("Seed must contain only hexadecimal digits")
     return seed_str.lower()
 
 
-def _prepare_empty_out_dir(out_dir_path: Path) -> None:
-    """Ensure the output directory exists, is not a symlink, and is empty."""
-    resolved_str = os.fspath(out_dir_path)
+def _open_empty_out_dir(out_dir_path: Path) -> int:
+    """Create or check the output directory and return an fd for it.
 
-    if out_dir_path.exists():
-        st = os.lstat(resolved_str)
-        if stat.S_ISLNK(st.st_mode):
-            raise MutantError(f"Output directory is a symlink: {resolved_str}")
-        if not stat.S_ISDIR(st.st_mode):
-            raise MutantError(f"Output path is not a directory: {resolved_str}")
-
-        # Check if directory is empty
-        with os.scandir(resolved_str) as entries:
-            for entry in entries:
-                raise MutantError(f"Output directory is not empty: {resolved_str}")
-    else:
-        out_dir_path.mkdir(parents=True, exist_ok=True)
-        st = os.lstat(resolved_str)
-        if stat.S_ISLNK(st.st_mode):
-            raise MutantError(f"Created output directory is a symlink: {resolved_str}")
-
-
-def _atomic_write_file(target_path: Path, data: bytes) -> None:
-    """Write data to a file atomically via a temporary file in the same directory."""
-    dir_path = target_path.parent
-    token = secrets.token_hex(4)
-    tmp_path = dir_path / f".tmp_{target_path.name}_{os.getpid()}_{token}"
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
-    fd = os.open(os.fspath(tmp_path), flags, 0o644)
+    The directory must not be a symlink and must be empty. The returned fd is
+    opened with O_NOFOLLOW and checked against the lstat result (device and
+    inode), and every later write goes through it.
+    """
+    path_str = os.fspath(out_dir_path)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        st = os.lstat(path_str)
+    except FileNotFoundError:
+        out_dir_path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(path_str, 0o755)
+        st = os.lstat(path_str)
 
-    os.replace(tmp_path, target_path)
+    if stat.S_ISLNK(st.st_mode):
+        raise MutantError(f"Output directory is a symlink: {path_str}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise MutantError(f"Output path is not a directory: {path_str}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(path_str, flags)
+    try:
+        fst = os.fstat(dir_fd)
+        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != (
+            st.st_dev,
+            st.st_ino,
+        ):
+            raise MutantError(f"Output directory changed during check: {path_str}")
+        with os.scandir(dir_fd) as entries:
+            for _entry in entries:
+                raise MutantError(f"Output directory is not empty: {path_str}")
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
 
 
-def write_pool_output(pool: Pool, seed: str, out_dir: Path) -> None:
-    """Write variants and manifest.json atomically to the empty out_dir."""
-    # Write variant files
-    for variant in pool.variants:
-        variant_path = out_dir / variant.name
-        _atomic_write_file(variant_path, variant.source.encode("utf-8"))
+def _atomic_write_file(dir_fd: int, name: str, data: bytes) -> None:
+    """Write data to name inside dir_fd atomically via a temporary file and rename."""
+    tmp_name = f".tmp_{name}_{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
 
-    # Construct deterministic manifest (no host time, no host identity, no host paths)
+    fd = os.open(tmp_name, flags, 0o644, dir_fd=dir_fd)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise MutantError(f"Short write for {name}")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def build_manifest_bytes(pool: Pool, seed: str) -> bytes:
+    """Deterministic manifest (no host time, no host identity, no host paths)."""
     manifest_data = {
         "counts": {
             "equivalents": pool.shortfalls["actual_equivalents"],
@@ -97,6 +124,7 @@ def write_pool_output(pool: Pool, seed: str, out_dir: Path) -> None:
             for p in pool.pairs
         ],
         "seed": seed,
+        "shortfall_reason": pool.shortfall_reason,
         "shortfalls": pool.shortfalls,
         "variants": [
             {
@@ -109,17 +137,32 @@ def write_pool_output(pool: Pool, seed: str, out_dir: Path) -> None:
             for v in pool.variants
         ],
     }
+    return (json.dumps(manifest_data, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
-    manifest_bytes = (
-        json.dumps(manifest_data, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    manifest_path = out_dir / "manifest.json"
-    _atomic_write_file(manifest_path, manifest_bytes)
+
+def write_pool_output(pool: Pool, seed: str, out_dir: Path) -> None:
+    """Write variants, then manifest.json last, atomically into the empty out_dir."""
+    manifest_bytes = build_manifest_bytes(pool, seed)
+    dir_fd = _open_empty_out_dir(out_dir)
+    try:
+        for variant in pool.variants:
+            _atomic_write_file(dir_fd, variant.name, variant.source.encode("utf-8"))
+        _atomic_write_file(dir_fd, "manifest.json", manifest_bytes)
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Argument parser that reports usage errors as MutantError (exit 1, not 2)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        raise MutantError(f"invalid arguments: {message}")
 
 
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="hermetic_mutants",
         description="Generate deterministic test-variants by syntax-tree rewriting.",
     )
@@ -167,10 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         # Securely read test file
         source_bytes = read_test_file(args.test_file)
 
-        # Prepare empty output directory
-        _prepare_empty_out_dir(args.out)
-
-        # Build variants
+        # Build variants (all input is validated here, before any file is touched)
         pool = build_pool(
             source=source_bytes,
             seed=valid_seed,
@@ -178,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             n_mutants=args.mutants,
         )
 
-        # Write output files and manifest atomically
+        # Check the empty output directory, then write files and manifest atomically
         write_pool_output(pool, seed=valid_seed, out_dir=args.out)
 
         return 0
@@ -186,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"hermetic_mutants error: {exc}\n")
         return 1
     except Exception as exc:
-        sys.stderr.write(f"hermetic_mutants unexpected error: {exc}\n")
+        sys.stderr.write(f"hermetic_mutants unexpected error: {type(exc).__name__}\n")
         return 1
 
 
