@@ -94,6 +94,7 @@ impl Config {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     Clock(i64),
+    MountDev,
     MountBaseReadOnly,
     MountDisk(String),
     PrepareOverlay,
@@ -172,6 +173,7 @@ pub fn boot<S: Sys>(sys: &mut S, config: &Config) -> Result<Booted<S::FreezeHand
     // Clock is the first effect. Even the freeze handle is opened afterwards.
     sys.effect(Effect::Clock(config.clock))?;
     if config.initramfs {
+        sys.effect(Effect::MountDev)?;
         sys.effect(Effect::MountBaseReadOnly)?;
     }
     sys.effect(Effect::MountDisk(config.overlay.clone()))?;

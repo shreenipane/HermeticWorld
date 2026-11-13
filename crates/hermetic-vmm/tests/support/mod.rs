@@ -12,6 +12,7 @@ pub fn spec(role: Role) -> VmSpec {
         vcpus: 2,
         memory_mib: 256,
         kernel_image: "/images/kernel".into(),
+        initrd: None,
         boot_args: concat!(
             "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda ",
             "init=/sbin/hermetic-execd clocksource=tsc tsc=reliable ",

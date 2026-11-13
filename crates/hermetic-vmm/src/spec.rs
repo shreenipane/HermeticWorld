@@ -17,6 +17,14 @@ pub const MAX_PIDS: u32 = 4096;
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_TOTAL_IMAGE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 pub const MAX_T_CLOCK: u64 = 4_102_444_800;
+pub const MAX_INITRD_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Initrd {
+    pub path: String,
+    pub sha256: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +87,8 @@ pub struct VmSpec {
     pub vcpus: u8,
     pub memory_mib: u32,
     pub kernel_image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initrd: Option<Initrd>,
     pub boot_args: String,
     pub root_drive: Drive,
     pub drives: Vec<Drive>,
@@ -251,6 +261,48 @@ impl VmSpec {
             ));
         }
         validate_boot_args(&self.boot_args)?;
+        let words: Vec<_> = self.boot_args.split_ascii_whitespace().collect();
+        if let Some(initrd) = &self.initrd {
+            if self.role != Role::Agent
+                || !self.networks.is_empty()
+                || !absolute_path(&initrd.path)
+                || initrd.sha256.len() != 64
+                || !initrd
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || words.iter().any(|w| {
+                    matches!(*w, "init" | "rdinit" | "noinitrd" | "skip_initramfs")
+                        || w.starts_with("init=")
+                        || w.starts_with("rdinit=")
+                        || w.starts_with("noinitrd=")
+                        || w.starts_with("skip_initramfs=")
+                })
+                || !words.contains(&"hermetic.initramfs=1")
+                || !words.contains(&"root=/dev/vda")
+                || self
+                    .drives
+                    .first()
+                    .is_none_or(|d| d.id != "overlay" || d.read_only)
+                || words.iter().any(|w| {
+                    w.starts_with("hermetic.overlay=") && *w != "hermetic.overlay=/dev/vdb"
+                })
+            {
+                return Err(Error::Validation("trusted reboot initrd contract"));
+            }
+            let clock = words
+                .iter()
+                .find_map(|w| w.strip_prefix("hermetic.t="))
+                .and_then(|t| t.parse::<u64>().ok());
+            if clock.is_none_or(|t| !(315532800..=4102444799).contains(&t)) {
+                return Err(Error::Validation("trusted reboot clock range"));
+            }
+        } else if words.iter().any(|w| {
+            (w.starts_with("hermetic.initramfs") && *w != "hermetic.initramfs=0")
+                || w.starts_with("rdinit=")
+        }) {
+            return Err(Error::Validation("initramfs mode requires pinned initrd"));
+        }
         let mut ids = BTreeSet::new();
         for drive in std::iter::once(&self.root_drive).chain(self.drives.iter()) {
             if !identifier(&drive.id, 32) || !ids.insert(&drive.id) || !absolute_path(&drive.path) {

@@ -233,6 +233,176 @@ fn boots_guest_and_reads_guest_clock() {
         eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
     }
 }
+
+/// Boot once, poison disk PID 1 candidates and execd, freeze the upper, then
+/// boot a copy with a trusted initrd. No touched executable may run before the
+/// host explicitly authorizes the new PID 1.
+#[cfg(feature = "dev-unjailed")]
+#[test]
+#[ignore = "needs /dev/kvm and pinned inputs; run scripts/integration/reboot-smoke.sh"]
+fn reboots_touched_disk_with_trusted_initramfs() {
+    use hermetic_vmm::spec::Initrd;
+    use sha2::{Digest, Sha256};
+    fn call(socket: &str, request: serde_json::Value, end: Instant) -> serde_json::Value {
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let reply = guest_call(api::connect(socket, end).unwrap(), &bytes, end).unwrap();
+        serde_json::from_slice(&reply).unwrap()
+    }
+    fn ready(vm: &Vmm<hermetic_vmm::runner::DevUnjailed>) -> (String, serde_json::Value) {
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        loop {
+            match guest_status(&socket, end) {
+                Ok(status) => {
+                    assert!(status.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+                    return (
+                        socket.clone(),
+                        call(&socket, serde_json::json!({"type":"status"}), end),
+                    );
+                }
+                Err(Error::Io) => {
+                    assert!(Instant::now() < end, "execd readiness deadline");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("execd readiness: {e}"),
+            }
+        }
+    }
+    let first = environment().expect("smoke requires pinned Firecracker, kernel and rootfs");
+    let archive = std::env::var("HERMETIC_INITRD").expect("HERMETIC_INITRD");
+    let pin = std::env::var("HERMETIC_INITRD_SHA256").expect("HERMETIC_INITRD_SHA256");
+    let mut reboot = support::Fixture::new();
+    reboot.spec.jail.firecracker = first.spec.jail.firecracker.clone();
+    reboot.spec.kernel_image = first.spec.kernel_image.clone();
+    reboot.spec.root_drive.path = first.spec.root_drive.path.clone();
+    reboot.spec.networks.clear();
+    reboot.spec.boot_args = first
+        .spec
+        .boot_args
+        .replace("init=/sbin/hermetic-init", "hermetic.initramfs=1");
+    reboot.spec.initrd = Some(Initrd {
+        path: archive,
+        sha256: pin,
+    });
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&first)).unwrap();
+    let mut vm = Vmm::new(first.spec.clone().validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+    vm.wait_ready(Duration::from_secs(30)).unwrap();
+    let (socket, status) = ready(&vm);
+    assert_eq!(status["locked"], false);
+    let end = deadline(Duration::from_secs(30)).unwrap();
+    for path in [
+        "/sbin/hermetic-init",
+        "/sbin/hermetic-execd",
+        "/sbin/init",
+        "/init",
+        "/work/reboot-proof",
+    ] {
+        assert_eq!(
+            call(
+                &socket,
+                serde_json::json!({"type":"upload","path":path,"data":b"touched-disk".to_vec()}),
+                end
+            )["type"],
+            "ok"
+        );
+    }
+    let spec = br#"{"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,"entrypoint":["/bin/busybox","touch","/work/unauthorized"],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n","resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}"#;
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"upload", "path":"/etc/hermetic/run-spec.json", "data":spec.to_vec()}),
+            end
+        )["type"],
+        "ok"
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"shutdown"}), end)["type"],
+        "frozen"
+    );
+    vm.stop(Duration::from_secs(2)).unwrap();
+    let touched = vm.jail().unwrap().root.descriptor_path("drive-overlay");
+    std::fs::copy(touched, &reboot.spec.drives[0].path).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&reboot)).unwrap();
+    let mut vm = Vmm::new(reboot.spec.clone().validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+    vm.wait_ready(Duration::from_secs(30)).unwrap();
+    let (socket, status) = ready(&vm);
+    assert_eq!(status["locked"], true);
+    let end = deadline(Duration::from_secs(30)).unwrap();
+    let denied = call(
+        &socket,
+        serde_json::json!({"type":"exec","argv":["/bin/busybox","true"],"tty":false,"timeout_ms":1000}),
+        end,
+    );
+    assert_eq!(
+        denied,
+        serde_json::json!({"type":"error","reason":"locked"})
+    );
+    let marker = call(
+        &socket,
+        serde_json::json!({"type":"download","path":"/work/reboot-proof"}),
+        end,
+    );
+    assert_eq!(marker["data"], serde_json::json!(b"touched-disk".to_vec()));
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"download","path":"/work/unauthorized"}),
+            end
+        )["type"],
+        "error"
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"authorize"}), end)["type"],
+        "ok"
+    );
+    let exec = guest_exec(&socket, &["/bin/busybox", "echo", "trusted-reboot-ok"], end).unwrap();
+    assert_eq!(exec.code, Some(0));
+    assert_eq!(exec.output, b"trusted-reboot-ok\n");
+    // This child helper must come from the initramfs: disk execd was poisoned.
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"download","path":"/sbin/hermetic-execd"}),
+            end
+        )["data"],
+        serde_json::json!(b"touched-disk".to_vec())
+    );
+    let record = serde_json::to_vec(vm.boot_record().unwrap()).unwrap();
+    assert_eq!(vm.boot_record().unwrap().boot_path, "trusted_initramfs");
+    let output = std::env::var("HERMETIC_REBOOT_RECORD_OUT").expect("HERMETIC_REBOOT_RECORD_OUT");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)
+        .unwrap();
+    file.write_all(&record).unwrap();
+    file.sync_all().unwrap();
+    // The pin recorded by the host is exactly the staged archive's digest.
+    let staged = std::fs::read(vm.jail().unwrap().root.descriptor_path("initrd")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(staged)),
+        vm.boot_record()
+            .unwrap()
+            .initrd_sha256
+            .as_ref()
+            .unwrap()
+            .as_str()
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"shutdown"}), end)["type"],
+        "frozen"
+    );
+    vm.stop(Duration::from_secs(2)).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+    eprintln!("trusted reboot: touched disk, locked startup, authorization, trusted child helper, boot record passed");
+}
 /// The guest serial line `grader-init SECONDS clock`, printed right after the
 /// grader PID 1 sets the clock.
 fn grader_clock_line(serial: &[u8]) -> Option<u64> {

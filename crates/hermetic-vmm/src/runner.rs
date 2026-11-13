@@ -201,7 +201,12 @@ impl DevUnjailed {
 #[cfg(feature = "dev-unjailed")]
 fn development_request(request: &ApiRequest, root: &str) -> ApiRequest {
     let mut req = request.clone();
-    for key in ["kernel_image_path", "path_on_host", "uds_path"] {
+    for key in [
+        "kernel_image_path",
+        "initrd_path",
+        "path_on_host",
+        "uds_path",
+    ] {
         if let Some(path) = req
             .body
             .get(key)
@@ -455,6 +460,7 @@ mod tests {
             vcpus: 1,
             memory_mib: 128,
             kernel_image: "/kernel".into(),
+            initrd: None,
             boot_args: "clocksource=tsc tsc=reliable hermetic.t=1 ro".into(),
             root_drive: Drive {
                 id: "root".into(),
@@ -661,6 +667,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+    #[cfg(feature = "dev-unjailed")]
+    #[test]
+    fn trusted_reboot_development_rewrites_both_boot_files() {
+        let request = ApiRequest::new(
+            "PUT",
+            "/boot-source",
+            serde_json::json!({"kernel_image_path":"/kernel", "initrd_path":"/initrd", "boot_args":"hermetic.initramfs=1"}),
+        );
+        let rewritten = development_request(&request, "/proc/123/fd/7/");
+        assert_eq!(
+            rewritten.body,
+            serde_json::json!({
+                "kernel_image_path":"/proc/123/fd/7/kernel",
+                "initrd_path":"/proc/123/fd/7/initrd",
+                "boot_args":"hermetic.initramfs=1"
+            })
+        );
+        assert_eq!(request.body["initrd_path"], "/initrd");
+    }
+
     #[cfg(feature = "dev-unjailed")]
     #[test]
     fn dev_path_rewriting_uses_only_pinned_directory() {

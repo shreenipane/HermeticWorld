@@ -56,6 +56,47 @@ fn fake_request(
     (result, server.join().unwrap())
 }
 #[test]
+fn trusted_reboot_boot_source_passes_transport_and_rejects_malformed_initrd() {
+    let request = ApiRequest {
+        method: "PUT".into(),
+        path: "/boot-source".into(),
+        body: json!({
+            "kernel_image_path":"/kernel", "initrd_path":"/initrd",
+            "boot_args":"root=/dev/vda ro clocksource=tsc tsc=reliable hermetic.t=1700000000 hermetic.initramfs=1"
+        }),
+    };
+    let (response, wire) = fake_request(
+        request.clone(),
+        b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+        false,
+    );
+    assert_eq!(response.unwrap().status, 204);
+    let body = wire.split(|b| *b == b'\n').next_back().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+        request.body
+    );
+    for value in [
+        json!(null),
+        json!(7),
+        json!(""),
+        json!("relative"),
+        json!("/../initrd"),
+    ] {
+        let mut bad = request.clone();
+        bad.body["initrd_path"] = value;
+        let (result, wire) = fake_request(bad, Vec::new(), false);
+        assert!(result.is_err());
+        assert!(wire.is_empty());
+    }
+    let mut bad = request;
+    bad.body["unknown"] = json!("secret");
+    let (result, wire) = fake_request(bad, Vec::new(), false);
+    assert!(result.is_err());
+    assert!(wire.is_empty());
+}
+
+#[test]
 fn every_planned_request_passes_the_strict_transport_schema() {
     #[path = "support/mod.rs"]
     mod support;

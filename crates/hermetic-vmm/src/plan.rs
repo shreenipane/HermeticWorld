@@ -52,6 +52,10 @@ pub struct JailPlan {
 }
 pub fn api_requests(valid: &ValidatedSpec) -> Vec<ApiRequest> {
     let s = valid.spec();
+    let mut boot = json!({"kernel_image_path":"/kernel","boot_args":s.boot_args});
+    if s.initrd.is_some() {
+        boot["initrd_path"] = json!("/initrd");
+    }
     let mut out = vec![
         ApiRequest::new(
             "PUT",
@@ -59,11 +63,7 @@ pub fn api_requests(valid: &ValidatedSpec) -> Vec<ApiRequest> {
             json!({"vcpu_count":s.vcpus,"mem_size_mib":s.memory_mib,"smt":false}),
         ),
         ApiRequest::new("PUT", "/cpu-config", cpu_template()),
-        ApiRequest::new(
-            "PUT",
-            "/boot-source",
-            json!({"kernel_image_path":"/kernel","boot_args":s.boot_args}),
-        ),
+        ApiRequest::new("PUT", "/boot-source", boot),
     ];
     for (root, d) in
         std::iter::once((true, &s.root_drive)).chain(s.drives.iter().map(|d| (false, d)))
@@ -163,6 +163,14 @@ pub fn jail_plan(valid: &ValidatedSpec) -> JailPlan {
             rule: "copy".into(),
         },
     ];
+    if let Some(initrd) = &s.initrd {
+        files.push(JailFile {
+            source: Some(initrd.path.clone()),
+            destination: "initrd".into(),
+            writable: false,
+            rule: "copy-sha256-pinned".into(),
+        });
+    }
     for d in std::iter::once(&s.root_drive).chain(s.drives.iter()) {
         files.push(JailFile {
             source: Some(d.path.clone()),

@@ -1,5 +1,34 @@
 # hermetic-vmm
 
+Trusted reboot (TR-EXD-6) uses the optional specification field
+`"initrd":{"path":"/trusted/reboot.cpio","sha256":"<64 lowercase hex digits>"}`.
+Supply `hermetic.initramfs=1 root=/dev/vda`, with the writable `overlay` drive
+first after the sealed root (`/dev/vdb`). Disk `init=`, `rdinit=`, `noinitrd` and
+`skip_initramfs` are refused, as is reboot mode without a pinned initrd. This
+mode is supported for AgentVM only, without network interfaces (§11.4). First boot continues to use
+`init=/sbin/hermetic-init` without an initrd. Only a trusted host policy may
+choose the digest or authorize a rebooted guest.
+
+Preparation checks regular-file type, ownership, mode, all path components and
+`MAX_INITRD_BYTES` (64 MiB), then snapshots and hashes the archive before creating
+artifacts. The jail gets those exact bytes in a separate read-only copy at
+`/initrd`; the Firecracker boot request includes `initrd_path`. Changing the source
+inode after hashing cannot change the booted archive. The deadline covers the
+bounded read and hashing. As with other local image reads, a stalled kernel I/O
+operation cannot be interrupted by these between-call deadline checks.
+
+After the boot starts, `Vmm::boot_record()` retains a serializable host record
+(`vm_id`, `boot_path: sealed_disk|trusted_initramfs`, `initrd_sha256`) even after
+teardown. Include it in the enclosing run record; it contains no host paths or
+timestamps and is never read from a guest disk. The reboot smoke writes this
+record to `reboot-record.json`. See `scripts/integration/BOOT_NOTES.md` for the
+exact owner-run VM check.
+
+Open integration: `hermetic-attest::RunRecord` currently has no boot-path or
+initrd-digest field. Propagating this evidence into that signed schema requires
+a change in that component; the VMM record and smoke artifact do not claim to
+be a signed `hermetic-run/v1` record.
+
 Host-side Firecracker orchestration for Linux x86_64. The library never mounts a
 guest disk. It forbids unsafe Rust and uses only the workspace's existing Rust
 dependencies. `hermetic-vmm plan SPEC.json` (absolute path), or `plan -` for stdin,

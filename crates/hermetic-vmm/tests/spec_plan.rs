@@ -4,6 +4,88 @@ use serde_json::{json, Value};
 use support::spec;
 
 #[test]
+fn trusted_reboot_requires_pinned_initrd_and_excludes_disk_init_and_bypasses() {
+    let mut first_boot = spec(Role::Agent);
+    first_boot.boot_args.push_str(" hermetic.initramfs=0");
+    assert!(first_boot.validate().is_ok());
+    let mut s = spec(Role::Agent);
+    s.networks.clear();
+    s.initrd = Some(Initrd {
+        path: "/images/trusted.cpio".into(),
+        sha256: "a".repeat(64),
+    });
+    s.boot_args = s
+        .boot_args
+        .replace("init=/sbin/hermetic-execd", "hermetic.initramfs=1");
+    let valid = s.clone().validate().unwrap();
+    let requests = api_requests(&valid);
+    assert_eq!(
+        requests[2].body,
+        json!({"kernel_image_path":"/kernel", "initrd_path":"/initrd", "boot_args":s.boot_args})
+    );
+    let plan = jail_plan(&valid);
+    let file = plan
+        .files
+        .iter()
+        .find(|f| f.destination == "initrd")
+        .unwrap();
+    assert_eq!(file.source.as_deref(), Some("/images/trusted.cpio"));
+    assert!(!file.writable);
+    for extra in [
+        "init=/sbin/init",
+        "init",
+        "rdinit=/evil",
+        "rdinit",
+        "noinitrd",
+        "noinitrd=1",
+        "skip_initramfs",
+        "skip_initramfs=1",
+        "hermetic.overlay=/dev/vdc",
+    ] {
+        let mut bad = s.clone();
+        bad.boot_args.push_str(&format!(" {extra}"));
+        assert!(bad.validate().is_err(), "{extra}");
+    }
+    for clock in ["1", "4102444800"] {
+        let mut bad = s.clone();
+        bad.boot_args = bad.boot_args.replace("1700000000", clock);
+        assert!(bad.validate().is_err());
+    }
+    for pin in ["", "a", &"A".repeat(64), &"g".repeat(64), &"a".repeat(65)] {
+        let mut bad = s.clone();
+        bad.initrd.as_mut().unwrap().sha256 = pin.into();
+        assert!(bad.validate().is_err());
+    }
+    let mut bad = s.clone();
+    bad.initrd.as_mut().unwrap().path = "/images/../evil".into();
+    assert!(bad.validate().is_err());
+    let mut bad = s.clone();
+    bad.initrd = None;
+    assert!(bad.validate().is_err());
+    for replacement in ["hermetic.initramfs=0", "", "root=/dev/vdc"] {
+        let mut bad = s.clone();
+        bad.boot_args = bad.boot_args.replace("hermetic.initramfs=1", replacement);
+        assert!(bad.validate().is_err());
+    }
+    let mut bad = s.clone();
+    bad.role = Role::Extractor;
+    assert!(bad.validate().is_err());
+    let mut bad = s.clone();
+    bad.networks = spec(Role::Agent).networks;
+    assert!(bad.validate().is_err());
+    let mut bad = s;
+    bad.drives.insert(
+        0,
+        Drive {
+            id: "other".into(),
+            path: "/images/other".into(),
+            read_only: true,
+        },
+    );
+    assert!(bad.validate().is_err());
+}
+
+#[test]
 fn agent_and_extractor_full_known_answers() {
     for (role, fixture) in [
         (Role::Agent, include_str!("fixtures/agent-requests.json")),
