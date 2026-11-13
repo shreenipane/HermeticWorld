@@ -1623,6 +1623,12 @@ fn is_excluded(path: &IndexPath, canon_root: &Path, exclude: &[PathBuf]) -> bool
     exclude.iter().any(|d| full.starts_with(d))
 }
 
+#[derive(Default)]
+struct UnitGateState {
+    last_text_path: String,
+    last_text_gate_hunks: HashSet<usize>,
+}
+
 /// Match one record against a task, appending its findings.
 fn query_record(
     rec: &IndexRecord,
@@ -1630,6 +1636,7 @@ fn query_record(
     fp: &FingerprintSet,
     opts: &ScanOptions,
     findings: &mut Vec<Finding>,
+    gate_state: &mut UnitGateState,
 ) {
     match rec {
         IndexRecord::File {
@@ -1723,7 +1730,18 @@ fn query_record(
                 *d9_flags,
                 opts.visibility,
             ));
-            findings.extend(match_unit_hashes(hashes, fp, opts, "D2", "file", &display));
+            let unit_findings = match_unit_hashes(hashes, fp, opts, "D2", "file", &display);
+            let mut gate_hunks = HashSet::new();
+            for f in &unit_findings {
+                if f.detector == "D2" && f.severity == Severity::Gate {
+                    if let Some(h) = f.hunk {
+                        gate_hunks.insert(h);
+                    }
+                }
+            }
+            gate_state.last_text_path = display.clone();
+            gate_state.last_text_gate_hunks = gate_hunks;
+            findings.extend(unit_findings);
         }
         IndexRecord::Binary {
             path,
@@ -1732,13 +1750,9 @@ fn query_record(
         } => {
             let display = path.display(root);
             if channel == TIER2_CONTEXT_CHANNEL {
+                let is_same_path = gate_state.last_text_path == display;
                 for hunk in &fp.hunks {
-                    if findings.iter().any(|f| {
-                        f.detector == "D2"
-                            && f.path == display
-                            && f.hunk == Some(hunk.hunk_index)
-                            && f.severity == Severity::Gate
-                    }) {
+                    if is_same_path && gate_state.last_text_gate_hunks.contains(&hunk.hunk_index) {
                         continue;
                     }
                     if let Some(finding) = crate::tier2::match_tier2_by_membership(
@@ -1854,6 +1868,7 @@ pub fn query_reader_with_limit<R: Read>(
         }
     };
     let mut findings = Vec::new();
+    let mut gate_state = UnitGateState::default();
     let mut merger = ContinuationMerger::new(max_unit_bytes, |rec| {
         let path = match &rec {
             IndexRecord::File { path, .. }
@@ -1869,7 +1884,7 @@ pub fn query_reader_with_limit<R: Read>(
             IndexRecord::TextCont { path, .. } | IndexRecord::BinaryCont { path, .. } => path,
         };
         if !is_excluded(path, &canon_root, &opts.exclude_dirs) {
-            query_record(&rec, &root, fp, opts, &mut findings);
+            query_record(&rec, &root, fp, opts, &mut findings, &mut gate_state);
         }
         Ok(())
     });

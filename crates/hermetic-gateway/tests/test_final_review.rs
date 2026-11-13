@@ -286,6 +286,35 @@ fn test_concurrency_check_waits_briefly_for_a_released_slot() {
     assert!(tracker.snapshot().limit_exceeded);
 }
 
+#[test]
+fn test_concurrency_wait_rechecks_wall_time_limit() {
+    let tracker = Arc::new(QuotaTracker::new(QuotasConfig {
+        max_concurrent_requests: Some(1),
+        max_wall_time_seconds: Some(1),
+        ..Default::default()
+    }));
+    tracker.check_and_acquire(0).unwrap();
+    let t2 = tracker.clone();
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1100));
+        t2.release_concurrent();
+    });
+    let err = tracker.check_and_acquire(0);
+    assert!(err.is_err());
+    match err.unwrap_err() {
+        hermetic_gateway::quota::QuotaBreach::WallTimeExceeded {
+            elapsed_secs,
+            limit,
+        } => {
+            assert!(elapsed_secs >= 1);
+            assert_eq!(limit, 1);
+        }
+        other => panic!("Expected WallTimeExceeded, got {other:?}"),
+    }
+    assert!(tracker.snapshot().limit_exceeded);
+    common::join_within(releaser);
+}
+
 // ---------- (e) Retry-After ----------
 
 #[test]
