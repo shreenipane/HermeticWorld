@@ -4,10 +4,12 @@ use hermetic_grader_result::{
     read_bounded_regular_file, read_disk, verdict, DiskError, GradingPlan, RunResult,
     VerdictStatus, MAX_PLAN_BYTES,
 };
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const MAX_CLI_ARGS: usize = 32;
+const MAX_CLI_ARG_BYTES: usize = 4_096;
 
 #[derive(Debug)]
 enum CliError {
@@ -40,9 +42,12 @@ fn parse_cli_args() -> Result<CliPaths, CliError> {
             return Err(CliError::Usage);
         }
 
+        if flag_os.as_encoded_bytes().len() > MAX_CLI_ARG_BYTES {
+            return Err(CliError::Usage);
+        }
         let flag = flag_os.to_str().ok_or(CliError::Usage)?;
         let val_os = args_iter.next().ok_or(CliError::Usage)?;
-        if val_os.is_empty() {
+        if val_os.is_empty() || val_os.as_encoded_bytes().len() > MAX_CLI_ARG_BYTES {
             return Err(CliError::Usage);
         }
         let path = PathBuf::from(val_os);
@@ -122,7 +127,7 @@ fn run_cli() -> Result<ExitCode, CliError> {
 
     let out = verdict(r0, r1, r2, r3, &plan);
     let json = serde_json::to_string(&out).map_err(|_| CliError::Io)?;
-    println!("{}", json);
+    writeln!(io::stdout().lock(), "{}", json).map_err(|_| CliError::Io)?;
 
     if out.status == VerdictStatus::Resolved {
         Ok(ExitCode::from(0))
@@ -135,11 +140,17 @@ fn main() -> ExitCode {
     match run_cli() {
         Ok(code) => code,
         Err(CliError::Usage) => {
-            eprintln!("usage: hermetic-grader-verdict --r0 F --r1 F --r2 F [--r3 F] --plan F");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "usage: hermetic-grader-verdict --r0 F --r1 F --r2 F [--r3 F] --plan F"
+            );
             ExitCode::from(1)
         }
         Err(CliError::Io) => {
-            eprintln!("error: failed to read grading inputs");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "error: grading input or output failure"
+            );
             ExitCode::from(1)
         }
     }

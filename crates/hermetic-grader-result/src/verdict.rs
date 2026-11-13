@@ -4,7 +4,8 @@ use crate::disk::{
     encode_disk, is_valid_node_id, sha256_hex, DiskError, RunId, RunResult, SupervisorExit,
     TestStatus, MAX_TESTS,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -51,12 +52,81 @@ impl fmt::Display for VerdictStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GradingPlan {
+    #[serde(deserialize_with = "deserialize_test_set")]
     pub f2p: BTreeSet<String>,
+    #[serde(deserialize_with = "deserialize_test_set")]
     pub p2p: BTreeSet<String>,
     #[serde(alias = "r1_mutated", alias = "mutated_tests")]
+    #[serde(deserialize_with = "deserialize_test_set")]
     pub mutated: BTreeSet<String>,
     #[serde(alias = "paired_equivalents", alias = "r2_equivalents")]
+    #[serde(deserialize_with = "deserialize_equivalents")]
     pub equivalents: BTreeMap<String, String>,
+}
+
+fn deserialize_test_set<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeSet<String>, D::Error> {
+    struct TestSetVisitor;
+    impl<'de> Visitor<'de> for TestSetVisitor {
+        type Value = BTreeSet<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a bounded list of distinct test IDs")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut tests = BTreeSet::new();
+            for _ in 0..MAX_PLAN_TESTS {
+                let Some(id) = access.next_element::<String>()? else {
+                    return Ok(tests);
+                };
+                if !is_valid_node_id(&id) || !tests.insert(id) {
+                    return Err(serde::de::Error::custom("invalid or duplicate plan test"));
+                }
+            }
+            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("plan test cap exceeded"));
+            }
+            Ok(tests)
+        }
+    }
+    deserializer.deserialize_seq(TestSetVisitor)
+}
+
+fn deserialize_equivalents<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct EquivalentsVisitor;
+    impl<'de> Visitor<'de> for EquivalentsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a bounded map of distinct equivalent test pairs")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut pairs = BTreeMap::new();
+            for _ in 0..MAX_EQUIVALENT_PAIRS {
+                let Some((original, equivalent)) = access.next_entry::<String, String>()? else {
+                    return Ok(pairs);
+                };
+                if !is_valid_node_id(&original)
+                    || !is_valid_node_id(&equivalent)
+                    || pairs.insert(original, equivalent).is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "invalid or duplicate equivalent pair",
+                    ));
+                }
+            }
+            if access.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("equivalent pair cap exceeded"));
+            }
+            Ok(pairs)
+        }
+    }
+    deserializer.deserialize_map(EquivalentsVisitor)
 }
 
 impl GradingPlan {
@@ -189,7 +259,7 @@ fn inspect_run_slot(
                     runs_out.insert(slot, metrics);
                     Some(run.clone())
                 }
-                Err(DiskError::Tamper(_)) => {
+                Err(DiskError::Tamper(_)) | Err(DiskError::NotRegularFile(_)) => {
                     promote_status(status, VerdictStatus::Tampered);
                     reasons.insert("disk_tamper".to_string());
                     runs_out.insert(slot, RunMetrics::empty());
@@ -203,13 +273,13 @@ fn inspect_run_slot(
                 }
             }
         }
-        Err(DiskError::Tamper(_)) => {
+        Err(DiskError::Tamper(_)) | Err(DiskError::NotRegularFile(_)) => {
             promote_status(status, VerdictStatus::Tampered);
             reasons.insert("disk_tamper".to_string());
             runs_out.insert(slot, RunMetrics::empty());
             None
         }
-        Err(DiskError::NotRegularFile(_)) | Err(DiskError::Io(_)) => {
+        Err(DiskError::Io(_)) => {
             promote_status(status, VerdictStatus::InfraError);
             reasons.insert("disk_io_error".to_string());
             runs_out.insert(slot, RunMetrics::empty());
@@ -320,16 +390,14 @@ pub fn verdict(
     }
 
     if let Some(ref r3_run) = valid_r3 {
-        if !plan.f2p.is_empty() {
-            let all_f2p_passed = plan
-                .f2p
-                .iter()
-                .take(MAX_PLAN_TESTS)
-                .all(|test_id| r3_run.tests.get(test_id) == Some(&TestStatus::Passed));
-            if all_f2p_passed {
-                promote_status(&mut status, VerdictStatus::Review);
-                reasons.insert("fix_removal_passed".to_string());
-            }
+        let all_f2p_passed = plan
+            .f2p
+            .iter()
+            .take(MAX_PLAN_TESTS)
+            .all(|test_id| r3_run.tests.get(test_id) == Some(&TestStatus::Passed));
+        if all_f2p_passed {
+            promote_status(&mut status, VerdictStatus::Review);
+            reasons.insert("fix_removal_passed".to_string());
         }
     }
 

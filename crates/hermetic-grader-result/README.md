@@ -33,7 +33,9 @@ The differential verdict evaluates all rules and selects the final status using 
 hermetic-grader-verdict --r0 PATH --r1 PATH --r2 PATH [--r3 PATH] --plan PATH
 ```
 
+Plan collections are bounded and reject duplicate test IDs and equivalent-pair keys. R3 passing all F2P tests also includes an empty F2P set. Non-regular result files are classified as tampering. Result files are created with mode 0600 on Unix; failures to sync the parent directory are returned as I/O errors.
+
 Exit codes:
 * `0`: verdict status is "resolved"
 * `2`: verdict status is "tampered", "infra_error", "unresolved", or "review"
-* `1`: command-line usage error or file I/O error
+* `1`: command-line usage error or input/output error

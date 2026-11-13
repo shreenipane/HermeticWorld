@@ -19,6 +19,8 @@ pub const SHA256_BYTES: usize = 32;
 pub const SHA256_HEX_LEN: usize = 64;
 pub const MAX_TESTS: usize = 100_000;
 pub const MAX_NODE_ID_BYTES: usize = 1_024;
+pub const MAX_INPUT_FILE_BYTES: usize = DISK_BYTES;
+pub const READ_CHUNK_BYTES: usize = 4_096;
 pub const MAX_READ_ITERATIONS: usize = 16_384;
 pub const MAX_WRITE_ITERATIONS: usize = 16_384;
 pub const MAX_TEMP_ATTEMPTS: u32 = 64;
@@ -133,6 +135,7 @@ pub enum TamperReason {
         passed_count: u32,
     },
     FileIdentityChanged,
+    NotRegularFile(InvalidFileType),
 }
 
 impl TamperReason {
@@ -154,6 +157,7 @@ impl TamperReason {
             Self::InvalidNodeId => "invalid_node_id",
             Self::InconsistentCounts { .. } => "inconsistent_counts",
             Self::FileIdentityChanged => "file_identity_changed",
+            Self::NotRegularFile(_) => "not_regular_file",
         }
     }
 }
@@ -336,18 +340,48 @@ fn copy_slice_into(dst: &mut [u8], offset: usize, src: &[u8]) -> Result<(), Disk
     Ok(())
 }
 
+// The serializer must enforce the cap before growing its buffer, including when
+// called on an in-memory result rather than an already size-checked disk.
+struct PayloadBuffer {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for PayloadBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > PAYLOAD_CAP.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_payload(result: &RunResult) -> Result<Vec<u8>, DiskError> {
+    let mut buffer = PayloadBuffer {
+        bytes: Vec::with_capacity(PAYLOAD_CAP),
+        exceeded: false,
+    };
+    let serialized = serde_json::to_writer(&mut buffer, result);
+    if buffer.exceeded {
+        return Err(DiskError::Tamper(TamperReason::PayloadLengthExceedsCap {
+            // Serialization stopped at the cap; no claimed full length is trusted.
+            len: (PAYLOAD_CAP as u32).saturating_add(1),
+        }));
+    }
+    serialized.map_err(|_| DiskError::Tamper(TamperReason::InvalidJson))?;
+    Ok(buffer.bytes)
+}
+
 pub fn encode_disk(result: &RunResult) -> Result<(Vec<u8>, [u8; SHA256_BYTES]), DiskError> {
     validate_run_result(result)?;
 
-    let payload =
-        serde_json::to_vec(result).map_err(|_| DiskError::Tamper(TamperReason::InvalidJson))?;
-
-    if payload.len() > PAYLOAD_CAP {
-        let capped_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-        return Err(DiskError::Tamper(TamperReason::PayloadLengthExceedsCap {
-            len: capped_len,
-        }));
-    }
+    let payload = canonical_payload(result)?;
 
     let payload_len_u32 = u32::try_from(payload.len())
         .map_err(|_| DiskError::Tamper(TamperReason::PayloadLengthExceedsCap { len: u32::MAX }))?;
@@ -503,8 +537,7 @@ pub fn parse_disk_bytes(bytes: &[u8]) -> Result<RunResult, DiskError> {
 
     validate_run_result(&result)?;
 
-    let canonical_payload =
-        serde_json::to_vec(&result).map_err(|_| DiskError::Tamper(TamperReason::InvalidJson))?;
+    let canonical_payload = canonical_payload(&result)?;
     if canonical_payload.as_slice() != payload_bytes {
         return Err(DiskError::Tamper(TamperReason::NonCanonicalJson));
     }
@@ -514,13 +547,13 @@ pub fn parse_disk_bytes(bytes: &[u8]) -> Result<RunResult, DiskError> {
 
 fn classify_json_error(err: serde_json::Error) -> DiskError {
     let msg = err.to_string();
-    if msg.contains("duplicate field") || msg.contains(ERR_DUPLICATE_KEY) {
+    if msg.starts_with("duplicate field `") || msg.starts_with(ERR_DUPLICATE_KEY) {
         DiskError::Tamper(TamperReason::DuplicateJsonKey)
-    } else if msg.contains(ERR_TOO_MANY_TESTS) {
+    } else if msg.starts_with(ERR_TOO_MANY_TESTS) {
         DiskError::Tamper(TamperReason::TooManyTests {
             count: MAX_TESTS.saturating_add(1),
         })
-    } else if msg.contains(ERR_INVALID_NODE_ID) {
+    } else if msg.starts_with(ERR_INVALID_NODE_ID) {
         DiskError::Tamper(TamperReason::InvalidNodeId)
     } else {
         DiskError::Tamper(TamperReason::InvalidJson)
@@ -584,6 +617,9 @@ pub fn open_regular_file_nofol(path: &Path) -> Result<(File, Metadata), DiskErro
 }
 
 pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, DiskError> {
+    if max_bytes > MAX_INPUT_FILE_BYTES {
+        return Err(DiskError::Io(io::ErrorKind::InvalidInput));
+    }
     let (mut file, open_meta) = open_regular_file_nofol(path)?;
     let file_len =
         usize::try_from(open_meta.len()).map_err(|_| DiskError::Io(io::ErrorKind::InvalidData))?;
@@ -591,8 +627,8 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8
         return Err(DiskError::Io(io::ErrorKind::InvalidData));
     }
 
-    let mut buf = Vec::with_capacity(file_len);
-    let mut chunk = [0u8; 4096];
+    let mut buf = Vec::with_capacity(max_bytes);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
     let mut total: usize = 0;
 
     for _ in 0..MAX_READ_ITERATIONS {
@@ -617,7 +653,13 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8
 }
 
 pub fn read_disk<P: AsRef<Path>>(path: P) -> Result<RunResult, DiskError> {
-    let (mut file, open_meta) = open_regular_file_nofol(path.as_ref())?;
+    let (mut file, open_meta) =
+        open_regular_file_nofol(path.as_ref()).map_err(|err| match err {
+            DiskError::NotRegularFile(kind) => {
+                DiskError::Tamper(TamperReason::NotRegularFile(kind))
+            }
+            other => other,
+        })?;
     let meta_len = open_meta.len();
     if meta_len != DISK_BYTES as u64 {
         return Err(DiskError::Tamper(TamperReason::InvalidDiskSize {
@@ -722,7 +764,16 @@ pub fn write_disk<P: AsRef<Path>>(
     result: &RunResult,
     path: P,
 ) -> Result<[u8; SHA256_BYTES], DiskError> {
-    let dest = path.as_ref();
+    write_disk_with_parent_sync(result, path.as_ref(), |parent| {
+        File::open(parent)?.sync_all()
+    })
+}
+
+fn write_disk_with_parent_sync(
+    result: &RunResult,
+    dest: &Path,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<[u8; SHA256_BYTES], DiskError> {
     let (image, disk_hash) = encode_disk(result)?;
 
     check_destination_not_special(dest)?;
@@ -732,11 +783,14 @@ pub fn write_disk<P: AsRef<Path>>(
     let mut created_temp: Option<(File, PathBuf)> = None;
     for attempt in 0..MAX_TEMP_ATTEMPTS {
         let candidate = make_temp_path(parent, &digest_hex, attempt);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
             Ok(file) => {
                 created_temp = Some((file, candidate));
                 break;
@@ -778,9 +832,58 @@ pub fn write_disk<P: AsRef<Path>>(
         return Err(DiskError::Io(err.kind()));
     }
 
-    if let Ok(dir_file) = File::open(parent) {
-        let _ = dir_file.sync_all();
-    }
+    sync_parent(parent).map_err(|e| DiskError::Io(e.kind()))?;
 
     Ok(disk_hash)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn payload_buffer_rejects_growth_before_allocation() {
+        let mut buffer = PayloadBuffer {
+            bytes: vec![0; PAYLOAD_CAP],
+            exceeded: false,
+        };
+        let capacity = buffer.bytes.capacity();
+        assert_eq!(
+            buffer.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(buffer.exceeded);
+        assert_eq!(buffer.bytes.len(), PAYLOAD_CAP);
+        assert_eq!(buffer.bytes.capacity(), capacity);
+    }
+
+    #[test]
+    fn parent_directory_open_and_sync_failures_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("disk");
+        let result = RunResult {
+            run: RunId::R0,
+            variant_set: "a".repeat(SHA256_HEX_LEN),
+            tests: BTreeMap::new(),
+            supervisor: SupervisorSummary {
+                exit: SupervisorExit::Clean,
+                tests_started: 0,
+                tests_finished: 0,
+            },
+        };
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::Other] {
+            let mut called = false;
+            let outcome = write_disk_with_parent_sync(&result, &dest, |parent| {
+                called = true;
+                assert_eq!(parent, dir.path());
+                // The image has already been atomically published, but its
+                // durability cannot be claimed if opening/fsyncing the parent fails.
+                assert_eq!(read_disk(&dest).unwrap(), result);
+                Err(kind.into())
+            });
+            assert!(called);
+            assert_eq!(outcome, Err(DiskError::Io(kind)));
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
 }

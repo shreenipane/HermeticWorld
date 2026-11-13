@@ -440,7 +440,9 @@ fn refuse_symlinks_and_fifos() {
     symlink(&real_path, &link_path).unwrap();
     assert_eq!(
         read_disk(&link_path),
-        Err(DiskError::NotRegularFile(InvalidFileType::Symlink))
+        Err(DiskError::Tamper(TamperReason::NotRegularFile(
+            InvalidFileType::Symlink
+        )))
     );
     assert_eq!(
         write_disk(&run, &link_path),
@@ -453,7 +455,9 @@ fn refuse_symlinks_and_fifos() {
     assert!(status.success());
     assert_eq!(
         read_disk(&fifo_path),
-        Err(DiskError::NotRegularFile(InvalidFileType::Fifo))
+        Err(DiskError::Tamper(TamperReason::NotRegularFile(
+            InvalidFileType::Fifo
+        )))
     );
     assert_eq!(
         write_disk(&run, &fifo_path),
@@ -463,7 +467,9 @@ fn refuse_symlinks_and_fifos() {
     // Directory must be refused on both read and write
     assert_eq!(
         read_disk(dir.path()),
-        Err(DiskError::NotRegularFile(InvalidFileType::Directory))
+        Err(DiskError::Tamper(TamperReason::NotRegularFile(
+            InvalidFileType::Directory
+        )))
     );
     assert_eq!(
         write_disk(&run, dir.path()),
