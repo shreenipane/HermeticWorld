@@ -20,6 +20,7 @@ members = [
     "crates/hermetic-grader-sandbox",
     "crates/hermetic-execd",
     "crates/hermetic-vmm",
+    "crates/hermetic-bundle",
     "crates/hermetic-grader-result",
 ]
 resolver = "2"

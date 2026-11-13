@@ -521,6 +521,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-bundle"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hermetic-cli"
 version = "0.1.0"
 dependencies = [
