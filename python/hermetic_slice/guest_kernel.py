@@ -65,7 +65,8 @@ class Rule:
 # One policy drives the checker, config fragments and README requirement table.
 RULES: dict[str, Rule] = {}
 for _purpose, _names in (
-    ("TR-VMM-4: x86 microVM boot", "64BIT X86_64 SMP HYPERVISOR_GUEST KVM_GUEST PCI BLOCK BLK_DEV MODULES NET NETDEVICES INET UNIX PROC_FS SYSFS TMPFS MULTIUSER TTY SERIAL_8250 SERIAL_8250_CONSOLE PRINTK ELF_CORE BINFMT_ELF BINFMT_SCRIPT UNIX98_PTYS DEVTMPFS FHANDLE"),
+    ("Phase 3b: deny guest root access to kernel code and memory", "SECURITY SECURITYFS SECURITY_LOCKDOWN_LSM SECURITY_LOCKDOWN_LSM_EARLY LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY BPF_UNPRIV_DEFAULT_OFF"),
+    ("TR-VMM-4: x86 microVM boot", "64BIT X86_64 SMP HYPERVISOR_GUEST PCI BLOCK BLK_DEV NET NETDEVICES INET UNIX PROC_FS SYSFS TMPFS MULTIUSER TTY SERIAL_8250 SERIAL_8250_CONSOLE PRINTK ELF_CORE BINFMT_ELF BINFMT_SCRIPT UNIX98_PTYS DEVTMPFS FHANDLE"),
     ("execd boot contract: the kernel mounts devtmpfs at /dev before PID 1", "DEVTMPFS_MOUNT"),
     ("execd: PID 1 reaps orphans via /proc/<pid>/task/<tid>/children", "PROC_CHILDREN"),
     ("TR-EXD-6: trusted initramfs support (uncompressed or gzip only)", "BLK_DEV_INITRD RD_GZIP"),
@@ -79,6 +80,7 @@ for _purpose, _names in (
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("y", _purpose)
 for _purpose, _names in (
+    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS PERF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK"),
     ("TR-VMM-4: prevent accidental host clock reads", "PTP_1588_CLOCK PTP_1588_CLOCK_KVM PTP_1588_CLOCK_VMW RTC_HCTOSYS"),
     ("TR-VMM-4: fixed build identity; config supplied separately", "LOCALVERSION_AUTO IKCONFIG"),
     ("T3.1: no time namespace needed", "TIME_NS"),

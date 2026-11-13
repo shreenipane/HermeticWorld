@@ -994,3 +994,45 @@ def test_netvm_filter_requires_builtin_legacy_tables():
         assert k.RULES[option].value == "y"
         assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
         assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
+
+
+# Root must not be able to replace or inspect the trusted kernel even when it
+# creates its own device nodes or supplies arbitrary modules and BPF programs.
+LOCKDOWN_REQUIRED = (
+    "SECURITY SECURITYFS SECURITY_LOCKDOWN_LSM SECURITY_LOCKDOWN_LSM_EARLY "
+    "LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY BPF_UNPRIV_DEFAULT_OFF"
+).split()
+LOCKDOWN_FORBIDDEN = (
+    "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID "
+    "PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES "
+    "KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS PERF_EVENTS ACPI_CUSTOM_METHOD "
+    "ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK"
+).split()
+
+
+@pytest.mark.parametrize("symbol", LOCKDOWN_REQUIRED + LOCKDOWN_FORBIDDEN)
+def test_root_ring0_policy_is_enforced(symbol):
+    name = "CONFIG_" + symbol
+    wanted = "y" if symbol in LOCKDOWN_REQUIRED else "n"
+    assert k.RULES.get(name) == k.Rule(wanted, "Phase 3b: deny guest root access to kernel code and memory")
+    values = {key: rule.value for key, rule in k.RULES.items()}
+    for wrong in ("m", "n" if wanted == "y" else "y"):
+        values[name] = wrong
+        assert name in {finding.option for finding in k.check_config(config(values))}
+
+
+def test_lockdown_retains_builtin_vm_and_grader_support():
+    merged = {}
+    for filename in ("base-x86_64.config", "hermetic.config"):
+        merged.update(k.parse_config((ROOT / filename).read_bytes()))
+    for symbol in LOCKDOWN_REQUIRED:
+        assert merged.get("CONFIG_" + symbol) == "y"
+    for symbol in LOCKDOWN_FORBIDDEN:
+        assert merged.get("CONFIG_" + symbol) == "n"
+    for name, rule in k.RULES.items():
+        if rule.value == "y":
+            assert merged.get(name) == "y", name
+    for symbol in ("VIRTIO_BLK VIRTIO_NET VIRTIO_VSOCKETS HW_RANDOM_VIRTIO "
+                   "EXT4_FS OVERLAY_FS DEVTMPFS CGROUP_BPF BPF_SYSCALL "
+                   "NETFILTER_XTABLES NF_TABLES NFT_TPROXY").split():
+        assert merged["CONFIG_" + symbol] == "y"

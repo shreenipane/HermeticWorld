@@ -8,6 +8,12 @@ Firecracker's x86_64 microVM platform. This selects an explicit
 substrate, not the newest stable release. Runtime compatibility still needs the
 owner's pinned Firecracker integration test.
 
+The guest-root policy also forces early confidentiality lockdown and compiles
+out modules, raw memory/MSR/port access, kexec, hibernation, tracing and KVM
+paravirtual clock hooks. Required VM drivers and cgroup-device BPF remain built
+in. See [guest lockdown](../../docs/guest-lockdown.md) for the source rationale,
+probe contract, exact manager build commands and all VM smoke commands.
+
 ## Pinned values in `kernel.lock.json`
 
 The lock file `kernel.lock.json` contains verified upstream pin values:
@@ -150,6 +156,8 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | Option | Required value | Requirement |
 | --- | --- | --- |
 | `CONFIG_64BIT` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_ACPI_CUSTOM_METHOD` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_ACPI_TABLE_UPGRADE` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_BFQ_GROUP_IOSCHED` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_BINFMT_ELF` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_BINFMT_SCRIPT` | `y` | TR-VMM-4: x86 microVM boot |
@@ -160,7 +168,10 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_BLK_DEV_THROTTLING` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_BLOCK` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_BPF` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
+| `CONFIG_BPF_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_BPF_KPROBE_OVERRIDE` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_BPF_SYSCALL` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
+| `CONFIG_BPF_UNPRIV_DEFAULT_OFF` | `y` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_BUILD_SALT` | `""` | TR-VMM-4: no random build salt |
 | `CONFIG_CFS_BANDWIDTH` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_CGROUPS` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
@@ -173,6 +184,8 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_CRYPTO_SHA256` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_DEBUG_INFO` | `n` | TR-VMM-4: no compiler paths or debug metadata |
 | `CONFIG_DEFAULT_HOSTNAME` | `"hermetic"` | TR-VMM-4: fixed default guest hostname |
+| `CONFIG_DEVKMEM` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_DEVMEM` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_DEVTMPFS` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_DEVTMPFS_MOUNT` | `y` | execd boot contract: the kernel mounts devtmpfs at /dev before PID 1 |
 | `CONFIG_DM_VERITY` | `y` | TR-VMM-4: dm-verity and seccomp |
@@ -182,6 +195,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_FAIR_GROUP_SCHED` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_FHANDLE` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_FS_POSIX_ACL` | `y` | TR-VMM-4: root filesystems |
+| `CONFIG_HIBERNATION` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_HW_RANDOM` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
 | `CONFIG_HW_RANDOM_VIRTIO` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
 | `CONFIG_HYPERVISOR_GUEST` | `y` | TR-VMM-4: x86 microVM boot |
@@ -198,12 +212,18 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_IP_NF_IPTABLES` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP_NF_MANGLE` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP_NF_NAT` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
-| `CONFIG_KVM_GUEST` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_KEXEC` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_KEXEC_CORE` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_KEXEC_FILE` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_KPROBES` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_KPROBE_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_KVM_GUEST` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_LOCALVERSION` | `""` | TR-VMM-4: no local version or host suffix |
 | `CONFIG_LOCALVERSION_AUTO` | `n` | TR-VMM-4: fixed build identity; config supplied separately |
+| `CONFIG_LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY` | `y` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_MD` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_MEMCG` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
-| `CONFIG_MODULES` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_MODULES` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_MULTIUSER` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_NAMESPACES` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_NET` | `y` | TR-VMM-4: x86 microVM boot |
@@ -230,12 +250,16 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_NF_TPROXY_IPV4` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NF_TPROXY_IPV6` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_OVERLAY_FS` | `y` | TR-VMM-4: root filesystems |
+| `CONFIG_PARAVIRT` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_PARAVIRT_CLOCK` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PCI` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_PERF_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PID_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_POSIX_MQUEUE` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_PRINTK` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_PROC_CHILDREN` | `y` | execd: PID 1 reaps orphans via /proc/<pid>/task/<tid>/children |
 | `CONFIG_PROC_FS` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_PROC_KCORE` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_PTP_1588_CLOCK` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_PTP_1588_CLOCK_KVM` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_PTP_1588_CLOCK_VMW` | `n` | TR-VMM-4: prevent accidental host clock reads |
@@ -249,6 +273,10 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_RTC_HCTOSYS` | `n` | TR-VMM-4: prevent accidental host clock reads |
 | `CONFIG_SECCOMP` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_SECCOMP_FILTER` | `y` | TR-VMM-4: dm-verity and seccomp |
+| `CONFIG_SECURITY` | `y` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_SECURITYFS` | `y` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_SECURITY_LOCKDOWN_LSM` | `y` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_SECURITY_LOCKDOWN_LSM_EARLY` | `y` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_SERIAL_8250` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_SERIAL_8250_CONSOLE` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_SMP` | `y` | TR-VMM-4: x86 microVM boot |
@@ -259,6 +287,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_TTY` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_UNIX` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_UNIX98_PTYS` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_UPROBE_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_USER_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_UTS_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_VIRTIO` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
@@ -270,4 +299,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_VIRTIO_VSOCKETS` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
 | `CONFIG_VSOCKETS` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
 | `CONFIG_X86_64` | `y` | TR-VMM-4: x86 microVM boot |
+| `CONFIG_X86_CPUID` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_X86_IOPL_IOPERM` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_X86_MSR` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 <!-- END POLICY -->
