@@ -8,6 +8,11 @@ members = [
     "crates/hermetic-world-server",
     "crates/hermetic-extract-walk",
     "crates/hermetic-cli",
+    "crates/hermetic-netvm-dns",
+    "crates/hermetic-extract",
+    "crates/hermetic-netvm-http",
+    "crates/hermetic-grader-sandbox",
+    "crates/hermetic-execd",
     "crates/hermetic-vmm",
 ]
 resolver = "2"
