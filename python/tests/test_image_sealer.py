@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 from unittest.mock import patch
@@ -684,7 +685,6 @@ def test_restore_modes_sh_tracked_ancestor_and_final_symlinks_never_chmod(tmp_pa
 # =============================================================================
 
 
-FAKE_IMAGE_TAG = "hermetic-test/fake-swebench:latest"
 DISTINCTIVE_DANGLING_LINE = "SECRET_DISTINCTIVE_DANGLING_LINE_987654"
 PRE_BASE_SECRET_LINE = "SECRET_PRE_BASE_HISTORIC_LINE_12345"
 
@@ -767,19 +767,20 @@ def fake_swebench_image(tmp_path_factory: pytest.TempPathFactory):
         encoding="utf-8",
     )
 
-    run_docker(["build", "-t", FAKE_IMAGE_TAG, str(tmp_dir)], check=True)
+    image_tag = f"hermetic-test/fake-swebench-{secrets.token_hex(8)}:latest"
+    try:
+        run_docker(["build", "-t", image_tag, str(tmp_dir)], check=True)
 
-    yield {
-        "image": FAKE_IMAGE_TAG,
-        "c1": c1,
-        "c2": c2,
-        "c3_base": c3_base,
-        "distinctive_line": DISTINCTIVE_DANGLING_LINE,
-        "pre_base_line": PRE_BASE_SECRET_LINE,
-    }
-
-    # Teardown: remove images
-    run_docker(["rmi", "-f", FAKE_IMAGE_TAG], check=False)
+        yield {
+            "image": image_tag,
+            "c1": c1,
+            "c2": c2,
+            "c3_base": c3_base,
+            "distinctive_line": DISTINCTIVE_DANGLING_LINE,
+            "pre_base_line": PRE_BASE_SECRET_LINE,
+        }
+    finally:
+        run_docker(["rmi", "-f", image_tag], check=False)
 
 
 @pytest.mark.docker
@@ -825,7 +826,7 @@ def test_seal_image_end_to_end(tmp_path: Path, fake_swebench_image: dict) -> Non
     distinctive_line = fake_swebench_image["distinctive_line"]
     pre_base_line = fake_swebench_image["pre_base_line"]
 
-    instance_id = "test-fake__task-1"
+    instance_id = f"test-fake__task-1-{secrets.token_hex(8)}"
     task_dir = tmp_path / "tasks" / instance_id
     staging_dir = task_dir / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -912,7 +913,7 @@ def test_seal_image_failure_writes_report(tmp_path: Path, fake_swebench_image: d
     c3_base = fake_swebench_image["c3_base"]
     distinctive_line = fake_swebench_image["distinctive_line"]
 
-    instance_id = "test-fail__task-1"
+    instance_id = f"test-fail__task-1-{secrets.token_hex(8)}"
     task_dir = tmp_path / "tasks" / instance_id
     staging_dir = task_dir / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -956,7 +957,7 @@ def test_cli_seal_images(tmp_path: Path, fake_swebench_image: dict) -> None:
     image = fake_swebench_image["image"]
     c3_base = fake_swebench_image["c3_base"]
 
-    instance_id = "test-cli__task-1"
+    instance_id = f"test-cli__task-1-{secrets.token_hex(8)}"
     tasks_root = tmp_path / "cli_tasks"
     task_dir = tasks_root / instance_id
     staging_dir = task_dir / "staging"
