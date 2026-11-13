@@ -2457,3 +2457,121 @@ fn priorcheck_3_stale_endpoint_in_group_writable_directory_is_not_reclaimed() {
         );
     }
 }
+
+#[test]
+fn test_sandboxed_server_endpoint_cleanup_on_drop() {
+    let root = tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    let log_dir = root.path().join("log");
+    let socket_dir = root.path().join("endpoint");
+    support::create_private_dir(&store_dir).unwrap();
+    support::create_private_dir(&log_dir).unwrap();
+    support::create_private_dir(&socket_dir).unwrap();
+    support::create_private_dir_all(store_dir.join("example.org")).unwrap();
+    fs::write(store_dir.join("example.org/item"), b"payload").unwrap();
+
+    let socket_path = socket_dir.join("server.sock");
+    let lock_path = socket_dir.join(".server.sock.lock");
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-world-server"));
+    command
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--log")
+        .arg(&log_dir)
+        .arg("--socket")
+        .arg(&socket_path)
+        .args([
+            "--t-clock",
+            "2024-03-01T12:00:00Z",
+            "--allow-no-landlock",
+            "--max-requests",
+            "1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = AuditChild(command.spawn().unwrap());
+
+    // Connect to server socket
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stream = loop {
+        if socket_path.exists() {
+            if let Ok(s) = support::connect(&socket_path) {
+                break s;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout connecting to sandboxed server"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+
+    // Send a valid request
+    let req = RequestFrame {
+        method: Method::Get,
+        request_id: 1,
+        authority: "example.org".into(),
+        path_and_query: "/item".into(),
+        range: None,
+    };
+    stream.write_all(&req.encode().unwrap()).unwrap();
+    let resp = ResponseFrame::read_from(&mut stream, 1024).unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"payload");
+    drop(stream);
+
+    // Wait for the sandboxed server to complete and exit
+    let status = child.wait_status();
+    assert!(status.success(), "sandboxed server failed: {status:?}");
+
+    // The endpoint socket and its lock must be removed on drop
+    assert!(
+        !socket_path.exists(),
+        "socket {} was not removed on drop",
+        socket_path.display()
+    );
+    assert!(
+        !lock_path.exists(),
+        "lock {} was not removed on drop",
+        lock_path.display()
+    );
+
+    // A second server on the same socket path must succeed to start without --recover
+    let log_dir2 = root.path().join("log2");
+    support::create_private_dir(&log_dir2).unwrap();
+    let mut second_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-world-server"));
+    second_cmd
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--log")
+        .arg(&log_dir2)
+        .arg("--socket")
+        .arg(&socket_path)
+        .args([
+            "--t-clock",
+            "2024-03-01T12:00:00Z",
+            "--allow-no-landlock",
+            "--max-requests",
+            "1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut second_child = AuditChild(second_cmd.spawn().unwrap());
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let stream2 = loop {
+        if socket_path.exists() {
+            if let Ok(s) = support::connect(&socket_path) {
+                break s;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline2,
+            "timeout connecting to second server"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    drop(stream2);
+    let _ = second_child.wait_status();
+}

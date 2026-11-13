@@ -47,6 +47,16 @@ pub fn apply_landlock(
     log_dir: &Path,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
+    apply_landlock_for_endpoint(store_dir, log_dir, None, allow_no_landlock)
+}
+
+/// Apply Landlock filesystem restrictions with optional endpoint directory access.
+pub fn apply_landlock_for_endpoint(
+    store_dir: &Path,
+    log_dir: &Path,
+    socket_dir: Option<&Path>,
+    allow_no_landlock: bool,
+) -> Result<SandboxLandlockStatus, SandboxError> {
     if INJECT_LANDLOCK_UNAVAILABLE.load(std::sync::atomic::Ordering::SeqCst)
         || std::env::var_os("HERMETIC_TEST_INJECT_LANDLOCK_UNAVAILABLE").is_some()
     {
@@ -64,12 +74,22 @@ pub fn apply_landlock(
         }
     }
     let abi = ABI::V3;
-    let ruleset_res = Ruleset::default()
+    let mut ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .and_then(|r| r.create())
         .and_then(|r| r.add_rules(path_beneath_rules(&[store_dir], AccessFs::from_read(abi))))
-        .and_then(|r| r.add_rules(path_beneath_rules(&[log_dir], AccessFs::from_all(abi))))
-        .and_then(|r| r.restrict_self());
+        .and_then(|r| r.add_rules(path_beneath_rules(&[log_dir], AccessFs::from_all(abi))));
+
+    if let Some(sock_dir) = socket_dir {
+        ruleset = ruleset.and_then(|r| {
+            r.add_rules(path_beneath_rules(
+                &[sock_dir],
+                AccessFs::RemoveFile | AccessFs::MakeSock,
+            ))
+        });
+    }
+
+    let ruleset_res = ruleset.and_then(|r| r.restrict_self());
 
     match ruleset_res {
         Ok(status) => match status.ruleset {
@@ -289,7 +309,18 @@ pub fn apply_sandbox(
     log_dir: &Path,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
-    let landlock_status = apply_landlock(store_dir, log_dir, allow_no_landlock)?;
+    apply_sandbox_for_endpoint(store_dir, log_dir, None, allow_no_landlock)
+}
+
+/// Apply full sandbox with optional endpoint directory access (Landlock then Seccomp).
+pub fn apply_sandbox_for_endpoint(
+    store_dir: &Path,
+    log_dir: &Path,
+    socket_dir: Option<&Path>,
+    allow_no_landlock: bool,
+) -> Result<SandboxLandlockStatus, SandboxError> {
+    let landlock_status =
+        apply_landlock_for_endpoint(store_dir, log_dir, socket_dir, allow_no_landlock)?;
     apply_seccomp()?;
     Ok(landlock_status)
 }
