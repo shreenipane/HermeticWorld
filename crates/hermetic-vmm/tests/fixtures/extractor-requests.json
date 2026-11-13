@@ -1,0 +1,71 @@
+[
+  {
+    "method": "PUT",
+    "path": "/machine-config",
+    "body": {
+      "vcpu_count": 2,
+      "mem_size_mib": 256,
+      "smt": false
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/cpu-config",
+    "body": {
+      "cpuid_modifiers": [
+        {
+          "leaf": "0x40000001",
+          "subleaf": "0x0",
+          "flags": 0,
+          "modifiers": [
+            {
+              "register": "eax",
+              "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxxxxxx0xx0"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/boot-source",
+    "body": {
+      "kernel_image_path": "/kernel",
+      "boot_args": "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda init=/sbin/hermetic-execd clocksource=tsc tsc=reliable hermetic.t=1700000000 ro"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/drives/rootfs",
+    "body": {
+      "drive_id": "rootfs",
+      "path_on_host": "/drive-rootfs",
+      "is_root_device": true,
+      "is_read_only": true
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/drives/tests",
+    "body": {
+      "drive_id": "tests",
+      "path_on_host": "/drive-tests",
+      "is_root_device": false,
+      "is_read_only": true
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/vsock",
+    "body": {
+      "guest_cid": 3,
+      "uds_path": "/vsock"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/entropy",
+    "body": {}
+  }
+]
