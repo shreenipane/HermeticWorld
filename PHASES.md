@@ -197,6 +197,11 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image
   - [ ] Open: two-VM boot/network verification; this environment has no /dev/kvm. Run `scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"` on the prepared host with a policy-checked kernel including built-in legacy IPv4 filtering (see BOOT_NOTES.md, Network VM).
 - [ ] AgentVM on a CoW world; Mode H through vsock 5000
+  - [x] Optional host harness: mini-swe-agent 1.17.4 pin/hash/licence, real execd JSON frames and Rust known-answer vectors, bounded observations/deadlines, direct Messages gateway client, SWE-bench prompts and manifest-clock trajectory, atomic command evidence.
+  - [x] Gateway Chat Completions upstream adapter: text/tools/results, incremental SSE and usage, existing policy/nonce/quotas/stripping/logging path, 0600 descriptor-pinned key loading; fake local upstream tests.
+  - [ ] Owner-run `scripts/integration/agent-h-smoke.sh`: no-network AgentVM, scripted harness patch, untrusted HEXT collection, VM teardown, validation and clean GraderVM grading. Requires a prepared sealed fixture image and the optional harness runtime; not yet KVM-verified here.
+  - [ ] Open: requests/httpbin stand-in and manifest registration require a versioned WorldServer/NetVM policy decision. Current frames omit request headers/bodies and only permit GET/HEAD; requests tests require POST/PUT/DELETE, cookies and authentication. See `python/hermetic_agent/README.md`.
+  - [ ] Open: the Chat Completions upstream has no exact Messages count_tokens equivalent or documented inline-document mapping. These requests fail closed on that path; expanding the upstream endpoint allowlist or choosing a supported representation needs an owner decision. The Anthropic upstream retains its existing surface.
 - [ ] Mode G: `/opt/agent` volume, model path NetVM → gateway (cut list: optional)
 - [ ] ExtractorVM plus host validator (TR-EXT-*)
 - [ ] GraderVM supervisor and isolation (TR-GR-1 to TR-GR-5)

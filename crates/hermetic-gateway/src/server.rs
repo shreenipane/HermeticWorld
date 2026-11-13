@@ -184,6 +184,14 @@ pub struct GatewayServer {
 }
 
 impl GatewayServer {
+    fn adapter_version(&self) -> &'static str {
+        if self.config.upstream_protocol == crate::config::UpstreamProtocol::OpenaiChat {
+            crate::openai::ADAPTER_VERSION
+        } else {
+            ANTHROPIC_ADAPTER_VERSION
+        }
+    }
+
     pub fn new(config: GatewayConfig, t_clock: time::OffsetDateTime) -> Result<Self, String> {
         Self::new_with_clock(config, GuestClock::new(t_clock))
     }
@@ -461,7 +469,7 @@ impl GatewayServer {
                 .now()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
-            adapter_version: ANTHROPIC_ADAPTER_VERSION.to_string(),
+            adapter_version: self.adapter_version().to_string(),
             endpoint: endpoint.to_string(),
             model: None,
             stream: false,
@@ -762,6 +770,7 @@ impl GatewayServer {
             client_anthropic_beta.as_deref(),
             is_stream,
             self.wall_time_left(),
+            Some((slot.clone(), self.quota.clone())),
         );
 
         match upstream_res {
@@ -829,7 +838,7 @@ impl GatewayServer {
                             .now()
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default(),
-                        adapter_version: ANTHROPIC_ADAPTER_VERSION.to_string(),
+                        adapter_version: self.adapter_version().to_string(),
                         endpoint,
                         model: Some(parsed_req.model.clone()),
                         stream: false,
@@ -900,7 +909,7 @@ impl GatewayServer {
                             .now()
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default(),
-                        adapter_version: ANTHROPIC_ADAPTER_VERSION.to_string(),
+                        adapter_version: self.adapter_version().to_string(),
                         endpoint,
                         model: Some(parsed_req.model.clone()),
                         stream: false,
@@ -979,7 +988,7 @@ impl GatewayServer {
                         .now()
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_default(),
-                    adapter_version: ANTHROPIC_ADAPTER_VERSION.to_string(),
+                    adapter_version: self.adapter_version().to_string(),
                     endpoint,
                     model: Some(parsed_req.model.clone()),
                     stream: true,

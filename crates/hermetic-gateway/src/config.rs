@@ -4,9 +4,19 @@ use crate::quota::QuotasConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+    #[default]
+    Anthropic,
+    OpenaiChat,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfigFile {
+    #[serde(default)]
+    pub upstream_protocol: UpstreamProtocol,
     #[serde(default = "default_upstream_base_url")]
     pub upstream_base_url: String,
 
@@ -38,6 +48,7 @@ fn default_upstream_read_timeout_s() -> u64 {
 
 #[derive(Clone)]
 pub struct GatewayConfig {
+    pub upstream_protocol: UpstreamProtocol,
     pub upstream_base_url: String,
     pub anthropic_version: String,
     pub allowed_betas: Vec<String>,
@@ -54,6 +65,7 @@ impl std::fmt::Debug for GatewayConfig {
     /// Same as a derived Debug, except that the API key is redacted.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewayConfig")
+            .field("upstream_protocol", &self.upstream_protocol)
             .field("upstream_base_url", &self.upstream_base_url)
             .field("anthropic_version", &self.anthropic_version)
             .field("allowed_betas", &self.allowed_betas)
@@ -79,8 +91,14 @@ impl GatewayConfig {
         let parsed: GatewayConfigFile = serde_json::from_str(&file_contents)
             .map_err(|e| format!("Failed to parse config JSON {}: {e}", path_ref.display()))?;
 
-        // Regular file only (no symlink, device or FIFO), at most MAX_API_KEY_FILE_BYTES.
-        let raw_key = crate::fsutil::read_regular_file_capped(
+        if parsed.upstream_read_timeout_s == 0 || parsed.upstream_read_timeout_s > 300 {
+            return Err("Upstream timeout must be in 1..=300 seconds".into());
+        }
+        if parsed.upstream_protocol == UpstreamProtocol::OpenaiChat {
+            crate::openai::validate_base_url(&parsed.upstream_base_url)?;
+        }
+        // The key is opened once through pinned directory descriptors, mode 0600 only.
+        let raw_key = crate::fsutil::read_secret_file_capped(
             &parsed.api_key_file,
             crate::fsutil::MAX_API_KEY_FILE_BYTES,
         )
@@ -106,8 +124,12 @@ impl GatewayConfig {
                 parsed.api_key_file.display()
             ));
         }
+        if !api_key.bytes().all(|byte| (33..=126).contains(&byte)) {
+            return Err("API key contains invalid header bytes".into());
+        }
 
         Ok(Self {
+            upstream_protocol: parsed.upstream_protocol,
             upstream_base_url: parsed.upstream_base_url,
             anthropic_version: parsed.anthropic_version,
             allowed_betas: parsed.allowed_betas,
@@ -133,6 +155,7 @@ impl GatewayConfig {
         api_key: String,
     ) -> Self {
         Self {
+            upstream_protocol: UpstreamProtocol::Anthropic,
             upstream_base_url,
             anthropic_version,
             allowed_betas,
@@ -147,6 +170,11 @@ impl GatewayConfig {
 
     pub fn with_upstream_read_timeout_s(mut self, timeout_s: u64) -> Self {
         self.upstream_read_timeout_s = timeout_s;
+        self
+    }
+
+    pub fn with_upstream_protocol(mut self, protocol: UpstreamProtocol) -> Self {
+        self.upstream_protocol = protocol;
         self
     }
 

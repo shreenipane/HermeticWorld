@@ -686,6 +686,11 @@ fn test_12_config_and_key_reads_are_capped_and_regular_only() {
     };
     let good_key = tmp.path().join("key");
     std::fs::write(&good_key, b"sk-test").unwrap();
+    std::fs::set_permissions(
+        &good_key,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     assert!(GatewayConfig::load_from_file(write_config("ok.json", &good_key)).is_ok());
 
     let big_key = tmp.path().join("bigkey");

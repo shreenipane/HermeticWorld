@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermetic-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+mini = ["mini-swe-agent==1.17.4"]
+
+[tool.setuptools]
+packages = ["hermetic_agent"]
+package-dir = {"" = "..", hermetic_agent = "."}
+py-modules = ["hermetic_safe_io"]
+
+[tool.setuptools.package-data]
+hermetic_agent = ["swebench.json", "MINI_LICENSE.txt", "wire-vectors.json"]
