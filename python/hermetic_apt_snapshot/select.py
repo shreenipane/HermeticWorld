@@ -34,7 +34,21 @@ OLD_DEBIAN_SECURITY_SUITES = frozenset(
         "jessie",
         "stretch",
         "buster",
+    }
+)
+
+# Relative Debian aliases name a different release depending on the date, so the security
+# suite naming (old "<suite>/updates" vs new "<suite>-security") cannot be decided from the
+# name alone. They are refused (fail closed); callers must pass the release codename.
+DEBIAN_RELATIVE_SUITE_ALIASES = frozenset(
+    {
+        "stable",
+        "oldstable",
+        "oldoldstable",
         "oldoldoldstable",
+        "testing",
+        "unstable",
+        "experimental",
     }
 )
 
@@ -44,6 +58,9 @@ _RFC3339_RE = re.compile(
     flags=re.ASCII,
 )
 _SUITE_COMP_RE = re.compile(r"^[a-z0-9-]+$", flags=re.ASCII)
+# Signed-By is a whitespace-separated list in deb822, so the single path must not contain
+# whitespace, control or non-ASCII characters.
+_SIGNED_BY_RE = re.compile(r"^/[A-Za-z0-9._+/-]+$", flags=re.ASCII)
 
 
 class HermeticAptSnapshotError(Exception):
@@ -110,6 +127,8 @@ def _validate_signed_by(signed_by: Any) -> str:
         raise ValidationError("signed_by must not contain NUL or newline characters")
     if not signed_by.startswith("/"):
         raise ValidationError("signed_by must be an absolute path inside the guest")
+    if _SIGNED_BY_RE.fullmatch(signed_by) is None:
+        raise ValidationError("signed_by must be a single path of [A-Za-z0-9._+/-] characters")
     return signed_by
 
 
@@ -152,6 +171,8 @@ def select_apt_snapshot(
         raise ValidationError("dist must be 'ubuntu' or 'debian'")
 
     clean_suite = _validate_token(suite, "suite")
+    if dist == "debian" and clean_suite in DEBIAN_RELATIVE_SUITE_ALIASES:
+        raise ValidationError("debian suite must be a release codename, not a relative alias")
 
     if not isinstance(components, list) or len(components) == 0:
         raise ValidationError("components must be a non-empty list")

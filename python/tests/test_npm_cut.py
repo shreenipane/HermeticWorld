@@ -245,3 +245,207 @@ def test_rule6_cli_and_safety(tmp_path: Path) -> None:
     # CLI failure exit code 1
     rc_err = cli_main(["--packument", str(sym_f), "--cutoff", "2023-04-01T00:00:00Z", "--out", str(out1), "--report", str(rep1)])
     assert rc_err == 1
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+from hermetic_npm_cut.cut import read_regular_file_bounded, write_file_atomic  # noqa: E402
+
+_CUTOFF = "2023-04-01T00:00:00Z"
+
+
+def _call_with_deadline(fn, seconds: float = 5.0):  # type: ignore[no-untyped-def]
+    box: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            box["exc"] = exc
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(seconds)
+    return (not t.is_alive()), box.get("exc"), t
+
+
+def _small_packument() -> dict:  # type: ignore[type-arg]
+    return {
+        "name": "x",
+        "versions": {"1.0.0": {"name": "x", "version": "1.0.0"}},
+        "time": {"1.0.0": "2023-01-01T00:00:00Z"},
+        "dist-tags": {"latest": "1.0.0"},
+    }
+
+
+def test_review_fifo_packument_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "pkg.fifo"
+    os.mkfifo(fifo)
+    finished, exc, thread = _call_with_deadline(lambda: read_regular_file_bounded(fifo, 1024))
+    if not finished:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        thread.join(5)
+    assert finished, "opening a FIFO packument blocked"
+    assert isinstance(exc, FileSafetyError)
+
+
+def test_review_device_and_symlinked_parent_refused(tmp_path: Path) -> None:
+    with pytest.raises(FileSafetyError):
+        read_regular_file_bounded("/dev/null", 1024)
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "pkg.json").write_text(json.dumps(_small_packument()), encoding="utf-8")
+    os.symlink(real, tmp_path / "link")
+    with pytest.raises(FileSafetyError):
+        read_regular_file_bounded(tmp_path / "link" / "pkg.json", 1 << 20)
+    # Output through a symlinked parent directory is refused as well.
+    with pytest.raises(FileSafetyError):
+        write_file_atomic(tmp_path / "link" / "out.json", b"{}")
+    assert not (real / "out.json").exists()
+
+
+def test_review_atomic_write_fsyncs_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import stat as stat_mod
+
+    synced_dirs: list[bool] = []
+    real_fsync = os.fsync
+
+    def spy(fd: int) -> None:
+        synced_dirs.append(stat_mod.S_ISDIR(os.fstat(fd).st_mode))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    write_file_atomic(tmp_path / "out.json", b"{}")
+    assert (tmp_path / "out.json").read_bytes() == b"{}"
+    assert True in synced_dirs, "destination directory was not fsynced after rename"
+    assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
+
+
+def test_review_lone_surrogate_is_typed_error(tmp_path: Path) -> None:
+    src = tmp_path / "pkg.json"
+    doc = json.dumps(_small_packument())
+    src.write_text(doc.replace('"version": "1.0.0"}', '"version": "1.0.0", "description": "\\ud800"}', 1), encoding="utf-8")
+    assert "\\ud800" in src.read_text(encoding="utf-8")
+    with pytest.raises(ValidationError):
+        cut_packument_files(src, _CUTOFF, tmp_path / "o.json", tmp_path / "r.json")
+    assert cli_main(
+        ["--packument", str(src), "--cutoff", _CUTOFF, "--out", str(tmp_path / "o.json"),
+         "--report", str(tmp_path / "r.json")]
+    ) == 1
+    assert not (tmp_path / "o.json").exists()
+
+
+def test_review_rule4_latest_derived_and_unknown_top_level_keys_removed() -> None:
+    packument = _small_packument()
+    packument["versions"]["2.0.0"] = {
+        "name": "x", "version": "2.0.0", "description": "future", "keywords": ["future"],
+    }
+    packument["versions"]["1.0.0"]["description"] = "old description"
+    packument["time"]["2.0.0"] = "2024-01-01T00:00:00Z"
+    packument.update(
+        {
+            "_id": "x",
+            "description": "future description of 2.0.0",
+            "keywords": ["future"],
+            "maintainers": [{"name": "joined-2024"}],
+            "homepage": "https://example.invalid/2024",
+            "_attachments": {"x-2.0.0.tgz": {}},
+            "x-registry-extra": "2024 state",
+        }
+    )
+    out, report = cut_packument(packument, _CUTOFF)
+    assert report.latest == "1.0.0"
+    assert out["description"] == "old description"
+    for key in ("keywords", "maintainers", "homepage", "_attachments", "x-registry-extra"):
+        assert key not in out, key
+    assert set(out) == {"_id", "name", "versions", "time", "dist-tags", "description"}
+    assert "future" not in json.dumps(out) and "2024" not in json.dumps(out)
+
+
+def test_review_deprecated_field_stripped_from_kept_manifests() -> None:
+    packument = _small_packument()
+    packument["versions"]["1.0.0"]["deprecated"] = "Use 2.0.0 released in 2024"
+    out, _ = cut_packument(packument, _CUTOFF)
+    assert "deprecated" not in out["versions"]["1.0.0"]
+    assert out["versions"]["1.0.0"] == {"name": "x", "version": "1.0.0"}
+
+
+def test_review_reserved_time_key_as_version_is_unknown() -> None:
+    packument = _small_packument()
+    packument["versions"]["created"] = {"name": "x", "version": "created"}
+    packument["time"]["created"] = "2022-01-01T00:00:00Z"
+    out, report = cut_packument(packument, _CUTOFF)
+    assert report.unknown == ["created"]
+    assert "created" not in out["versions"]
+    assert out["time"] == {
+        "created": "2023-01-01T00:00:00Z",
+        "modified": "2023-01-01T00:00:00Z",
+        "1.0.0": "2023-01-01T00:00:00Z",
+    }
+
+
+def test_review_rule1_boundary_and_fractional_cutoff() -> None:
+    packument = _small_packument()
+    packument["versions"]["1.0.1"] = {"name": "x", "version": "1.0.1"}
+    packument["versions"]["1.0.2"] = {"name": "x", "version": "1.0.2"}
+    packument["time"]["1.0.1"] = "2023-04-01T00:00:00.000Z"
+    packument["time"]["1.0.2"] = "2023-04-01T00:00:00.001Z"
+    out, report = cut_packument(packument, _CUTOFF)
+    assert sorted(out["versions"]) == ["1.0.0", "1.0.1"]
+    assert report.dropped_after_cutoff == 1
+    assert report.latest == "1.0.1"
+
+
+def test_review_rule3_latest_ignores_invalid_semver_and_build_metadata() -> None:
+    packument = _small_packument()
+    for ver in ("9.0", "v9.0.0", "1.5.0+build.7", "1.5.0-rc.1"):
+        packument["versions"][ver] = {"name": "x", "version": ver}
+        packument["time"][ver] = "2023-02-01T00:00:00Z"
+    out, report = cut_packument(packument, _CUTOFF)
+    assert report.latest == "1.5.0+build.7"
+    assert out["dist-tags"]["latest"] == "1.5.0+build.7"
+
+
+def test_review_cut_is_deterministic_under_key_order(tmp_path: Path) -> None:
+    packument = _small_packument()
+    packument["versions"]["0.9.0"] = {"name": "x", "version": "0.9.0"}
+    packument["time"]["0.9.0"] = "2022-12-01T00:00:00Z"
+    reordered = json.loads(json.dumps(packument, sort_keys=True))
+    reordered["versions"] = dict(reversed(list(reordered["versions"].items())))
+    a = tmp_path / "a.json"
+    b = tmp_path / "b.json"
+    a.write_text(json.dumps(packument), encoding="utf-8")
+    b.write_text(json.dumps(reordered, indent=2), encoding="utf-8")
+    cut_packument_files(a, _CUTOFF, tmp_path / "oa.json", tmp_path / "ra.json")
+    cut_packument_files(b, _CUTOFF, tmp_path / "ob.json", tmp_path / "rb.json")
+    assert (tmp_path / "oa.json").read_bytes() == (tmp_path / "ob.json").read_bytes()
+    assert (tmp_path / "ra.json").read_bytes() == (tmp_path / "rb.json").read_bytes()
+
+
+def test_review_hostile_packuments_raise_typed_errors() -> None:
+    from hermetic_npm_cut.cut import HermeticNpmCutError, parse_json_bytes
+
+    hostile_docs = [
+        b"[" * 100 + b"]" * 100,
+        b'{"a": NaN}',
+        b"\xff\xfe",
+        b'{"name": "x"',
+    ]
+    for raw in hostile_docs:
+        with pytest.raises(HermeticNpmCutError):
+            parse_json_bytes(raw, 1 << 20)
+    hostile_values = [
+        {"name": "x", "versions": {"1.0.0": "notobj"}, "time": {}},
+        {"name": "x", "versions": {}, "time": {}, "dist-tags": {"latest": 5}},
+        {"name": "x", "versions": {"1.0.0": {}}, "time": {"1.0.0": 1680307200}},
+        {"name": "x", "versions": {}, "time": {}, "_id": ["x"]},
+        {"name": 5, "versions": {}, "time": {}},
+    ]
+    for doc in hostile_values:
+        with pytest.raises(HermeticNpmCutError):
+            cut_packument(doc, _CUTOFF)

@@ -237,3 +237,106 @@ def test_rule5_cli_and_determinism(capsys: pytest.CaptureFixture[str]) -> None:
         ]
     )
     assert rc_bad == 1
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+from hermetic_apt_snapshot.select import MAX_ARCHITECTURES, MAX_COMPONENTS, MAX_NAME_LEN  # noqa: E402
+
+_KEY = "/usr/share/keyrings/debian-archive-keyring.gpg"
+
+
+@pytest.mark.parametrize(
+    "alias", ["stable", "oldstable", "oldoldstable", "oldoldoldstable", "testing", "unstable", "experimental"]
+)
+def test_review_debian_relative_alias_refused(alias: str) -> None:
+    # "stable" in 2020 was buster ("stable/updates"); in 2022 it was bullseye ("stable-security").
+    with pytest.raises(ValidationError):
+        select_apt_snapshot("debian", alias, ["main"], ["amd64"], "2020-05-01T00:00:00Z", _KEY)
+
+
+@pytest.mark.parametrize(
+    "signed_by",
+    ["/usr/share/key rings/k.gpg", "/k.gpg\tX", "/k.gpg\x0bX", "/ké.gpg", "/k.gpg\x7f", "/k.gpg X: y"],
+)
+def test_review_signed_by_whitespace_and_non_ascii_refused(signed_by: str) -> None:
+    with pytest.raises(ValidationError):
+        select_apt_snapshot("debian", "bookworm", ["main"], ["amd64"], "2023-07-01T00:00:00Z", signed_by)
+
+
+def test_review_rule3_old_debian_known_answer_text() -> None:
+    res = select_apt_snapshot("debian", "buster", ["main", "contrib"], ["i386", "amd64"], "2020-05-01T12:34:56.7Z", _KEY)
+    assert res == {
+        "available": True,
+        "snapshot_id": "20200501T123456Z",
+        "sources": (
+            "Types: deb\n"
+            "URIs: https://snapshot.debian.org/archive/debian/20200501T123456Z\n"
+            "Suites: buster buster-updates\n"
+            "Components: contrib main\n"
+            "Architectures: amd64 i386\n"
+            f"Signed-By: {_KEY}\n"
+            "Check-Valid-Until: no\n"
+            "\n"
+            "Types: deb\n"
+            "URIs: https://snapshot.debian.org/archive/debian-security/20200501T123456Z\n"
+            "Suites: buster/updates\n"
+            "Components: contrib main\n"
+            "Architectures: amd64 i386\n"
+            f"Signed-By: {_KEY}\n"
+            "Check-Valid-Until: no\n"
+        ),
+    }
+    # bullseye is the first release using "<suite>-security".
+    new = select_apt_snapshot("debian", "bullseye", ["main"], ["amd64"], "2022-01-01T00:00:00Z", _KEY)
+    assert "Suites: bullseye-security\n" in new["sources"]
+    assert "/updates" not in new["sources"]
+
+
+def test_review_rule2_snapshot_id_never_after_cutoff() -> None:
+    for cutoff, expected in [
+        ("2023-12-31T23:59:59.999999999Z", "20231231T235959Z"),
+        ("2023-03-01T00:00:00.000000001Z", "20230301T000000Z"),
+        ("2024-02-29T08:09:10Z", "20240229T080910Z"),
+    ]:
+        res = select_apt_snapshot("ubuntu", "jammy", ["main"], ["amd64"], cutoff, "/k.gpg")
+        assert res["snapshot_id"] == expected
+        assert expected in res["sources"]
+
+
+def test_review_rule4_caps_and_hostile_inputs() -> None:
+    good = ("debian", "bookworm", ["main"], ["amd64"], "2023-07-01T00:00:00Z", _KEY)
+    hostile = [
+        ("debian", "a" * (MAX_NAME_LEN + 1), ["main"], ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", ["c%d" % i for i in range(MAX_COMPONENTS + 1)], ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", ["main"], ["amd64"] * (MAX_ARCHITECTURES + 1), good[4], _KEY),
+        ("debian", "bookworm", ["Main"], ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", [""], ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", ["main"], ["AMD64"], good[4], _KEY),
+        ("debian", "book١worm", ["main"], ["amd64"], good[4], _KEY),
+        ("debian", None, ["main"], ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", "main", ["amd64"], good[4], _KEY),
+        ("debian", "bookworm", ["main"], [5], good[4], _KEY),
+        ("debian", "bookworm", ["main"], ["amd64"], good[4], 7),
+    ]
+    for args in hostile:
+        with pytest.raises(ValidationError):
+            select_apt_snapshot(*args)  # type: ignore[arg-type]
+    for bad_cutoff in ["2023-07-01T00:00:00+00:00", "2023-02-30T00:00:00Z", "2023-07-01t00:00:00z", 1688169600]:
+        with pytest.raises(DateParseError):
+            select_apt_snapshot("debian", "bookworm", ["main"], ["amd64"], bad_cutoff, _KEY)  # type: ignore[arg-type]
+    assert select_apt_snapshot(*good)["available"] is True
+
+
+def test_review_cli_hostile_arguments_exit_1(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli_main([]) == 1
+    assert cli_main(["--help"]) == 1
+    base = ["--dist", "debian", "--suite", "bookworm", "--components", "main", "--arch", "amd64",
+            "--cutoff", "2023-07-01T00:00:00Z", "--signed-by", _KEY]
+    assert cli_main(base) == 0
+    capsys.readouterr()
+    assert cli_main(base[:-1] + ["/k ey"]) == 1
+    assert cli_main([a if a != "main" else "main,,contrib" for a in base]) == 1
+    assert capsys.readouterr().out == ""

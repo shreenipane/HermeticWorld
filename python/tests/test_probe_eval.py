@@ -157,3 +157,133 @@ def test_rule5_cli_exit_codes_and_hostile_inputs(tmp_path: Path, capsys: pytest.
     assert rc_err == 1
     # Check no host path in error output
     assert str(tmp_path) not in err_out
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+from hermetic_probe_eval.evaluate import read_regular_file_bounded  # noqa: E402
+
+
+def _call_with_deadline(fn, seconds: float = 5.0):  # type: ignore[no-untyped-def]
+    box: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            box["exc"] = exc
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(seconds)
+    return (not t.is_alive()), box.get("exc"), t
+
+
+def test_review_fifo_results_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "results.fifo"
+    os.mkfifo(fifo)
+    finished, exc, thread = _call_with_deadline(lambda: evaluate_probe_file(fifo))
+    if not finished:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        thread.join(5)
+    assert finished, "opening a FIFO results file blocked"
+    assert isinstance(exc, FileSafetyError)
+
+
+def test_review_device_and_symlinked_parent_refused(tmp_path: Path) -> None:
+    with pytest.raises(FileSafetyError):
+        read_regular_file_bounded("/dev/null", 1024)
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "r.json").write_text(json.dumps({"probe_version": "1", "checks": _passing_checks()}), encoding="utf-8")
+    os.symlink(real, tmp_path / "link")
+    with pytest.raises(FileSafetyError):
+        evaluate_probe_file(tmp_path / "link" / "r.json")
+
+
+def test_review_lone_surrogate_is_typed_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    checks = _passing_checks()
+    checks.append({"id": "mystery", "outcome": "error", "evidence": "\ud800"})
+    with pytest.raises(ValidationError):
+        evaluate_probe_results({"probe_version": "1", "checks": checks})
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps({"probe_version": "1", "checks": checks}), encoding="ascii")
+    assert cli_main(["--results", str(f)]) == 1
+    assert "INTERNAL_ERROR" not in capsys.readouterr().err
+
+
+def test_review_unknown_ids_echoed_only_as_printable_ascii() -> None:
+    checks = _passing_checks()
+    hostile_id = "evil‮\x1b[2Jid" + "Z" * 200
+    checks.append({"id": hostile_id[:128], "outcome": "blocked", "evidence": ""})
+    report = evaluate_probe_results({"probe_version": "1", "checks": checks})
+    assert report.verdict == "fail"
+    assert report.unknown == ["evil??[2Jid" + "Z" * 117]
+    out = json.dumps(report.to_dict(), ensure_ascii=False)
+    assert all(0x20 <= ord(ch) <= 0x7E for ch in out)
+
+
+def test_review_rule1_unknown_id_alone_fails_closed() -> None:
+    checks = _passing_checks()
+    checks.append({"id": "extra_check", "outcome": "passed", "evidence": "fine"})
+    report = evaluate_probe_results({"probe_version": "1", "checks": checks})
+    assert report.verdict == "fail"
+    assert report.missing == []
+    assert report.unknown == ["extra_check"]
+
+
+@pytest.mark.parametrize(
+    "cid,outcome",
+    [("raw_ip", "passed"), ("raw_ip", "failed"), ("raw_ip", "error"),
+     ("curl_fetch", "blocked"), ("curl_fetch", "escaped"), ("curl_fetch", "failed"), ("curl_fetch", "error")],
+)
+def test_review_rule1_wrong_outcome_fails(cid: str, outcome: str) -> None:
+    checks = _passing_checks()
+    for c in checks:
+        if c["id"] == cid:
+            c["outcome"] = outcome
+    report = evaluate_probe_results({"probe_version": "1", "checks": checks})
+    assert report.verdict == "fail"
+    assert report.escaped == []
+    assert [f["id"] for f in report.failed] == [cid]
+
+
+def test_review_rule2_duplicate_escape_is_escape_and_cli_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checks = _passing_checks()
+    checks.append({"id": "quic", "outcome": "escaped", "evidence": "reached host"})
+    report = evaluate_probe_results({"probe_version": "1", "checks": checks})
+    assert report.verdict == "escape"
+    assert report.escaped == ["quic"]
+    f = tmp_path / "e.json"
+    f.write_text(json.dumps({"probe_version": "1", "checks": checks}), encoding="utf-8")
+    assert cli_main(["--results", str(f)]) == 2
+    assert json.loads(capsys.readouterr().out)["verdict"] == "escape"
+
+
+def test_review_rule3_evidence_boundary_and_rule4_digest_content() -> None:
+    import hashlib
+
+    checks = _passing_checks()
+    for c in checks:
+        if c["id"] == "icmp":
+            c["outcome"] = "error"
+            c["evidence"] = "A" * 256 + "TAIL"
+    report = evaluate_probe_results({"probe_version": "1", "checks": checks})
+    ev = [f for f in report.failed if f["id"] == "icmp"][0]["evidence"]
+    assert ev == "A" * 256
+    assert "TAIL" not in json.dumps(report.to_dict())
+    canonical = json.dumps(
+        sorted(checks, key=lambda c: (c["id"], c["outcome"], c["evidence"])),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    assert report.digest == "sha256:" + hashlib.sha256(canonical).hexdigest()
+    changed = [dict(c) for c in checks]
+    changed[0]["evidence"] += "x"
+    assert evaluate_probe_results({"probe_version": "1", "checks": changed}).digest != report.digest

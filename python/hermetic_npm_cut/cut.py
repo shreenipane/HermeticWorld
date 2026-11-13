@@ -11,6 +11,8 @@ import re
 import stat
 from typing import Any
 
+from hermetic_safe_io import atomic_write, open_regular
+
 DEFAULT_PACKUMENT_CAP_BYTES = 64 * 1024 * 1024
 MAX_VERSIONS = 100_000
 MAX_TAGS = 10_000
@@ -19,8 +21,31 @@ MAX_JSON_TOKENS = 8_000_000
 MAX_OBJECT_KEYS = 250_000
 MAX_STRING_LEN = 256 * 1024
 MAX_VERSION_LEN = 256
-MAX_TEMP_ATTEMPTS = 128
+MAX_OPEN_SIZE_BYTES = 1 << 62
 READ_CHUNK_BYTES = 65_536
+
+# "time" keys that describe the whole package, never a single version.
+_RESERVED_TIME_KEYS = frozenset({"created", "modified", "unpublished"})
+
+# Top-level keys the registry derives from the newest publish (post-cutoff state). Like
+# "readme" (rule 4) they are replaced by the kept latest version's own value, else removed.
+LATEST_DERIVED_KEYS = (
+    "readme",
+    "readmeFilename",
+    "description",
+    "keywords",
+    "author",
+    "contributors",
+    "maintainers",
+    "repository",
+    "homepage",
+    "bugs",
+    "license",
+)
+
+# Manifest keys the registry can mutate after a version was published, so their value at
+# the cutoff is unverifiable: dropped from every kept manifest (fail closed).
+POST_PUBLISH_MANIFEST_KEYS = ("deprecated",)
 
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _RFC3339_RE = re.compile(
@@ -289,11 +314,14 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
 
 
 def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    """Read a pinned regular inode without following any symlink or blocking on a FIFO."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValidationError("Byte cap must be a non-negative integer")
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, or OS error)") from exc
+        # The cap is enforced below so that an oversized file maps to CapExceededError.
+        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
     try:
         try:
             st = os.fstat(fd)
@@ -326,79 +354,13 @@ def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> b
 
 
 def write_file_atomic(target_path: str | os.PathLike[str], content: bytes) -> None:
-    target_str = os.fspath(target_path)
+    """Atomically publish bytes: temp file in the pinned parent, fsync, rename, dir fsync."""
+    if not isinstance(content, bytes):
+        raise ValidationError("Output content must be bytes")
     try:
-        st = os.lstat(target_str)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise FileSafetyError("Refusing to overwrite symlink or non-regular destination")
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise FileSafetyError("Cannot inspect destination path") from exc
-
-    parent = os.path.dirname(target_str) or "."
-    base = os.path.basename(target_str)
-    if not base or base in (".", ".."):
-        raise FileSafetyError("Invalid destination filename")
-
-    pid = os.getpid()
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    tmp_path: str | None = None
-    fd: int | None = None
-
-    for attempt in range(MAX_TEMP_ATTEMPTS):
-        candidate = os.path.join(parent, f".{base}.tmp.{pid}.{attempt}")
-        try:
-            fd = os.open(candidate, open_flags, 0o644)
-            tmp_path = candidate
-            break
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise FileSafetyError("Unable to create temporary file in destination directory") from exc
-
-    if fd is None or tmp_path is None:
-        raise FileSafetyError("Exhausted attempts creating temporary file")
-
-    try:
-        view = memoryview(content)
-        written = 0
-        total_len = len(content)
-        max_writes = (total_len // READ_CHUNK_BYTES) + 4
-        for _ in range(max_writes):
-            if written >= total_len:
-                break
-            try:
-                n = os.write(fd, view[written : written + READ_CHUNK_BYTES])
-            except OSError as exc:
-                raise FileSafetyError("Failed writing to temporary file") from exc
-            if n <= 0:
-                raise FileSafetyError("Short write to temporary file")
-            written += n
-        if written != total_len:
-            raise FileSafetyError("Incomplete write to temporary file")
-        try:
-            os.fsync(fd)
-        except OSError as exc:
-            raise FileSafetyError("Failed fsync on temporary file") from exc
-        os.close(fd)
-        fd = None
-        try:
-            os.replace(tmp_path, target_str)
-        except OSError as exc:
-            raise FileSafetyError("Atomic rename failed") from exc
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        raise
+        atomic_write(target_path, content)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Unable to write destination atomically") from exc
 
 
 def _validate_str(val: Any, field: str, max_len: int = MAX_STRING_LEN) -> str:
@@ -456,14 +418,18 @@ def cut_packument(
         if not isinstance(manifest, dict):
             raise ValidationError(f"Manifest for version '{ver}' must be a JSON object")
 
-        if ver not in raw_time or raw_time[ver] is None:
+        if ver in _RESERVED_TIME_KEYS or ver not in raw_time or raw_time[ver] is None:
+            # A reserved "time" key is package-level, not this version's publish time.
             unknown_versions.append(ver)
             continue
 
         ver_time_str = raw_time[ver]
         ver_nanos = parse_rfc3339_utc_nanos(ver_time_str)
         if ver_nanos <= cutoff_nanos:
-            kept_versions[ver] = copy.deepcopy(manifest)
+            kept_manifest = copy.deepcopy(manifest)
+            for mutable_key in POST_PUBLISH_MANIFEST_KEYS:
+                kept_manifest.pop(mutable_key, None)
+            kept_versions[ver] = kept_manifest
             kept_times_str[ver] = ver_time_str
             kept_times_nanos[ver] = ver_nanos
         else:
@@ -509,25 +475,25 @@ def cut_packument(
 
     tags_dropped.sort()
 
-    out_packument = copy.deepcopy(packument)
-    out_packument["name"] = pkg_name
-    out_packument["versions"] = kept_versions
-    out_packument["time"] = recomputed_time
-    out_packument["dist-tags"] = recomputed_tags
+    # Build the output from an allow-list (fail closed): every top-level key not listed
+    # here ("users", "_rev", "_attachments", unknown registry keys) may carry post-cutoff
+    # state and is dropped. "_id" and "name" are kept (rule 4).
+    out_packument: dict[str, Any] = {
+        "name": pkg_name,
+        "versions": kept_versions,
+        "time": recomputed_time,
+        "dist-tags": recomputed_tags,
+    }
+    if "_id" in packument:
+        out_packument["_id"] = _validate_str(packument["_id"], "_id", max_len=512)
 
-    # Always strip post-cutoff leak keys "users" and "_rev"; keep "_id" and "name"
-    out_packument.pop("users", None)
-    out_packument.pop("_rev", None)
-
-    # Replace top-level "readme" and "readmeFilename" with kept latest version's values if present
-    out_packument.pop("readme", None)
-    out_packument.pop("readmeFilename", None)
+    # Rule 4: "readme", "readmeFilename" and the other latest-derived keys are replaced by
+    # the kept latest version's own values if present, else removed.
     if best_latest_ver is not None:
         latest_manifest = kept_versions[best_latest_ver]
-        if isinstance(latest_manifest.get("readme"), str):
-            out_packument["readme"] = latest_manifest["readme"]
-        if isinstance(latest_manifest.get("readmeFilename"), str):
-            out_packument["readmeFilename"] = latest_manifest["readmeFilename"]
+        for derived_key in LATEST_DERIVED_KEYS:
+            if derived_key in latest_manifest:
+                out_packument[derived_key] = copy.deepcopy(latest_manifest[derived_key])
 
     report = NpmCutReport(
         kept=len(kept_versions),
@@ -537,6 +503,17 @@ def cut_packument(
         latest=best_latest_ver,
     )
     return out_packument, report
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Canonical JSON (sorted keys, compact, UTF-8); unencodable text is a typed error."""
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # json accepts "\ud800" escapes; a lone surrogate has no UTF-8 encoding.
+        raise ValidationError("Packument contains text that is not valid Unicode") from exc
 
 
 def cut_packument_files(
@@ -550,12 +527,8 @@ def cut_packument_files(
     data = parse_json_bytes(raw, max_bytes=packument_cap_bytes)
     cut_data, report = cut_packument(data, cutoff=cutoff)
 
-    out_bytes = json.dumps(
-        cut_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    rep_bytes = json.dumps(
-        report.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    out_bytes = canonical_json_bytes(cut_data)
+    rep_bytes = canonical_json_bytes(report.to_dict())
 
     write_file_atomic(out_path, out_bytes)
     write_file_atomic(report_path, rep_bytes)

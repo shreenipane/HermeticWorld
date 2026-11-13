@@ -10,6 +10,8 @@ import os
 import stat
 from typing import Any
 
+from hermetic_safe_io import open_regular
+
 DEFAULT_RESULTS_CAP_BYTES = 4 * 1024 * 1024
 MAX_CHECKS = 1000
 MAX_EVIDENCE_INPUT_LEN = 4096
@@ -20,6 +22,7 @@ MAX_JSON_DEPTH = 8
 MAX_JSON_TOKENS = 200_000
 MAX_OBJECT_KEYS = 10_000
 READ_CHUNK_BYTES = 65_536
+MAX_OPEN_SIZE_BYTES = 1 << 62
 
 NEGATIVE_CHECK_IDS = frozenset(
     {
@@ -105,10 +108,19 @@ class ProbeEvalReport:
         }
 
 
+def _sanitise_text(raw: str, limit: int) -> str:
+    prefix = raw[:limit]
+    return "".join(ch if 0x20 <= ord(ch) <= 0x7E else "?" for ch in prefix)
+
+
 def sanitise_evidence(raw_evidence: str) -> str:
     """Truncate evidence to 256 chars and replace all non-printable ASCII with '?'."""
-    prefix = raw_evidence[:MAX_EVIDENCE_OUTPUT_LEN]
-    return "".join(ch if 0x20 <= ord(ch) <= 0x7E else "?" for ch in prefix)
+    return _sanitise_text(raw_evidence, MAX_EVIDENCE_OUTPUT_LEN)
+
+
+def sanitise_check_id(raw_id: str) -> str:
+    """Check ids come from the guest: echo them only as printable ASCII within the id cap."""
+    return _sanitise_text(raw_id, MAX_ID_LEN)
 
 
 def _precheck_json_structure(text: str, max_depth: int, max_tokens: int) -> None:
@@ -188,11 +200,14 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
 
 
 def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    """Read a pinned regular inode without following any symlink or blocking on a FIFO."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValidationError("Byte cap must be a non-negative integer")
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, or OS error)") from exc
+        # The cap is enforced below so that an oversized file maps to CapExceededError.
+        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
     try:
         try:
             st = os.fstat(fd)
@@ -272,14 +287,20 @@ def evaluate_probe_results(data: Any) -> ProbeEvalReport:
         validated_checks,
         key=lambda c: (c["id"], c["outcome"], c["evidence"]),
     )
-    canonical_checks_bytes = json.dumps(
-        sorted_checks, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    try:
+        canonical_checks_bytes = json.dumps(
+            sorted_checks, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # json accepts "\ud800" escapes; a lone surrogate has no canonical UTF-8 form.
+        raise ValidationError("Probe output contains text that is not valid Unicode") from exc
     digest_hex = hashlib.sha256(canonical_checks_bytes).hexdigest()
     digest_str = f"sha256:{digest_hex}"
 
     missing_ids = sorted(req_id for req_id in ALL_REQUIRED_CHECK_IDS if req_id not in counts_by_id)
-    unknown_ids = sorted({c["id"] for c in sorted_checks if c["id"] not in ALL_REQUIRED_CHECK_IDS})
+    unknown_ids = sorted(
+        {sanitise_check_id(c["id"]) for c in sorted_checks if c["id"] not in ALL_REQUIRED_CHECK_IDS}
+    )
     escaped_ids: set[str] = set()
     failed_entries: list[dict[str, str]] = []
 
@@ -291,7 +312,7 @@ def evaluate_probe_results(data: Any) -> ProbeEvalReport:
         if cid not in ALL_REQUIRED_CHECK_IDS:
             failed_entries.append(
                 {
-                    "id": cid,
+                    "id": sanitise_check_id(cid),
                     "outcome": outcome,
                     "reason": "unknown_check_id",
                     "evidence": sanitise_evidence(evidence),
