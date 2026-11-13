@@ -1,0 +1,20 @@
+[package]
+name = "hermetic-extract"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+hermetic-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "hermetic-extract-validate"
+path = "src/bin/hermetic_extract_validate.rs"

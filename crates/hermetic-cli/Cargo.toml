@@ -1,0 +1,20 @@
+
+[package]
+name = "hermetic-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Strict command-line front end and dispatch layer for Hermetic World"
+
+[lib]
+name = "hermetic_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermetic"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+

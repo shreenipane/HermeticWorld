@@ -29,6 +29,37 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-12: seven review branches merged, Phase 3 started, CodeRabbit pass on main (Phases 1, 2, 3)
+
+- **Phase:** 1, 2, 3
+- **Type:** build | decision | incident
+- **Requirements:** TR-SEAL-9, §5.5, TR-SC-5, TR-WS-*, TR-SEAL-10, TR-GW-2 to TR-GW-8, TR-SEAL-7, TR-SEAL-8, TR-VMM-1, TR-VMM-2, TR-VMM-5
+
+### Done
+- Merged after review, both gates and a key scan: T1.13 thread scrub and mutable-content rule; T2.1 WorldServer; T1.14 dispositions (repaired/excluded); T2.5 per-world CA and trust injection; T2.2 gateway policy core (Anthropic adapter); T1.12 `.pyc` code-object fingerprints; T2.4 rootfs builder (tar stream into `mke2fs -d`, pinned e2fsprogs 1.47.2 and `data/mke2fs-hermetic.conf`, D4 guard).
+- `tiny_http` 0.12.0 vendored at `crates/vendor/tiny_http` with local patches (see `VENDORED.md`), because its self-generated replies carried the host date.
+- Phase 3 briefs T3.1 to T3.7 written (`agy-tasks/`). T3.3 `hermetic-vmm` merged after one review round: VM spec validation, Firecracker request plan with the kvmclock-hiding CPU template (`vmm/hide-kvmclock.cpu-template.json`), jail plan, lifecycle with deadlines, strict API client, descriptor-anchored host paths, `dev-unjailed` mode. Firecracker v1.18.0 pinned in `vmm/firecracker.lock.json` (archive and binary SHA-256 verified against the release's `SHA256SUMS`).
+- CodeRabbit review of everything merged on 2026-11-12: 17 findings (12 major, 5 minor). Fixed and merged: sealcheck (tier-2 query cost, NUL-file baseline consistency, budget exhaustion scoped to the `.pyc` tier, single-symbol `.pyc` gating) and gateway / tiny_http / world-server (source checks limited to protocol content blocks, wall time rechecked after a concurrency wait, accept loop survives recoverable errors, sandboxed endpoint cleanup).
+
+### Results / measurements
+- Main after the last merge (`23d1e25`): `rust-gate` 729 passed, 0 failed; `py-gate` 527 passed.
+
+### Decisions
+- Merge rule changed for speed: narrow review checks of the listed blocking items instead of a fresh full review each round; later one review per task, after which a fix round is gated and merged without a second review. Non-blocking findings are recorded as deferred sub-items in `PHASES.md`, never dropped.
+- Owner postponed the gateway deadline defect (the next request's head deadline overwrote the current body deadline). A first fix on branch `t2.2` was rejected in review; three related CodeRabbit findings are recorded with it in `PHASES.md`.
+- `hermetic-execd` may contain one documented `unsafe` module for syscalls `rustix` lacks (owner approved).
+- Phase 3 work started before the remaining Phase 2 items (owner's call); those stay open in `PHASES.md`.
+
+### Problems / open questions
+- Incident: the machine ran out of memory at 14:25 with several builds running and the CLI crashed. Gates now run under `systemd-run` with a 5 GB memory cap and at most two at a time machine-wide (flock slots).
+- Gateway test `test_8_stalled_clients...` and a world-server recovery test fail intermittently under heavy parallel load.
+- Root-only jailer tests and the in-VM boot test have not run (need `sudo -v`, a built guest kernel and a rootfs).
+
+### Next
+- One review each for T3.1, T3.2, T3.4 to T3.7 and the externally drafted components; then the first guest kernel build, rootfs, and a development-mode VM boot.
+
+---
+
 ## 2026-11-11: T1.6 layer index and per-task query (Phase 1)
 
 - **Phase:** 1
