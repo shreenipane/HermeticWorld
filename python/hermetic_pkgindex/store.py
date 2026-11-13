@@ -14,9 +14,11 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 from typing import Any
-import uuid
+
+import hermetic_safe_io
 
 logger = logging.getLogger("hermetic_pkgindex.store")
 
@@ -85,6 +87,8 @@ class VerifiedFile:
     filename: str
     size: int
     content_type: str
+    # Identity of the inode whose digest was verified; streaming refuses any other.
+    identity: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 def normalize_project_name(name: str) -> str:
@@ -214,49 +218,35 @@ def render_project_html(project_name: str, payload: dict[str, Any]) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
+def _file_identity(st: os.stat_result) -> tuple[int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def _open_regular_file_nofollow(
     root: Path,
     rel_parts: tuple[str, ...],
     max_bytes: int,
 ) -> tuple[int, int, Path]:
-    """Open a regular file inside `root` without following any symlinks."""
-    current = root
-    for idx, part in enumerate(rel_parts):
+    """Open a regular file inside `root` without following any symlink or blocking on a FIFO.
+
+    Every component is opened relative to its parent descriptor with no-follow
+    semantics (hermetic_safe_io), so a component swapped for a symlink between
+    inspection and open is refused instead of followed.
+    """
+    for part in rel_parts:
         if part in ("", ".", "..") or "/" in part or "\\" in part or "\x00" in part:
             raise PathTraversalError(f"Unsafe path component: {part!r}")
-        current = current / part
-        try:
-            st = os.lstat(current)
-        except FileNotFoundError as exc:
-            raise NotFoundMissError(f"Missing path component: {current}") from exc
-        except OSError as exc:
-            raise IntegrityError(f"OS error accessing {current}: {exc}") from exc
-
-        if stat.S_ISLNK(st.st_mode):
-            raise SymlinkError(f"Refusing symlink inside store: {current}")
-
-        is_last = idx == len(rel_parts) - 1
-        if not is_last:
-            if not stat.S_ISDIR(st.st_mode):
-                raise NotFoundMissError(f"Expected directory at {current}")
-        else:
-            if not stat.S_ISREG(st.st_mode):
-                raise SymlinkError(f"Refusing non-regular file inside store: {current}")
-
+    current = root.joinpath(*rel_parts)
     try:
-        resolved_parent = current.parent.resolve(strict=True)
-        if os.path.commonpath([str(root), str(resolved_parent)]) != str(root):
-            raise PathTraversalError(f"Path escapes store root: {current}")
-    except (OSError, ValueError) as exc:
-        raise PathTraversalError(f"Unable to verify store containment for {current}") from exc
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    try:
-        fd = os.open(current, flags)
-    except FileNotFoundError as exc:
-        raise NotFoundMissError(f"File disappeared before open: {current}") from exc
+        fd = hermetic_safe_io.open_regular(current, sys.maxsize)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise NotFoundMissError(f"Missing path component: {current}") from exc
+    except hermetic_safe_io.UnsafePathError as exc:
+        raise SymlinkError(f"Refusing symlink or non-regular object in store: {current}") from exc
+    except ValueError as exc:
+        raise PathTraversalError(f"Unsafe store path: {current}") from exc
     except OSError as exc:
-        raise SymlinkError(f"Refused or failed opening {current}: {exc}") from exc
+        raise IntegrityError(f"OS error accessing {current}: {exc}") from exc
 
     try:
         fst = os.fstat(fd)
@@ -330,6 +320,10 @@ class FrozenStore:
                         norm = normalize_project_name(entry.name)
                     except InvalidNameError:
                         continue
+                    if norm != entry.name:
+                        # Only normalised directories are reachable by get_project_page;
+                        # listing any other name would advertise an unservable project.
+                        continue
                     index_path = Path(entry.path) / "index.json"
                     try:
                         idx_st = os.lstat(index_path)
@@ -394,6 +388,7 @@ class FrozenStore:
         hasher = hashlib.sha256()
         total = 0
         try:
+            identity = _file_identity(os.fstat(fd))
             while True:
                 chunk = os.read(fd, FILE_CHUNK_BYTES)
                 if not chunk:
@@ -407,6 +402,9 @@ class FrozenStore:
             raise IntegrityError(f"Failed reading {file_path}") from exc
         finally:
             os.close(fd)
+
+        if total != expected_size:
+            raise IntegrityError(f"File {file_path} changed size while being hashed")
 
         actual_sha = hasher.hexdigest()
         if not hmac.compare_digest(actual_sha, valid_sha):
@@ -424,8 +422,9 @@ class FrozenStore:
             path=file_path,
             sha256=valid_sha,
             filename=valid_name,
-            size=total if total == expected_size else total,
+            size=total,
             content_type=_content_type_for_filename(valid_name),
+            identity=identity,
         )
 
     def iter_file_range(self, verified: VerifiedFile, start: int, end: int) -> Iterator[bytes]:
@@ -440,6 +439,11 @@ class FrozenStore:
         )
         remaining = end - start + 1
         try:
+            current_identity = _file_identity(os.fstat(fd))
+            if current_identity != verified.identity or current_identity[2] != verified.size:
+                raise IntegrityError(
+                    f"File {verified.path} changed after its digest was verified"
+                )
             os.lseek(fd, start, os.SEEK_SET)
             while remaining > 0:
                 to_read = min(FILE_CHUNK_BYTES, remaining)
@@ -503,10 +507,14 @@ class MissLog:
         if not stat.S_ISREG(st.st_mode):
             raise MissLogError(f"Miss log path is not a regular file: {self.path}")
 
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
-            fd = os.open(self.path, flags)
-        except OSError as exc:
+            # Descriptor-anchored, no-follow, non-blocking open of a regular file.
+            fd = hermetic_safe_io.open_regular(self.path, sys.maxsize)
+        except FileNotFoundError:
+            return [], 0
+        except hermetic_safe_io.UnsafePathError as exc:
+            raise SymlinkError(f"Refusing unsafe miss log: {self.path}") from exc
+        except (OSError, ValueError) as exc:
             raise MissLogError(f"Cannot open miss log {self.path}: {exc}") from exc
 
         chunks: list[bytes] = []
@@ -574,31 +582,11 @@ class MissLog:
                 current_size -= len(dropped)
 
             payload = b"".join(kept_lines) + new_line
-            tmp_path = self.path.parent / f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            flags = (
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_BINARY", 0)
-            )
             try:
-                fd = os.open(tmp_path, flags, 0o600)
-                try:
-                    view = memoryview(payload)
-                    written = 0
-                    while written < len(payload):
-                        written += os.write(fd, view[written:])
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.replace(tmp_path, self.path)
-            except OSError as exc:
-                try:
-                    if tmp_path.exists() or os.path.islink(tmp_path):
-                        os.unlink(tmp_path)
-                except OSError:
-                    pass
+                hermetic_safe_io.atomic_write(self.path, payload)
+            except hermetic_safe_io.UnsafePathError as exc:
+                raise SymlinkError(f"Refusing unsafe miss log: {self.path}") from exc
+            except (OSError, ValueError) as exc:
                 raise MissLogError(f"Atomic write to miss log {self.path} failed: {exc}") from exc
 
             return seq

@@ -9,6 +9,10 @@ Limitations & Requirements:
   than ``assert`` statements, so pytest does not emit ``pytest_assertion_pass``
   for them when they succeed. They are recorded by line only when they fail
   with an ``AssertionError`` (with ``index`` and ``site_id`` set to ``None``).
+- Site indices follow the TR-GR-9 assertion-site numbering used by the
+  eligibility analysis (hermetic_assert_flow): plain ``assert`` statements and
+  the supported ``self.assertX(...)`` calls share one source-ordered index
+  within a function, so ``<qualname>#<index>`` names the same site in both.
 """
 
 from __future__ import annotations
@@ -19,11 +23,12 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 from types import TracebackType
 from typing import Any
 
 import pytest
+
+import hermetic_safe_io
 
 ENV_LOG_PATH: str = "HERMETIC_ASSERT_LOG"
 
@@ -38,6 +43,20 @@ MAX_ERROR_STR_LEN: int = 512
 MAX_AST_FILE_BYTES: int = 2_000_000
 MAX_AST_FUNCTIONS_PER_FILE: int = 2_000
 MAX_ASSERTS_PER_FUNCTION: int = 1_000
+
+# unittest assertion methods that occupy a site index (same set as the TR-GR-9
+# site listing in hermetic_assert_flow.sites.SUPPORTED_ASSERT_METHODS).
+SITE_ASSERT_METHODS: frozenset[str] = frozenset(
+    {
+        "assertEqual",
+        "assertNotEqual",
+        "assertTrue",
+        "assertFalse",
+        "assertIs",
+        "assertIsNone",
+        "assertIn",
+    }
+)
 
 
 def _cap_str(value: str, max_len: int) -> str:
@@ -78,28 +97,52 @@ class TestRecord:
     reached: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _collect_scope_asserts(stmts: list[ast.stmt]) -> list[ast.Assert]:
-    """Collect ``ast.Assert`` nodes inside a function without entering nested scopes."""
-    found: list[ast.Assert] = []
+def _is_site_assert_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "self"
+        and func.attr in SITE_ASSERT_METHODS
+    )
+
+
+def _collect_scope_asserts(stmts: list[ast.stmt]) -> list[tuple[int, ast.Assert]]:
+    """Return ``(site index, node)`` for plain asserts of one function scope.
+
+    The index counts plain ``assert`` statements and supported ``self.assertX``
+    calls together in source order, without entering nested scopes, so that it
+    matches the TR-GR-9 site numbering.
+    """
+    found: list[tuple[int, int, bool, ast.AST]] = []
 
     def _visit(node: ast.AST) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             return
         if isinstance(node, ast.Assert):
-            found.append(node)
+            found.append((node.lineno, node.col_offset, True, node))
+        elif _is_site_assert_call(node):
+            found.append((node.lineno, node.col_offset, False, node))
         for child in ast.iter_child_nodes(node):
             _visit(child)
 
     for stmt in stmts:
         _visit(stmt)
 
-    found.sort(key=lambda n: (n.lineno, n.col_offset))
-    return found[:MAX_ASSERTS_PER_FUNCTION]
+    found.sort(key=lambda entry: (entry[0], entry[1]))
+    return [
+        (idx, node)
+        for idx, (_, _, is_plain, node) in enumerate(found[:MAX_ASSERTS_PER_FUNCTION])
+        if is_plain and isinstance(node, ast.Assert)
+    ]
 
 
 def _index_file_ast(file_path: Path) -> tuple[FunctionScope, ...]:
     """Parse ``file_path`` without importing it and index all function assertion sites."""
-    with file_path.open("rb") as handle:
+    fd = hermetic_safe_io.open_regular(file_path, MAX_AST_FILE_BYTES)
+    with os.fdopen(fd, "rb") as handle:
         raw = handle.read(MAX_AST_FILE_BYTES + 1)
     if len(raw) > MAX_AST_FILE_BYTES:
         raise ValueError(f"Test file exceeds {MAX_AST_FILE_BYTES} bytes")
@@ -136,7 +179,7 @@ def _index_file_ast(file_path: Path) -> tuple[FunctionScope, ...]:
                         qualname=func_qual,
                         site_id=_cap_str(f"{func_qual}#{idx}", MAX_QUALNAME_LEN),
                     )
-                    for idx, node in enumerate(assert_nodes)
+                    for idx, node in assert_nodes
                 )
                 end_line = stmt.end_lineno if stmt.end_lineno is not None else stmt.lineno
                 scopes.append(
@@ -183,7 +226,8 @@ class AssertRecorder:
         try:
             if len(self._internal_errors) >= MAX_INTERNAL_ERRORS:
                 return
-            msg = _cap_str(f"{context}: {type(exc).__name__}: {exc}", MAX_ERROR_STR_LEN)
+            # Exception text can carry absolute host paths; only the type is kept.
+            msg = _cap_str(f"{context}: {type(exc).__name__}", MAX_ERROR_STR_LEN)
             self._internal_errors.append(msg)
         except Exception:
             pass
@@ -208,7 +252,12 @@ class AssertRecorder:
         return Path(str(raw_path)).resolve()
 
     def _get_or_create_test_record(self, item: pytest.Item) -> TestRecord | None:
-        nodeid = _cap_str(str(item.nodeid), MAX_NODEID_LEN)
+        raw_nodeid = str(item.nodeid)
+        if len(raw_nodeid) > MAX_NODEID_LEN:
+            # Truncating would merge distinct tests into one record; skip instead.
+            self._record_internal_error("nodeid exceeds cap", ValueError())
+            return None
+        nodeid = raw_nodeid
         existing = self._tests.get(nodeid)
         if existing is not None:
             return existing
@@ -440,8 +489,7 @@ class AssertRecorder:
         try:
             if not hasattr(report, "wasxfail"):
                 return
-            nodeid = _cap_str(str(report.nodeid), MAX_NODEID_LEN)
-            record = self._tests.get(nodeid)
+            record = self._tests.get(str(report.nodeid))
             if record is None:
                 return
             if report.skipped:
@@ -472,30 +520,7 @@ class AssertRecorder:
         payload = self.build_payload()
         serialized = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
-        target_path = Path(log_path_str)
-        parent_dir = target_path.parent
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(parent_dir),
-                prefix=".hermetic_assert_",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp_file:
-                tmp_path = Path(tmp_file.name)
-                tmp_file.write(serialized)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
-            os.replace(str(tmp_path), str(target_path))
-            tmp_path = None
-        finally:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        hermetic_safe_io.atomic_write(log_path_str, serialized.encode("utf-8"))
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int | pytest.ExitCode) -> None:
         try:

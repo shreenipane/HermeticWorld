@@ -356,3 +356,86 @@ def test_deterministic_output_across_repeated_runs(
     assert log1.read_text(encoding="utf-8") == log2.read_text(encoding="utf-8")
 
 
+
+
+def test_site_indices_match_flow_numbering_with_unittest_asserts(
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain-assert site ids count self.assertX sites too, matching TR-GR-9 numbering."""
+    from hermetic_assert_flow.sites import list_assertion_sites
+
+    log_path = pytester.path / "log.json"
+    monkeypatch.setenv(ENV_LOG_PATH, str(log_path))
+    source = "\n".join(
+        [
+            "import unittest",
+            "",
+            "class TestMixed(unittest.TestCase):",
+            "    def test_mixed(self):",
+            "        self.assertEqual(1, 1)",  # flow site #0
+            "        assert 2 == 2",  # flow site #1
+            "        self.assertTrue(True)",  # flow site #2
+            "        assert 3 == 4",  # flow site #3, fails
+        ]
+    ) + "\n"
+    pytester.makepyfile(test_mixed=source)
+    result = pytester.runpytest("-p", "hermetic_assert_recorder.plugin")
+    assert result.ret == 1
+
+    flow_ids = {site.lineno: site.site_id for site in list_assertion_sites(source.encode(), "TestMixed.test_mixed")}
+    data = json.loads(log_path.read_text(encoding="utf-8"))
+    reached = data["tests"]["test_mixed.py::TestMixed::test_mixed"]["reached"]
+    assert reached == [
+        {"line": 6, "index": 1, "site_id": "TestMixed.test_mixed#1", "passed": True},
+        {"line": 8, "index": 3, "site_id": "TestMixed.test_mixed#3", "passed": False},
+    ]
+    for entry in reached:
+        assert flow_ids[entry["line"]] == entry["site_id"]
+
+
+def test_site_assert_methods_match_flow_set() -> None:
+    from hermetic_assert_flow.sites import SUPPORTED_ASSERT_METHODS
+
+    from hermetic_assert_recorder.plugin import SITE_ASSERT_METHODS
+
+    assert SITE_ASSERT_METHODS == frozenset(SUPPORTED_ASSERT_METHODS)
+
+
+def test_internal_errors_never_carry_host_paths(pytester: pytest.Pytester) -> None:
+    """Internal error entries name the exception type only, never its path-bearing text."""
+    config = pytester.parseconfig()
+    recorder = AssertRecorder(config)
+    host_path = str(pytester.path / "secret" / "dir")
+    recorder._record_internal_error("ctx", FileNotFoundError(2, "No such file", host_path))
+    payload = recorder.build_payload()
+    assert payload["internal_errors"] == ["ctx: FileNotFoundError"]
+    assert host_path not in json.dumps(payload)
+
+
+def test_overlong_nodeids_are_not_merged(
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two tests whose node ids share a prefix longer than the cap never share a record."""
+    from hermetic_assert_recorder.plugin import MAX_NODEID_LEN
+
+    log_path = pytester.path / "log.json"
+    monkeypatch.setenv(ENV_LOG_PATH, str(log_path))
+    prefix = "p" * (MAX_NODEID_LEN + 10)
+    pytester.makepyfile(
+        test_long="\n".join(
+            [
+                "import pytest",
+                f"@pytest.mark.parametrize('v', [1, 2], ids=['{prefix}A', '{prefix}B'])",
+                "def test_x(v):",
+                "    assert v == 1",
+            ]
+        )
+        + "\n"
+    )
+    result = pytester.runpytest("-p", "hermetic_assert_recorder.plugin")
+    assert result.ret == 1
+    data = json.loads(log_path.read_text(encoding="utf-8"))
+    assert data["tests"] == {}
+    assert any("nodeid exceeds cap" in err for err in data["internal_errors"])

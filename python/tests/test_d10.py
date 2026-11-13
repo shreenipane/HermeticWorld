@@ -516,3 +516,151 @@ def test_cli_exit_codes_pass_gate_error(tmp_path: Path, capsys: pytest.CaptureFi
     assert json.loads(proc.stdout)["verdict"] == "gate"
 
 
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: hostile inputs, fail-closed CLI, and carrier coverage
+# ---------------------------------------------------------------------------
+
+
+def test_tar_with_unrepresentable_pax_mtime_is_refused_not_crash(tmp_path: Path) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo(name="a.txt")
+        ti.size = 1
+        ti.pax_headers = {"mtime": "1e300"}
+        tf.addfile(ti, io.BytesIO(b"x"))
+    (tmp_path / "huge.tar").write_bytes(buf.getvalue())
+
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert not res.is_complete()
+    assert any(r.path == "huge.tar" for r in res.refusals)
+    assert cli_main(["--root", str(tmp_path), "--t-clock", T_CLOCK_STR]) == 1
+
+
+@pytest.mark.parametrize(
+    "date_value",
+    ["Fri, 31 Dec 9999 23:59:59 -1400", "9999-12-31T23:59:59-14:00"],
+)
+def test_metadata_date_overflow_does_not_crash(tmp_path: Path, date_value: str) -> None:
+    (tmp_path / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: x\nBuild-Date: {date_value}\n\n", encoding="utf-8"
+    )
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.refusals == []
+
+
+def test_unsupported_zip_compression_is_refusal_and_cli_fails_closed(tmp_path: Path) -> None:
+    data = bytearray(
+        _make_zip_bytes([("a.txt", b"hi", (2020, 1, 1, 0, 0, 0), b"")], zipfile.ZIP_STORED)
+    )
+    local = data.find(b"PK\x03\x04")
+    central = data.find(b"PK\x01\x02")
+    struct.pack_into("<H", data, local + 8, 99)
+    struct.pack_into("<H", data, central + 10, 99)
+    (tmp_path / "odd.zip").write_bytes(bytes(data))
+
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert any(r.path == "odd.zip" for r in res.refusals)
+    assert not res.is_complete()
+    assert cli_main(["--root", str(tmp_path), "--t-clock", T_CLOCK_STR]) == 1
+
+
+def test_malformed_archive_makes_cli_fail_closed(tmp_path: Path) -> None:
+    (tmp_path / "broken.zip").write_bytes(b"this is not a zip archive at all")
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "pass"
+    assert res.to_dict()["complete"] is False
+    assert cli_main(["--root", str(tmp_path), "--t-clock", T_CLOCK_STR]) == 1
+
+
+def test_zip_local_header_dos_time_differing_from_central_is_gated(tmp_path: Path) -> None:
+    data = bytearray(_make_zip_bytes([("a.txt", b"hi", (2020, 1, 1, 0, 0, 0), b"")]))
+    local = data.find(b"PK\x03\x04")
+    post = T_CLOCK + timedelta(days=30)
+    dos_time = (post.hour << 11) | (post.minute << 5) | (post.second // 2)
+    dos_date = ((post.year - 1980) << 9) | (post.month << 5) | post.day
+    struct.pack_into("<HH", data, local + 10, dos_time, dos_date)
+    (tmp_path / "local.zip").write_bytes(bytes(data))
+
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "gate"
+    assert any(f.carrier == "zip_local_dos_timestamp" and f.severity == "gate" for f in res.findings)
+
+
+def test_zip_local_only_extended_atime_is_gated(tmp_path: Path) -> None:
+    at = int(T_CLOCK.timestamp())
+    post = at + 86_400
+    local_extra = struct.pack("<HHBII", 0x5455, 9, 0x03, at, post)
+    data = bytearray(_make_zip_bytes([("a.txt", b"hi", (2020, 1, 1, 0, 0, 0), local_extra)]))
+    central = data.find(b"PK\x01\x02")
+    central_extra_at = data.find(local_extra, central)
+    assert central_extra_at > central
+    # Central copy keeps only an at-cutoff atime: the post-cutoff value lives in the local header.
+    struct.pack_into("<I", data, central_extra_at + 9, at)
+    (tmp_path / "ut.zip").write_bytes(bytes(data))
+
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "gate"
+    assert any(
+        f.carrier == "zip_ext_timestamp_atime" and f.severity == "gate" for f in res.findings
+    )
+
+
+def test_zip_ntfs_extra_timestamp_is_gated(tmp_path: Path) -> None:
+    post = T_CLOCK + timedelta(days=2)
+    filetime = (int(post.timestamp()) + 11_644_473_600) * 10_000_000
+    ntfs = struct.pack("<HHIHHQQQ", 0x000A, 32, 0, 0x0001, 24, filetime, filetime, filetime)
+    (tmp_path / "ntfs.zip").write_bytes(
+        _make_zip_bytes([("a.txt", b"hi", (2020, 1, 1, 0, 0, 0), ntfs)])
+    )
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "gate"
+    assert any(f.carrier == "zip_ntfs_mtime" and f.severity == "gate" for f in res.findings)
+
+
+def test_prefixed_zip_such_as_zipapp_is_inspected(tmp_path: Path) -> None:
+    post = T_CLOCK + timedelta(days=3)
+    payload = b"#!/usr/bin/env python3\n" + _make_zip_bytes(
+        [("__main__.py", b"print(1)", _dt_to_dos(post), b"")]
+    )
+    (tmp_path / "tool.pyz").write_bytes(payload)
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "gate"
+
+
+def test_concatenated_bz2_streams_are_all_scanned(tmp_path: Path) -> None:
+    import bz2
+
+    post_ts = int((T_CLOCK + timedelta(days=5)).timestamp())
+    at_ts = int(T_CLOCK.timestamp())
+    tar_bytes = _make_tar_bytes([("first.txt", b"a" * 600, at_ts), ("second.txt", b"b", post_ts)])
+    split = 512 + 1024  # header + padded data of the first member
+    assert tar_bytes[split + 257 : split + 262] == b"ustar"
+    (tmp_path / "multi.tar.bz2").write_bytes(
+        bz2.compress(tar_bytes[:split]) + bz2.compress(tar_bytes[split:])
+    )
+    res = scan_tree(tmp_path, T_CLOCK_STR)
+    assert res.verdict == "gate"
+    assert any(f.member_chain[-1] == "second.txt" for f in res.findings if f.severity == "gate")
+
+
+def test_directory_entry_cap_is_a_refusal(tmp_path: Path) -> None:
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    res = scan_tree(tmp_path, T_CLOCK_STR, caps=ScanCaps(max_dir_entries=3))
+    assert any(r.reason == "max_dir_entries_exceeded" for r in res.refusals)
+    assert res.has_cap_error()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_refusal_details_never_contain_host_paths(tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        res = scan_tree(tmp_path, T_CLOCK_STR)
+    finally:
+        os.chmod(locked, 0o755)
+    assert any(r.reason == "directory_unreadable" for r in res.refusals)
+    assert str(tmp_path) not in res.to_json()

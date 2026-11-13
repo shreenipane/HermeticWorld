@@ -38,6 +38,21 @@ MAX_DRAIN_BODY_BYTES: int = 65536
 MAX_CONCURRENT_CONNECTIONS: int = 64
 REQUEST_QUEUE_SIZE: int = 64
 SOCKET_TIMEOUT_SECONDS: float = 10.0
+# Wall-clock budget for receiving the whole request line and header block. The
+# per-recv socket timeout alone lets a client drip one byte per interval forever.
+REQUEST_READ_DEADLINE_SECONDS: float = 20.0
+# Longest decimal offset accepted in a Range header (2**64 has 20 digits).
+MAX_RANGE_DIGITS: int = 20
+
+# RFC 9110 token characters allowed in a header field name.
+_TOKEN_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+# Headers whose repetition makes a request ambiguous; such requests are refused.
+_SINGLETON_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "range"}
+)
 
 PEP691_JSON_MIME = "application/vnd.pypi.simple.v1+json"
 PEP503_HTML_MIME = "text/html; charset=utf-8"
@@ -105,6 +120,12 @@ def parse_and_validate_target(raw_target: str) -> str:
 
     if "\x00" in decoded_path or "\\" in decoded_path:
         raise HttpProtocolError(HTTPStatus.BAD_REQUEST, "Unsafe character in decoded path.")
+    for ch in decoded_path:
+        code = ord(ch)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            raise HttpProtocolError(
+                HTTPStatus.BAD_REQUEST, "Control character in decoded path."
+            )
 
     for seg in decoded_path.split("/"):
         if seg in (".", ".."):
@@ -192,6 +213,12 @@ def parse_single_byte_range(range_header: str, total_size: int) -> tuple[int, in
 
     start_str = start_str.strip()
     end_str = end_str.strip()
+    if len(start_str) > MAX_RANGE_DIGITS or len(end_str) > MAX_RANGE_DIGITS:
+        raise HttpProtocolError(
+            HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+            "Byte range offset exceeds digit cap.",
+            content_range=f"bytes */{total_size}",
+        )
 
     if not start_str and not end_str:
         raise HttpProtocolError(
@@ -269,10 +296,12 @@ class HermeticHTTPServer(ThreadingHTTPServer):
         *,
         max_connections: int = MAX_CONCURRENT_CONNECTIONS,
         socket_timeout: float = SOCKET_TIMEOUT_SECONDS,
+        request_read_deadline: float = REQUEST_READ_DEADLINE_SECONDS,
     ) -> None:
         self.store = store
         self.miss_log = miss_log
         self.socket_timeout = socket_timeout
+        self.request_read_deadline = request_read_deadline
         self._conn_semaphore = threading.BoundedSemaphore(max_connections)
         super().__init__(server_address, HermeticRequestHandler)
 
@@ -311,14 +340,50 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         """Read and handle a single HTTP/1.1 request, then close the connection."""
         self.close_connection = True
+        # The response framing never depends on the client's claimed version: the
+        # base class omits the status line and headers entirely for "HTTP/0.9".
+        self.request_version = self.protocol_version
+        self.command = ""
+        self.path = ""
+        self._response_started = False
         try:
-            method, raw_target, version, headers = self._read_bounded_request()
+            self._handle_guarded()
+        except OSError:
+            # Peer vanished, deadline shut the socket, or a send timed out.
+            self.close_connection = True
+
+    def _read_request_with_deadline(
+        self,
+    ) -> tuple[str | None, str, str, dict[str, str]]:
+        """Read the request head, shutting the socket if the wall-clock budget expires."""
+        expired = threading.Event()
+
+        def _expire() -> None:
+            expired.set()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(self.server.request_read_deadline, _expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            result = self._read_bounded_request()
+        finally:
+            timer.cancel()
+        if expired.is_set():
+            raise TimeoutError("Request head not received within deadline.")
+        return result
+
+    def _handle_guarded(self) -> None:
+        try:
+            method, raw_target, version, headers = self._read_request_with_deadline()
             if method is None:
                 return
 
             self.command = method
             self.path = raw_target
-            self.request_version = version
 
             if version != "HTTP/1.1":
                 raise HttpProtocolError(
@@ -338,18 +403,21 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
             self._dispatch(clean_path, headers)
 
         except HttpProtocolError as exc:
-            self._send_error_response(exc.status, exc.message, content_range=exc.content_range)
-        except (socket.timeout, BrokenPipeError, ConnectionResetError):
+            if not self._response_started:
+                self._send_error_response(
+                    exc.status, exc.message, content_range=exc.content_range
+                )
+        except OSError:
             self.close_connection = True
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled internal error while serving request: %s", exc)
-            try:
+            # Once a status line is on the wire a second response would corrupt the
+            # stream; closing the connection is the only safe signal left.
+            if not self._response_started:
                 self._send_error_response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     "Internal server error.",
                 )
-            except OSError:
-                pass
 
     def _read_bounded_request(
         self,
@@ -398,6 +466,11 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
                 )
             if hline in (b"\r\n", b"\n"):
                 break
+            if hline[:1] in (b" ", b"\t"):
+                raise HttpProtocolError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Obsolete header line folding is refused.",
+                )
 
             header_count += 1
             total_header_bytes += len(hline)
@@ -421,17 +494,38 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
                     "Malformed header line without colon.",
                 )
             name, _, value = decoded.partition(":")
-            key = name.strip().lower()
-            if not key or any(ch.isspace() for ch in key):
+            if not name or any(ch not in _TOKEN_CHARS for ch in name):
                 raise HttpProtocolError(
                     HTTPStatus.BAD_REQUEST,
                     "Invalid header field name.",
                 )
-            val = value.strip()
+            key = name.lower()
+            val = value.strip(" \t")
+            if any((ord(ch) < 0x20 and ch != "\t") or ord(ch) == 0x7F for ch in val):
+                raise HttpProtocolError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Control character in header value.",
+                )
             if key in headers:
+                if key in _SINGLETON_HEADERS:
+                    raise HttpProtocolError(
+                        HTTPStatus.BAD_REQUEST,
+                        f"Repeated {key} header is ambiguous.",
+                    )
                 headers[key] = f"{headers[key]}, {val}"
             else:
                 headers[key] = val
+
+        if version == "HTTP/1.1" and not headers.get("host"):
+            raise HttpProtocolError(
+                HTTPStatus.BAD_REQUEST,
+                "HTTP/1.1 request without a Host header.",
+            )
+        if "content-length" in headers and "transfer-encoding" in headers:
+            raise HttpProtocolError(
+                HTTPStatus.BAD_REQUEST,
+                "Content-Length together with Transfer-Encoding is ambiguous.",
+            )
 
         return method, raw_target, version, headers
 
@@ -474,7 +568,9 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
         try:
             projects = self.server.store.list_projects()
         except SymlinkError as exc:
-            raise HttpProtocolError(HTTPStatus.FORBIDDEN, str(exc)) from exc
+            # The store error text names absolute host paths; never send it.
+            logger.error("Refused unsafe store object: %s", exc)
+            raise HttpProtocolError(HTTPStatus.FORBIDDEN, "Forbidden.") from exc
         except (IntegrityError, StoreLimitError) as exc:
             logger.error("Store error listing projects: %s", exc)
             raise HttpProtocolError(
@@ -515,7 +611,9 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
                 ) from log_exc
             raise HttpProtocolError(HTTPStatus.NOT_FOUND, "Project not found.") from exc
         except SymlinkError as exc:
-            raise HttpProtocolError(HTTPStatus.FORBIDDEN, str(exc)) from exc
+            # The store error text names absolute host paths; never send it.
+            logger.error("Refused unsafe store object: %s", exc)
+            raise HttpProtocolError(HTTPStatus.FORBIDDEN, "Forbidden.") from exc
         except (IntegrityError, StoreLimitError) as exc:
             logger.error("Store error loading project %r: %s", raw_project, exc)
             raise HttpProtocolError(
@@ -558,7 +656,9 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
                 ) from log_exc
             raise HttpProtocolError(HTTPStatus.NOT_FOUND, "File not found.") from exc
         except SymlinkError as exc:
-            raise HttpProtocolError(HTTPStatus.FORBIDDEN, str(exc)) from exc
+            # The store error text names absolute host paths; never send it.
+            logger.error("Refused unsafe store object: %s", exc)
+            raise HttpProtocolError(HTTPStatus.FORBIDDEN, "Forbidden.") from exc
         except (IntegrityError, StoreLimitError) as exc:
             raise HttpProtocolError(
                 HTTPStatus.INTERNAL_SERVER_ERROR, "Internal server error."
@@ -568,6 +668,7 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
         if range_header is not None:
             start, end = parse_single_byte_range(range_header, verified.size)
             slice_len = end - start + 1
+            self._response_started = True
             self.send_response_only(HTTPStatus.PARTIAL_CONTENT)
             self.send_header("Content-Type", verified.content_type)
             self.send_header("Content-Length", str(slice_len))
@@ -580,6 +681,7 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
             return
 
+        self._response_started = True
         self.send_response_only(HTTPStatus.OK)
         self.send_header("Content-Type", verified.content_type)
         self.send_header("Content-Length", str(verified.size))
@@ -600,6 +702,7 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
         content_range: str | None = None,
     ) -> None:
         """Send response with strictly controlled headers (no Date, Server, or Last-Modified)."""
+        self._response_started = True
         self.send_response_only(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -621,13 +724,14 @@ class HermeticRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Send a plain-text error response without Date or Server headers."""
         body = (message + "\n").encode("utf-8")
+        self._response_started = True
         self.send_response_only(status)
         self.send_header("Content-Type", TEXT_PLAIN_MIME)
         self.send_header("Content-Length", str(len(body)))
         if content_range is not None:
             self.send_header("Content-Range", content_range)
         self.end_headers()
-        if getattr(self, "command", "GET") != "HEAD":
+        if self.command != "HEAD":
             self.wfile.write(body)
         self.wfile.flush()
 

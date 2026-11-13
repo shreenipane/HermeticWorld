@@ -434,3 +434,47 @@ def test_named_caps_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         build_manifest(tmp_path / "does_not_exist")
 
 
+
+
+@pytest.mark.parametrize(
+    "payload_a,payload_b",
+    [
+        ("[" * 200_000 + "]" * 200_000, "[" * 200_000 + "1" + "]" * 200_000),
+        ('{"n": ' + "1" * 6000 + "}", '{"n": ' + "2" * 6000 + "}"),
+    ],
+)
+def test_hostile_json_is_parse_error_not_exception(
+    tmp_path: Path, payload_a: str, payload_b: str
+) -> None:
+    """Deeply nested or over-long-number JSON localises as a parse error, never raises."""
+    world_a = tmp_path / "a"
+    world_b = tmp_path / "b"
+    world_a.mkdir()
+    world_b.mkdir()
+    (world_a / "state.json").write_text(payload_a, encoding="utf-8")
+    (world_b / "state.json").write_text(payload_b, encoding="utf-8")
+
+    report = compare_worlds(world_a, world_b)
+    assert report.reproducible is False
+    [diff] = report.size_hash_diffs
+    assert diff.json_loc is not None
+    assert diff.json_loc.parse_error
+    assert "JSON parse error" in format_report(report)
+
+
+def test_localisation_never_follows_symlinked_parent(tmp_path: Path) -> None:
+    """Files read for localisation are opened component by component without following links."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("host secret\n", encoding="utf-8")
+    world = tmp_path / "world"
+    world.mkdir()
+    os.symlink(outside, world / "linked")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "notes.txt").write_text("other\n", encoding="utf-8")
+
+    with pytest.raises(UnsupportedEntryError):
+        compare_mod._localize_text(world / "linked" / "notes.txt", other / "notes.txt", "linked/notes.txt")
+    with pytest.raises(UnsupportedEntryError):
+        tree_mod._hash_regular_file(world / "linked" / "notes.txt", "linked/notes.txt")

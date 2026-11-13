@@ -7,8 +7,11 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any
+
+import hermetic_safe_io
 
 # Named constant caps bounding every read and loop.
 READ_CHUNK_BYTES: int = 65_536
@@ -78,15 +81,25 @@ def _lstat_checked(full_path: Path, display_path: str) -> os.stat_result:
         raise WorldPathError(display_path, exc.strerror or str(exc)) from exc
 
 
-def _hash_regular_file(full_path: Path, rel_path: str) -> str:
-    """Compute SHA-256 of a regular file without following symlinks, bounded by caps."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def open_regular_no_follow(full_path: Path, rel_path: str) -> int:
+    """Open a regular file with every path component opened no-follow and non-blocking.
+
+    A component replaced by a symlink, or the file replaced by a FIFO, after the
+    caller's lstat is refused instead of being followed or blocking.
+    """
     try:
-        fd = os.open(full_path, flags)
+        return hermetic_safe_io.open_regular(full_path, sys.maxsize)
+    except hermetic_safe_io.UnsafePathError as exc:
+        raise UnsupportedEntryError(rel_path, "symlink or non-regular file") from exc
+    except ValueError as exc:
+        raise WorldPathError(rel_path, "invalid path") from exc
     except OSError as exc:
-        if exc.errno in {getattr(os, "ELOOP", -1), getattr(os, "EMLINK", -1)}:
-            raise UnsupportedEntryError(rel_path, "symlink") from exc
-        raise WorldPathError(rel_path, exc.strerror or str(exc)) from exc
+        raise WorldPathError(rel_path, exc.strerror or type(exc).__name__) from exc
+
+
+def _hash_regular_file(full_path: Path, rel_path: str) -> tuple[str, int]:
+    """Compute SHA-256 and byte size of a regular file without following symlinks."""
+    fd = open_regular_no_follow(full_path, rel_path)
 
     try:
         try:
@@ -112,7 +125,9 @@ def _hash_regular_file(full_path: Path, rel_path: str) -> str:
             except OSError as exc:
                 raise WorldPathError(rel_path, exc.strerror or str(exc)) from exc
             if not chunk:
-                return hasher.hexdigest()
+                if total_bytes != st.st_size:
+                    raise WorldPathError(rel_path, "file changed size while being hashed")
+                return hasher.hexdigest(), total_bytes
             total_bytes += len(chunk)
             if total_bytes > MAX_FILE_BYTES:
                 raise CapExceededError("MAX_FILE_BYTES", MAX_FILE_BYTES, rel_path)
@@ -205,13 +220,13 @@ def build_manifest(root_dir: str | Path) -> dict[str, Any]:
                 if st.st_nlink > 1 or inode_key in seen_inodes:
                     raise UnsupportedEntryError(rel_path, "hard link")
                 seen_inodes.add(inode_key)
-                digest = _hash_regular_file(full_path, rel_path)
+                digest, size = _hash_regular_file(full_path, rel_path)
                 entries.append(
                     {
                         "executable": bool(st.st_mode & 0o111),
                         "path": rel_path,
                         "sha256": digest,
-                        "size": int(st.st_size),
+                        "size": size,
                         "type": "file",
                     }
                 )

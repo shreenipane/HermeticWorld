@@ -4,9 +4,14 @@
 In-scope carriers:
   - ZIP/JAR/WHL member DOS timestamps (compared conservatively against T_clock + 14h,
     since MS-DOS timestamps record local wall-clock time without a timezone and UTC+14:00
-    is the maximum positive timezone offset on Earth).
-  - ZIP/JAR/WHL extended-timestamp extra fields (header ID 0x5455).
-  - TAR member modification times (mtime).
+    is the maximum positive timezone offset on Earth), from both the central directory
+    and each member's local file header (the two copies can differ).
+  - ZIP/JAR/WHL timestamp extra fields, central and local: extended timestamp (0x5455,
+    whose atime/ctime exist only in the local header), Info-ZIP Unix (0x5855), PKWARE
+    Unix (0x000D) and NTFS (0x000A).
+  - ZIP archives found by their end-of-central-directory record (zipapps, self-extracting
+    archives) even when the file does not start with a ZIP signature.
+  - TAR member modification times (mtime), plus pax atime/ctime records.
   - GZIP header MTIME (RFC 1952).
   - Python wheel and egg METADATA / PKG-INFO date-bearing RFC 822 header fields.
   - JAR META-INF/MANIFEST.MF "Created-By" / "Build-Date"-style entries with parseable dates.
@@ -45,6 +50,10 @@ MAX_METADATA_LINES: int = 5_000                # Max lines parsed in text metada
 MAX_EXTRA_FIELD_BYTES: int = 65_536            # 64 KiB max ZIP extra field block
 READ_CHUNK_SIZE: int = 65_536                  # 64 KiB streaming read chunk size
 MAX_DIR_DEPTH: int = 64                        # Max filesystem directory recursion depth
+MAX_DIR_ENTRIES: int = 100_000                 # Max entries listed from one directory
+MAX_TREE_ENTRIES: int = 1_000_000              # Max entries visited across a tree scan
+MAX_COMPRESSED_STREAMS: int = 1_024            # Max concatenated bz2/xz streams per payload
+ZIP_EOCD_SEARCH_BYTES: int = 65_557            # EOCD record (22) + max comment (65535)
 
 # Timestamp evaluation constants
 DOS_TIMEZONE_SLACK_HOURS: int = 14
@@ -125,6 +134,8 @@ class ScanCaps:
     max_extra_field_bytes: int = MAX_EXTRA_FIELD_BYTES
     read_chunk_size: int = READ_CHUNK_SIZE
     max_dir_depth: int = MAX_DIR_DEPTH
+    max_dir_entries: int = MAX_DIR_ENTRIES
+    max_tree_entries: int = MAX_TREE_ENTRIES
 
 
 @dataclass(frozen=True)
@@ -283,7 +294,7 @@ def parse_flexible_date(raw: str, *, allow_epoch: bool = False) -> datetime | No
             tz = timezone(delta)
         try:
             return datetime(yr, mo, dy, hr, mi, sc, us, tzinfo=tz).astimezone(timezone.utc)
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
 
     if _FOUR_DIGIT_YEAR_RE.search(text):
@@ -293,7 +304,7 @@ def parse_flexible_date(raw: str, *, allow_epoch: bool = False) -> datetime | No
                 if parsed.tzinfo is None:
                     return parsed.replace(tzinfo=timezone.utc)
                 return parsed.astimezone(timezone.utc)
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, IndexError, OverflowError):
             pass
 
     return None
@@ -456,15 +467,26 @@ def inspect_jar_manifest_bytes(
     return findings
 
 
-def _parse_zip_extra_0x5455(
-    rel_path: str,
-    member_chain: list[str],
-    extra: bytes,
-    t_clock: datetime,
-    caps: ScanCaps,
-) -> list[Finding]:
-    """Parse ZIP extended-timestamp extra field (header ID 0x5455)."""
-    findings: list[Finding] = []
+_NTFS_EPOCH_OFFSET_SECONDS: int = 11_644_473_600  # 1601-01-01 to 1970-01-01
+
+
+def _unix_ts_to_dt(ts: int) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _filetime_to_dt(filetime: int) -> datetime | None:
+    try:
+        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=filetime // 10)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _zip_extra_timestamps(extra: bytes, caps: ScanCaps) -> list[tuple[str, datetime]]:
+    """Return (carrier, datetime) for every timestamp in a ZIP extra-field block."""
+    found: list[tuple[str, datetime]] = []
     limit = min(len(extra), caps.max_extra_field_bytes)
     pos = 0
     while pos + 4 <= limit:
@@ -472,31 +494,88 @@ def _parse_zip_extra_0x5455(
         pos += 4
         if pos + data_size > limit:
             break
+        end = pos + data_size
+        stamps: list[tuple[str, int | None, datetime | None]] = []
         if header_id == 0x5455 and data_size >= 1:
             flags = extra[pos]
             cursor = pos + 1
-            end = pos + data_size
-            if (flags & 0x01) and cursor + 4 <= end:
-                (mtime_ts,) = struct.unpack_from("<I", extra, cursor)
+            for bit, carrier in (
+                (0x01, "zip_ext_timestamp"),
+                (0x02, "zip_ext_timestamp_atime"),
+                (0x04, "zip_ext_timestamp_ctime"),
+            ):
+                if (flags & bit) and cursor + 4 <= end:
+                    (value,) = struct.unpack_from("<I", extra, cursor)
+                    cursor += 4
+                    stamps.append((carrier, value, None))
+        elif header_id in (0x5855, 0x000D) and data_size >= 8:
+            # Info-ZIP Unix (old) and PKWARE Unix: atime then mtime, 32-bit Unix seconds.
+            atime, mtime = struct.unpack_from("<II", extra, pos)
+            stamps.append(("zip_unix_extra_atime", atime, None))
+            stamps.append(("zip_unix_extra_mtime", mtime, None))
+        elif header_id == 0x000A and data_size >= 4:
+            cursor = pos + 4  # reserved
+            while cursor + 4 <= end:
+                tag, tag_size = struct.unpack_from("<HH", extra, cursor)
                 cursor += 4
-                dt = datetime.fromtimestamp(mtime_ts, tz=timezone.utc)
-                findings.append(_make_finding(rel_path, member_chain, "zip_ext_timestamp", dt, t_clock))
-            if (flags & 0x02) and cursor + 4 <= end:
-                (atime_ts,) = struct.unpack_from("<I", extra, cursor)
-                cursor += 4
-                dt = datetime.fromtimestamp(atime_ts, tz=timezone.utc)
-                findings.append(
-                    _make_finding(rel_path, member_chain, "zip_ext_timestamp_atime", dt, t_clock)
-                )
-            if (flags & 0x04) and cursor + 4 <= end:
-                (ctime_ts,) = struct.unpack_from("<I", extra, cursor)
-                cursor += 4
-                dt = datetime.fromtimestamp(ctime_ts, tz=timezone.utc)
-                findings.append(
-                    _make_finding(rel_path, member_chain, "zip_ext_timestamp_ctime", dt, t_clock)
-                )
-        pos += data_size
-    return findings
+                if cursor + tag_size > end:
+                    break
+                if tag == 0x0001 and tag_size >= 24:
+                    mtime, atime, ctime = struct.unpack_from("<QQQ", extra, cursor)
+                    stamps.append(("zip_ntfs_mtime", None, _filetime_to_dt(mtime)))
+                    stamps.append(("zip_ntfs_atime", None, _filetime_to_dt(atime)))
+                    stamps.append(("zip_ntfs_ctime", None, _filetime_to_dt(ctime)))
+                cursor += tag_size
+        for carrier, unix_value, direct in stamps:
+            dt = direct if unix_value is None else _unix_ts_to_dt(unix_value)
+            if dt is not None:
+                found.append((carrier, dt))
+        pos = end
+    return found
+
+
+def _parse_zip_extra_0x5455(
+    rel_path: str,
+    member_chain: list[str],
+    extra: bytes,
+    t_clock: datetime,
+    caps: ScanCaps,
+) -> list[Finding]:
+    """Parse ZIP timestamp extra fields (0x5455 and the other timestamp-bearing IDs)."""
+    return [
+        _make_finding(rel_path, member_chain, carrier, dt, t_clock)
+        for carrier, dt in _zip_extra_timestamps(extra, caps)
+    ]
+
+
+def _dos_fields_to_dt(dos_time: int, dos_date: int) -> datetime | None:
+    yr = (dos_date >> 9) + 1980
+    mo = (dos_date >> 5) & 0x0F
+    dy = dos_date & 0x1F
+    hr = dos_time >> 11
+    mi = (dos_time >> 5) & 0x3F
+    sc = (dos_time & 0x1F) * 2
+    try:
+        return datetime(yr, mo, dy, hr, mi, sc, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _zip_local_header(data: bytes, offset: int) -> tuple[int, int, bytes]:
+    """Return (dos_time, dos_date, extra) from the local file header at ``offset``."""
+    if offset < 0 or offset + 30 > len(data) or data[offset : offset + 4] != b"PK\x03\x04":
+        raise MalformedArchiveError("ZIP member local file header missing or truncated.")
+    dos_time, dos_date = struct.unpack_from("<HH", data, offset + 10)
+    name_len, extra_len = struct.unpack_from("<HH", data, offset + 26)
+    extra_start = offset + 30 + name_len
+    extra_end = extra_start + extra_len
+    if extra_end > len(data):
+        raise MalformedArchiveError("ZIP member local extra field truncated.")
+    return dos_time, dos_date, data[extra_start:extra_end]
+
+
+def _has_zip_eocd(data: bytes) -> bool:
+    return data.rfind(b"PK\x05\x06", max(0, len(data) - ZIP_EOCD_SEARCH_BYTES)) != -1
 
 
 def _is_zip_bytes(filename: str, data: bytes) -> bool:
@@ -573,8 +652,15 @@ def inspect_zip_bytes(
         )
     try:
         zf = zipfile.ZipFile(io.BytesIO(data), mode="r")
-    except (zipfile.BadZipFile, OSError, EOFError, struct.error) as exc:
-        raise MalformedArchiveError(f"Invalid ZIP archive: {exc}") from exc
+    except (
+        zipfile.BadZipFile,
+        OSError,
+        EOFError,
+        struct.error,
+        ValueError,
+        NotImplementedError,
+    ) as exc:
+        raise MalformedArchiveError(f"Invalid ZIP archive: {type(exc).__name__}") from exc
 
     findings: list[Finding] = []
     total_decompressed = 0
@@ -609,11 +695,40 @@ def inspect_zip_bytes(
                 except ValueError:
                     pass
 
-            # 2. Extended-timestamp extra field (0x5455)
+            # 2. Timestamp extra fields from the central directory
+            seen_stamps: set[tuple[str, str]] = set()
             if info.extra:
-                findings.extend(
-                    _parse_zip_extra_0x5455(rel_path, cur_chain, info.extra, t_clock, caps)
+                for carrier, dt in _zip_extra_timestamps(info.extra, caps):
+                    seen_stamps.add((carrier, format_rfc3339_utc(dt)))
+                    findings.append(_make_finding(rel_path, cur_chain, carrier, dt, t_clock))
+
+            # 3. The local file header carries its own DOS time and extra block; Info-ZIP
+            #    writes atime/ctime only there. Report whatever the central copy lacks.
+            local_time, local_date, local_extra = _zip_local_header(data, info.header_offset)
+            local_dos = _dos_fields_to_dt(local_time, local_date)
+            if local_dos is not None and (
+                local_dos.year,
+                local_dos.month,
+                local_dos.day,
+                local_dos.hour,
+                local_dos.minute,
+                local_dos.second,
+            ) != tuple(info.date_time):
+                findings.append(
+                    _make_finding(
+                        rel_path,
+                        cur_chain,
+                        "zip_local_dos_timestamp",
+                        local_dos,
+                        t_clock,
+                        is_dos=True,
+                    )
                 )
+            for carrier, dt in _zip_extra_timestamps(local_extra, caps):
+                key = (carrier, format_rfc3339_utc(dt))
+                if key not in seen_stamps:
+                    seen_stamps.add(key)
+                    findings.append(_make_finding(rel_path, cur_chain, carrier, dt, t_clock))
 
             # Skip directories and symlink entries inside ZIP
             if info.is_dir():
@@ -642,9 +757,18 @@ def inspect_zip_bytes(
                         caps.read_chunk_size,
                         f"ZIP member {info.filename!r}",
                     )
-            except (zipfile.BadZipFile, zlib.error, EOFError, OSError, RuntimeError) as exc:
+            except (
+                zipfile.BadZipFile,
+                zlib.error,
+                lzma.LZMAError,
+                EOFError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                NotImplementedError,
+            ) as exc:
                 raise MalformedArchiveError(
-                    f"Corrupt ZIP member {info.filename!r}: {exc}"
+                    f"Corrupt or unsupported ZIP member {info.filename!r}: {type(exc).__name__}"
                 ) from exc
 
             total_decompressed += len(member_bytes)
@@ -662,6 +786,13 @@ def inspect_zip_bytes(
     return findings
 
 
+def _tar_time_to_dt(value: float) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
 def inspect_tar_bytes(
     rel_path: str,
     member_chain: list[str],
@@ -677,7 +808,7 @@ def inspect_tar_bytes(
         )
     try:
         tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
-    except (tarfile.TarError, OSError, EOFError) as exc:
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
         raise MalformedArchiveError(f"Invalid TAR archive: {exc}") from exc
 
     findings: list[Finding] = []
@@ -687,7 +818,7 @@ def inspect_tar_bytes(
         while True:
             try:
                 member = tf.next()
-            except (tarfile.TarError, OSError, EOFError) as exc:
+            except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
                 raise MalformedArchiveError(f"Corrupt TAR stream: {exc}") from exc
             if member is None:
                 break
@@ -698,8 +829,27 @@ def inspect_tar_bytes(
                 )
 
             cur_chain = member_chain + [member.name]
-            mtime_dt = datetime.fromtimestamp(member.mtime, tz=timezone.utc)
+            mtime_dt = _tar_time_to_dt(member.mtime)
+            if mtime_dt is None:
+                raise MalformedArchiveError(
+                    f"TAR member {member.name!r} has an unrepresentable mtime."
+                )
             findings.append(_make_finding(rel_path, cur_chain, "tar_mtime", mtime_dt, t_clock))
+            for pax_key in ("atime", "ctime"):
+                raw_value = member.pax_headers.get(pax_key)
+                if raw_value is None:
+                    continue
+                try:
+                    pax_dt = _tar_time_to_dt(float(raw_value))
+                except (TypeError, ValueError):
+                    pax_dt = None
+                if pax_dt is None:
+                    raise MalformedArchiveError(
+                        f"TAR member {member.name!r} has an unrepresentable pax {pax_key}."
+                    )
+                findings.append(
+                    _make_finding(rel_path, cur_chain, f"tar_pax_{pax_key}", pax_dt, t_clock)
+                )
 
             # Only inspect regular file payloads; never extract symlinks, hardlinks, FIFOs, or devices.
             if not member.isfile():
@@ -715,17 +865,22 @@ def inspect_tar_bytes(
                     f"Cumulative TAR extracted size exceeds cap ({caps.max_decompressed_bytes})."
                 )
 
-            extracted_fp = tf.extractfile(member)
-            if extracted_fp is None:
-                continue
             remaining_budget = caps.max_decompressed_bytes - total_extracted
-            with extracted_fp:
-                member_bytes = _read_stream_bounded(
-                    extracted_fp,
-                    remaining_budget,
-                    caps.read_chunk_size,
-                    f"TAR member {member.name!r}",
-                )
+            try:
+                extracted_fp = tf.extractfile(member)
+                if extracted_fp is None:
+                    continue
+                with extracted_fp:
+                    member_bytes = _read_stream_bounded(
+                        extracted_fp,
+                        remaining_budget,
+                        caps.read_chunk_size,
+                        f"TAR member {member.name!r}",
+                    )
+            except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
+                raise MalformedArchiveError(
+                    f"Corrupt TAR member {member.name!r}: {type(exc).__name__}"
+                ) from exc
             total_extracted += len(member_bytes)
             findings.extend(
                 inspect_payload_bytes(
@@ -835,52 +990,74 @@ def inspect_gzip_bytes(
     return findings
 
 
-def _decompress_bz2_bounded(data: bytes, caps: ScanCaps) -> bytes:
-    decompressor = bz2.BZ2Decompressor()
+def _decompress_streams_bounded(
+    data: bytes,
+    caps: ScanCaps,
+    label: str,
+    make_decompressor: object,
+    errors: tuple[type[BaseException], ...],
+    *,
+    skip_null_padding: bool = False,
+) -> bytes:
+    """Decompress every concatenated stream in ``data`` within the decompression cap."""
     out_buf = bytearray()
-    pos = 0
+    pending = data
     try:
-        while pos < len(data) and not decompressor.eof:
-            chunk = data[pos : pos + caps.read_chunk_size]
-            pos += len(chunk)
-            remaining_budget = caps.max_decompressed_bytes - len(out_buf)
-            if remaining_budget <= 0:
-                raise CapExceededError(
-                    f"BZ2 decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                )
-            piece = decompressor.decompress(chunk, max_length=remaining_budget)
-            out_buf.extend(piece)
-            if decompressor.needs_input is False and len(out_buf) >= caps.max_decompressed_bytes:
-                raise CapExceededError(
-                    f"BZ2 decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                )
-    except OSError as exc:
-        raise MalformedArchiveError(f"Corrupt BZ2 stream: {exc}") from exc
-    return bytes(out_buf)
+        for _ in range(MAX_COMPRESSED_STREAMS):
+            decompressor = make_decompressor()  # type: ignore[operator]
+            pos = 0
+            while pos < len(pending) and not decompressor.eof:
+                chunk = pending[pos : pos + caps.read_chunk_size]
+                pos += len(chunk)
+                remaining_budget = caps.max_decompressed_bytes - len(out_buf)
+                if remaining_budget <= 0:
+                    raise CapExceededError(
+                        f"{label} decompressed output exceeds cap ({caps.max_decompressed_bytes})."
+                    )
+                piece = decompressor.decompress(chunk, max_length=remaining_budget)
+                out_buf.extend(piece)
+                # Drain output held back by max_length before feeding more input.
+                while not decompressor.eof and not decompressor.needs_input:
+                    remaining_budget = caps.max_decompressed_bytes - len(out_buf)
+                    if remaining_budget <= 0:
+                        raise CapExceededError(
+                            f"{label} decompressed output exceeds cap "
+                            f"({caps.max_decompressed_bytes})."
+                        )
+                    piece = decompressor.decompress(b"", max_length=remaining_budget)
+                    if not piece:
+                        break
+                    out_buf.extend(piece)
+            if not decompressor.eof:
+                raise MalformedArchiveError(f"Truncated {label} stream.")
+            pending = decompressor.unused_data
+            if skip_null_padding:
+                # xz permits NUL stream padding between and after streams.
+                pending = pending.lstrip(b"\x00")
+            if not pending:
+                return bytes(out_buf)
+        raise CapExceededError(
+            f"Concatenated {label} stream count exceeds cap ({MAX_COMPRESSED_STREAMS})."
+        )
+    except errors as exc:
+        raise MalformedArchiveError(f"Corrupt {label} stream: {type(exc).__name__}") from exc
+
+
+def _decompress_bz2_bounded(data: bytes, caps: ScanCaps) -> bytes:
+    return _decompress_streams_bounded(
+        data, caps, "BZ2", bz2.BZ2Decompressor, (OSError, EOFError, ValueError)
+    )
 
 
 def _decompress_xz_bounded(data: bytes, caps: ScanCaps) -> bytes:
-    decompressor = lzma.LZMADecompressor()
-    out_buf = bytearray()
-    pos = 0
-    try:
-        while pos < len(data) and not decompressor.eof:
-            chunk = data[pos : pos + caps.read_chunk_size]
-            pos += len(chunk)
-            remaining_budget = caps.max_decompressed_bytes - len(out_buf)
-            if remaining_budget <= 0:
-                raise CapExceededError(
-                    f"XZ decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                )
-            piece = decompressor.decompress(chunk, max_length=remaining_budget)
-            out_buf.extend(piece)
-            if not decompressor.needs_input and len(out_buf) >= caps.max_decompressed_bytes:
-                raise CapExceededError(
-                    f"XZ decompressed output exceeds cap ({caps.max_decompressed_bytes})."
-                )
-    except lzma.LZMAError as exc:
-        raise MalformedArchiveError(f"Corrupt XZ stream: {exc}") from exc
-    return bytes(out_buf)
+    return _decompress_streams_bounded(
+        data,
+        caps,
+        "XZ",
+        lzma.LZMADecompressor,
+        (lzma.LZMAError, EOFError, ValueError),
+        skip_null_padding=True,
+    )
 
 
 def inspect_payload_bytes(
@@ -965,6 +1142,25 @@ def inspect_payload_bytes(
 
     if _is_tar_bytes(filename, data):
         return inspect_tar_bytes(
+            rel_path=rel_path,
+            member_chain=member_chain,
+            data=data,
+            t_clock=t_clock,
+            caps=caps,
+            depth=depth + 1,
+        )
+
+    if _has_zip_eocd(data):
+        # A ZIP with a prefix (zipapp shebang, self-extractor stub) has no leading
+        # signature. Only a payload that actually opens as a ZIP is inspected; other
+        # bytes that merely contain the EOCD signature are ordinary data.
+        try:
+            zipfile.ZipFile(io.BytesIO(data), mode="r").close()
+        except Exception:  # noqa: BLE001
+            return []
+        # zipfile reports header offsets including the prefix, so local headers
+        # are located in ``data`` as is.
+        return inspect_zip_bytes(
             rel_path=rel_path,
             member_chain=member_chain,
             data=data,

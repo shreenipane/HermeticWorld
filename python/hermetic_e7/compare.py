@@ -19,6 +19,7 @@ from hermetic_e7.tree import (
     UnsupportedEntryError,
     WorldPathError,
     build_manifest,
+    open_regular_no_follow,
 )
 
 # Named constant caps bounding every read and loop.
@@ -203,13 +204,7 @@ def classify_file(rel_path: str) -> str:
 
 def _open_regular_file(full_path: Path, rel_path: str) -> int:
     """Open a regular file without following symlinks and verify its file status."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(full_path, flags)
-    except OSError as exc:
-        if exc.errno in {getattr(os, "ELOOP", -1), getattr(os, "EMLINK", -1)}:
-            raise UnsupportedEntryError(rel_path, "symlink") from exc
-        raise WorldPathError(rel_path, exc.strerror or str(exc)) from exc
+    fd = open_regular_no_follow(full_path, rel_path)
 
     try:
         st = os.fstat(fd)
@@ -300,7 +295,9 @@ def _localize_json(path_a: Path, path_b: Path, rel_path: str) -> JsonLocalisatio
     try:
         doc_a = json.loads(raw_a.decode("utf-8"))
         doc_b = json.loads(raw_b.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # ValueError covers JSONDecodeError and over-long integer literals;
+        # RecursionError covers nesting deeper than the parser's stack.
         return JsonLocalisation(
             differing_paths=[],
             truncated=False,

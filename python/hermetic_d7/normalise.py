@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
+import hermetic_safe_io
+
 # Named constant caps bounding every read and loop.
 PYC_HEADER_SIZE: int = 16
 MAX_ARCHIVE_MEMBERS: int = 10_000
@@ -34,6 +36,9 @@ MAX_READ_CHUNKS: int = (MAX_MEMBER_BYTES // READ_CHUNK_SIZE) + 2
 MAX_RECORD_LINES: int = 50_000
 MAX_METADATA_LINES: int = 50_000
 MAX_DIFF_INPUT_LINES: int = 50_000
+# Cap on a single tar extended header (pax or GNU long name/link). tarfile reads
+# these fully into memory before any member cap applies.
+MAX_TAR_EXTENDED_HEADER_BYTES: int = 1024 * 1024
 
 
 class HermeticD7Error(Exception):
@@ -334,18 +339,27 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
     stack: list[tuple[Path, str, int]] = [(root_path, "", 0)]
     entries_seen = 0
     total_bytes = 0
-    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
 
     for _ in range(limits.max_archive_members + 1):
         if not stack:
             break
         current_dir, prefix, depth = stack.pop()
 
+        raw_entries: list[os.DirEntry[str]] = []
         try:
             with os.scandir(current_dir) as it:
-                raw_entries = list(it)
+                # Bounded: a directory with more entries than the member cap is refused
+                # before its listing is held in memory.
+                for scanned in it:
+                    if entries_seen + len(raw_entries) >= limits.max_archive_members:
+                        raise ResourceLimitError(
+                            f"Directory exceeds max member count ({limits.max_archive_members})"
+                        )
+                    raw_entries.append(scanned)
         except OSError as exc:
-            raise InvalidArtifactError(f"Failed to scan directory {current_dir}: {exc}") from exc
+            raise InvalidArtifactError(
+                f"Failed to scan directory {prefix or '.'!r}: {type(exc).__name__}"
+            ) from exc
 
         raw_entries.sort(key=lambda e: e.name)
 
@@ -384,6 +398,10 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
                 norm_path = validate_member_path(
                     rel_path, is_dir=False, max_depth=limits.max_nesting_depth
                 )
+                if est.st_nlink > 1:
+                    raise SecurityViolationError(
+                        f"Hardlinked file refused in directory artifact: {norm_path!r}"
+                    )
                 if norm_path in members:
                     raise SecurityViolationError(f"Duplicate directory member: {norm_path!r}")
                 if est.st_size > limits.max_member_bytes:
@@ -391,9 +409,13 @@ def _read_directory(root_path: Path, limits: ResourceLimits) -> dict[str, Normal
                         f"File {norm_path!r} exceeds per-member byte cap ({limits.max_member_bytes})"
                     )
                 try:
-                    fd = os.open(entry.path, os.O_RDONLY | no_follow_flag)
-                except OSError as exc:
-                    raise InvalidArtifactError(f"Failed to open {entry.path}: {exc}") from exc
+                    # Descriptor-anchored, no-follow, non-blocking: a member swapped for a
+                    # symlink or FIFO after the stat above is refused, never followed.
+                    fd = hermetic_safe_io.open_regular(entry.path, limits.max_member_bytes)
+                except (OSError, ValueError) as exc:
+                    raise SecurityViolationError(
+                        f"Failed to open {norm_path!r} safely: {type(exc).__name__}"
+                    ) from exc
                 with os.fdopen(fd, "rb") as fobj:
                     raw_bytes, total_bytes = _read_bounded_stream(
                         fobj, norm_path, limits, total_bytes
@@ -491,6 +513,28 @@ def _read_zip(archive_path: Path, limits: ResourceLimits) -> dict[str, Normalise
     return members
 
 
+_TAR_EXTENDED_TYPES = frozenset(
+    {
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+    }
+)
+
+
+class _CappedTarInfo(tarfile.TarInfo):
+    """TarInfo that refuses oversized extended headers before tarfile buffers them."""
+
+    def _proc_member(self, tarfile_obj: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+        if self.type in _TAR_EXTENDED_TYPES and self.size > MAX_TAR_EXTENDED_HEADER_BYTES:
+            raise tarfile.HeaderError(
+                f"Extended tar header exceeds cap ({self.size} > {MAX_TAR_EXTENDED_HEADER_BYTES})"
+            )
+        return super()._proc_member(tarfile_obj)
+
+
 def _read_tar(
     archive_path: Path,
     tar_mode: str,
@@ -501,7 +545,7 @@ def _read_tar(
     total_bytes = 0
 
     try:
-        tf_ctx = tarfile.open(archive_path, mode=tar_mode)
+        tf_ctx = tarfile.open(archive_path, mode=tar_mode, tarinfo=_CappedTarInfo)
     except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
         raise InvalidArtifactError(f"Invalid TAR archive {archive_path}: {exc}") from exc
 

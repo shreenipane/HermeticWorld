@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import hashlib
+import html.parser
 import http.client
 import json
 import os
@@ -208,7 +209,20 @@ def test_root_and_project_pages_html_and_json(running_server: dict[str, object])
     _assert_clean_headers(headers, {"content-type", "content-length", "etag"})
     proj_html = body.decode("utf-8")
     assert f'/files/{wheel_sha}/{wheel_name}#sha256={wheel_sha}' in proj_html
-    assert 'data-requires-python=">=3.11"' in proj_html
+    # PEP 503: "<" and ">" in the attribute value have to be encoded as &lt; and &gt;.
+    assert 'data-requires-python="&gt;=3.11"' in proj_html
+    assert 'data-requires-python=">=3.11"' not in proj_html
+    parsed_requires: list[str | None] = []
+
+    class _LinkParser(html.parser.HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag == "a":
+                attr_map = dict(attrs)
+                if "data-requires-python" in attr_map:
+                    parsed_requires.append(attr_map["data-requires-python"])
+
+    _LinkParser().feed(proj_html)
+    assert parsed_requires == [">=3.11"]
 
     # Project page JSON via Accept header
     status, headers, body = _http_request(
@@ -563,3 +577,187 @@ def test_cli_entrypoint(store_env: dict[str, object], tmp_path: Path) -> None:
         proc.wait(timeout=5.0)
 
 
+
+
+def _raw_exchange(host: str, port: int, payload: bytes, timeout: float = 5.0) -> bytes:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.sendall(payload)
+        raw = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except ConnectionResetError:
+                break
+            if not chunk:
+                break
+            raw += chunk
+    return raw
+
+
+def test_http09_version_claim_cannot_suppress_status_line(
+    running_server: dict[str, object],
+) -> None:
+    """A client claiming HTTP/0.9 must still get a framed 505, never a bare body."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    raw = _raw_exchange(host, port, b"GET /simple/ HTTP/0.9\r\nHost: x\r\n\r\n")
+    assert raw.startswith(b"HTTP/1.1 505 ")
+    assert b"\r\nContent-Length: " in raw
+
+
+def test_forbidden_response_never_names_host_paths(
+    running_server: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """Refusals for symlinked store objects must not reveal absolute host paths."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    store_root: Path = running_server["store_root"]  # type: ignore[assignment]
+
+    secret = tmp_path / "outside.bin"
+    secret.write_bytes(b"outside")
+    sha = hashlib.sha256(b"outside").hexdigest()
+    (store_root / "files" / sha).mkdir(parents=True)
+    os.symlink(secret, store_root / "files" / sha / "x-1.0.whl")
+    outside_proj = tmp_path / "outside_proj2"
+    outside_proj.mkdir()
+    (outside_proj / "index.json").write_text('{"files":[]}', encoding="utf-8")
+    os.symlink(outside_proj, store_root / "simple" / "evil2")
+
+    for path in (f"/files/{sha}/x-1.0.whl", "/simple/evil2/"):
+        status, _, body = _http_request(host, port, "GET", path)
+        assert status == 403
+        assert str(tmp_path).encode() not in body
+        assert b"/" not in body.strip()
+
+
+def test_slow_header_drip_is_cut_by_request_deadline(store_env: dict[str, object]) -> None:
+    """A client dripping header bytes under the per-recv timeout is cut at the deadline."""
+    store = FrozenStore(store_env["store_root"])  # type: ignore[arg-type]
+    miss_log = MissLog(store_env["misses_path"])  # type: ignore[arg-type]
+    server = HermeticHTTPServer(
+        ("127.0.0.1", 0),
+        store=store,
+        miss_log=miss_log,
+        socket_timeout=5.0,
+        request_read_deadline=0.5,
+    )
+    host, port = server.server_address[:2]
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection((host, port), timeout=5.0) as sock:
+            sock.sendall(b"GET /simple/ HTTP/1.1\r\nHost: x\r\n")
+            started = time.monotonic()
+            closed = False
+            for i in range(40):
+                try:
+                    sock.sendall(f"X-Drip-{i}: y\r\n".encode())
+                except OSError:
+                    closed = True
+                    break
+                sock.settimeout(0.1)
+                try:
+                    data = sock.recv(4096)
+                    if data == b"":
+                        closed = True
+                        break
+                except TimeoutError:
+                    pass
+                except OSError:
+                    closed = True
+                    break
+            assert closed
+            assert time.monotonic() - started < 3.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"GET /simple/ HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n folded\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nHost : x\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nAccept: */*\r\n\r\n",
+        b"GET /simple/ HTTP/1.1\r\nHost: x\r\nX-B: a\rb\r\n\r\n",
+    ],
+)
+def test_ambiguous_request_heads_refused(running_server: dict[str, object], head: bytes) -> None:
+    """Folding, padded names, repeated framing headers and a missing Host are refused."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    raw = _raw_exchange(host, port, head)
+    assert raw.startswith(b"HTTP/1.1 400 ")
+
+
+def test_range_with_huge_offsets_is_416_not_500(running_server: dict[str, object]) -> None:
+    """Range offsets longer than the digit cap are unsatisfiable, not an internal error."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    path = f"/files/{running_server['wheel_sha']}/{running_server['wheel_name']}"
+    for value in ("bytes=" + "9" * 5000 + "-", "bytes=0-" + "9" * 5000, "bytes=-" + "9" * 5000):
+        status, _, _ = _http_request(host, port, "GET", path, headers={"Range": value})
+        assert status == 416
+
+
+def test_encoded_control_characters_refused(running_server: dict[str, object]) -> None:
+    """Percent-encoded control characters in the path are refused before any lookup."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    misses_path: Path = running_server["misses_path"]  # type: ignore[assignment]
+    for bad in ("/files/" + "c" * 64 + "/foo%0abar.whl", "/simple/a%0d%0ab/", "/files/" + "c" * 64 + "/x%7f.whl"):
+        status, _, _ = _http_request(host, port, "GET", bad)
+        assert status == 400
+    assert not misses_path.exists()
+
+
+def test_unnormalised_project_directory_not_listed(store_env: dict[str, object]) -> None:
+    """Only directories reachable by their normalised name are advertised."""
+    store_root: Path = store_env["store_root"]  # type: ignore[assignment]
+    _write_project(store_root, "Odd_Name", [])
+    store = FrozenStore(store_root)
+    assert store.list_projects() == ["alpha", "demo-pkg"]
+
+
+def test_file_replaced_after_verification_is_not_streamed(store_env: dict[str, object]) -> None:
+    """Bytes are streamed only from the inode whose digest was verified."""
+    store_root: Path = store_env["store_root"]  # type: ignore[assignment]
+    store = FrozenStore(store_root)
+    sha: str = store_env["alpha_sha"]  # type: ignore[assignment]
+    name: str = store_env["alpha_name"]  # type: ignore[assignment]
+    original: bytes = store_env["alpha_bytes"]  # type: ignore[assignment]
+    verified = store.verify_and_prepare_file(sha, name)
+    target = store_root / "files" / sha / name
+    replacement = store_root / "files" / sha / "tmp-replacement"
+    replacement.write_bytes(b"X" * len(original))
+    os.replace(replacement, target)
+    from hermetic_pkgindex import IntegrityError
+
+    with pytest.raises(IntegrityError):
+        b"".join(store.iter_file_range(verified, 0, verified.size - 1))
+
+
+def test_failure_after_headers_sent_never_appends_second_response(
+    running_server: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error while streaming closes the connection instead of writing another status line."""
+    host: str = running_server["host"]  # type: ignore[assignment]
+    port: int = running_server["port"]  # type: ignore[assignment]
+    server: HermeticHTTPServer = running_server["server"]  # type: ignore[assignment]
+    from hermetic_pkgindex import IntegrityError
+
+    def _broken(*_args: object, **_kwargs: object) -> Iterator[bytes]:
+        yield b"PK"
+        raise IntegrityError("simulated mid-stream failure")
+
+    monkeypatch.setattr(server.store, "iter_file_range", _broken)
+    path = f"/files/{running_server['wheel_sha']}/{running_server['wheel_name']}"
+    raw = _raw_exchange(host, port, f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert raw.startswith(b"HTTP/1.1 200 ")
+    assert raw.count(b"HTTP/1.1 ") == 1

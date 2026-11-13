@@ -114,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if result.verdict == "gate":
         return 2
+    # Fail closed: a scan that skipped any payload (malformed or unreadable data,
+    # internal errors) cannot certify the tree as clean.
+    if not result.is_complete():
+        return 1
+    if result.verdict == "gate":
+        return 2
     return 0
 
 

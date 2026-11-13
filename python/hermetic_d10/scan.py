@@ -9,11 +9,14 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import sys
 
+import hermetic_safe_io
 from hermetic_d10.carriers import (
     CapExceededError,
     Finding,
     HermeticD10Error,
+    MalformedArchiveError,
     Refusal,
     ScanCaps,
     UnsafeFileError,
@@ -21,6 +24,16 @@ from hermetic_d10.carriers import (
     inspect_payload_bytes,
     parse_rfc3339_utc,
 )
+
+
+_BENIGN_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {"symlink_refused", "non_regular_file_refused"}
+)
+
+
+def _os_reason(exc: OSError) -> str:
+    """Describe an OS error without the absolute path the exception text carries."""
+    return exc.strerror or type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,15 @@ class ScanResult:
     def has_cap_error(self) -> bool:
         return any(r.error_type == CapExceededError.__name__ for r in self.refusals)
 
+    def is_complete(self) -> bool:
+        """True only if every byte that could carry a date was inspected.
+
+        Symlinks and special files are refused by design and carry no payload; any
+        other refusal (cap, malformed or unreadable data, internal error) means part
+        of the tree went unscanned, so a clean verdict cannot be trusted.
+        """
+        return all(r.reason in _BENIGN_REFUSAL_REASONS for r in self.refusals)
+
     def to_dict(self) -> dict[str, object]:
         gate_count = sum(1 for f in self.findings if f.severity == "gate")
         info_count = sum(1 for f in self.findings if f.severity == "info")
@@ -45,6 +67,7 @@ class ScanResult:
             "detector": "D10",
             "t_clock": self.t_clock,
             "verdict": self.verdict,
+            "complete": self.is_complete(),
             "findings": [f.to_dict() for f in self.findings],
             "refusals": [r.to_dict() for r in self.refusals],
             "stats": {
@@ -75,16 +98,19 @@ def _read_regular_file_bounded(
     caps: ScanCaps,
     remaining_total_bytes: int,
 ) -> bytes:
-    """Safely open a regular file without following symlinks and read within byte caps."""
+    """Open a regular file without following symlinks or blocking, and read within caps.
+
+    Error texts never name the host path; callers attach the scan-relative path.
+    """
     try:
         st = os.lstat(file_path)
     except OSError as exc:
-        raise UnsafeFileError(f"Unable to stat {file_path}: {exc}") from exc
+        raise UnsafeFileError(f"Unable to stat file: {_os_reason(exc)}") from exc
 
     if stat.S_ISLNK(st.st_mode):
-        raise UnsafeFileError(f"Refusing symlink: {file_path}")
+        raise UnsafeFileError("Refusing symlink.")
     if not stat.S_ISREG(st.st_mode):
-        raise UnsafeFileError(f"Refusing non-regular file (mode {oct(st.st_mode)}): {file_path}")
+        raise UnsafeFileError(f"Refusing non-regular file (mode {oct(st.st_mode)}).")
 
     effective_cap = min(caps.max_file_bytes, remaining_total_bytes)
     if st.st_size > effective_cap:
@@ -92,17 +118,18 @@ def _read_regular_file_bounded(
             f"File size ({st.st_size} bytes) exceeds cap ({effective_cap} bytes)."
         )
 
-    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(file_path, open_flags)
-    except OSError as exc:
-        raise UnsafeFileError(f"Refusing file that could not be opened safely: {exc}") from exc
+        fd = hermetic_safe_io.open_regular(file_path, sys.maxsize)
+    except (OSError, ValueError) as exc:
+        raise UnsafeFileError(
+            f"Refusing file that could not be opened safely: {type(exc).__name__}"
+        ) from exc
 
     try:
         f_st = os.fstat(fd)
         if not stat.S_ISREG(f_st.st_mode):
             raise UnsafeFileError(
-                f"Refusing non-regular file descriptor (mode {oct(f_st.st_mode)}): {file_path}"
+                f"Refusing non-regular file descriptor (mode {oct(f_st.st_mode)})."
             )
         buf = bytearray()
         with os.fdopen(fd, "rb", closefd=True) as fp:
@@ -110,7 +137,10 @@ def _read_regular_file_bounded(
             while True:
                 remaining = effective_cap - len(buf)
                 to_read = min(caps.read_chunk_size, remaining + 1)
-                chunk = fp.read(to_read)
+                try:
+                    chunk = fp.read(to_read)
+                except OSError as exc:
+                    raise UnsafeFileError(f"Read failed: {_os_reason(exc)}") from exc
                 if not chunk:
                     break
                 buf.extend(chunk)
@@ -122,6 +152,32 @@ def _read_regular_file_bounded(
     finally:
         if fd != -1:
             os.close(fd)
+
+
+def _inspect_guarded(
+    rel_path: str,
+    filename: str,
+    data: bytes,
+    t_clock: datetime,
+    caps: ScanCaps,
+) -> list[Finding]:
+    """Run the carrier inspectors; any unexpected exception becomes a typed error."""
+    try:
+        return inspect_payload_bytes(
+            rel_path=rel_path,
+            filename=filename,
+            member_chain=[],
+            data=data,
+            t_clock=t_clock,
+            caps=caps,
+            depth=0,
+        )
+    except HermeticD10Error:
+        raise
+    except (Exception, RecursionError) as exc:  # noqa: BLE001
+        raise MalformedArchiveError(
+            f"Unexpected failure while inspecting payload: {type(exc).__name__}"
+        ) from exc
 
 
 def scan_file(
@@ -138,15 +194,7 @@ def scan_file(
     display_path = rel_path if rel_path is not None else PurePosixPath(path_obj.name).as_posix()
 
     raw = _read_regular_file_bounded(path_obj, active_caps, active_caps.max_total_bytes_read)
-    findings = inspect_payload_bytes(
-        rel_path=display_path,
-        filename=path_obj.name,
-        member_chain=[],
-        data=raw,
-        t_clock=clock_dt,
-        caps=active_caps,
-        depth=0,
-    )
+    findings = _inspect_guarded(display_path, path_obj.name, raw, clock_dt, active_caps)
     return _sort_findings(findings)
 
 
@@ -191,12 +239,12 @@ def scan_tree(
     try:
         root_st = os.lstat(root_path)
     except OSError as exc:
-        raise UnsafeFileError(f"Root path cannot be accessed: {exc}") from exc
+        raise UnsafeFileError(f"Root path cannot be accessed: {_os_reason(exc)}") from exc
 
     if stat.S_ISLNK(root_st.st_mode):
-        raise UnsafeFileError(f"Refusing symlink root directory: {root_path}")
+        raise UnsafeFileError("Refusing symlink root directory.")
     if not stat.S_ISDIR(root_st.st_mode):
-        raise UnsafeFileError(f"Root path is not a regular directory: {root_path}")
+        raise UnsafeFileError("Root path is not a regular directory.")
 
     findings: list[Finding] = []
     refusals: list[Refusal] = []
@@ -206,6 +254,7 @@ def scan_tree(
     # Iterative DFS stack: (absolute_dir_path, relative_posix_path, dir_depth)
     dir_stack: list[tuple[Path, str, int]] = [(root_path, "", 0)]
     cap_halted = False
+    tree_entries = 0
 
     while dir_stack and not cap_halted:
         cur_dir, cur_rel, dir_depth = dir_stack.pop()
@@ -221,9 +270,15 @@ def scan_tree(
             )
             continue
 
+        listed: list[os.DirEntry[str]] = []
+        dir_overflow = False
         try:
             with os.scandir(cur_dir) as it:
-                entries = sorted(it, key=lambda e: e.name)
+                for listed_entry in it:
+                    if len(listed) >= active_caps.max_dir_entries:
+                        dir_overflow = True
+                        break
+                    listed.append(listed_entry)
         except OSError as exc:
             refusals.append(
                 Refusal(
@@ -231,10 +286,34 @@ def scan_tree(
                     member_chain=[],
                     error_type=UnsafeFileError.__name__,
                     reason="directory_unreadable",
-                    detail=str(exc),
+                    detail=_os_reason(exc),
                 )
             )
             continue
+        if dir_overflow:
+            refusals.append(
+                Refusal(
+                    path=cur_rel or ".",
+                    member_chain=[],
+                    error_type=CapExceededError.__name__,
+                    reason="max_dir_entries_exceeded",
+                    detail=f"Directory entry cap ({active_caps.max_dir_entries}) exceeded.",
+                )
+            )
+            continue
+        tree_entries += len(listed)
+        if tree_entries > active_caps.max_tree_entries:
+            refusals.append(
+                Refusal(
+                    path=cur_rel or ".",
+                    member_chain=[],
+                    error_type=CapExceededError.__name__,
+                    reason="max_tree_entries_exceeded",
+                    detail=f"Tree entry cap ({active_caps.max_tree_entries}) exceeded.",
+                )
+            )
+            break
+        entries = sorted(listed, key=lambda e: e.name)
 
         subdirs_to_push: list[tuple[Path, str, int]] = []
         for entry in entries:
@@ -248,7 +327,7 @@ def scan_tree(
                         member_chain=[],
                         error_type=UnsafeFileError.__name__,
                         reason="stat_failed",
-                        detail=str(exc),
+                        detail=_os_reason(exc),
                     )
                 )
                 continue
@@ -317,14 +396,8 @@ def scan_tree(
                     remaining_total,
                 )
                 bytes_read += len(raw)
-                file_findings = inspect_payload_bytes(
-                    rel_path=entry_rel,
-                    filename=entry.name,
-                    member_chain=[],
-                    data=raw,
-                    t_clock=clock_dt,
-                    caps=active_caps,
-                    depth=0,
+                file_findings = _inspect_guarded(
+                    entry_rel, entry.name, raw, clock_dt, active_caps
                 )
                 findings.extend(file_findings)
             except CapExceededError as exc:

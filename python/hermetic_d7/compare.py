@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,38 @@ def build_unified_diff(
     return True, "\n".join(diff_lines), truncated
 
 
+def _report_path(path: str | Path | None) -> str:
+    """Name an input artifact by its final component only, never its host location."""
+    if path is None:
+        return ""
+    return Path(path).name
+
+
+def _scrub_host_paths(
+    text: str,
+    shipped_path: str | Path | None,
+    rebuilt_path: str | Path | None,
+) -> str:
+    """Replace every spelling of the input locations in an error message."""
+    replacements: list[tuple[str, str]] = []
+    for label, path in (("<shipped>", shipped_path), ("<rebuilt>", rebuilt_path)):
+        if path is None:
+            continue
+        # Only absolute spellings: a short relative name would match ordinary words.
+        spellings = {os.path.abspath(str(path))}
+        try:
+            spellings.add(str(Path(path).resolve()))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        replacements.extend(
+            (spelling, label) for spelling in spellings if spelling and spelling != "/"
+        )
+    # Longest first so a prefix never pre-empts a longer spelling.
+    for spelling, label in sorted(replacements, key=lambda item: (-len(item[0]), item[0])):
+        text = text.replace(spelling, label)
+    return text
+
+
 def build_error_report(
     shipped_path: str | Path | None,
     rebuilt_path: str | Path | None,
@@ -94,7 +127,7 @@ def build_error_report(
         "content_differences": [],
         "detector": "D7",
         "error": {
-            "message": str(error),
+            "message": _scrub_host_paths(str(error), shipped_path, rebuilt_path),
             "type": type(error).__name__,
         },
         "gating": False,
@@ -102,8 +135,8 @@ def build_error_report(
         "only_in_rebuilt": [],
         "only_in_shipped": [],
         "policy": AUDIT_POLICY_STATEMENT,
-        "rebuilt_path": str(rebuilt_path) if rebuilt_path is not None else "",
-        "shipped_path": str(shipped_path) if shipped_path is not None else "",
+        "rebuilt_path": _report_path(rebuilt_path),
+        "shipped_path": _report_path(shipped_path),
         "summary": {
             "content_differences_count": 0,
             "only_in_rebuilt_count": 0,
@@ -213,8 +246,8 @@ def compare_artifacts(
             "only_in_rebuilt": only_in_rebuilt,
             "only_in_shipped": only_in_shipped,
             "policy": AUDIT_POLICY_STATEMENT,
-            "rebuilt_path": str(rebuilt_path),
-            "shipped_path": str(shipped_path),
+            "rebuilt_path": _report_path(rebuilt_path),
+            "shipped_path": _report_path(shipped_path),
             "summary": {
                 "content_differences_count": len(content_differences),
                 "only_in_rebuilt_count": len(only_in_rebuilt),

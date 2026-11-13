@@ -525,3 +525,75 @@ def test_cli_exit_codes_and_determinism(tmp_path: Path) -> None:
     assert json.loads(res_bad_cli.stdout)["verdict"] == "error"
 
 
+
+
+def test_oversized_tar_extended_header_refused(tmp_path: Path) -> None:
+    """A pax header larger than the cap is refused before tarfile buffers it."""
+    clean_tar = _write_tar(
+        tmp_path / "clean.tar",
+        [("pkg/ok.py", b"x = 1\n", 1_700_000_000, 0o644)],
+    )
+    pax_tar = tmp_path / "pax.tar"
+    with tarfile.open(pax_tar, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo(name="pkg/ok.py")
+        ti.size = len(b"x = 1\n")
+        ti.mtime = 1_700_000_000
+        ti.mode = 0o644
+        ti.pax_headers = {"comment": "c" * (2 * 1024 * 1024)}
+        tf.addfile(ti, io.BytesIO(b"x = 1\n"))
+
+    report = compare_artifacts(pax_tar, clean_tar)
+    assert report["verdict"] == "error"
+    assert report["error"]["type"] == "InvalidArtifactError"
+    from hermetic_d7.normalise import MAX_TAR_EXTENDED_HEADER_BYTES
+
+    assert MAX_TAR_EXTENDED_HEADER_BYTES < 2 * 1024 * 1024
+
+
+def test_directory_hardlink_refused(tmp_path: Path) -> None:
+    """Hardlinked files in a directory artifact are refused, as documented."""
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    shipped = tmp_path / "shipped"
+    shipped.mkdir()
+    os.link(outside, shipped / "leak.txt")
+    rebuilt = tmp_path / "rebuilt"
+    rebuilt.mkdir()
+    (rebuilt / "leak.txt").write_text("other\n", encoding="utf-8")
+
+    report = compare_artifacts(shipped, rebuilt)
+    assert report["verdict"] == "error"
+    assert report["error"]["type"] == "SecurityViolationError"
+    assert "secret" not in format_report_json(report)
+
+
+def test_directory_member_cap_applies_while_listing(tmp_path: Path) -> None:
+    """One directory with more entries than the member cap is refused."""
+    shipped = tmp_path / "wide"
+    shipped.mkdir()
+    for i in range(6):
+        (shipped / f"f{i}.txt").write_text("x", encoding="utf-8")
+    report = compare_artifacts(shipped, shipped, limits=ResourceLimits(max_archive_members=5))
+    assert report["verdict"] == "error"
+    assert report["error"]["type"] == "ResourceLimitError"
+
+
+def test_reports_never_contain_absolute_host_paths(tmp_path: Path) -> None:
+    """Reports name inputs by final component and scrub host locations from errors."""
+    shipped = tmp_path / "shipped_dir"
+    shipped.mkdir()
+    os.symlink(tmp_path / "nowhere", shipped / "dangling")
+    rebuilt = tmp_path / "rebuilt_dir"
+    rebuilt.mkdir()
+
+    error_report = compare_artifacts(shipped, rebuilt)
+    assert error_report["verdict"] == "error"
+    text = format_report_json(error_report)
+    assert str(tmp_path) not in text
+    assert error_report["shipped_path"] == "shipped_dir"
+
+    (shipped / "dangling").unlink()
+    ok_report = compare_artifacts(shipped, rebuilt)
+    assert ok_report["verdict"] == "identical"
+    assert str(tmp_path) not in format_report_json(ok_report)
+    assert ok_report["rebuilt_path"] == "rebuilt_dir"
