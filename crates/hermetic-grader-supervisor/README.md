@@ -39,11 +39,11 @@ Strict decoding preserves all valid records prior to any stream corruption and m
 ## Result Disk Format (`HGRD`, Exact 1 MiB)
 
 * `0..4`: Magic `b"HGRD"`
-* `4..6`: Version `1u16` (LE)
-* `6..8`: Flags `0u16` (LE)
-* `8..12`: Payload length `u32` (LE)
+* `4..6`: Version `1u16` (big-endian, as in hermetic-grader-result)
+* `6..8`: Flags `0u16` (big-endian)
+* `8..12`: Payload length `u32` (big-endian)
 * `12..44`: SHA-256 digest of the canonical JSON payload
-* `44..(44 + length)`: Compact canonical JSON payload (`run`, `supervisor`, `tests`, `variant_set`)
+* `44..(44 + length)`: Compact canonical JSON payload, keys in the host schema order (`run`, `variant_set`, `tests`, `supervisor`), exactly as `hermetic-grader-result` re-serializes it
 * `(44 + length)..1_048_576`: Zero padding (`0x00`)
 
 ## Future Privileged Hardening

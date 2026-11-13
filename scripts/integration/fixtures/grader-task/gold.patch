@@ -1,0 +1,8 @@
+--- a/calc.py
++++ b/calc.py
+@@ -6,4 +6,4 @@
+ 
+ 
+ def add(a, b):
+-    return a - b
++    return a + b

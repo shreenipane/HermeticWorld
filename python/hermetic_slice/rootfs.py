@@ -1206,7 +1206,10 @@ def build_rootfs(
             path_env = f"{path_env}:/sbin:/usr/sbin"
         mke2fs_env = {
             "PATH": path_env,
-            "LANG": "C",
+            # UTF-8, not plain C: mke2fs reads the PAX tar through libarchive, which refuses
+            # any non-ASCII name or link target under an ASCII locale (real images ship such
+            # names, e.g. CA certificates). The image bytes do not depend on the locale.
+            "LANG": "C.UTF-8",
             "TZ": "UTC",
             "MKE2FS_CONFIG": str(config_path),
             "SOURCE_DATE_EPOCH": str(source_date_epoch),
