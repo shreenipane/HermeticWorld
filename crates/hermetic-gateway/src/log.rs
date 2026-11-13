@@ -118,9 +118,11 @@ impl HostLogger {
     pub fn log(&self, entry: &HostLogEntry) -> bool {
         let mut entry = entry.clone();
         if let Some(body) = entry.original_error_body.as_mut() {
+            *body = self.redact(std::mem::take(body));
             cut(body, MAX_LOGGED_FIELD_BYTES);
         }
         for v in entry.dropped_headers.values_mut() {
+            *v = self.redact(std::mem::take(v));
             cut(v, MAX_LOGGED_FIELD_BYTES);
         }
         let json_line = match serde_json::to_string(&entry) {

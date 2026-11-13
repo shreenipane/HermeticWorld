@@ -28,7 +28,10 @@ where
 {
     inner: SequentialReaderInner<R>,
     next: Sender<R>,
+    on_start: Option<StartCallback<R>>,
 }
+
+type StartCallback<R> = Box<dyn FnOnce(&mut R) + Send>;
 
 enum SequentialReaderInner<R>
 where
@@ -85,11 +88,13 @@ impl<R: Read + Send> Iterator for SequentialReaderBuilder<R> {
             SequentialReaderBuilderInner::First(reader) => Some(SequentialReader {
                 inner: SequentialReaderInner::MyTurn(reader),
                 next: tx,
+                on_start: None,
             }),
 
             SequentialReaderBuilderInner::NotFirst(previous) => Some(SequentialReader {
                 inner: SequentialReaderInner::Waiting(previous),
                 next: tx,
+                on_start: None,
             }),
         }
     }
@@ -110,17 +115,30 @@ impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
     }
 }
 
+impl<R: Read + Send> SequentialReader<R> {
+    /// Runs once, after acquiring the stream and before reading its first byte.
+    pub(crate) fn on_start(&mut self, callback: impl FnOnce(&mut R) + Send + 'static) {
+        self.on_start = Some(Box::new(callback));
+    }
+}
+
 impl<R: Read + Send> Read for SequentialReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        let mut reader = match self.inner {
-            SequentialReaderInner::MyTurn(ref mut reader) => return reader.read(buf),
-            SequentialReaderInner::Waiting(ref mut recv) => recv.recv().unwrap(),
-            SequentialReaderInner::Empty => unreachable!(),
-        };
-
-        let result = reader.read(buf);
-        self.inner = SequentialReaderInner::MyTurn(reader);
-        result
+        if let SequentialReaderInner::Waiting(recv) = &self.inner {
+            let reader = recv.recv().map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted, "previous reader disconnected"
+            ))?;
+            self.inner = SequentialReaderInner::MyTurn(reader);
+        }
+        match &mut self.inner {
+            SequentialReaderInner::MyTurn(reader) => {
+                if let Some(callback) = self.on_start.take() {
+                    callback(reader);
+                }
+                reader.read(buf)
+            }
+            _ => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "reader unavailable")),
+        }
     }
 }
 

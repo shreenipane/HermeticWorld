@@ -145,7 +145,7 @@ pub struct RequestDeadlines {
     pub body: Option<Duration>,
 }
 
-/// HERMETIC PATCH: decrements the open-connection count when a connection task ends.
+/// HERMETIC PATCH: decrements the count after the last connection stream is dropped.
 struct ConnectionSlot(Arc<AtomicUsize>);
 
 impl Drop for ConnectionSlot {
@@ -375,10 +375,10 @@ impl Server {
                             let _ = sock.shutdown(Shutdown::Both);
                             continue;
                         }
-                        let slot = ConnectionSlot(open_connections.clone());
+                        let slot = Arc::new(ConnectionSlot(open_connections.clone()));
                         // HERMETIC PATCH: duplicate socket handle for disconnect detection.
                         let probe = sock.try_clone().ok();
-                        let (read_closable, write_closable) = match ssl {
+                        let (mut read_closable, mut write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
                             Some(ref ssl) => {
@@ -397,6 +397,8 @@ impl Server {
                             #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
                             Some(ref _ssl) => unreachable!(),
                         };
+                        read_closable.hold_connection_slot(slot.clone());
+                        write_closable.hold_connection_slot(slot.clone());
 
                         Ok((
                             ClientConnection::new(

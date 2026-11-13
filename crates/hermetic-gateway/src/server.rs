@@ -624,14 +624,6 @@ impl GatewayServer {
         };
         // The vendored tiny_http enforces REQUEST_BODY_DEADLINE on these reads.
         let body_result = read_body_bounded(request.as_reader(), &mut reservation);
-        if body_result.is_ok() {
-            // Body complete: lift the read deadline and clear the socket's read timeout so the
-            // disconnect watcher's peek is not cut short.
-            request.set_read_deadline(None);
-            if let Some(p) = peer.as_ref() {
-                let _ = p.set_read_timeout(None);
-            }
-        }
         let body_bytes = match body_result {
             Ok(b) => b,
             Err(BodyReadError::TooLarge) => {

@@ -136,6 +136,8 @@ pub struct RefinedTcpStream {
     read_deadline: Option<DeadlineCell>,
     // HERMETIC PATCH: absolute write deadline applied before every write (write half only).
     write_deadline: Option<DeadlineCell>,
+    // The socket remains live in queued requests and extracted response writers.
+    connection_slot: Option<Arc<crate::ConnectionSlot>>,
 }
 
 impl RefinedTcpStream {
@@ -153,6 +155,7 @@ impl RefinedTcpStream {
             close_write: false,
             read_deadline: None,
             write_deadline: None,
+            connection_slot: None,
         };
 
         let write = RefinedTcpStream {
@@ -161,9 +164,14 @@ impl RefinedTcpStream {
             close_write: true,
             read_deadline: None,
             write_deadline: None,
+            connection_slot: None,
         };
 
         (read, write)
+    }
+
+    pub(crate) fn hold_connection_slot(&mut self, slot: Arc<crate::ConnectionSlot>) {
+        self.connection_slot = Some(slot);
     }
 
     /// Returns true if this struct wraps around a secure connection.
