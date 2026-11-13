@@ -1,595 +1,701 @@
-"""Tests for hermetic_slice.e3 corpus generation and accuracy harness."""
+
+"""Comprehensive pytest suite for Hermetic World Experiment E3.
+
+Every numbered requirement (1 through 6) has dedicated hand-written fixtures
+and assertions that fail if that requirement is violated.
+"""
 
 from __future__ import annotations
 
-import difflib
+import io
 import json
-from pathlib import Path
-import shutil
-import sqlite3
+import os
+import random
 import subprocess
 import sys
-import tarfile
+from pathlib import Path
 from typing import Any
-import zipfile
 
 import pytest
 
-from hermetic_slice.__main__ import main
-from hermetic_slice.e3 import (
-    SYNTHETIC_MODULE_LINES,
-    build_corpus,
-    compute_dir_files_sha256,
-    generate_synthetic_tasks,
-    parse_patch_hunks,
-    parse_patch_touched_files,
-    run_e3,
-    wilson_interval,
+import hermetic_e3
+import hermetic_e3.match as match_mod
+from hermetic_e3 import (
+    CliArgumentError,
+    DuplicateKeyError,
+    FileSecurityError,
+    Finding,
+    HermeticE3Error,
+    JsonFormatError,
+    Leak,
+    MAX_FILE_BYTES,
+    RangeError,
+    SchemaValidationError,
+    SizeLimitError,
+    bootstrap_confidence_interval,
+    compute_all_metrics,
+    evaluate,
+    evaluate_exit_criterion,
+    load_findings,
+    load_ground_truth,
+    match_findings,
+    parse_findings,
+    parse_ground_truth,
+    ranges_overlap,
 )
-from hermetic_slice.gitutil import run_git
+from hermetic_e3.__main__ import run_cli
 
 
-def _create_fake_task(tasks_dir: Path, base_trees_dir: Path, task_id: str = "fake_task_1") -> tuple[Path, Path]:
-    """Create a tiny fake task with a 3-file repo and a real-format gold patch."""
-    td = tasks_dir / task_id
-    bd = base_trees_dir / task_id
-    staging = td / "staging"
-    agent = td / "agent"
+def _assert_no_floats_anywhere(value: Any) -> None:
+    """Recursively verify that no float appears anywhere in stored results."""
+    assert not isinstance(value, float), f"Unexpected float found: {value!r}"
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _assert_no_floats_anywhere(k)
+            _assert_no_floats_anywhere(v)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_no_floats_anywhere(item)
 
-    td.mkdir(parents=True, exist_ok=True)
-    bd.mkdir(parents=True, exist_ok=True)
-    staging.mkdir(parents=True, exist_ok=True)
-    agent.mkdir(parents=True, exist_ok=True)
 
-    # 3-file repo in base tree
-    app_py_content = (
-        "def get_version():\n"
-        '    return "1.0.0"\n'
-        "\n"
-        "def calculate_discount(price: float) -> float:\n"
-        "    # default discount rate\n"
-        "    rate = 0.10\n"
-        "    return price * rate\n"
-        "\n"
-        "def format_output(val: float) -> str:\n"
-        '    return f"${val:.2f}"\n'
-    )
-    config_py_content = "DEBUG = False\nTIMEOUT = 30\nSERVICE_NAME = 'sample_service'\n"
-    utils_py_content = (
-        "def add(a: int, b: int) -> int:\n"
-        "    return a + b\n"
-        "\n"
-        "def subtract(a: int, b: int) -> int:\n"
-        "    return a - b\n"
-    )
+def _write_json(path: Path, data: Any) -> Path:
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
 
-    (bd / "app.py").write_text(app_py_content, encoding="utf-8", newline="")
-    (bd / "config.py").write_text(config_py_content, encoding="utf-8", newline="")
-    (bd / "utils.py").write_text(utils_py_content, encoding="utf-8", newline="")
 
-    # Real-format gold patch modifying app.py
-    gold_patch = (
-        "diff --git a/app.py b/app.py\n"
-        "--- a/app.py\n"
-        "+++ b/app.py\n"
-        "@@ -4,4 +4,4 @@\n"
-        " def calculate_discount(price: float) -> float:\n"
-        "-    # default discount rate\n"
-        "-    rate = 0.10\n"
-        "+    # improved discount rate\n"
-        "+    rate = 0.15\n"
-        "     return price * rate\n"
-    )
-    (staging / "gold.patch").write_text(gold_patch, encoding="utf-8", newline="")
+# ---------------------------------------------------------------------------
+# Requirement 1: Inputs, caps, strict schema, duplicate keys, unknown fields,
+#                symlink & non-regular file refusal
+# ---------------------------------------------------------------------------
 
-    test_patch = (
-        "diff --git a/test_app.py b/test_app.py\n"
-        "--- a/test_app.py\n"
-        "+++ b/test_app.py\n"
-        "@@ -1,2 +1,4 @@\n"
-        "+def test_discount():\n"
-        "+    assert calculate_discount(100.0) == 15.0\n"
-    )
-    (staging / "test.patch").write_text(test_patch, encoding="utf-8", newline="")
-    (staging / "hints.txt").write_text("Check discount rate calculation.\n", encoding="utf-8", newline="")
-    (agent / "problem_statement.md").write_text("Discount calculation should be 15%.\n", encoding="utf-8", newline="")
 
-    task_json = {
-        "instance_id": task_id,
-        "base_commit": "abcdef123456",
-        "repo": "example/fake",
-        "cutoffs": {
-            "t_world": "2026-01-01T00:00:00Z",
-            "t_clock": "2026-01-01T00:00:00Z",
-            "discarded": [],
+def test_req1_valid_ground_truth_and_findings_load(tmp_path: Path) -> None:
+    truth_file = _write_json(
+        tmp_path / "truth.json",
+        {
+            "leaks": [
+                {
+                    "id": "L-001",
+                    "task": "task-alpha",
+                    "path": "src/app.py",
+                    "line_start": 10,
+                    "line_end": 12,
+                    "detector_hint": "git-history",
+                    "kind": "seeded",
+                },
+                {
+                    "id": "L-002",
+                    "task": "task-alpha",
+                    "path": "src/cfg.py",
+                    "line_start": 5,
+                    "line_end": 5,
+                    "detector_hint": None,
+                    "kind": "real",
+                },
+            ]
         },
-    }
-    (td / "task.json").write_text(json.dumps(task_json, indent=2) + "\n", encoding="utf-8")
-
-    return td, bd
-
-
-def test_wilson_interval_hand_computed() -> None:
-    """Check Wilson interval against hand-computed values and boundary conditions."""
-    # k=95, n=100
-    low, high = wilson_interval(95, 100)
-    assert abs(low - 0.8882) < 1e-3
-    assert abs(high - 0.9785) < 1e-3
-
-    # k=1, n=3
-    low, high = wilson_interval(1, 3)
-    assert abs(low - 0.0615) < 1e-3
-    assert abs(high - 0.7923) < 1e-3
-
-    # k=10, n=10
-    low, high = wilson_interval(10, 10)
-    assert abs(low - 0.7225) < 1e-3
-    assert abs(high - 1.0) < 1e-4
-
-    # k=0, n=10
-    low, high = wilson_interval(0, 10)
-    assert abs(low - 0.0) < 1e-4
-    assert abs(high - 0.2775) < 1e-3
-
-    # n=0
-    assert wilson_interval(0, 0) == (0.0, 1.0)
-
-
-def test_synthetic_tasks_properties(tmp_path: Path) -> None:
-    """Check synthetic deletion-only and one-character tasks produce exact patch deltas."""
-    synth_dir = tmp_path / "synthetic"
-    task_ids = generate_synthetic_tasks(synth_dir)
-
-    assert len(task_ids) == 6
-    del_tasks = [t for t in task_ids if "del" in t]
-    char_tasks = [t for t in task_ids if "char" in t]
-
-    assert len(del_tasks) == 3
-    assert len(char_tasks) == 3
-
-    # Check realistic generated Python modules of about 300 lines
-    assert 250 <= len(SYNTHETIC_MODULE_LINES) <= 350
-
-    # Check deletion-only tasks
-    for dtid in del_tasks:
-        td = synth_dir / dtid
-        gold_patch = (td / "staging" / "gold.patch").read_text(encoding="utf-8")
-        removed_lines = [
-            line for line in gold_patch.splitlines() if line.startswith("-") and not line.startswith("---")
-        ]
-        added_lines = [line for line in gold_patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
-        assert len(removed_lines) == 1, f"Task {dtid} must have exactly one removed line"
-        assert len(added_lines) == 0, f"Task {dtid} must have 0 added lines"
-
-    # Check one-character tasks
-    for ctid in char_tasks:
-        td = synth_dir / ctid
-        gold_patch = (td / "staging" / "gold.patch").read_text(encoding="utf-8")
-        removed_lines = [
-            line for line in gold_patch.splitlines() if line.startswith("-") and not line.startswith("---")
-        ]
-        added_lines = [line for line in gold_patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
-        assert len(removed_lines) == 1, f"Task {ctid} must have exactly one removed line"
-        assert len(added_lines) == 1, f"Task {ctid} must have exactly one added line"
-
-        old_l = removed_lines[0][1:]
-        new_l = added_lines[0][1:]
-        assert len(old_l) == len(new_l), "One character fix must preserve line length"
-        diff_count = sum(1 for c1, c2 in zip(old_l, new_l) if c1 != c2)
-        assert diff_count == 1, f"Task {ctid} must differ by exactly 1 character"
-
-
-def test_corpus_build_variants_and_determinism(tmp_path: Path) -> None:
-    """Build corpus from tiny fake task and check variants, seed determinism, p01, p04."""
-    tasks_dir = tmp_path / "tasks"
-    base_trees_dir = tmp_path / "base_trees"
-    out_dir_1 = tmp_path / "corpus_seed42_a"
-    out_dir_2 = tmp_path / "corpus_seed42_b"
-    out_dir_3 = tmp_path / "corpus_seed99"
-
-    task_id = "fake_task_1"
-    td, bd = _create_fake_task(tasks_dir, base_trees_dir, task_id)
-
-    # 1. Build with seed 42 (run A)
-    build_corpus(tasks_dir, base_trees_dir, out_dir_1, seed=42)
-
-    # Check every variant exists with the right label
-    expected_variants = {
-        "p01_postfix_file": ("gate", "positive"),
-        "p02_reformatted": ("gate", "positive"),
-        "p03_patch_file": ("gate", "positive"),
-        "p04_regenerated_diff": ("gate", "positive"),
-        "p05_hunk_in_prose": ("gate", "positive"),
-        "p06_zip": ("gate", "positive"),
-        "p07_tar_gz": ("gate", "positive"),
-        "p08_nested": ("gate", "positive"),
-        "p09_sqlite": ("gate", "positive"),
-        "p10_hidden_tests": ("gate", "positive"),
-        "p11_pyc": ("gate", "positive"),
-        "n01_prefix_files": ("clean", "negative"),
-        "n02_base_sample": ("clean", "negative"),
-        "n03_cross_task": ("clean", "negative"),
-    }
-
-    cases_dir_1 = out_dir_1 / "cases"
-    for var_name, (exp_call, exp_kind) in expected_variants.items():
-        case_id = f"{task_id}__{var_name}"
-        case_path = cases_dir_1 / case_id
-        assert case_path.is_dir(), f"Case directory for variant {var_name} missing"
-        meta = json.loads((case_path / "case.json").read_text(encoding="utf-8"))
-        assert meta["expected"] == exp_call, f"Variant {var_name} expected {exp_call}, got {meta['expected']}"
-        assert meta["kind"] == exp_kind, f"Variant {var_name} kind {exp_kind}, got {meta['kind']}"
-        assert (case_path / "root").is_dir()
-
-    # 2. Check identical corpus with same seed
-    build_corpus(tasks_dir, base_trees_dir, out_dir_2, seed=42)
-    corpus_1_text = (out_dir_1 / "corpus.json").read_text(encoding="utf-8")
-    corpus_2_text = (out_dir_2 / "corpus.json").read_text(encoding="utf-8")
-    assert corpus_1_text == corpus_2_text, "Corpus json must be byte-identical for identical seed"
-
-    # 3. Check different seed gives a different n02 sample
-    build_corpus(tasks_dir, base_trees_dir, out_dir_3, seed=99)
-    n02_case_1 = cases_dir_1 / f"{task_id}__n02_base_sample" / "root"
-    n02_case_3 = (out_dir_3 / "cases") / f"{task_id}__n02_base_sample" / "root"
-    files_1 = sorted([p.name for p in n02_case_1.iterdir()])
-    files_3 = sorted([p.name for p in n02_case_3.iterdir()])
-    assert files_1 != files_3, f"Different seed must yield different n02 sample (got {files_1} vs {files_3})"
-
-    # 4. Check p01 equals patch applied
-    p01_root = cases_dir_1 / f"{task_id}__p01_postfix_file" / "root"
-    p01_app = (p01_root / "app.py").read_text(encoding="utf-8")
-    assert "rate = 0.15" in p01_app
-    assert "rate = 0.10" not in p01_app
-
-    # 5. Check p04 is a valid diff that git apply --check accepts against the base
-    p04_root = cases_dir_1 / f"{task_id}__p04_regenerated_diff" / "root"
-    diff_file = p04_root / "fix.diff"
-    assert diff_file.exists()
-    diff_text = diff_file.read_text(encoding="utf-8")
-    assert "--- a/app.py" in diff_text
-    assert "+++ b/app.py" in diff_text
-
-    # Test git apply --check in a copy of base tree
-    with_base_copy = tmp_path / "base_copy"
-    shutil.copytree(bd, with_base_copy)
-    shutil.copy2(diff_file, with_base_copy / "fix.diff")
-    proc = run_git(["apply", "--check", "fix.diff"], cwd=with_base_copy)
-    assert proc == b""
-
-    # Also check sqlite content in p09
-    p09_db = cases_dir_1 / f"{task_id}__p09_sqlite" / "root" / "leak.db"
-    assert p09_db.exists()
-    conn = sqlite3.connect(str(p09_db))
-    rows = conn.execute("SELECT path, content FROM leaks").fetchall()
-    conn.close()
-    assert len(rows) == 1
-    assert rows[0][0] == "app.py"
-    assert "rate = 0.15" in rows[0][1]
-
-
-def test_e3_run_against_stub_sealcheck(tmp_path: Path) -> None:
-    """Run e3-run against a stub sealcheck python script and verify TP, FP, TN, FN and Wilson intervals."""
-    tasks_dir = tmp_path / "tasks"
-    base_trees_dir = tmp_path / "base_trees"
-    corpus_dir = tmp_path / "corpus"
-    out_dir = tmp_path / "run_out"
-
-    task_id = "eval_task"
-    _create_fake_task(tasks_dir, base_trees_dir, task_id)
-    build_corpus(tasks_dir, base_trees_dir, corpus_dir, seed=42)
-
-    # Write a stub sealcheck script that produces canned JSON
-    stub_sealcheck = tmp_path / "stub_sealcheck.py"
-    stub_content = (
-        "import argparse, json, sys\n"
-        "from pathlib import Path\n"
-        "\n"
-        "parser = argparse.ArgumentParser()\n"
-        "subparsers = parser.add_subparsers(dest='subcommand')\n"
-        "scan_p = subparsers.add_parser('scan')\n"
-        "scan_p.add_argument('--task')\n"
-        "scan_p.add_argument('--base-tree')\n"
-        "scan_p.add_argument('--root', required=True)\n"
-        "scan_p.add_argument('--root-visibility')\n"
-        "scan_p.add_argument('--format')\n"
-        "args = parser.parse_args()\n"
-        "\n"
-        "case_name = Path(args.root).parent.name\n"
-        "\n"
-        "# Deterministic behavior by case pattern:\n"
-        "if 'p01_postfix_file' in case_name:\n"
-        "    # Gate detection (TP for positive)\n"
-        "    findings = [{'detector': 'D2', 'severity': 'gate', 'visibility': 'agent_visible', 'channel': 'file'}]\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': findings}))\n"
-        "    sys.exit(2)\n"
-        "elif 'p03_patch_file' in case_name:\n"
-        "    # Gate detection (TP for positive)\n"
-        "    findings = [{'detector': 'D0', 'severity': 'gate', 'visibility': 'agent_visible', 'channel': 'diff'}]\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': findings}))\n"
-        "    sys.exit(2)\n"
-        "elif 'p04_regenerated_diff' in case_name:\n"
-        "    # Clean call on positive -> False Negative\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': []}))\n"
-        "    sys.exit(0)\n"
-        "elif 'n01_prefix_files' in case_name:\n"
-        "    # Clean call on negative -> True Negative\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': []}))\n"
-        "    sys.exit(0)\n"
-        "elif 'n02_base_sample' in case_name:\n"
-        "    # Gate finding on negative -> False Positive\n"
-        "    findings = [{'detector': 'D3b', 'severity': 'gate', 'visibility': 'agent_visible', 'channel': 'pkg'}]\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': findings}))\n"
-        "    sys.exit(2)\n"
-        "elif 'n03_cross_task' in case_name:\n"
-        "    # Crash simulation on negative -> Counts as error against precision\n"
-        "    sys.stderr.write('Fatal memory error in sealcheck!\\n')\n"
-        "    sys.exit(1)\n"
-        "elif 'p05_hunk_in_prose' in case_name:\n"
-        "    # Crash simulation on positive -> Counts as error against recall\n"
-        "    sys.stderr.write('Fatal crash!\\n')\n"
-        "    sys.exit(1)\n"
-        "else:\n"
-        "    # Clean default\n"
-        "    print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': []}))\n"
-        "    sys.exit(0)\n"
     )
-    stub_sealcheck.write_text(stub_content, encoding="utf-8")
+    findings_file = _write_json(
+        tmp_path / "findings.json",
+        {
+            "findings": [
+                {
+                    "task": "task-alpha",
+                    "detector": "git-history",
+                    "path": "src/app.py",
+                    "line_start": 12,
+                    "line_end": 15,
+                    "severity": "gate",
+                }
+            ]
+        },
+    )
 
-    # Run e3 harness
-    run_e3(corpus_dir, tasks_dir, base_trees_dir, stub_sealcheck, out_dir)
-
-    # Verify results.jsonl and metrics.json
-    results_jsonl = out_dir / "results.jsonl"
-    metrics_json = out_dir / "metrics.json"
-    metrics_md = out_dir / "metrics.md"
-
-    assert results_jsonl.exists()
-    assert metrics_json.exists()
-    assert metrics_md.exists()
-
-    metrics = json.loads(metrics_json.read_text(encoding="utf-8"))
-    assert "overall" in metrics
-    assert "per_variant" in metrics
-    assert "synthetic" in metrics
-    assert "per_task" in metrics
-
-    # Per variant assertions
-    pv = metrics["per_variant"]
-    assert pv["p01_postfix_file"]["tp"] > 0
-    assert pv["n01_prefix_files"]["tn"] > 0
-    assert pv["n02_base_sample"]["fp"] > 0
-    assert pv["n03_cross_task"]["errors"] > 0
-    assert pv["n03_cross_task"]["errors_negative"] > 0
-    assert pv["p05_hunk_in_prose"]["errors"] > 0
-    assert pv["p05_hunk_in_prose"]["errors_positive"] > 0
-    # The stub reports only D0 for p03: D0 is not scored per case, so p03 is a miss,
-    # and the task is listed once under d0_gate_tasks.
-    assert pv["p03_patch_file"]["tp"] == 0
-    assert metrics["d0_gate_tasks"]
-
-    # Hand-computed Wilson interval verification
-    ov = metrics["overall"]
-    calc_prec_low, calc_prec_high = wilson_interval(ov["tp"], ov["tp"] + ov["fp"])
-    calc_rec_low, calc_rec_high = wilson_interval(ov["tp"], ov["tp"] + ov["fn"])
-
-    assert abs(ov["precision_ci"][0] - round(calc_prec_low, 4)) < 1e-4
-    assert abs(ov["precision_ci"][1] - round(calc_prec_high, 4)) < 1e-4
-    assert abs(ov["recall_ci"][0] - round(calc_rec_low, 4)) < 1e-4
-    assert abs(ov["recall_ci"][1] - round(calc_rec_high, 4)) < 1e-4
+    leaks = load_ground_truth(truth_file)
+    findings = load_findings(findings_file)
+    assert len(leaks) == 2
+    assert leaks[0].id == "L-001"
+    assert leaks[1].detector_hint is None
+    assert len(findings) == 1
+    assert findings[0].severity == "gate"
 
 
-def test_blind_labels_read_only_after_scanning(tmp_path: Path) -> None:
-    """Verify that blind labels are read only after every blind case has been scanned."""
-    tasks_dir = tmp_path / "tasks"
-    base_trees_dir = tmp_path / "base_trees"
-    corpus_dir = tmp_path / "corpus"
-    blind_dir = tmp_path / "blind"
-    out_dir = tmp_path / "out"
+def test_req1_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    dup_top = tmp_path / "dup_top.json"
+    dup_top.write_text('{"leaks": [], "leaks": []}', encoding="utf-8")
+    with pytest.raises(DuplicateKeyError):
+        load_ground_truth(dup_top)
 
-    task_id = "t_blind"
-    _create_fake_task(tasks_dir, base_trees_dir, task_id)
-    build_corpus(tasks_dir, base_trees_dir, corpus_dir, seed=42)
+    dup_nested = tmp_path / "dup_nested.json"
+    dup_nested.write_text(
+        '{"findings": [{"task": "t1", "task": "t2", "detector": "d", '
+        '"path": "a.py", "line_start": 1, "line_end": 2, "severity": "gate"}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(DuplicateKeyError):
+        load_findings(dup_nested)
 
-    # Set up blind cases
-    blind_cases_dir = blind_dir / "cases"
-    b_case_1 = blind_cases_dir / f"{task_id}__blind_case_1" / "root"
-    b_case_2 = blind_cases_dir / f"{task_id}__blind_case_2" / "root"
-    b_case_1.mkdir(parents=True, exist_ok=True)
-    b_case_2.mkdir(parents=True, exist_ok=True)
-    (b_case_1 / "leak.txt").write_text("leak 1", encoding="utf-8")
-    (b_case_2 / "leak.txt").write_text("leak 2", encoding="utf-8")
 
-    labels_file = blind_dir / "labels.json"
-    labels_file.write_text(
-        json.dumps(
+def test_req1_rejects_unknown_and_missing_fields(tmp_path: Path) -> None:
+    unknown_top = _write_json(tmp_path / "u1.json", {"leaks": [], "extra": 1})
+    with pytest.raises(SchemaValidationError):
+        load_ground_truth(unknown_top)
+
+    unknown_leak_field = _write_json(
+        tmp_path / "u2.json",
+        {
+            "leaks": [
+                {
+                    "id": "L1",
+                    "task": "t1",
+                    "path": "a.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "detector_hint": None,
+                    "kind": "real",
+                    "unexpected": "nope",
+                }
+            ]
+        },
+    )
+    with pytest.raises(SchemaValidationError):
+        load_ground_truth(unknown_leak_field)
+
+    missing_finding_field = _write_json(
+        tmp_path / "m1.json",
+        {
+            "findings": [
+                {
+                    "task": "t1",
+                    "detector": "d1",
+                    "path": "a.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                }
+            ]
+        },
+    )
+    with pytest.raises(SchemaValidationError):
+        load_findings(missing_finding_field)
+
+
+def test_req1_rejects_invalid_types_and_bounds(tmp_path: Path) -> None:
+    # Boolean instead of integer for line_start must be rejected.
+    bool_line = _write_json(
+        tmp_path / "bool_line.json",
+        {
+            "leaks": [
+                {
+                    "id": "L1",
+                    "task": "t1",
+                    "path": "a.py",
+                    "line_start": True,
+                    "line_end": 2,
+                    "detector_hint": None,
+                    "kind": "real",
+                }
+            ]
+        },
+    )
+    with pytest.raises(SchemaValidationError):
+        load_ground_truth(bool_line)
+
+    # line_end < line_start must be rejected.
+    inverted_range = _write_json(
+        tmp_path / "inv.json",
+        {
+            "findings": [
+                {
+                    "task": "t1",
+                    "detector": "d1",
+                    "path": "a.py",
+                    "line_start": 10,
+                    "line_end": 9,
+                    "severity": "gate",
+                }
+            ]
+        },
+    )
+    with pytest.raises(SchemaValidationError):
+        load_findings(inverted_range)
+
+    # Duplicate leak ID must be rejected.
+    dup_id = _write_json(
+        tmp_path / "dup_id.json",
+        {
+            "leaks": [
+                {
+                    "id": "L1",
+                    "task": "t1",
+                    "path": "a.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "detector_hint": None,
+                    "kind": "real",
+                },
+                {
+                    "id": "L1",
+                    "task": "t1",
+                    "path": "b.py",
+                    "line_start": 3,
+                    "line_end": 4,
+                    "detector_hint": None,
+                    "kind": "seeded",
+                },
+            ]
+        },
+    )
+    with pytest.raises(SchemaValidationError):
+        load_ground_truth(dup_id)
+
+    # NaN constant in JSON must be rejected.
+    nan_file = tmp_path / "nan.json"
+    nan_file.write_text(
+        '{"findings": [{"task": "t1", "detector": "d1", "path": "a.py", '
+        '"line_start": NaN, "line_end": 2, "severity": "gate"}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(JsonFormatError):
+        load_findings(nan_file)
+
+
+def test_req1_refuses_symlinks_and_non_regular_files(tmp_path: Path) -> None:
+    real_file = _write_json(tmp_path / "real.json", {"leaks": []})
+    symlink_file = tmp_path / "link.json"
+    symlink_file.symlink_to(real_file)
+
+    with pytest.raises(FileSecurityError):
+        load_ground_truth(symlink_file)
+
+    # Directory is a non-regular file and must be refused.
+    with pytest.raises(FileSecurityError):
+        load_ground_truth(tmp_path)
+
+    # FIFO (named pipe) is a non-regular file and must be refused without blocking.
+    if hasattr(os, "mkfifo"):
+        fifo_path = tmp_path / "pipe.json"
+        os.mkfifo(fifo_path)
+        with pytest.raises(FileSecurityError):
+            load_findings(fifo_path)
+
+
+def test_req1_enforces_file_size_and_entry_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # File exceeding MAX_FILE_BYTES (16 MiB) must fail with SizeLimitError.
+    oversized = tmp_path / "big.json"
+    with oversized.open("wb") as handle:
+        handle.seek(MAX_FILE_BYTES)
+        handle.write(b" ")
+    with pytest.raises(SizeLimitError):
+        load_ground_truth(oversized)
+
+    # Entry count cap (200,000 in production; patched to 3 to verify exact enforcement).
+    monkeypatch.setattr(match_mod, "MAX_ENTRIES", 3)
+    too_many = {
+        "findings": [
             {
-                f"{task_id}__blind_case_1": "gate",
-                f"{task_id}__blind_case_2": "clean",
+                "task": "t1",
+                "detector": "d1",
+                "path": "a.py",
+                "line_start": i + 1,
+                "line_end": i + 1,
+                "severity": "gate",
             }
-        ),
-        encoding="utf-8",
+            for i in range(4)
+        ]
+    }
+    with pytest.raises(SizeLimitError):
+        parse_findings(too_many)
+
+
+# ---------------------------------------------------------------------------
+# Requirement 2: Matching rules (overlap boundaries, info ignored,
+#                no double counting, multi-leak match)
+# ---------------------------------------------------------------------------
+
+
+def test_req2_overlap_boundaries_touching_vs_adjacent() -> None:
+    # Touching ranges overlap: [10, 15] and [15, 20] share line 15.
+    assert ranges_overlap(10, 15, 15, 20) is True
+    assert ranges_overlap(15, 20, 10, 15) is True
+    # Adjacent ranges do not overlap: [10, 15] and [16, 20] share no lines.
+    assert ranges_overlap(10, 15, 16, 20) is False
+    assert ranges_overlap(16, 20, 10, 15) is False
+
+    leaks = (
+        Leak("L_touch", "t1", "f.py", 10, 15, None, "real"),
+        Leak("L_adj", "t1", "f.py", 16, 20, None, "real"),
+    )
+    findings = (Finding("t1", "det1", "f.py", 5, 10, "gate"),)
+    res = match_findings(leaks, findings)
+    assert res.matched_leak_ids == ("L_touch",)
+    assert res.unmatched_active_findings == ()
+
+
+def test_req2_info_findings_ignored_completely() -> None:
+    leaks = (Leak("L1", "t1", "f.py", 10, 20, None, "real"),)
+    findings = (
+        # Info overlapping L1 must NOT match L1.
+        Finding("t1", "det1", "f.py", 10, 20, "info"),
+        # Info nowhere near L1 must NOT become a false positive.
+        Finding("t1", "det1", "other.py", 1, 5, "info"),
+    )
+    res = match_findings(leaks, findings)
+    assert res.matched_leak_ids == ()
+    assert res.unmatched_active_findings == ()
+    assert res.active_finding_count == 0
+    assert res.ignored_info_finding_count == 2
+
+
+def test_req2_double_counting_prevented_and_one_finding_can_match_several_leaks() -> None:
+    leaks = (
+        Leak("L1", "t1", "f.py", 10, 12, None, "real"),
+        Leak("L2", "t1", "f.py", 18, 20, None, "seeded"),
+    )
+    findings = (
+        # Broad finding spans both L1 and L2 -> matches both leaks.
+        Finding("t1", "det1", "f.py", 1, 25, "gate"),
+        # Second finding also overlaps L1 -> L1 must still be counted only once.
+        Finding("t1", "det2", "f.py", 11, 11, "warning"),
+    )
+    res = match_findings(leaks, findings)
+    assert res.matched_leak_ids == ("L1", "L2")
+    assert res.unmatched_active_findings == ()
+
+    overall, _, _ = compute_all_metrics(leaks, findings, match_result=res)
+    assert overall.tp == 2
+    assert overall.fn == 0
+    assert overall.fp == 0
+    assert overall.recall_permille == 1000
+    assert overall.precision_permille == 1000
+
+
+# ---------------------------------------------------------------------------
+# Requirement 3: Overall, per-detector, and per-kind metrics with integer
+#                per-mille rounded down and FP deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_req3_overall_per_detector_and_per_kind_metrics_and_fp_dedup() -> None:
+    leaks = (
+        Leak("R1", "t1", "a.py", 10, 12, "d1", "real"),
+        Leak("R2", "t1", "b.py", 20, 22, "d2", "real"),
+        Leak("R3", "t2", "c.py", 30, 32, None, "real"),
+        Leak("S1", "t1", "d.py", 40, 42, "d1", "seeded"),
+    )
+    findings = (
+        # d1 catches R1 and S1, and emits two duplicate FPs at the exact same location/range/detector.
+        Finding("t1", "d1", "a.py", 10, 12, "gate"),
+        Finding("t1", "d1", "d.py", 41, 41, "warning"),
+        Finding("t1", "d1", "fp.py", 1, 3, "gate"),
+        Finding("t1", "d1", "fp.py", 1, 3, "warning"),  # Deduplicated with above FP!
+        # d2 catches R2 and emits one distinct FP at the same file/range (different detector).
+        Finding("t1", "d2", "b.py", 20, 22, "gate"),
+        Finding("t1", "d2", "fp.py", 1, 3, "gate"),
+        # d3 emits only an info finding -> 0 TP, 0 FP, 4 FN.
+        Finding("t2", "d3", "c.py", 30, 32, "info"),
     )
 
-    # Marker file: stub sealcheck will fail if labels.json was read before scanning finishes
-    log_marker = tmp_path / "scan_events.log"
+    overall, per_detector, per_kind = compute_all_metrics(leaks, findings)
 
-    stub_script = tmp_path / "stub_blind_sealcheck.py"
-    stub_content = (
-        "import argparse, json, sys\n"
-        "from pathlib import Path\n"
-        "parser = argparse.ArgumentParser()\n"
-        "subparsers = parser.add_subparsers(dest='subcommand')\n"
-        "scan_p = subparsers.add_parser('scan')\n"
-        "scan_p.add_argument('--task')\n"
-        "scan_p.add_argument('--base-tree')\n"
-        "scan_p.add_argument('--root', required=True)\n"
-        "scan_p.add_argument('--root-visibility')\n"
-        "scan_p.add_argument('--format')\n"
-        "args = parser.parse_args()\n"
-        f"log_file = Path(r'{log_marker}')\n"
-        "with log_file.open('a', encoding='utf-8') as f:\n"
-        "    f.write(f'SCANNED:{Path(args.root).parent.name}\\n')\n"
-        "findings = [{'detector': 'D2', 'severity': 'gate', 'visibility': 'agent_visible', 'channel': 'test'}]\n"
-        "print(json.dumps({'schema': 'hermetic-sealcheck/v0', 'findings': findings}))\n"
-        "sys.exit(2)\n"
+    # Overall: 3 TP (R1, R2, S1), 1 FN (R3), 2 deduplicated FPs (d1 fp.py:1-3, d2 fp.py:1-3).
+    # Precision = floor(3 * 1000 / 5) = 600; Recall = floor(3 * 1000 / 4) = 750.
+    assert overall.tp == 3
+    assert overall.fn == 1
+    assert overall.fp == 2
+    assert overall.precision_permille == 600
+    assert overall.recall_permille == 750
+    assert overall.missed_leak_ids == ("R3",)
+
+    # Per detector:
+    assert sorted(per_detector.keys()) == ["d1", "d2", "d3"]
+    # d1: 2 TP (R1, S1), 2 FN (R2, R3), 1 FP -> precision = floor(2000/3) = 666, recall = 500.
+    assert per_detector["d1"].tp == 2
+    assert per_detector["d1"].fn == 2
+    assert per_detector["d1"].fp == 1
+    assert per_detector["d1"].precision_permille == 666
+    assert per_detector["d1"].recall_permille == 500
+    assert per_detector["d1"].missed_leak_ids == ("R2", "R3")
+
+    # d2: 1 TP (R2), 3 FN (R1, R3, S1), 1 FP -> precision = 500, recall = 250.
+    assert per_detector["d2"].tp == 1
+    assert per_detector["d2"].fn == 3
+    assert per_detector["d2"].fp == 1
+    assert per_detector["d2"].precision_permille == 500
+    assert per_detector["d2"].recall_permille == 250
+    assert per_detector["d2"].missed_leak_ids == ("R1", "R3", "S1")
+
+    # d3: 0 TP, 4 FN, 0 FP -> precision = 0, recall = 0.
+    assert per_detector["d3"].tp == 0
+    assert per_detector["d3"].fn == 4
+    assert per_detector["d3"].fp == 0
+    assert per_detector["d3"].precision_permille == 0
+    assert per_detector["d3"].recall_permille == 0
+    assert per_detector["d3"].missed_leak_ids == ("R1", "R2", "R3", "S1")
+
+    # Per kind:
+    # real: 2 TP (R1, R2), 1 FN (R3), 2 FP -> precision = floor(2000/4) = 500, recall = floor(2000/3) = 666.
+    assert per_kind["real"].tp == 2
+    assert per_kind["real"].fn == 1
+    assert per_kind["real"].fp == 2
+    assert per_kind["real"].precision_permille == 500
+    assert per_kind["real"].recall_permille == 666
+    assert per_kind["real"].missed_leak_ids == ("R3",)
+
+    # seeded: 1 TP (S1), 0 FN, 2 FP -> precision = floor(1000/3) = 333, recall = 1000.
+    assert per_kind["seeded"].tp == 1
+    assert per_kind["seeded"].fn == 0
+    assert per_kind["seeded"].fp == 2
+    assert per_kind["seeded"].precision_permille == 333
+    assert per_kind["seeded"].recall_permille == 1000
+    assert per_kind["seeded"].missed_leak_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# Requirement 4: Percentile bootstrap CI over tasks (determinism & known answer
+#                with seed 7)
+# ---------------------------------------------------------------------------
+
+
+def test_req4_bootstrap_determinism_and_known_answer_seed_7() -> None:
+    # Two tasks:
+    # - task_1: 1 leak matched, 0 FPs -> (tp=1, fn=0, fp=0)
+    # - task_2: 1 leak missed, 1 FP  -> (tp=0, fn=1, fp=1)
+    leaks = (
+        Leak("L1", "task_1", "a.py", 1, 2, None, "real"),
+        Leak("L2", "task_2", "b.py", 1, 2, None, "real"),
     )
-    stub_script.write_text(stub_content, encoding="utf-8")
+    findings = (
+        Finding("task_1", "det", "a.py", 1, 2, "gate"),
+        Finding("task_2", "det", "fp.py", 5, 6, "gate"),
+    )
 
-    run_e3(corpus_dir, tasks_dir, base_trees_dir, stub_script, out_dir, blind_dir=blind_dir)
+    ci_first = bootstrap_confidence_interval(leaks, findings, seed=7)
+    ci_second = bootstrap_confidence_interval(leaks, findings, seed=7)
+    assert ci_first == ci_second
+    assert ci_first.bootstrap_iterations == 1000
+    assert ci_first.seed == 7
+    assert ci_first.task_count == 2
 
-    metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
-    assert "blind" in metrics
-    blind_m = metrics["blind"]
-    assert blind_m["total"] == 2
-    # In blind_m: case 1 expected gate, called gate -> TP = 1. Case 2 expected clean, called gate -> FP = 1.
-    assert blind_m["tp"] == 1
-    assert blind_m["fp"] == 1
+    # With 2 equally likely tasks (task_1 -> 1000, task_2 -> 0), each extreme occurs
+    # with p = 0.25 (> 0.025), so for B=1000 the 2.5th percentile is 0 and 97.5th is 1000.
+    assert ci_first.recall.low_permille == 0
+    assert ci_first.recall.high_permille == 1000
+    assert ci_first.precision.low_permille == 0
+    assert ci_first.precision.high_permille == 1000
 
-    # Check that events log recorded both blind scans
-    log_lines = log_marker.read_text(encoding="utf-8").splitlines()
-    assert any("blind_case_1" in line for line in log_lines)
-    assert any("blind_case_2" in line for line in log_lines)
+    # Hand-verified exact sequence for B=10 with seed=7:
+    rng = random.Random(7)
+    triples = [(1, 0, 0), (0, 1, 1)]
+    expected_recalls = []
+    expected_precisions = []
+    for _ in range(10):
+        tp = fn = fp = 0
+        for _ in range(2):
+            t_tp, t_fn, t_fp = triples[rng.randrange(2)]
+            tp += t_tp
+            fn += t_fn
+            fp += t_fp
+        expected_recalls.append((tp * 1000) // (tp + fn))
+        expected_precisions.append((tp * 1000) // (tp + fp))
+    expected_recalls.sort()
+    expected_precisions.sort()
+
+    ci_small = bootstrap_confidence_interval(leaks, findings, seed=7, bootstrap_iterations=10)
+    assert ci_small.recall.low_permille == expected_recalls[0]
+    assert ci_small.recall.high_permille == expected_recalls[9]
+    assert ci_small.precision.low_permille == expected_precisions[0]
+    assert ci_small.precision.high_permille == expected_precisions[9]
 
 
-def test_cli_subcommands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test hermetic_slice CLI subcommands e3-build and e3-run."""
-    tasks_dir = tmp_path / "cli_tasks"
-    base_trees_dir = tmp_path / "cli_basetrees"
-    corpus_dir = tmp_path / "cli_corpus"
-    out_dir = tmp_path / "cli_out"
+# ---------------------------------------------------------------------------
+# Requirement 5: Exit-criterion check on 'real' kind
+# ---------------------------------------------------------------------------
 
-    _create_fake_task(tasks_dir, base_trees_dir, "cli_task")
 
-    # Test e3-build CLI
-    exit_code_build = main(
+def test_req5_exit_criterion_checks_real_kind_thresholds() -> None:
+    leaks = (
+        Leak("R1", "t1", "a.py", 1, 2, None, "real"),
+        Leak("R2", "t1", "b.py", 1, 2, None, "real"),
+        Leak("S1", "t1", "c.py", 1, 2, None, "seeded"),
+    )
+    # Matches R1 and S1 (misses R2), plus 1 FP -> real recall = 500, real precision = 500.
+    findings = (
+        Finding("t1", "det", "a.py", 1, 2, "gate"),
+        Finding("t1", "det", "c.py", 1, 2, "gate"),
+        Finding("t1", "det", "fp.py", 9, 9, "gate"),
+    )
+
+    report_pass = evaluate(
+        leaks, findings, seed=7, min_recall_permille=500, min_precision_permille=500
+    )
+    assert report_pass.exit_criterion.passed is True
+    assert report_pass.exit_criterion.kind == "real"
+    assert report_pass.exit_criterion.actual_recall_permille == 500
+    assert report_pass.exit_criterion.actual_precision_permille == 500
+
+    report_fail = evaluate(
+        leaks, findings, seed=7, min_recall_permille=501, min_precision_permille=500
+    )
+    assert report_fail.exit_criterion.passed is False
+    assert report_fail.exit_criterion.recall_passed is False
+    assert report_fail.exit_criterion.precision_passed is True
+    _assert_no_floats_anywhere(report_fail.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Requirement 6: CLI deterministic JSON and exit codes (0 pass, 2 fail, 1 error)
+# ---------------------------------------------------------------------------
+
+
+def test_req6_cli_exit_codes_0_2_1_and_deterministic_json(tmp_path: Path) -> None:
+    truth_file = _write_json(
+        tmp_path / "truth.json",
+        {
+            "leaks": [
+                {
+                    "id": "R1",
+                    "task": "t1",
+                    "path": "a.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "detector_hint": None,
+                    "kind": "real",
+                },
+                {
+                    "id": "R2",
+                    "task": "t1",
+                    "path": "b.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "detector_hint": None,
+                    "kind": "real",
+                },
+            ]
+        },
+    )
+    findings_file = _write_json(
+        tmp_path / "findings.json",
+        {
+            "findings": [
+                {
+                    "task": "t1",
+                    "detector": "d1",
+                    "path": "a.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "severity": "gate",
+                }
+            ]
+        },
+    )
+
+    # Exit 0 (pass): real recall is 500, real precision is 1000.
+    out_pass_1 = io.StringIO()
+    err_pass_1 = io.StringIO()
+    rc_pass_1 = run_cli(
         [
-            "e3-build",
-            "--tasks-dir",
-            str(tasks_dir),
-            "--base-trees",
-            str(base_trees_dir),
-            "--out",
-            str(corpus_dir),
+            "--truth",
+            str(truth_file),
+            "--findings",
+            str(findings_file),
             "--seed",
-            "123",
-        ]
+            "7",
+            "--min-recall",
+            "500",
+            "--min-precision",
+            "1000",
+        ],
+        stdout=out_pass_1,
+        stderr=err_pass_1,
     )
-    assert exit_code_build == 0
-    assert (corpus_dir / "corpus.json").exists()
+    assert rc_pass_1 == 0
+    assert err_pass_1.getvalue() == ""
 
-    # Test e3-run CLI
-    stub_script = tmp_path / "simple_stub.py"
-    stub_script.write_text(
-        "import sys, json\nprint(json.dumps({'findings': []}))\nsys.exit(0)\n",
-        encoding="utf-8",
-    )
-
-    exit_code_run = main(
+    out_pass_2 = io.StringIO()
+    err_pass_2 = io.StringIO()
+    rc_pass_2 = run_cli(
         [
-            "e3-run",
-            "--corpus",
-            str(corpus_dir),
-            "--tasks-dir",
-            str(tasks_dir),
-            "--base-trees",
-            str(base_trees_dir),
-            "--sealcheck",
-            str(stub_script),
-            "--out",
-            str(out_dir),
-        ]
+            "--truth",
+            str(truth_file),
+            "--findings",
+            str(findings_file),
+            "--seed",
+            "7",
+            "--min-recall",
+            "500",
+            "--min-precision",
+            "1000",
+        ],
+        stdout=out_pass_2,
+        stderr=err_pass_2,
     )
-    assert exit_code_run == 0
-    assert (out_dir / "results.jsonl").exists()
-    assert (out_dir / "metrics.json").exists()
-    assert (out_dir / "metrics.md").exists()
+    assert rc_pass_2 == 0
+    assert out_pass_1.getvalue() == out_pass_2.getvalue()
+    parsed_pass = json.loads(out_pass_1.getvalue())
+    _assert_no_floats_anywhere(parsed_pass)
+    assert parsed_pass["exit_criterion"]["passed"] is True
 
-
-def test_e3_basetrees_mocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test extract_basetrees and e3-basetrees CLI with mocked docker."""
-    tasks_dir = tmp_path / "bt_tasks"
-    out_dir = tmp_path / "bt_out"
-
-    # Create task directories
-    (tasks_dir / "task_1").mkdir(parents=True, exist_ok=True)
-    (tasks_dir / "task_1" / "task.json").write_text("{}", encoding="utf-8")
-    (tasks_dir / "task_2").mkdir(parents=True, exist_ok=True)
-    (tasks_dir / "task_2" / "task.json").write_text("{}", encoding="utf-8")
-
-    # Pretend task_2 output already exists
-    (out_dir / "task_2").mkdir(parents=True, exist_ok=True)
-    (out_dir / "task_2" / "existing.py").write_text("print('existing')", encoding="utf-8")
-
-    commands_run: list[list[str]] = []
-
-    def mock_run_docker(args: list[str], **kwargs: Any) -> bytes:
-        commands_run.append(list(args))
-        if args[0] == "create":
-            return b"container_id_123\n"
-        elif args[0] == "cp":
-            # args: ["cp", "container_id_123:/testbed", target_path]
-            target_path = Path(args[2])
-            target_path.mkdir(parents=True, exist_ok=True)
-            (target_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
-            git_dir = target_path / ".git"
-            git_dir.mkdir(parents=True, exist_ok=True)
-            (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-            return b""
-        elif args[0] == "rm":
-            return b""
-        return b""
-
-    monkeypatch.setattr("hermetic_slice.e3.run_docker", mock_run_docker)
-
-    # Run e3-basetrees
-    from hermetic_slice.e3 import extract_basetrees
-
-    extract_basetrees(tasks_dir, out_dir, only=["task_1"])
-
-    # task_1 should have been extracted
-    assert (out_dir / "task_1").is_dir()
-    assert (out_dir / "task_1" / "mod.py").exists()
-    # .git should have been removed
-    assert not (out_dir / "task_1" / ".git").exists()
-
-    # basetree.json should exist
-    meta_path = out_dir / "task_1.basetree.json"
-    assert meta_path.exists()
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert meta["task_id"] == "task_1"
-    assert meta["file_count"] == 1
-    assert "sha256" in meta
-
-    # Check commands sequence: create, cp, rm
-    create_cmds = [c for c in commands_run if c[0] == "create"]
-    cp_cmds = [c for c in commands_run if c[0] == "cp"]
-    rm_cmds = [c for c in commands_run if c[0] == "rm"]
-    assert len(create_cmds) == 1
-    assert "hermetic/task_1:sealed" in create_cmds[0]
-    assert len(cp_cmds) == 1
-    assert len(rm_cmds) == 1
-
-    # Check CLI subcommand e3-basetrees
-    commands_run.clear()
-    exit_code = main(
+    # Exit 2 (fail): require min-recall 600 when actual is 500.
+    out_fail = io.StringIO()
+    err_fail = io.StringIO()
+    rc_fail = run_cli(
         [
-            "e3-basetrees",
-            "--tasks-dir",
-            str(tasks_dir),
-            "--out",
-            str(out_dir),
-            "--only",
-            "task_2",
-        ]
+            "--truth",
+            str(truth_file),
+            "--findings",
+            str(findings_file),
+            "--seed",
+            "7",
+            "--min-recall",
+            "600",
+            "--min-precision",
+            "1000",
+        ],
+        stdout=out_fail,
+        stderr=err_fail,
     )
-    assert exit_code == 0
-    # Because task_2 already existed, no docker command should have been run!
-    assert len(commands_run) == 0
+    assert rc_fail == 2
+    parsed_fail = json.loads(out_fail.getvalue())
+    _assert_no_floats_anywhere(parsed_fail)
+    assert parsed_fail["exit_criterion"]["passed"] is False
+
+    # Exit 1 (error): bad CLI argument, out-of-range threshold, or missing file.
+    out_err = io.StringIO()
+    err_err = io.StringIO()
+    rc_err = run_cli(
+        ["--truth", str(truth_file), "--findings", str(findings_file)],  # missing --seed
+        stdout=out_err,
+        stderr=err_err,
+    )
+    assert rc_err == 1
+    assert out_err.getvalue() == ""
+    err_json = json.loads(err_err.getvalue())
+    assert err_json["error"]["type"] == "CliArgumentError"
+
+    # Subprocess smoke test verifying `python -m hermetic_e3` entrypoint.
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermetic_e3",
+            "--truth",
+            str(truth_file),
+            "--findings",
+            str(findings_file),
+            "--seed",
+            "7",
+            "--min-recall",
+            "500",
+            "--min-precision",
+            "1000",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == out_pass_1.getvalue()
 
 
-def test_p05_and_p10_are_skipped_when_they_add_nothing() -> None:
-    from hermetic_slice.e3 import _build_variant_p05, _build_variant_p10
-
-    deletion_only = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,1 @@\n keep\n-gone\n"
-    assert _build_variant_p05(deletion_only) is None
-    assert _build_variant_p10("").strip() == ""
