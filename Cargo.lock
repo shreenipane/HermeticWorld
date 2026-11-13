@@ -536,6 +536,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-extract"
+version = "0.1.0"
+dependencies = [
+ "hermetic-common",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hermetic-gateway"
 version = "0.1.0"
 dependencies = [
