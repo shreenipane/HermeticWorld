@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -75,95 +74,46 @@ impl ExtractReport {
 
 /// Helper to walk output directory and produce deterministic tree manifest and SHA-256 digest.
 pub fn generate_tree_manifest(root: &Path) -> io::Result<(String, u64, u64)> {
-    let mut file_entries = Vec::new();
-    walk_regular_files(root, "", &mut file_entries)?;
-
-    // Sort by relative path
-    file_entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-
-    let mut manifest_bytes = Vec::new();
-    let mut total_bytes = 0u64;
-
-    for entry in &file_entries {
-        let line = format!("{} {:04o} {}\n", entry.rel_path, entry.mode, entry.sha256);
-        manifest_bytes.extend_from_slice(line.as_bytes());
-        total_bytes += entry.size;
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(&manifest_bytes);
-    let digest: [u8; 32] = hasher.finalize().into();
-
-    Ok((format_hex(&digest), file_entries.len() as u64, total_bytes))
+    let root = crate::safe_fs::open_dir_path(root).map_err(io::Error::other)?;
+    generate_tree_manifest_fd(&root).map_err(io::Error::other)
 }
 
-struct ManifestEntry {
-    rel_path: String,
-    mode: u32,
-    size: u64,
-    sha256: String,
-}
-
-fn walk_regular_files(root: &Path, rel_dir: &str, out: &mut Vec<ManifestEntry>) -> io::Result<()> {
-    let current = if rel_dir.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel_dir)
-    };
-
-    let entries = std::fs::read_dir(&current)?;
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let name = entry.file_name();
-        let name_str = name
-            .to_str()
-            .ok_or_else(|| io::Error::other("non-UTF8 file name in output tree"))?;
-
-        let rel_path = if rel_dir.is_empty() {
-            name_str.to_string()
-        } else {
-            format!("{rel_dir}/{name_str}")
-        };
-
-        if file_type.is_symlink() {
-            return Err(io::Error::other(format!(
-                "forbidden symlink in output tree: {rel_path}"
-            )));
-        }
-
-        if file_type.is_dir() {
-            walk_regular_files(root, &rel_path, out)?;
-        } else if file_type.is_file() {
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path)?;
-            let mode = meta.mode() & 0o777;
-            let size = meta.len();
-
-            let mut file = File::open(&path)?;
-            let mut hasher = Sha256::new();
-            let mut buf = [0u8; 64 * 1024];
+/// Manifest lines contain a JSON path string, mode and hash. Directories have
+/// a zero hash, binding empty directories and disambiguating newlines in names.
+pub fn generate_tree_manifest_fd(
+    root: &OwnedFd,
+) -> Result<(String, u64, u64), crate::error::ExtractError> {
+    let entries = crate::safe_fs::copy_base_tree(root, None)?;
+    let mut manifest = Sha256::new();
+    let mut file_count = 0;
+    let mut total_bytes = 0;
+    for (path, entry) in entries {
+        let mut hash = [0u8; 32];
+        if !entry.is_dir {
+            let file = crate::safe_fs::open_relative_regular(root, &path)?;
+            let mut file = file.take(entry.size + 1);
+            let mut digest = Sha256::new();
+            let mut buf = [0u8; crate::format::CHUNK_SIZE];
+            let mut bytes = 0u64;
             loop {
                 let n = file.read(&mut buf)?;
                 if n == 0 {
                     break;
                 }
-                hasher.update(&buf[..n]);
+                digest.update(&buf[..n]);
+                bytes += n as u64;
             }
-            let hash: [u8; 32] = hasher.finalize().into();
-
-            out.push(ManifestEntry {
-                rel_path,
-                mode,
-                size,
-                sha256: format_hex(&hash),
-            });
-        } else {
-            return Err(io::Error::other(format!(
-                "forbidden special entry in output tree: {rel_path}"
-            )));
+            if bytes != entry.size {
+                return Err(crate::error::QuotaError::ResourceLimit("changed tree file").into());
+            }
+            hash = digest.finalize().into();
+            file_count += 1;
+            total_bytes += bytes;
         }
+        let quoted_path = serde_json::to_string(&path).map_err(io::Error::other)?;
+        manifest
+            .update(format!("{quoted_path} {:04o} {}\n", entry.mode, format_hex(&hash)).as_bytes());
     }
-
-    Ok(())
+    let hash: [u8; 32] = manifest.finalize().into();
+    Ok((format_hex(&hash), file_count, total_bytes))
 }

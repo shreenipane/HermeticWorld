@@ -246,6 +246,7 @@ impl std::error::Error for PathError {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QuotaError {
+    ResourceLimit(&'static str),
     FileBytesExceeded { path: String, size: u64, cap: u64 },
     TotalBytesExceeded { total: u64, cap: u64 },
     FileCountExceeded { count: u64, cap: u64 },
@@ -255,6 +256,7 @@ pub enum QuotaError {
 impl fmt::Display for QuotaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResourceLimit(name) => write!(f, "resource limit exceeded: {name}"),
             Self::FileBytesExceeded { path, size, cap } => {
                 write!(f, "file '{path}' size {size} exceeds quota {cap}")
             }

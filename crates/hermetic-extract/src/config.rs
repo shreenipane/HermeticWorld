@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -136,69 +134,77 @@ impl Default for ExtractConfig {
 }
 
 impl ExtractConfig {
+    /// Configuration paths share stream path rules; an absent/empty repo root
+    /// denotes the base tree root. Limit lists before building policy indexes.
+    pub fn validate(&self) -> Result<(), ExtractError> {
+        const MAX_CONFIG_ENTRIES: usize = 10_000;
+        let mut bytes = 0usize;
+        for list in [
+            &self.artifact_paths,
+            &self.test_paths,
+            &self.import_roots,
+            &self.installed_packages,
+        ] {
+            if list.len() > MAX_CONFIG_ENTRIES {
+                return Err(ExtractError::Config(
+                    "too many configuration entries".into(),
+                ));
+            }
+            for value in list {
+                bytes = bytes
+                    .checked_add(value.len())
+                    .filter(|n| *n <= MAX_CONFIG_FILE_BYTES as usize)
+                    .ok_or_else(|| {
+                        ExtractError::Config("configuration entries too large".into())
+                    })?;
+            }
+        }
+        for (path, allow_root) in self
+            .repo_dir
+            .iter()
+            .map(|p| (p, true))
+            .chain(self.artifact_paths.iter().map(|p| (p, false)))
+            .chain(self.test_paths.iter().map(|p| (p, false)))
+            .chain(self.import_roots.iter().map(|p| (p, true)))
+        {
+            if path.is_empty() && allow_root {
+                continue;
+            }
+            if path.len() > crate::safe_fs::MAX_TREE_PATH_BYTES
+                || path.contains(['\\', '\0'])
+                || path.split('/').count() > crate::safe_fs::MAX_TREE_DEPTH
+                || path
+                    .split('/')
+                    .any(|c| c.is_empty() || c == "." || c == ".." || c.contains(':'))
+            {
+                return Err(ExtractError::Config("invalid configuration path".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Safely loads configuration from a regular JSON file.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, ExtractError> {
         let path = path.as_ref();
-        let meta = std::fs::symlink_metadata(path).map_err(|e| {
-            ExtractError::Config(format!("cannot stat config file '{}': {e}", path.display()))
-        })?;
-
-        if meta.file_type().is_symlink() {
-            return Err(ExtractError::Config(format!(
-                "config file '{}' is a symlink",
-                path.display()
-            )));
-        }
-
-        if !meta.file_type().is_file() {
-            return Err(ExtractError::Config(format!(
-                "config file '{}' is not a regular file",
-                path.display()
-            )));
-        }
-
-        if meta.size() > MAX_CONFIG_FILE_BYTES {
-            return Err(ExtractError::Config(format!(
-                "config file '{}' size {} exceeds limit of {} bytes",
-                path.display(),
-                meta.size(),
-                MAX_CONFIG_FILE_BYTES
-            )));
-        }
-
-        let mut file = File::open(path).map_err(|e| {
-            ExtractError::Config(format!("cannot open config file '{}': {e}", path.display()))
-        })?;
-
-        let mut contents = Vec::with_capacity(meta.size().min(MAX_CONFIG_FILE_BYTES) as usize);
+        let mut file = crate::safe_fs::open_regular_path(path)
+            .map_err(|_| ExtractError::Config("unsafe config file".into()))?;
+        let mut contents = Vec::new();
         file.by_ref()
             .take(MAX_CONFIG_FILE_BYTES + 1)
             .read_to_end(&mut contents)
-            .map_err(|e| {
-                ExtractError::Config(format!("cannot read config file '{}': {e}", path.display()))
-            })?;
+            .map_err(|_| ExtractError::Config("cannot read config".into()))?;
 
         if contents.len() as u64 > MAX_CONFIG_FILE_BYTES {
-            return Err(ExtractError::Config(format!(
-                "config file '{}' exceeded maximum size",
-                path.display()
-            )));
+            return Err(ExtractError::Config("config exceeded maximum size".into()));
         }
 
-        let s = std::str::from_utf8(&contents).map_err(|_| {
-            ExtractError::Config(format!(
-                "config file '{}' is not valid UTF-8",
-                path.display()
-            ))
-        })?;
+        let s = std::str::from_utf8(&contents)
+            .map_err(|_| ExtractError::Config("config is not UTF-8".into()))?;
 
-        let config: ExtractConfig = serde_json::from_str(s).map_err(|e| {
-            ExtractError::Config(format!(
-                "failed to parse config JSON '{}': {e}",
-                path.display()
-            ))
-        })?;
+        let config: ExtractConfig = serde_json::from_str(s)
+            .map_err(|_| ExtractError::Config("invalid config JSON".into()))?;
 
+        config.validate()?;
         Ok(config)
     }
 }

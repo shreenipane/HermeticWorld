@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -14,7 +13,7 @@ use crate::format::{
     STREAM_VERSION,
 };
 use crate::report::{
-    generate_tree_manifest, AcceptedPath, DroppedPath, ExtractReport, ReportFlag, ReportTotals,
+    generate_tree_manifest_fd, AcceptedPath, DroppedPath, ExtractReport, ReportFlag, ReportTotals,
     RestoredPath,
 };
 use crate::restore::{
@@ -22,9 +21,13 @@ use crate::restore::{
 };
 use crate::safe_fs::{
     copy_base_tree, create_directory, create_file_exclusive, create_staging_dir, delete_entry,
-    prepare_output_dir, publish_atomically, resolve_or_create_parent_dir, CleanupGuard,
+    open_dir_path, prepare_output_dir, publish_atomically, read_base_file, resolve_existing_parent,
+    resolve_or_create_parent_dir, restore_base_entry, CleanupGuard,
 };
 use crate::shadowing::check_shadowing;
+
+pub const MAX_STREAM_RECORDS: u64 = 20_000;
+pub const MAX_SECTION_BYTES: u64 = 1024 * 1024;
 
 /// Validates a stream from `reader` and extracts it into `out_dir` according to `class` and `config`.
 pub fn validate_stream<R: Read>(
@@ -34,16 +37,7 @@ pub fn validate_stream<R: Read>(
     class: TaskClass,
     config: &ExtractConfig,
 ) -> Result<ExtractReport, ExtractError> {
-    // 1. Prepare output directory and staging directory
-    let (parent_fd, out_name, tmp_name) = prepare_output_dir(out_dir)?;
-    let mut cleanup_guard = CleanupGuard::new(&parent_fd, tmp_name.clone());
-    let staging_fd = create_staging_dir(&parent_fd, &tmp_name)?;
-
-    // 2. If task class is Patch, copy pristine base tree to staging directory first
-    if class == TaskClass::Patch {
-        copy_base_tree(base_dir, &staging_fd)?;
-    }
-
+    config.validate()?;
     // 3. Read and validate stream header (8 bytes: magic [u8; 4], version u32 LE)
     let mut stream_header = [0u8; 8];
     reader
@@ -72,6 +66,27 @@ pub fn validate_stream<R: Read>(
         )));
     }
 
+    let base_fd = open_dir_path(base_dir)?;
+    let (parent_fd, out_fd, out_name, tmp_name) = prepare_output_dir(out_dir)?;
+    let staging_fd = create_staging_dir(&parent_fd, &tmp_name)?;
+    let mut cleanup_guard = CleanupGuard::new(&parent_fd, &staging_fd, tmp_name.clone());
+    let base_index = copy_base_tree(&base_fd, (class == TaskClass::Patch).then_some(&staging_fd))?;
+    let mut protected_ancestors = HashSet::new();
+    for path in base_index.keys().chain(config.test_paths.iter()) {
+        if is_whole_path_test_infra(path, &config.test_paths).is_some()
+            || is_section_restored_file(path)
+        {
+            let mut prefix = String::new();
+            for component in path.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                protected_ancestors.insert(prefix.clone());
+            }
+        }
+    }
+
     // 4. Processing loop
     let mut records_received = 0u64;
     let mut files_accepted = 0u64;
@@ -81,11 +96,12 @@ pub fn validate_stream<R: Read>(
     let mut total_stream_file_bytes = 0u64;
     let mut paths_dropped = 0u64;
     let mut paths_restored = 0u64;
+    let mut files_received = 0u64;
+    let mut directories_received = HashSet::new();
 
     let mut declared_files: HashSet<String> = HashSet::new();
     let mut declared_directories: HashSet<String> = HashSet::new();
     let mut all_seen_paths: HashSet<String> = HashSet::new();
-    let mut case_folded_map: HashMap<String, String> = HashMap::new();
 
     let mut report_accepted = Vec::new();
     let mut report_dropped = Vec::new();
@@ -130,11 +146,14 @@ pub fn validate_stream<R: Read>(
             match reader.read(&mut trailing_byte) {
                 Ok(0) => {}
                 Ok(_) => return Err(ExtractError::Format(FormatError::TrailingGarbage)),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
                 Err(e) => return Err(ExtractError::Io(e)),
             }
 
             break;
+        }
+
+        if records_received > MAX_STREAM_RECORDS {
+            return Err(QuotaError::ResourceLimit("MAX_STREAM_RECORDS").into());
         }
 
         // Non-EOS records in State task class are forbidden
@@ -148,11 +167,14 @@ pub fn validate_stream<R: Read>(
 
         // Validate path_len
         let path_len = header.path_len as usize;
-        if path_len > config.max_path_bytes {
+        let path_cap = config
+            .max_path_bytes
+            .min(crate::safe_fs::MAX_TREE_PATH_BYTES);
+        if path_len > path_cap {
             return Err(ExtractError::Format(FormatError::OversizedField {
                 field: "path_len",
                 size: path_len,
-                cap: config.max_path_bytes,
+                cap: path_cap,
             }));
         }
 
@@ -201,7 +223,7 @@ pub fn validate_stream<R: Read>(
         }
 
         let components: Vec<&str> = path_str.split('/').collect();
-        if components.len() > config.max_path_depth {
+        if components.len() > config.max_path_depth.min(crate::safe_fs::MAX_TREE_DEPTH) {
             return Err(ExtractError::PathValidation(PathError::DepthExceeded {
                 path: path_str.to_string(),
                 depth: components.len(),
@@ -266,17 +288,6 @@ pub fn validate_stream<R: Read>(
         }
         all_seen_paths.insert(path_str.to_string());
 
-        // Case-fold collision check
-        let lower = path_str.to_lowercase();
-        if let Some(existing) = case_folded_map.get(&lower) {
-            report_flags.push(ReportFlag {
-                flag_type: "case_fold_collision".to_string(),
-                path: path_str.to_string(),
-                detail: format!("collides with '{existing}' under case-folding"),
-            });
-        }
-        case_folded_map.insert(lower, path_str.to_string());
-
         // Task class boundary checks
         match class {
             TaskClass::Patch => {
@@ -318,7 +329,9 @@ pub fn validate_stream<R: Read>(
         }
 
         if header.record_type == RecordType::RegularFile {
-            total_stream_file_bytes = total_stream_file_bytes.saturating_add(header.size);
+            total_stream_file_bytes = total_stream_file_bytes
+                .checked_add(header.size)
+                .ok_or(QuotaError::ResourceLimit("stream total bytes overflow"))?;
             if total_stream_file_bytes > config.max_total_bytes {
                 return Err(ExtractError::Quota(QuotaError::TotalBytesExceeded {
                     total: total_stream_file_bytes,
@@ -328,25 +341,62 @@ pub fn validate_stream<R: Read>(
         }
 
         if header.record_type == RecordType::RegularFile {
-            if files_accepted + 1 > config.max_file_count {
+            files_received += 1;
+            if files_received > config.max_file_count {
                 return Err(ExtractError::Quota(QuotaError::FileCountExceeded {
-                    count: files_accepted + 1,
+                    count: files_received,
                     cap: config.max_file_count,
                 }));
             }
-        } else if header.record_type == RecordType::Directory
-            && directories_accepted + 1 > config.max_dir_count
-        {
+        }
+        if header.record_type != RecordType::Deletion {
+            for i in 1..components.len() {
+                directories_received.insert(components[..i].join("/"));
+                if directories_received.len() > crate::safe_fs::MAX_TREE_ENTRIES {
+                    return Err(
+                        QuotaError::ResourceLimit("MAX_TREE_ENTRIES stream directories").into(),
+                    );
+                }
+            }
+        }
+        if header.record_type == RecordType::Directory {
+            directories_received.insert(path_str.to_string());
+        }
+        if directories_received.len() as u64 > config.max_dir_count {
             return Err(ExtractError::Quota(QuotaError::DirCountExceeded {
-                count: directories_accepted + 1,
+                count: directories_received.len() as u64,
                 cap: config.max_dir_count,
             }));
+        }
+
+        // Declarations constrain later paths even when policy drops the record.
+        match header.record_type {
+            RecordType::RegularFile => {
+                declared_files.insert(path_str.to_owned());
+            }
+            RecordType::Directory => {
+                declared_directories.insert(path_str.to_owned());
+            }
+            _ => {}
         }
 
         // -------------------------------------------------------------------
         // Test infrastructure checks (whole path drop and restore)
         // -------------------------------------------------------------------
-        if let Some(reason) = is_whole_path_test_infra(path_str, &config.test_paths) {
+        let protected_reason = is_whole_path_test_infra(path_str, &config.test_paths)
+            .or_else(|| {
+                (protected_ancestors.contains(path_str)
+                    && (header.record_type != RecordType::Directory)
+                    && !(header.record_type == RecordType::RegularFile
+                        && is_section_restored_file(path_str)))
+                .then_some("protected_descendant")
+            })
+            .or_else(|| {
+                (is_section_restored_file(path_str)
+                    && header.record_type != RecordType::RegularFile)
+                    .then_some("protected_configuration_type")
+            });
+        if let Some(reason) = protected_reason {
             paths_dropped += 1;
             report_dropped.push(DroppedPath {
                 path: path_str.to_string(),
@@ -354,11 +404,15 @@ pub fn validate_stream<R: Read>(
             });
 
             // Stream and discard payload, verifying SHA-256 and size
-            PayloadStreamer::discard_and_hash(reader, header.size, header.sha256, path_str)
-                .map_err(ExtractError::Format)?;
+            if header.record_type == RecordType::RegularFile {
+                PayloadStreamer::discard_and_hash(reader, header.size, header.sha256, path_str)?;
+            }
 
             // If it exists in base, record it as restored
-            if base_dir.join(path_str).exists() {
+            if base_index.contains_key(path_str) {
+                if class != TaskClass::Patch {
+                    restore_base_entry(&base_fd, &base_index, &staging_fd, path_str)?;
+                }
                 paths_restored += 1;
                 report_restored.push(RestoredPath {
                     path: path_str.to_string(),
@@ -372,30 +426,36 @@ pub fn validate_stream<R: Read>(
         // -------------------------------------------------------------------
         // Section restoration checks (setup.cfg, pyproject.toml)
         // -------------------------------------------------------------------
-        if is_section_restored_file(path_str) {
-            let mut payload = vec![0u8; header.size as usize];
-            reader.read_exact(&mut payload).map_err(|_e| {
-                ExtractError::Format(FormatError::Truncated("incomplete section file payload"))
-            })?;
-
-            let mut hasher = Sha256::new();
-            hasher.update(&payload);
-            let actual_hash: [u8; 32] = hasher.finalize().into();
-            if actual_hash != header.sha256 {
-                return Err(ExtractError::Format(FormatError::HashMismatch {
-                    path: path_str.to_string(),
-                    declared: format_hex(&header.sha256),
-                    actual: format_hex(&actual_hash),
-                }));
+        if is_section_restored_file(path_str) && header.record_type == RecordType::RegularFile {
+            if header.size > MAX_SECTION_BYTES {
+                return Err(QuotaError::ResourceLimit("MAX_SECTION_BYTES").into());
             }
+            let mut payload = Vec::new();
+            PayloadStreamer::stream_to_writer(
+                reader,
+                header.size,
+                header.sha256,
+                &mut payload,
+                path_str,
+            )?;
 
             let agent_text = std::str::from_utf8(&payload).ok();
-            let base_file_path = base_dir.join(path_str);
-            let base_text = std::fs::read_to_string(&base_file_path).ok();
+            let base_payload = if base_index.contains_key(path_str) {
+                Some(read_base_file(&base_fd, path_str, MAX_SECTION_BYTES)?)
+            } else {
+                None
+            };
+            let base_text = base_payload
+                .as_deref()
+                .and_then(|v| std::str::from_utf8(v).ok());
 
             match agent_text {
                 Some(agent_str) => {
-                    match restore_file_sections(path_str, base_text.as_deref(), agent_str) {
+                    match if base_payload.is_some() && base_text.is_none() {
+                        RestoreOutcome::FallbackWholeBaseRestored
+                    } else {
+                        restore_file_sections(path_str, base_text, agent_str)
+                    } {
                         RestoreOutcome::SectionsRestored(merged) => {
                             let (p_fd, leaf) = resolve_or_create_parent_dir(&staging_fd, path_str)?;
                             let mut f = create_file_exclusive(&p_fd, &leaf, 0o644)?;
@@ -424,7 +484,15 @@ pub fn validate_stream<R: Read>(
                             });
                         }
                         RestoreOutcome::FallbackWholeBaseRestored => {
-                            if base_file_path.exists() {
+                            if base_index.contains_key(path_str) {
+                                if class != TaskClass::Patch {
+                                    restore_base_entry(
+                                        &base_fd,
+                                        &base_index,
+                                        &staging_fd,
+                                        path_str,
+                                    )?;
+                                }
                                 paths_restored += 1;
                                 report_restored.push(RestoredPath {
                                     path: path_str.to_string(),
@@ -455,7 +523,7 @@ pub fn validate_stream<R: Read>(
                                 size: header.size,
                                 sha256: format_hex(&header.sha256),
                             });
-                            if !base_dir.join(path_str).exists() {
+                            if !base_index.contains_key(path_str) {
                                 new_files.push(path_str.to_string());
                             }
                         }
@@ -463,7 +531,10 @@ pub fn validate_stream<R: Read>(
                 }
                 None => {
                     // Non-UTF-8: conservative rule restores whole file from base
-                    if base_file_path.exists() {
+                    if base_index.contains_key(path_str) {
+                        if class != TaskClass::Patch {
+                            restore_base_entry(&base_fd, &base_index, &staging_fd, path_str)?;
+                        }
                         paths_restored += 1;
                         report_restored.push(RestoredPath {
                             path: path_str.to_string(),
@@ -502,8 +573,9 @@ pub fn validate_stream<R: Read>(
                 });
             }
             RecordType::Deletion => {
-                let (p_fd, leaf) = resolve_or_create_parent_dir(&staging_fd, path_str)?;
-                delete_entry(&p_fd, &leaf)?;
+                if let Some((p_fd, leaf)) = resolve_existing_parent(&staging_fd, path_str)? {
+                    delete_entry(&p_fd, &leaf)?;
+                }
                 deletions_accepted += 1;
 
                 report_accepted.push(AcceptedPath {
@@ -527,8 +599,7 @@ pub fn validate_stream<R: Read>(
                     header.sha256,
                     &mut out_file,
                     path_str,
-                )
-                .map_err(ExtractError::Format)?;
+                )?;
 
                 declared_files.insert(path_str.to_string());
                 files_accepted += 1;
@@ -542,13 +613,17 @@ pub fn validate_stream<R: Read>(
                     sha256: format_hex(&header.sha256),
                 });
 
-                if !base_dir.join(path_str).exists() {
+                if !base_index.contains_key(path_str) {
                     new_files.push(path_str.to_string());
                 }
             }
             RecordType::EndOfStream => unreachable!(),
         }
     }
+
+    report_flags.extend(case_collision_flags(
+        base_index.keys().chain(all_seen_paths.iter()),
+    ));
 
     // 5. Shadowing checks for new files
     for new_path in &new_files {
@@ -560,12 +635,11 @@ pub fn validate_stream<R: Read>(
     }
 
     // 6. Tree manifest generation
-    let staging_proc_path = format!("/proc/self/fd/{}", staging_fd.as_raw_fd());
     let (tree_manifest_sha256, tree_file_count, tree_total_bytes) =
-        generate_tree_manifest(Path::new(&staging_proc_path)).map_err(ExtractError::Io)?;
+        generate_tree_manifest_fd(&staging_fd)?;
 
     // 7. Atomic publication
-    publish_atomically(&parent_fd, &tmp_name, &out_name)?;
+    publish_atomically(&parent_fd, &out_fd, &staging_fd, &tmp_name, &out_name)?;
     cleanup_guard.disarm();
 
     // 8. Assemble report
@@ -592,4 +666,40 @@ pub fn validate_stream<R: Read>(
 
     report.sort_deterministic();
     Ok(report)
+}
+
+fn case_collision_flags<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<ReportFlag> {
+    let mut prefixes = BTreeSet::new();
+    for path in paths {
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            prefixes.insert(prefix.clone());
+        }
+    }
+    let mut folded = HashMap::new();
+    let mut flags = Vec::new();
+    for path in prefixes {
+        let key = path.to_lowercase();
+        if let Some(existing) = folded.get(&key) {
+            flags.push(ReportFlag {
+                flag_type: "case_fold_collision".into(),
+                path: path.clone(),
+                detail: format!("collides with '{existing}' under case-folding"),
+            });
+        } else if !path.is_ascii() {
+            // Lowercasing is not full Unicode case folding. Flag these paths
+            // conservatively rather than silently miss multi-character folds.
+            flags.push(ReportFlag {
+                flag_type: "case_fold_collision".into(),
+                path: path.clone(),
+                detail: "possible Unicode case-fold collision requires review".into(),
+            });
+        }
+        folded.entry(key).or_insert(path);
+    }
+    flags
 }

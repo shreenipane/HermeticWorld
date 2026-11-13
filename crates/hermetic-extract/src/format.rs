@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::FormatError;
+use crate::error::{ExtractError, FormatError};
 
 pub const STREAM_MAGIC: [u8; 4] = *b"HEXT";
 pub const STREAM_VERSION: u32 = 1;
@@ -69,6 +69,9 @@ impl RecordHeader {
     pub fn parse(buf: &[u8; RECORD_HEADER_SIZE]) -> Result<Self, FormatError> {
         let record_type = RecordType::from_u8(buf[0])?;
         let flags = buf[1];
+        if flags != 0 {
+            return Err(FormatError::InvalidPayloadForType("unknown flags"));
+        }
         let reserved = [buf[2], buf[3]];
         if reserved != [0, 0] {
             return Err(FormatError::InvalidReservedBytes(reserved));
@@ -323,7 +326,7 @@ impl PayloadStreamer {
         declared_sha256: [u8; 32],
         writer: &mut W,
         path: &str,
-    ) -> Result<[u8; 32], FormatError> {
+    ) -> Result<[u8; 32], ExtractError> {
         let mut hasher = Sha256::new();
         let mut remaining = size;
         let mut buf = [0u8; CHUNK_SIZE];
@@ -333,15 +336,15 @@ impl PayloadStreamer {
             match reader.read_exact(&mut buf[..to_read]) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Err(FormatError::Truncated("file payload truncated"));
+                    return Err(FormatError::Truncated("file payload truncated").into());
                 }
-                Err(_) => return Err(FormatError::Truncated("i/o error reading payload")),
+                Err(e) => return Err(ExtractError::Io(e)),
             }
 
             hasher.update(&buf[..to_read]);
             writer
                 .write_all(&buf[..to_read])
-                .map_err(|_| FormatError::Truncated("failed writing payload chunk"))?;
+                .map_err(ExtractError::Io)?;
             remaining -= to_read as u64;
         }
 
@@ -351,7 +354,8 @@ impl PayloadStreamer {
                 path: path.to_string(),
                 declared: format_hex(&declared_sha256),
                 actual: format_hex(&actual_hash),
-            });
+            }
+            .into());
         }
 
         Ok(actual_hash)
@@ -363,7 +367,7 @@ impl PayloadStreamer {
         size: u64,
         declared_sha256: [u8; 32],
         path: &str,
-    ) -> Result<[u8; 32], FormatError> {
+    ) -> Result<[u8; 32], ExtractError> {
         let mut sink = io::sink();
         Self::stream_to_writer(reader, size, declared_sha256, &mut sink, path)
     }

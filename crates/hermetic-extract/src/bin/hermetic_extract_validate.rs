@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::fs::File;
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
@@ -16,7 +15,13 @@ fn print_usage_and_exit(code: i32) -> ! {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = match std::env::args_os().map(|a| a.into_string()).collect() {
+        Ok(args) => args,
+        Err(_) => {
+            eprintln!("Arguments must be UTF-8");
+            process::exit(1);
+        }
+    };
     let mut stream_path: Option<PathBuf> = None;
     let mut base_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -57,8 +62,8 @@ fn main() {
                 }
                 match TaskClass::from_str(&args[i + 1]) {
                     Ok(c) => class_opt = Some(c),
-                    Err(e) => {
-                        eprintln!("{e}");
+                    Err(_) => {
+                        eprintln!("Invalid task class");
                         process::exit(1);
                     }
                 }
@@ -75,8 +80,8 @@ fn main() {
             "--help" | "-h" => {
                 print_usage_and_exit(0);
             }
-            other => {
-                eprintln!("Unknown argument: {other}");
+            _ => {
+                eprintln!("Unknown argument");
                 process::exit(1);
             }
         }
@@ -120,32 +125,16 @@ fn main() {
 
     let config = match ExtractConfig::load_from_file(&config_file) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config: {e}");
+        Err(_) => {
+            eprintln!("Failed to load config");
             process::exit(1);
         }
     };
 
-    // Verify stream file is a regular file
-    let meta = match std::fs::symlink_metadata(&stream_file) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Cannot stat stream file '{}': {e}", stream_file.display());
-            process::exit(1);
-        }
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        eprintln!(
-            "Stream file '{}' must be a regular file",
-            stream_file.display()
-        );
-        process::exit(1);
-    }
-
-    let mut stream = match File::open(&stream_file) {
+    let mut stream = match hermetic_extract::safe_fs::open_regular_path(&stream_file) {
         Ok(f) => f,
-        Err(e) => {
-            eprintln!("Cannot open stream file '{}': {e}", stream_file.display());
+        Err(_) => {
+            eprintln!("Cannot safely open stream file");
             process::exit(1);
         }
     };
@@ -163,10 +152,11 @@ fn main() {
             process::exit(0);
         }
         Err(e) => {
-            eprintln!("Validation failed: {e}");
             if e.is_rejection() {
+                eprintln!("Validation rejected");
                 process::exit(2);
             } else {
+                eprintln!("Validation failed");
                 process::exit(1);
             }
         }
