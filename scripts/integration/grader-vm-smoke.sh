@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Development GraderVM smoke test (offline, KVM, no jailer). For the fixture task it
-# builds one D4-checked grader image per (variant, run) with the patch applied on the
+# builds byte-identical D4-checked grader images per variant with the patch applied on the
 # host, boots each image through hermetic-vmm's dev-unjailed runner with
 # init=/sbin/hermetic-grader-init (no vsock, no network), waits for the guest to power
 # off, checks the guest clock line against hermetic.t, collects the 1 MiB result drive
@@ -66,6 +66,7 @@ for v in empty gold; do
     mkdir "$GSP/hermetic_grader_records"
     cp python/hermetic_grader_records/{__init__,plugin,record,supervisor}.py "$GSP/hermetic_grader_records/"
     cp python/hermetic_safe_io.py "$GSP/"
+    cp "$FIX/hermetic_run_probe.py" "$GSP/"
     find "$GSP" -name __pycache__ -type d -prune -exec rm -r {} +
     mkdir -p "$TREE/work" "$TREE/etc/hermetic/grader"
     if [ -n "${HERMETIC_GRADER_PUBLISHED_ROOT:-}" ]; then
@@ -79,9 +80,9 @@ for v in empty gold; do
     # The launcher supplies a dedicated record fd and applies the runner plan.
     cat > "$TREE/etc/hermetic/grader/run.json" <<JSON
 {"argv":["/usr/local/bin/python3.12","-s","-m","pytest","-p","no:cacheprovider","-q","$F2P","$P2P"],
- "env":{},"sandbox":{"t_clock":$T,"required_pytest_plugins":[]},
+ "env":{},"sandbox":{"t_clock":$T,"required_pytest_plugins":["hermetic_run_probe"]},
  "cwd":"/work/repo","deadline_seconds":120,"expected_test_ids":["$F2P","$P2P"],
- "run":"$r","variant_set":"$VS"}
+ "variant_set":"$VS"}
 JSON
     find "$TREE" -exec touch -h -d @$T {} +
     /usr/bin/python3 -I - "$top/python" "$TREE" "$IMG/grader.img" "$WORK/sealcheck" "$IMG" <<'PY'
@@ -97,9 +98,18 @@ assert r["d4"] == "pass", r
 PY
     chmod 0400 "$IMG/grader.img"
     rm -rf "$TREE"
+  done
+  # Check all three sealed images before executing any tests. No label or nonce
+  # is baked in; only the supervisor's result drive receives host boot input.
+  cmp -s "$D/R0/img/grader.img" "$D/R1/img/grader.img"
+  cmp -s "$D/R0/img/grader.img" "$D/R2/img/grader.img"
+  sha256sum "$D"/R{0,1,2}/img/grader.img > "$D/host/image-sha256.txt"
+  for r in R0 R1 R2; do
+    IMG="$D/$r/img"
     # Boot, wait for power-off, check the clock line, collect the result drive.
     HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" \
     HERMETIC_GRADER_ROOTFS="$IMG/grader.img" HERMETIC_GRADER_RESULT_OUT="$D/host/$r.img" \
+    HERMETIC_GRADER_RUN="$r" \
       timeout 400 cargo test -q -p hermetic-vmm --features dev-unjailed --test guest \
       boots_grader_and_collects_result_drive -- --ignored --nocapture --exact 2>&1 \
       | grep -E '^grader serial:|test result:|panicked'
