@@ -11,7 +11,16 @@ members = [
     "crates/hermetic-netvm-core",
     "crates/hermetic-run",
     "crates/hermetic-cmdlog",
+    "crates/hermetic-attest",
+    "crates/hermetic-extract-walk",
+    "crates/hermetic-cli",
+    "crates/hermetic-netvm-dns",
+    "crates/hermetic-extract",
+    "crates/hermetic-netvm-http",
+    "crates/hermetic-grader-sandbox",
+    "crates/hermetic-execd",
     "crates/hermetic-vmm",
+    "crates/hermetic-grader-result",
 ]
 resolver = "2"
 
