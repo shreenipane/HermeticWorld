@@ -31,7 +31,7 @@ Mode normalization:
 
 * Paths are relative to the bundle root, valid UTF-8, separated by `/`.
 * Empty paths, leading or trailing `/`, empty components (`//`), `.`, `..`, NUL bytes, and `\` are refused.
-* NFC Unicode normalization is not required, but any two paths in the bundle that differ only in ASCII case (`to_ascii_lowercase()`) are refused.
+* NFC Unicode normalization is not required, but any two paths in the bundle that differ only in ASCII case (`to_ascii_lowercase()`) are refused. The root manifest name also participates in this rule and cannot be used as a directory prefix.
 * Symlinks, hard-linked regular files (`st_nlink > 1`), FIFOs, sockets, block devices, and character devices are refused.
 * Bounded caps:
   * `MAX_ENTRIES` = 1,000,000
@@ -40,6 +40,33 @@ Mode normalization:
   * `MAX_DEPTH` = 128
   * `MAX_TOTAL_FILE_BYTES` = 64 GiB (68,719,476,736 bytes)
   * `MAX_MANIFEST_BYTES` = 512 MiB (536,870,912 bytes)
+  * `MAX_JSON_STRING_BYTES` = 4,096 decoded bytes; `MAX_JSON_OBJECT_KEYS` = 6
+  * `MAX_ROOT_PATH_BYTES` = 8,192; `MAX_ROOT_COMPONENTS` = 4,096
+
+Parsing checks string lengths and array/object counts before schema deserialization.
+Noncanonical encodings (including extra whitespace, reordered fields, and null
+file fields on directories) are refused. Every entry's parent must be a listed
+directory. Serialization checks the byte cap while writing.
+
+Filesystem operations use Linux x86_64 flags and require a trusted procfs at
+`/proc/self/fd`. Root components and child directories are opened with
+`O_DIRECTORY | O_NOFOLLOW` after lstat, then checked by descriptor identity.
+Enumeration and child lookups use those pinned descriptors. Pending siblings
+share parent handles, bounding distinct directory handles by the active depth.
+Regular files are pinned with `O_PATH | O_NOFOLLOW`, checked for type and identity,
+then opened through their pinned descriptor; a substituted FIFO cannot block and
+a substituted device is never opened for data. Files are checked again after
+hashing for changes in identity, size, mode, link count, and modification metadata.
+The excluded manifest is still checked for refused object types before sealing.
+Manifest reads, temporary creation, rename, and directory fsync all use the same
+root handle, so replacing the root pathname cannot redirect them.
+
+Sealing and verification are not filesystem snapshots. An actor able to write
+the tree concurrently can change an already inspected entry or replace a named
+temporary file before publication. The caller must exclude concurrent writers
+while sealing or verifying, including privileged writers; enforcing that ownership
+boundary belongs to the caller. Detected changes fail closed, but metadata checks
+cannot provide snapshot isolation.
 
 ## 3. Root Hash Definition
 

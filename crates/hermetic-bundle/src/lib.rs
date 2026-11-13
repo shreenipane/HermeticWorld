@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Typed error returned by sealing, verification, and manifest validation operations.
 ///
@@ -121,7 +121,8 @@ impl Error for BundleError {}
 /// Seals the directory tree at `dir`, writes `bundle.manifest.json` atomically,
 /// and returns the resulting canonical `Manifest`.
 pub fn seal(dir: impl AsRef<Path>) -> Result<Manifest, BundleError> {
-    let root_dir = dir.as_ref();
+    let root_handle = walk::open_root(dir.as_ref())?;
+    let root_dir = &root_handle;
     let entries = walk::walk_for_seal(root_dir)?;
     let root = compute_root(&entries)?;
     let manifest = Manifest {
@@ -144,7 +145,8 @@ pub fn verify(dir: impl AsRef<Path>, expected_root: Option<&str>) -> Result<Repo
         validate_root_digest(expected).map_err(|_| BundleError::InvalidExpectedRoot)?;
     }
 
-    let root_dir = dir.as_ref();
+    let root_handle = walk::open_root(dir.as_ref())?;
+    let root_dir = &root_handle;
     let manifest = read_and_validate_manifest(root_dir)?;
     let walk_outcome = walk::walk_for_verify(root_dir)?;
     let recomputed_root = compute_root(&walk_outcome.entries)?;
@@ -273,23 +275,8 @@ pub fn verify(dir: impl AsRef<Path>, expected_root: Option<&str>) -> Result<Repo
 }
 
 #[cfg(unix)]
-fn read_and_validate_manifest(root_dir: &Path) -> Result<Manifest, BundleError> {
-    let root_meta = fs::symlink_metadata(root_dir).map_err(|_| BundleError::InvalidRootDir {
-        reason: "cannot stat bundle root",
-    })?;
-    if root_meta.file_type().is_symlink() {
-        return Err(BundleError::RefusedObject {
-            path: ".".to_string(),
-            kind: RefusedKind::Symlink,
-        });
-    }
-    if !root_meta.file_type().is_dir() {
-        return Err(BundleError::NotADirectory {
-            path: ".".to_string(),
-        });
-    }
-
-    let manifest_path = root_dir.join(MANIFEST_FILENAME);
+fn read_and_validate_manifest(root_dir: &File) -> Result<Manifest, BundleError> {
+    let manifest_path = walk::handle_path(root_dir).join(MANIFEST_FILENAME);
     let sym_meta = match fs::symlink_metadata(&manifest_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -303,48 +290,7 @@ fn read_and_validate_manifest(root_dir: &Path) -> Result<Manifest, BundleError> 
         }
     };
 
-    let ft = sym_meta.file_type();
-    if ft.is_symlink() {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::Symlink,
-        });
-    }
-    if ft.is_fifo() {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::Fifo,
-        });
-    }
-    if ft.is_socket() {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::Socket,
-        });
-    }
-    if ft.is_block_device() {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::BlockDevice,
-        });
-    }
-    if ft.is_char_device() {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::CharDevice,
-        });
-    }
-    if !ft.is_file() {
-        return Err(BundleError::ManifestInvalid {
-            reason: "manifest is not a regular file".to_string(),
-        });
-    }
-    if sym_meta.nlink() > 1 {
-        return Err(BundleError::RefusedObject {
-            path: MANIFEST_FILENAME.to_string(),
-            kind: RefusedKind::HardLink,
-        });
-    }
+    walk::validate_manifest_object(&sym_meta)?;
 
     let declared_len = sym_meta.len();
     if declared_len > MAX_MANIFEST_BYTES {
@@ -354,24 +300,7 @@ fn read_and_validate_manifest(root_dir: &Path) -> Result<Manifest, BundleError> 
         });
     }
 
-    let file = File::open(&manifest_path).map_err(|e| BundleError::Io {
-        path: MANIFEST_FILENAME.to_string(),
-        kind: e.kind(),
-    })?;
-    let opened_meta = file.metadata().map_err(|e| BundleError::Io {
-        path: MANIFEST_FILENAME.to_string(),
-        kind: e.kind(),
-    })?;
-
-    if opened_meta.dev() != sym_meta.dev()
-        || opened_meta.ino() != sym_meta.ino()
-        || !opened_meta.file_type().is_file()
-        || opened_meta.nlink() > 1
-    {
-        return Err(BundleError::ConcurrentModification {
-            path: MANIFEST_FILENAME.to_string(),
-        });
-    }
+    let file = walk::open_regular_file(&manifest_path, &sym_meta, MANIFEST_FILENAME)?;
 
     let initial_cap = usize::try_from(declared_len)
         .unwrap_or(0)
@@ -402,31 +331,17 @@ fn read_and_validate_manifest(root_dir: &Path) -> Result<Manifest, BundleError> 
 }
 
 #[cfg(not(unix))]
-fn read_and_validate_manifest(_root_dir: &Path) -> Result<Manifest, BundleError> {
+fn read_and_validate_manifest(_root_dir: &File) -> Result<Manifest, BundleError> {
     Err(BundleError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
 fn write_manifest_atomically(
-    root_dir: &Path,
+    root_dir: &File,
     root_digest: &str,
     canonical_bytes: &[u8],
 ) -> Result<(), BundleError> {
-    let root_meta = fs::symlink_metadata(root_dir).map_err(|_| BundleError::InvalidRootDir {
-        reason: "cannot stat bundle root",
-    })?;
-    if root_meta.file_type().is_symlink() {
-        return Err(BundleError::RefusedObject {
-            path: ".".to_string(),
-            kind: RefusedKind::Symlink,
-        });
-    }
-    if !root_meta.file_type().is_dir() {
-        return Err(BundleError::NotADirectory {
-            path: ".".to_string(),
-        });
-    }
-
+    let root_path = walk::handle_path(root_dir);
     let tag: String = root_digest
         .strip_prefix("sha256:")
         .unwrap_or("00000000")
@@ -443,10 +358,11 @@ fn write_manifest_atomically(
             });
         }
         let candidate_name = format!(".{MANIFEST_FILENAME}.tmp.{tag}.{attempt}");
-        let candidate_path = root_dir.join(&candidate_name);
+        let candidate_path = root_path.join(&candidate_name);
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&candidate_path)
         {
             Ok(f) => break (f, candidate_name, candidate_path),
@@ -489,7 +405,7 @@ fn write_manifest_atomically(
         return Err(e);
     }
 
-    let final_path = root_dir.join(MANIFEST_FILENAME);
+    let final_path = root_path.join(MANIFEST_FILENAME);
     if let Err(e) = fs::rename(&temp_path, &final_path) {
         let _ = fs::remove_file(&temp_path);
         return Err(BundleError::Io {
@@ -498,22 +414,73 @@ fn write_manifest_atomically(
         });
     }
 
-    if let Ok(dir_handle) = File::open(root_dir) {
-        if let Ok(dir_meta) = dir_handle.metadata() {
-            if dir_meta.dev() == root_meta.dev() && dir_meta.ino() == root_meta.ino() {
-                let _ = dir_handle.sync_all();
-            }
-        }
-    }
+    root_dir.sync_all().map_err(|e| walk::io_error(".", e))?;
 
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn write_manifest_atomically(
-    _root_dir: &Path,
+    _root_dir: &File,
     _root_digest: &str,
     _canonical_bytes: &[u8],
 ) -> Result<(), BundleError> {
     Err(BundleError::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    #[test]
+    fn manifest_operations_stay_with_the_opened_root_after_a_swap() {
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("bundle");
+        let saved = parent.path().join("saved");
+        let decoy = parent.path().join("decoy");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&decoy).unwrap();
+        let original = seal(&root).unwrap();
+        let handle = walk::open_root(&root).unwrap();
+        fs::rename(&root, &saved).unwrap();
+        symlink("decoy", &root).unwrap();
+        fs::write(decoy.join(MANIFEST_FILENAME), b"untrusted decoy").unwrap();
+        assert_eq!(read_and_validate_manifest(&handle).unwrap(), original);
+        assert!(walk::walk_for_seal(&handle).unwrap().is_empty());
+        write_manifest_atomically(
+            &handle,
+            &original.root,
+            &original.to_canonical_json_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(decoy.join(MANIFEST_FILENAME)).unwrap(),
+            b"untrusted decoy"
+        );
+        assert_eq!(verify(&saved, None).unwrap().verdict, Verdict::Ok);
+    }
+}
+
+#[cfg(test)]
+mod durability_regression {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn directory_sync_failure_is_not_reported_as_success() {
+        let tree = TempDir::new().unwrap();
+        // O_PATH still permits descriptor-relative pathname operations, but
+        // fsync on this handle returns EBADF. Publication must surface that.
+        const O_PATH: i32 = 0o10000000;
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH)
+            .open(tree.path())
+            .unwrap();
+        let root = compute_root(&[]).unwrap();
+        let result = write_manifest_atomically(&handle, &root, b"fixture");
+        assert!(matches!(result, Err(BundleError::Io { path, .. }) if path == "."));
+    }
 }

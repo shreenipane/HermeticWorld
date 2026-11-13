@@ -7,14 +7,16 @@ use crate::BundleError;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 
 const MAX_CHUNKS_PER_FILE: u64 = (MAX_TOTAL_FILE_BYTES / (HASH_CHUNK_BYTES as u64)) + 2;
 
@@ -29,53 +31,34 @@ enum WalkPolicy {
     CollectVerify,
 }
 
-struct DirFrame {
-    host_path: PathBuf,
-    rel_path: String,
-    depth: usize,
-    expected_dev: u64,
-    expected_ino: u64,
+enum PendingDirectory {
+    Root(Arc<File>),
+    Child {
+        parent: Arc<File>,
+        name: OsString,
+        meta: fs::Metadata,
+    },
 }
 
-pub(crate) fn walk_for_seal(root_dir: &Path) -> Result<Vec<ManifestEntry>, BundleError> {
+struct DirFrame {
+    directory: PendingDirectory,
+    rel_path: String,
+    depth: usize,
+}
+
+pub(crate) fn walk_for_seal(root_dir: &File) -> Result<Vec<ManifestEntry>, BundleError> {
     let outcome = walk_tree(root_dir, WalkPolicy::StrictSeal)?;
     Ok(outcome.entries)
 }
 
-pub(crate) fn walk_for_verify(root_dir: &Path) -> Result<VerifyWalkOutcome, BundleError> {
+pub(crate) fn walk_for_verify(root_dir: &File) -> Result<VerifyWalkOutcome, BundleError> {
     walk_tree(root_dir, WalkPolicy::CollectVerify)
 }
 
-/// Walks `root_dir` without following symlinks and without unbounded recursion.
-///
-/// Directory race mitigation:
-/// Before calling `std::fs::read_dir` on a directory path, we record `(dev, ino)`
-/// via `symlink_metadata` (lstat) and verify it is a real directory. Immediately
-/// after `std::fs::read_dir` opens the directory stream, we re-check `(dev, ino)`
-/// via `symlink_metadata` on the same path to detect a directory-to-symlink swap.
-/// Because `std::fs::read_dir` does not expose `O_NOFOLLOW | O_DIRECTORY` or `fstat`
-/// on the underlying `DIR*` descriptor without `libc`/`unsafe`, a narrow TOCTOU
-/// window remains if a privileged adversary swaps a directory to a symlink and
-/// swaps it back around `read_dir`. Every child entry is independently checked via
-/// `symlink_metadata`, and every regular file is verified via `fstat` `(dev, ino)`
-/// after `File::open`.
+/// Enumerates directories through pinned descriptors. Child lookups contain only
+/// one validated component, so renaming an ancestor cannot redirect a lookup.
 #[cfg(unix)]
-fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, BundleError> {
-    let root_meta = fs::symlink_metadata(root_dir).map_err(|_| BundleError::InvalidRootDir {
-        reason: "cannot stat bundle root",
-    })?;
-    if root_meta.file_type().is_symlink() {
-        return Err(BundleError::RefusedObject {
-            path: ".".to_string(),
-            kind: RefusedKind::Symlink,
-        });
-    }
-    if !root_meta.file_type().is_dir() {
-        return Err(BundleError::NotADirectory {
-            path: ".".to_string(),
-        });
-    }
-
+fn walk_tree(root_dir: &File, policy: WalkPolicy) -> Result<VerifyWalkOutcome, BundleError> {
     let mut entries: Vec<ManifestEntry> = Vec::new();
     let mut refused_objects: Vec<RefusedObject> = Vec::new();
     let mut seen_lower: BTreeMap<String, String> = BTreeMap::new();
@@ -85,11 +68,11 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
 
     let mut stack: Vec<DirFrame> = Vec::new();
     stack.push(DirFrame {
-        host_path: root_dir.to_path_buf(),
+        directory: PendingDirectory::Root(Arc::new(
+            root_dir.try_clone().map_err(|e| io_error(".", e))?,
+        )),
         rel_path: String::new(),
         depth: 0,
-        expected_dev: root_meta.dev(),
-        expected_ino: root_meta.ino(),
     });
 
     while let Some(frame) = stack.pop() {
@@ -99,43 +82,22 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
                 max: MAX_DEPTH as u64,
             });
         }
-
         let display_dir = if frame.rel_path.is_empty() {
-            ".".to_string()
+            "."
         } else {
-            frame.rel_path.clone()
+            &frame.rel_path
         };
-
-        let pre_meta = fs::symlink_metadata(&frame.host_path).map_err(|_| {
-            BundleError::ConcurrentModification {
-                path: display_dir.clone(),
-            }
-        })?;
-        if pre_meta.file_type().is_symlink()
-            || !pre_meta.file_type().is_dir()
-            || pre_meta.dev() != frame.expected_dev
-            || pre_meta.ino() != frame.expected_ino
-        {
-            return Err(BundleError::ConcurrentModification { path: display_dir });
-        }
-
-        let read_dir = fs::read_dir(&frame.host_path).map_err(|e| BundleError::Io {
-            path: display_dir.clone(),
-            kind: e.kind(),
-        })?;
-
-        let post_meta = fs::symlink_metadata(&frame.host_path).map_err(|_| {
-            BundleError::ConcurrentModification {
-                path: display_dir.clone(),
-            }
-        })?;
-        if post_meta.file_type().is_symlink()
-            || !post_meta.file_type().is_dir()
-            || post_meta.dev() != frame.expected_dev
-            || post_meta.ino() != frame.expected_ino
-        {
-            return Err(BundleError::ConcurrentModification { path: display_dir });
-        }
+        // Pending siblings share their parent's handle. Only the active ancestor
+        // chain holds distinct handles, bounded by MAX_DEPTH plus the root.
+        let handle = match frame.directory {
+            PendingDirectory::Root(handle) => handle,
+            PendingDirectory::Child { parent, name, meta } => Arc::new(open_directory(
+                &child_path(&parent, &name),
+                &meta,
+                display_dir,
+            )?),
+        };
+        let read_dir = fs::read_dir(handle_path(&handle)).map_err(|e| io_error(display_dir, e))?;
 
         let mut child_names: Vec<OsString> = Vec::new();
         for dir_entry_res in read_dir {
@@ -153,7 +115,7 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
             }
 
             let dir_entry = dir_entry_res.map_err(|e| BundleError::Io {
-                path: display_dir.clone(),
+                path: display_dir.to_string(),
                 kind: e.kind(),
             })?;
             child_names.push(dir_entry.file_name());
@@ -186,6 +148,12 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
             };
 
             if frame.depth == 0 && child_name == MANIFEST_FILENAME {
+                // The manifest is excluded from the digest, but is still an
+                // object in the tree and must satisfy the regular-file rules.
+                let path = child_path(&handle, child_os.as_os_str());
+                let meta =
+                    fs::symlink_metadata(&path).map_err(|e| io_error(MANIFEST_FILENAME, e))?;
+                validate_manifest_object(&meta)?;
                 continue;
             }
 
@@ -224,7 +192,7 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
             }
             seen_lower.insert(child_lower, child_rel.clone());
 
-            let child_host = frame.host_path.join(child_name);
+            let child_host = child_path(&handle, child_os.as_os_str());
             let child_meta = fs::symlink_metadata(&child_host).map_err(|e| BundleError::Io {
                 path: child_rel.clone(),
                 kind: e.kind(),
@@ -301,11 +269,13 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
                 }
 
                 stack.push(DirFrame {
-                    host_path: child_host,
+                    directory: PendingDirectory::Child {
+                        parent: Arc::clone(&handle),
+                        name: child_os.clone(),
+                        meta: child_meta,
+                    },
                     rel_path: child_rel,
                     depth: next_depth,
-                    expected_dev: child_meta.dev(),
-                    expected_ino: child_meta.ino(),
                 });
             } else if ft.is_file() {
                 if child_meta.nlink() > 1 {
@@ -355,7 +325,7 @@ fn walk_tree(root_dir: &Path, policy: WalkPolicy) -> Result<VerifyWalkOutcome, B
 }
 
 #[cfg(not(unix))]
-fn walk_tree(_root_dir: &Path, _policy: WalkPolicy) -> Result<VerifyWalkOutcome, BundleError> {
+fn walk_tree(_root_dir: &File, _policy: WalkPolicy) -> Result<VerifyWalkOutcome, BundleError> {
     Err(BundleError::UnsupportedPlatform)
 }
 
@@ -381,24 +351,8 @@ fn hash_regular_file(
         });
     }
 
-    let mut file = File::open(host_path).map_err(|e| BundleError::Io {
-        path: rel_path.to_string(),
-        kind: e.kind(),
-    })?;
-    let opened_meta = file.metadata().map_err(|e| BundleError::Io {
-        path: rel_path.to_string(),
-        kind: e.kind(),
-    })?;
-
-    if opened_meta.dev() != sym_meta.dev()
-        || opened_meta.ino() != sym_meta.ino()
-        || !opened_meta.file_type().is_file()
-        || opened_meta.nlink() > 1
-    {
-        return Err(BundleError::ConcurrentModification {
-            path: rel_path.to_string(),
-        });
-    }
+    let mut file = open_regular_file(host_path, sym_meta, rel_path)?;
+    let opened_meta = file.metadata().map_err(|e| io_error(rel_path, e))?;
 
     let mode = if (opened_meta.mode() & 0o111) != 0 {
         EntryMode::Mode0755
@@ -466,6 +420,17 @@ fn hash_regular_file(
         }
     }
 
+    let final_meta = file.metadata().map_err(|e| io_error(rel_path, e))?;
+    let path_meta = fs::symlink_metadata(host_path).map_err(|e| io_error(rel_path, e))?;
+    if !same_file_state(&opened_meta, &final_meta)
+        || !same_file_state(&final_meta, &path_meta)
+        || actual_size != final_meta.len()
+    {
+        return Err(BundleError::ConcurrentModification {
+            path: rel_path.to_string(),
+        });
+    }
+
     let digest = hasher.finalize();
     let sha256 = encode_lower_hex(&digest);
 
@@ -483,5 +448,237 @@ fn join_rel_path(parent: &str, child: &str) -> String {
         child.to_string()
     } else {
         format!("{parent}/{child}")
+    }
+}
+
+// Linux x86_64 is the project host platform (TRD section 1). Do not silently
+// reuse these flag values on another ABI.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!("hermetic-bundle descriptor operations require Linux x86_64");
+const O_NOFOLLOW: i32 = 0o400000;
+const O_DIRECTORY: i32 = 0o200000;
+const O_PATH: i32 = 0o10000000;
+const O_NONBLOCK: i32 = 0o4000;
+const MAX_ROOT_PATH_BYTES: usize = 8192;
+const MAX_ROOT_COMPONENTS: usize = 4096;
+
+pub(crate) fn io_error(rel: &str, e: std::io::Error) -> BundleError {
+    BundleError::Io {
+        path: rel.to_string(),
+        kind: e.kind(),
+    }
+}
+
+pub(crate) fn handle_path(handle: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+}
+
+fn child_path(handle: &File, name: &std::ffi::OsStr) -> PathBuf {
+    handle_path(handle).join(name)
+}
+
+pub(crate) fn open_root(path: &Path) -> Result<File, BundleError> {
+    if path.as_os_str().len() > MAX_ROOT_PATH_BYTES {
+        return Err(BundleError::LimitExceeded {
+            limit: "MAX_ROOT_PATH_BYTES",
+            max: MAX_ROOT_PATH_BYTES as u64,
+        });
+    }
+    if path.as_os_str().is_empty() {
+        return Err(BundleError::InvalidRootDir {
+            reason: "empty root path",
+        });
+    }
+    let mut count = 0usize;
+    for _ in path.components() {
+        count = count.saturating_add(1);
+        if count > MAX_ROOT_COMPONENTS {
+            return Err(BundleError::LimitExceeded {
+                limit: "MAX_ROOT_COMPONENTS",
+                max: MAX_ROOT_COMPONENTS as u64,
+            });
+        }
+    }
+    let base = Path::new(if path.is_absolute() { "/" } else { "." });
+    let meta = fs::symlink_metadata(base).map_err(|_| BundleError::InvalidRootDir {
+        reason: "cannot stat bundle root",
+    })?;
+    let mut handle = open_directory(base, &meta, ".")?;
+    for component in path.components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::RootDir | Component::CurDir => continue,
+            Component::Prefix(_) => {
+                return Err(BundleError::InvalidRootDir {
+                    reason: "unsupported root prefix",
+                })
+            }
+        };
+        let child = child_path(&handle, name);
+        let meta = fs::symlink_metadata(&child).map_err(|_| BundleError::InvalidRootDir {
+            reason: "cannot stat bundle root",
+        })?;
+        handle = open_directory(&child, &meta, ".")?;
+    }
+    Ok(handle)
+}
+
+fn open_directory(path: &Path, meta: &fs::Metadata, rel: &str) -> Result<File, BundleError> {
+    if meta.is_symlink() {
+        return Err(BundleError::RefusedObject {
+            path: rel.to_string(),
+            kind: RefusedKind::Symlink,
+        });
+    }
+    if !meta.is_dir() {
+        return Err(BundleError::NotADirectory {
+            path: rel.to_string(),
+        });
+    }
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|e| io_error(rel, e))?;
+    let opened = handle.metadata().map_err(|e| io_error(rel, e))?;
+    if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+        return Err(BundleError::ConcurrentModification {
+            path: rel.to_string(),
+        });
+    }
+    Ok(handle)
+}
+
+pub(crate) fn validate_manifest_object(meta: &fs::Metadata) -> Result<(), BundleError> {
+    let ft = meta.file_type();
+    let kind = if ft.is_symlink() {
+        Some(RefusedKind::Symlink)
+    } else if ft.is_fifo() {
+        Some(RefusedKind::Fifo)
+    } else if ft.is_socket() {
+        Some(RefusedKind::Socket)
+    } else if ft.is_block_device() {
+        Some(RefusedKind::BlockDevice)
+    } else if ft.is_char_device() {
+        Some(RefusedKind::CharDevice)
+    } else if ft.is_file() && meta.nlink() > 1 {
+        Some(RefusedKind::HardLink)
+    } else if !ft.is_file() {
+        Some(RefusedKind::SpecialFile)
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
+        return Err(BundleError::RefusedObject {
+            path: MANIFEST_FILENAME.to_string(),
+            kind,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn open_regular_file(
+    path: &Path,
+    meta: &fs::Metadata,
+    rel: &str,
+) -> Result<File, BundleError> {
+    // O_PATH pins the object without opening a device or waiting on a FIFO.
+    // O_NOFOLLOW pins a substituted symlink itself; fstat rejects it below.
+    let pinned = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_PATH | O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| io_error(rel, e))?;
+    let pinned_meta = pinned.metadata().map_err(|e| io_error(rel, e))?;
+    if !pinned_meta.is_file() || pinned_meta.nlink() > 1 || !same_file_state(meta, &pinned_meta) {
+        return Err(BundleError::ConcurrentModification {
+            path: rel.to_string(),
+        });
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(handle_path(&pinned))
+        .map_err(|e| io_error(rel, e))?;
+    let opened = file.metadata().map_err(|e| io_error(rel, e))?;
+    if !same_file_state(&pinned_meta, &opened) {
+        return Err(BundleError::ConcurrentModification {
+            path: rel.to_string(),
+        });
+    }
+    Ok(file)
+}
+
+fn same_file_state(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.mode() == b.mode()
+        && a.nlink() == b.nlink()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    #[test]
+    fn file_swapped_to_symlink_is_refused_even_with_the_same_target_inode() {
+        let tree = TempDir::new().unwrap();
+        let file = tree.path().join("file");
+        fs::write(&file, b"data").unwrap();
+        let meta = fs::symlink_metadata(&file).unwrap();
+        fs::rename(&file, tree.path().join("saved")).unwrap();
+        symlink("saved", &file).unwrap();
+        assert!(matches!(
+            hash_regular_file(&file, "file", &meta, &mut 0),
+            Err(BundleError::ConcurrentModification { .. })
+        ));
+    }
+
+    #[test]
+    fn file_swapped_to_fifo_does_not_block() {
+        let tree = TempDir::new().unwrap();
+        let file = tree.path().join("file");
+        fs::write(&file, b"data").unwrap();
+        let meta = fs::symlink_metadata(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        match Command::new("mkfifo").arg(&file).status() {
+            Ok(status) if status.success() => {
+                let (send, receive) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = hash_regular_file(&file, "file", &meta, &mut 0);
+                    let _ = send.send(result);
+                });
+                const MAX_FIFO_TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+                assert!(matches!(
+                    receive
+                        .recv_timeout(MAX_FIFO_TEST_WAIT)
+                        .expect("opening a substituted FIFO blocked"),
+                    Err(BundleError::ConcurrentModification { .. })
+                ));
+            }
+            _ => eprintln!("skipping swapped-FIFO fixture: mkfifo unavailable"),
+        }
+    }
+
+    #[test]
+    fn file_changed_since_lstat_is_refused() {
+        let tree = TempDir::new().unwrap();
+        let file = tree.path().join("file");
+        fs::write(&file, b"first").unwrap();
+        let meta = fs::symlink_metadata(&file).unwrap();
+        fs::write(&file, b"second").unwrap();
+        assert!(matches!(
+            hash_regular_file(&file, "file", &meta, &mut 0),
+            Err(BundleError::ConcurrentModification { .. })
+        ));
     }
 }

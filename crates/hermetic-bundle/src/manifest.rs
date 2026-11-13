@@ -46,6 +46,12 @@ pub const MAX_JSON_SCAN_STEPS_MULTIPLIER: usize = 4;
 /// Base step allowance for duplicate key scanning.
 pub const MAX_JSON_SCAN_STEPS_BASE: usize = 1024;
 
+/// No schema object contains more than six keys.
+const MAX_JSON_OBJECT_KEYS: usize = 6;
+/// Longest decoded JSON string permitted before schema deserialization.
+const MAX_JSON_STRING_BYTES: usize = MAX_PATH_BYTES;
+const MAX_JSON_ARRAY_ITEMS: usize = MAX_ENTRIES;
+
 const HEX_DIGEST_LEN: usize = 64;
 const ROOT_PREFIX: &str = "sha256:";
 
@@ -103,9 +109,37 @@ pub struct ManifestEntry {
 impl ManifestEntry {
     /// Serializes this entry to its canonical compact UTF-8 JSON bytes.
     pub fn to_canonical_json_bytes(&self) -> Result<Vec<u8>, BundleError> {
-        serde_json::to_vec(self).map_err(|e| BundleError::ManifestInvalid {
-            reason: format!("failed to serialize entry: {e}"),
-        })
+        self.validate()?;
+        bounded_json(self)
+    }
+
+    fn validate(&self) -> Result<(), BundleError> {
+        validate_relative_path(&self.path)?;
+        match self.kind {
+            EntryKind::File => {
+                let size = self
+                    .size
+                    .ok_or_else(|| invalid("file entry missing size"))?;
+                if size > MAX_TOTAL_FILE_BYTES {
+                    return Err(BundleError::LimitExceeded {
+                        limit: "MAX_TOTAL_FILE_BYTES",
+                        max: MAX_TOTAL_FILE_BYTES,
+                    });
+                }
+                if !self.sha256.as_deref().is_some_and(is_lower_hex_64) {
+                    return Err(invalid("file entry has invalid or missing sha256"));
+                }
+            }
+            EntryKind::Dir => {
+                if self.mode != EntryMode::Mode0755 || self.size.is_some() || self.sha256.is_some()
+                {
+                    return Err(invalid(
+                        "directory entry must have mode 0755 and no file fields",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -121,9 +155,8 @@ pub struct Manifest {
 impl Manifest {
     /// Serializes the manifest to canonical compact UTF-8 JSON bytes.
     pub fn to_canonical_json_bytes(&self) -> Result<Vec<u8>, BundleError> {
-        serde_json::to_vec(self).map_err(|e| BundleError::ManifestInvalid {
-            reason: format!("failed to serialize manifest: {e}"),
-        })
+        self.validate()?;
+        bounded_json(self)
     }
 
     /// Parses and validates canonical manifest JSON bytes, rejecting duplicate keys,
@@ -137,10 +170,11 @@ impl Manifest {
         }
         validate_json_no_duplicate_keys(bytes)?;
         let manifest: Manifest =
-            serde_json::from_slice(bytes).map_err(|e| BundleError::ManifestInvalid {
-                reason: format!("JSON parse/schema error: {e}"),
-            })?;
+            serde_json::from_slice(bytes).map_err(|_| invalid("JSON parse/schema error"))?;
         manifest.validate()?;
+        if manifest.to_canonical_json_bytes()? != bytes {
+            return Err(invalid("manifest JSON is not canonical"));
+        }
         Ok(manifest)
     }
 
@@ -148,7 +182,7 @@ impl Manifest {
     pub fn validate(&self) -> Result<(), BundleError> {
         if self.format != FORMAT_VERSION {
             return Err(BundleError::ManifestInvalid {
-                reason: format!("unsupported format '{}'", self.format),
+                reason: "unsupported manifest format".to_string(),
             });
         }
 
@@ -164,9 +198,16 @@ impl Manifest {
         let mut prev_path: Option<&[u8]> = None;
         let mut seen_lower: BTreeSet<String> = BTreeSet::new();
         let mut total_bytes: u64 = 0;
+        let mut parents = std::collections::BTreeMap::new();
 
         for entry in &self.entries {
-            validate_relative_path(&entry.path)?;
+            entry.validate()?;
+            if let Some((parent, _)) = entry.path.rsplit_once('/') {
+                if parents.get(parent) != Some(&EntryKind::Dir) {
+                    return Err(invalid("entry parent must be an earlier directory entry"));
+                }
+            }
+            parents.insert(entry.path.as_str(), entry.kind);
 
             let path_bytes = entry.path.as_bytes();
             if let Some(prev) = prev_path {
@@ -358,6 +399,12 @@ pub fn validate_relative_path(path: &str) -> Result<(), BundleError> {
             max: MAX_PATH_BYTES as u64,
         });
     }
+    if path.starts_with('/') {
+        return Err(BundleError::InvalidPath {
+            path: "<invalid>".to_string(),
+            reason: "leading slash in path",
+        });
+    }
     if path.as_bytes().contains(&0) {
         return Err(BundleError::InvalidPath {
             path: sanitize_path_for_error(path),
@@ -370,19 +417,17 @@ pub fn validate_relative_path(path: &str) -> Result<(), BundleError> {
             reason: "backslash in path",
         });
     }
-    if path.starts_with('/') {
-        return Err(BundleError::InvalidPath {
-            path: path.to_string(),
-            reason: "leading slash in path",
-        });
-    }
     if path.ends_with('/') {
         return Err(BundleError::InvalidPath {
             path: path.to_string(),
             reason: "trailing slash in path",
         });
     }
-    if path == MANIFEST_FILENAME {
+    if path
+        .split('/')
+        .next()
+        .is_some_and(|part| part.eq_ignore_ascii_case(MANIFEST_FILENAME))
+    {
         return Err(BundleError::InvalidPath {
             path: path.to_string(),
             reason: "manifest filename cannot be a bundle entry",
@@ -450,6 +495,22 @@ pub fn compute_root(entries: &[ManifestEntry]) -> Result<String, BundleError> {
         });
     }
 
+    let mut total = 0u64;
+    for entry in entries {
+        entry.validate()?;
+        total = total
+            .checked_add(entry.size.unwrap_or(0))
+            .ok_or(BundleError::LimitExceeded {
+                limit: "MAX_TOTAL_FILE_BYTES",
+                max: MAX_TOTAL_FILE_BYTES,
+            })?;
+        if total > MAX_TOTAL_FILE_BYTES {
+            return Err(BundleError::LimitExceeded {
+                limit: "MAX_TOTAL_FILE_BYTES",
+                max: MAX_TOTAL_FILE_BYTES,
+            });
+        }
+    }
     let mut ordered: Vec<&ManifestEntry> = entries.iter().collect();
     ordered.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
 
@@ -642,6 +703,9 @@ impl<'a> JsonKeyScanner<'a> {
     }
 
     fn parse_object(&mut self, depth: usize) -> Result<(), BundleError> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(invalid("JSON nesting depth exceeded"));
+        }
         if self.bump() != Some(b'{') {
             return Err(BundleError::ManifestInvalid {
                 reason: "expected '{'".to_string(),
@@ -658,6 +722,12 @@ impl<'a> JsonKeyScanner<'a> {
             self.tick()?;
             self.skip_ws();
             let key = self.parse_string()?;
+            if seen_keys.len() >= MAX_JSON_OBJECT_KEYS {
+                return Err(BundleError::LimitExceeded {
+                    limit: "MAX_JSON_OBJECT_KEYS",
+                    max: MAX_JSON_OBJECT_KEYS as u64,
+                });
+            }
             if !seen_keys.insert(key) {
                 return Err(BundleError::ManifestInvalid {
                     reason: "duplicate key in JSON object".to_string(),
@@ -684,6 +754,9 @@ impl<'a> JsonKeyScanner<'a> {
     }
 
     fn parse_array(&mut self, depth: usize) -> Result<(), BundleError> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(invalid("JSON nesting depth exceeded"));
+        }
         if self.bump() != Some(b'[') {
             return Err(BundleError::ManifestInvalid {
                 reason: "expected '['".to_string(),
@@ -695,7 +768,15 @@ impl<'a> JsonKeyScanner<'a> {
             return Ok(());
         }
 
+        let mut count = 0usize;
         loop {
+            if count >= MAX_JSON_ARRAY_ITEMS {
+                return Err(BundleError::LimitExceeded {
+                    limit: "MAX_ENTRIES",
+                    max: MAX_ENTRIES as u64,
+                });
+            }
+            count = count.saturating_add(1);
             self.tick()?;
             self.parse_value(depth)?;
             self.skip_ws();
@@ -726,6 +807,12 @@ impl<'a> JsonKeyScanner<'a> {
             })?;
             if b == b'"' {
                 flush_utf16(&mut utf16_units, &mut raw_utf8)?;
+                if raw_utf8.len() > MAX_JSON_STRING_BYTES {
+                    return Err(BundleError::LimitExceeded {
+                        limit: "MAX_JSON_STRING_BYTES",
+                        max: MAX_JSON_STRING_BYTES as u64,
+                    });
+                }
                 return String::from_utf8(raw_utf8).map_err(|_| BundleError::ManifestInvalid {
                     reason: "invalid UTF-8 in JSON string".to_string(),
                 });
@@ -741,6 +828,12 @@ impl<'a> JsonKeyScanner<'a> {
                 })?;
                 if esc == b'u' {
                     let unit = self.parse_hex_u16()?;
+                    if utf16_units.len() >= MAX_JSON_STRING_BYTES {
+                        return Err(BundleError::LimitExceeded {
+                            limit: "MAX_JSON_STRING_BYTES",
+                            max: MAX_JSON_STRING_BYTES as u64,
+                        });
+                    }
                     utf16_units.push(unit);
                 } else {
                     flush_utf16(&mut utf16_units, &mut raw_utf8)?;
@@ -759,11 +852,11 @@ impl<'a> JsonKeyScanner<'a> {
                             });
                         }
                     };
-                    raw_utf8.push(mapped);
+                    push_string_byte(&mut raw_utf8, mapped)?;
                 }
             } else {
                 flush_utf16(&mut utf16_units, &mut raw_utf8)?;
-                raw_utf8.push(b);
+                push_string_byte(&mut raw_utf8, b)?;
             }
         }
     }
@@ -790,6 +883,17 @@ impl<'a> JsonKeyScanner<'a> {
     }
 }
 
+fn push_string_byte(out: &mut Vec<u8>, byte: u8) -> Result<(), BundleError> {
+    if out.len() >= MAX_JSON_STRING_BYTES {
+        return Err(BundleError::LimitExceeded {
+            limit: "MAX_JSON_STRING_BYTES",
+            max: MAX_JSON_STRING_BYTES as u64,
+        });
+    }
+    out.push(byte);
+    Ok(())
+}
+
 fn flush_utf16(units: &mut Vec<u16>, out_utf8: &mut Vec<u8>) -> Result<(), BundleError> {
     if units.is_empty() {
         return Ok(());
@@ -800,8 +904,128 @@ fn flush_utf16(units: &mut Vec<u16>, out_utf8: &mut Vec<u8>) -> Result<(), Bundl
             reason: "unpaired UTF-16 surrogate in JSON string".to_string(),
         })?;
         let s = ch.encode_utf8(&mut enc_buf);
+        if out_utf8.len().saturating_add(s.len()) > MAX_JSON_STRING_BYTES {
+            return Err(BundleError::LimitExceeded {
+                limit: "MAX_JSON_STRING_BYTES",
+                max: MAX_JSON_STRING_BYTES as u64,
+            });
+        }
         out_utf8.extend_from_slice(s.as_bytes());
     }
     units.clear();
     Ok(())
+}
+
+fn invalid(reason: &'static str) -> BundleError {
+    BundleError::ManifestInvalid {
+        reason: reason.to_string(),
+    }
+}
+
+/// Bound the output while serializing, rather than after allocating it.
+fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, BundleError> {
+    bounded_json_with_cap(value, MAX_MANIFEST_BYTES)
+}
+
+fn bounded_json_with_cap(value: &impl Serialize, cap: u64) -> Result<Vec<u8>, BundleError> {
+    struct CappedJson {
+        bytes: Vec<u8>,
+        cap: u64,
+        exceeded: bool,
+    }
+    impl std::io::Write for CappedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.cap {
+                self.exceeded = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = CappedJson {
+        bytes: Vec::new(),
+        cap,
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut out, value).is_err() {
+        if out.exceeded {
+            return Err(BundleError::LimitExceeded {
+                limit: "MAX_MANIFEST_BYTES",
+                max: cap,
+            });
+        }
+        return Err(invalid("JSON serialization error"));
+    }
+    Ok(out.bytes)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn scanner_bounds_allocations_before_schema_deserialization() {
+        for string in [
+            format!("\"{}\"", "a".repeat(MAX_JSON_STRING_BYTES + 1)),
+            format!("\"{}\"", "\\u0061".repeat(MAX_JSON_STRING_BYTES + 1)),
+        ] {
+            assert!(matches!(
+                validate_json_no_duplicate_keys(string.as_bytes()),
+                Err(BundleError::LimitExceeded {
+                    limit: "MAX_JSON_STRING_BYTES",
+                    ..
+                })
+            ));
+        }
+        let array = format!("[{}0]", "0,".repeat(MAX_ENTRIES));
+        assert!(matches!(
+            validate_json_no_duplicate_keys(array.as_bytes()),
+            Err(BundleError::LimitExceeded {
+                limit: "MAX_ENTRIES",
+                ..
+            })
+        ));
+        let object = br#"{"a":0,"b":0,"c":0,"d":0,"e":0,"f":0,"g":0}"#;
+        assert!(matches!(
+            validate_json_no_duplicate_keys(object),
+            Err(BundleError::LimitExceeded {
+                limit: "MAX_JSON_OBJECT_KEYS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scanner_enforces_the_exact_nesting_cap() {
+        let allowed = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH),
+            "]".repeat(MAX_JSON_NESTING_DEPTH)
+        );
+        assert!(validate_json_no_duplicate_keys(allowed.as_bytes()).is_ok());
+        let too_deep = format!("[{allowed}]");
+        assert!(validate_json_no_duplicate_keys(too_deep.as_bytes()).is_err());
+        let objects = format!(
+            "{}0{}",
+            "{\"k\":".repeat(MAX_JSON_NESTING_DEPTH + 1),
+            "}".repeat(MAX_JSON_NESTING_DEPTH + 1)
+        );
+        assert!(validate_json_no_duplicate_keys(objects.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn serialization_stops_at_the_byte_cap() {
+        assert_eq!(bounded_json_with_cap(&"abc", 5).unwrap(), b"\"abc\"");
+        assert!(matches!(
+            bounded_json_with_cap(&"abc", 4),
+            Err(BundleError::LimitExceeded {
+                limit: "MAX_MANIFEST_BYTES",
+                max: 4
+            })
+        ));
+    }
 }

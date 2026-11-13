@@ -2,6 +2,7 @@
 
 use hermetic_bundle::{seal, verify, Verdict};
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -101,42 +102,45 @@ fn main() -> ExitCode {
     let cmd = match parse_args() {
         Ok(c) => c,
         Err(msg) => {
-            eprintln!("error: {msg}");
+            let _ = writeln!(io::stderr().lock(), "error: {msg}");
             return ExitCode::from(1);
         }
     };
 
     match cmd {
         Command::Seal { dir } => match seal(Path::new(&dir)) {
-            Ok(manifest) => {
-                println!("{}", manifest.root);
-                ExitCode::from(0)
-            }
+            Ok(manifest) => match write_root(&mut io::stdout().lock(), &manifest.root) {
+                Ok(()) => ExitCode::from(0),
+                Err(_) => ExitCode::from(1),
+            },
             Err(err) => {
-                eprintln!("error: {err}");
+                let _ = writeln!(io::stderr().lock(), "error: {err}");
                 ExitCode::from(1)
             }
         },
         Command::Verify { dir, expected_root } => {
             match verify(Path::new(&dir), expected_root.as_deref()) {
-                Ok(report) => match serde_json::to_string_pretty(&report) {
-                    Ok(json) => {
-                        println!("{json}");
-                        match report.verdict {
-                            Verdict::Ok => ExitCode::from(0),
-                            Verdict::Mismatch => ExitCode::from(2),
-                        }
+                Ok(report) => {
+                    let mut stdout = io::stdout().lock();
+                    if serde_json::to_writer_pretty(&mut stdout, &report).is_err()
+                        || stdout.write_all(b"\n").is_err()
+                    {
+                        return ExitCode::from(1);
                     }
-                    Err(err) => {
-                        eprintln!("error: failed to serialize report: {err}");
-                        ExitCode::from(1)
+                    match report.verdict {
+                        Verdict::Ok => ExitCode::from(0),
+                        Verdict::Mismatch => ExitCode::from(2),
                     }
-                },
+                }
                 Err(err) => {
-                    eprintln!("error: {err}");
+                    let _ = writeln!(io::stderr().lock(), "error: {err}");
                     ExitCode::from(1)
                 }
             }
         }
     }
+}
+
+fn write_root(output: &mut impl Write, root: &str) -> io::Result<()> {
+    writeln!(output, "{root}")
 }

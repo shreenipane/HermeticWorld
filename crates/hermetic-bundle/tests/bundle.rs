@@ -550,3 +550,231 @@ fn manual_manifest_construction_and_caps() {
     };
     assert!(missing_file_sha.validate().is_err());
 }
+
+#[test]
+fn root_paths_reject_symlink_ancestors_and_trailing_slashes() {
+    let tree = TempDir::new().unwrap();
+    create_dir(&tree.path().join("real/bundle"));
+    seal(tree.path().join("real/bundle")).unwrap();
+    symlink("real", tree.path().join("alias")).unwrap();
+    let through_ancestor = tree.path().join("alias/bundle");
+    assert!(matches!(
+        seal(&through_ancestor),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Symlink,
+            ..
+        })
+    ));
+    assert!(matches!(
+        verify(&through_ancestor, None),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Symlink,
+            ..
+        })
+    ));
+    symlink("real/bundle", tree.path().join("link")).unwrap();
+    let trailing = format!("{}/link/", tree.path().display());
+    assert!(matches!(
+        seal(Path::new(&trailing)),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Symlink,
+            ..
+        })
+    ));
+    assert!(matches!(
+        verify(Path::new(&trailing), None),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Symlink,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn seal_checks_excluded_manifest_objects_before_writing() {
+    let tree = TempDir::new().unwrap();
+    let manifest = tree.path().join(MANIFEST_FILENAME);
+    write_file(&tree.path().join("target"), b"preserve", 0o600);
+    symlink("target", &manifest).unwrap();
+    assert!(matches!(
+        seal(tree.path()),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Symlink,
+            ..
+        })
+    ));
+    assert!(fs::symlink_metadata(&manifest).unwrap().is_symlink());
+    assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"preserve");
+    fs::remove_file(&manifest).unwrap();
+    fs::hard_link(tree.path().join("target"), &manifest).unwrap();
+    assert!(matches!(
+        seal(tree.path()),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::HardLink,
+            ..
+        })
+    ));
+    fs::remove_file(&manifest).unwrap();
+    fs::create_dir(&manifest).unwrap();
+    assert!(matches!(
+        seal(tree.path()),
+        Err(BundleError::RefusedObject { .. })
+    ));
+    fs::remove_dir(&manifest).unwrap();
+    let listener = UnixListener::bind(&manifest).unwrap();
+    assert!(matches!(
+        seal(tree.path()),
+        Err(BundleError::RefusedObject {
+            kind: RefusedKind::Socket,
+            ..
+        })
+    ));
+    drop(listener);
+    fs::remove_file(&manifest).unwrap();
+    match Command::new("mkfifo").arg(&manifest).status() {
+        Ok(status) if status.success() => {
+            assert!(matches!(
+                seal(tree.path()),
+                Err(BundleError::RefusedObject {
+                    kind: RefusedKind::Fifo,
+                    ..
+                })
+            ));
+        }
+        _ => eprintln!("skipping excluded-manifest FIFO fixture: mkfifo unavailable"),
+    }
+}
+
+#[test]
+fn reserved_manifest_name_participates_in_portability_rules() {
+    for path in [
+        "BUNDLE.MANIFEST.JSON",
+        "bundle.manifest.json/hidden",
+        "Bundle.Manifest.Json/hidden",
+    ] {
+        assert!(validate_relative_path(path).is_err(), "{path}");
+    }
+    assert!(validate_relative_path("sub/bundle.manifest.json").is_ok());
+    let tree = TempDir::new().unwrap();
+    write_file(&tree.path().join("BUNDLE.MANIFEST.JSON"), b"data", 0o644);
+    assert!(seal(tree.path()).is_err());
+    assert!(!tree.path().join(MANIFEST_FILENAME).exists());
+}
+
+#[test]
+fn canonical_manifest_rejects_alternate_encodings_and_null_fields() {
+    let root = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let whitespace = format!(r#"{{ "format":"hermetic-bundle/v1","entries":[],"root":"{root}"}}"#);
+    let order = format!(r#"{{"root":"{root}","entries":[],"format":"hermetic-bundle/v1"}}"#);
+    let null_size = format!(
+        r#"{{"format":"hermetic-bundle/v1","entries":[{{"path":"sub","kind":"dir","mode":"0755","size":null}}],"root":"{root}"}}"#
+    );
+    let null_hash = null_size.replace("size", "sha256");
+    for json in [whitespace, order, null_size, null_hash] {
+        assert!(
+            Manifest::from_json_bytes(json.as_bytes()).is_err(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn manifest_rejects_impossible_parent_structure() {
+    let tree = TempDir::new().unwrap();
+    write_file(&tree.path().join("a/b"), b"data", 0o644);
+    let mut manifest = seal(tree.path()).unwrap();
+    manifest.entries.remove(0);
+    assert!(manifest.validate().is_err());
+    let mut file_parent = manifest.entries[0].clone();
+    file_parent.path = "a".to_string();
+    manifest.entries.insert(0, file_parent);
+    assert!(manifest.validate().is_err());
+}
+
+#[test]
+fn public_hash_and_serialization_apis_enforce_input_caps() {
+    let mut entry = ManifestEntry {
+        path: "x".repeat(MAX_PATH_BYTES + 1),
+        kind: EntryKind::File,
+        mode: EntryMode::Mode0644,
+        size: Some(0),
+        sha256: Some("0".repeat(64)),
+    };
+    assert!(matches!(
+        entry.to_canonical_json_bytes(),
+        Err(BundleError::LimitExceeded {
+            limit: "MAX_PATH_BYTES",
+            ..
+        })
+    ));
+    assert!(matches!(
+        compute_root(&[entry.clone()]),
+        Err(BundleError::LimitExceeded {
+            limit: "MAX_PATH_BYTES",
+            ..
+        })
+    ));
+    entry.path = "file".to_string();
+    entry.size = Some(hermetic_bundle::MAX_TOTAL_FILE_BYTES + 1);
+    assert!(compute_root(&[entry.clone()]).is_err());
+    let manifest = Manifest {
+        format: "hermetic-bundle/v1".to_string(),
+        entries: vec![entry],
+        root: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+    };
+    assert!(manifest.to_canonical_json_bytes().is_err());
+}
+
+#[test]
+fn manifest_errors_do_not_echo_supplied_values() {
+    let secret = "/private/host-identity-and-secret";
+    let root = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for json in [
+        format!(r#"{{"format":"{secret}","entries":[],"root":"{root}"}}"#),
+        format!(
+            r#"{{"format":"hermetic-bundle/v1","entries":[],"root":"{root}","{secret}":true}}"#
+        ),
+        format!(
+            r#"{{"format":"hermetic-bundle/v1","entries":[{{"path":"file","kind":"{secret}","mode":"0644"}}],"root":"{root}"}}"#
+        ),
+    ] {
+        let error = Manifest::from_json_bytes(json.as_bytes()).unwrap_err();
+        assert!(!error.to_string().contains(secret), "{error}");
+        assert!(!format!("{error:?}").contains(secret));
+    }
+    assert!(!validate_relative_path(secret)
+        .unwrap_err()
+        .to_string()
+        .contains(secret));
+}
+
+#[test]
+fn cli_closed_output_streams_return_error_without_panicking() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    fn closed_stream() -> Stdio {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        Stdio::from(OwnedFd::from(writer))
+    }
+    let bin = env!("CARGO_BIN_EXE_hermetic-bundle");
+    let tree = TempDir::new().unwrap();
+    for command in ["seal", "verify"] {
+        let output = Command::new(bin)
+            .arg(command)
+            .arg(tree.path())
+            .stdout(closed_stream())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    }
+    let output = Command::new(bin)
+        .arg("invalid-command")
+        .stderr(closed_stream())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+}
