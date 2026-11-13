@@ -23,6 +23,7 @@ use std::{
 pub struct Linux {
     root: Option<Root>,
     helper: Option<File>,
+    network_program: Option<File>,
     signals: Option<OwnedFd>,
     pub listener: Option<VsockListener>,
     entry: Option<Running>,
@@ -276,6 +277,18 @@ impl Linux {
         spec::args(argv, false)?;
         let program = argv.first().ok_or(Error::InvalidInput)?;
         let executable = self.root()?.regular(program)?;
+        self.spawn_pinned(spec, argv, tty, deadline, executable)
+    }
+    fn spawn_pinned(
+        &mut self,
+        spec: &RunSpec,
+        argv: &[String],
+        tty: bool,
+        deadline: Instant,
+        executable: File,
+    ) -> Result<Running> {
+        spec.validate()?;
+        spec::args(argv, false)?;
         let cwd = self.root()?.directory(&spec.workdir)?;
         let helper = self.helper.as_ref().ok_or(Error::Boot)?;
         let (startup_read, startup_write) = rustix::net::socketpair(
@@ -664,6 +677,17 @@ impl Sys for Linux {
         // The running executable stays pinned across switch_root and hostile
         // overlay changes. /proc/self/exe is a kernel-owned magic link.
         self.helper = Some(self.root()?.proc.executable()?);
+        // Optional for networkless images. A requested network fails closed if
+        // the sealed base lacks a regular, symlink-free static busybox. Never
+        // execute a replacement from the touched overlay, even on reboot.
+        self.network_program = match &self.base {
+            Some(base) => self
+                .root()?
+                .reroot(rustix::io::dup(base)?)?
+                .regular(crate::network::NETWORK_PROGRAM)
+                .ok(),
+            None => self.root()?.regular(crate::network::NETWORK_PROGRAM).ok(),
+        };
         self.root()?.directory("/mnt/hermetic-overlay")
     }
     fn freeze(&mut self, fd: &OwnedFd) -> Result<()> {
@@ -680,6 +704,20 @@ impl Sys for Linux {
         let _ = self.root()?.directory(&spec.workdir)?;
         rustix::system::sethostname(spec.hostname.as_bytes())?;
         self.install_spec_files(spec)
+    }
+    fn configure_network(&mut self, spec: &RunSpec) -> Result<()> {
+        crate::network::configure(spec, |setup, argv| {
+            let executable = self
+                .network_program
+                .as_ref()
+                .ok_or(Error::Network)?
+                .try_clone()?;
+            let deadline =
+                Instant::now() + Duration::from_millis(crate::network::NETWORK_COMMAND_TIMEOUT_MS);
+            let running = self.spawn_pinned(setup, argv, false, deadline, executable)?;
+            // Drain and discard applet output; never expose it in logs/errors.
+            self.supervise(running, deadline, 0)
+        })
     }
     fn start_entrypoint(&mut self, spec: &RunSpec) -> Result<()> {
         if self.entry.is_some() {
@@ -1087,6 +1125,120 @@ mod tests {
     }
     fn run_spec() -> RunSpec {
         RunSpec::parse(br#"{"env":{},"workdir":"/","uid":1000,"gid":1000,"entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n","resources":{"vcpus":1,"memory_mib":512,"disk_mib":1,"wall_time_s":1}}"#.as_slice()).unwrap()
+    }
+    #[test]
+    fn network_executable_is_pinned_before_overlay_and_special_files_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        for path in [base.path(), overlay.path()] {
+            std::fs::create_dir_all(path.join("mnt/hermetic-overlay")).unwrap();
+            std::fs::create_dir(path.join("bin")).unwrap();
+        }
+        std::fs::write(base.path().join("bin/busybox"), b"sealed executable").unwrap();
+        std::fs::write(overlay.path().join("bin/busybox"), b"hostile replacement").unwrap();
+        // Reboot mounts the sealed lower separately from the initramfs root.
+        // Only that lower supplies busybox, even if the initramfs has another.
+        let mut reboot = Linux {
+            root: Some(Root::open_root(overlay.path().to_str().unwrap()).unwrap()),
+            base: Some(
+                Root::open_root(base.path().to_str().unwrap())
+                    .unwrap()
+                    .directory("/")
+                    .unwrap(),
+            ),
+            ..Linux::default()
+        };
+        reboot.keep_upper().unwrap();
+        assert_eq!(
+            read_capped(
+                reboot
+                    .network_program
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .unwrap(),
+                MAX_STRING
+            )
+            .unwrap(),
+            b"sealed executable"
+        );
+        let mut linux = Linux {
+            root: Some(Root::open_root(base.path().to_str().unwrap()).unwrap()),
+            ..Linux::default()
+        };
+        let _upper = linux.keep_upper().unwrap();
+        std::fs::rename(
+            base.path().join("bin/busybox"),
+            base.path().join("bin/original"),
+        )
+        .unwrap();
+        symlink(
+            overlay.path().join("bin/busybox"),
+            base.path().join("bin/busybox"),
+        )
+        .unwrap();
+        linux.root = Some(
+            linux
+                .root()
+                .unwrap()
+                .reroot(
+                    Root::open_root(overlay.path().to_str().unwrap())
+                        .unwrap()
+                        .directory("/")
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            read_capped(
+                linux.network_program.as_ref().unwrap().try_clone().unwrap(),
+                MAX_STRING
+            )
+            .unwrap(),
+            b"sealed executable"
+        );
+
+        let mut spec = run_spec();
+        spec.network = Some(crate::spec::Network {
+            address: "10.0.2.15".parse().unwrap(),
+            prefix: 24,
+            gateway: "10.0.2.3".parse().unwrap(),
+            mtu: 1500,
+        });
+        // Symlinks, FIFOs, and an absent applet are optional only when the spec
+        // is networkless. No fallback opens the executable on the overlay.
+        for kind in ["symlink", "fifo", "absent"] {
+            if kind != "symlink" {
+                std::fs::remove_file(base.path().join("bin/busybox")).unwrap();
+            }
+            if kind == "fifo" {
+                fs::mknodat(
+                    fs::CWD,
+                    base.path().join("bin/busybox"),
+                    fs::FileType::Fifo,
+                    Mode::RUSR | Mode::WUSR,
+                    0,
+                )
+                .unwrap();
+            }
+            let mut linux = Linux {
+                root: Some(Root::open_root(base.path().to_str().unwrap()).unwrap()),
+                ..Linux::default()
+            };
+            linux.keep_upper().unwrap();
+            assert!(linux.network_program.is_none(), "{kind}");
+            linux.root = Some(Root::open_root(overlay.path().to_str().unwrap()).unwrap());
+            assert_eq!(linux.configure_network(&spec), Err(Error::Network));
+            spec.network = None;
+            assert_eq!(linux.configure_network(&spec), Ok(()));
+            spec.network = Some(crate::spec::Network {
+                address: "10.0.2.15".parse().unwrap(),
+                prefix: 24,
+                gateway: "10.0.2.3".parse().unwrap(),
+                mtu: 1500,
+            });
+        }
     }
     #[test]
     fn descriptor_relative_helper_spawn_executes_the_pinned_inode() {

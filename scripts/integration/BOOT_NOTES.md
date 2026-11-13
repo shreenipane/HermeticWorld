@@ -315,11 +315,17 @@ persistent vsock connection to CID 2 port 5001. Firecracker forwards that port t
 is execd; 5002 is reserved for the gateway.
 
 AgentVM boots execd through `hermetic-init`. The run spec installs a regular
-`/etc/resolv.conf` pointing at NetVM. Before starting the agent, the trusted
-harness runs the fixed busybox setup through execd as root: IPv6 off, eth0
-`10.0.2.15/24`, and the sole default route via `10.0.2.3`. The existing run-spec
-schema has no network-effect field; automatic eth0 initialization requires an
-execd schema/boot change and remains open in PHASES.md.
+`/etc/resolv.conf` pointing at NetVM and includes
+`"network":{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500}`.
+Execd applies it after setting the clock and assembling the root, before either
+the entrypoint or vsock readiness: IPv6 off, loopback up, eth0 MTU 1500 and
+`10.0.2.15/24`, default route via NetVM `10.0.2.3`. It executes fixed busybox
+`ip`/`sysctl` argv with an empty environment and a 5-second per-command deadline,
+discarding output and powering off on failure. The static busybox is pinned from
+the sealed base before root switch, including on trusted-initramfs reboot.
+No harness command configures the agent network. Immediately after
+readiness, the smoke inspects the address, MTU, route and IPv6 settings before
+testing DNS and HTTP.
 
 The test checks allowed DNS, exact GET fixture bytes, POST 405, NXDOMAIN for
 unknown DNS, rejection of unknown HTTP hosts, blocked unrelated addresses and
