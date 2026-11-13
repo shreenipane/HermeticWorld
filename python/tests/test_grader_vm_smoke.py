@@ -229,3 +229,26 @@ def test_image_difference_fails_before_any_vm_boot(tmp_path, smoke_environment):
                             capture_output=True, text=True, timeout=30)
     assert result.returncode != 0, result.stdout + result.stderr
     assert not list(work.glob("*/host/*.img"))
+
+
+def test_vm_timeout_keeps_console_diagnostics_in_smoke_output(tmp_path, smoke_environment):
+    commands = Path(smoke_environment["PATH"].split(os.pathsep)[0])
+    cargo = commands / "cargo"
+    original = commands / "cargo-builder"
+    cargo.rename(original)
+    executable(
+        cargo,
+        "import os, sys\n"
+        "if 'boots_grader_and_collects_result_drive' not in sys.argv:\n"
+        f"    os.execv({str(original)!r}, [{str(original)!r}, *sys.argv[1:]])\n"
+        "print('grader timeout: serial: tsc: Unable to calibrate against PIT')\n"
+        "print('grader timeout: stderr: VMM failure')\n"
+        "print('test result: FAILED')\n"
+        "sys.exit(1)\n",
+    )
+    result = subprocess.run(["bash", str(SCRIPT), str(tmp_path / "timeout")],
+                            env=smoke_environment, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "grader timeout: serial: tsc: Unable to calibrate against PIT" in result.stdout
+    assert "grader timeout: stderr: VMM failure" in result.stdout
+    assert "grader VM smoke: ok" not in result.stdout
