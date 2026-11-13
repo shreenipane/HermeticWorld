@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Hermetic World grader supervisor library.
 //!
@@ -11,6 +11,8 @@ pub mod disk;
 pub mod os;
 pub mod records;
 pub mod run;
+pub mod sandbox;
+pub mod sys;
 
 pub use disk::{
     canonical_payload_json, decode_result_disk, encode_result_disk, DiskError, FinalTestOutcome,

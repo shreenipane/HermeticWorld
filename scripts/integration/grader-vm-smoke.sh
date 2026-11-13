@@ -68,17 +68,18 @@ for v in empty gold; do
     cp python/hermetic_safe_io.py "$GSP/"
     find "$GSP" -name __pycache__ -type d -prune -exec rm -r {} +
     mkdir -p "$TREE/work" "$TREE/etc/hermetic/grader"
-    cp -r "$FIX/repo" "$TREE/work/repo"
-    (cd "$TREE/work/repo" && patch -s -p1 < "$FIX/$v.patch")
+    if [ -n "${HERMETIC_GRADER_PUBLISHED_ROOT:-}" ]; then
+      cp -r "$HERMETIC_GRADER_PUBLISHED_ROOT/$v" "$TREE/work/repo"
+    else
+      cp -r "$FIX/repo" "$TREE/work/repo"
+      (cd "$TREE/work/repo" && patch -s -p1 < "$FIX/$v.patch")
+    fi
     install -m 0755 "$BIN/hermetic-grader-supervisor" "$TREE/sbin/hermetic-grader-supervisor"
     install -m 0755 "$BIN/hermetic-grader-init" "$TREE/sbin/hermetic-grader-init"
-    # One fixed config path per image (the grader PID 1 passes it unchanged).
-    # The plugin needs a result fd >= 3 while the supervisor hands the pipe over on
-    # fd 2; the shell moves it to fd 3 (see BOOT_NOTES.md, known gaps).
+    # The launcher supplies a dedicated record fd and applies the runner plan.
     cat > "$TREE/etc/hermetic/grader/run.json" <<JSON
-{"argv":["/bin/busybox","sh","-c","exec 3>&2 2>/dev/null; exec /usr/local/bin/python3.12 -s -m pytest -p hermetic_grader_records.plugin -p no:cacheprovider -q $F2P $P2P"],
- "env":{"PATH":"/usr/local/bin:/usr/bin:/bin","LANG":"C.UTF-8","HOME":"/tmp","HERMETIC_RESULT_FD":"3",
-        "PYTEST_DISABLE_PLUGIN_AUTOLOAD":"1","PYTHONDONTWRITEBYTECODE":"1"},
+{"argv":["/usr/local/bin/python3.12","-s","-m","pytest","-p","no:cacheprovider","-q","$F2P","$P2P"],
+ "env":{},"sandbox":{"t_clock":$T,"required_pytest_plugins":[]},
  "cwd":"/work/repo","deadline_seconds":120,"expected_test_ids":["$F2P","$P2P"],
  "run":"$r","variant_set":"$VS"}
 JSON

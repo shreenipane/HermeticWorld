@@ -651,6 +651,9 @@ name = "hermetic-grader-supervisor"
 version = "0.1.0"
 dependencies = [
  "hermetic-grader-result",
+ "hermetic-grader-sandbox",
+ "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -24,6 +24,7 @@ fn make_config_json(deadline_seconds: u64, expected: &[&str], run: RunName) -> V
         argv: vec!["pytest".to_string(), "-q".to_string()],
         env,
         cwd: "/workspace".to_string(),
+        sandbox: Default::default(),
         deadline_seconds,
         expected_test_ids: expected.iter().map(|s| (*s).to_string()).collect(),
         run,
@@ -73,29 +74,12 @@ fn test_os_trait_and_real_os_offline() {
             ],
             env,
             cwd: tmp.path().to_path_buf(),
+            sandbox: Default::default(),
+            deadline_seconds: 10,
         };
-        let mut child = real_os.spawn(&spec).expect("spawn /bin/sh");
-        let mut collected = Vec::new();
-        for _ in 0..200 {
-            match real_os
-                .read_pipe(&mut child, 64, Duration::from_millis(20))
-                .expect("read pipe")
-            {
-                hermetic_grader_supervisor::PipeRead::Data(d) => collected.extend_from_slice(&d),
-                hermetic_grader_supervisor::PipeRead::WouldBlock => {}
-                hermetic_grader_supervisor::PipeRead::Eof => break,
-            }
-        }
-        for _ in 0..200 {
-            if let TreeStatus::Exited(kind) = real_os
-                .wait_tree(&mut child, Duration::from_millis(20))
-                .expect("wait tree")
-            {
-                assert_eq!(kind, ExitKind::Clean);
-                break;
-            }
-        }
-        assert_eq!(collected, b"HGR1");
+        // Arbitrary shell commands must now fail before launch: every real
+        // child is subject to the sandbox planner's pytest-only contract.
+        assert!(real_os.spawn(&spec).is_err());
     }
 
     // Exercise the compiled binary CLI (`--config FILE --result-disk FILE`) error path offline.
@@ -628,46 +612,68 @@ fn test_disk_not_written_before_tree_ends() {
 /// Runs `script` under `/bin/sh` through `RealOs` and `run_supervisor` on a worker thread,
 /// returning `None` if the supervisor did not return within `limit`.
 #[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct ShellReport {
+    payload: ResultPayload,
+    stream_error: Option<String>,
+}
+
+#[cfg(unix)]
 fn run_real_shell(
     script: &str,
     deadline_seconds: u64,
     limit: Duration,
-) -> Option<Result<hermetic_grader_supervisor::RunReport, String>> {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut env = BTreeMap::new();
-    env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
-    let cfg = RunConfig {
-        argv: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
-        env,
-        cwd: tmp.path().to_string_lossy().into_owned(),
-        deadline_seconds,
-        expected_test_ids: vec!["test_a".to_string()],
-        run: RunName::R0,
-        variant_set: SAMPLE_VARIANT_SHA256.to_string(),
-    };
-    let cfg_path = tmp.path().join("config.json");
-    let disk_path = tmp.path().join("result.disk");
-    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).expect("config json")).expect("config");
-
+) -> Option<Result<ShellReport, String>> {
+    let command = Command::new(env!("CARGO_BIN_EXE_hermetic-grader-supervisor"));
+    // Run in a private mount namespace with a bounded private /tmp. The shell
+    // fixture exercises the record transport; it is not a production bypass.
+    let worker = std::env::current_exe().expect("test executable");
+    let output = Command::new("timeout")
+        .args([
+            "45",
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--fork",
+        ])
+        .arg(worker)
+        .args(["--exact", "privileged_real_shell_worker", "--nocapture"])
+        .env("HERMETIC_SHELL_FIXTURE", script)
+        .env("HERMETIC_SHELL_DEADLINE", deadline_seconds.to_string())
+        .env("HERMETIC_SHELL_BINARY", command.get_program())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("private shell fixture");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut os = RealOs::new();
-        let res = run_supervisor(&mut os, &cfg_path, &disk_path).map_err(|e| e.to_string());
-        let _ = tx.send(res);
-        drop(tmp);
+        let _ = tx.send(output.wait_with_output());
     });
-    rx.recv_timeout(limit).ok()
+    let result = rx.recv_timeout(limit).ok()?.ok()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let marker = String::from_utf8(result.stdout).expect("worker output");
+    let json = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("REPORT "))
+        .expect("report");
+    Some(Ok(serde_json::from_str(json).expect("actual worker report")))
 }
 
 #[cfg(unix)]
 #[test]
 fn regression_real_os_descendant_holding_pipe_cannot_stall_past_deadline() {
-    if !Path::new("/bin/sh").exists() {
+    if !rustix::process::geteuid().is_root() {
+        eprintln!("requires root and mount/namespace privileges");
         return;
     }
-    // The leader exits at once; a background child keeps the result pipe (fd 2) open past the
+    // The runner waits while a background child holds the dedicated result pipe open past the
     // 1 s deadline. The deadline must still be enforced and classified as a timeout.
-    let res = run_real_shell("sleep 4 & exit 0", 1, Duration::from_secs(25))
+    let res = run_real_shell("sleep 4 & wait", 1, Duration::from_secs(25))
         .expect("supervisor must return");
     let report = res.expect("supervisor run");
     assert_eq!(report.payload.supervisor.exit, SupervisorExit::Timeout);
@@ -680,7 +686,8 @@ fn regression_real_os_descendant_holding_pipe_cannot_stall_past_deadline() {
 #[cfg(unix)]
 #[test]
 fn regression_real_os_large_garbage_on_pipe_does_not_deadlock() {
-    if !Path::new("/bin/sh").exists() {
+    if !rustix::process::geteuid().is_root() {
+        eprintln!("requires root and mount/namespace privileges");
         return;
     }
     // Far more garbage than the reader channel plus the pipe buffer can hold: after the stream
@@ -715,4 +722,47 @@ fn regression_real_os_atomic_write_never_follows_planted_temp_symlink() {
     std::os::unix::fs::symlink(&victim, &link).expect("plant symlink");
     assert!(os.write_file_atomic(&link, b"result bytes").is_err());
     assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_real_shell_worker() {
+    let Some(script) = std::env::var_os("HERMETIC_SHELL_FIXTURE") else {
+        return;
+    };
+    assert!(rustix::process::geteuid().is_root());
+    rustix::mount::mount(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        rustix::mount::MountFlags::NOSUID | rustix::mount::MountFlags::NODEV,
+        Some(c"size=268435456,nr_inodes=65536,mode=1777"),
+    )
+    .expect("private tmp");
+    let tmp = tempfile::tempdir().expect("fixture");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).expect("repo");
+    let body = format!("import subprocess, sys\nsys.exit(subprocess.call(['/bin/sh', '-c', {:?}], stderr=3, pass_fds=(3,)))\n", script.to_str().expect("script"));
+    std::fs::write(repo.join("pytest.py"), body).expect("runner");
+    let cfg = RunConfig {
+        argv: vec!["pytest".into()],
+        env: BTreeMap::new(),
+        cwd: repo.to_string_lossy().into_owned(),
+        sandbox: hermetic_grader_supervisor::sandbox::SandboxSettings {
+            t_clock: rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec,
+            required_pytest_plugins: vec![],
+        },
+        deadline_seconds: std::env::var("HERMETIC_SHELL_DEADLINE")
+            .unwrap()
+            .parse()
+            .unwrap(),
+        expected_test_ids: vec!["test_a".into()],
+        run: RunName::R0,
+        variant_set: SAMPLE_VARIANT_SHA256.into(),
+    };
+    let config = tmp.path().join("config");
+    std::fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let mut os = RealOs::with_launcher(std::env::var_os("HERMETIC_SHELL_BINARY").unwrap().into());
+    let report = run_supervisor(&mut os, &config, &tmp.path().join("disk")).expect("supervisor");
+    println!("REPORT {}", serde_json::to_string(&serde_json::json!({"payload": report.payload, "stream_error": report.stream_error.map(|e| format!("{e:?}"))})).unwrap());
 }

@@ -132,7 +132,7 @@ arguments with `init=/sbin/hermetic-init`, the two drives and vsock:
 firecracker --no-api --config-file cfg.json > serial.log 2>&1
 ```
 
-# Grader smoke (development, offline, VM not booted yet)
+# Grader smoke (development, offline, VM)
 
 Command, from the worktree root:
 
@@ -146,39 +146,25 @@ Fixture task: `scripts/integration/fixtures/grader-task/`.
 - `gold.patch` fixes `add`, and `empty.patch` is the empty patch.
 - `plan.json` is the grading plan (no mutants, no equivalents).
 
-For each variant, the script:
+For each variant the script applies the patch to a fixture work tree, emits a
+HEXT v1 stream with `hermetic-extract-agent`, and publishes the validated result
+with `hermetic-extract-validate`. It then passes those published trees to
+`grader-vm-smoke.sh`, which builds and boots one image per run. This preserves the
+full extraction, grading and host verdict checks. A supplied work directory must
+be fresh; symlinks are refused before any chmod.
 
-1. Builds a grader tree.
-   - Base userland: the local `python:3.12-alpine` image, exported with `--pull never`.
-   - pytest 9.2.0 and its pure-Python dependencies, copied from the project venv.
-   - The `hermetic_grader_records` plugin.
-   - The repo with the patch applied, under `/work/repo`.
-   - Static `/sbin/hermetic-grader-supervisor`.
-   - One run config per run in `/etc/hermetic/grader/run-R{0,1,2}.json`.
-2. Builds a D4-checked grader image of that tree with `hermetic_slice.rootfs.build_rootfs`. Both variants give 95420416 bytes, and the build is reproducible across runs.
-3. Runs the real grading chain from the same tree, in a container with no network, read-only, no capabilities, no-new-privileges and a non-root user. The chain is: supervisor, then `python -s -m pytest -p hermetic_grader_records.plugin` with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, then HGR1 records, then a 1 MiB HGRD result disk. It runs once per run: R0, R1, R2.
-4. Validates the disks on the host with `hermetic-grader-verdict`: strict parser, then the differential verdict.
+## Grader VM boot and supervisor isolation
 
-Result:
+The grader VM boots through `hermetic-grader-init` (details below). The supervisor
+applies the sandbox plan before executing repository code: new PID, mount, IPC,
+UTS and network namespaces, fixed identity and environment, exact capability
+sets, no-new-privileges, private mounts and minimal devices. A dedicated fd 3
+carries records; stdout and stderr go to `/dev/null`. PID namespace teardown and
+pidfds cover descendants that change sessions or close their record descriptor.
 
-```
-empty: verdict rc=2 {"status":"unresolved","reasons":["f2p_failed"], ... passed 1, failed 1 ...}
-gold:  verdict rc=0 {"status":"resolved","reasons":[], ... passed 2 ...}
-```
-
-## Why the grader VM is not booted
-
-There is no grader-mode PID 1. Nothing was bypassed to get around that:
-
-- `hermetic-vmm` refuses vsock for `Role::Grader` (TR-GR-1), and it refuses a standalone `--` in boot arguments.
-- execd binds vsock 5000 as its last boot step and powers off if that fails. So execd cannot be the grader's PID 1.
-- `hermetic-init` only execs execd.
-- The supervisor needs `--config` and `--result-disk` flags. It neither sets the clock nor mounts anything, and it does not power off.
-
-Because the VM is not booted, two things are not checked yet:
-
-- that the grader clock equals `T_clock`;
-- that the supervisor applies the `hermetic-grader-sandbox` plan. Nothing calls that crate yet, and the supervisor's `RealOs` has no namespaces, capability drop or device cgroup (see its README).
+The former container smoke used the host realtime clock. Namespaces cannot give
+it a private `CLOCK_REALTIME`, and setting it would change the host clock. Both
+smoke entry points now use the VM, whose initializer sets the sealed clock.
 
 ## What broke and how it was fixed
 
@@ -191,7 +177,6 @@ Because the VM is not booted, two things are not checked yet:
 
 ## Known gaps (not fixed here)
 
-- **Result fd hand-over.** The supervisor's `RealOs` hands the record pipe over on fd 2 and advertises `HERMETIC_RESULT_FD=2`. The plugin requires an fd of 3 or higher. The smoke bridges this with `sh -c 'exec 3>&2 2>/dev/null; exec python ...'` and `HERMETIC_RESULT_FD=3`.
 - **HEXT v1 mismatch (fixed 2026-11-13).** The agent and the validator used to implement two incompatible HEXT v1 formats, so the smoke applied the patch on the host. The validator's format (u32 version, fixed 60-byte header, end record with record count and total bytes) is now canonical and the agent emits it byte for byte (`crates/hermetic-extract-agent/tests/validator_compat.rs`). The smoke now applies the variant patch to a copy of the base repo, runs `hermetic-extract-agent --class patch:` and publishes through `hermetic-extract-validate` with `fixtures/grader-task/extract-config.json`. Both still run on the host, not in an ExtractorVM.
 - **Tree root spelling (fixed 2026-11-13).** The root is the empty string on both sides: agent `--class patch:`, validator `repo_dir: ""`. The agent refuses `patch:.` (`InvalidTaskClass`) and the validator refuses `repo_dir: "."` (config error).
 
@@ -251,6 +236,35 @@ Any failure ends the VM. The clock check uses the serial line because the HGRD r
 
 ## Still open
 
-- Supervisor isolation (task B).
 - The read-only work or patch drive. The patch is baked into the image for now.
-- The fd 3 bridge.
+
+## Running the isolation checks
+
+Offline gates run without root or KVM. Root-only tests print their prerequisite
+and return when not root. In a disposable Linux grading environment with root,
+mount/namespace privileges and cgroup-device BPF support, run from this worktree:
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target"
+cargo test --offline -p hermetic-grader-supervisor --no-run
+sudo env PATH="$PATH" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test --offline -p hermetic-grader-supervisor -- --nocapture
+```
+
+With `/dev/kvm` available and the pinned kernel, Firecracker, Docker base image
+and venv staged as above, run these exact commands from the worktree root (each
+script creates a fresh temporary work directory when no argument is supplied):
+
+```sh
+bash scripts/integration/grader-vm-smoke.sh
+bash scripts/integration/grader-smoke.sh
+```
+
+The supervisor mounts cgroup v2 privately and attaches the ordered device BPF
+rules before joining the test cgroup. Only `ENODEV` from mounting cgroup2 permits
+omitting that layer, for kernels built without cgroup v2. Such kernels still get
+the PID/mount boundary, minimal `/dev`, no-new-privileges and capability drop.
+All permission, controller, attachment and verifier failures stop setup. The
+sealed grader kernel policy requires cgroup v2 and device BPF, so the expected VM
+path includes the filter. The privileged test independently opens a planted
+block node to verify denial, and tests namespace identity, mount permissions,
+capabilities, environment, fd handoff and teardown on both exit and timeout.
