@@ -28,6 +28,8 @@ def smoke_environment(tmp_path):
     fixture = top / "scripts/integration/fixtures/grader-task"
     shutil.copytree(ROOT / "scripts/integration/fixtures/grader-task", fixture)
     shutil.copyfile(SCRIPT, top / "scripts/integration/grader-vm-smoke.sh")
+    shutil.copyfile(SCRIPT.with_name("grader-smoke.sh"), top / "scripts/integration/grader-smoke.sh")
+    shutil.copyfile(SCRIPT.with_name("smoke_work.py"), top / "scripts/integration/smoke_work.py")
     python = top / "python"
     python.mkdir()
     (python / "hermetic_safe_io.py").touch()
@@ -70,8 +72,12 @@ def smoke_environment(tmp_path):
         "elif sys.argv[1] == 'export': sys.stdout.buffer.write(archive.read_bytes())\n",
     )
     verdict_script = (
-        "#!/usr/bin/python3\nimport json, sys\n"
+        "#!/usr/bin/python3\nimport json, sys, os, shutil\nfrom pathlib import Path\n"
         "empty = any('/empty/' in arg for arg in sys.argv)\n"
+        "if not empty:\n"
+        "    work = Path(os.environ['HERMETIC_SMOKE_WORK'])\n"
+        "    if work.name == 'vm': work = work.parent\n"
+        "    shutil.copytree(work, work.with_name(work.name + '-saved'))\n"
         "print(json.dumps({'status': 'unresolved' if empty else 'resolved', "
         "'reasons': ['f2p_failed'] if empty else []}, separators=(',', ':')))\n"
         "sys.exit(2 if empty else 0)\n"
@@ -132,6 +138,8 @@ def test_successful_vm_smoke_checks_both_verdicts(tmp_path, smoke_environment):
     result = subprocess.run(["bash", str(SCRIPT), str(work)], env=smoke_environment,
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert not work.exists()
+    work = work.with_name(work.name + "-saved")
     assert "empty: verdict rc=2" in result.stdout
     assert "gold: verdict rc=0" in result.stdout
     assert "grader VM smoke: ok" in result.stdout
@@ -155,6 +163,8 @@ def test_vm_configs_apply_the_sealed_runner_without_a_shell_bridge(tmp_path, smo
     result = subprocess.run(["bash", str(SCRIPT), str(work)], env=smoke_environment,
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert not work.exists()
+    work = work.with_name(work.name + "-saved")
     for variant in ("empty", "gold"):
         for run in ("R0", "R1", "R2"):
             config = json.loads((work / variant / run / "img/grader.run.json").read_text())
@@ -172,6 +182,8 @@ def test_full_smoke_keeps_validated_extraction_and_uses_vm_clock(tmp_path, smoke
     result = subprocess.run(["bash", str(ROOT / "scripts/integration/grader-smoke.sh"), str(work)],
                             env=smoke_environment, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert not work.exists()
+    work = work.with_name(work.name + "-saved")
     assert "validated extraction" in result.stdout
     for variant in ("empty", "gold"):
         published = (work / "published" / variant / "calc.py").read_bytes()
@@ -198,6 +210,8 @@ def test_all_run_images_hash_equal_and_contain_no_run_label(tmp_path, smoke_envi
     result = subprocess.run(["bash", str(SCRIPT), str(work)], env=smoke_environment,
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert not work.exists()
+    work = work.with_name(work.name + "-saved")
     for variant in ("empty", "gold"):
         images = [(work / variant / run / "img/grader.img").read_bytes()
                   for run in ("R0", "R1", "R2")]

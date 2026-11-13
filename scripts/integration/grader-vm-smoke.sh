@@ -14,14 +14,9 @@
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
+smoke_main() {
+WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
-if [ "$#" -gt 0 ]; then
-  WORK="$1"
-  # A supplied directory must be fresh; never chmod a pre-existing symlink.
-  mkdir -m 0700 -- "$WORK"
-else
-  WORK="$(mktemp -d /tmp/hermetic-grader-vm-smoke.XXXXXX)"
-fi
 export CARGO_TARGET_DIR="$U/hermetic/cargo-target/$(basename "$top")"
 VENV="${HERMETIC_VENV:-$U/Heavy Coding/Projects/Hermetic World/python/.venv}"
 FC="${HERMETIC_FC_BIN:-$U/.hermetic/tools/firecracker-1.18.0/firecracker}"
@@ -133,3 +128,9 @@ PY
   fi
 done
 echo "grader VM smoke: ok (empty patch unresolved, gold patch resolved, clock = hermetic.t)"
+
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec /usr/bin/python3 -I "$top/scripts/integration/smoke_work.py" "$top/scripts/integration/grader-vm-smoke.sh" "$@"
+fi

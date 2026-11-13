@@ -3,7 +3,7 @@
 Command, from the worktree root:
 
 ```
-scripts/integration/boot-smoke.sh /tmp/hermetic-boot-smoke
+scripts/integration/boot-smoke.sh
 ```
 
 The script runs these steps:
@@ -137,7 +137,7 @@ firecracker --no-api --config-file cfg.json > serial.log 2>&1
 Command, from the worktree root:
 
 ```
-scripts/integration/grader-smoke.sh /tmp/hermetic-grader-smoke
+scripts/integration/grader-smoke.sh
 ```
 
 Fixture task: `scripts/integration/fixtures/grader-task/`.
@@ -186,7 +186,7 @@ smoke entry points now use the VM, whose initializer sets the sealed clock.
 Command, from the worktree root:
 
 ```
-bash scripts/integration/grader-vm-smoke.sh /tmp/hermetic-grader-vm-smoke
+bash scripts/integration/grader-vm-smoke.sh
 ```
 
 For each variant (empty, gold) and each run (R0, R1, R2), the script:
@@ -224,14 +224,14 @@ offline builders. Existing test fixtures now place labels on result drives
 instead of in configs; their original behavior assertions are retained.
 
 For the real six-boot check on the prepared KVM host, from this worktree root,
-use a fresh output directory:
+let the script allocate a fresh work directory:
 
 ```sh
-bash scripts/integration/grader-vm-smoke.sh /tmp/hermetic-run-label-check
-sha256sum /tmp/hermetic-run-label-check/{empty,gold}/R{0,1,2}/img/grader.img
+bash scripts/integration/grader-vm-smoke.sh
 ```
 
-The three hashes within each variant must match. This also executes the sandbox
+The script requires the three hashes within each variant to match before boot
+and removes the images on success. This also executes the sandbox
 probe in all six VMs and requires the empty/gold verdicts below. These VM checks
 cannot run in the review sandbox because `/dev/kvm` is unavailable.
 
@@ -280,10 +280,10 @@ Any failure ends the VM. The clock check uses the serial line because the HGRD r
 Run from the worktree root on the prepared host:
 
 ```sh
-scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"
+scripts/integration/net-smoke.sh
 ```
 
-The work directory must be new, with a parent not writable by other users. The
+An optional work directory must be new, with a parent not writable by other users. The
 script uses `$HOME` for the pinned Firecracker and kernel locations;
 `HERMETIC_KERNEL` can select another policy-checked kernel. It builds static
 NetVM/execd/init binaries, copies the offline fixture in `net-fixture`, builds two
@@ -364,3 +364,35 @@ sealed grader kernel policy requires cgroup v2 and device BPF, so the expected V
 path includes the filter. The privileged test independently opens a planted
 block node to verify denial, and tests namespace identity, mount permissions,
 capabilities, environment, fd handoff and teardown on both exit and timeout.
+
+
+## Smoke work storage and cleanup
+
+All four integration smoke scripts (`boot-smoke.sh`, `net-smoke.sh`,
+`grader-smoke.sh`, `grader-vm-smoke.sh`) allocate fresh work directories under
+`${HERMETIC_SMOKE_DIR:-$HOME/.cache/hermetic-smoke}` by default. Choose a disk-backed
+location with enough free space for the images. The host's RAM-backed `/tmp` is
+not used for these work directories. Missing cache directories and each work
+directory are created with mode 0700, and symlink components are refused.
+
+A single optional `NEW_WORK_DIR` argument selects an exact fresh path instead;
+its parent must exist, be owned by the caller and not be writable by other users.
+Existing directories, files and symlinks are refused without chmod or deletion.
+The shared `smoke_work.py` runner removes only the work directory it created,
+using held directory descriptors and bounded cleanup that never follows links.
+It refuses cleanup if the directory entry has been replaced.
+
+A successful run removes its work directory, including images and logs. Failure
+(including INT, TERM or HUP) retains the work and prints its path on stderr for
+inspection. The nested grader VM work follows the same rule; a failed full grader
+smoke retains the outer extraction artifacts as well. The network script checks
+KVM/TUN access before allocating work. Cleanup failures return a nonzero status.
+No script sweeps or deletes artifacts from earlier runs.
+
+Rootfs Python tests place their sealcheck copy, staging files and image outputs
+under pytest's per-test `tmp_path`, and discard that tree after assertions, even
+on test failure. This avoids retaining large images in pytest's recent-run cache.
+Offline regressions in `test_smoke_work.py` exercise cleanup, failure retention,
+symlink rejection, directory substitution and signal handling on small fixtures.
+The grader shell tests snapshot their fixture artifacts before successful cleanup
+so the existing image, extraction and verdict assertions remain in place.

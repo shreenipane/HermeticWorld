@@ -6,13 +6,13 @@
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
+smoke_main() {
+WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
 FC_SRC="$U/.hermetic/tools/firecracker/release-v1.18.0-x86_64/firecracker-v1.18.0-x86_64"
 FC_DIR="$U/.hermetic/tools/firecracker-1.18.0"
 FC_SHA=b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba
-WORK="${1:-$(mktemp -d /tmp/hermetic-boot-smoke.XXXXXX)}"
-mkdir -p "$WORK"; chmod 0700 "$WORK"
 export CARGO_TARGET_DIR="$U/hermetic/cargo-target/$(basename "$top")"
 T=1700000000
 
@@ -64,3 +64,9 @@ HERMETIC_FC_BIN="$FC_DIR/firecracker" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS=
   --exclude hermetic-sealcheck --exclude hermetic-trust --exclude hermetic-world-server \
   --exclude tiny_http --features dev-unjailed --test guest boots_guest_and_reads_guest_clock \
   -- --ignored --nocapture
+
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec /usr/bin/python3 -I "$top/scripts/integration/smoke_work.py" "$top/scripts/integration/boot-smoke.sh" "$@"
+fi
