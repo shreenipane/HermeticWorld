@@ -146,6 +146,21 @@ fn main() -> ExitCode {
         }
     }
     let mut os = RealOs::new();
+    if args.get(1).and_then(|s| s.to_str()) == Some("--infra-error") {
+        let result = parse_cli_args(std::env::args_os().skip(1)).and_then(|parsed| {
+            hermetic_grader_supervisor::write_infra_error(
+                &mut os,
+                &parsed.config,
+                &parsed.result_disk,
+            )
+            .map_err(CliError::Supervisor)
+        });
+        return if result.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
     match run_with_os(std::env::args_os(), &mut os) {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError::HelpRequested) => {

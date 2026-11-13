@@ -99,6 +99,9 @@ pub trait Os {
     /// Opaque handle representing a spawned child process tree and its result pipe.
     type Child;
 
+    /// Fixed phase labels only; never include repository input or OS details.
+    fn phase(&mut self, _phase: &'static str) {}
+
     /// Returns monotonic elapsed duration since supervisor startup.
     fn now_monotonic(&self) -> Duration;
 
@@ -217,6 +220,10 @@ const MAX_DROP_POLLS: usize = 200;
 impl Os for RealOs {
     type Child = RealChild;
 
+    fn phase(&mut self, phase: &'static str) {
+        eprintln!("grader-supervisor phase {phase}");
+    }
+
     fn now_monotonic(&self) -> Duration {
         self.epoch.elapsed()
     }
@@ -266,7 +273,7 @@ impl Os for RealOs {
             .env_clear()
             .stdin(Stdio::from(fd))
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .process_group(0)
             .spawn()
             .map_err(|e| os_error("spawn", e))?;
@@ -277,7 +284,9 @@ impl Os for RealOs {
             exited: None,
         };
         handle.pipe = handle.child.stdout.take();
+        self.phase("launch-input");
         crate::sandbox::write_spec(&mut peer, spec).map_err(|e| os_error("launch_input", e))?;
+        self.phase("launch-handshake");
         let mut pid = [0; 4];
         peer.read_exact(&mut pid)
             .map_err(|e| os_error("launch_handshake", e))?;
@@ -291,6 +300,7 @@ impl Os for RealOs {
         );
         peer.write_all(&[1])
             .map_err(|e| os_error("launch_ack", e))?;
+        self.phase("init-pinned");
         let pipe = handle
             .pipe
             .as_ref()

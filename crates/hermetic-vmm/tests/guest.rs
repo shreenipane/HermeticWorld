@@ -259,6 +259,48 @@ fn grader_clock_line_is_strict() {
         assert_eq!(grader_clock_line(bad), None);
     }
 }
+
+fn grader_exit_diagnostics(exit: Result<()>, serial: &[u8], output: &mut impl Write) -> Result<()> {
+    let exit = if String::from_utf8_lossy(serial)
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == "grader-init phase recovery-failed")
+    {
+        Err(Error::Protocol)
+    } else {
+        exit
+    };
+    if exit.is_err() {
+        // Keep every line under the smoke harness's diagnostic prefix. The
+        // runner retains its bounded capture even after wait_exit cleanup.
+        writeln!(output, "grader serial: VM exit failed; console follows")?;
+        for line in String::from_utf8_lossy(serial).lines() {
+            writeln!(output, "grader serial: {line}")?;
+        }
+    }
+    exit
+}
+
+#[test]
+fn grader_timeout_prints_console_and_supervisor_phases_before_returning_error() {
+    let serial = b"grader-init 1700000000 clock\ngrader-supervisor phase init-wait\n";
+    let mut output = Vec::new();
+    let error = Err(Error::Protocol);
+    assert_eq!(
+        grader_exit_diagnostics(error.clone(), serial, &mut output),
+        error
+    );
+    assert_eq!(output, b"grader serial: VM exit failed; console follows\ngrader serial: grader-init 1700000000 clock\ngrader serial: grader-supervisor phase init-wait\n");
+    output.clear();
+    assert_eq!(grader_exit_diagnostics(Ok(()), serial, &mut output), Ok(()));
+    assert!(output.is_empty());
+    assert!(grader_exit_diagnostics(
+        Ok(()),
+        b"grader-init phase recovery-failed\r\n",
+        &mut output
+    )
+    .is_err());
+    assert!(output.ends_with(b"grader serial: grader-init phase recovery-failed\n"));
+}
 /// Boots a grader image with `init=/sbin/hermetic-grader-init` (no vsock, no
 /// network), waits for the guest to power off, checks the guest clock line and
 /// copies the 1 MiB result drive to HERMETIC_GRADER_RESULT_OUT for the host verdict.
@@ -299,9 +341,10 @@ fn boots_grader_and_collects_result_drive() {
         vm.prepare(Duration::from_secs(120)).unwrap();
         vm.start(Duration::from_secs(10)).unwrap();
         vm.wait_ready(Duration::from_secs(30)).unwrap();
-        vm.wait_exit(Duration::from_secs(300))
+        let exit = vm.wait_exit(Duration::from_secs(300));
+        let (serial, _) = vm.runner().console_output();
+        grader_exit_diagnostics(exit, &serial, &mut std::io::stderr())
             .expect("grader VM did not power off");
-        let serial = vm.runner().serial();
         let guest = grader_clock_line(&serial).expect("grader-init clock line on serial");
         eprintln!("grader serial: grader-init clock={guest}");
         assert!(

@@ -26,8 +26,13 @@ pub const RESULT_DISK: &str = "/dev/vdb";
 /// tmpfs data, fixed.
 pub const TMP_OPTIONS: &std::ffi::CStr = c"size=256m,mode=1777,nr_inodes=65536";
 pub const PTS_OPTIONS: &std::ffi::CStr = c"newinstance,ptmxmode=0666,mode=0620";
-/// Backstop for the supervisor, which enforces its own run deadline.
-pub const SUPERVISOR_BACKSTOP: Duration = Duration::from_secs(4 * 60 * 60);
+/// Same maximum run deadline as the supervisor; allow startup and kill grace.
+pub const MAX_GRADING_SECONDS: u64 = 86_400;
+pub const SUPERVISOR_MARGIN: Duration = Duration::from_secs(60);
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const POLL: Duration = Duration::from_millis(50);
 
 pub fn supervisor_args() -> [&'static str; 4] {
@@ -55,6 +60,10 @@ pub trait GraderSys {
     /// The kernel command line through the early read-only proc.
     fn cmdline(&mut self) -> Result<Vec<u8>>;
     fn effect(&mut self, effect: GraderEffect) -> Result<()>;
+    fn phase(&mut self, _phase: &'static str) {}
+    fn recover_result(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Runs the grader boot. Always ends with sync and power-off once PID 1 is
@@ -83,9 +92,18 @@ pub fn run<S: GraderSys>(sys: &mut S) -> Result<()> {
             "failed"
         }));
     }
-    let _ = sys.effect(GraderEffect::Sync);
+    if clock_set {
+        sys.phase("sync");
+    }
+    let sync = sys.effect(GraderEffect::Sync);
+    if sync.is_err() && clock_set {
+        let _ = sys.recover_result();
+    }
+    if clock_set {
+        sys.phase("poweroff");
+    }
     let _ = sys.effect(GraderEffect::PowerOff);
-    result
+    result.and(sync)
 }
 
 /// Guest implementation.
@@ -105,32 +123,125 @@ fn mkdir_nofollow(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_supervisor() -> Result<()> {
-    let mut child = std::process::Command::new(SUPERVISOR)
-        .args(supervisor_args())
-        .env_clear()
-        .current_dir("/")
-        .stdin(std::process::Stdio::null())
-        .spawn()?;
+fn supervisor_backstop(bytes: &[u8]) -> Result<Duration> {
+    #[derive(serde::Deserialize)]
+    struct Deadline {
+        #[serde(alias = "deadline_secs")]
+        deadline_seconds: u64,
+    }
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(Error::Limit);
+    }
+    let config: Deadline = serde_json::from_slice(bytes).map_err(|_| Error::InvalidInput)?;
+    if config.deadline_seconds == 0 || config.deadline_seconds > MAX_GRADING_SECONDS {
+        return Err(Error::InvalidInput);
+    }
+    Ok(Duration::from_secs(config.deadline_seconds).saturating_add(SUPERVISOR_MARGIN))
+}
+
+fn poll_child(
+    limit: Duration,
+    mut poll: impl FnMut() -> Result<Option<bool>>,
+    mut kill: impl FnMut(),
+) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(Error::Boot)
-            };
+        if let Some(success) = poll()? {
+            return if success { Ok(()) } else { Err(Error::Boot) };
         }
-        if start.elapsed() >= SUPERVISOR_BACKSTOP {
-            let _ = child.kill();
-            let _ = child.wait();
+        if start.elapsed() >= limit {
+            kill();
+            // SIGKILL need not complete for an uninterruptible child. PID 1
+            // must retain control and reach reboot rather than blocking in wait.
             return Err(Error::Timeout);
         }
         std::thread::sleep(POLL);
     }
 }
 
+fn command_supervisor(recovery: bool, limit: Duration) -> Result<()> {
+    let mut command = std::process::Command::new(SUPERVISOR);
+    if recovery {
+        command.arg("--infra-error");
+    }
+    let child = std::cell::RefCell::new(
+        command
+            .args(supervisor_args())
+            .env_clear()
+            .current_dir("/")
+            .stdin(std::process::Stdio::null())
+            .spawn()?,
+    );
+    poll_child(
+        limit,
+        || Ok(child.borrow_mut().try_wait()?.map(|s| s.success())),
+        || {
+            let _ = child.borrow_mut().kill();
+        },
+    )
+}
+
+fn recover_result() -> Result<()> {
+    // This operation is legal only in the disposable GraderVM's PID 1.
+    if rustix::process::getpid().as_raw_pid() != 1 {
+        return Err(Error::Boot);
+    }
+    eprintln!("grader-init phase recovery");
+    let result = recover_quiescent_result();
+    if result.is_err() {
+        // A collector must reject the drive if recovery could not replace it.
+        eprintln!("grader-init phase recovery-failed");
+    }
+    result
+}
+
+fn recover_quiescent_result() -> Result<()> {
+    crate::sys::kill_all(libc::SIGKILL)?;
+    let start = std::time::Instant::now();
+    loop {
+        match rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG) {
+            Err(rustix::io::Errno::CHILD) => break,
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if start.elapsed() >= REAP_TIMEOUT {
+            return Err(Error::ChildStuck);
+        }
+        std::thread::sleep(POLL);
+    }
+    command_supervisor(true, RECOVERY_TIMEOUT)
+}
+
+fn run_supervisor() -> Result<()> {
+    let result = (|| {
+        let root = crate::fs::Root::open_root("/")?;
+        let bytes = root.read(CONFIG, MAX_CONFIG_BYTES)?;
+        command_supervisor(false, supervisor_backstop(&bytes)?)
+    })();
+    if result.is_err() {
+        let _ = recover_result();
+    }
+    result
+}
+
+fn bounded_sync(limit: Duration, sync: impl FnOnce() + Send + 'static) -> Result<()> {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("grader-sync".into())
+        .spawn(move || {
+            sync();
+            let _ = send.send(());
+        })?;
+    receive.recv_timeout(limit).map_err(|_| Error::Timeout)
+}
+
 impl GraderSys for LinuxGrader {
+    fn recover_result(&mut self) -> Result<()> {
+        recover_result()
+    }
+    fn phase(&mut self, phase: &'static str) {
+        eprintln!("grader-init phase {phase}");
+    }
     fn is_pid1(&self) -> bool {
         rustix::process::getpid().as_raw_nonzero().get() == 1
     }
@@ -175,7 +286,7 @@ impl GraderSys for LinuxGrader {
                 )?;
             }
             GraderEffect::RunSupervisor => run_supervisor()?,
-            GraderEffect::Sync => rustix::fs::sync(),
+            GraderEffect::Sync => bounded_sync(SYNC_TIMEOUT, rustix::fs::sync)?,
             // Ends the VM. The sealed kernel has no working power-off path in
             // Firecracker (`reboot(POWER_OFF)` only halts, and Firecracker keeps
             // running). A restart with `reboot=k` resets through the i8042
@@ -198,6 +309,7 @@ mod tests {
         cmdline: Vec<u8>,
         fail: Option<GraderEffect>,
         log: Vec<GraderEffect>,
+        recoveries: usize,
     }
     impl Recorder {
         fn new(cmdline: &str) -> Self {
@@ -206,10 +318,15 @@ mod tests {
                 cmdline: cmdline.as_bytes().to_vec(),
                 fail: None,
                 log: Vec::new(),
+                recoveries: 0,
             }
         }
     }
     impl GraderSys for Recorder {
+        fn recover_result(&mut self) -> Result<()> {
+            self.recoveries += 1;
+            Ok(())
+        }
         fn is_pid1(&self) -> bool {
             self.pid1
         }
@@ -317,5 +434,79 @@ mod tests {
         assert_eq!(SUPERVISOR, "/sbin/hermetic-grader-supervisor");
         assert_eq!(TMP_OPTIONS, c"size=256m,mode=1777,nr_inodes=65536");
         assert_eq!(PTS_OPTIONS, c"newinstance,ptmxmode=0666,mode=0620");
+    }
+
+    #[test]
+    fn backstop_tracks_configured_deadline_including_runs_longer_than_four_hours() {
+        for seconds in [1, 120, MAX_GRADING_SECONDS] {
+            let json = format!(r#"{{"deadline_seconds":{seconds},"argv":["pytest"]}}"#);
+            assert_eq!(
+                supervisor_backstop(json.as_bytes()),
+                Ok(Duration::from_secs(seconds) + SUPERVISOR_MARGIN)
+            );
+        }
+        assert_eq!(
+            supervisor_backstop(br#"{"deadline_secs":120}"#),
+            Ok(Duration::from_secs(180))
+        );
+        for json in [
+            br#"{}"#.as_slice(),
+            br#"{"deadline_seconds":0}"#,
+            br#"{"deadline_seconds":86401}"#,
+            br#"{"deadline_seconds":-1}"#,
+            br#"{"deadline_seconds":1,"deadline_secs":2}"#,
+        ] {
+            assert!(supervisor_backstop(json).is_err());
+        }
+        assert_eq!(
+            supervisor_backstop(&vec![b' '; MAX_CONFIG_BYTES + 1]),
+            Err(Error::Limit)
+        );
+    }
+
+    #[test]
+    fn backstop_kills_but_never_waits_for_an_uninterruptible_child() {
+        let killed = std::cell::Cell::new(false);
+        assert_eq!(
+            poll_child(Duration::ZERO, || Ok(None), || killed.set(true)),
+            Err(Error::Timeout)
+        );
+        assert!(killed.get());
+        killed.set(false);
+        assert_eq!(
+            poll_child(Duration::ZERO, || Ok(Some(true)), || killed.set(true)),
+            Ok(())
+        );
+        assert!(!killed.get());
+    }
+
+    #[test]
+    fn stalled_sync_is_bounded_and_sync_error_still_powers_off() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        assert_eq!(
+            bounded_sync(Duration::ZERO, move || {
+                wait.recv().unwrap();
+                finished.send(()).unwrap();
+            }),
+            Err(Error::Timeout)
+        );
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut sys = Recorder::new(LINE);
+        sys.fail = Some(Sync);
+        assert_eq!(run(&mut sys), Err(Error::Io));
+        assert_eq!(sys.log.last(), Some(&PowerOff));
+        assert_eq!(sys.recoveries, 1);
+
+        let mut sys = Recorder::new("ro");
+        sys.fail = Some(Sync);
+        assert_eq!(run(&mut sys), Err(Error::InvalidClock));
+        assert_eq!(
+            sys.recoveries, 0,
+            "no result write before setting the sealed clock"
+        );
+        assert_eq!(sys.log, [MountProcReadOnly, Sync, PowerOff]);
     }
 }

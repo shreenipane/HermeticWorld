@@ -476,6 +476,7 @@ pub fn run_supervisor<O: Os>(
     config_path: &Path,
     result_disk_path: &Path,
 ) -> Result<RunReport, SupervisorError> {
+    os.phase("config");
     let config_bytes = os.read_file(config_path, MAX_CONFIG_BYTES)?;
     let config = RunConfig::from_json_bytes(&config_bytes)?;
 
@@ -496,7 +497,9 @@ pub fn run_supervisor<O: Os>(
     let deadline_at = start_time.saturating_add(Duration::from_secs(config.deadline_seconds));
     let poll_slice = Duration::from_millis(POLL_SLICE_MS);
 
+    os.phase("spawn");
     let mut child = os.spawn(&spawn_spec)?;
+    os.phase("records");
 
     let mut decoder = RecordDecoder::new();
     let mut tracker = StreamTracker::new(&config.expected_test_ids);
@@ -509,6 +512,7 @@ pub fn run_supervisor<O: Os>(
         let now = os.now_monotonic();
 
         if !timed_out && now >= deadline_at {
+            os.phase("kill");
             timed_out = true;
             os.kill_process_group(&mut child)?;
             pipe_eof = true;
@@ -563,6 +567,7 @@ pub fn run_supervisor<O: Os>(
         match os.wait_tree(&mut child, wait_timeout)? {
             TreeStatus::Running => {}
             TreeStatus::Exited(kind) => {
+                os.phase("tree-exited");
                 tree_exit = Some(kind);
 
                 // Drain any final bytes that arrived right as the process tree exited.
@@ -637,11 +642,53 @@ pub fn run_supervisor<O: Os>(
     };
 
     let disk_bytes = encode_result_disk(&payload)?;
+    os.phase("result-write");
     os.write_file_atomic(result_disk_path, &disk_bytes)?;
+    os.phase("result-synced");
 
     Ok(RunReport {
         payload,
         unexpected_ids: tracker.unexpected_ids_count,
         stream_error: tracker.stream_error,
     })
+}
+
+/// PID 1 calls this only after quiescing every child. Replace any previously
+/// successful result after an infrastructure failure, without running repo code.
+pub fn write_infra_error<O: Os>(
+    os: &mut O,
+    config_path: &Path,
+    result_disk_path: &Path,
+) -> Result<(), SupervisorError> {
+    let bytes = os.read_file(config_path, MAX_CONFIG_BYTES)?;
+    let config = RunConfig::from_json_bytes(&bytes)?;
+    crate::sandbox::build_plan(&SpawnSpec {
+        argv: config.argv,
+        env: config.env,
+        cwd: config.cwd.into(),
+        sandbox: config.sandbox,
+        deadline_seconds: config.deadline_seconds,
+    })
+    .map_err(|_| OsError::Io {
+        operation: "validate_sandbox",
+        detail: "invalid sandbox configuration".into(),
+    })?;
+    let payload = ResultPayload {
+        run: config.run,
+        variant_set: config.variant_set,
+        tests: config
+            .expected_test_ids
+            .into_iter()
+            .map(|id| (id, FinalTestOutcome::Missing))
+            .collect(),
+        supervisor: SupervisorSummary {
+            exit: SupervisorExit::Crash,
+            tests_started: 0,
+            tests_finished: 0,
+        },
+    };
+    os.phase("infra-error-write");
+    os.write_file_atomic(result_disk_path, &encode_result_disk(&payload)?)?;
+    os.phase("infra-error-synced");
+    Ok(())
 }

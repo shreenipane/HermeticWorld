@@ -128,6 +128,7 @@ pub fn apply_plan<O: SandboxOs>(os: &mut O, plan: &SandboxPlan) -> io::Result<()
         Stage::RecordFd,
         Stage::Exec,
     ] {
+        eprintln!("grader-supervisor phase sandbox-{stage:?}");
         os.apply(stage, plan)?;
     }
     Err(invalid()) // Successful exec never returns.
@@ -172,17 +173,19 @@ pub fn helper(init: bool) -> io::Result<()> {
         let plan = build_plan(&spec)?;
         return apply_plan(&mut LinuxSandbox::new()?, &plan);
     }
+    eprintln!("grader-supervisor phase namespaces");
     create_namespaces(&mut LinuxSandbox::new()?, &build_plan(&spec)?)?;
     let mut child = Command::new(std::env::current_exe()?)
         .arg("--sandbox-init")
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()?;
     // The init blocks on its input until the supervisor pins a pidfd. Thus its
     // PID cannot be recycled between transmission and pidfd_open.
     let handshake = (|| {
+        eprintln!("grader-supervisor phase init-pin");
         let mut socket = std::fs::File::from(rustix::io::dup(io::stdin())?);
         socket.write_all(&child.id().to_le_bytes())?;
         let mut ack = [0];
@@ -195,7 +198,9 @@ pub fn helper(init: bool) -> io::Result<()> {
     if handshake.is_err() {
         let _ = child.kill();
     }
+    eprintln!("grader-supervisor phase init-wait");
     let status = child.wait()?;
+    eprintln!("grader-supervisor phase cgroup-cleanup");
     crate::sys::cleanup_cgroup(child.id())?;
     handshake?;
     if status.code().is_some() {
