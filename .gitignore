@@ -13,3 +13,7 @@ target/
 # Local scratch and generated worlds
 .scratch/
 out/
+
+# local gate logs and temp dirs left by worktree runs
+.*-gate-*.log
+.*-gate-tmp/
