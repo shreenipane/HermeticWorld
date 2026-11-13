@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 from typing import Any
 import zipfile
 
@@ -18,6 +19,7 @@ import pytest
 from hermetic_slice.__main__ import main
 from hermetic_slice.e3 import (
     SYNTHETIC_MODULE_LINES,
+    apply_patch_in_temp_dir,
     build_corpus,
     compute_dir_files_sha256,
     generate_synthetic_tasks,
@@ -265,6 +267,20 @@ def test_corpus_build_variants_and_determinism(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0][0] == "app.py"
     assert "rate = 0.15" in rows[0][1]
+
+
+def test_patch_application_with_worktree_local_tmpdir(tmp_path: Path, monkeypatch) -> None:
+    """Patch copies even when temporary storage is inside an enclosing worktree."""
+    _, base = _create_fake_task(tmp_path / "tasks", tmp_path / "base")
+    patch = (tmp_path / "tasks/fake_task_1/staging/gold.patch").read_text()
+    original = (base / "app.py").read_bytes()
+    worktree = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(prefix=".patch_regression_", dir=worktree) as storage:
+        monkeypatch.setattr(tempfile, "tempdir", storage)
+        patched = apply_patch_in_temp_dir(base, patch, ["app.py"])
+    assert "rate = 0.15" in patched["app.py"]
+    assert "rate = 0.10" not in patched["app.py"]
+    assert (base / "app.py").read_bytes() == original
 
 
 def test_e3_run_against_stub_sealcheck(tmp_path: Path) -> None:
