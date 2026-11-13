@@ -310,3 +310,12 @@ def test_cli_output_is_ascii_for_undecodable_argv(capsys: pytest.CaptureFixture[
     assert rc == 0
     assert out.isascii()
     assert json.loads(out)["status"] == 405
+
+
+def test_regression_decision_hash_consistent_with_string_equality() -> None:
+    from hermetic_tlspolicy.policy import Decision, ResetReason
+
+    d = Decision("reset", ResetReason.UNKNOWN_SNI)
+    assert d == "reset"
+    assert d in {"reset"}
+    assert {"reset": 1}[d] == 1

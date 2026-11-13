@@ -664,3 +664,41 @@ def test_refusal_details_never_contain_host_paths(tmp_path: Path) -> None:
         os.chmod(locked, 0o755)
     assert any(r.reason == "directory_unreadable" for r in res.refusals)
     assert str(tmp_path) not in res.to_json()
+
+
+def test_regression_multistream_bz2_beyond_first_chunk_is_fully_decompressed() -> None:
+    import bz2
+
+    from hermetic_d10.carriers import _decompress_bz2_bounded
+
+    first = bz2.compress(b"A" * 100)
+    second = bz2.compress(os.urandom(4096))
+    third = bz2.compress(b"third-stream")
+    data = first + second + third
+    caps = ScanCaps(read_chunk_size=64)
+    out = _decompress_bz2_bounded(data, caps)
+    assert out == bz2.decompress(data)
+
+
+def test_regression_multistream_xz_stream_ending_at_chunk_boundary_is_not_skipped() -> None:
+    import lzma
+
+    from hermetic_d10.carriers import _decompress_xz_bounded
+
+    first = lzma.compress(b"first")
+    second = lzma.compress(b"second-stream")
+    caps = ScanCaps(read_chunk_size=len(first))
+    out = _decompress_xz_bounded(first + second, caps)
+    assert out == b"firstsecond-stream"
+
+
+def test_regression_gzip_decompression_cap_is_archive_wide() -> None:
+    from hermetic_d10.carriers import CapExceededError, inspect_gzip_bytes
+
+    stream = gzip.compress(b"\x00" * 600, mtime=0)
+    caps = ScanCaps(max_decompressed_bytes=1000)
+    clock = datetime(2025, 5, 1, tzinfo=timezone.utc)
+    # One stream fits within the cap; two streams together exceed it.
+    inspect_gzip_bytes("a.gz", "a.gz", [], stream, clock, caps, 0)
+    with pytest.raises(CapExceededError):
+        inspect_gzip_bytes("a.gz", "a.gz", [], stream + stream, clock, caps, 0)

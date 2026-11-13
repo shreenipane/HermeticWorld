@@ -594,3 +594,19 @@ def test_run_from_paths_rejects_oversized_page(tmp_path):
     yanks.write_text("{}", encoding="utf-8")
     with pytest.raises(YankError):
         run_yank_rewrite_from_paths(str(page), str(yanks), CUTOFF, str(tmp_path / "o"), str(tmp_path / "r"))
+
+
+def test_regression_out_and_report_same_file_via_symlinked_ancestor(tmp_path):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    os.symlink(real, tmp_path / "alias")
+    page = tmp_path / "page.json"
+    page.write_text(json.dumps(_page([_file("demo_pkg-1.0.tar.gz", upload="2023-01-01T00:00:00Z")])), encoding="utf-8")
+    yanks = tmp_path / "yanks.json"
+    yanks.write_text("{}", encoding="utf-8")
+    with pytest.raises(YankError):
+        run_yank_rewrite_from_paths(
+            str(page), str(yanks), CUTOFF,
+            str(real / "sub" / "x.json"), str(tmp_path / "alias" / "sub" / "x.json"),
+        )
+    assert not (real / "sub" / "x.json").exists()

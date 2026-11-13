@@ -411,7 +411,8 @@ def test_docker_grade_and_oracle_integration(tmp_path: Path, docker_test_env: di
         "new file mode 100644\n"
         "--- /dev/null\n"
         "+++ b/test_target.py\n"
-        "@@ -0,0 +1,10 @@\n"
+        "@@ -0,0 +1,12 @@\n"
+        "+import urllib.error\n"
         "+import urllib.request\n"
         "+import pytest\n"
         "+from target import solve\n"
@@ -420,8 +421,9 @@ def test_docker_grade_and_oracle_integration(tmp_path: Path, docker_test_env: di
         "+    assert solve(1) == 2\n"
         "+\n"
         "+def test_network():\n"
-        "+    with pytest.raises(Exception):\n"
+        "+    with pytest.raises(urllib.error.URLError) as exc_info:\n"
         "+        urllib.request.urlopen('http://1.1.1.1', timeout=1)\n"
+        "+    assert not isinstance(exc_info.value, urllib.error.HTTPError)\n"
     )
     (staging_dir / "test.patch").write_text(test_patch_text, encoding="utf-8", newline="")
 
@@ -479,6 +481,9 @@ def test_docker_grade_and_oracle_integration(tmp_path: Path, docker_test_env: di
     assert gold_grade["resolution"] == "RESOLVED_FULL"
     assert gold_grade["resolved"] is True
     assert len(gold_grade["f2p"]["success"]) == 1
+    # The network-isolation test passed because the container had no network.
+    assert gold_grade["network"] == "none"
+    assert gold_grade["p2p"]["success"] == ["test_target.py::test_network"]
 
     # Check 2: Empty patch gives RESOLVED_NO with FAIL_TO_PASS failing
     empty_grade = grade(task_dir, "", image=image, out_dir=tmp_path / "out_empty")
@@ -564,8 +569,13 @@ def test_oracle_check_f2p_passing_without_fix(tmp_path, monkeypatch, empty_f2p, 
     task_dir = tmp_path / "task"
     (task_dir / "staging").mkdir(parents=True)
     (task_dir / "staging" / "gold.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
-    gold = {"resolved": True, "f2p": {"success": ["a", "b", "help"], "failure": []}, "p2p": {"failure": []}}
-    empty = {"resolved": empty_resolved, "f2p": empty_f2p, "p2p": {"failure": []}}
+    gold = {
+        "status": "graded",
+        "resolved": True,
+        "f2p": {"success": ["a", "b", "help"], "failure": []},
+        "p2p": {"failure": []},
+    }
+    empty = {"status": "graded", "resolved": empty_resolved, "f2p": empty_f2p, "p2p": {"failure": []}}
     _fake_grades(monkeypatch, gold, empty)
 
     res = oracle_check(task_dir, image="unused", out_root=tmp_path / "oracle")
@@ -573,3 +583,19 @@ def test_oracle_check_f2p_passing_without_fix(tmp_path, monkeypatch, empty_f2p, 
     assert res["oracle_ok"] is expected_ok
     assert res["f2p_pass_without_fix"] == sorted(empty_f2p["success"])
     assert json.loads((tmp_path / "oracle" / "oracle.json").read_text(encoding="utf-8")) == res
+
+
+@pytest.mark.parametrize("empty_status", ["timeout", "patch_apply_failed", "error"])
+def test_regression_oracle_requires_completed_empty_grade(tmp_path, monkeypatch, empty_status):
+    task_dir = tmp_path / "task"
+    (task_dir / "staging").mkdir(parents=True)
+    (task_dir / "staging" / "gold.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+    gold = {"status": "graded", "resolved": True, "f2p": {"success": ["a"], "failure": []}, "p2p": {"failure": []}}
+    empty = {"status": empty_status, "resolved": False, "f2p": {"success": [], "failure": ["a"]}, "p2p": {"failure": []}}
+    _fake_grades(monkeypatch, gold, empty)
+
+    res = oracle_check(task_dir, image="unused", out_root=tmp_path / "oracle")
+
+    assert res["oracle_ok"] is False
+    assert res["empty_f2p_all_fail"] is False
+    assert res["empty_graded"] is False

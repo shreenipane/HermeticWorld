@@ -789,3 +789,36 @@ def test_regression_bootstrap_total_work_is_capped(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(metrics_mod, "MAX_BOOTSTRAP_DRAWS", 100)
     ci = bootstrap_confidence_interval(leaks, (), seed=1, bootstrap_iterations=10)
     assert ci.task_count == 10
+
+
+def test_regression_info_only_task_does_not_enter_bootstrap_population() -> None:
+    from hermetic_e3.match import Finding, Leak
+    from hermetic_e3.metrics import bootstrap_confidence_interval
+
+    leaks = (Leak("L1", "A", "f.py", 1, 1, None, "real"),)
+    base = (Finding("A", "det1", "f.py", 1, 1, "gate"),)
+    with_info = base + (Finding("B", "det1", "g.py", 1, 1, "info"),)
+    ci_base = bootstrap_confidence_interval(leaks, base, seed=7, bootstrap_iterations=200)
+    ci_info = bootstrap_confidence_interval(leaks, with_info, seed=7, bootstrap_iterations=200)
+    assert ci_info == ci_base
+
+
+def test_regression_matching_work_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermetic_e3.match import Finding, Leak, match_findings
+
+    monkeypatch.setattr(match_mod, "MAX_MATCH_CHECKS", 100)
+    leaks = tuple(Leak(f"L{i}", "t", "f.py", 1, 1, None, "real") for i in range(20))
+    findings = tuple(Finding("t", "d", "f.py", 2, 2, "gate") for _ in range(20))
+    with pytest.raises(hermetic_e3.SizeLimitError):
+        match_findings(leaks, findings)
+
+
+def test_regression_detector_by_leak_work_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hermetic_e3.metrics as metrics_mod
+    from hermetic_e3.match import Finding, Leak
+
+    monkeypatch.setattr(metrics_mod, "MAX_DETECTOR_LEAK_WORK", 50)
+    leaks = tuple(Leak(f"L{i}", "t", "f.py", i + 1, i + 1, None, "real") for i in range(10))
+    findings = tuple(Finding("t", f"d{i}", "z.py", 1, 1, "gate") for i in range(10))
+    with pytest.raises(hermetic_e3.SizeLimitError):
+        metrics_mod.compute_all_metrics(leaks, findings)

@@ -134,21 +134,21 @@ def test_rule3_every_user_form_and_group_resolution() -> None:
     spec_unknown_uid = derive_runspec({"config": {"User": "2000"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
     assert (spec_unknown_uid["uid"], spec_unknown_uid["gid"], spec_unknown_uid["supplementary_gids"]) == (2000, 0, [])
 
-    # 4. "name:group" -> alice:docker -> 1000:999, supplementary [10] (primary 999 excluded)
+    # 4. "name:group" -> alice:docker -> 1000:999; explicit group ignores supplementary groups (OCI)
     spec_ng = derive_runspec({"config": {"User": "alice:docker"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
-    assert (spec_ng["uid"], spec_ng["gid"], spec_ng["supplementary_gids"]) == (1000, 999, [10])
+    assert (spec_ng["uid"], spec_ng["gid"], spec_ng["supplementary_gids"]) == (1000, 999, [])
 
-    # 5. "uid:gid" -> 1001:2000 -> 1001:2000, bob's supplementary [999]
+    # 5. "uid:gid" -> 1001:2000 -> 1001:2000, no supplementary groups
     spec_ug = derive_runspec({"config": {"User": "1001:2000"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
-    assert (spec_ug["uid"], spec_ug["gid"], spec_ug["supplementary_gids"]) == (1001, 2000, [999])
+    assert (spec_ug["uid"], spec_ug["gid"], spec_ug["supplementary_gids"]) == (1001, 2000, [])
 
-    # 6. "name:gid" -> alice:3000 -> 1000:3000, supplementary [10, 999]
+    # 6. "name:gid" -> alice:3000 -> 1000:3000, no supplementary groups
     spec_ngid = derive_runspec({"config": {"User": "alice:3000"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
-    assert (spec_ngid["uid"], spec_ngid["gid"], spec_ngid["supplementary_gids"]) == (1000, 3000, [10, 999])
+    assert (spec_ngid["uid"], spec_ngid["gid"], spec_ngid["supplementary_gids"]) == (1000, 3000, [])
 
-    # 7. "uid:group" -> 1001:wheel -> 1001:10, bob's supplementary [999]
+    # 7. "uid:group" -> 1001:wheel -> 1001:10, no supplementary groups
     spec_ugrp = derive_runspec({"config": {"User": "1001:wheel"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
-    assert (spec_ugrp["uid"], spec_ugrp["gid"], spec_ugrp["supplementary_gids"]) == (1001, 10, [999])
+    assert (spec_ugrp["uid"], spec_ugrp["gid"], spec_ugrp["supplementary_gids"]) == (1001, 10, [])
 
     # User in overrides takes precedence over config.User
     ov_user = _base_overrides()
@@ -428,3 +428,16 @@ def test_cli_rejects_abbreviated_options(tmp_path: Path) -> None:
     ov_f = tmp_path / "ov.json"
     ov_f.write_text(json.dumps(_base_overrides()), encoding="utf-8")
     assert cli_main(["--conf", str(cfg_f), "--passwd", str(pw_f), "--group", str(gr_f), "--overrides", str(ov_f)]) == 1
+
+
+def test_regression_reserved_uid_gid_4294967295_rejected() -> None:
+    with pytest.raises(UserResolutionError):
+        derive_runspec(
+            {"config": {"User": "4294967295:4294967295"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides()
+        )
+    spec = derive_runspec(
+        {"config": {"User": "4294967294:4294967294"}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides()
+    )
+    assert (spec["uid"], spec["gid"]) == (4294967294, 4294967294)
+    _, by_uid, bad = parse_passwd_bytes(b"x:x:4294967295:0::/:/bin/sh\n")
+    assert by_uid == {} and bad == 1

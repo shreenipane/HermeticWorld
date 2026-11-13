@@ -68,6 +68,7 @@ from hermetic_e3 import (
     JsonFormatError,
     MAX_ENTRIES,
     MAX_FILE_BYTES,
+    MAX_MATCH_CHECKS,
     MAX_LINE_NUMBER,
     MAX_OBJECT_KEYS,
     MAX_READ_CHUNKS,
@@ -449,6 +450,7 @@ def match_findings(
     unmatched_active: list[Finding] = []
     active_count = 0
     ignored_info_count = 0
+    match_checks = 0
 
     for finding in findings[:MAX_ENTRIES]:
         matched_by_detector.setdefault(finding.detector, set())
@@ -467,6 +469,11 @@ def match_findings(
         for leak in candidates[:MAX_ENTRIES]:
             if leak.line_start > finding.line_end:
                 break
+            match_checks += 1
+            if match_checks > MAX_MATCH_CHECKS:
+                raise SizeLimitError(
+                    f"Matching work exceeds cap {MAX_MATCH_CHECKS} candidate checks"
+                )
             if ranges_overlap(
                 finding.line_start, finding.line_end, leak.line_start, leak.line_end
             ):

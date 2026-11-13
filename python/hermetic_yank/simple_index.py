@@ -465,6 +465,15 @@ def run_yank_rewrite_from_paths(
     out_dir, out_base = check_output_path(out_path)
     rep_dir, rep_base = check_output_path(report_path)
     same_name = (os.path.abspath(out_dir), out_base) == (os.path.abspath(rep_dir), rep_base)
+    # Directory identity catches the same directory reached through different ancestor
+    # paths even when neither output file exists yet.
+    try:
+        out_dst = os.stat(out_dir)
+        rep_dst = os.stat(rep_dir)
+    except OSError as exc:
+        raise YankError("failed to stat output directory") from exc
+    if (out_dst.st_dev, out_dst.st_ino, out_base) == (rep_dst.st_dev, rep_dst.st_ino, rep_base):
+        same_name = True
     try:
         same_file = os.path.samefile(out_path, report_path)
     except OSError:

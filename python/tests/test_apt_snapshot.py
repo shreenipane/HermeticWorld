@@ -340,3 +340,33 @@ def test_review_cli_hostile_arguments_exit_1(capsys: pytest.CaptureFixture[str])
     assert cli_main(base[:-1] + ["/k ey"]) == 1
     assert cli_main([a if a != "main" else "main,,contrib" for a in base]) == 1
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("codename", ["sid", "rc-buggy"])
+def test_regression_debian_sid_codename_refused(codename: str) -> None:
+    with pytest.raises(ValidationError):
+        select_apt_snapshot("debian", codename, ["main"], ["amd64"], "2023-05-01T00:00:00Z", _KEY)
+
+
+def test_regression_ubuntu_non_x86_architectures_use_ports_archive() -> None:
+    res = select_apt_snapshot(
+        "ubuntu", "noble", ["main"], ["arm64", "amd64", "armhf"], "2024-06-15T00:00:00Z",
+        "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+    )
+    assert res["sources"] == (
+        "Types: deb\n"
+        "URIs: https://snapshot.ubuntu.com/ubuntu/20240615T000000Z\n"
+        "Suites: noble noble-updates noble-security\n"
+        "Components: main\n"
+        "Architectures: amd64\n"
+        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+        "Check-Valid-Until: no\n"
+        "\n"
+        "Types: deb\n"
+        "URIs: https://snapshot.ubuntu.com/ubuntu-ports/20240615T000000Z\n"
+        "Suites: noble noble-updates noble-security\n"
+        "Components: main\n"
+        "Architectures: arm64 armhf\n"
+        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+        "Check-Valid-Until: no\n"
+    )
