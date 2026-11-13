@@ -131,7 +131,7 @@ impl Caps {
 /// Benchmark task class determining which part of the work tree is extracted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskClass {
-    /// Extract changes within a repository directory (`"."` denotes tree root).
+    /// Extract changes within a repository directory (`""` denotes the tree root).
     Patch { repo_dir: String },
     /// Extract changes only for explicitly declared relative paths.
     Artifact { paths: Vec<String> },
@@ -139,18 +139,21 @@ pub enum TaskClass {
     State,
 }
 
-/// Parses a CLI `--class` specification (`patch:REPO`, `artifact:P1,P2`, or `state`).
+/// Parses a CLI `--class` specification (`patch:REPO`, `patch:` for the tree root,
+/// `artifact:P1,P2`, or `state`).
 pub fn parse_task_class(spec: &str) -> Result<TaskClass, ExtractError> {
     if spec == "state" {
         return Ok(TaskClass::State);
     }
     if let Some(repo) = spec.strip_prefix("patch:") {
-        if repo.is_empty() {
+        // The tree root is spelled as the empty string (`patch:`), matching the host
+        // validator's `repo_dir: ""`. Any other spelling of the root is refused.
+        if repo == "." || repo == "./" || repo == "/" {
             return Err(ExtractError::InvalidTaskClass {
-                reason: "patch repository path must not be empty",
+                reason: "tree root must be spelled `patch:` (empty repo path), not '.' or '/'",
             });
         }
-        if repo != "." {
+        if !repo.is_empty() {
             validate_relative_path(repo)?;
         }
         return Ok(TaskClass::Patch {

@@ -159,6 +159,15 @@ impl ExtractConfig {
                     })?;
             }
         }
+        // The tree root is spelled as the empty string (agent CLI `patch:`). Other root
+        // spellings are refused explicitly rather than normalized.
+        if let Some(repo) = &self.repo_dir {
+            if repo == "." || repo == "./" || repo == "/" {
+                return Err(ExtractError::Config(
+                    "repo_dir must be \"\" for the tree root, not '.' or '/'".into(),
+                ));
+            }
+        }
         for (path, allow_root) in self
             .repo_dir
             .iter()

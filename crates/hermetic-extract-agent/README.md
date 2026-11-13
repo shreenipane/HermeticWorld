@@ -13,15 +13,24 @@ Guest-side deterministic change extractor for Hermetic World. Reads a read-only 
 
 ## Wire Format (`HEXT` v1)
 
-1. **Header**: `b"HEXT"` (4 bytes) + version `1u16` LE (2 bytes).
-2. **Records** (repeated until `type == 4`):
-   - `type`: `u8` (`1` = file, `2` = dir, `3` = delete, `4` = end)
-   - `path_len`: `u16` LE (`0` for `end`)
-   - `path`: `path_len` UTF-8 bytes, relative `/`-separated
-   - `mode`: `u32` LE (`0o644` or `0o755` for files, `0o755` for dirs, `0` otherwise)
-   - `size`: `u64` LE (file byte length for files, `0` for dirs/deletes, preceding record count for `end`)
-   - `sha256`: 32 bytes (SHA-256 of file bytes for files, all zeros for dirs/deletes, SHA-256 of all preceding stream bytes for `end`)
-   - `file_bytes`: `size` raw bytes (present only when `type == 1`)
+The host validator in `crates/hermetic-extract` (`format.rs`, TR-EXT-5) defines the format; this crate emits it byte for byte. `tests/validator_compat.rs` feeds agent streams to the validator and checks the agent's bytes against the validator's own encoder.
+
+1. **Stream header** (8 bytes): `b"HEXT"` + version `1u32` LE.
+2. **Records**, each a fixed 60-byte little-endian header, then the path, then the payload:
+
+   | Offset | Size | Field |
+   |---|---|---|
+   | 0 | 1 | `type`: `1` file, `2` dir, `3` delete, `4` end |
+   | 1 | 1 | `flags`: must be `0` |
+   | 2 | 2 | reserved: must be `0` |
+   | 4 | 4 | `path_len` (`u32`, `0` for end) |
+   | 8 | 4 | `mode`: `0o644`/`0o755` for files, `0o755` for dirs, `0` otherwise |
+   | 12 | 8 | `size`: file byte length; `0` for dirs/deletes; for end, the total file payload bytes of the stream |
+   | 20 | 8 | `record_count`: `0` except in the end record, where it is the number of preceding records |
+   | 28 | 32 | `sha256`: SHA-256 of the file bytes for files, all zeros otherwise |
+
+   After the header: `path_len` UTF-8 path bytes (relative, `/`-separated), then `size` raw bytes for files.
+3. The end record is last; any byte after it is an error.
 
 ## CLI Usage
 
@@ -35,7 +44,8 @@ hermetic-extract-agent \
 
 Supported `--class` forms:
 
-* `patch:REPO` (`REPO` may be `.` for the tree root or a relative subdirectory)
+* `patch:REPO` (a relative subdirectory; record paths keep the `REPO/` prefix, matching validator config `repo_dir: "REPO"`)
+* `patch:` (empty: the whole tree root, matching validator config `repo_dir: ""`). `patch:.` and `patch:/` are refused with `InvalidTaskClass`; the validator likewise refuses `repo_dir: "."`.
 * `artifact:P1,P2` (comma-separated relative file/directory paths)
 * `state` (emits no change records; writes header and `end` record)
 
