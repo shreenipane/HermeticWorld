@@ -9,6 +9,9 @@ use crate::scan::{Finding, Severity, Visibility};
 
 const SUPERBLOCK_OFFSET: usize = 1024;
 const SUPERBLOCK_SIZE: usize = 1024;
+pub const MAX_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_IMAGE_INODES: u64 = 1_000_000;
+const MAX_IMAGE_FINDINGS: usize = 100_000;
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
 const EXT4_EA_INODE_FL: u32 = 0x0020_0000;
@@ -57,14 +60,19 @@ pub enum Ext4Error {
 ///
 /// The lower 2 bits of `extra` extend the 32-bit signed seconds field by 2 bits.
 /// The upper 30 bits of `extra` store the nanoseconds.
-fn ext4_decode_extra_time(base: u32, extra: u32) -> (i64, u32) {
+fn ext4_decode_extra_time(base: u32, extra: u32) -> Result<(i64, u32), Ext4Error> {
     let mut sec = (base as i32) as i64;
     let epoch = (extra & 3) as u64;
     if epoch != 0 {
         sec += (epoch << 32) as i64;
     }
     let nsec = (extra & 0xFFFF_FFFC) >> 2;
-    (sec, nsec)
+    if nsec >= 1_000_000_000 {
+        return Err(Ext4Error::Malformed(
+            "invalid inode timestamp nanoseconds".into(),
+        ));
+    }
+    Ok((sec, nsec))
 }
 
 /// Decode superblock timestamp with optional `_hi` extension byte.
@@ -126,6 +134,9 @@ fn parse_ext4(
     if (s_feature_incompat & EXT4_FEATURE_INCOMPAT_JOURNAL_DEV) != 0 {
         return Err(Ext4Error::Unsupported("journal_dev".into()));
     }
+    if (s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) != 0 {
+        return Err(Ext4Error::Unsupported("journal recovery required".into()));
+    }
     let unsupported = s_feature_incompat & !SUPPORTED_INCOMPAT;
     if unsupported != 0 {
         return Err(Ext4Error::Unsupported(format!(
@@ -156,6 +167,9 @@ fn parse_ext4(
     // Inodes per group and total inodes
     let s_inodes_per_group = u32::from_le_bytes([sb[0x28], sb[0x29], sb[0x2A], sb[0x2B]]) as u64;
     let s_inodes_count = u32::from_le_bytes([sb[0x00], sb[0x01], sb[0x02], sb[0x03]]) as u64;
+    if s_inodes_count > MAX_IMAGE_INODES {
+        return Err(Ext4Error::Malformed("image inode cap exceeded".into()));
+    }
     if s_inodes_per_group == 0 || s_inodes_count == 0 {
         return Err(Ext4Error::Malformed(
             "inodes per group or total inodes is zero".into(),
@@ -470,7 +484,8 @@ fn parse_ext4(
                 None => return Err(Ext4Error::Malformed("inode slice out of bounds".into())),
             };
 
-            // i_dtime at 0x14: only for deleted inodes, which aren't in use, so skip
+            // The allocation bitmap is authoritative. An allocated inode with a
+            // deletion time is inconsistent, never an excuse to skip its times.
             let dtime = u32::from_le_bytes([
                 inode_slice[0x14],
                 inode_slice[0x15],
@@ -478,7 +493,9 @@ fn parse_ext4(
                 inode_slice[0x17],
             ]);
             if dtime != 0 {
-                continue;
+                return Err(Ext4Error::Malformed(
+                    "allocated inode has a deletion time".into(),
+                ));
             }
 
             let flags = u32::from_le_bytes([
@@ -495,6 +512,9 @@ fn parse_ext4(
             } else {
                 0
             };
+            if extra_isize > s_inode_size.saturating_sub(128) || extra_isize % 4 != 0 {
+                return Err(Ext4Error::Malformed("invalid inode extra size".into()));
+            }
 
             let mut violating_evidence = Vec::new();
 
@@ -514,7 +534,7 @@ fn parse_ext4(
                         inode_slice[0x8E],
                         inode_slice[0x8F],
                     ]);
-                    ext4_decode_extra_time(atime_lo, extra)
+                    ext4_decode_extra_time(atime_lo, extra)?
                 } else {
                     ((atime_lo as i32) as i64, 0)
                 };
@@ -543,7 +563,7 @@ fn parse_ext4(
                     inode_slice[0x86],
                     inode_slice[0x87],
                 ]);
-                ext4_decode_extra_time(ctime_lo, extra)
+                ext4_decode_extra_time(ctime_lo, extra)?
             } else {
                 ((ctime_lo as i32) as i64, 0)
             };
@@ -570,7 +590,7 @@ fn parse_ext4(
                     inode_slice[0x8A],
                     inode_slice[0x8B],
                 ]);
-                ext4_decode_extra_time(mtime_lo, extra)
+                ext4_decode_extra_time(mtime_lo, extra)?
             } else {
                 ((mtime_lo as i32) as i64, 0)
             };
@@ -599,7 +619,7 @@ fn parse_ext4(
                             inode_slice[0x96],
                             inode_slice[0x97],
                         ]);
-                        ext4_decode_extra_time(crtime_lo, extra)
+                        ext4_decode_extra_time(crtime_lo, extra)?
                     } else {
                         ((crtime_lo as i32) as i64, 0)
                     };
@@ -616,6 +636,9 @@ fn parse_ext4(
 
             // Emit at most one finding per inode path
             if !violating_evidence.is_empty() {
+                if findings.len() >= MAX_IMAGE_FINDINGS {
+                    return Err(Ext4Error::Malformed("image finding cap exceeded".into()));
+                }
                 findings.push(Finding {
                     detector: "D4".into(),
                     channel: "inode".into(),
@@ -639,15 +662,31 @@ pub fn scan_ext4_slice(
     data: &[u8],
     t_clock: OffsetDateTime,
 ) -> Result<Vec<Finding>, Ext4Error> {
+    if data.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(Ext4Error::Malformed("image byte cap exceeded".into()));
+    }
     parse_ext4(image_display, data, t_clock)
 }
 
-/// Scan an ext4 image file from disk against `T_clock`.
+/// Stable evidence label, including when the image arrives on an inherited descriptor.
+pub fn image_display(image_path: &Path) -> String {
+    if image_path.parent() == Some(Path::new("/proc/self/fd")) {
+        "<image>".into()
+    } else {
+        image_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Scan a regular image path or an explicitly inherited image descriptor.
 pub fn scan_ext4_image(
     image_path: &Path,
     t_clock: OffsetDateTime,
 ) -> Result<Vec<Finding>, Ext4Error> {
-    let display = image_path.display().to_string();
-    let data = std::fs::read(image_path)?;
+    let display = image_display(image_path);
+    let data = crate::safe_fs::read(image_path, MAX_IMAGE_BYTES)?;
     scan_ext4_slice(&display, &data, t_clock)
 }

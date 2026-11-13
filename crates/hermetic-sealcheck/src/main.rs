@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand, ValueEnum};
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -13,7 +12,6 @@ use hermetic_sealcheck::{
     FingerprintSummary, SarifRunProperties, ScanOptions, SealcheckReport, Severity, Visibility,
     NOT_COVERED, UNDATED_NOT_COVERED,
 };
-use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -396,6 +394,9 @@ fn write_report(
     let gate = all_findings
         .iter()
         .any(|f| f.severity == Severity::Gate && f.visibility == Visibility::AgentVisible);
+    let incomplete = all_findings
+        .iter()
+        .any(|f| f.detector == "D4" && f.channel == "tree_incomplete");
 
     let output_str = match format {
         OutputFormat::Sarif => {
@@ -450,13 +451,18 @@ fn write_report(
     };
 
     if let Some(out_path) = out {
-        fs::write(out_path, format!("{}\n", output_str))?;
+        hermetic_sealcheck::safe_fs::atomic_write(
+            &out_path,
+            format!("{}\n", output_str).as_bytes(),
+        )?;
     } else {
         println!("{}", output_str);
     }
 
     if gate {
         Ok(ExitCode::from(2))
+    } else if incomplete {
+        Ok(ExitCode::FAILURE)
     } else {
         Ok(ExitCode::SUCCESS)
     }
@@ -644,11 +650,36 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 fn run_d4_image(args: D4ImageArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let t_clock = hermetic_common::cutoff::parse_utc_datetime(&args.t_clock)
         .map_err(|e| format!("invalid --t-clock: {e}"))?;
-    let findings = hermetic_sealcheck::scan_ext4_image(&args.image, t_clock)?;
+    let image_name = hermetic_sealcheck::ext4::image_display(&args.image);
+    let findings = match hermetic_sealcheck::scan_ext4_image(&args.image, t_clock) {
+        Ok(findings) => findings,
+        Err(error) => {
+            let finding = Finding {
+                detector: "D4".into(),
+                channel: "image_malformed".into(),
+                path: image_name.clone(),
+                visibility: Visibility::AgentVisible,
+                severity: Severity::Info,
+                confidence: 0.0,
+                hunk: None,
+                evidence: vec![error.to_string()],
+            };
+            write_report(
+                vec![finding],
+                None,
+                image_name,
+                args.format,
+                args.out,
+                None,
+                Vec::new(),
+            )?;
+            return Err(error.into());
+        }
+    };
     write_report(
         findings,
         None,
-        args.image.display().to_string(),
+        image_name,
         args.format,
         args.out,
         None,
@@ -680,12 +711,8 @@ struct D8Args {
 }
 
 fn run_d8(args: D8Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if !args.root.is_dir() {
-        return Err(format!(
-            "--root '{}' does not exist or is not a directory",
-            args.root.display()
-        )
-        .into());
+    if !hermetic_sealcheck::safe_fs::is_dir(&args.root) {
+        return Err("--root does not exist or is not a directory".into());
     }
 
     let t_clock = match time::OffsetDateTime::parse(
@@ -741,7 +768,10 @@ fn run_d8(args: D8Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
 
     if let Some(out_path) = args.out {
-        fs::write(out_path, format!("{}\n", output_str))?;
+        hermetic_sealcheck::safe_fs::atomic_write(
+            &out_path,
+            format!("{}\n", output_str).as_bytes(),
+        )?;
     } else {
         println!("{}", output_str);
     }
@@ -816,11 +846,16 @@ fn parse_iso_date(s: &str) -> Result<time::Date, String> {
 }
 
 fn run_d11(args: D11Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let patch_text = fs::read_to_string(&args.patch)?;
     let opts = D11Options {
         benchmark_test_files: args.benchmark_test_file,
         installed_packages: args.installed_package,
     };
+    opts.validate()?;
+    let patch_bytes = hermetic_sealcheck::safe_fs::read(
+        &args.patch,
+        hermetic_sealcheck::d11::MAX_PATCH_BYTES as u64,
+    )?;
+    let patch_text = String::from_utf8(patch_bytes).map_err(|_| "patch is not UTF-8")?;
     let findings = check_d11(&patch_text, &opts);
     write_advisory_report(findings, "d11", args.format, args.out)?;
     Ok(ExitCode::SUCCESS)
@@ -838,95 +873,80 @@ fn run_d12(args: D12Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         host_names: args.host_name,
         host_paths: args.host_path,
     };
+    opts.validate()?;
 
     let mut findings = Vec::new();
-    const MAX_SIZE: u64 = 64 * 1024 * 1024;
-
+    let mut total_bytes = 0u64;
+    let mut entries = 0usize;
+    let mut incomplete = false;
     for target in &args.path {
-        let sym_meta = match fs::symlink_metadata(target) {
-            Ok(m) => m,
-            Err(_) => {
-                return Err(format!("path does not exist: {}", target.display()).into());
+        for entry in hermetic_sealcheck::safe_fs::walk(target, |_| true) {
+            entries = entries.saturating_add(1);
+            if entries > hermetic_sealcheck::safe_fs::MAX_TREE_ENTRIES {
+                return Err("D12 tree entry cap exceeded".into());
             }
-        };
-
-        if sym_meta.file_type().is_symlink() {
-            findings.push(Finding {
-                detector: "D12".to_string(),
-                channel: "skipped_symlink".to_string(),
-                path: target.display().to_string(),
-                visibility: Visibility::AgentVisible,
-                severity: Severity::Info,
-                confidence: 1.0,
-                hunk: None,
-                evidence: vec!["symlink not followed".to_string()],
-            });
-            continue;
-        }
-
-        if target.is_file() {
-            let meta = fs::metadata(target)?;
-            if meta.len() > MAX_SIZE {
+            let path = entry.map_err(|_| "D12 directory unreadable or traversal cap exceeded")?;
+            let meta = hermetic_sealcheck::safe_fs::metadata(&path)?;
+            let display = if meta.is_dir() || path != *target {
+                path.strip_prefix(target)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            } else {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if meta.file_type().is_symlink() {
                 findings.push(Finding {
-                    detector: "D12".to_string(),
-                    channel: "oversize_file".to_string(),
-                    path: target.display().to_string(),
+                    detector: "D12".into(),
+                    channel: "skipped_symlink".into(),
+                    path: display,
                     visibility: Visibility::AgentVisible,
                     severity: Severity::Info,
                     confidence: 1.0,
                     hunk: None,
-                    evidence: vec![format!("file over 64 MiB skipped: {} bytes", meta.len())],
+                    evidence: vec!["symlink not followed".into()],
                 });
-            } else {
-                let bytes = fs::read(target)?;
-                let text = String::from_utf8_lossy(&bytes);
-                let f = check_d12(&target.display().to_string(), &text, &opts);
-                findings.extend(f);
-            }
-        } else if target.is_dir() {
-            for entry in WalkDir::new(target) {
-                let entry = entry?;
-                if entry.file_type().is_symlink() {
-                    findings.push(Finding {
-                        detector: "D12".to_string(),
-                        channel: "skipped_symlink".to_string(),
-                        path: entry.path().display().to_string(),
-                        visibility: Visibility::AgentVisible,
-                        severity: Severity::Info,
-                        confidence: 1.0,
-                        hunk: None,
-                        evidence: vec!["symlink not followed".to_string()],
-                    });
-                } else if entry.file_type().is_file() {
-                    let p = entry.path();
-                    let meta = entry.metadata()?;
-                    if meta.len() > MAX_SIZE {
+            } else if meta.is_file() {
+                let cap = hermetic_sealcheck::d12::MAX_TEXT_BYTES as u64;
+                let remaining =
+                    hermetic_sealcheck::safe_fs::MAX_TREE_BYTES.saturating_sub(total_bytes);
+                match hermetic_sealcheck::safe_fs::read_counted(
+                    &path,
+                    cap.min(remaining),
+                    &mut total_bytes,
+                ) {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        findings.extend(check_d12(&display, &text, &opts));
+                    }
+                    Err(_) => {
+                        incomplete = true;
                         findings.push(Finding {
-                            detector: "D12".to_string(),
-                            channel: "oversize_file".to_string(),
-                            path: p.display().to_string(),
+                            detector: "D12".into(),
+                            channel: "read_error".into(),
+                            path: display,
                             visibility: Visibility::AgentVisible,
                             severity: Severity::Info,
-                            confidence: 1.0,
+                            confidence: 0.0,
                             hunk: None,
-                            evidence: vec![format!(
-                                "file over 64 MiB skipped: {} bytes",
-                                meta.len()
-                            )],
+                            evidence: vec!["file refused or byte cap exceeded".into()],
                         });
-                    } else {
-                        let bytes = fs::read(p)?;
-                        let text = String::from_utf8_lossy(&bytes);
-                        let f = check_d12(&p.display().to_string(), &text, &opts);
-                        findings.extend(f);
                     }
                 }
+            } else if !meta.is_dir() {
+                incomplete = true;
             }
         }
     }
-
     write_advisory_report(findings, "d12", args.format, args.out)?;
-    Ok(ExitCode::SUCCESS)
+    Ok(if incomplete {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn write_advisory_report(
@@ -973,7 +993,10 @@ fn write_advisory_report(
     };
 
     if let Some(out_path) = out {
-        fs::write(out_path, format!("{}\n", output_str))?;
+        hermetic_sealcheck::safe_fs::atomic_write(
+            &out_path,
+            format!("{}\n", output_str).as_bytes(),
+        )?;
     } else {
         println!("{}", output_str);
     }
@@ -1007,5 +1030,35 @@ fn main() -> ExitCode {
             eprintln!("hermetic-sealcheck error: {}", e);
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod detector_coverage_tests {
+    use super::*;
+    #[test]
+    fn incomplete_d4_coverage_exits_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let finding = Finding {
+            detector: "D4".into(),
+            channel: "tree_incomplete".into(),
+            path: ".".into(),
+            visibility: Visibility::AgentVisible,
+            severity: Severity::Info,
+            confidence: 0.0,
+            hunk: None,
+            evidence: vec!["tree cap exceeded".into()],
+        };
+        let exit = write_report(
+            vec![finding],
+            None,
+            String::new(),
+            OutputFormat::Json,
+            Some(directory.path().join("report.json")),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(exit, ExitCode::FAILURE);
     }
 }

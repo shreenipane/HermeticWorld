@@ -10,6 +10,9 @@ use std::collections::HashSet;
 
 use crate::scan::{Finding, Severity, Visibility};
 
+pub const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OPTION_ITEMS: usize = 10_000;
+
 /// Options for detector D12.
 #[derive(Debug, Clone)]
 pub struct D12Options {
@@ -21,6 +24,22 @@ pub struct D12Options {
     pub host_names: Vec<String>,
     /// Host paths to search for (as substrings).
     pub host_paths: Vec<String>,
+}
+
+impl D12Options {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.host_names.len() > MAX_OPTION_ITEMS
+            || self.host_paths.len() > MAX_OPTION_ITEMS
+            || self
+                .host_names
+                .iter()
+                .chain(&self.host_paths)
+                .any(|s| s.len() > crate::safe_fs::MAX_PATH_BYTES)
+        {
+            return Err("D12 option cap exceeded");
+        }
+        Ok(())
+    }
 }
 
 impl Default for D12Options {
@@ -732,6 +751,18 @@ fn scan_dates(
 
 /// Check text for real-date sentinels, host names, and host paths (Detector D12).
 pub fn check_d12(path: &str, text: &str, opts: &D12Options) -> Vec<Finding> {
+    if text.len() > MAX_TEXT_BYTES || opts.validate().is_err() {
+        return vec![Finding {
+            detector: "D12".into(),
+            channel: "scan_error".into(),
+            path: path.into(),
+            visibility: Visibility::AgentVisible,
+            severity: Severity::Info,
+            confidence: 0.0,
+            hunk: None,
+            evidence: vec!["text or option cap exceeded".into()],
+        }];
+    }
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -739,11 +770,11 @@ pub fn check_d12(path: &str, text: &str, opts: &D12Options) -> Vec<Finding> {
     let min_date = opts
         .real_date
         .checked_sub(time::Duration::days(opts.tolerance_days as i64))
-        .unwrap_or(opts.real_date);
+        .unwrap_or(time::Date::MIN);
     let max_date = opts
         .real_date
         .checked_add(time::Duration::days(opts.tolerance_days as i64))
-        .unwrap_or(opts.real_date);
+        .unwrap_or(time::Date::MAX);
 
     // 1. Channel "host_path": any opts.host_paths entry as a substring
     for target in &opts.host_paths {

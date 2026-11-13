@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use crate::benchmark::BenchmarkSignatures;
 use crate::bytecode::check_pyc_bytecode;
@@ -703,7 +701,25 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
         inner: MatchSink::new(fp, &opts.signatures, opts),
         d4_paths: HashSet::new(),
     };
-    walk_tree(root, opts, sink).inner.findings
+    let mut findings = walk_tree(root, opts, sink).inner.findings;
+    relative_d4_paths(&mut findings, root);
+    findings
+}
+
+pub(crate) fn relative_d4_paths(findings: &mut Vec<Finding>, root: &Path) {
+    for finding in findings.iter_mut().filter(|f| f.detector == "D4") {
+        if let Ok(relative) = Path::new(&finding.path).strip_prefix(root) {
+            finding.path = if relative.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                relative.display().to_string()
+            };
+        }
+    }
+    let mut seen = HashSet::new();
+    findings.retain(|f| {
+        f.detector != "D4" || f.severity != Severity::Gate || seen.insert(f.path.clone())
+    });
 }
 
 /// Walk `root` as `scan_tree` does (pruning, symlinks, size limits, container recursion)
@@ -713,33 +729,40 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
     let root_prefix_len = root_str.len();
 
     let is_git_dir = |p: &Path| {
-        p.join("HEAD").is_file() && p.join("objects").is_dir() && p.join("refs").is_dir()
+        crate::safe_fs::is_file(&p.join("HEAD"))
+            && crate::safe_fs::is_dir(&p.join("objects"))
+            && crate::safe_fs::is_dir(&p.join("refs"))
     };
 
     if is_git_dir(root) {
         sink.git_repo(root);
     }
 
-    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
-        let path = e.path();
-        if root == Path::new("/") {
-            let path_str = path.to_string_lossy();
-            if path_str == "/proc" || path_str == "/sys" || path_str == "/dev" {
-                return false;
-            }
+    let absolute_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(root),
+            Err(_) => root.to_path_buf(),
         }
-        if e.file_type().is_dir() {
-            if e.file_name() == "objects" && path.parent().is_some_and(is_git_dir) {
-                return false;
-            }
-            if !opts.exclude_dirs.is_empty() {
-                if let Ok(canon) = path.canonicalize() {
-                    return !opts.exclude_dirs.iter().any(|d| canon.starts_with(d));
-                }
-            }
+    };
+    let walker = crate::safe_fs::walk(root, |path| {
+        if root == Path::new("/")
+            && [Path::new("/proc"), Path::new("/sys"), Path::new("/dev")].contains(&path)
+        {
+            return false;
         }
-        true
+        if path.file_name().is_some_and(|n| n == "objects") && path.parent().is_some_and(is_git_dir)
+        {
+            return false;
+        }
+        let absolute_path = absolute_root.join(path.strip_prefix(root).unwrap_or(path));
+        !opts
+            .exclude_dirs
+            .iter()
+            .any(|d| absolute_path.starts_with(d))
     });
+    let mut tree_bytes = 0u64;
 
     let error_finding = |path: String, what: String| Finding {
         detector: "D2".into(),
@@ -751,27 +774,43 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         hunk: None,
         evidence: vec![what],
     };
+    let incomplete_mtime = |path: String| Finding {
+        detector: "D4".into(),
+        channel: "tree_incomplete".into(),
+        path,
+        visibility: opts.visibility,
+        severity: Severity::Info,
+        confidence: 0.0,
+        hunk: None,
+        evidence: vec!["timestamp coverage incomplete: tree cap or metadata error".into()],
+    };
 
     for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
+        let file_path_owned = match entry {
+            Ok(p) => p,
             Err(e) => {
-                let path = e
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| root.display().to_string());
-                sink.fixed(error_finding(path, format!("walk error: {e}")));
+                if opts.t_clock.is_some() {
+                    sink.fixed(incomplete_mtime(root_str.clone()));
+                }
+                sink.fixed(error_finding(root_str.clone(), format!("walk error: {e}")));
                 continue;
             }
         };
-        let file_path = entry.path();
+        let file_path = file_path_owned.as_path();
         let display_path = file_path.display().to_string();
-
-        if entry.path_is_symlink() {
-            if let Ok(sym_meta) = std::fs::symlink_metadata(file_path) {
-                sink.symlink(&display_path, &sym_meta);
+        let metadata = match crate::safe_fs::metadata(file_path) {
+            Ok(m) => m,
+            Err(e) => {
+                if opts.t_clock.is_some() {
+                    sink.fixed(incomplete_mtime(display_path.clone()));
+                }
+                sink.fixed(error_finding(display_path, format!("metadata error: {e}")));
+                continue;
             }
-            if entry.file_name() == ".git" {
+        };
+        if metadata.file_type().is_symlink() {
+            sink.symlink(&display_path, &metadata);
+            if file_path.file_name().is_some_and(|n| n == ".git") {
                 sink.d1_finding(Finding {
                     detector: "D1".into(),
                     channel: "git_pointer".into(),
@@ -783,63 +822,59 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
                     evidence: vec!["symlink named .git".into()],
                 });
             }
+            sink.fixed(error_finding(display_path, "symlink not followed".into()));
+            continue;
         }
-
-        let metadata = if entry.path_is_symlink() {
-            match std::fs::metadata(file_path) {
-                Ok(m) if m.is_file() => m,
-                Ok(_) => {
-                    sink.fixed(error_finding(
-                        display_path,
-                        "symlink to a non-file not followed".into(),
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    sink.fixed(error_finding(display_path, format!("broken symlink: {e}")));
-                    continue;
-                }
-            }
-        } else if entry.file_type().is_file() {
-            if entry.file_name() == ".git" {
-                sink.d1_finding(Finding {
-                    detector: "D1".into(),
-                    channel: "git_pointer".into(),
-                    path: display_path.clone(),
-                    visibility: opts.visibility,
-                    severity: Severity::Gate,
-                    confidence: 1.0,
-                    hunk: None,
-                    evidence: vec!["git pointer file present".into()],
-                });
-            }
-            match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    sink.fixed(error_finding(display_path, format!("metadata error: {e}")));
-                    continue;
-                }
-            }
-        } else if entry.file_type().is_dir() {
-            if let Ok(dir_meta) = entry.metadata() {
-                sink.directory(&display_path, &dir_meta);
-            }
+        if metadata.is_dir() {
+            sink.directory(&display_path, &metadata);
             if file_path != root && is_git_dir(file_path) {
                 sink.git_repo(file_path);
             }
             continue;
-        } else {
+        }
+        if !metadata.is_file() {
             continue;
-        };
+        }
+        if file_path.file_name().is_some_and(|n| n == ".git") {
+            sink.d1_finding(Finding {
+                detector: "D1".into(),
+                channel: "git_pointer".into(),
+                path: display_path.clone(),
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec!["git pointer file present".into()],
+            });
+        }
 
+        // Keep timestamp inspection and payload reads on the same pinned inode.
+        let mut file = match crate::safe_fs::open_regular(file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                sink.loose_file(&display_path, &metadata);
+                sink.fixed(error_finding(display_path, format!("open error: {e}")));
+                continue;
+            }
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                if opts.t_clock.is_some() {
+                    sink.fixed(incomplete_mtime(display_path.clone()));
+                }
+                sink.fixed(error_finding(display_path, format!("metadata error: {e}")));
+                continue;
+            }
+        };
         sink.loose_file(&display_path, &metadata);
 
         // Size check for loose file
         if metadata.len() > opts.max_file_bytes {
             let is_large_archive = if metadata.len() <= opts.max_member_bytes {
-                if let Ok(mut f) = File::open(file_path) {
+                {
                     let mut head = [0u8; 512];
-                    if let Ok(n) = f.read(&mut head) {
+                    if let Ok(n) = file.read_at(&mut head, 0) {
                         matches!(
                             detect_container_type(&head[..n], &display_path),
                             Some(
@@ -854,8 +889,6 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
                     } else {
                         false
                     }
-                } else {
-                    false
                 }
             } else {
                 false
@@ -887,7 +920,12 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         }
 
         // Read file bytes
-        let bytes = match std::fs::read(file_path) {
+        let remaining = crate::safe_fs::MAX_TREE_BYTES.saturating_sub(tree_bytes);
+        let bytes = match crate::safe_fs::read_open(
+            &mut file,
+            opts.max_member_bytes.min(remaining),
+            &mut tree_bytes,
+        ) {
             Ok(b) => b,
             Err(e) => {
                 sink.fixed(error_finding(display_path, format!("read error: {e}")));

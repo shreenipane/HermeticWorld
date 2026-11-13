@@ -1,11 +1,30 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::scan::{Finding, Severity, Visibility};
+
+const MAX_SYMLINK_HOPS: usize = 40;
+const MAX_D8_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_LOG_FILES: usize = 500;
+const MAX_CERT_FILES: usize = 2000;
+const MAX_CERTS_PER_FILE: usize = 500;
+
+fn cap_finding(path: &Path, visibility: Visibility, cap: &str) -> Finding {
+    Finding {
+        detector: "D8".into(),
+        channel: "d8_error".into(),
+        path: path.display().to_string(),
+        visibility,
+        severity: Severity::Info,
+        confidence: 0.0,
+        hunk: None,
+        evidence: vec![format!("inspection incomplete: {cap} cap exceeded")],
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Built-in tables: Distro releases
@@ -280,22 +299,24 @@ fn truncate_200(s: &str) -> String {
 }
 
 pub fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
-    let mut file = File::open(path)?;
+    let max_bytes = max_bytes.min(MAX_D8_FILE_BYTES);
+    let mut file = crate::safe_fs::open_regular(path)?;
     let mut buf = Vec::new();
     (&mut file).take(max_bytes).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
 pub fn read_log_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
-    let mut file = File::open(path)?;
+    let max_bytes = max_bytes.min(MAX_LOG_BYTES);
+    let mut file = crate::safe_fs::open_regular(path)?;
     let file_len = file.metadata()?.len();
     if file_len <= max_bytes {
-        let mut buf = Vec::with_capacity(file_len as usize);
+        let mut buf = Vec::new();
         (&mut file).take(max_bytes).read_to_end(&mut buf)?;
         Ok(buf)
     } else {
         file.seek(SeekFrom::Start(file_len - max_bytes))?;
-        let mut buf = Vec::with_capacity(max_bytes as usize);
+        let mut buf = Vec::new();
         (&mut file).take(max_bytes).read_to_end(&mut buf)?;
         if let Some(first_nl) = buf.iter().position(|&b| b == b'\n') {
             Ok(buf[first_nl + 1..].to_vec())
@@ -313,6 +334,12 @@ enum PathStep {
 }
 
 pub fn resolve_in_root(root: &Path, rel: &Path) -> Option<PathBuf> {
+    if root.as_os_str().as_encoded_bytes().len() > crate::safe_fs::MAX_PATH_BYTES
+        || rel.as_os_str().as_encoded_bytes().len() > crate::safe_fs::MAX_PATH_BYTES
+        || rel.components().count() > crate::safe_fs::MAX_PATH_COMPONENTS
+    {
+        return None;
+    }
     let mut hops = 0usize;
 
     let mut resolved: Vec<OsString> = Vec::new();
@@ -343,14 +370,14 @@ pub fn resolve_in_root(root: &Path, rel: &Path) -> Option<PathBuf> {
                 }
                 candidate.push(&name);
 
-                match std::fs::symlink_metadata(&candidate) {
+                match crate::safe_fs::metadata(&candidate) {
                     Ok(meta) => {
                         if meta.file_type().is_symlink() {
                             hops += 1;
-                            if hops > 40 {
+                            if hops > MAX_SYMLINK_HOPS {
                                 return None;
                             }
-                            let target = match std::fs::read_link(&candidate) {
+                            let target = match crate::safe_fs::read_link(&candidate) {
                                 Ok(t) => t,
                                 Err(_) => return None,
                             };
@@ -1001,7 +1028,7 @@ fn check_ca_bundle(
     ] {
         match resolve_in_root(root, Path::new(bundle_rel)) {
             Some(resolved) => {
-                if resolved.is_file() && !cert_files.contains(&resolved) {
+                if crate::safe_fs::is_file(&resolved) && !cert_files.contains(&resolved) {
                     cert_files.push(resolved);
                 }
             }
@@ -1021,12 +1048,12 @@ fn check_ca_bundle(
     }
 
     if let Some(cert_dir) = resolve_in_root(root, Path::new("etc/ssl/certs")) {
-        if cert_dir.is_dir() {
-            match std::fs::read_dir(&cert_dir) {
+        if crate::safe_fs::is_dir(&cert_dir) {
+            match crate::safe_fs::read_dir(&cert_dir) {
                 Ok(entries) => {
                     let mut dir_files = Vec::new();
-                    for entry in entries.flatten() {
-                        let path = entry.path();
+                    for entry in entries {
+                        let path = entry;
                         let rel_entry = match path.strip_prefix(root) {
                             Ok(p) => p,
                             Err(_) => continue,
@@ -1051,12 +1078,15 @@ fn check_ca_bundle(
                             || resolved
                                 .extension()
                                 .is_some_and(|e| e == "pem" || e == "crt");
-                        if resolved.is_file() && ext_match {
+                        if crate::safe_fs::is_file(&resolved) && ext_match {
                             dir_files.push(resolved);
                         }
                     }
                     dir_files.sort();
-                    for path in dir_files.into_iter().take(2000) {
+                    if dir_files.len() > MAX_CERT_FILES {
+                        findings.push(cap_finding(&cert_dir, visibility, "certificate files"));
+                    }
+                    for path in dir_files.into_iter().take(MAX_CERT_FILES) {
                         if !cert_files.contains(&path) {
                             cert_files.push(path);
                         }
@@ -1117,7 +1147,7 @@ fn check_ca_bundle(
         let mut offset = 0;
         let mut block_idx = 0usize;
 
-        while offset < bytes.len() && block_idx < 500 {
+        while offset < bytes.len() && block_idx < MAX_CERTS_PER_FILE {
             let rem = &bytes[offset..];
             let begin_pos = match rem
                 .windows(begin_marker.len())
@@ -1176,6 +1206,13 @@ fn check_ca_bundle(
                     }
                 }
             }
+        }
+        if block_idx == MAX_CERTS_PER_FILE
+            && bytes
+                .get(offset..)
+                .is_some_and(|rest| rest.windows(begin_marker.len()).any(|w| w == begin_marker))
+        {
+            findings.push(cap_finding(&file_path, visibility, "certificates per file"));
         }
     }
 }
@@ -1254,11 +1291,11 @@ fn check_kernel(
                 continue;
             }
         };
-        if m_dir.is_dir() {
-            match std::fs::read_dir(&m_dir) {
+        if crate::safe_fs::is_dir(&m_dir) {
+            match crate::safe_fs::read_dir(&m_dir) {
                 Ok(entries) => {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
+                    for entry in entries {
+                        let path = entry;
                         let rel_entry = match path.strip_prefix(root) {
                             Ok(p) => p,
                             Err(_) => continue,
@@ -1279,7 +1316,7 @@ fn check_kernel(
                                 continue;
                             }
                         };
-                        if resolved.is_dir() {
+                        if crate::safe_fs::is_dir(&resolved) {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 if let Some((maj, min)) = parse_kernel_version(name) {
                                     if let Some(rel_dt) = lookup_kernel_date(maj, min) {
@@ -1357,11 +1394,11 @@ fn check_kernel(
             return;
         }
     };
-    if boot_dir.is_dir() {
-        match std::fs::read_dir(&boot_dir) {
+    if crate::safe_fs::is_dir(&boot_dir) {
+        match crate::safe_fs::read_dir(&boot_dir) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
+                for entry in entries {
+                    let path = entry;
                     let rel_entry = match path.strip_prefix(root) {
                         Ok(p) => p,
                         Err(_) => continue,
@@ -1382,7 +1419,7 @@ fn check_kernel(
                             continue;
                         }
                     };
-                    if resolved.is_file() {
+                    if crate::safe_fs::is_file(&resolved) {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if fname.starts_with("config-") {
                                 match read_file_capped(&resolved, 4 * 1024 * 1024) {
@@ -1849,22 +1886,23 @@ fn check_dated_logs(
             return;
         }
     };
-    if !log_dir.is_dir() {
+    if !crate::safe_fs::is_dir(&log_dir) {
         return;
     }
 
     let mut log_files: Vec<PathBuf> = Vec::new();
 
-    match std::fs::read_dir(&log_dir) {
+    match crate::safe_fs::read_dir(&log_dir) {
         Ok(entries) => {
             let mut top_entries = Vec::new();
-            for entry in entries.flatten() {
-                top_entries.push(entry.path());
+            for entry in entries {
+                top_entries.push(entry);
             }
             top_entries.sort();
 
             for path in top_entries {
-                if log_files.len() >= 500 {
+                if log_files.len() >= MAX_LOG_FILES {
+                    findings.push(cap_finding(&log_dir, visibility, "log files"));
                     break;
                 }
                 let rel_entry = match path.strip_prefix(root) {
@@ -1887,17 +1925,18 @@ fn check_dated_logs(
                         continue;
                     }
                 };
-                if resolved.is_file() {
+                if crate::safe_fs::is_file(&resolved) {
                     log_files.push(resolved);
-                } else if resolved.is_dir() {
-                    if let Ok(sub_entries) = std::fs::read_dir(&resolved) {
+                } else if crate::safe_fs::is_dir(&resolved) {
+                    if let Ok(sub_entries) = crate::safe_fs::read_dir(&resolved) {
                         let mut sub_list = Vec::new();
-                        for sub_entry in sub_entries.flatten() {
-                            sub_list.push(sub_entry.path());
+                        for sub_entry in sub_entries {
+                            sub_list.push(sub_entry);
                         }
                         sub_list.sort();
                         for sub_path in sub_list {
-                            if log_files.len() >= 500 {
+                            if log_files.len() >= MAX_LOG_FILES {
+                                findings.push(cap_finding(&log_dir, visibility, "log files"));
                                 break;
                             }
                             let rel_sub = match sub_path.strip_prefix(root) {
@@ -1920,7 +1959,7 @@ fn check_dated_logs(
                                     continue;
                                 }
                             };
-                            if sub_resolved.is_file() {
+                            if crate::safe_fs::is_file(&sub_resolved) {
                                 log_files.push(sub_resolved);
                             }
                         }
@@ -2061,11 +2100,11 @@ fn check_python_build(
                 continue;
             }
         };
-        if py_dir.is_dir() {
-            match std::fs::read_dir(&py_dir) {
+        if crate::safe_fs::is_dir(&py_dir) {
+            match crate::safe_fs::read_dir(&py_dir) {
                 Ok(entries) => {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
+                    for entry in entries {
+                        let path = entry;
                         let rel_entry = match path.strip_prefix(root) {
                             Ok(p) => p,
                             Err(_) => continue,
@@ -2086,7 +2125,7 @@ fn check_python_build(
                                 continue;
                             }
                         };
-                        if resolved.is_dir() {
+                        if crate::safe_fs::is_dir(&resolved) {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 if name.starts_with("python3") {
                                     if let Some((maj, min)) = parse_python_version(name) {
@@ -2163,5 +2202,16 @@ pub fn check_d8(root: &Path, t_clock: OffsetDateTime, visibility: Visibility) ->
     check_kernel(root, t_clock, visibility, &mut findings);
     check_dated_logs(root, t_clock, visibility, &mut findings);
     check_python_build(root, t_clock, visibility, &mut findings);
+    for finding in &mut findings {
+        if let Ok(relative) = Path::new(&finding.path).strip_prefix(root) {
+            finding.path = relative.to_string_lossy().into_owned();
+        }
+    }
+    findings.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.channel.cmp(&b.channel))
+            .then(a.evidence.cmp(&b.evidence))
+    });
     findings
 }

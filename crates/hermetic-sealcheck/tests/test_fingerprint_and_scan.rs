@@ -275,7 +275,7 @@ fn test_unreadable_file_is_reported_not_skipped() {
 
 #[cfg(unix)]
 #[test]
-fn test_symlink_to_outside_leak_is_scanned() {
+fn test_symlink_to_outside_leak_is_refused() {
     let base_dir = tempdir().expect("tempdir");
     let base_tree = base_dir.path();
     fs::write(
@@ -300,10 +300,10 @@ fn test_symlink_to_outside_leak_is_scanned() {
     assert!(
         findings
             .iter()
-            .any(|f| f.severity == Severity::Gate && f.path.ends_with("innocent.txt")),
-        "link to a leaked file must gate: {findings:?}"
+            .all(|f| f.detector != "D2" || f.channel == "scan_error"),
+        "external payload must never be read: {findings:?}"
     );
-    for name in ["dirlink", "broken"] {
+    for name in ["innocent.txt", "dirlink", "broken"] {
         assert!(
             findings
                 .iter()

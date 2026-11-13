@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import stat
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 MAX_PATH_BYTES = 4096
 MAX_PATH_COMPONENTS = 256
@@ -90,6 +92,37 @@ def open_regular(path: str | os.PathLike[str], max_bytes: int) -> int:
         if pinned is not None:
             os.close(pinned)
         os.close(directory)
+
+
+@contextmanager
+def scandir(path: str | os.PathLike[str]):
+    """List a pinned directory; never follow a supplied symlink component."""
+    directory, _ = open_parent(os.path.join(os.fspath(path), ".directory-probe"))
+    try:
+        with os.scandir(directory) as entries:
+            yield (_DirectoryEntry(entry.name, entry.stat(follow_symlinks=False)) for entry in entries)
+    finally:
+        os.close(directory)
+
+
+@dataclass(frozen=True)
+class _DirectoryEntry:
+    """Metadata captured while its parent descriptor is still alive."""
+
+    name: str
+    metadata: os.stat_result
+
+    @property
+    def path(self) -> str:
+        return self.name
+
+    def stat(self, *, follow_symlinks: bool = False) -> os.stat_result:
+        if follow_symlinks:
+            raise UnsafePathError("Symlink following is unavailable")
+        return self.metadata
+
+    def is_symlink(self) -> bool:
+        return stat.S_ISLNK(self.metadata.st_mode)
 
 
 def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:

@@ -47,6 +47,8 @@ pub struct Patch {
 pub enum DiffParseError {
     #[error("Invalid hunk header: {0}")]
     InvalidHunkHeader(String),
+    #[error("Invalid quoted diff path")]
+    InvalidPath,
 }
 
 fn parse_range(s: &str) -> Option<HunkRange> {
@@ -116,18 +118,95 @@ fn strip_git_prefix(path: &str) -> &str {
     }
 }
 
-fn parse_file_path(line: &str, prefix: &str) -> Option<String> {
+fn decode_path(path: &str) -> Result<String, DiffParseError> {
+    if !path.starts_with('"') {
+        return Ok(path.to_string());
+    }
+    let quoted = path
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or(DiffParseError::InvalidPath)?;
+    let mut output = Vec::new();
+    let mut bytes = quoted.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            output.push(byte);
+            continue;
+        }
+        let escaped = bytes.next().ok_or(DiffParseError::InvalidPath)?;
+        let value = match escaped {
+            b'\\' | b'"' => escaped,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b'a' => 7,
+            b'b' => 8,
+            b'v' => 11,
+            b'f' => 12,
+            b'0'..=b'3' => {
+                let b = bytes
+                    .next()
+                    .filter(|v| (b'0'..=b'7').contains(v))
+                    .ok_or(DiffParseError::InvalidPath)?;
+                let c = bytes
+                    .next()
+                    .filter(|v| (b'0'..=b'7').contains(v))
+                    .ok_or(DiffParseError::InvalidPath)?;
+                (escaped - b'0') * 64 + (b - b'0') * 8 + (c - b'0')
+            }
+            _ => return Err(DiffParseError::InvalidPath),
+        };
+        output.push(value);
+    }
+    String::from_utf8(output).map_err(|_| DiffParseError::InvalidPath)
+}
+
+fn git_paths(header: &str) -> Result<Vec<String>, DiffParseError> {
+    let mut paths = Vec::new();
+    let mut start = None;
+    let mut quoted = false;
+    let mut escape = false;
+    for (index, c) in header.char_indices() {
+        if start.is_none() && c.is_whitespace() {
+            continue;
+        }
+        if start.is_none() {
+            start = Some(index);
+        }
+        if escape {
+            escape = false;
+        } else if c == '\\' && quoted {
+            escape = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            if let Some(begin) = start.take() {
+                paths.push(decode_path(&header[begin..index])?);
+            }
+        }
+    }
+    if quoted || escape {
+        return Err(DiffParseError::InvalidPath);
+    }
+    if let Some(begin) = start {
+        paths.push(decode_path(&header[begin..])?);
+    }
+    Ok(paths)
+}
+
+fn parse_file_path(line: &str, prefix: &str) -> Result<Option<String>, DiffParseError> {
     if let Some(path_part) = line.strip_prefix(prefix) {
         let p = path_part.trim();
         if p == "/dev/null" {
-            None
+            Ok(None)
         } else {
             // Strip timestamp if present (unified diff separator is often tab)
             let path_only = p.split('\t').next().unwrap_or(p);
-            Some(strip_git_prefix(path_only).to_string())
+            let decoded = decode_path(path_only)?;
+            Ok(Some(strip_git_prefix(&decoded).to_string()))
         }
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -190,10 +269,10 @@ pub fn parse_patch(diff_text: &str) -> Result<Patch, DiffParseError> {
             }
 
             // Extract default paths from `diff --git a/path b/path`
-            let parts: Vec<&str> = git_header.split_whitespace().collect();
+            let parts = git_paths(git_header)?;
             let (old_p, new_p) = if parts.len() >= 2 {
-                let op = strip_git_prefix(parts[0]).to_string();
-                let np = strip_git_prefix(parts[1]).to_string();
+                let op = strip_git_prefix(&parts[0]).to_string();
+                let np = strip_git_prefix(&parts[1]).to_string();
                 (Some(op), Some(np))
             } else {
                 (None, None)
@@ -208,9 +287,48 @@ pub fn parse_patch(diff_text: &str) -> Result<Patch, DiffParseError> {
             continue;
         }
 
+        if let Some(file) = current_file.as_mut() {
+            if let Some(path) = line
+                .strip_prefix("rename from ")
+                .or_else(|| line.strip_prefix("copy from "))
+            {
+                file.old_path = Some(decode_path(path)?);
+                idx += 1;
+                continue;
+            }
+            if let Some(path) = line
+                .strip_prefix("rename to ")
+                .or_else(|| line.strip_prefix("copy to "))
+            {
+                file.new_path = Some(decode_path(path)?);
+                idx += 1;
+                continue;
+            }
+            if line.starts_with("new file mode ") {
+                file.old_path = None;
+            }
+            if line.starts_with("deleted file mode ") {
+                file.new_path = None;
+            }
+        }
         if line.starts_with("--- ") {
+            // Standard unified diffs need no `diff --git` preamble. A new old
+            // header after a completed hunk starts the next file.
+            if let Some(hunk) = current_hunk.take() {
+                if let Some(mut file) = current_file.take() {
+                    file.hunks.push(hunk);
+                    files.push(file);
+                }
+            }
+            if current_file.is_none() {
+                current_file = Some(FilePatch {
+                    old_path: None,
+                    new_path: None,
+                    hunks: Vec::new(),
+                });
+            }
             if let Some(ref mut file) = current_file {
-                file.old_path = parse_file_path(line, "--- ");
+                file.old_path = parse_file_path(line, "--- ")?;
             }
             idx += 1;
             continue;
@@ -218,7 +336,7 @@ pub fn parse_patch(diff_text: &str) -> Result<Patch, DiffParseError> {
 
         if line.starts_with("+++ ") {
             if let Some(ref mut file) = current_file {
-                file.new_path = parse_file_path(line, "+++ ");
+                file.new_path = parse_file_path(line, "+++ ")?;
             }
             idx += 1;
             continue;

@@ -501,9 +501,6 @@ fn test_d12_directory_scan_skips_symlinks() {
     );
     assert_eq!(symlink_findings[0]["detector"], "D12");
     assert_eq!(symlink_findings[0]["severity"], "info");
-    assert_eq!(
-        symlink_findings[0]["path"],
-        symlink_file.display().to_string()
-    );
+    assert_eq!(symlink_findings[0]["path"], "link_to_real.txt");
     assert_eq!(symlink_findings[0]["evidence"][0], "symlink not followed");
 }

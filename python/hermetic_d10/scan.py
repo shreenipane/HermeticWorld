@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
-import sys
 
 import hermetic_safe_io
 from hermetic_d10.carriers import (
@@ -93,10 +92,17 @@ def _normalize_t_clock(t_clock: datetime | str) -> datetime:
     return parse_rfc3339_utc(format_rfc3339_utc(t_clock))
 
 
+@dataclass
+class _ReadCounter:
+    bytes_read: int = 0
+
+
 def _read_regular_file_bounded(
     file_path: Path,
     caps: ScanCaps,
     remaining_total_bytes: int,
+    *,
+    counter: _ReadCounter | None = None,
 ) -> bytes:
     """Open a regular file without following symlinks or blocking, and read within caps.
 
@@ -119,7 +125,7 @@ def _read_regular_file_bounded(
         )
 
     try:
-        fd = hermetic_safe_io.open_regular(file_path, sys.maxsize)
+        fd = hermetic_safe_io.open_regular(file_path, effective_cap)
     except (OSError, ValueError) as exc:
         raise UnsafeFileError(
             f"Refusing file that could not be opened safely: {type(exc).__name__}"
@@ -143,6 +149,8 @@ def _read_regular_file_bounded(
                     raise UnsafeFileError(f"Read failed: {_os_reason(exc)}") from exc
                 if not chunk:
                     break
+                if counter is not None:
+                    counter.bytes_read += len(chunk)
                 buf.extend(chunk)
                 if len(buf) > effective_cap:
                     raise CapExceededError(
@@ -237,6 +245,11 @@ def scan_tree(
     root_path = Path(root)
 
     try:
+        hermetic_safe_io.validate_path(os.path.join(os.fspath(root_path), ".directory-probe"))
+    except ValueError as exc:
+        raise UnsafeFileError("Invalid root directory path") from exc
+
+    try:
         root_st = os.lstat(root_path)
     except OSError as exc:
         raise UnsafeFileError(f"Root path cannot be accessed: {_os_reason(exc)}") from exc
@@ -273,7 +286,7 @@ def scan_tree(
         listed: list[os.DirEntry[str]] = []
         dir_overflow = False
         try:
-            with os.scandir(cur_dir) as it:
+            with hermetic_safe_io.scandir(cur_dir) as it:
                 for listed_entry in it:
                     if len(listed) >= active_caps.max_dir_entries:
                         dir_overflow = True
@@ -346,7 +359,7 @@ def scan_tree(
                 continue
 
             if stat.S_ISDIR(mode):
-                subdirs_to_push.append((Path(entry.path), entry_rel, dir_depth + 1))
+                subdirs_to_push.append((cur_dir / entry.name, entry_rel, dir_depth + 1))
                 continue
 
             if not stat.S_ISREG(mode):
@@ -389,13 +402,14 @@ def scan_tree(
                 cap_halted = True
                 break
 
+            counter = _ReadCounter()
             try:
                 raw = _read_regular_file_bounded(
-                    Path(entry.path),
+                    cur_dir / entry.name,
                     active_caps,
                     remaining_total,
+                    counter=counter,
                 )
-                bytes_read += len(raw)
                 file_findings = _inspect_guarded(
                     entry_rel, entry.name, raw, clock_dt, active_caps
                 )
@@ -420,6 +434,9 @@ def scan_tree(
                         detail=str(exc),
                     )
                 )
+            finally:
+                # Failed/growing-file reads consume the tree budget as well.
+                bytes_read += counter.bytes_read
 
         # Reverse so lowest alphabetical directory is popped first
         for sub in reversed(subdirs_to_push):
