@@ -8,8 +8,9 @@ from enum import Enum
 import json
 import os
 import re
-import stat
 from typing import Any
+
+from hermetic_safe_io import open_regular
 
 DEFAULT_HOSTS_CAP_BYTES = 1 * 1024 * 1024
 MAX_HOSTS = 4096
@@ -20,6 +21,9 @@ MAX_JSON_DEPTH = 16
 MAX_JSON_TOKENS = 50_000
 MAX_OBJECT_KEYS = 100
 READ_CHUNK_BYTES = 65_536
+# open_regular's own size cap; the caller-supplied cap is checked separately for a typed error.
+MAX_OPEN_SIZE_BYTES = 1 << 40
+MAX_CLI_INT_DIGITS = 20
 
 SECONDS_PER_DAY = 86_400
 DAYS_BEFORE = 7
@@ -35,6 +39,9 @@ ALLOWED_METHODS = frozenset({"GET", "HEAD"})
 _DNS_LABEL_LOWER_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", flags=re.ASCII)
 _DNS_LABEL_ANYCASE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$", flags=re.ASCII)
 _ALL_DIGITS_RE = re.compile(r"^[0-9]+$", flags=re.ASCII)
+_CLI_INT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$", flags=re.ASCII)
+# One component of a legacy inet_aton IPv4 literal: decimal, octal or 0x-hex.
+_INET_ATON_PART_RE = re.compile(r"^(?:0[xX][0-9A-Fa-f]*|[0-9]+)$", flags=re.ASCII)
 
 
 class HermeticTlsPolicyError(Exception):
@@ -203,18 +210,18 @@ def _strict_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    """Read a pinned regular file; symlinks, FIFOs and devices are refused without blocking."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise ValidationError("max_bytes must be a non-negative integer")
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, or OS error)") from exc
+        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
     try:
         try:
             st = os.fstat(fd)
         except OSError as exc:
             raise FileSafetyError("Unable to stat file descriptor") from exc
-        if not stat.S_ISREG(st.st_mode):
-            raise FileSafetyError("Refusing non-regular file")
         if st.st_size > max_bytes:
             raise CapExceededError("File size exceeds byte cap")
         chunks: list[bytes] = []
@@ -239,6 +246,16 @@ def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> b
         os.close(fd)
 
 
+def _is_ip_literal(name: str) -> bool:
+    """True for IPv4 literals, including legacy inet_aton forms such as "1.2.3.0x4" or "0x7f.1"."""
+    labels = name.split(".")
+    if _ALL_DIGITS_RE.fullmatch(labels[-1]) is not None:
+        return True
+    if _INET_ATON_PART_RE.fullmatch(labels[-1]) is not None and len(labels) <= 4:
+        return all(_INET_ATON_PART_RE.fullmatch(label) is not None for label in labels)
+    return False
+
+
 def _validate_strict_lowercase_dns_name(name: Any) -> str:
     """Validate a strict lower-case DNS name for the host allow-table."""
     if not isinstance(name, str):
@@ -255,7 +272,7 @@ def _validate_strict_lowercase_dns_name(name: Any) -> str:
             raise ValidationError("DNS label length out of bounds (1..63)")
         if _DNS_LABEL_LOWER_RE.fullmatch(label) is None:
             raise ValidationError("DNS label must be lower-case [a-z0-9-] with no leading/trailing hyphen")
-    if _ALL_DIGITS_RE.fullmatch(labels[-1]) is not None:
+    if _is_ip_literal(name):
         raise ValidationError("IP literals and all-numeric TLDs are not allowed")
     return name
 
@@ -331,64 +348,42 @@ def _normalise_wire_dns_name(raw_name: str, allowed_port_suffix: int | None) -> 
             return None
         if _DNS_LABEL_ANYCASE_RE.fullmatch(label) is None:
             return None
-    if _ALL_DIGITS_RE.fullmatch(labels[-1]) is not None:
+    if _is_ip_literal(host_part):
         return None
     return host_part.lower()
 
 
 def decide(
-    host_table: HostTable | str | None = None,
-    sni: str | None = None,
-    host_header: str | int | None = None,
-    port: int | bool = 0,
-    is_tls: bool = False,
-    has_ech: bool = False,
-    *,
-    table: HostTable | None = None,
+    host_table: HostTable,
+    sni: str | None,
+    host_header: str | None,
+    port: int,
+    is_tls: bool,
+    has_ech: bool,
 ) -> Decision:
-    """Decide whether to intercept or reset a connection given TLS/HTTP metadata."""
-    if isinstance(host_table, HostTable):
-        actual_table = host_table
-        actual_sni = sni
-        actual_host = (
-            host_header
-            if isinstance(host_header, (str, type(None)))
-            else None
-        )
-        actual_port = (
-            port
-            if isinstance(port, int) and not isinstance(port, bool)
-            else port
-        )
-        actual_tls = is_tls
-        actual_ech = has_ech
-    else:
-        actual_table = table if table is not None else (host_table if isinstance(host_table, HostTable) else None)
-        if isinstance(host_table, (str, type(None))) and isinstance(port, bool):
-            # Positional call: decide(sni, host_header, port, is_tls, has_ech)
-            actual_sni = host_table
-            actual_host = sni if isinstance(sni, (str, type(None))) else None
-            actual_port = host_header if isinstance(host_header, (int, bool)) else 0
-            actual_tls = port
-            actual_ech = is_tls
-        else:
-            actual_sni = sni
-            actual_host = host_header if isinstance(host_header, (str, type(None))) else None
-            actual_port = port
-            actual_tls = is_tls
-            actual_ech = has_ech
+    """Decide whether to intercept or reset a connection given TLS/HTTP metadata.
 
-    if not isinstance(actual_table, HostTable):
+    The rule-3 signature decide(sni, host_header, port, is_tls, has_ech) is preceded by the
+    validated host table. Any value of the wrong type is a reset with MALFORMED_INPUT; it is
+    never coerced to a missing value.
+    """
+    if not isinstance(host_table, HostTable):
         raise ValidationError("host_table must be a HostTable instance")
 
-    if isinstance(actual_port, bool) or not isinstance(actual_port, int):
+    if isinstance(port, bool) or not isinstance(port, int):
         return Decision(DecisionAction.RESET.value, ResetReason.MALFORMED_INPUT)
-    if not isinstance(actual_tls, bool) or not isinstance(actual_ech, bool):
+    if not isinstance(is_tls, bool) or not isinstance(has_ech, bool):
         return Decision(DecisionAction.RESET.value, ResetReason.MALFORMED_INPUT)
-    if actual_sni is not None and not isinstance(actual_sni, str):
+    if sni is not None and not isinstance(sni, str):
         return Decision(DecisionAction.RESET.value, ResetReason.MALFORMED_INPUT)
-    if actual_host is not None and not isinstance(actual_host, str):
+    if host_header is not None and not isinstance(host_header, str):
         return Decision(DecisionAction.RESET.value, ResetReason.MALFORMED_INPUT)
+    actual_table = host_table
+    actual_sni = sni
+    actual_host = host_header
+    actual_port = port
+    actual_tls = is_tls
+    actual_ech = has_ech
 
     if actual_port not in ALLOWED_PORTS:
         return Decision(DecisionAction.RESET.value, ResetReason.UNSUPPORTED_PORT)
@@ -454,14 +449,7 @@ def decide_from_file(
     max_bytes: int = DEFAULT_HOSTS_CAP_BYTES,
 ) -> Decision:
     table = load_host_table_file(hosts_path, max_bytes=max_bytes)
-    return decide(
-        host_table=table,
-        sni=sni,
-        host_header=host_header,
-        port=port,
-        is_tls=is_tls,
-        has_ech=has_ech,
-    )
+    return decide(table, sni, host_header, port, is_tls, has_ech)
 
 
 def method_policy(method: str) -> int:
@@ -469,3 +457,12 @@ def method_policy(method: str) -> int:
     if isinstance(method, str) and method in ALLOWED_METHODS:
         return 200
     return 405
+
+
+def parse_cli_int(text: str) -> int:
+    """Parse a CLI integer strictly: optional '-', ASCII digits only, bounded length."""
+    if not isinstance(text, str) or _CLI_INT_RE.fullmatch(text) is None:
+        raise ValidationError("Integer argument must be ASCII decimal digits")
+    if len(text) > MAX_CLI_INT_DIGITS:
+        raise CapExceededError("Integer argument too long")
+    return int(text)

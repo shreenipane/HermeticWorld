@@ -18,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="hermetic_conda_cut",
         description="Filter conda repodata.json at world cutoff timestamp.",
         add_help=False,
+        allow_abbrev=False,
     )
     parser.add_argument("--repodata", required=True)
     parser.add_argument("--cutoff", required=True)

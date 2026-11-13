@@ -6,10 +6,10 @@ from dataclasses import dataclass
 import ipaddress
 import json
 import os
-import posixpath
 import re
-import stat
 from typing import Any
+
+from hermetic_safe_io import open_regular
 
 DEFAULT_CONFIG_CAP_BYTES = 4 * 1024 * 1024
 DEFAULT_PASSWD_CAP_BYTES = 1 * 1024 * 1024
@@ -33,6 +33,20 @@ MAX_VCPUS = 256
 MAX_MEMORY_MIB = 1_048_576
 MAX_DISK_MIB = 10_485_760
 READ_CHUNK_BYTES = 65_536
+# open_regular's own size cap; the caller-supplied cap is checked separately for a typed error.
+MAX_OPEN_SIZE_BYTES = 1 << 40
+MAX_USER_SPEC_LEN = 256
+# Linux HOST_NAME_MAX: sethostname() in PID 1 refuses anything longer.
+MAX_HOSTNAME_LEN = 64
+
+# Keys of the OCI image config "config" object (OCI image-spec plus the Docker fields found in
+# real images). Any other key is refused rather than silently ignored.
+_OCI_CONFIG_ALLOWED_KEYS = frozenset({
+    "User", "ExposedPorts", "Env", "Entrypoint", "Cmd", "Volumes", "WorkingDir", "Labels",
+    "StopSignal", "ArgsEscaped", "Memory", "MemorySwap", "CpuShares", "Healthcheck",
+    "Hostname", "Domainname", "AttachStdin", "AttachStdout", "AttachStderr", "Tty",
+    "OpenStdin", "StdinOnce", "Image", "OnBuild", "Shell", "StopTimeout",
+})
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$", flags=re.ASCII)
 _POSIX_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\$?$", flags=re.ASCII)
@@ -161,18 +175,18 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
 
 
 def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    """Read a pinned regular file; symlinks, FIFOs and devices are refused without blocking."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise ValidationError("max_bytes must be a non-negative integer")
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, or OS error)") from exc
+        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
     try:
         try:
             st = os.fstat(fd)
         except OSError as exc:
             raise FileSafetyError("Unable to stat file descriptor") from exc
-        if not stat.S_ISREG(st.st_mode):
-            raise FileSafetyError("Refusing non-regular file")
         if st.st_size > max_bytes:
             raise CapExceededError("File size exceeds byte cap")
         chunks: list[bytes] = []
@@ -195,6 +209,15 @@ def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> b
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def _require_utf8(value: str, what: str) -> str:
+    """Refuse strings that cannot be encoded as UTF-8 (lone surrogates from JSON escapes)."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValidationError(f"{what} must be valid Unicode text") from exc
+    return value
 
 
 def _parse_uint_id(text: str) -> int | None:
@@ -222,7 +245,9 @@ def parse_passwd_bytes(
     except UnicodeDecodeError as exc:
         raise ValidationError("passwd contents must be valid UTF-8") from exc
 
-    lines = text.splitlines()
+    # Split on "\n" only: str.splitlines() would also split on \v, \f, \x1c-\x1e, \x85 and
+    # U+2028/U+2029, letting a field smuggle in an extra entry. A trailing "\r" is not stripped.
+    lines = text.split("\n")
     if len(lines) > MAX_PASSWD_GROUP_LINES:
         raise CapExceededError("passwd line count exceeds MAX_PASSWD_GROUP_LINES")
 
@@ -273,7 +298,7 @@ def parse_group_bytes(
     except UnicodeDecodeError as exc:
         raise ValidationError("group contents must be valid UTF-8") from exc
 
-    lines = text.splitlines()
+    lines = text.split("\n")
     if len(lines) > MAX_PASSWD_GROUP_LINES:
         raise CapExceededError("group line count exceeds MAX_PASSWD_GROUP_LINES")
 
@@ -328,7 +353,7 @@ def _resolve_user_and_groups(
 ) -> tuple[int, int, list[int]]:
     if not isinstance(user_spec, str) or "\x00" in user_spec:
         raise UserResolutionError("Invalid user specification")
-    if len(user_spec) > 256:
+    if len(user_spec) > MAX_USER_SPEC_LEN:
         raise UserResolutionError("User specification exceeds maximum length")
 
     if user_spec == "":
@@ -399,9 +424,9 @@ def _normalise_and_validate_cwd(raw_cwd: str | None) -> str:
     segments = raw_cwd.split("/")
     if ".." in segments:
         raise ValidationError("Working directory must not contain '..' traversal components")
-    normalised = posixpath.normpath(raw_cwd)
-    if not normalised.startswith("/"):
-        raise ValidationError("Normalised working directory is not absolute")
+    _require_utf8(raw_cwd, "Working directory")
+    # posixpath.normpath keeps a leading "//"; rebuild from segments so the result is canonical.
+    normalised = "/" + "/".join(seg for seg in segments if seg not in ("", "."))
     return normalised
 
 
@@ -422,6 +447,7 @@ def _parse_env_list(raw_env: Any) -> list[list[str]]:
             raise ValidationError("config.Env entries must not contain NUL bytes")
         if "=" not in item:
             raise ValidationError("Each config.Env entry must be formatted as NAME=value")
+        _require_utf8(item, "config.Env entry")
         name, value = item.split("=", 1)
         if _ENV_NAME_RE.fullmatch(name) is None:
             raise ValidationError(f"Invalid environment variable name: {name}")
@@ -455,6 +481,7 @@ def _validate_argv_list(raw_list: Any, field_name: str) -> list[str]:
             raise ValidationError(f"Every element in {field_name} must be a string")
         if "\x00" in item:
             raise ValidationError(f"Elements in {field_name} must not contain NUL bytes")
+        _require_utf8(item, field_name)
         out.append(item)
     return out
 
@@ -462,8 +489,8 @@ def _validate_argv_list(raw_list: Any, field_name: str) -> list[str]:
 def _validate_hostname(hostname: Any) -> str:
     if not isinstance(hostname, str):
         raise ValidationError("hostname must be a string")
-    if len(hostname) == 0 or len(hostname) > MAX_HOST_LEN:
-        raise ValidationError("hostname length out of bounds (1..253)")
+    if len(hostname) == 0 or len(hostname) > MAX_HOSTNAME_LEN:
+        raise ValidationError("hostname length out of bounds (1..64)")
     if not hostname.isascii() or "\x00" in hostname:
         raise ValidationError("hostname must be pure ASCII")
     if hostname.startswith(".") or hostname.endswith("."):
@@ -517,6 +544,8 @@ def derive_runspec(
         cfg = cfg_raw
     else:
         raise ValidationError("OCI image config 'config' field must be an object or null")
+    if set(cfg.keys()) - _OCI_CONFIG_ALLOWED_KEYS:
+        raise ValidationError("OCI image config 'config' contains unknown fields")
 
     if not isinstance(overrides_data, dict):
         raise ValidationError("overrides must be a JSON object")
@@ -526,6 +555,9 @@ def derive_runspec(
     missing_ov = _OVERRIDES_REQUIRED_KEYS - set(overrides_data.keys())
     if missing_ov:
         raise ValidationError("overrides is missing required fields")
+    for optional_key in ("cmd", "workdir", "user"):
+        if optional_key in overrides_data and overrides_data[optional_key] is None:
+            raise ValidationError(f"overrides.{optional_key} must not be null when present")
 
     vcpus = _validate_positive_int(overrides_data["vcpus"], "vcpus", 1, MAX_VCPUS)
     memory_mib = _validate_positive_int(overrides_data["memory_mib"], "memory_mib", 16, MAX_MEMORY_MIB)
@@ -540,12 +572,13 @@ def derive_runspec(
         user_spec = overrides_data["user"]
         if not isinstance(user_spec, str):
             raise ValidationError("overrides.user must be a string")
+        _require_utf8(user_spec, "overrides.user")
     else:
         raw_cfg_user = cfg.get("User")
         if raw_cfg_user is None:
             user_spec = ""
         elif isinstance(raw_cfg_user, str):
-            user_spec = raw_cfg_user
+            user_spec = _require_utf8(raw_cfg_user, "config.User")
         else:
             raise ValidationError("config.User must be a string or null")
 

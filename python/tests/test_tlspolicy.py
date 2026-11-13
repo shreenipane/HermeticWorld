@@ -217,3 +217,96 @@ def test_rule5_cli_and_file_safety(tmp_path: Path, capsys: pytest.CaptureFixture
     # Byte cap enforced
     with pytest.raises(CapExceededError):
         load_host_table_file(hosts_f, max_bytes=4)
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+import subprocess
+import sys
+
+from hermetic_tlspolicy.policy import DEFAULT_HOSTS_CAP_BYTES
+
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def test_named_caps_match_requirement() -> None:
+    """Rule 2: the host table caps are exactly 1 MiB and 4096 entries."""
+    assert DEFAULT_HOSTS_CAP_BYTES == 1024 * 1024
+    assert MAX_HOSTS == 4096
+    load_host_table({"hosts": [f"h{i}.example.com" for i in range(MAX_HOSTS)]})
+
+
+def test_fifo_host_table_refused_without_blocking(tmp_path: Path) -> None:
+    """A FIFO named as the host table is refused immediately instead of blocking on open."""
+    fifo = tmp_path / "hosts.fifo"
+    os.mkfifo(fifo)
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from hermetic_tlspolicy.__main__ import main; raise SystemExit(main(sys.argv[2:]))",
+         _PKG_ROOT, "decide", "--hosts", str(fifo), "--port", "443", "--sni", "pypi.org", "--tls"],
+        capture_output=True, timeout=30, check=False,
+    )
+    assert proc.returncode == 1
+    assert proc.stdout == b""
+    with pytest.raises(FileSafetyError):
+        load_host_table_file(fifo)
+
+
+def test_non_string_host_header_is_malformed_not_ignored() -> None:
+    """Rule 3: a malformed (non-string) Host header resets; it is never treated as absent."""
+    table = load_host_table({"hosts": ["pypi.org"]})
+    for bad_host in (123, b"pypi.org", ["pypi.org"], True):
+        res = decide(table, "pypi.org", bad_host, 443, True, False)  # type: ignore[arg-type]
+        assert res == "reset"
+        assert res.reason == ResetReason.MALFORMED_INPUT
+    res80 = decide(table, None, 80, 80, False, False)  # type: ignore[arg-type]
+    assert res80.reason == ResetReason.MALFORMED_INPUT
+    for bad_sni in (123, b"pypi.org"):
+        res = decide(table, bad_sni, None, 443, True, False)  # type: ignore[arg-type]
+        assert res.reason == ResetReason.MALFORMED_INPUT
+    with pytest.raises(ValidationError):
+        decide("pypi.org", None, 443, True, False, table)  # type: ignore[arg-type]
+
+
+def test_inet_aton_ip_literal_forms_refused() -> None:
+    """Rule 2: legacy IPv4 literal spellings are IP literals, not host names."""
+    for bad in ("1.2.3.0x4", "0x7f.1", "0x7f000001", "127.1", "0177.0.0.01"):
+        with pytest.raises(ValidationError):
+            load_host_table({"hosts": [bad]})
+    table = load_host_table({"hosts": ["pypi.org", "a1.example", "0x7f.example"]})
+    assert table.contains("0x7f.example")
+    assert decide(table, "0x7f.1", None, 443, True, False).reason == ResetReason.MALFORMED_SNI
+    assert decide(table, None, "0x7f.1", 80, False, False).reason == ResetReason.MALFORMED_HOST_HEADER
+
+
+def test_cli_integers_parsed_strictly(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Rule 5: --port and --t-clock accept plain ASCII decimal only."""
+    hosts_f = tmp_path / "hosts.json"
+    hosts_f.write_text(json.dumps({"hosts": ["pypi.org"]}), encoding="utf-8")
+    for port in ("4_43", " 443", "443 ", "+443", "0443", "\uff14\uff14\uff13", "0x1bb", ""):
+        rc = cli_main(["decide", "--hosts", str(hosts_f), "--port", port, "--sni", "pypi.org", "--tls"])
+        assert rc == 1, port
+        assert capsys.readouterr().out == ""
+    for t_clock in ("1_680_307_200", "1680307200.0", " 1680307200", "+1680307200"):
+        assert cli_main(["window", "--t-clock", t_clock]) == 1, t_clock
+        assert capsys.readouterr().out == ""
+    assert cli_main(["window", "--t-clock", "1680307200"]) == 0
+    capsys.readouterr()
+
+
+def test_cli_rejects_abbreviated_options(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Rule 5: only the exact option names are accepted."""
+    assert cli_main(["window", "--t-cl", "1680307200"]) == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_output_is_ascii_for_undecodable_argv(capsys: pytest.CaptureFixture[str]) -> None:
+    """Rule 5: undecodable argv bytes never crash output; the JSON is pure ASCII."""
+    rc = cli_main(["method", "--method", "G\udcffET"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.isascii()
+    assert json.loads(out)["status"] == 405

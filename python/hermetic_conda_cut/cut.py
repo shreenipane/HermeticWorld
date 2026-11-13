@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
-import stat
 from typing import Any
+
+from hermetic_safe_io import atomic_write, open_regular, validate_path
 
 DEFAULT_REPODATA_CAP_BYTES = 512 * 1024 * 1024
 MAX_PACKAGE_RECORDS = 1_000_000
@@ -18,8 +18,14 @@ MAX_JSON_DEPTH = 16
 MAX_JSON_TOKENS = 20_000_000
 MAX_OBJECT_KEYS = 1_000_000
 MAX_STRING_LEN = 4096
-MAX_TEMP_ATTEMPTS = 128
 READ_CHUNK_BYTES = 65_536
+# open_regular's own size cap; the caller-supplied cap is checked separately for a typed error.
+MAX_OPEN_SIZE_BYTES = 1 << 40
+MAX_REPODATA_VERSION = 1_000
+
+# Top-level repodata keys this cut understands. Any other key (for example a "signatures" map
+# keyed by filename) could carry data about records dropped at the cutoff, so it is refused.
+_REPODATA_ALLOWED_KEYS = frozenset({"info", "packages", "packages.conda", "removed", "repodata_version"})
 
 # Unix timestamps in seconds are below 10**11 until year 5138; conda timestamps must be in ms.
 MIN_CONDA_TIMESTAMP_MS = 10**11
@@ -175,18 +181,18 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
 
 
 def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    """Read a pinned regular file; symlinks, FIFOs and devices are refused without blocking."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise ValidationError("max_bytes must be a non-negative integer")
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, or OS error)") from exc
+        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
     try:
         try:
             st = os.fstat(fd)
         except OSError as exc:
             raise FileSafetyError("Unable to stat file descriptor") from exc
-        if not stat.S_ISREG(st.st_mode):
-            raise FileSafetyError("Refusing non-regular file")
         if st.st_size > max_bytes:
             raise CapExceededError("File size exceeds byte cap")
         chunks: list[bytes] = []
@@ -212,84 +218,13 @@ def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> b
 
 
 def write_file_atomic(target_path: str | os.PathLike[str], content: bytes) -> None:
-    target_str = os.fspath(target_path)
+    """Write via a pinned parent directory: temp file, fsync, rename, directory fsync."""
+    if not isinstance(content, bytes):
+        raise ValidationError("content must be bytes")
     try:
-        st = os.lstat(target_str)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise FileSafetyError("Refusing to overwrite symlink or non-regular destination")
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise FileSafetyError("Cannot inspect destination path") from exc
-
-    parent = os.path.dirname(target_str) or "."
-    base = os.path.basename(target_str)
-    if not base or base in (".", ".."):
-        raise FileSafetyError("Invalid destination filename")
-
-    pid = os.getpid()
-    open_flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    tmp_path: str | None = None
-    fd: int | None = None
-
-    for attempt in range(MAX_TEMP_ATTEMPTS):
-        candidate = os.path.join(parent, f".{base}.tmp.{pid}.{attempt}")
-        try:
-            fd = os.open(candidate, open_flags, 0o644)
-            tmp_path = candidate
-            break
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise FileSafetyError("Unable to create temporary file in destination directory") from exc
-
-    if fd is None or tmp_path is None:
-        raise FileSafetyError("Exhausted attempts creating temporary file")
-
-    try:
-        view = memoryview(content)
-        written = 0
-        total_len = len(content)
-        max_writes = (total_len // READ_CHUNK_BYTES) + 4
-        for _ in range(max_writes):
-            if written >= total_len:
-                break
-            try:
-                n = os.write(fd, view[written : written + READ_CHUNK_BYTES])
-            except OSError as exc:
-                raise FileSafetyError("Failed writing to temporary file") from exc
-            if n <= 0:
-                raise FileSafetyError("Short write to temporary file")
-            written += n
-        if written != total_len:
-            raise FileSafetyError("Incomplete write to temporary file")
-        try:
-            os.fsync(fd)
-        except OSError as exc:
-            raise FileSafetyError("Failed fsync on temporary file") from exc
-        os.close(fd)
-        fd = None
-        try:
-            os.replace(tmp_path, target_str)
-        except OSError as exc:
-            raise FileSafetyError("Atomic rename failed") from exc
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        atomic_write(target_path, content)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FileSafetyError("Unable to write destination file atomically") from exc
 
 
 def _validate_str(val: Any, field_name: str, max_len: int = MAX_STRING_LEN) -> str:
@@ -337,6 +272,13 @@ def cut_repodata(
     if "packages.conda" not in repodata or not isinstance(repodata["packages.conda"], dict):
         raise ValidationError("Repodata must include a 'packages.conda' JSON object")
 
+    if set(repodata.keys()) - _REPODATA_ALLOWED_KEYS:
+        raise ValidationError("Repodata contains unknown top-level fields")
+    if "repodata_version" in repodata:
+        version = repodata["repodata_version"]
+        if isinstance(version, bool) or not isinstance(version, int) or not 0 <= version <= MAX_REPODATA_VERSION:
+            raise ValidationError("Repodata 'repodata_version' must be a small non-negative integer")
+
     total_records = len(repodata["packages"]) + len(repodata["packages.conda"])
     if total_records > MAX_PACKAGE_RECORDS:
         raise CapExceededError("Total package records exceed MAX_PACKAGE_RECORDS")
@@ -354,7 +296,9 @@ def cut_repodata(
     dropped_after_count = 0
     unknown_filenames: list[str] = []
 
-    out_repodata = copy.deepcopy(repodata)
+    # Shallow copy: kept records and the other top-level values are never mutated, so they are
+    # shared with the input instead of deep-copied (a 512 MiB document would otherwise double).
+    out_repodata = dict(repodata)
 
     for map_key in ("packages", "packages.conda"):
         raw_map: dict[str, Any] = repodata[map_key]
@@ -368,7 +312,7 @@ def cut_repodata(
                 continue
             record_nanos = ts_ms * 1_000_000
             if record_nanos <= cutoff_nanos:
-                kept_map[filename] = copy.deepcopy(record)
+                kept_map[filename] = record
                 kept_count += 1
             else:
                 dropped_after_count += 1
@@ -392,16 +336,29 @@ def cut_repodata_files(
     report_path: str | os.PathLike[str],
     repodata_cap_bytes: int = DEFAULT_REPODATA_CAP_BYTES,
 ) -> CondaCutReport:
+    # Validate every argument before any file is read or written.
+    parse_rfc3339_utc_nanos(cutoff)
+    try:
+        out_raw, _ = validate_path(out_path)
+        report_raw, _ = validate_path(report_path)
+    except (ValueError, TypeError) as exc:
+        raise FileSafetyError("Invalid output path") from exc
+    if os.path.normpath(out_raw) == os.path.normpath(report_raw):
+        raise ValidationError("--out and --report must be different files")
     raw = read_regular_file_bounded(repodata_path, max_bytes=repodata_cap_bytes)
     data = parse_json_bytes(raw, max_bytes=repodata_cap_bytes)
     cut_data, report = cut_repodata(data, cutoff=cutoff)
 
-    out_bytes = json.dumps(
-        cut_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    rep_bytes = json.dumps(
-        report.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    try:
+        out_bytes = json.dumps(
+            cut_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        rep_bytes = json.dumps(
+            report.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # JSON "\ud800"-style escapes decode to lone surrogates that have no UTF-8 encoding.
+        raise ValidationError("Repodata contains text that is not valid Unicode") from exc
 
     write_file_atomic(out_path, out_bytes)
     write_file_atomic(report_path, rep_bytes)

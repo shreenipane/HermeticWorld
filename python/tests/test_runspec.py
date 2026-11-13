@@ -271,3 +271,160 @@ def test_rule7_cli_and_file_safety(tmp_path: Path, capsys: pytest.CaptureFixture
     # CLI exit code 1 on error
     rc_err = cli_main(["--config", str(cfg_f), "--passwd", str(sym_pw), "--group", str(gr_f), "--overrides", str(ov_f)])
     assert rc_err == 1
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+import subprocess
+import sys
+
+from hermetic_runspec.derive import MAX_ARGV_BYTES, MAX_ENV_BYTES
+
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def test_fifo_input_refused_without_blocking(tmp_path: Path) -> None:
+    """A FIFO named as /etc/passwd is refused immediately instead of blocking on open."""
+    cfg_f = tmp_path / "cfg.json"
+    cfg_f.write_text(json.dumps({"config": {"Cmd": ["true"]}}), encoding="utf-8")
+    gr_f = tmp_path / "group"
+    gr_f.write_bytes(GROUP_FIXTURE)
+    ov_f = tmp_path / "ov.json"
+    ov_f.write_text(json.dumps(_base_overrides()), encoding="utf-8")
+    fifo = tmp_path / "passwd.fifo"
+    os.mkfifo(fifo)
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from hermetic_runspec.__main__ import main; raise SystemExit(main(sys.argv[2:]))",
+         _PKG_ROOT, "--config", str(cfg_f), "--passwd", str(fifo), "--group", str(gr_f),
+         "--overrides", str(ov_f)],
+        capture_output=True, timeout=30, check=False,
+    )
+    assert proc.returncode == 1
+    assert proc.stdout == b""
+    with pytest.raises(FileSafetyError):
+        derive_runspec_from_files(cfg_f, fifo, gr_f, ov_f)
+
+
+def test_cwd_leading_double_slash_normalised() -> None:
+    """Rule 4: the cwd is fully normalised, including a leading '//'."""
+    for raw, expected in (("//foo", "/foo"), ("///a/./b//", "/a/b"), ("//", "/"), ("/.", "/")):
+        spec = derive_runspec({"config": {"WorkingDir": raw}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+        assert spec["cwd"] == expected, raw
+
+
+def test_passwd_and_group_split_on_newline_only() -> None:
+    """Rule 3: strict parsing; Unicode line separators inside a field never start a new entry."""
+    passwd = PASSWD_FIXTURE + b"carol:x:1002:1002:C\xc2\x85eve:x:0:0:E:/root:/bin/sh\n"
+    by_name, _, bad = parse_passwd_bytes(passwd)
+    assert "eve" not in by_name
+    assert bad == 3
+    with pytest.raises(UserResolutionError):
+        derive_runspec({"config": {"User": "eve"}}, passwd, GROUP_FIXTURE, _base_overrides())
+    group = GROUP_FIXTURE + b"staff:x:50:bob\x0broot2:x:0:alice\n"
+    by_group, members, bad_gr = parse_group_bytes(group)
+    assert "root2" not in by_group
+    assert bad_gr == 2
+    assert 0 not in members.get("alice", set())
+
+
+def test_lone_surrogates_are_validation_errors() -> None:
+    """Hostile text that cannot be encoded raises a typed error, never UnicodeEncodeError."""
+    ov = _base_overrides()
+    for cfg in (
+        {"config": {"Env": ["A=\ud800"]}},
+        {"config": {"Cmd": ["\udcff"]}},
+        {"config": {"Entrypoint": ["/x\ud800"]}},
+        {"config": {"WorkingDir": "/\ud800"}},
+        {"config": {"User": "\ud800"}},
+    ):
+        with pytest.raises((ValidationError, UserResolutionError)):
+            derive_runspec(cfg, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+
+
+def test_unknown_config_fields_refused() -> None:
+    """Unknown OCI config fields are refused (fail closed), known Docker fields accepted."""
+    with pytest.raises(ValidationError):
+        derive_runspec({"config": {"Privileged": True}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+    known = {"config": {"ExposedPorts": {"80/tcp": {}}, "Labels": {"a": "b"}, "StopSignal": "SIGTERM"}}
+    derive_runspec(known, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+
+
+def test_unknown_or_null_override_fields_refused() -> None:
+    """Overrides: unknown keys and nulls for the optional str/[str] keys are refused."""
+    for key in ("cmd", "workdir", "user"):
+        ov = _base_overrides()
+        ov[key] = None
+        with pytest.raises(ValidationError):
+            derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+    ov = _base_overrides()
+    ov["privileged"] = True
+    with pytest.raises(ValidationError):
+        derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+    ov = _base_overrides()
+    del ov["nameserver"]
+    with pytest.raises(ValidationError):
+        derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+
+
+def test_hostname_fits_linux_host_name_max() -> None:
+    """Rule 6: a hostname longer than 64 bytes cannot be set by PID 1 and is refused."""
+    ov = _base_overrides()
+    ov["hostname"] = "a" * 63 + ".b"
+    with pytest.raises(ValidationError):
+        derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+    ov["hostname"] = "a" * 63
+    assert derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)["hostname"] == "a" * 63
+    for bad in ("-a", "a-", "a_b", "", "a..b", "123"):
+        ov["hostname"] = bad
+        with pytest.raises(ValidationError):
+            derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+
+
+def test_nameserver_strict_ipv4() -> None:
+    """Rule 6: the nameserver must be a dotted-quad IPv4 address."""
+    for bad in ("010.0.0.1", "10.0.2", "10.0.2.3 ", "::ffff:10.0.2.3", "10.0.2.256", 167772675):
+        ov = _base_overrides()
+        ov["nameserver"] = bad
+        with pytest.raises(ValidationError):
+            derive_runspec({"config": {}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+
+
+def test_env_total_size_cap_and_no_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rule 2: total env size is capped at 256 KiB and host variables are never added."""
+    assert MAX_ENV_BYTES == 256 * 1024
+    big = "V=" + "x" * (MAX_ENV_BYTES)
+    with pytest.raises(CapExceededError):
+        derive_runspec({"config": {"Env": [big]}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+    monkeypatch.setenv("HERMETIC_HOST_SECRET", "leak")
+    spec = derive_runspec({"config": {"Env": ["A=1"]}}, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+    assert spec["env"] == [["A", "1"]]
+    assert "leak" not in json.dumps(spec)
+
+
+def test_argv_total_size_cap() -> None:
+    """Rule 5: the combined entrypoint + cmd size is capped."""
+    half = "x" * (MAX_ARGV_BYTES // 2 + 1)
+    cfg = {"config": {"Entrypoint": [half], "Cmd": [half]}}
+    with pytest.raises(CapExceededError):
+        derive_runspec(cfg, PASSWD_FIXTURE, GROUP_FIXTURE, _base_overrides())
+    ov = _base_overrides()
+    ov["cmd"] = []
+    spec = derive_runspec({"config": {"Entrypoint": ["/e"], "Cmd": ["a"]}}, PASSWD_FIXTURE, GROUP_FIXTURE, ov)
+    assert spec["entrypoint"] == ["/e"] and spec["cmd"] == []
+
+
+def test_cli_rejects_abbreviated_options(tmp_path: Path) -> None:
+    """Rule 7: only the exact option names are accepted."""
+    cfg_f = tmp_path / "cfg.json"
+    cfg_f.write_text(json.dumps({"config": {}}), encoding="utf-8")
+    pw_f = tmp_path / "passwd"
+    pw_f.write_bytes(PASSWD_FIXTURE)
+    gr_f = tmp_path / "group"
+    gr_f.write_bytes(GROUP_FIXTURE)
+    ov_f = tmp_path / "ov.json"
+    ov_f.write_text(json.dumps(_base_overrides()), encoding="utf-8")
+    assert cli_main(["--conf", str(cfg_f), "--passwd", str(pw_f), "--group", str(gr_f), "--overrides", str(ov_f)]) == 1

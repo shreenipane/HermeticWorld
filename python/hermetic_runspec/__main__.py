@@ -19,6 +19,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="hermetic_runspec",
         description="Derive deterministic microVM run spec from OCI image config.",
         add_help=False,
+        allow_abbrev=False,
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--passwd", required=True)
@@ -33,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
             group_path=args.group,
             overrides_path=args.overrides,
         )
+        # ASCII-only output so a non-UTF-8 stdout encoding can never fail after validation.
+        out = json.dumps(runspec, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except HermeticRunSpecError as exc:
         sys.stderr.write(f"error [{exc.code}]: {exc.message}\n")
         return 1
@@ -43,7 +46,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("error [INTERNAL_ERROR]: unexpected failure\n")
         return 1
 
-    out = json.dumps(runspec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     sys.stdout.write(out + "\n")
     return 0
 
