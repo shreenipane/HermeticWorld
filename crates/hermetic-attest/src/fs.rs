@@ -33,6 +33,7 @@ pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_PATH_COMPONENTS: usize = 256;
 pub const MAX_TEMP_ATTEMPTS: usize = 32;
+const TEMP_PREFIX: &str = ".attest-tmp-";
 
 pub enum FsError {
     Io(io::Error),
@@ -204,6 +205,12 @@ fn write_with_hook(
     content: &[u8],
     after_parent: impl FnOnce(),
 ) -> Result<(), FsError> {
+    if path
+        .file_name()
+        .is_some_and(|name| name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()))
+    {
+        return Err(invalid_path());
+    }
     if content.len() > MAX_FILE_BYTES {
         return Err(FsError::FileTooLarge {
             path: "file".into(),
@@ -226,10 +233,7 @@ fn write_with_hook(
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..MAX_TEMP_ATTEMPTS {
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary = child_path(&parent, OsStr::new(&format!(".attest-tmp-{count}")));
-        if temporary == destination {
-            continue;
-        }
+        let temporary = child_path(&parent, OsStr::new(&format!("{TEMP_PREFIX}{count}")));
         let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -256,6 +260,23 @@ fn write_with_hook(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn review_atomic_write_rejects_reserved_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for name in [".attest-tmp-0", ".attest-tmp-123", ".attest-tmp-"] {
+            let path = dir.path().join(name);
+            assert!(matches!(
+                safe_atomic_write_file(&path, b"replacement"),
+                Err(FsError::InvalidPath(_))
+            ));
+            assert!(!path.exists());
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        safe_atomic_write_file(&dir.path().join("run.json"), b"record").unwrap();
+        assert_eq!(fs::read(dir.path().join("run.json")).unwrap(), b"record");
+    }
 
     #[test]
     fn read_refuses_leaf_swapped_after_lstat() {

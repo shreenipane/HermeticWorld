@@ -466,6 +466,10 @@ impl RunRecord {
             }
         }
 
+        if self.run_status == RunStatus::Resolved && self.r0_result != GradingRunResult::Passed {
+            return Err(RunValidationError::InvalidField("run_status"));
+        }
+
         // 7. Task class and grader isolation consistency (§1.4)
         match self.task_class {
             TaskClass::Patch | TaskClass::Artifact => {

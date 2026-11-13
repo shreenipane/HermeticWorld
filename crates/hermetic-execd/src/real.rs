@@ -466,6 +466,42 @@ impl Linux {
     }
 }
 
+fn prepare_overlay(dir: &OwnedFd, lower: &OwnedFd) -> Result<()> {
+    let lower_meta = fs::fstat(lower)?;
+    for name in ["upper", "work"] {
+        let created = match fs::mkdirat(dir, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
+            Err(e) => return Err(e.into()),
+        };
+        let before = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if fs::FileType::from_raw_mode(before.st_mode) != fs::FileType::Directory {
+            return Err(Error::Boot);
+        }
+        let directory = fs::openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let after = fs::fstat(&directory)?;
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
+            return Err(Error::Boot);
+        }
+        if name == "upper" && created {
+            fs::fchown(
+                &directory,
+                Some(process::Uid::from_raw(lower_meta.st_uid)),
+                Some(process::Gid::from_raw(lower_meta.st_gid)),
+            )?;
+            fs::fchmod(&directory, Mode::from_raw_mode(lower_meta.st_mode & 0o7777))?;
+        } else if name == "work" {
+            fs::fchmod(&directory, Mode::from_raw_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 impl Sys for Linux {
     type FreezeHandle = OwnedFd;
     fn effect(&mut self, effect: Effect) -> Result<()> {
@@ -509,18 +545,8 @@ impl Sys for Linux {
             }
             Effect::PrepareOverlay => {
                 let dir = self.root()?.directory("/mnt/hermetic-overlay")?;
-                for name in ["upper", "work"] {
-                    match fs::mkdirat(&dir, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    let _ = fs::openat(
-                        &dir,
-                        name,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )?;
-                }
+                let root = self.root()?.directory("/")?;
+                prepare_overlay(&dir, self.base.as_ref().unwrap_or(&root))?;
             }
             Effect::AssembleOverlay => {
                 let root = self.root()?.directory("/")?;
@@ -955,6 +981,59 @@ pub fn serial_failure(
 mod tests {
     use super::*;
     use std::{io::IsTerminal, os::unix::process::CommandExt};
+
+    #[test]
+    fn review_overlay_upper_inherits_lower_metadata_only_when_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower_path = temp.path().join("lower");
+        let overlay_path = temp.path().join("overlay");
+        std::fs::create_dir(&lower_path).unwrap();
+        std::fs::create_dir(&overlay_path).unwrap();
+        let open = |path: &std::path::Path| {
+            fs::open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+        let lower = open(&lower_path);
+        let overlay = open(&overlay_path);
+        for lower_gid in process::getgroups()
+            .unwrap()
+            .into_iter()
+            .filter(|gid| *gid != process::getegid())
+        {
+            match fs::fchown(&lower, None, Some(lower_gid)) {
+                Ok(()) => break,
+                // User namespaces can expose unmapped supplementary groups.
+                Err(rustix::io::Errno::INVAL) => continue,
+                Err(error) => panic!("cannot prepare lower root group: {error}"),
+            }
+        }
+        fs::fchmod(&lower, Mode::from_raw_mode(0o751)).unwrap();
+        prepare_overlay(&overlay, &lower).unwrap();
+        let upper = open(&overlay_path.join("upper"));
+        let work = open(&overlay_path.join("work"));
+        let lower_meta = fs::fstat(&lower).unwrap();
+        let upper_meta = fs::fstat(&upper).unwrap();
+        assert_eq!(
+            (
+                upper_meta.st_uid,
+                upper_meta.st_gid,
+                upper_meta.st_mode & 0o7777
+            ),
+            (
+                lower_meta.st_uid,
+                lower_meta.st_gid,
+                lower_meta.st_mode & 0o7777
+            )
+        );
+        assert_eq!(fs::fstat(&work).unwrap().st_mode & 0o777, 0o700);
+        fs::fchmod(&upper, Mode::from_raw_mode(0o711)).unwrap();
+        prepare_overlay(&overlay, &lower).unwrap();
+        assert_eq!(fs::fstat(&upper).unwrap().st_mode & 0o777, 0o711);
+    }
 
     fn deadline(ms: u64) -> Instant {
         Instant::now() + Duration::from_millis(ms)

@@ -493,8 +493,8 @@ fn every_cap_aborts_naming_cap_and_emits_nothing_further() {
         }
     ));
     assert!(err.to_string().contains("entries"));
-    // Header + 1st record ("a.txt") emitted, nothing further (no End record)
-    assert_eq!(out_entries.len(), 6 + 47 + 5 + 5);
+    // Directory collection exceeds the budget before emitting any records.
+    assert_eq!(out_entries, b"HEXT\x01\x00");
 
     // 2. Depth cap
     let mut out_depth = Vec::new();
@@ -1014,5 +1014,66 @@ fn regression_cli_failed_extraction_leaves_no_partial_output() {
         leftovers.len(),
         2,
         "only base and work remain: {leftovers:?}"
+    );
+}
+
+#[test]
+fn review_type_replacements_charge_each_record() {
+    for kind in ["file_to_dir", "dir_to_file", "ancestor"] {
+        let base = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        if kind == "dir_to_file" {
+            fs::create_dir(base.path().join("x")).unwrap();
+            write_file(&work.path().join("x"), b"new");
+        } else {
+            write_file(&base.path().join("x"), b"old");
+            fs::create_dir(work.path().join("x")).unwrap();
+            if kind == "ancestor" {
+                write_file(&work.path().join("x/child"), b"new");
+            }
+        }
+        let required = if kind == "ancestor" { 3 } else { 2 };
+        let class = TaskClass::Artifact {
+            paths: vec![if kind == "ancestor" { "x/child" } else { "x" }.into()],
+        };
+        let mut caps = Caps {
+            max_entries: required - 1,
+            ..Caps::default()
+        };
+        let mut stream = Vec::new();
+        assert!(
+            matches!(
+                extract(base.path(), work.path(), &class, &caps, &mut stream),
+                Err(ExtractError::CapExceeded {
+                    cap: CapName::Entries,
+                    ..
+                })
+            ),
+            "accepted {kind}"
+        );
+        caps.max_entries = required;
+        stream.clear();
+        extract(base.path(), work.path(), &class, &caps, &mut stream).unwrap();
+        assert_eq!(
+            decode_with_caps(stream.as_slice(), &caps).unwrap().len(),
+            required + 1 // Includes the End record, which is not charged against the cap.
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn review_mode_change_between_probe_and_read_is_rejected() {
+    let base = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    for root in [base.path(), work.path()] {
+        write_file(&root.join("x"), b"same");
+        fs::set_permissions(root.join("x"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut hook =
+        |_: &str| fs::set_permissions(work.path().join("x"), fs::Permissions::from_mode(0o755));
+    let mut stream = Vec::new();
+    assert!(
+        matches!(extract_with_hook(base.path(), work.path(), &TaskClass::Patch { repo_dir: ".".into() }, &Caps::default(), &mut stream, Some(&mut hook)), Err(ExtractError::FileChangedDuringRead { path }) if path == "x")
     );
 }

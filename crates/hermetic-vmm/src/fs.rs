@@ -31,7 +31,9 @@ fn regular(stat: &fs::Stat) -> Result<()> {
     Ok(())
 }
 fn validate_ancestor(dir: &Directory) -> Result<()> {
-    let s = fs::fstat(&dir.0)?;
+    validate_ancestor_stat(&fs::fstat(&dir.0)?)
+}
+fn validate_ancestor_stat(s: &fs::Stat) -> Result<()> {
     let owner = rustix::process::geteuid().as_raw();
     let caller_gid = rustix::process::getegid().as_raw();
     if s.st_uid != 0 && s.st_uid != owner {
@@ -40,11 +42,9 @@ fn validate_ancestor(dir: &Directory) -> Result<()> {
     if s.st_mode & 0o002 != 0 && !(s.st_uid == 0 && s.st_mode & 0o1000 != 0) {
         return Err(Error::Validation("unsafe ancestor mode: world writable"));
     }
-    if s.st_mode & 0o020 != 0
-        && !(s.st_mode & 0o1000 != 0)
-        && s.st_gid != 0
-        && s.st_gid != caller_gid
-    {
+    // Group write is trusted only for the caller's own (user-private) group; root's group
+    // and every other group stay refused unless the directory is sticky.
+    if s.st_mode & 0o020 != 0 && s.st_mode & 0o1000 == 0 && s.st_gid != caller_gid {
         return Err(Error::Validation("unsafe ancestor mode: group writable"));
     }
     Ok(())
@@ -480,6 +480,33 @@ fn remove_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_ancestor_rejects_group_write_for_every_gid() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = File::open(temp.path()).unwrap();
+        let mut stat = fs::fstat(&dir).unwrap();
+        stat.st_uid = 0;
+        stat.st_mode = 0o040770;
+        let caller_gid = rustix::process::getegid().as_raw();
+        for gid in [0, 123456] {
+            if gid == caller_gid {
+                continue;
+            }
+            stat.st_gid = gid;
+            assert!(validate_ancestor_stat(&stat).is_err(), "accepted gid {gid}");
+        }
+        stat.st_gid = caller_gid;
+        validate_ancestor_stat(&stat).unwrap();
+        stat.st_gid = 123456;
+        stat.st_mode = 0o041777;
+        validate_ancestor_stat(&stat).unwrap();
+        stat.st_mode = 0o040755;
+        validate_ancestor_stat(&stat).unwrap();
+        stat.st_uid = rustix::process::geteuid().as_raw();
+        stat.st_mode = 0o041770;
+        validate_ancestor_stat(&stat).unwrap();
+    }
     #[test]
     fn ownership_check_refuses_foreign_ids_special_files_and_write_bits() {
         let temporary = tempfile::tempfile().unwrap();

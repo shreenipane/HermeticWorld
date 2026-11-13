@@ -342,3 +342,74 @@ fn test_unparseable_configuration_file_restores_whole_from_base() {
     let result = fs::read_to_string(out.path().join("setup.cfg")).unwrap();
     assert_eq!(result, base_cfg);
 }
+
+#[test]
+fn review_native_pytest_table_is_restored() {
+    let agent = "[project]\nname = \"fixed\"\n[tool.pytest]\naddopts = \"-p agent_plugin\"\n";
+    for base_config in [
+        None,
+        Some("[tool.pytest]\naddopts = \"-q\"\n"),
+        Some("[tool.pytest.ini_options]\naddopts = \"-q\"\n"),
+    ] {
+        let base = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        if let Some(content) = base_config {
+            fs::write(base.path().join("pyproject.toml"), content).unwrap();
+        }
+        let mut stream = Vec::new();
+        StreamEncoder::write_stream_header(&mut stream).unwrap();
+        StreamEncoder::write_file(&mut stream, "pyproject.toml", 0o644, agent.as_bytes()).unwrap();
+        StreamEncoder::write_end(&mut stream, 1, agent.len() as u64).unwrap();
+        validate_stream(
+            &mut Cursor::new(stream),
+            base.path(),
+            out.path(),
+            TaskClass::Patch,
+            &ExtractConfig::default(),
+        )
+        .unwrap();
+        let actual = fs::read_to_string(out.path().join("pyproject.toml")).unwrap();
+        assert!(!actual.contains("agent_plugin"), "{actual}");
+        assert!(actual.contains("name = \"fixed\""));
+        if let Some(content) = base_config {
+            assert!(actual.contains(content));
+        } else {
+            assert!(!actual.contains("[tool.pytest]"));
+        }
+    }
+}
+
+#[test]
+fn review_alternate_pytest_configs_are_whole_file_protected() {
+    for name in [".pytest.ini", "pytest.toml", ".pytest.toml"] {
+        for existing in [false, true] {
+            let base = tempdir().unwrap();
+            let out = tempdir().unwrap();
+            let path = format!("pkg/{name}");
+            if existing {
+                fs::create_dir(base.path().join("pkg")).unwrap();
+                fs::write(base.path().join(&path), b"# pristine").unwrap();
+            }
+            let payload = b"[pytest]\naddopts = [\"-p\", \"agent_plugin\"]\n";
+            let mut stream = Vec::new();
+            StreamEncoder::write_stream_header(&mut stream).unwrap();
+            StreamEncoder::write_file(&mut stream, &path, 0o644, payload).unwrap();
+            StreamEncoder::write_end(&mut stream, 1, payload.len() as u64).unwrap();
+            let report = validate_stream(
+                &mut Cursor::new(stream),
+                base.path(),
+                out.path(),
+                TaskClass::Patch,
+                &ExtractConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(report.dropped.len(), 1, "{name}");
+            if existing {
+                assert_eq!(fs::read(out.path().join(&path)).unwrap(), b"# pristine");
+                assert_eq!(report.restored.len(), 1);
+            } else {
+                assert!(!out.path().join(&path).exists());
+            }
+        }
+    }
+}

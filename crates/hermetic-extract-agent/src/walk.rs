@@ -170,6 +170,7 @@ where
                 let depth = idx.saturating_add(1);
                 self.check_entry_budget(&current, depth)?;
                 if matches!(base_node, BaseNode::File(_)) {
+                    self.check_entry_budget(&current, depth)?;
                     self.writer.write_delete(&current)?;
                 }
                 self.writer.write_dir(&current)?;
@@ -232,6 +233,7 @@ where
                 self.walk_dir(rel_path, depth, Reach::work_only())
             }
             (BaseNode::File(_), WorkNode::Dir) => {
+                self.check_entry_budget(rel_path, depth)?;
                 self.writer.write_delete(rel_path)?;
                 if !self.emitted_dirs.contains(rel_path) {
                     self.writer.write_dir(rel_path)?;
@@ -244,6 +246,7 @@ where
                 self.emit_file_if_changed(&work_fs, None, rel_path, &work_meta)
             }
             (BaseNode::Dir, WorkNode::File(work_meta)) => {
+                self.check_entry_budget(rel_path, depth)?;
                 self.writer.write_delete(rel_path)?;
                 self.emit_file_if_changed(&work_fs, None, rel_path, &work_meta)
             }
@@ -279,12 +282,13 @@ where
             join_rel_path(self.work_root, rel_dir)
         };
 
+        let remaining_entries = self.caps.max_entries.saturating_sub(self.entries_seen);
         let mut names = BTreeSet::new();
         if reach.base {
-            collect_dir_names_if_real_dir(&base_dir_fs, rel_dir, &mut names)?;
+            collect_dir_names_if_real_dir(&base_dir_fs, rel_dir, &mut names, remaining_entries)?;
         }
         if reach.work == WorkReach::Reachable {
-            collect_dir_names_if_real_dir(&work_dir_fs, rel_dir, &mut names)?;
+            collect_dir_names_if_real_dir(&work_dir_fs, rel_dir, &mut names, remaining_entries)?;
         }
 
         let child_depth = dir_depth.saturating_add(1);
@@ -488,6 +492,7 @@ fn collect_dir_names_if_real_dir(
     dir_fs: &Path,
     rel_dir: &str,
     out: &mut BTreeSet<String>,
+    remaining_entries: usize,
 ) -> Result<(), ExtractError> {
     let meta = match fs::symlink_metadata(dir_fs) {
         Ok(m) => m,
@@ -542,6 +547,13 @@ fn collect_dir_names_if_real_dir(
             return Err(ExtractError::InvalidPath {
                 path: name,
                 reason: "invalid directory entry name",
+            });
+        }
+        if !out.contains(&name) && out.len() >= remaining_entries {
+            return Err(ExtractError::CapExceeded {
+                cap: CapName::Entries,
+                limit: remaining_entries as u64,
+                actual: out.len().saturating_add(1) as u64,
             });
         }
         out.insert(name);
@@ -725,6 +737,7 @@ where
     if !open_meta.file_type().is_file()
         || open_meta.file_type().is_symlink()
         || open_meta.len() != expected_size
+        || file_mode_from_meta(&open_meta) != mode
     {
         return Err(ExtractError::FileChangedDuringRead {
             path: rel_path.to_string(),
@@ -883,7 +896,10 @@ where
         path: Some(rel_path.to_string()),
         kind: e.kind(),
     })?;
-    if !post_open_meta.file_type().is_file() || post_open_meta.len() != expected_size {
+    if !post_open_meta.file_type().is_file()
+        || post_open_meta.len() != expected_size
+        || file_mode_from_meta(&post_open_meta) != mode
+    {
         return Err(ExtractError::FileChangedDuringRead {
             path: rel_path.to_string(),
         });
@@ -902,6 +918,7 @@ where
     if !post_path_meta.file_type().is_file()
         || post_path_meta.file_type().is_symlink()
         || post_path_meta.len() != expected_size
+        || file_mode_from_meta(&post_path_meta) != mode
     {
         return Err(ExtractError::FileChangedDuringRead {
             path: rel_path.to_string(),
@@ -971,4 +988,26 @@ fn read_exact_base_chunk(file: &mut File, buf: &mut [u8]) -> Result<bool, io::Er
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn review_agent_directory_collection_respects_remaining_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let mut names = BTreeSet::new();
+        assert!(matches!(
+            collect_dir_names_if_real_dir(dir.path(), "", &mut names, 1),
+            Err(ExtractError::CapExceeded {
+                cap: CapName::Entries,
+                ..
+            })
+        ));
+        assert_eq!(names.len(), 1);
+    }
 }

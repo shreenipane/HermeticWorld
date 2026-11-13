@@ -22,8 +22,11 @@ pub fn is_whole_path_test_infra(path: &str, test_paths: &[String]) -> Option<&'s
     if filename == "conftest.py" {
         return Some("conftest");
     }
-    if filename == "pytest.ini" {
+    if matches!(filename, "pytest.ini" | ".pytest.ini") {
         return Some("pytest_ini");
+    }
+    if matches!(filename, "pytest.toml" | ".pytest.toml") {
+        return Some("pytest_toml");
     }
     if filename == "tox.ini" {
         return Some("tox_ini");
@@ -419,7 +422,8 @@ fn parse_toml_tables(content: &str) -> Result<(Vec<String>, Vec<TomlTable>), ()>
 }
 
 fn is_test_runner_toml_table(name: &str) -> bool {
-    name == "tool.pytest.ini_options"
+    name == "tool.pytest"
+        || name == "tool.pytest.ini_options"
         || name.starts_with("tool.pytest.")
         || name == "project.entry-points.pytest11"
         || name == "project.entry-points.\"pytest11\""

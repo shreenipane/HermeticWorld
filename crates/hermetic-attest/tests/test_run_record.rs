@@ -6,6 +6,22 @@ use hermetic_attest::{
 };
 
 #[test]
+fn review_resolved_requires_r0_passed() {
+    use hermetic_attest::{GradingRunResult, RunStatus};
+    let mut record = sample_run_record();
+    record.run_status = RunStatus::Resolved;
+    for result in [GradingRunResult::Failed, GradingRunResult::Skipped] {
+        record.r0_result = result;
+        assert!(record.validate().is_err(), "accepted {result:?}");
+    }
+    record.r0_result = GradingRunResult::Passed;
+    record.validate().unwrap();
+    record.run_status = RunStatus::Unresolved;
+    record.r0_result = GradingRunResult::Failed;
+    record.validate().unwrap();
+}
+
+#[test]
 fn test_valid_fixture_parses_and_validates() {
     let record = sample_run_record();
     assert!(record.validate().is_ok());
