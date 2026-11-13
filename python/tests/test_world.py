@@ -14,7 +14,7 @@ import pytest
 
 from hermetic_slice.__main__ import main
 from hermetic_slice.dockerutil import is_docker_available, run_docker
-from hermetic_slice.world import probe, start_world, stop_world, world_exec
+from hermetic_slice.world import probe, start_world, stop_world, world_exec, world_probe_name
 
 requires_docker = pytest.mark.skipif(
     not is_docker_available(),
@@ -270,3 +270,12 @@ def test_world_probe_cli(tmp_path: Path, fake_agent_image: str) -> None:
     assert probe_json.exists()
     probe_data = json.loads(probe_json.read_text(encoding="utf-8"))
     assert probe_data["all_ok"] is True
+
+
+def test_world_probe_name_unique_per_run() -> None:
+    """Concurrent probes of the same task must not share container or network names."""
+    first = world_probe_name("org__pkg_1")
+    second = world_probe_name("org__pkg_1")
+    assert first != second
+    assert first.startswith("hermetic-world-org-pkg-1-")
+    assert second.startswith("hermetic-world-org-pkg-1-")
