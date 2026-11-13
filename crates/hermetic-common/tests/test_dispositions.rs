@@ -281,11 +281,42 @@ fn test_should_exclude_rejects_untrusted_spans_without_panicking() {
 }
 
 #[test]
-fn test_clean_disposition_manifest_roundtrip() {
-    let mut manifest = sample_manifest();
-    manifest.add_disposition(DispositionKind::Clean, "none", "gate passed");
-    let serialized = serde_json::to_string(&manifest).expect("serialize manifest");
-    let loaded = WorldManifest::from_json_str(&serialized).expect("load manifest");
-    assert_eq!(loaded.dispositions[0].kind, DispositionKind::Clean);
-    assert_eq!(loaded.world_root().unwrap(), manifest.world_root().unwrap());
+fn test_clean_disposition_rejected_in_manifest() {
+    let mut manifest = serde_json::to_value(sample_manifest()).expect("serialize manifest");
+    manifest["dispositions"] = serde_json::json!([{
+        "kind": "clean", "detector": "none", "detail": "gate passed"
+    }]);
+    assert!(WorldManifest::from_json_str(&manifest.to_string()).is_err());
+}
+
+#[test]
+fn test_empty_spans_rejected_before_merging() {
+    for spans in [vec![(0, 0)], vec![(0, 1), (1, 1)]] {
+        assert!(validate_and_merge_spans("xxxxxxxxxx", spans.clone()).is_err());
+        assert!(redact_statement("xxxxxxxxxx", spans).is_err());
+    }
+}
+
+#[test]
+fn test_surviving_characters_shared_with_python() {
+    for (survivors, excluded) in [
+        ("[REDACTED]abcdefghij".to_string(), false),
+        (
+            format!("{}\u{001c}\u{001d}\u{001e}\u{001f}", "a".repeat(19)),
+            false,
+        ),
+        (
+            format!("{}\u{0085}\u{00a0}\u{2028}\u{2029}", "a".repeat(19)),
+            true,
+        ),
+        ("a".repeat(20), false),
+    ] {
+        assert_eq!(
+            should_exclude_d0(&format!("LEAK {survivors}"), &[(0, 4)]),
+            excluded
+        );
+    }
+    for spans in [vec![(0, 1), (1, 2)], vec![(0, 2), (1, 2)]] {
+        assert!(redact_statement("é", spans).is_err());
+    }
 }

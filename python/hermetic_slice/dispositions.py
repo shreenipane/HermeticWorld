@@ -44,6 +44,9 @@ from typing import Any, Callable
 # Exactly 50% (fraction <= 0.50) and exactly 20 characters (remaining >= 20) are eligible for repair.
 MAX_REDACTION_FRACTION: float = 0.50
 MIN_REMAINING_CHARS: int = 20
+# Unicode White_Space (stable explicit rule shared with Rust). U+001C..U+001F
+# count as surviving characters; inserted markers do not, original literal markers do.
+UNICODE_WHITE_SPACE = frozenset("\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
 
 # Limits apply before allocation, traversal, parsing, and subprocess collection.
 MAX_REPORT_BYTES = 8 * 1024 * 1024
@@ -238,7 +241,20 @@ class SafeDirectory:
             raise DispositionsError("File access rejected") from None
 
     def write(self, name: str, content: str) -> None:
-        self.check_file(name)
+        before = self.check_file(name)
+        mode = 0o600
+        if name == "problem_statement.md":
+            if before is None:
+                mode = 0o644
+            else:
+                source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+                try:
+                    after = os.fstat(source_fd)
+                    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                        raise DispositionsError("Statement changed during open")
+                    mode = stat.S_IMODE(after.st_mode) & 0o777
+                finally:
+                    os.close(source_fd)
         temp_name = ".disposition-" + uuid.uuid4().hex
         fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fd)
@@ -246,6 +262,7 @@ class SafeDirectory:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 stream.write(content)
                 stream.flush()
+                os.fchmod(stream.fileno(), mode)
                 os.fsync(stream.fileno())
             self.check_file(name)
             os.replace(temp_name, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
@@ -354,6 +371,7 @@ def find_binary(bin_name: str, custom_path: str | Path | None = None, env_var: s
         cp = Path(custom_path)
         if cp.is_file() and os.access(cp, os.X_OK):
             return str(cp.resolve())
+        raise DispositionsError("Explicit executable unavailable")
     if env_var:
         env_val = os.environ.get(env_var)
         if env_val:
@@ -377,7 +395,7 @@ def find_binary(bin_name: str, custom_path: str | Path | None = None, env_var: s
     raise FileNotFoundError(f"Could not locate {bin_name} binary")
 
 
-def validate_and_merge_spans(statement_bytes_len: int, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def validate_and_merge_spans(statement_bytes_len: int, spans: list[tuple[int, int]], *, statement_bytes: bytes | None = None) -> list[tuple[int, int]]:
     """Validate, sort, and merge overlapping, nested, or adjacent UTF-8 byte spans.
 
     Offsets must be within [0, statement_bytes_len].
@@ -388,8 +406,12 @@ def validate_and_merge_spans(statement_bytes_len: int, spans: list[tuple[int, in
         if not isinstance(span, (list, tuple)) or len(span) != 2 or any(type(v) is not int for v in span):
             raise DispositionsError("Invalid span")
         s_start, s_end = span
-        if not (0 <= s_start <= s_end <= statement_bytes_len):
-            raise DispositionsError("Invalid span offset range")
+        if not (0 <= s_start < s_end <= statement_bytes_len):
+            raise DispositionsError("Invalid UTF-8 byte span offset range")
+        if statement_bytes is not None:
+            for boundary in (s_start, s_end):
+                if boundary < len(statement_bytes) and statement_bytes[boundary] & 0xC0 == 0x80:
+                    raise DispositionsError("Span is not on a UTF-8 character boundary")
 
     if not spans:
         return []
@@ -494,14 +516,7 @@ def redact_problem_statement(
     statement_bytes = statement.encode("utf-8")
     if len(statement_bytes) > MAX_STATEMENT_BYTES:
         raise DispositionsError("Statement byte cap exceeded")
-    merged_spans = validate_and_merge_spans(len(statement_bytes), byte_spans)
-
-    for start, end in merged_spans:
-        try:
-            statement_bytes[:start].decode("utf-8")
-            statement_bytes[:end].decode("utf-8")
-        except UnicodeError:
-            raise DispositionsError("Span is not on a UTF-8 character boundary") from None
+    merged_spans = validate_and_merge_spans(len(statement_bytes), byte_spans, statement_bytes=statement_bytes)
     redacted_records: list[RedactedSpan] = []
     for b_start, b_end in merged_spans:
         span_bytes = statement_bytes[b_start:b_end]
@@ -526,6 +541,18 @@ def redact_problem_statement(
     if len(res_bytes) > MAX_STATEMENT_BYTES:
         raise DispositionsError("Redacted statement byte cap exceeded")
     return res_bytes.decode("utf-8"), redacted_records
+
+
+def surviving_character_count(statement: str, spans: list[tuple[int, int]]) -> int:
+    """Count original, unredacted Unicode scalars outside Unicode White_Space."""
+    data = statement.encode("utf-8")
+    remaining = []
+    last = 0
+    for start, end in spans:
+        remaining.append(data[last:start])
+        last = end
+    remaining.append(data[last:])
+    return sum(char not in UNICODE_WHITE_SPACE for char in b"".join(remaining).decode("utf-8"))
 
 
 def validate_scan_config(config: Any) -> dict[str, Any]:
@@ -985,9 +1012,42 @@ def has_incomplete_coverage(report: dict[str, Any]) -> list[str]:
 
 
 def append_manifest_disposition(manifest: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Record current status; retain prior repair evidence inside exclusion detail.
+
+    The detail's repair_history is evidence, not a second current disposition. Its
+    complete entries remain bound to the world root and verified against the sidecar.
+    """
     dispositions = manifest.setdefault("dispositions", [])
+    if entry["kind"] == "excluded":
+        history = manifest_repair_history(manifest)
+        dispositions[:] = [item for item in dispositions if item["kind"] == "excluded"]
+        if history:
+            entry = {**entry, "detail": json.dumps({"reason": entry["detail"], "repair_history": history}, sort_keys=True)}
+    elif entry["kind"] == "repaired":
+        dispositions[:] = [item for item in dispositions if item["kind"] == "repaired"]
     if entry not in dispositions:
         dispositions.append(entry)
+
+
+def manifest_repair_history(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    history = []
+    for entry in manifest.get("dispositions", []):
+        if entry.get("kind") == "repaired":
+            candidates = [entry]
+        elif entry.get("kind") == "excluded":
+            try:
+                detail = parse_json(entry["detail"])
+            except MalformedGateOutputError:
+                continue
+            candidates = detail.get("repair_history", []) if isinstance(detail, dict) else []
+            if not isinstance(candidates, list) or any(not isinstance(item, dict) or item.get("kind") != "repaired" for item in candidates):
+                raise DispositionsError("Invalid persisted repair history")
+        else:
+            continue
+        for candidate in candidates:
+            if candidate not in history:
+                history.append(candidate)
+    return history
 
 
 def validate_report(report: Any) -> None:
@@ -1045,8 +1105,6 @@ def decide_task_disposition(
 
     # Clean case
     if not gate_findings:
-        if manifest is not None:
-            append_manifest_disposition(manifest, {"kind": "clean", "detector": "none", "detail": "gate passed"})
         return TaskDispositionResult(
             task_id=task_id,
             disposition="clean",
@@ -1112,7 +1170,7 @@ def decide_task_disposition(
 
     # Identify spans to redact (UTF-8 byte offsets)
     if explicit_spans is not None:
-        merged_spans = validate_and_merge_spans(stmt_len, explicit_spans)
+        merged_spans = validate_and_merge_spans(stmt_len, explicit_spans, statement_bytes=statement_bytes)
     else:
         evidence_list: list[str] = []
         for f in gate_findings:
@@ -1145,7 +1203,7 @@ def decide_task_disposition(
 
     # Simulate redaction to count remaining non-whitespace characters
     redacted_text, redacted_spans = redact_problem_statement(problem_statement, merged_spans)
-    non_ws_remaining = len(re.sub(r"\s+", "", redacted_text.replace("[REDACTED]", "")))
+    non_ws_remaining = surviving_character_count(problem_statement, merged_spans)
 
     # Boundary check: fraction > 0.50 or non_ws_remaining < 20 excludes
     if fraction > MAX_REDACTION_FRACTION or non_ws_remaining < MIN_REMAINING_CHARS:
@@ -1383,9 +1441,9 @@ def verify_repair_metadata(metadata: Any, statement: str, manifest: Any, *, requ
     if not last_end <= len(statement_bytes) - shift <= MAX_STATEMENT_BYTES:
         raise DispositionsError("Persisted repair length mismatch")
     expected = repair_manifest_entry(metadata["spans"], digest)
-    dispositions = manifest.get("dispositions", [])
-    if expected not in dispositions:
-        if require_manifest_entry or any(isinstance(e, dict) and e.get("kind") == "repaired" for e in dispositions):
+    history = manifest_repair_history(manifest)
+    if expected not in history:
+        if require_manifest_entry or history:
             raise DispositionsError("Persisted repair manifest mismatch")
         # Publication stopped before the manifest was replaced: finish recording the repair.
         append_manifest_disposition(manifest, expected)
@@ -1416,7 +1474,7 @@ def is_exclusion_only(report: dict[str, Any], stmt: str | None = None, is_persis
     stmt_len = len(stmt_bytes)
     if "explicit_spans" in report:
         try:
-            spans = validate_and_merge_spans(stmt_len, report["explicit_spans"])
+            spans = validate_and_merge_spans(stmt_len, report["explicit_spans"], statement_bytes=stmt_bytes)
         except DispositionsError:
             return True
     else:
@@ -1440,7 +1498,7 @@ def is_exclusion_only(report: dict[str, Any], stmt: str | None = None, is_persis
         redacted_text, _ = redact_problem_statement(problem_text, spans)
     except DispositionsError:
         return True
-    non_ws_remaining = len(re.sub(r"\s+", "", redacted_text.replace("[REDACTED]", "")))
+    non_ws_remaining = surviving_character_count(problem_text, spans)
     if fraction > MAX_REDACTION_FRACTION or non_ws_remaining < MIN_REMAINING_CHARS:
         return True
     return False
@@ -1545,8 +1603,15 @@ def process_dispositions(
                 if disk_manifest is not None:
                     parsed_disk_manifest = parse_json(disk_manifest)
                     if manifest is not None and manifest != parsed_disk_manifest:
-                        raise DispositionsError("Conflicting inline manifest and on-disk manifest")
-                    manifest = parsed_disk_manifest if manifest is None else manifest
+                        reconciled = copy.deepcopy(manifest)
+                        if metadata is None:
+                            raise DispositionsError("Conflicting inline manifest and on-disk manifest")
+                        verify_repair_metadata(metadata, disk_statement, parsed_disk_manifest,
+                                               require_manifest_entry=not unpublished_repair)
+                        verify_repair_metadata(metadata, disk_statement, reconciled, require_manifest_entry=False)
+                        if reconciled != parsed_disk_manifest:
+                            raise DispositionsError("Conflicting inline manifest and on-disk manifest")
+                    manifest = parsed_disk_manifest
                 raw_task = task_dir.read("task.json", MAX_REPORT_BYTES, optional=True)
                 if raw_task is not None:
                     parsed_disk_task = parse_json(raw_task)
@@ -1626,6 +1691,7 @@ def process_dispositions(
                         append_manifest_disposition(manifest, {"kind": "excluded", "detector": detector, "detail": result.reason})
                 else:
                     result = TaskDispositionResult(tid, "repaired", ["D0"], "D0 leak repaired: problem statement redacted and re-scan clean", redacted_spans=spans, redacted_statement=stmt)
+                    append_manifest_disposition(manifest, repair_manifest_entry([span.to_dict() for span in spans], hashlib.sha256(stmt.encode("utf-8")).hexdigest()))
             else:
                 result = decide_task_disposition(tid, report["findings"], gate_flag=report["gate"],
                     not_covered=report["not_covered"], problem_statement=stmt,

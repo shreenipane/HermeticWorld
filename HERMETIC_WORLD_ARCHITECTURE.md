@@ -262,6 +262,20 @@ A task is never dropped silently, because that changes the denominator of the sc
 | `repaired` | The sealer can remove the leak without changing the task, and a re-scan is clean. For a D0 leak, the leaking span is redacted from the problem statement. | New world version; `problem_statement_redacted` where it applies |
 | `excluded` | The leak is the task (for example, the issue text is the fix) | Listed in the score card with the detector that fired (§12.4) |
 
+The per-run report also lists passing tasks as `clean`; this is not a manifest disposition
+and does not change the world root. Manifest dispositions describe the current status.
+If a repaired task is later excluded, its former repair entries are retained as
+`repair_history` in the exclusion entry's JSON `detail`, separate from the current status
+and still bound to the world root. The repair sidecar must match that evidence on rerun.
+
+D0 repair excludes a task if it removes more than 50% of the original UTF-8 bytes or
+leaves fewer than 20 original Unicode scalar values outside Unicode White_Space
+(U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000–U+200A,
+U+2028–U+2029, U+202F, U+205F, U+3000). Count only unredacted original text:
+inserted `[REDACTED]` markers contribute nothing; literal markers in the original count
+normally. U+001C–U+001F are not whitespace under this rule. All supplied spans must be
+nonempty and every original endpoint must be a UTF-8 boundary before merging.
+
 ### 5.6 Retrieval classifier
 
 After a run, the classifier (on the grading host) labels each success as derived or retrieved, using host-side logs and the final work only.

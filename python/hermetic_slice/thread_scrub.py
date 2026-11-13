@@ -38,6 +38,9 @@ A JSON array of scrub entries sorted deterministically by (url, kind, match, rea
 ]
 
 Matching semantics:
+- GitHub aliases share a resource identity: HTTP/HTTPS, www, a trailing host dot,
+  and empty path segments are canonicalised. Repository-ID routes are denied because
+  their owner/repository identity cannot be verified from the scrub list.
 - "exact": The requested URL matches if its normalized resource URL (scheme, host, and path,
   with query parameters and fragment stripped unless the scrub entry explicitly specifies them)
   equals the entry's `url`. If the entry specifies a fragment (such as '#issuecomment-123'),
@@ -203,11 +206,18 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
             return None
         hostname = _normalize_unreserved_percent_encodings(hostname)
 
-    hostname = hostname.lower()
+    hostname = hostname.lower().rstrip(".")
+    if hostname == "www.github.com":
+        hostname = "github.com"
 
     default_port = 443 if scheme == "https" else 80
     if port is not None and port == default_port:
         port = None
+
+    if hostname in ("github.com", "api.github.com"):
+        if port is not None:
+            return None
+        scheme = "https"
 
     if port is not None:
         if not (0 < port < 65536):
@@ -226,12 +236,17 @@ def _canonicalize_url(url: str) -> tuple[str, str, str, str, str] | None:
             return None
         path = _normalize_unreserved_percent_encodings(path)
 
+    if hostname in ("github.com", "api.github.com"):
+        path = re.sub(r"/+", "/", path)
+
     # Resolve dot segments only after unreserved percent-decoding, so that
     # "%2E%2E" is treated exactly like ".." (RFC 3986 sections 5.2.4, 6.2.2.3).
     path = _remove_dot_segments(path) or "/"
 
     # Canonicalize GitHub owner/repository components
     parts = path.split("/")
+    if hostname in ("github.com", "api.github.com") and len(parts) > 1 and parts[1].lower() == "repositories":
+        return None
     if canon_netloc == "api.github.com":
         if len(parts) >= 4 and parts[1].lower() == "repos":
             parts[1] = "repos"

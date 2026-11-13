@@ -26,6 +26,8 @@ pub const MAX_REDACTION_FRACTION: f64 = 0.50;
 /// Minimum number of non-whitespace characters that must remain in the problem
 /// statement after redaction. If strictly fewer characters remain (`chars < MIN_REMAINING_CHARS`),
 /// the statement is considered destroyed. Exactly 20 remaining characters (`chars >= 20`) is eligible for repair.
+/// Count original, unredacted Unicode scalars outside Unicode White_Space. Inserted
+/// markers contribute nothing; literal markers in the original contribute normally.
 pub const MIN_REMAINING_CHARS: usize = 20;
 
 pub const MAX_STATEMENT_BYTES: usize = 1024 * 1024;
@@ -85,7 +87,7 @@ pub fn validate_and_merge_spans(
         return Err(DispositionError::ResourceCap);
     }
     for &(s, e) in &spans {
-        if s > e || e > statement.len() {
+        if s >= e || e > statement.len() {
             return Err(DispositionError::OutOfBounds(s, e, statement.len()));
         }
         if !statement.is_char_boundary(s) {
@@ -168,8 +170,19 @@ pub fn checked_should_exclude_d0(
     );
     Ok(
         redacted_bytes as f64 / statement.len() as f64 > MAX_REDACTION_FRACTION
-            || remaining.chars().filter(|c| !c.is_whitespace()).count() < MIN_REMAINING_CHARS,
+            || remaining
+                .chars()
+                .filter(|c| !is_redaction_whitespace(*c))
+                .count()
+                < MIN_REMAINING_CHARS,
     )
+}
+
+// Explicit Unicode White_Space rule shared with the Python dispositions engine.
+fn is_redaction_whitespace(c: char) -> bool {
+    matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{0085}' | '\u{00a0}'
+        | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
+        | '\u{202f}' | '\u{205f}' | '\u{3000}')
 }
 
 /// Redact spans from a problem statement string.
