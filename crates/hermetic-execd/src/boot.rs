@@ -7,6 +7,37 @@ use crate::{
 pub const MIN_CLOCK: i64 = 315532800; // 1980-01-01, ZIP's lower bound
 pub const MAX_CLOCK: i64 = 4102444799; // 2099-12-31
 
+/// Reads the capped kernel command line and returns its `hermetic.t=` clock.
+/// Shared by execd and the grader PID 1 (`crate::grader`).
+pub fn read_clock(reader: impl std::io::Read) -> Result<i64> {
+    let data = read_capped(reader, MAX_CMDLINE).map_err(|_| Error::InvalidClock)?;
+    let line = std::str::from_utf8(&data).map_err(|_| Error::InvalidClock)?;
+    parse_clock(line)
+}
+
+/// Exactly one `hermetic.t=<decimal seconds>` in [MIN_CLOCK, MAX_CLOCK].
+/// Classifies missing/invalid clocks independently of other option order:
+/// no other malformed option may hide the distinct fatal clock reason.
+pub fn parse_clock(line: &str) -> Result<i64> {
+    let mut clock = None;
+    for word in line.split_ascii_whitespace() {
+        if word == "hermetic.t" {
+            return Err(Error::InvalidClock);
+        }
+        if let Some(t) = word.strip_prefix("hermetic.t=") {
+            if clock.is_some() || t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Error::InvalidClock);
+            }
+            let t = t.parse::<i64>().map_err(|_| Error::InvalidClock)?;
+            if !(MIN_CLOCK..=MAX_CLOCK).contains(&t) {
+                return Err(Error::InvalidClock);
+            }
+            clock = Some(t);
+        }
+    }
+    clock.ok_or(Error::InvalidClock)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub clock: i64,
@@ -18,25 +49,7 @@ impl Config {
     pub fn parse(reader: impl std::io::Read) -> Result<Self> {
         let data = read_capped(reader, MAX_CMDLINE).map_err(|_| Error::InvalidClock)?;
         let line = std::str::from_utf8(&data).map_err(|_| Error::InvalidClock)?;
-        let mut clock = None;
-        // Classify missing/invalid clocks independently of other option order.
-        // No other malformed option may hide the distinct fatal clock reason.
-        for word in line.split_ascii_whitespace() {
-            if word == "hermetic.t" {
-                return Err(Error::InvalidClock);
-            }
-            if let Some(t) = word.strip_prefix("hermetic.t=") {
-                if clock.is_some() || t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(Error::InvalidClock);
-                }
-                let t = t.parse::<i64>().map_err(|_| Error::InvalidClock)?;
-                if !(MIN_CLOCK..=MAX_CLOCK).contains(&t) {
-                    return Err(Error::InvalidClock);
-                }
-                clock = Some(t);
-            }
-        }
-        let clock = clock.ok_or(Error::InvalidClock)?;
+        let clock = parse_clock(line)?;
         let mut overlay = None;
         let mut spec = None;
         let mut initramfs = None;

@@ -15,6 +15,9 @@ struct Fake {
     fail: Option<String>,
     alive: bool,
     stalled: bool,
+    /// Number of `exited` polls after which a running guest ends itself.
+    exit_after: Option<u32>,
+    exit_delay: Duration,
     killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Runner for Fake {
@@ -46,6 +49,14 @@ impl Runner for Fake {
         Ok(())
     }
     fn exited(&mut self, _: Instant) -> Result<bool> {
+        if let Some(n) = &mut self.exit_after {
+            if *n == 0 {
+                std::thread::sleep(self.exit_delay);
+                self.alive = false;
+            } else {
+                *n -= 1;
+            }
+        }
         Ok(!self.alive)
     }
     fn kill(&mut self, _: Instant) -> Result<()> {
@@ -565,4 +576,82 @@ fn rejected_specifications_create_no_artifacts() {
         assert!(!f.temp.path().join(format!("firecracker/{bad_id}")).exists());
         assert!(!f.temp.path().join("firecracker").exists());
     }
+}
+#[test]
+fn grader_result_drive_must_be_exactly_one_mib() {
+    for len in [0, 1024 * 1024 - 1, 1024 * 1024 + 1, 4096] {
+        let f = Fixture::grader();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&f.spec.drives[0].path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+        assert!(vm.prepare(TIMEOUT).is_err(), "{len}");
+        assert!(!f.root().exists());
+    }
+    let f = Fixture::grader();
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    vm.prepare(TIMEOUT).unwrap();
+    assert_eq!(
+        fs::metadata(f.root().join("drive-result")).unwrap().len(),
+        1024 * 1024
+    );
+    vm.destroy(TIMEOUT).unwrap();
+}
+#[test]
+fn wait_exit_stops_after_guest_exit_and_destroys_on_deadline() {
+    let f = Fixture::grader();
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    assert_eq!(vm.wait_exit(TIMEOUT), Err(Error::State));
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    // The guest has not ended by the deadline: killed and jail destroyed.
+    vm.wait_ready(TIMEOUT).unwrap();
+    assert_eq!(
+        vm.wait_exit(Duration::from_millis(120)),
+        Err(Error::Step("wait-exit"))
+    );
+    assert_eq!(vm.state(), State::Failed);
+    assert!(!vm.runner().alive);
+    assert!(!f.root().exists());
+
+    let f = Fixture::grader();
+    // wait_ready polls once; the guest then ends during wait_exit.
+    let fake = Fake {
+        exit_after: Some(3),
+        ..Fake::default()
+    };
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), fake);
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    vm.wait_ready(TIMEOUT).unwrap();
+    vm.wait_exit(TIMEOUT).unwrap();
+    assert_eq!(vm.state(), State::Stopped);
+    // The result drive copy is still readable before destroy.
+    assert!(f.root().join("drive-result").exists());
+    vm.destroy(TIMEOUT).unwrap();
+    assert!(!f.root().exists());
+}
+
+#[test]
+fn wait_exit_rejects_an_exit_reported_after_the_deadline() {
+    let f = Fixture::grader();
+    let fake = Fake {
+        exit_after: Some(1),
+        exit_delay: Duration::from_millis(80),
+        ..Fake::default()
+    };
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), fake);
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    vm.wait_ready(TIMEOUT).unwrap();
+    assert_eq!(
+        vm.wait_exit(Duration::from_millis(10)),
+        Err(Error::Step("wait-exit"))
+    );
+    assert_eq!(vm.state(), State::Failed);
+    assert!(vm.runner().killed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!f.root().exists());
 }

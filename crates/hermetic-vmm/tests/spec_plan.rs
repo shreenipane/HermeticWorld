@@ -345,3 +345,53 @@ fn default_configuration_cannot_select_development_runner() {
     value["runner"] = json!("dev_unjailed");
     assert!(VmSpec::read(serde_json::to_vec(&value).unwrap().as_slice()).is_err());
 }
+#[test]
+fn grader_drive_layout_requires_writable_result_first_and_read_only_others() {
+    type Mutation = Box<dyn Fn(&mut VmSpec)>;
+    assert!(spec(Role::Grader).validate().is_ok());
+    let extra = Drive {
+        id: "work".into(),
+        path: "/images/work".into(),
+        read_only: true,
+    };
+    let mut ok = spec(Role::Grader);
+    ok.drives.push(extra.clone());
+    assert!(ok.validate().is_ok());
+    let cases: Vec<Mutation> = vec![
+        Box::new(|s| s.drives.clear()),
+        Box::new(|s| s.drives[0].read_only = true),
+        Box::new(|s| s.drives[0].id = "overlay".into()),
+        Box::new(move |s| s.drives.insert(0, extra.clone())),
+        Box::new(|s| {
+            s.drives.push(Drive {
+                id: "scratch".into(),
+                path: "/images/scratch".into(),
+                read_only: false,
+            })
+        }),
+        // TR-GR-1 stays enforced alongside the layout rule.
+        Box::new(|s| s.vsock = spec(Role::Agent).vsock),
+        Box::new(|s| s.networks = spec(Role::Agent).networks),
+    ];
+    for (i, case) in cases.into_iter().enumerate() {
+        let mut s = spec(Role::Grader);
+        case(&mut s);
+        assert!(s.validate().is_err(), "case {i}");
+    }
+    assert_eq!(GRADER_RESULT_DRIVE, "result");
+    assert_eq!(GRADER_RESULT_BYTES, 1_048_576);
+    let requests = api_requests(&spec(Role::Grader).validate().unwrap());
+    let drives: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.starts_with("/drives/"))
+        .map(|r| r.path.as_str())
+        .collect();
+    // Guest names follow attach order: vda root, vdb result.
+    assert_eq!(
+        drives,
+        ["/drives/rootfs", "/drives/result", "/drives/tests"]
+    );
+    assert!(requests
+        .iter()
+        .all(|r| r.path != "/vsock" && !r.path.starts_with("/network")));
+}

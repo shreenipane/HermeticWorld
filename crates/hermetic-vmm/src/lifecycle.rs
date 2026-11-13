@@ -7,6 +7,18 @@ use std::time::{Duration, Instant};
 
 pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const READY_RETRY: Duration = Duration::from_millis(5);
+pub const EXIT_POLL: Duration = Duration::from_millis(50);
+
+fn wait_for_exit(runner: &mut impl Runner, end: Instant) -> Result<()> {
+    loop {
+        remaining(end, "wait-exit")?;
+        if runner.exited(end)? {
+            remaining(end, "wait-exit")?;
+            return Ok(());
+        }
+        std::thread::sleep(remaining(end, "wait-exit")?.min(EXIT_POLL));
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -233,6 +245,22 @@ impl<R: Runner> Vmm<R> {
             Err(_) => Err(self.failure("stop")),
         }
     }
+    /// Waits for a running VM whose guest ends itself (GraderVM resets after
+    /// the supervisor). That exit moves the
+    /// VM to `Stopped`; call `destroy` next. On deadline the VM is killed and the jail destroyed.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Result<()> {
+        self.require(&[State::Running])?;
+        let end = deadline(timeout)?;
+        let result = wait_for_exit(&mut self.runner, end);
+        match result {
+            // `destroy` kills the remaining process group and reaps it.
+            Ok(()) => {
+                self.state = State::Stopped;
+                Ok(())
+            }
+            Err(_) => Err(self.failure("wait-exit")),
+        }
+    }
     pub fn destroy(&mut self, timeout: Duration) -> Result<()> {
         self.require(&[State::Prepared, State::Stopped, State::Failed])?;
         let end = deadline(timeout)?;
@@ -254,5 +282,42 @@ impl<R: Runner> Drop for Vmm<R> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct LateExit;
+    impl Runner for LateExit {
+        fn spawn(
+            &mut self,
+            _: &ValidatedSpec,
+            _: &crate::JailPlan,
+            _: &PreparedJail,
+            _: Instant,
+        ) -> Result<()> {
+            Err(Error::State)
+        }
+        fn request(&mut self, _: &str, _: &ApiRequest, _: Instant) -> Result<()> {
+            Err(Error::State)
+        }
+        fn exited(&mut self, _: Instant) -> Result<bool> {
+            std::thread::sleep(Duration::from_millis(80));
+            Ok(true)
+        }
+        fn kill(&mut self, _: Instant) -> Result<()> {
+            Err(Error::State)
+        }
+    }
+
+    #[test]
+    fn late_exit_does_not_extend_the_wait_deadline() {
+        let end = deadline(Duration::from_millis(10)).unwrap();
+        assert_eq!(
+            wait_for_exit(&mut LateExit, end),
+            Err(Error::Deadline("wait-exit"))
+        );
     }
 }

@@ -24,7 +24,7 @@ fields are `id`, `role`, `index`, `vcpus`, `memory_mib`, `kernel_image`, `boot_a
 | `agent` | Read-only root; further drive named `overlay` must be writable; at most one interface, declared peer `net`. |
 | `net` | All drives read-only; at most one interface, declared peer `agent`. |
 | `extractor` | Read-only root; no network. A writable private disk copy can replay the agent overlay journal. |
-| `grader` | Read-only root; no network and no vsock (TR-GR-1). Output belongs on an explicit writable drive. |
+| `grader` | Read-only root; no network and no vsock (TR-GR-1). The first further drive is `result`, writable and exactly 1 MiB (`GRADER_RESULT_BYTES`, checked at prepare), so the guest sees it as `/dev/vdb`; every other further drive is read-only. |
 
 The harness is trusted to provision the declared tap peers and isolated network
 namespaces. No interface is implicitly bridged or attached to a host route.
@@ -124,7 +124,11 @@ The process group is killed before its exited leader is reaped, so descendants
 cannot survive a jailer or launcher exit.
 
 `Vmm` states are `new`, `prepared`, `starting`, `running`, `paused`, `stopped`,
-`destroyed`, `failed`. Invalid transitions fail before effects. Calls accept
+`destroyed`, `failed`. Invalid transitions fail before effects. `wait_exit` (from `running`) waits for
+a guest that ends itself, such as the GraderVM after its supervisor, until the
+Firecracker process exits; it then moves to `stopped`, so the caller can read the
+jail's `drive-result` copy before `destroy`. On its deadline it kills and destroys
+like any failed step. Calls accept
 0 < timeout <= 300 seconds, and API operations use one overall monotonic deadline
 for connect/write/header/body (slow-drip traffic cannot extend it). `wait_ready`
 means Firecracker API readiness and successful configuration/InstanceStart;
@@ -217,7 +221,12 @@ private copy of the system Python interpreter as its exec launcher. Invoke:
 /home/flingboot/.hermetic/bin/rust-gate --exclude hermetic-common --exclude hermetic-gateway --exclude hermetic-sealcheck --exclude hermetic-trust --exclude hermetic-world-server --exclude tiny_http --features dev-unjailed --test guest boots_guest_and_reads_guest_clock -- --ignored --nocapture
 ```
 
-Missing variables print a clear skip message. This test connects outbound to
+Missing variables print a clear skip message. `boots_grader_and_collects_result_drive` (same flags) boots a
+grader image (`HERMETIC_GRADER_ROOTFS`) with `init=/sbin/hermetic-grader-init`,
+waits for power-off, checks the serial line `grader-init SECONDS clock` against
+`hermetic.t`, and writes the result drive to `HERMETIC_GRADER_RESULT_OUT`. The
+development runner's `serial()` returns the first 64 KiB of guest serial output;
+production runners expose none. This test connects outbound to
 Firecracker's vsock backend, sends `CONNECT 5000\n`, checks bounded `OK PORT\n`,
 and sends a u32 **little-endian** length followed by `{"type":"status"}`. It expects
 a bounded JSON reply containing `{"type":"status","guest_time_unix":SECONDS}`
@@ -241,7 +250,7 @@ host settings. No privileged test is run by the default gate.
 | 1. Specification | `validates_roles_devices_identifiers_paths_and_caps`, `every_boot_argument_rule`, `run_rejects_duplicate_cid_uid_gid_and_id`, `project_mac_known_answers_are_independent_of_host_identity` |
 | 2. Configuration | `agent_and_extractor_full_known_answers`, `all_roles_attach_entropy_and_template_without_metadata_or_balloon`, `template_changes_exactly_leaf_eax_bits_zero_and_three` |
 | 3. Jail plan | `jail_vector_known_answer`, `descriptor_copy_and_reserved_slot_teardown_never_follow_links`; owner-only `jailer_boots_in_isolated_namespace` |
-| 4. Lifecycle | `explicit_state_machine_configures_starts_pauses_resumes_stops_and_destroys`, `failures_name_the_step_and_destroy_the_jail`, `configuration_failure_names_the_specific_device_step`, `startup_stall_is_destroyed_and_drop_kills_a_running_vm`; runner unit tests cover environment, descriptors, groups, capture and descendants |
+| 4. Lifecycle | `explicit_state_machine_configures_starts_pauses_resumes_stops_and_destroys`, `wait_exit_stops_after_guest_exit_and_destroys_on_deadline`, `grader_result_drive_must_be_exactly_one_mib`, `grader_drive_layout_requires_writable_result_first_and_read_only_others`, `failures_name_the_step_and_destroy_the_jail`, `configuration_failure_names_the_specific_device_step`, `startup_stall_is_destroyed_and_drop_kills_a_running_vm`; runner unit tests cover environment, descriptors, groups, capture and descendants |
 | 5. API client | `correct_request_and_response_known_answer`, `fault_body_is_not_exposed`, `oversized_truncated_and_early_close_are_refused`, `stalled_response_hits_overall_deadline`, `slow_drip_does_not_reset_call_deadline`, `malicious_http_grammar_is_bounded_and_strict`, `every_planned_request_passes_the_strict_transport_schema` |
 | 6. Host paths | `rejects_unsafe_sources_and_directories_before_creating_artifacts`, `opened_source_remains_pinned_after_path_replacement`, `destroy_refuses_replaced_vm_or_root_identity`, `ancestor_replacement_does_not_redirect_prepared_jail_paths_or_cleanup`; filesystem unit tests cover ownership and atomic publication |
 | 7. Development | `default_configuration_cannot_select_development_runner`, feature-only `dev_path_rewriting_uses_only_pinned_directory`, `guest_status_frame_known_answer_and_cap`; owner-only `boots_guest_and_reads_guest_clock` |

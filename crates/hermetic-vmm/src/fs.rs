@@ -236,6 +236,12 @@ impl PreparedJail {
                 Some(f) => f.metadata()?.len(),
                 None => 4096,
             };
+            if valid.spec().role == crate::spec::Role::Grader
+                && entry.destination == format!("drive-{}", crate::spec::GRADER_RESULT_DRIVE)
+                && size != crate::spec::GRADER_RESULT_BYTES
+            {
+                return Err(Error::Validation("GraderVM result drive must be 1 MiB"));
+            }
             total = total.checked_add(size).ok_or(Error::Io)?;
             if total > MAX_TOTAL_IMAGE_BYTES {
                 return Err(Error::Validation("total image size cap"));

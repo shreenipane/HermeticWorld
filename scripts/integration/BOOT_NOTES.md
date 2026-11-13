@@ -194,3 +194,63 @@ Because the VM is not booted, two things are not checked yet:
 - **Result fd hand-over.** The supervisor's `RealOs` hands the record pipe over on fd 2 and advertises `HERMETIC_RESULT_FD=2`. The plugin requires an fd of 3 or higher. The smoke bridges this with `sh -c 'exec 3>&2 2>/dev/null; exec python ...'` and `HERMETIC_RESULT_FD=3`.
 - **HEXT v1 mismatch (fixed 2026-11-13).** The agent and the validator used to implement two incompatible HEXT v1 formats, so the smoke applied the patch on the host. The validator's format (u32 version, fixed 60-byte header, end record with record count and total bytes) is now canonical and the agent emits it byte for byte (`crates/hermetic-extract-agent/tests/validator_compat.rs`). The smoke now applies the variant patch to a copy of the base repo, runs `hermetic-extract-agent --class patch:` and publishes through `hermetic-extract-validate` with `fixtures/grader-task/extract-config.json`. Both still run on the host, not in an ExtractorVM.
 - **Tree root spelling (fixed 2026-11-13).** The root is the empty string on both sides: agent `--class patch:`, validator `repo_dir: ""`. The agent refuses `patch:.` (`InvalidTaskClass`) and the validator refuses `repo_dir: "."` (config error).
+
+# Grader VM (development, dev-unjailed)
+
+Command, from the worktree root:
+
+```
+scripts/integration/grader-vm-smoke.sh /tmp/hermetic-grader-vm-smoke
+```
+
+For each variant (empty, gold) and each run (R0, R1, R2), the script:
+
+1. Builds the grader tree from the "Grader smoke" section. The patch is applied on the host. The tree adds static `/sbin/hermetic-grader-init` and has one fixed config, `/etc/hermetic/grader/run.json`. Every run gets its own D4-checked image, and the kernel command line is the same for all of them.
+2. Boots the image with hermetic-vmm's `dev-unjailed` runner through `tests/guest.rs::boots_grader_and_collects_result_drive`.
+   - Firecracker 1.18.0, kernel `kernel-out-20261113-6.6b`.
+   - Boot arguments: `init=/sbin/hermetic-grader-init`, `hermetic.t=1700000000`, `reboot=k panic=-1`.
+   - Drives: root `vda` read-only, then `result` `vdb`, which is writable and exactly 1 MiB. No vsock and no network.
+3. Waits for the VM to exit (`Vmm::wait_exit`) and checks the serial line `grader-init SECONDS clock` against `hermetic.t`. It then copies the jail's result drive out.
+4. Runs `hermetic-grader-verdict` over R0/R1/R2.
+
+The interrupted implementation recorded the following result. The current review
+environment has no `/dev/kvm`, so these six boots have not been independently
+verified here. Run the command above on a KVM-capable host to close that check.
+
+Previously recorded result:
+
+```
+grader serial: grader-init clock=1700000000      (all six boots)
+empty: verdict rc=2 {"status":"unresolved","reasons":["f2p_failed"], ... passed 1, failed 1 ...}
+gold:  verdict rc=0 {"status":"resolved","reasons":[], ... passed 2 ...}
+```
+
+Each boot takes about 1.7 s.
+
+## Grader PID 1
+
+`hermetic-grader-init` is a binary in the hermetic-execd crate (`src/grader.rs`). It is static and `forbid(unsafe_code)`. It reuses execd's clock rule (`boot::read_clock`, which was factored out of `Config::parse`) and execd's clock setter (`real::set_realtime`). It runs these steps in order:
+
+1. Checks that it is PID 1.
+2. Mounts `/proc` read-only.
+3. Reads `hermetic.t`, sets CLOCK_REALTIME and logs the clock line. Nothing writable exists before this step.
+4. Mounts tmpfs on `/tmp` (nosuid, nodev, 256 MiB).
+5. Mounts a private devpts on `/dev/pts`.
+6. Runs the supervisor with `--config /etc/hermetic/grader/run.json --result-disk /dev/vdb`, an empty environment and a 4 h backstop.
+7. Logs `done` or `failed`, syncs and ends the VM.
+
+Any failure ends the VM. The clock check uses the serial line because the HGRD result schema has no time field. The guest stamps that line right after `clock_settime`.
+
+## What broke and how it was fixed
+
+1. **Power-off does not end the VM.** `reboot(POWER_OFF)` only halts the sealed kernel (`reboot: System halted`), and Firecracker keeps running, so `wait_exit` timed out. The grader PID 1 now ends with `reboot(RESTART)`. With `reboot=k`, Firecracker exits on the i8042 reset. Order tests: `grader::tests::*`. Boot regression: `boots_grader_and_collects_result_drive`. execd's own power-off has the same property; its harness kills the VM instead.
+
+## Development-only surface
+
+`DevUnjailed::serial()` returns the first 64 KiB of guest serial output. It exists only with the `dev-unjailed` feature. Production runners expose no guest output.
+
+## Still open
+
+- Supervisor isolation (task B).
+- The read-only work or patch drive. The patch is baked into the image for now.
+- The fd 3 bridge.

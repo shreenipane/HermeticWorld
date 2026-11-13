@@ -187,6 +187,18 @@ impl Runner for DevUnjailed {
     }
 }
 #[cfg(feature = "dev-unjailed")]
+impl DevUnjailed {
+    /// Development only: the first bytes (at most MAX_CAPTURE_BYTES) of
+    /// Firecracker's stdout, which carries the guest serial console. Trusted
+    /// disposable fixtures only; production runners never expose guest output.
+    pub fn serial(&self) -> Vec<u8> {
+        self.process
+            .as_ref()
+            .and_then(|p| p.output._data.lock().ok().map(|d| d.stdout.clone()))
+            .unwrap_or_default()
+    }
+}
+#[cfg(feature = "dev-unjailed")]
 fn development_request(request: &ApiRequest, root: &str) -> ApiRequest {
     let mut req = request.clone();
     for key in ["kernel_image_path", "path_on_host", "uds_path"] {

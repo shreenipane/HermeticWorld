@@ -72,6 +72,23 @@ it skips nested mounts, including same-device bind mounts. It stamps symlink
 inodes without following their targets, never opens device nodes for I/O, and
 never chmods anything.
 
+## GraderVM PID 1
+
+`/sbin/hermetic-grader-init` (binary `hermetic-grader-init`, `src/grader.rs`) is the
+GraderVM's PID 1, booted with `init=/sbin/hermetic-grader-init`. It shares execd's
+clock rule (`boot::read_clock`) and clock setter (`real::set_realtime`). Order:
+refuse unless PID 1; mount procfs read-only; read `hermetic.t=` from
+`/proc/cmdline` and set CLOCK_REALTIME (nothing writable exists before this);
+write `grader-init SECONDS clock` to the serial console; mount `/tmp` as tmpfs
+(nosuid, nodev, 256 MiB) and a private devpts at `/dev/pts`; run
+`/sbin/hermetic-grader-supervisor --config /etc/hermetic/grader/run.json
+--result-disk /dev/vdb` with an empty environment, bounded by a 4-hour backstop;
+write `grader-init SECONDS done|failed`; sync; end the VM. Any failure ends the VM.
+The end is `reboot(RESTART)`: with `reboot=k` Firecracker exits on the i8042 reset,
+while `reboot(POWER_OFF)` only halts the sealed kernel and leaves Firecracker running.
+It opens no vsock and configures no network. Execd-only `hermetic.*` options
+are ignored by the grader; the clock option follows the same strict rule.
+
 ## Run spec
 
 All fields are required; unknown fields, including resource fields, and duplicate
