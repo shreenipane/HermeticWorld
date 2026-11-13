@@ -3,6 +3,8 @@ mod support;
 use hermetic_vmm::{api, deadline, runner::Runner, Error, Result, Vmm};
 use serde::Deserialize;
 use std::io::Write;
+#[cfg(feature = "dev-unjailed")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -229,6 +231,98 @@ fn boots_guest_and_reads_guest_clock() {
     #[cfg(not(feature = "dev-unjailed"))]
     {
         eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
+    }
+}
+/// The guest serial line `grader-init SECONDS clock`, printed right after the
+/// grader PID 1 sets the clock.
+fn grader_clock_line(serial: &[u8]) -> Option<u64> {
+    String::from_utf8_lossy(serial).lines().find_map(|line| {
+        let mut words = line.trim_end_matches('\r').split(' ');
+        match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("grader-init"), Some(t), Some("clock"), None) => t.parse().ok(),
+            _ => None,
+        }
+    })
+}
+#[test]
+fn grader_clock_line_is_strict() {
+    assert_eq!(
+        grader_clock_line(b"[ 0.1] x\r\ngrader-init 1700000000 clock\r\n"),
+        Some(T_CLOCK)
+    );
+    for bad in [
+        &b"grader-init 1700000000 done\n"[..],
+        b"x grader-init 1700000000 clock\n",
+        b"grader-init 17x clock\n",
+        b"grader-init 1700000000 clock extra\n",
+    ] {
+        assert_eq!(grader_clock_line(bad), None);
+    }
+}
+/// Boots a grader image with `init=/sbin/hermetic-grader-init` (no vsock, no
+/// network), waits for the guest to power off, checks the guest clock line and
+/// copies the 1 MiB result drive to HERMETIC_GRADER_RESULT_OUT for the host verdict.
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and a grader image; see README"]
+fn boots_grader_and_collects_result_drive() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        let mut vars = Vec::new();
+        for name in [
+            "HERMETIC_FC_BIN",
+            "HERMETIC_KERNEL",
+            "HERMETIC_GRADER_ROOTFS",
+            "HERMETIC_GRADER_RESULT_OUT",
+        ] {
+            match std::env::var(name) {
+                Ok(value) => vars.push(value),
+                Err(_) => {
+                    eprintln!("skipped: set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_GRADER_ROOTFS and HERMETIC_GRADER_RESULT_OUT");
+                    return;
+                }
+            }
+        }
+        let mut f = support::Fixture::grader();
+        f.spec.jail.firecracker = vars[0].clone();
+        f.spec.kernel_image = vars[1].clone();
+        f.spec.root_drive.path = vars[2].clone();
+        f.spec.reserved_drives.clear();
+        f.spec.memory_mib = 1024;
+        f.spec.boot_args = concat!(
+            "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda ",
+            "init=/sbin/hermetic-grader-init clocksource=tsc tsc=reliable ",
+            "hermetic.t=1700000000 ro"
+        )
+        .into();
+        let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+        let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+        vm.prepare(Duration::from_secs(120)).unwrap();
+        vm.start(Duration::from_secs(10)).unwrap();
+        vm.wait_ready(Duration::from_secs(30)).unwrap();
+        vm.wait_exit(Duration::from_secs(300))
+            .expect("grader VM did not power off");
+        let serial = vm.runner().serial();
+        let guest = grader_clock_line(&serial).expect("grader-init clock line on serial");
+        eprintln!("grader serial: grader-init clock={guest}");
+        assert!(
+            guest >= T_CLOCK && guest - T_CLOCK <= CLOCK_TOLERANCE_SECONDS,
+            "grader clock outside T_clock tolerance"
+        );
+        let drive = vm.jail().unwrap().root.descriptor_path("drive-result");
+        let image = std::fs::read(drive).unwrap();
+        assert_eq!(image.len(), 1024 * 1024);
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&vars[3])
+            .unwrap();
+        out.write_all(&image).unwrap();
+        vm.destroy(Duration::from_secs(10)).unwrap();
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: build with --features dev-unjailed");
     }
 }
 #[test]

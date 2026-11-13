@@ -129,6 +129,10 @@ pub fn project_mac(role: Role, index: usize) -> String {
     };
     format!("02:48:57:{role:02x}:00:{index:02x}")
 }
+/// Id of the GraderVM's only writable drive (guest `/dev/vdb`).
+pub const GRADER_RESULT_DRIVE: &str = "result";
+/// Exact size of the GraderVM result drive (HGRD image).
+pub const GRADER_RESULT_BYTES: u64 = 1024 * 1024;
 pub fn validate_boot_args(args: &str) -> Result<()> {
     if args.len() > MAX_BOOT_ARGS
         || args.is_empty()
@@ -268,6 +272,20 @@ impl VmSpec {
                 .any(|d| d.id == "overlay" && !d.read_only)
         {
             return Err(Error::Validation("AgentVM requires writable overlay"));
+        }
+        // GraderVM layout: sealed read-only root (vda), then exactly one writable
+        // drive, `result` (vdb, GRADER_RESULT_BYTES), first among further drives so
+        // its guest name is fixed; every other further drive is read-only.
+        if self.role == Role::Grader
+            && (self
+                .drives
+                .first()
+                .is_none_or(|d| d.id != GRADER_RESULT_DRIVE || d.read_only)
+                || self.drives.iter().skip(1).any(|d| !d.read_only))
+        {
+            return Err(Error::Validation(
+                "GraderVM requires writable result drive first and read-only others",
+            ));
         }
         if matches!(self.role, Role::Extractor | Role::Grader) && !self.networks.is_empty() {
             return Err(Error::Validation("isolated role cannot have network"));

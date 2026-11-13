@@ -4,6 +4,7 @@
 pub mod boot;
 pub mod early;
 pub mod fs;
+pub mod grader;
 pub mod real;
 pub mod rpc;
 pub mod spec;

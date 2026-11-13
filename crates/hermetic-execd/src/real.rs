@@ -132,7 +132,18 @@ fn mount(source: &str, target: &str, kind: &str, data: Option<&str>) -> Result<(
 fn fd_path(fd: &impl AsRawFd) -> String {
     format!("/proc/self/fd/{}", fd.as_raw_fd())
 }
-fn now() -> i64 {
+/// Sets CLOCK_REALTIME to whole seconds. Shared with the grader PID 1.
+pub fn set_realtime(clock: i64) -> Result<()> {
+    rustix::time::clock_settime(
+        rustix::time::ClockId::Realtime,
+        rustix::time::Timespec {
+            tv_sec: clock,
+            tv_nsec: 0,
+        },
+    )?;
+    Ok(())
+}
+pub fn now() -> i64 {
     rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec
 }
 fn nonblock(file: &File) -> Result<()> {
@@ -507,13 +518,7 @@ impl Sys for Linux {
     fn effect(&mut self, effect: Effect) -> Result<()> {
         match effect {
             Effect::Clock(clock) => {
-                rustix::time::clock_settime(
-                    rustix::time::ClockId::Realtime,
-                    rustix::time::Timespec {
-                        tv_sec: clock,
-                        tv_nsec: 0,
-                    },
-                )?;
+                set_realtime(clock)?;
                 self.guest_clock_set = true;
                 self.root = Some(Root::open_root("/")?);
             }

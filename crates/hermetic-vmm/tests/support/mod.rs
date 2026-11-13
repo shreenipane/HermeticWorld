@@ -29,6 +29,12 @@ pub fn spec(role: Role) -> VmSpec {
                 path: "/images/overlay".into(),
                 read_only: false,
             }]
+        } else if role == Role::Grader {
+            vec![Drive {
+                id: "result".into(),
+                path: "/images/result".into(),
+                read_only: false,
+            }]
         } else {
             vec![]
         },
@@ -107,6 +113,22 @@ impl Fixture {
         s.drives[0].path = overlay.to_str().unwrap().into();
         s.jail.base = base.to_str().unwrap().into();
         Self { temp, spec: s }
+    }
+    /// GraderVM fixture: read-only root, 1 MiB writable `result` drive, no
+    /// network, no vsock.
+    pub fn grader() -> Self {
+        let mut f = Self::new();
+        f.spec.role = Role::Grader;
+        f.spec.vsock = None;
+        f.spec.networks.clear();
+        f.spec.drives[0].id = "result".into();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&f.spec.drives[0].path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        f
     }
     pub fn root(&self) -> std::path::PathBuf {
         self.temp.path().join("firecracker/vm-0/root")

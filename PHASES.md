@@ -240,6 +240,6 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
 - E5: date evidence at each clock level; 0 outside the substrate at `hidden`.
 
 ### Integration findings, 2026-11-13 (grader path)
-- [ ] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2).
+- [x] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2).
 - [ ] Supervisor isolation: apply the `hermetic-grader-sandbox` plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill.
 - [ ] Extraction format: `hermetic-extract-agent` and the `hermetic-extract` validator implement incompatible "HEXT v1" formats; pick one canonical format, align both sides, add a cross-crate test. Also `patch:.` vs `repo_dir: ""`.
