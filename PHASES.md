@@ -188,8 +188,8 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Open: synchronous filesystem I/O can stall the single RPC loop; needs isolated filesystem workers
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
   - [x] First-cut runtime: PID 1 clock setup, fixed eth0 addresses, table DNS, HTTP filter to persistent serialized WorldServer frames (CID 2 port 5001), ingress/egress service-port filter, forwarding and IPv6 off; offline transport/policy tests
-  - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver in run spec and trusted harness network commands through execd
-  - [ ] Open: automatic eth0 initialization from the AgentVM run spec requires an execd schema/boot change; this cut supplies trusted harness commands and sets the existing resolver field.
+  - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver and network in run spec
+  - [x] Automatic eth0 initialization from the AgentVM run spec: validated IPv4 address/prefix, on-link NetVM gateway and MTU; fixed, bounded trusted busybox commands after clock/root setup and before entrypoint/vsock; fail closed; offline validation/order/failure tests. Network smoke inspects setup instead of supplying harness commands; VM verification remains below.
   - [ ] Open: TLS termination, world-CA private-key delivery at boot and leaf minting (TR-NET-1/3/4); 443 currently dropped
   - [ ] Open: TPROXY (TR-NET-3); first cut owns manifest world addresses as /32s and listens directly on port 80
   - [ ] Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image

@@ -440,7 +440,7 @@ Before PID 1 runs, the kernel's clock holds the fixed CMOS-fallback date. Anythi
 3. Only then does it mount the per-run overlay disk read-write and assemble overlayfs over the read-only base. It moves the kernel's `/dev` (devtmpfs) into the new root, then switches root into it. The overlay disk was itself built with `SOURCE_DATE_EPOCH=T_clock`.
 4. Mount `/proc`, `/sys`, `/dev/pts` and `/dev/shm`, as Docker does. `/tmp` and `/run` stay ordinary directories on the overlay, already stamped at `T_clock`. A memory-backed `/tmp` would vanish with the VM, taking any artifacts written there, and would hold large unpacked builds in VM memory.
 5. Walk `/dev` without crossing mount points and re-stamp every node the kernel created before step 2. Because `/dev` is devtmpfs, this touches memory only and nothing is copied into the overlay.
-6. Apply the run spec (§9.4): environment, working directory, user, the image's entry point if the task needs it.
+6. Apply the run spec (§9.4): environment, working directory, user, resolver and optional eth0 IPv4 address/prefix, NetVM gateway and MTU. Network setup must succeed before starting the image's entry point if the task needs it.
 7. Start the vsock command server.
 
 Whenever a disk the agent has touched is booted again (the fallback for state tasks, §11.4), PID 1 comes from a trusted initramfs, not from that disk.
@@ -517,7 +517,7 @@ The agent itself is newer than every task and can't be installed from the sealed
 
 Benchmarks ship Docker images. A VM isn't a container, so the sealer writes a **run spec** into the manifest and execd applies it.
 
-- **Run spec.** Environment variables, working directory, user and group, entry point and command, declared resources (vCPUs, memory, disk), host name, and a `resolv.conf` pointing at NetVM.
+- **Run spec.** Environment variables, working directory, user and group, entry point and command, declared resources (vCPUs, memory, disk), host name, a `resolv.conf` pointing at NetVM, and optional validated network configuration (eth0 IPv4 address/prefix, on-link NetVM gateway, MTU).
 - **execd as PID 1.** It reaps zombies, forwards signals, allocates a TTY when asked, applies the run spec to every command, and starts the image's entry point as a child when the task needs a long-running service.
 - **Guest kernel.** One kernel for all tasks, with cgroup v2, namespaces, overlayfs and netfilter enabled, so ordinary tooling works. BPF and cgroup BPF are enabled too, because cgroup v2 enforces device rules with a small BPF program (§11.1).
 - **Fidelity risk.** A task whose oracle passes in Docker may fail in the VM. E9 measures this, by cause.

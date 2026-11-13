@@ -327,36 +327,33 @@ fn run() {
         agent_vm.wait_ready(Duration::from_secs(30)).unwrap();
         let socket = agent_vm.jail().unwrap().root.descriptor_path("vsock");
 
-        // Agent-side network config (runtime::agent_commands / hermetic_slice.netvm).
-        for argv in [
-            &[
-                "/bin/busybox",
-                "sysctl",
-                "-w",
-                "net.ipv6.conf.all.disable_ipv6=1",
-            ][..],
-            &["/bin/busybox", "ip", "link", "set", "lo", "up"],
-            &[
-                "/bin/busybox",
-                "ip",
-                "addr",
-                "add",
+        // Readiness now requires execd to apply the run-spec network. These
+        // probes only inspect it; no harness command repairs a missing setup.
+        for (argv, expected) in [
+            (
+                &["/bin/busybox", "ip", "addr", "show", "dev", "eth0"][..],
                 "10.0.2.15/24",
-                "dev",
-                "eth0",
-            ],
-            &["/bin/busybox", "ip", "link", "set", "eth0", "up"],
-            &[
-                "/bin/busybox",
-                "ip",
-                "route",
-                "add",
-                "default",
-                "via",
-                "10.0.2.3",
-                "dev",
-                "eth0",
-            ],
+            ),
+            (
+                &["/bin/busybox", "ip", "link", "show", "dev", "eth0"][..],
+                "mtu 1500",
+            ),
+            (
+                &["/bin/busybox", "ip", "route", "show", "default"][..],
+                "default via 10.0.2.3 dev eth0",
+            ),
+            (
+                &["/bin/busybox", "sysctl", "net.ipv6.conf.all.disable_ipv6"][..],
+                "net.ipv6.conf.all.disable_ipv6 = 1",
+            ),
+            (
+                &[
+                    "/bin/busybox",
+                    "sysctl",
+                    "net.ipv6.conf.default.disable_ipv6",
+                ][..],
+                "net.ipv6.conf.default.disable_ipv6 = 1",
+            ),
         ] {
             let r = exec(&socket, argv);
             assert_eq!(
@@ -365,6 +362,7 @@ fn run() {
                 "{argv:?}: {:?}",
                 String::from_utf8_lossy(&r.output)
             );
+            assert!(String::from_utf8_lossy(&r.output).contains(expected));
         }
         // Let the NetVM finish its boot (it binds after eth0 is up).
         let ready = Instant::now() + Duration::from_secs(20);

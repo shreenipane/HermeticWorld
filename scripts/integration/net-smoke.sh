@@ -68,7 +68,7 @@ rm -rf "$WORK/store" "$WORK/world-log"; cp -r "$FIX/store" "$WORK/store"
 find "$WORK/store" -type d -exec chmod 0700 {} +; find "$WORK/store" -type f -exec chmod 0600 {} +
 mkdir -m 0700 "$WORK/world-log"
 
-# 3. AgentVM rootfs: execd + early-proc shim + static busybox; resolv.conf points at NetVM.
+# 3. AgentVM rootfs: execd configures eth0 and the resolver before readiness.
 TREE="$WORK/agent-tree"; rm -rf "$TREE"
 for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
          mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
@@ -78,6 +78,7 @@ install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
 {"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,
  "entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.2.3\noptions ndots:0\n",
+ "network":{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500},
  "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}
 JSON
 find "$TREE" -exec touch -h -d @$T {} +

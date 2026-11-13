@@ -75,11 +75,12 @@ fixed x86-64 filter-table ABI. Every other new runtime module forbids unsafe cod
 
 
 For AgentVM, install `runtime::RESOLV_CONF` in the run spec's `resolv_conf` field;
-execd publishes it as a regular file. Before starting the agent, the trusted
-harness runs `runtime::agent_commands()` through execd as root (equivalently
-`hermetic_slice.netvm.AGENT_NETWORK_COMMANDS`): static eth0 address, IPv6 off,
-and the sole default route via NetVM. These root commands belong to trusted
-harness setup; the existing run-spec schema has no network-effect field.
+execd publishes it as a regular file. Set the execd run spec's `network` to
+`{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500}`.
+Execd configures eth0, disables IPv6 and installs the default route via NetVM
+before starting the entrypoint or command server. `runtime::agent_commands()`
+and `hermetic_slice.netvm.AGENT_NETWORK_COMMANDS` remain legacy harness helpers;
+the two-VM smoke relies entirely on the run spec.
 
 TLS termination, CA-key boot delivery, TPROXY and dm-verity remain open in
 PHASES.md. The first cut serves plain HTTP only; port 443 is dropped. See

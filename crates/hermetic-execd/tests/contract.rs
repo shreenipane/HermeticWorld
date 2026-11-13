@@ -3,7 +3,7 @@ use hermetic_execd::{
     fs::Root,
     real::{serial_failure, stamp_dev, DeadlineStream},
     rpc::{self, ExecReply, Listener, Reply, Request, Server},
-    spec::{self, RunSpec},
+    spec::{self, RunSpec, MAX_NETWORK_MTU, MIN_NETWORK_MTU},
     *,
 };
 use std::{
@@ -30,6 +30,7 @@ struct Fake {
     fail: Option<usize>,
     steps: usize,
     invalid_spec: bool,
+    network: Option<spec::Network>,
     caps: Vec<usize>,
     commands: Vec<(RunSpec, Vec<String>, bool, u64)>,
     reaped: usize,
@@ -80,6 +81,7 @@ impl Sys for Fake {
     fn load_spec(&mut self, path: &str) -> Result<RunSpec> {
         self.record(format!("load:{path}"))?;
         let mut spec = spec();
+        spec.network = self.network.clone();
         if self.invalid_spec {
             spec.workdir = "/work/../escape".into();
         }
@@ -88,6 +90,11 @@ impl Sys for Fake {
     fn apply(&mut self, spec: &RunSpec) -> Result<()> {
         spec.validate()?;
         self.effect(Effect::ApplySpec)
+    }
+    fn configure_network(&mut self, spec: &RunSpec) -> Result<()> {
+        network::configure(spec, |setup, argv| {
+            self.execute(setup, argv, false, network::NETWORK_COMMAND_TIMEOUT_MS, 0)
+        })
     }
     fn start_entrypoint(&mut self, spec: &RunSpec) -> Result<()> {
         self.record(format!("entry:{:?}", spec.initial_argv()))?;
@@ -1059,4 +1066,321 @@ fn binary_refuses_host_boot_and_non_utf8_or_extra_helper_arguments_silently() {
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
     }
+}
+
+fn network_spec() -> spec::Network {
+    spec::Network {
+        address: "10.0.2.15".parse().unwrap(),
+        prefix: 24,
+        gateway: "10.0.2.3".parse().unwrap(),
+        mtu: 1500,
+    }
+}
+
+#[test]
+fn network_spec_strict_schema_subnet_hosts_and_numeric_caps() {
+    let network = network_spec();
+    let mut s = spec();
+    s.network = Some(network.clone());
+    let json = serde_json::to_vec(&s).unwrap();
+    assert_eq!(RunSpec::parse(json.as_slice()).unwrap(), s);
+    // Existing networkless specs still round-trip byte-for-byte apart from the
+    // established sorted environment order.
+    assert_eq!(spec().network, None);
+    let mut networkless = serde_json::to_value(spec()).unwrap();
+    networkless["network"] = serde_json::Value::Null;
+    assert_eq!(
+        RunSpec::parse(networkless.to_string().as_bytes()).unwrap(),
+        spec()
+    );
+    for prefix in [0, 31, 32, 33, u8::MAX] {
+        let mut bad = network.clone();
+        bad.prefix = prefix;
+        assert_eq!(bad.validate(), Err(Error::InvalidInput));
+    }
+    for mtu in [0, MIN_NETWORK_MTU - 1, MAX_NETWORK_MTU + 1, u16::MAX] {
+        let mut bad = network.clone();
+        bad.mtu = mtu;
+        assert_eq!(bad.validate(), Err(Error::InvalidInput));
+    }
+    for (address, gateway) in [
+        ("10.0.2.15", "10.0.3.3"), // off-link NetVM
+        ("10.0.2.15", "10.0.2.15"),
+        ("10.0.2.0", "10.0.2.3"),
+        ("10.0.2.255", "10.0.2.3"),
+        ("10.0.2.15", "10.0.2.0"),
+        ("10.0.2.15", "10.0.2.255"),
+        ("0.0.0.0", "10.0.2.3"),
+        ("127.0.0.1", "127.0.0.2"),
+        ("169.254.1.1", "169.254.1.2"),
+        ("224.0.0.1", "224.0.0.2"),
+        ("255.255.255.255", "10.0.2.3"),
+        ("8.8.8.8", "8.8.8.9"),
+        ("10.0.2.15", "8.8.8.8"),
+    ] {
+        let bad = spec::Network {
+            address: address.parse().unwrap(),
+            gateway: gateway.parse().unwrap(),
+            ..network.clone()
+        };
+        assert_eq!(bad.validate(), Err(Error::InvalidInput), "{bad:?}");
+    }
+    for (prefix, mtu) in [(1, MIN_NETWORK_MTU), (30, MAX_NETWORK_MTU)] {
+        let valid = spec::Network {
+            address: "10.0.0.1".parse().unwrap(),
+            gateway: "10.0.0.2".parse().unwrap(),
+            prefix,
+            mtu,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+    }
+    let mut document = serde_json::to_value(&s).unwrap();
+    let good = document["network"].clone();
+    for bad in [
+        r#"{}"#,
+        r#"{"address":"10.0.2.15","prefix":24,"gateway":"10.0.2.3","mtu":1500,"interface":"host0"}"#,
+        r#"{"address":"10.0.2.15","address":"10.0.2.16","prefix":24,"gateway":"10.0.2.3","mtu":1500}"#,
+        r#"{"address":"10.0.2.15/24","prefix":24,"gateway":"10.0.2.3","mtu":1500}"#,
+    ] {
+        // Preserve duplicate keys so the actual deserializer sees them.
+        let encoded = String::from_utf8(json.clone()).unwrap();
+        let original = serde_json::to_string(&good).unwrap();
+        let value_order = serde_json::to_string(&document).unwrap();
+        assert!(encoded.contains("network"));
+        assert!(RunSpec::parse(value_order.replace(&original, bad).as_bytes()).is_err());
+    }
+    for (key, values) in [
+        (
+            "address",
+            vec![
+                serde_json::json!("::1"),
+                serde_json::json!("10.0.2.15;reboot"),
+                serde_json::json!("010.0.2.15"),
+                serde_json::json!("x".repeat(MAX_SPEC)),
+            ],
+        ),
+        (
+            "gateway",
+            vec![
+                serde_json::json!("10.0.2.3\nsecret"),
+                serde_json::json!("-1"),
+                serde_json::json!(123),
+            ],
+        ),
+        (
+            "prefix",
+            vec![
+                serde_json::json!(-1),
+                serde_json::json!(256),
+                serde_json::json!(1.5),
+                serde_json::json!("24"),
+            ],
+        ),
+        (
+            "mtu",
+            vec![
+                serde_json::json!(-1),
+                serde_json::json!(65536),
+                serde_json::json!(1.5),
+                serde_json::json!("1500"),
+            ],
+        ),
+    ] {
+        for value in values {
+            document["network"] = good.clone();
+            document["network"][key] = value;
+            assert!(RunSpec::parse(document.to_string().as_bytes()).is_err());
+        }
+    }
+}
+
+#[test]
+fn network_boot_order_fixed_argv_root_environment_and_every_failure() {
+    let expected_commands = [
+        "sysctl -w net.ipv6.conf.all.disable_ipv6=1",
+        "sysctl -w net.ipv6.conf.default.disable_ipv6=1",
+        "ip link set lo up",
+        "ip link set dev eth0 mtu 1500",
+        "ip addr add 10.0.2.15/24 dev eth0",
+        "ip link set dev eth0 up",
+        "ip route add default via 10.0.2.3 dev eth0",
+    ];
+    for initramfs in [false, true] {
+        let mut fake = Fake {
+            network: Some(network_spec()),
+            ..Fake::default()
+        };
+        let booted = boot::boot(
+            &mut fake,
+            &Config {
+                initramfs,
+                ..config()
+            },
+        )
+        .unwrap();
+        assert_eq!(booted.locked, initramfs);
+        let mut expected = boot_answer();
+        let apply = expected.iter().position(|e| e == "ApplySpec").unwrap();
+        expected.splice(
+            apply + 1..apply + 1,
+            vec!["exec".to_owned(); expected_commands.len()],
+        );
+        if initramfs {
+            expected.insert(1, "MountBaseReadOnly".into());
+            expected.retain(|e| !e.starts_with("entry:"));
+        }
+        assert_eq!(fake.events, expected);
+        assert_eq!(fake.commands.len(), expected_commands.len());
+        for ((setup, argv, tty, timeout), args) in fake.commands.iter().zip(expected_commands) {
+            assert_eq!(
+                argv,
+                &std::iter::once("/bin/busybox")
+                    .chain(args.split(' '))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!((setup.uid, setup.gid), (0, 0));
+            assert_eq!(setup.workdir, "/");
+            assert!(setup.env.is_empty());
+            assert!(setup.initial_argv().is_empty());
+            assert_eq!(setup.resources.memory_mib, network::NETWORK_MEMORY_MIB);
+            assert!(!tty);
+            assert_eq!(*timeout, network::NETWORK_COMMAND_TIMEOUT_MS);
+        }
+        assert_eq!(fake.caps, vec![0; expected_commands.len()]);
+        // Every applet failure powers off, without an entrypoint or listener.
+        let first = expected.iter().position(|e| e == "exec").unwrap();
+        for offset in 0..expected_commands.len() {
+            let mut fake = Fake {
+                network: Some(network_spec()),
+                fail: Some(first + offset),
+                ..Fake::default()
+            };
+            let cmdline = format!(
+                "hermetic.t=1700000000 hermetic.initramfs={}",
+                u8::from(initramfs)
+            );
+            assert!(matches!(
+                boot::start(&mut fake, cmdline.as_bytes()),
+                Err(Error::Io)
+            ));
+            let mut prefix = expected[..=first + offset].to_vec();
+            prefix.push("PowerOff(Io)".into());
+            assert_eq!(fake.events, prefix);
+        }
+    }
+}
+
+#[test]
+fn network_validates_before_commands_and_rejects_failure_signal_and_timeout() {
+    let mut s = spec();
+    s.network = Some(network_spec());
+    for bad_reply in [
+        ExecReply {
+            code: Some(1),
+            output: b"secret".to_vec(),
+            truncated: false,
+            timed_out: false,
+        },
+        ExecReply {
+            code: None,
+            output: Vec::new(),
+            truncated: false,
+            timed_out: false,
+        },
+        ExecReply {
+            code: Some(0),
+            output: Vec::new(),
+            truncated: false,
+            timed_out: true,
+        },
+    ] {
+        for fail in 0..7 {
+            let mut calls = 0;
+            let result = network::configure(&s, |_, _| {
+                let reply = if calls == fail {
+                    bad_reply.clone()
+                } else {
+                    ExecReply {
+                        code: Some(0),
+                        output: Vec::new(),
+                        truncated: false,
+                        timed_out: false,
+                    }
+                };
+                calls += 1;
+                Ok(reply)
+            });
+            assert_eq!(result, Err(Error::Network));
+            assert_eq!(calls, fail + 1);
+            assert_eq!(result.unwrap_err().to_string(), "Network");
+        }
+    }
+    s.network.as_mut().unwrap().prefix = u8::MAX;
+    assert_eq!(
+        network::configure(&s, |_, _| panic!("invalid network must have no effects")),
+        Err(Error::InvalidInput)
+    );
+    s.network = Some(network_spec());
+    s.workdir = "/bad/../path".into();
+    assert_eq!(
+        network::configure(&s, |_, _| panic!("validate the whole spec first")),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        network::configure(&spec(), |_, _| panic!(
+            "networkless boot must not run applets"
+        )),
+        Ok(())
+    );
+    let mut fake = Fake {
+        network: Some(spec::Network {
+            prefix: 255,
+            ..network_spec()
+        }),
+        ..Fake::default()
+    };
+    assert!(matches!(
+        boot::start(&mut fake, b"hermetic.t=1700000000".as_slice()),
+        Err(Error::InvalidInput)
+    ));
+    assert_eq!(fake.events.last().unwrap(), "PowerOff(InvalidInput)");
+    assert!(!fake.events.iter().any(|e| e == "ApplySpec"
+        || e == "exec"
+        || e.starts_with("entry:")
+        || e.starts_with("Listen")));
+}
+
+#[test]
+fn network_argv_uses_declared_address_prefix_gateway_and_mtu() {
+    let mut s = spec();
+    s.network = Some(spec::Network {
+        address: "172.16.1.19".parse().unwrap(),
+        prefix: 20,
+        gateway: "172.16.0.2".parse().unwrap(),
+        mtu: 576,
+    });
+    let mut calls = Vec::new();
+    network::configure(&s, |_, argv| {
+        calls.push(argv.join(" "));
+        Ok(ExecReply {
+            code: Some(0),
+            output: Vec::new(),
+            truncated: false,
+            timed_out: false,
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        calls,
+        [
+            "/bin/busybox sysctl -w net.ipv6.conf.all.disable_ipv6=1",
+            "/bin/busybox sysctl -w net.ipv6.conf.default.disable_ipv6=1",
+            "/bin/busybox ip link set lo up",
+            "/bin/busybox ip link set dev eth0 mtu 576",
+            "/bin/busybox ip addr add 172.16.1.19/20 dev eth0",
+            "/bin/busybox ip link set dev eth0 up",
+            "/bin/busybox ip route add default via 172.16.0.2 dev eth0",
+        ]
+    );
 }
