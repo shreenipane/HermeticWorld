@@ -76,32 +76,93 @@ fn split_host_and_port(raw_host: &str) -> Result<(String, Option<u16>), &'static
     }
 }
 
-fn filter_accept_encoding(headers: &[Header]) -> Option<String> {
-    let mut kept: Vec<&'static str> = Vec::new();
-    let mut seen_identity = false;
-    let mut seen_gzip = false;
-
-    for h in headers.iter().filter(|h| h.name == "accept-encoding") {
-        for (idx, part) in h.value.split(',').enumerate() {
-            if idx >= MAX_ACCEPT_ENCODING_TOKENS {
-                break;
+fn filter_accept_encoding(headers: &[Header]) -> Result<Option<String>, &'static str> {
+    let Some(header) = headers.iter().find(|h| h.name == "accept-encoding") else {
+        return Ok(None);
+    };
+    if header.value.is_empty() {
+        return Ok(Some("identity".to_owned()));
+    }
+    let mut seen = BTreeSet::new();
+    let mut kept = Vec::new();
+    let mut identity = None;
+    let mut gzip = None;
+    let mut wildcard = None;
+    for (idx, part) in header.value.split(',').enumerate() {
+        if idx >= MAX_ACCEPT_ENCODING_TOKENS {
+            return Err("too_many_accept_encoding_tokens");
+        }
+        let mut fields = part.trim().split(';');
+        let coding = fields
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if coding.is_empty()
+            || !coding.bytes().all(crate::parse::is_tchar)
+            || !seen.insert(coding.clone())
+        {
+            return Err("invalid_accept_encoding");
+        }
+        let acceptable = if let Some(parameter) = fields.next() {
+            let (name, value) = parameter
+                .trim()
+                .split_once('=')
+                .ok_or("invalid_accept_encoding")?;
+            let mut number = value.split('.');
+            let whole = number.next().unwrap_or_default();
+            let fraction = number.next();
+            if !name.eq_ignore_ascii_case("q")
+                || !matches!(whole, "0" | "1")
+                || number.next().is_some()
+                || fields.next().is_some()
+                || fraction.is_some_and(|f| {
+                    f.len() > 3
+                        || !f.bytes().all(|b| b.is_ascii_digit())
+                        || (whole == "1" && f.bytes().any(|b| b != b'0'))
+                })
+            {
+                return Err("invalid_accept_encoding");
             }
-            let coding = part.split(';').next().unwrap_or("").trim();
-            if coding.eq_ignore_ascii_case("identity") && !seen_identity {
-                seen_identity = true;
-                kept.push("identity");
-            } else if coding.eq_ignore_ascii_case("gzip") && !seen_gzip {
-                seen_gzip = true;
-                kept.push("gzip");
-            }
+            whole == "1" || fraction.is_some_and(|f| f.bytes().any(|b| b != b'0'))
+        } else {
+            true
+        };
+        match coding.as_str() {
+            "identity" => identity = Some(acceptable),
+            "gzip" => gzip = Some(acceptable),
+            "*" => wildcard = Some(acceptable),
+            _ => continue,
+        }
+        if coding != "*" {
+            kept.push(if acceptable {
+                coding
+            } else {
+                format!("{coding};q=0")
+            });
         }
     }
-
-    if kept.is_empty() {
-        None
-    } else {
-        Some(kept.join(", "))
+    // Unsupported codings are removed, but explicit exclusions must survive filtering.
+    if wildcard == Some(false) {
+        if identity.is_none() {
+            kept.push("identity;q=0".to_owned());
+        }
+        if gzip.is_none() {
+            kept.push("gzip;q=0".to_owned());
+        }
     }
+    let identity_ok = identity.unwrap_or(wildcard != Some(false));
+    let gzip_ok = gzip.unwrap_or(wildcard == Some(true));
+    if !identity_ok && !gzip_ok {
+        return Err("no_acceptable_encoding");
+    }
+    if identity_ok && identity.is_none() {
+        kept.push("identity".to_owned());
+    }
+    if gzip_ok && gzip.is_none() {
+        kept.push("gzip".to_owned());
+    }
+    Ok(Some(kept.join(", ")))
 }
 
 /// Validates a single byte range of the exact form `bytes=a-b` where `a` and `b` are ASCII digits
@@ -157,6 +218,34 @@ pub fn decide(head: &RequestHead, allowed_hosts: &BTreeSet<String>, scheme: Sche
         return Decision::MethodNotAllowed;
     }
 
+    let expected_scheme = match scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    if head
+        .target
+        .authority_scheme
+        .as_deref()
+        .is_some_and(|s| s != expected_scheme)
+    {
+        return Decision::Reject("scheme_mismatch".to_owned());
+    }
+    let mut seen = BTreeSet::new();
+    for header in &head.headers {
+        if matches!(
+            header.name.as_str(),
+            "accept"
+                | "accept-encoding"
+                | "range"
+                | "if-none-match"
+                | "if-modified-since"
+                | "user-agent"
+        ) && !seen.insert(&header.name)
+        {
+            return Decision::Reject("duplicate_forward_header".to_owned());
+        }
+    }
+
     let raw_host = match head.headers.iter().find(|h| h.name == "host") {
         Some(h) => h.value.as_str(),
         None => return Decision::Reject("missing_host".to_owned()),
@@ -188,7 +277,11 @@ pub fn decide(head: &RequestHead, allowed_hosts: &BTreeSet<String>, scheme: Sche
         });
     }
     // 2. accept-encoding (only identity or gzip)
-    if let Some(val) = filter_accept_encoding(&head.headers) {
+    let encoding = match filter_accept_encoding(&head.headers) {
+        Ok(value) => value,
+        Err(reason) => return Decision::Reject(reason.to_owned()),
+    };
+    if let Some(val) = encoding {
         out_headers.push(ForwardHeader {
             name: "accept-encoding".to_owned(),
             value: val,

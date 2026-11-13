@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import configparser
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import os
@@ -15,6 +16,12 @@ MAX_DIR_ENTRIES: int = 50_000
 MAX_SCAN_DIRS: int = 64
 MAX_HEADER_LINES: int = 20_000
 MAX_PEP440_SEGMENTS: int = 32
+MAX_VERSION_BYTES: int = 128
+MAX_PATH_BYTES: int = 4096
+MAX_DISTRIBUTIONS: int = 4096
+MAX_TOTAL_READ_BYTES: int = 64 * 1024 * 1024
+MAX_TOTAL_PLUGINS: int = 4096
+READ_CHUNK_BYTES: int = 65536
 
 _PEP503_NORMALIZE_RE = re.compile(r"[-_.]+")
 _PEP440_RE = re.compile(
@@ -29,12 +36,16 @@ _PEP440_RE = re.compile(
     (?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?
     $
     """,
-    re.VERBOSE | re.IGNORECASE,
+    re.VERBOSE | re.IGNORECASE | re.ASCII,
 )
 
 
 class ScanError(Exception):
     """Typed error raised on invalid scanner inputs or fatal directory errors."""
+
+
+class _AbsentFile(FileNotFoundError):
+    """Only an absent initial directory entry, never a subsequent open failure."""
 
 
 @dataclass(frozen=True)
@@ -45,39 +56,30 @@ class Pep440Version:
     post: int | None
     dev: int | None
 
+    local: tuple[str | int, ...] | None = None
+
     def sort_key(self) -> tuple[Any, ...]:
-        # PEP 440 ordering:
-        # dev-only < pre < pre+post < pre+dev < final < post
         rel = self.release
-        # Strip trailing zeros for comparison
         while len(rel) > 1 and rel[-1] == 0:
             rel = rel[:-1]
-
+        # Each component is compared independently, including post+dev on a prerelease.
         if self.pre is None and self.post is None and self.dev is not None:
-            pre_key: tuple[Any, ...] = (0, self.dev)
-        elif self.pre is not None:
-            pre_order = {"a": 0, "b": 1, "rc": 2}[self.pre[0]]
-            if self.dev is not None:
-                sub = (0, self.dev)
-            elif self.post is not None:
-                sub = (2, self.post)
-            else:
-                sub = (1, 0)
-            pre_key = (1, pre_order, self.pre[1], sub)
-        elif self.post is not None:
-            if self.dev is not None:
-                pre_key = (3, self.post, 0, self.dev)
-            else:
-                pre_key = (3, self.post, 1, 0)
+            pre_key = (0,)
+        elif self.pre is None:
+            pre_key = (2,)
         else:
-            pre_key = (2, 0)
-
-        return (self.epoch, rel, pre_key)
+            pre_key = (1, {"a": 0, "b": 1, "rc": 2}[self.pre[0]], self.pre[1])
+        post_key = (0,) if self.post is None else (1, self.post)
+        dev_key = (1,) if self.dev is None else (0, self.dev)
+        local_key = () if self.local is None else tuple(
+            (1, part) if isinstance(part, int) else (0, part) for part in self.local
+        )
+        return (self.epoch, rel, pre_key, post_key, dev_key, local_key)
 
 
 def parse_pep440(raw: str) -> Pep440Version | None:
     s = raw.strip()
-    if not s or len(s) > 128:
+    if not s or len(s) > MAX_VERSION_BYTES:
         return None
     m = _PEP440_RE.match(s)
     if not m:
@@ -120,7 +122,12 @@ def parse_pep440(raw: str) -> Pep440Version | None:
     if m.group("dev") is not None:
         dev = int(m.group("dev_n")) if m.group("dev_n") is not None else 0
 
-    return Pep440Version(epoch=epoch, release=release, pre=pre, post=post, dev=dev)
+    local_raw = m.group("local")
+    local = None if local_raw is None else tuple(
+        int(part) if part.isascii() and part.isdigit() else part.lower()
+        for part in re.split(r"[-_.]", local_raw)
+    )
+    return Pep440Version(epoch=epoch, release=release, pre=pre, post=post, dev=dev, local=local)
 
 
 def normalize_pep503(name: str) -> str:
@@ -137,9 +144,7 @@ class Inventory:
     unparsable: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        # Note: conftest.py-style plugin declarations are out of scope for static
-        # site-packages metadata scanning and are disabled at runtime via
-        # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1.
+        # conftest.py declarations are outside static site-packages scanning.
         sorted_plugins = sorted(
             self.plugins,
             key=lambda p: (p["distribution"], p["name"], p["module"]),
@@ -171,34 +176,92 @@ class Inventory:
         return json.dumps(self.to_dict(), sort_keys=True, indent=2)
 
 
-def _read_regular_file_capped(path: str, cap: int) -> bytes:
-    """Opens and reads a regular file without following symlinks and enforces a hard size cap."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags)
+def _same_file(before: os.stat_result, after: os.stat_result) -> bool:
+    return (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+
+
+def _same_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
+    return _same_file(before, after) and (
+        before.st_size, before.st_mtime_ns, before.st_ctime_ns
+    ) == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+
+
+@contextmanager
+def _directory_at(name: str, parent_fd: int | None = None):
+    before = os.lstat(name, dir_fd=parent_fd)
+    if stat.S_ISLNK(before.st_mode):
+        raise ValueError("symlink_refused")
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError("not_a_directory")
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 dir_fd=parent_fd)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError("not_regular_file")
-        if st.st_size > cap:
-            raise ValueError("file_too_large")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            to_read = min(65536, cap + 1 - total)
-            if to_read <= 0:
-                raise ValueError("file_too_large")
-            data = os.read(fd, to_read)
-            if not data:
-                break
-            total += len(data)
-            if total > cap:
-                raise ValueError("file_too_large")
-            chunks.append(data)
-        return b"".join(chunks)
+        if not _same_file(before, os.fstat(fd)):
+            raise ValueError("directory_changed")
+        yield fd
     finally:
         os.close(fd)
+
+
+@contextmanager
+def _site_directory(path: str):
+    # Walk every component relative to a held descriptor, including the initial root.
+    with _directory_at("/" if os.path.isabs(path) else ".") as root_fd:
+        fd = os.dup(root_fd)
+        try:
+            for part in path.split("/"):
+                if part in ("", "."):
+                    continue
+                with _directory_at(part, fd) as next_fd:
+                    os.close(fd)
+                    fd = os.dup(next_fd)
+            yield fd
+        finally:
+            os.close(fd)
+
+
+def _read_regular_file_capped(path: str, cap: int, *, dir_fd: int, budget: _Budget) -> bytes:
+    try:
+        before = os.lstat(path, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise _AbsentFile from None
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("not_regular_file")
+    if before.st_size > cap:
+        raise ValueError("file_too_large")
+    # O_PATH pins the inode without invoking a device driver or opening a FIFO.
+    pinned_fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        pinned = os.fstat(pinned_fd)
+        if not stat.S_ISREG(pinned.st_mode) or not _same_snapshot(before, pinned):
+            raise ValueError("file_changed")
+        # This kernel descriptor link reopens the pinned regular inode, not the input path.
+        fd = os.open(f"/proc/self/fd/{pinned_fd}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not _same_snapshot(pinned, st):
+                raise ValueError("file_changed")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = MAX_TOTAL_READ_BYTES - budget.read_bytes
+                if remaining <= 0:
+                    raise ScanError("total metadata byte limit exceeded")
+                data = os.read(fd, min(READ_CHUNK_BYTES, cap + 1 - total, remaining))
+                budget.read_bytes += len(data)
+                if not data:
+                    break
+                total += len(data)
+                if total > cap:
+                    raise ValueError("file_too_large")
+                chunks.append(data)
+            if not _same_snapshot(st, os.fstat(fd)):
+                raise ValueError("file_changed")
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pinned_fd)
 
 
 def _parse_rfc822_headers(raw_bytes: bytes) -> dict[str, list[str]]:
@@ -208,7 +271,7 @@ def _parse_rfc822_headers(raw_bytes: bytes) -> dict[str, list[str]]:
     current_key: str | None = None
     current_val_parts: list[str] = []
 
-    lines = text.splitlines()
+    lines = text.replace("\r\n", "\n").split("\n")
     if len(lines) > MAX_HEADER_LINES:
         raise ValueError("too_many_metadata_lines")
 
@@ -216,6 +279,8 @@ def _parse_rfc822_headers(raw_bytes: bytes) -> dict[str, list[str]]:
         if line == "":
             # End of RFC 822 header block (body follows)
             break
+        if any((ord(c) < 32 and c != "\t") or c in "\x7f\x85\u2028\u2029" for c in line):
+            raise ValueError("invalid_metadata_header_character")
         if line[0] in (" ", "\t"):
             if current_key is None:
                 raise ValueError("invalid_continuation_line")
@@ -230,9 +295,9 @@ def _parse_rfc822_headers(raw_bytes: bytes) -> dict[str, list[str]]:
         if ":" not in line:
             raise ValueError("malformed_metadata_header")
         k, v = line.split(":", 1)
-        key = k.strip().lower()
-        if not key:
-            raise ValueError("empty_metadata_header_name")
+        if not re.fullmatch(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+", k):
+            raise ValueError("invalid_metadata_header_name")
+        key = k.lower()
         current_key = key
         current_val_parts = [v.strip()]
 
@@ -244,7 +309,11 @@ def _parse_rfc822_headers(raw_bytes: bytes) -> dict[str, list[str]]:
 
 def _parse_pytest11_entry_points(raw_bytes: bytes) -> list[tuple[str, str]]:
     text = raw_bytes.decode("utf-8", errors="strict")
-    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and not re.fullmatch(r"\[[^\[\]]+\]", stripped):
+            raise ValueError("invalid_entry_point_section")
+    parser = configparser.ConfigParser(interpolation=None, strict=True, delimiters=("=",))
     # Preserve case of entry-point names
     parser.optionxform = lambda optionstr: optionstr  # type: ignore[method-assign]
     parser.read_string(text)
@@ -252,15 +321,37 @@ def _parse_pytest11_entry_points(raw_bytes: bytes) -> list[tuple[str, str]]:
     if not parser.has_section("pytest11"):
         return []
 
+    if parser.defaults():
+        raise ValueError("entry_point_defaults_forbidden")
     results: list[tuple[str, str]] = []
+    module = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    target_pattern = rf"({module}(?:\s*:\s*{module})?)(?:\s*\[\s*[A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*\s*\])?"
     for ep_name, ep_val in parser.items("pytest11"):
         clean_name = ep_name.strip()
-        # Strip optional extras marker `[extra]` from entry point target
-        target = ep_val.split("[", 1)[0].strip()
-        if not clean_name or not target:
+        match = re.fullmatch(target_pattern, ep_val.strip(), flags=re.ASCII)
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", clean_name) or match is None:
             raise ValueError("invalid_pytest11_entry_point")
-        results.append((clean_name, target))
+        results.append((clean_name, re.sub(r"\s+", "", match.group(1))))
     return results
+
+
+@dataclass
+class _Budget:
+    distributions: int = 0
+    read_bytes: int = 0
+    plugins: int = 0
+
+    def read(self, fd: int, name: str, cap: int) -> bytes:
+        remaining = MAX_TOTAL_READ_BYTES - self.read_bytes
+        if remaining <= 0:
+            raise ScanError("total metadata byte limit exceeded")
+        try:
+            data = _read_regular_file_capped(name, min(cap, remaining), dir_fd=fd, budget=self)
+        except ValueError as exc:
+            if str(exc) == "file_too_large" and remaining < cap:
+                raise ScanError("total metadata byte limit exceeded") from None
+            raise
+        return data
 
 
 def scan(site_packages_dirs: list[str]) -> Inventory:
@@ -269,152 +360,103 @@ def scan(site_packages_dirs: list[str]) -> Inventory:
         raise ScanError("site_packages_dirs must be a list of paths")
     if len(site_packages_dirs) > MAX_SCAN_DIRS:
         raise ScanError("too many site_packages_dirs")
+    # Validate the complete request before the first filesystem operation.
+    for path in site_packages_dirs:
+        if not isinstance(path, str) or not path or "\x00" in path or ".." in path.split("/"):
+            raise ScanError("invalid site_packages directory path")
+        try:
+            encoded = os.fsencode(path)
+        except UnicodeError:
+            raise ScanError("invalid site_packages directory path") from None
+        if len(encoded) > MAX_PATH_BYTES:
+            raise ScanError("site_packages directory path too long")
+    if not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_PATH")):
+        raise ScanError("safe filesystem operations unavailable")
 
     inv = Inventory()
-    threshold_3_8 = parse_pep440("3.8.0")
-    assert threshold_3_8 is not None
-
-    pytest_candidates: list[tuple[Pep440Version, str]] = []
-
+    budget = _Budget()
+    seen: dict[str, list[tuple[int, str]]] = {}
+    pytest_candidates: list[tuple[Pep440Version | None, str]] = []
     for dir_idx, site_dir in enumerate(site_packages_dirs):
-        if not isinstance(site_dir, str) or not site_dir or "\x00" in site_dir:
-            raise ScanError("invalid site_packages directory path")
-
         try:
-            dir_st = os.lstat(site_dir)
-        except OSError as exc:
-            raise ScanError(f"cannot access site_packages directory: {exc.strerror or 'error'}") from exc
+            with _site_directory(site_dir) as site_fd:
+                _scan_directory(site_fd, dir_idx, inv, budget, seen, pytest_candidates)
+        except (OSError, ValueError):
+            # OS diagnostics can contain paths and depend on the host's locale.
+            raise ScanError("cannot scan site_packages directory") from None
 
-        if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
-            raise ScanError("site_packages path must be a real directory, not a symlink")
+    for norm_name, entries in sorted(seen.items()):
+        by_dir: dict[int, list[str]] = {}
+        for idx, name in entries:
+            by_dir.setdefault(idx, []).append(name)
+        for idx, names in by_dir.items():
+            if len(names) > 1:
+                inv.conflicts.append({"dir_index": idx, "entries": sorted(names), "normalized_name": norm_name})
+        if len(by_dir) > 1:
+            inv.conflicts.append({"dir_index": min(by_dir), "dir_indices": sorted(by_dir),
+                                  "entries": sorted(name for _, name in entries), "normalized_name": norm_name})
 
-        try:
-            with os.scandir(site_dir) as it:
-                entries = []
-                for idx, entry in enumerate(it):
-                    if idx >= MAX_DIR_ENTRIES:
-                        raise ScanError("site_packages directory exceeds entry limit")
-                    entries.append(entry)
-        except OSError as exc:
-            raise ScanError(f"failed to list site_packages directory: {exc.strerror or 'error'}") from exc
-
-        # Deterministic traversal order
-        entries.sort(key=lambda e: e.name)
-
-        seen_in_dir: dict[str, list[str]] = {}
-
-        for entry in entries:
-            name = entry.name
-            if not (name.endswith(".dist-info") or name.endswith(".egg-info")):
-                continue
-
-            entry_path = os.path.join(site_dir, name)
-            try:
-                is_link = entry.is_symlink()
-                st = os.lstat(entry_path)
-            except OSError:
-                inv.refused.append({"entry": name, "reason": "lstat_failed"})
-                continue
-
-            if is_link or stat.S_ISLNK(st.st_mode):
-                inv.refused.append({"entry": name, "reason": "symlink_refused"})
-                continue
-
-            if not stat.S_ISDIR(st.st_mode):
-                inv.refused.append({"entry": name, "reason": "not_a_directory"})
-                continue
-
-            meta_filename = "METADATA" if name.endswith(".dist-info") else "PKG-INFO"
-            meta_path = os.path.join(entry_path, meta_filename)
-
-            try:
-                meta_bytes = _read_regular_file_capped(meta_path, MAX_METADATA_BYTES)
-                headers = _parse_rfc822_headers(meta_bytes)
-            except (OSError, UnicodeDecodeError, ValueError) as exc:
-                reason = str(exc) if isinstance(exc, ValueError) else "metadata_read_error"
-                inv.refused.append({"entry": name, "reason": reason})
-                continue
-
-            names = headers.get("name", [])
-            versions = headers.get("version", [])
-            if len(names) != 1 or not names[0] or len(versions) != 1 or not versions[0]:
-                inv.refused.append({"entry": name, "reason": "missing_or_duplicate_name_version"})
-                continue
-
-            dist_name = names[0]
-            dist_version_raw = versions[0]
-            norm_name = normalize_pep503(dist_name)
-
-            seen_in_dir.setdefault(norm_name, []).append(name)
-
-            parsed_ver = parse_pep440(dist_version_raw)
-            if parsed_ver is None:
-                inv.unparsable.append(
-                    {
-                        "entry": name,
-                        "reason": "unparsable_pep440_version",
-                        "value": dist_version_raw,
-                    }
-                )
-            elif norm_name == "pytest":
-                pytest_candidates.append((parsed_ver, dist_version_raw))
-
-            ep_path = os.path.join(entry_path, "entry_points.txt")
-            try:
-                ep_st = os.lstat(ep_path)
-            except FileNotFoundError:
-                ep_st = None
-            except OSError:
-                inv.refused.append({"entry": name, "reason": "entry_points_lstat_failed"})
-                continue
-
-            if ep_st is not None:
-                if stat.S_ISLNK(ep_st.st_mode):
-                    inv.refused.append({"entry": name, "reason": "entry_points_symlink_refused"})
-                    continue
-                try:
-                    ep_bytes = _read_regular_file_capped(ep_path, MAX_ENTRY_POINTS_BYTES)
-                    pytest11_eps = _parse_pytest11_entry_points(ep_bytes)
-                except (
-                    OSError,
-                    UnicodeDecodeError,
-                    ValueError,
-                    configparser.Error,
-                ) as exc:
-                    reason = (
-                        str(exc)
-                        if isinstance(exc, ValueError)
-                        else f"entry_points_parse_error:{type(exc).__name__}"
-                    )
-                    inv.refused.append({"entry": name, "reason": reason})
-                    continue
-
-                for ep_name, module_path in pytest11_eps:
-                    inv.plugins.append(
-                        {
-                            "distribution": norm_name,
-                            "module": module_path,
-                            "name": ep_name,
-                            "version": dist_version_raw,
-                        }
-                    )
-
-        for norm_name, dist_entries in seen_in_dir.items():
-            if len(dist_entries) > 1:
-                inv.conflicts.append(
-                    {
-                        "dir_index": dir_idx,
-                        "entries": sorted(dist_entries),
-                        "normalized_name": norm_name,
-                    }
-                )
-
-    if pytest_candidates:
-        # Pick highest-precedence pytest version encountered across site_packages_dirs
-        best_ver, best_raw = max(pytest_candidates, key=lambda item: item[0].sort_key())
-        inv.pytest_version = best_raw
-        inv.pytest_older_than_3_8 = best_ver.sort_key() < threshold_3_8.sort_key()
-
+    # Multiple installations do not identify which pytest will be imported at runtime.
+    if len(pytest_candidates) == 1:
+        version, raw = pytest_candidates[0]
+        if version is not None:
+            inv.pytest_version = raw
+            threshold = Pep440Version(0, (3, 8), None, None, None)
+            inv.pytest_older_than_3_8 = version.sort_key() < threshold.sort_key()
     return inv
 
 
+def _scan_directory(site_fd, dir_idx, inv, budget, seen, pytest_candidates):
+    with os.scandir(site_fd) as it:
+        names = []
+        for idx, entry in enumerate(it):
+            if idx >= MAX_DIR_ENTRIES:
+                raise ScanError("site_packages directory exceeds entry limit")
+            names.append(entry.name)
+    for name in sorted(names):
+        if not name.endswith((".dist-info", ".egg-info")):
+            continue
+        budget.distributions += 1
+        if budget.distributions > MAX_DISTRIBUTIONS:
+            raise ScanError("distribution limit exceeded")
+        try:
+            with _directory_at(name, site_fd) as dist_fd:
+                _scan_distribution(dist_fd, dir_idx, name, inv, budget, seen, pytest_candidates)
+        except UnicodeError:
+            inv.refused.append({"entry": name, "reason": "metadata_decode_error"})
+        except configparser.Error as exc:
+            inv.refused.append({"entry": name, "reason": f"entry_points_parse_error:{type(exc).__name__}"})
+        except ValueError as exc:
+            # All ValueError messages here are fixed codes produced by this module.
+            inv.refused.append({"entry": name, "reason": str(exc)})
+        except OSError:
+            inv.refused.append({"entry": name, "reason": "metadata_read_error"})
+
+
+def _scan_distribution(fd, dir_idx, name, inv, budget, seen, pytest_candidates):
+    meta_name = "METADATA" if name.endswith(".dist-info") else "PKG-INFO"
+    headers = _parse_rfc822_headers(budget.read(fd, meta_name, MAX_METADATA_BYTES))
+    names, versions = headers.get("name", []), headers.get("version", [])
+    if len(names) != 1 or not names[0] or len(versions) != 1 or not versions[0]:
+        raise ValueError("missing_or_duplicate_name_version")
+    dist_name, raw_version = names[0], versions[0]
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", dist_name):
+        raise ValueError("invalid_distribution_name")
+    norm_name = normalize_pep503(dist_name)
+    seen.setdefault(norm_name, []).append((dir_idx, name))
+    version = parse_pep440(raw_version)
+    if version is None:
+        inv.unparsable.append({"entry": name, "reason": "unparsable_pep440_version", "value": raw_version})
+    if norm_name == "pytest":
+        pytest_candidates.append((version, raw_version))
+    try:
+        ep_bytes = budget.read(fd, "entry_points.txt", MAX_ENTRY_POINTS_BYTES)
+    except _AbsentFile:
+        return
+    plugins = _parse_pytest11_entry_points(ep_bytes)
+    budget.plugins += len(plugins)
+    if budget.plugins > MAX_TOTAL_PLUGINS:
+        raise ScanError("plugin limit exceeded")
+    for ep_name, module_path in plugins:
+        inv.plugins.append({"distribution": norm_name, "module": module_path,
+                            "name": ep_name, "version": raw_version})

@@ -23,6 +23,8 @@ pub struct Header {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestTarget {
+    /// Scheme of an absolute-form target; must match the intercepted transport.
+    pub authority_scheme: Option<String>,
     /// Host extracted from absolute-form target (lower-cased), if present.
     pub authority_host: Option<String>,
     /// Optional port extracted from absolute-form target, if present.
@@ -75,6 +77,7 @@ pub enum HttpError {
     HostAuthorityMismatch,
     ExpectHeaderForbidden,
     UpgradeForbidden,
+    InvalidConnectionHeader,
 }
 
 impl fmt::Display for HttpError {
@@ -86,7 +89,7 @@ impl fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 #[inline]
-fn is_tchar(b: u8) -> bool {
+pub(crate) fn is_tchar(b: u8) -> bool {
     matches!(
         b,
         b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
@@ -196,11 +199,13 @@ fn parse_authority(auth: &[u8]) -> Result<(String, Option<u16>), HttpError> {
         if host_part.len() < 3 {
             return Err(HttpError::InvalidHostHeader);
         }
-        for &b in &host_part[1..close] {
-            if !(b.is_ascii_hexdigit() || b == b':' || b == b'.') {
-                return Err(HttpError::InvalidHostHeader);
-            }
-        }
+        let literal = host_part
+            .get(1..close)
+            .ok_or(HttpError::InvalidHostHeader)?;
+        let literal = std::str::from_utf8(literal).map_err(|_| HttpError::InvalidHostHeader)?;
+        literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| HttpError::InvalidHostHeader)?;
         let rest = auth.get(close + 1..).ok_or(HttpError::InvalidHostHeader)?;
         if rest.is_empty() {
             (host_part, None)
@@ -269,6 +274,9 @@ fn normalize_path(raw_path: &[u8]) -> Result<String, HttpError> {
     }
     if raw_path.contains(&b'#') {
         return Err(HttpError::InvalidTargetEncoding);
+    }
+    if raw_path.windows(2).any(|pair| pair == b"//") {
+        return Err(HttpError::ForbiddenPathCharacter);
     }
 
     let mut decoded: Vec<u8> = Vec::with_capacity(raw_path.len());
@@ -388,6 +396,7 @@ fn parse_target(raw: &[u8]) -> Result<RequestTarget, HttpError> {
         };
         let path = normalize_path(path_bytes)?;
         return Ok(RequestTarget {
+            authority_scheme: None,
             authority_host: None,
             authority_port: None,
             path,
@@ -396,10 +405,10 @@ fn parse_target(raw: &[u8]) -> Result<RequestTarget, HttpError> {
     }
 
     // Check for absolute-form http://... or https://...
-    let rest = if let Some(r) = raw.strip_prefix(b"http://") {
-        r
+    let (scheme, rest) = if let Some(r) = raw.strip_prefix(b"http://") {
+        ("http", r)
     } else if let Some(r) = raw.strip_prefix(b"https://") {
-        r
+        ("https", r)
     } else {
         // authority-form (e.g. example.com:443) or other scheme
         return Err(HttpError::UnsupportedTargetForm);
@@ -431,6 +440,7 @@ fn parse_target(raw: &[u8]) -> Result<RequestTarget, HttpError> {
 
     let path = normalize_path(path_bytes)?;
     Ok(RequestTarget {
+        authority_scheme: Some(scheme.to_owned()),
         authority_host: Some(auth_host),
         authority_port: auth_port,
         path,
@@ -595,9 +605,28 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
             }
             "connection" => {
                 for tok in h.value.split(',') {
-                    let t = tok.trim();
+                    let t = tok.trim_matches([' ', '\t']);
+                    if t.is_empty() || !t.bytes().all(is_tchar) {
+                        return Err(HttpError::InvalidConnectionHeader);
+                    }
                     if t.eq_ignore_ascii_case("upgrade") {
                         return Err(HttpError::UpgradeForbidden);
+                    }
+                    // Nominating an end-to-end or framing header makes its meaning ambiguous.
+                    if matches!(
+                        t.to_ascii_lowercase().as_str(),
+                        "host"
+                            | "content-length"
+                            | "transfer-encoding"
+                            | "connection"
+                            | "accept"
+                            | "accept-encoding"
+                            | "range"
+                            | "if-none-match"
+                            | "if-modified-since"
+                            | "user-agent"
+                    ) {
+                        return Err(HttpError::InvalidConnectionHeader);
                     }
                 }
             }

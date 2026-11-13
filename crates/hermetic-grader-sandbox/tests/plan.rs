@@ -88,19 +88,19 @@ fn test_device_list_and_cgroup_rule_order() {
         ]
     );
 
-    assert_eq!(p.device_cgroup_rules.len(), 8);
-    // First 6 allow the character devices; 7th denies all block devices; 8th is catch-all deny
-    for rule in &p.device_cgroup_rules[..6] {
+    assert_eq!(p.device_cgroup_rules.len(), 10);
+    // First 8 allow the character devices and private PTYs, followed by block/default denies.
+    for rule in &p.device_cgroup_rules[..8] {
         assert!(rule.allow);
         assert_eq!(rule.dev_type, "c");
     }
-    assert!(!p.device_cgroup_rules[6].allow);
-    assert_eq!(p.device_cgroup_rules[6].dev_type, "b");
-    assert_eq!(p.device_cgroup_rules[6].major, None);
-    assert_eq!(p.device_cgroup_rules[6].minor, None);
+    assert!(!p.device_cgroup_rules[8].allow);
+    assert_eq!(p.device_cgroup_rules[8].dev_type, "b");
+    assert_eq!(p.device_cgroup_rules[8].major, None);
+    assert_eq!(p.device_cgroup_rules[8].minor, None);
 
-    assert!(!p.device_cgroup_rules[7].allow);
-    assert_eq!(p.device_cgroup_rules[7].dev_type, "a");
+    assert!(!p.device_cgroup_rules[9].allow);
+    assert_eq!(p.device_cgroup_rules[9].dev_type, "a");
 }
 
 #[test]

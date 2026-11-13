@@ -19,6 +19,14 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_PLUGINS: usize = 64;
 /// Maximum byte length of a single pytest plugin name.
 pub const MAX_PLUGIN_NAME_BYTES: usize = 128;
+/// Byte and inode quotas for the private minimal device filesystem.
+pub const MAX_DEV_TMPFS_BYTES: usize = 1024 * 1024;
+pub const MAX_DEV_TMPFS_INODES: usize = 1024;
+/// Docker's default shared-memory size, with an explicit inode quota.
+pub const MAX_SHM_TMPFS_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SHM_TMPFS_INODES: usize = 4096;
+/// Maximum number of pseudo-terminals in the private devpts instance.
+pub const MAX_PTY_COUNT: usize = 256;
 
 /// Docker default capability set before removing MKNOD and administrative capabilities.
 const DOCKER_DEFAULT_CAPS: &[&str] = &[
@@ -105,6 +113,7 @@ pub enum PlanError {
     TooManyPlugins,
     InvalidPluginName,
     PluginNameTooLong,
+    RequiredPluginDisabled,
 }
 
 impl fmt::Display for PlanError {
@@ -146,6 +155,12 @@ pub struct DeviceNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSymlink {
+    pub path: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceCgroupRule {
     pub access: String,
     pub allow: bool,
@@ -170,11 +185,20 @@ pub struct SandboxPlan {
     pub capabilities: CapabilitySets,
     pub device_cgroup_order_note: String,
     pub device_cgroup_rules: Vec<DeviceCgroupRule>,
+    pub device_symlinks: Vec<DeviceSymlink>,
     pub devices: Vec<DeviceNode>,
+    /// Set with the hostname in the new UTS namespace before starting the child.
+    pub domainname: String,
     pub env: BTreeMap<String, String>,
     pub gid: u32,
+    /// Set after entering the new UTS namespace, before starting the child.
+    pub hostname: String,
+    /// Make the inherited mount tree recursively private before applying mounts.
+    pub mount_propagation: String,
     pub mounts: Vec<MountSpec>,
     pub namespaces: NamespaceSpec,
+    /// Applied before gid and uid so no parent groups reach the child.
+    pub supplementary_groups: Vec<u32>,
     pub t_clock: i64,
     pub uid: u32,
     pub working_dir: String,
@@ -190,8 +214,15 @@ fn validate_abs_clean_path(path: &str) -> Result<(), PlanError> {
     if path.as_bytes().contains(&0x00) {
         return Err(PlanError::NulByteInInput);
     }
-    for seg in path.split('/') {
-        if seg == ".." {
+    if path.bytes().any(|b| b.is_ascii_control()) {
+        return Err(PlanError::InvalidPath);
+    }
+    for seg in path
+        .strip_prefix('/')
+        .ok_or(PlanError::InvalidPath)?
+        .split('/')
+    {
+        if path != "/" && (seg.is_empty() || seg == "." || seg == "..") {
             return Err(PlanError::InvalidPath);
         }
     }
@@ -216,7 +247,7 @@ fn is_valid_plugin_name(name: &str) -> bool {
     let Some(&first) = bytes.first() else {
         return false;
     };
-    if !first.is_ascii_alphanumeric() {
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
         return false;
     }
     bytes
@@ -275,8 +306,8 @@ fn extract_pytest_args(argv: &[String]) -> Result<&[String], PlanError> {
                 }
                 return Err(PlanError::NotPytestCommand);
             }
-            // Allow harmless isolated/unbuffered flags before `-m`; forbid `-c` or positional scripts
-            if matches!(tok, "-s" | "-B" | "-u" | "-E" | "-I" | "-O" | "-OO") {
+            // -E and -I ignore the fixed hash seed and bytecode environment settings.
+            if matches!(tok, "-s" | "-B" | "-u" | "-O" | "-OO") {
                 idx += 1;
                 continue;
             }
@@ -353,6 +384,22 @@ fn build_devices() -> Vec<DeviceNode> {
     ]
 }
 
+fn build_device_symlinks() -> Vec<DeviceSymlink> {
+    [
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/ptmx", "pts/ptmx"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+    ]
+    .into_iter()
+    .map(|(path, target)| DeviceSymlink {
+        path: path.to_owned(),
+        target: target.to_owned(),
+    })
+    .collect()
+}
+
 fn build_device_cgroup_rules() -> Vec<DeviceCgroupRule> {
     // In cgroup v2 device BPF programs, rules are evaluated sequentially from most-specific
     // allow rules down to catch-all deny rules (matching crun/runc BPF device filter compilation,
@@ -400,6 +447,20 @@ fn build_device_cgroup_rules() -> Vec<DeviceCgroupRule> {
             dev_type: "c".to_owned(),
             major: Some(5),
             minor: Some(0),
+        },
+        DeviceCgroupRule {
+            access: "rw".to_owned(),
+            allow: true,
+            dev_type: "c".to_owned(),
+            major: Some(5),
+            minor: Some(2),
+        },
+        DeviceCgroupRule {
+            access: "rw".to_owned(),
+            allow: true,
+            dev_type: "c".to_owned(),
+            major: Some(136),
+            minor: None,
         },
         DeviceCgroupRule {
             access: "rwm".to_owned(),
@@ -457,6 +518,8 @@ fn build_mounts(working_dir: &str) -> Vec<MountSpec> {
                 "nosuid".to_owned(),
                 "noexec".to_owned(),
                 "mode=755".to_owned(),
+                format!("size={MAX_DEV_TMPFS_BYTES}"),
+                format!("nr_inodes={MAX_DEV_TMPFS_INODES}"),
             ],
             read_only: false,
             source: "tmpfs".to_owned(),
@@ -471,6 +534,7 @@ fn build_mounts(working_dir: &str) -> Vec<MountSpec> {
                 "newinstance".to_owned(),
                 "ptmxmode=0666".to_owned(),
                 "mode=0620".to_owned(),
+                format!("max={MAX_PTY_COUNT}"),
             ],
             read_only: false,
             source: "devpts".to_owned(),
@@ -484,6 +548,8 @@ fn build_mounts(working_dir: &str) -> Vec<MountSpec> {
                 "nodev".to_owned(),
                 "noexec".to_owned(),
                 "mode=1777".to_owned(),
+                format!("size={MAX_SHM_TMPFS_BYTES}"),
+                format!("nr_inodes={MAX_SHM_TMPFS_INODES}"),
             ],
             read_only: false,
             source: "shm".to_owned(),
@@ -517,6 +583,15 @@ pub fn plan(input: &PlanInput) -> Result<SandboxPlan, PlanError> {
     }
 
     validate_abs_clean_path(&input.working_dir)?;
+    // A later writable bind must never cover the root or any isolation mount.
+    if input.working_dir == "/"
+        || input.working_dir == "/tmp"
+        || ["/proc", "/sys", "/dev"].iter().any(|root| {
+            input.working_dir == *root || input.working_dir.starts_with(&format!("{root}/"))
+        })
+    {
+        return Err(PlanError::InvalidPath);
+    }
     let home = match &input.home_dir {
         Some(h) => {
             validate_abs_clean_path(h)?;
@@ -544,13 +619,48 @@ pub fn plan(input: &PlanInput) -> Result<SandboxPlan, PlanError> {
         plugin_set.insert(p.clone());
     }
 
-    // Rewrite command to `python -s -m pytest -p <plugin> ... <original args>`
-    let mut rewritten_argv: Vec<String> = vec![
-        "python".to_owned(),
-        "-s".to_owned(),
-        "-m".to_owned(),
-        "pytest".to_owned(),
-    ];
+    let mut tail = pytest_tail.iter();
+    while let Some(arg) = tail.next() {
+        // Pytest's plugin pre-parser scans even past `--` and strips Python whitespace.
+        let plugin = if arg == "-p" {
+            tail.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("-p")
+        };
+        if plugin
+            .map(|name| {
+                name.trim_matches(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, '\u{1c}'..='\u{1f}')
+                })
+            })
+            .and_then(|name| name.strip_prefix("no:"))
+            .is_some_and(|name| {
+                plugin_set.contains(name)
+                    || (!name.starts_with("pytest_")
+                        && plugin_set.contains(&format!("pytest_{name}")))
+                    || (name == "cacheprovider"
+                        && (plugin_set.contains("stepwise")
+                            || plugin_set.contains("pytest_stepwise")))
+            })
+        {
+            return Err(PlanError::RequiredPluginDisabled);
+        }
+    }
+
+    // Preserve interpreter settings before adding the mandatory runner settings.
+    let mut rewritten_argv = vec!["python".to_owned(), "-s".to_owned()];
+    if input.argv.first().is_some_and(|arg| is_python_binary(arg)) {
+        rewritten_argv.extend(
+            input
+                .argv
+                .iter()
+                .skip(1)
+                .take_while(|arg| arg.as_str() != "-m")
+                .filter(|arg| arg.as_str() != "-s")
+                .cloned(),
+        );
+    }
+    rewritten_argv.extend(["-m".to_owned(), "pytest".to_owned()]);
     for plugin in &plugin_set {
         rewritten_argv.push("-p".to_owned());
         rewritten_argv.push(plugin.clone());
@@ -584,7 +694,12 @@ pub fn plan(input: &PlanInput) -> Result<SandboxPlan, PlanError> {
         if !is_valid_env_name(&entry.name) {
             return Err(PlanError::InvalidEnvName);
         }
-        if RESERVED_ENV_KEYS.contains(&entry.name.as_str()) {
+        if RESERVED_ENV_KEYS.contains(&entry.name.as_str())
+            || ["PYTHON", "PYTEST_", "LD_", "DYLD_", "LC_"]
+                .iter()
+                .any(|prefix| entry.name.starts_with(prefix))
+            || matches!(entry.name.as_str(), "LANGUAGE" | "TZDIR")
+        {
             return Err(PlanError::ReservedEnvOverride);
         }
         if !seen_custom.insert(entry.name.clone()) {
@@ -596,12 +711,17 @@ pub fn plan(input: &PlanInput) -> Result<SandboxPlan, PlanError> {
     Ok(SandboxPlan {
         argv: rewritten_argv,
         capabilities: build_capabilities(),
-        device_cgroup_order_note: "Evaluated top-to-bottom by cgroup v2 device BPF: explicit character device allows (1:3, 1:5, 1:7, 1:8, 1:9, 5:0) precede block device catch-all deny (b *:* rwm) and final default deny (a *:* rwm).".to_owned(),
+        device_cgroup_order_note: "Evaluated top-to-bottom by cgroup v2 device BPF: explicit character device allows (1:3, 1:5, 1:7, 1:8, 1:9, 5:0, 5:2, 136:*) precede block device catch-all deny (b *:* rwm) and final default deny (a *:* rwm).".to_owned(),
         device_cgroup_rules: build_device_cgroup_rules(),
+        device_symlinks: build_device_symlinks(),
         devices: build_devices(),
+        domainname: "hermetic".to_owned(),
         env,
         gid: input.gid,
+        mount_propagation: "rprivate".to_owned(),
         mounts: build_mounts(&input.working_dir),
+        hostname: "hermetic".to_owned(),
+        supplementary_groups: Vec::new(),
         namespaces: NamespaceSpec {
             ipc: true,
             mount: true,
