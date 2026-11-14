@@ -24,6 +24,7 @@ pub struct Linux {
     root: Option<Root>,
     helper: Option<File>,
     network_program: Option<File>,
+    shell: Option<File>,
     signals: Option<OwnedFd>,
     pub listener: Option<VsockListener>,
     entry: Option<Running>,
@@ -276,8 +277,18 @@ impl Linux {
         spec.validate()?;
         spec::args(argv, false)?;
         let program = argv.first().ok_or(Error::InvalidInput)?;
-        let executable = self.root()?.regular(program)?;
+        let executable = self.executable(program)?;
         self.spawn_pinned(spec, argv, tty, deadline, executable)
+    }
+    fn executable(&self, program: &str) -> Result<File> {
+        if program == crate::fs::SEALED_SHELL {
+            return Ok(self
+                .shell
+                .as_ref()
+                .ok_or(Error::InvalidInput)?
+                .try_clone()?);
+        }
+        self.root()?.regular(program)
     }
     fn spawn_pinned(
         &mut self,
@@ -697,6 +708,17 @@ impl Sys for Linux {
                 .regular(crate::network::NETWORK_PROGRAM)
                 .ok(),
             None => self.root()?.regular(crate::network::NETWORK_PROGRAM).ok(),
+        };
+        // Only the sealed lower supplies shell aliases. Retain the resulting
+        // inode before overlay assembly, including on trusted-initramfs reboot.
+        // Images without bash still boot; requesting it then fails closed.
+        self.shell = match &self.base {
+            Some(base) => self
+                .root()?
+                .reroot(rustix::io::dup(base)?)?
+                .sealed_shell()
+                .ok(),
+            None => self.root()?.sealed_shell().ok(),
         };
         self.root()?.directory("/mnt/hermetic-overlay")
     }
@@ -1135,6 +1157,98 @@ mod tests {
     }
     fn run_spec() -> RunSpec {
         RunSpec::parse(br#"{"env":{},"workdir":"/","uid":1000,"gid":1000,"entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n","resources":{"vcpus":1,"memory_mib":512,"disk_mib":1,"wall_time_s":1}}"#.as_slice()).unwrap()
+    }
+    #[test]
+    fn sealed_shell_is_pinned_from_base_on_boot_and_reboot() {
+        use std::os::unix::fs::symlink;
+        for reboot in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let overlay = tempfile::tempdir().unwrap();
+            for path in [base.path(), overlay.path()] {
+                std::fs::create_dir_all(path.join("mnt/hermetic-overlay")).unwrap();
+                std::fs::create_dir_all(path.join("usr/bin")).unwrap();
+                symlink("/usr/bin", path.join("bin")).unwrap();
+            }
+            std::fs::copy("/bin/bash", base.path().join("usr/bin/bash")).unwrap();
+            std::fs::write(overlay.path().join("usr/bin/bash"), b"hostile shell").unwrap();
+            let mut linux = Linux {
+                root: Some(
+                    Root::open_root(
+                        if reboot { overlay.path() } else { base.path() }
+                            .to_str()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                base: reboot.then(|| {
+                    Root::open_root(base.path().to_str().unwrap())
+                        .unwrap()
+                        .directory("/")
+                        .unwrap()
+                }),
+                ..Linux::default()
+            };
+            linux.keep_upper().unwrap();
+            std::fs::rename(
+                base.path().join("usr/bin/bash"),
+                base.path().join("original"),
+            )
+            .unwrap();
+            symlink(
+                overlay.path().join("usr/bin/bash"),
+                base.path().join("usr/bin/bash"),
+            )
+            .unwrap();
+            linux.root = Some(Root::open_root(overlay.path().to_str().unwrap()).unwrap());
+            let executable = linux.executable(crate::fs::SEALED_SHELL).unwrap();
+            let mut command = Command::new(format!("./{}", executable.as_raw_fd()));
+            command
+                .args(["-c", "printf sealed-shell"])
+                .env_clear()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = sys::spawn_in(&mut command, &linux.root().unwrap().proc.fds).unwrap();
+            assert!(killed_status(&mut child).unwrap().success());
+            assert_eq!(
+                read_capped(child.stdout.take().unwrap(), MAX_STRING).unwrap(),
+                b"sealed-shell"
+            );
+            assert!(read_capped(child.stderr.take().unwrap(), MAX_STRING)
+                .unwrap()
+                .is_empty());
+            assert!(linux.executable("/bin/sh").is_err());
+            assert!(linux.download(crate::fs::SEALED_SHELL).is_err());
+        }
+    }
+
+    #[test]
+    fn sealed_shell_never_falls_back_to_overlay() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        for path in [base.path(), overlay.path()] {
+            std::fs::create_dir_all(path.join("mnt/hermetic-overlay")).unwrap();
+            std::fs::create_dir(path.join("bin")).unwrap();
+        }
+        std::fs::copy("/bin/bash", overlay.path().join("bin/bash")).unwrap();
+        let mut linux = Linux {
+            root: Some(Root::open_root(base.path().to_str().unwrap()).unwrap()),
+            ..Linux::default()
+        };
+        linux.keep_upper().unwrap();
+        linux.root = Some(Root::open_root(overlay.path().to_str().unwrap()).unwrap());
+        assert!(linux.executable(crate::fs::SEALED_SHELL).is_err());
+        assert!(linux
+            .spawn(
+                &run_spec(),
+                &[
+                    crate::fs::SEALED_SHELL.into(),
+                    "-c".into(),
+                    "printf hostile".into()
+                ],
+                false,
+                deadline(1000)
+            )
+            .is_err());
     }
     #[test]
     fn network_executable_is_pinned_before_overlay_and_special_files_fail_closed() {

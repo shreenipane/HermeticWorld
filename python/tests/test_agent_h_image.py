@@ -31,7 +31,7 @@ def test_builder_argument_errors_do_not_reflect_input():
     result = subprocess.run(["bash", str(INTEGRATION / "build-agent-h-fixture.sh"), "--private-value"],
                             capture_output=True, timeout=10)
     assert result.returncode != 0
-    assert result.stderr == b"Agent image build refused\n"
+    assert result.stderr == b"Agent image build refused: input\n"
     assert not result.stdout
 
 
@@ -410,3 +410,113 @@ def test_task_runner_refuses_unbootable_clock_before_creating_work(tmp_path, mon
         agent_h_run.run([str(work)])
     assert not work.exists()
     assert not calls
+
+
+def test_converter_excludes_only_root_installer_before_d4(tmp_path, monkeypatch):
+    root = task(tmp_path)
+    monkeypatch.setattr(image, "build_tools", lambda work: {})
+    cap = 64 * 1024**2
+    def export(name, work):
+        tree = work / "tree"
+        (tree / "bin").mkdir(parents=True)
+        (tree / "testbed").mkdir()
+        for program in ("bash", "cat", "sed"):
+            (tree / "bin" / program).write_bytes(static_elf())
+            (tree / "bin" / program).chmod(0o755)
+        # Sparse staging file represents the 141 MB image installer without
+        # allocating its contents in this offline regression.
+        with (tree / "miniconda.sh").open("wb") as out:
+            out.truncate(141_000_000)
+        (tree / "testbed/miniconda.sh").write_bytes(b"keep nested names")
+        (tree / "miniconda.sh.keep").write_bytes(b"keep similar names")
+        return "sha256:" + "a" * 64
+    monkeypatch.setattr(image, "export_image", export)
+    calls = []
+    def build(src, output, **kwargs):
+        assert not os.path.lexists(src / "miniconda.sh")
+        assert (src / "testbed/miniconda.sh").read_bytes() == b"keep nested names"
+        assert (src / "miniconda.sh.keep").read_bytes() == b"keep similar names"
+        assert max(p.stat().st_size for p in src.rglob("*") if p.is_file()) <= cap
+        assert kwargs["sealcheck_bin"] == output.parent / "sealcheck"
+        calls.append(src)
+        return {"d4": "pass", "sha256": "c" * 64, "skipped_special": []}
+    monkeypatch.setattr(image, "build_rootfs", build)
+    previous = os.umask(0o022)
+    try:
+        assert image.run(["sealed", str(root), "pytest-dev__pytest-6202", str(tmp_path / "work")]) == 0
+    finally:
+        os.umask(previous)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "absent"])
+def test_image_exclusion_never_follows_links_or_recurses(tmp_path, kind):
+    root = tmp_path / "tree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"private sentinel")
+    excluded = root / "miniconda.sh"
+    if kind == "symlink":
+        excluded.symlink_to(outside)
+    elif kind == "fifo":
+        os.mkfifo(excluded)
+    elif kind == "directory":
+        excluded.mkdir()
+        (excluded / "keep").write_bytes(b"keep")
+    tree = image.Tree(root)
+    try:
+        if kind in ("fifo", "directory"):
+            with pytest.raises(ValueError):
+                image.exclude_image_leftovers(tree)
+        else:
+            image.exclude_image_leftovers(tree)
+            assert not os.path.lexists(excluded)
+    finally:
+        tree.close()
+    assert outside.read_bytes() == b"private sentinel"
+
+
+@pytest.mark.parametrize("script", ["build-agent-h-fixture.sh", "convert-agent-h-task.sh"])
+def test_image_usage_explains_group_writable_parent_refusal(script):
+    result = subprocess.run(["bash", str(INTEGRATION / script), "--help"],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 0
+    assert b"group-writable" in result.stdout
+    assert b"caller" in result.stdout
+
+
+@pytest.mark.parametrize("stage", ["work-directory", "image-export", "rootfs-d4",
+                                   "rootfs-d4-file-byte-cap"])
+def test_image_cli_reports_safe_failure_category_only(tmp_path, monkeypatch, capsys, stage):
+    root = task(tmp_path)
+    work = tmp_path / "new"
+    if stage == "work-directory":
+        tmp_path.chmod(0o770)
+    else:
+        def fail(*args, **kwargs):
+            detail = "private-path secret-token hostname 2026-11-14"
+            if stage == "rootfs-d4-file-byte-cap":
+                detail = "sealcheck d4-image failed (1): file byte cap exceeded " + detail
+            raise RuntimeError(detail)
+        monkeypatch.setattr(image, "build_tools", lambda work: {})
+        if stage == "image-export":
+            monkeypatch.setattr(image, "export_image", fail)
+        else:
+            def export(name, work):
+                (work / "tree/testbed").mkdir(parents=True)
+                return "sha256:" + "a" * 64
+            monkeypatch.setattr(image, "export_image", export)
+            monkeypatch.setattr(image, "check_guest_runtime", lambda tree: None)
+            monkeypatch.setattr(image, "build_rootfs", fail)
+    previous = os.umask(0o022)
+    try:
+        assert image.main(["sealed", str(root), "pytest-dev__pytest-6202", str(work)]) == 1
+    finally:
+        os.umask(previous)
+        tmp_path.chmod(0o700)
+    captured = capsys.readouterr()
+    assert captured.err == "Agent image build refused: " + stage + "\n"
+    assert not captured.out
+    assert not (work / "world.json").exists()
+    if stage == "work-directory":
+        assert not work.exists()

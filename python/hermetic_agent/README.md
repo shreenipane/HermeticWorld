@@ -81,8 +81,9 @@ prepared VM host. A missing input fails; it cannot produce a successful skip.
 ## Build the fixture and run the first smoke
 
 Run these commands from the worktree root on the prepared manager host. All
-destination directories must be new, with an existing private, physical parent
-(no symlink components). The builders retain their artifacts on success and
+destination directories must be new, with an existing physical parent owned by
+the caller, with no symlink components and no group or world write permission.
+The builders retain their artifacts on success and
 failure. They need cached Cargo dependencies and pinned e2fsprogs 1.47.2. No
 download, Docker daemon, root privilege or KVM is needed to build the fixture.
 
@@ -125,6 +126,9 @@ also requires the Docker image and Python packages listed above.
 2. The converter pins the local sealed image ID before creating an unstarted,
    networkless container, exports it, removes the container, validates the entire
    bounded tar before unpacking, and installs the same static trusted binaries.
+   The reviewed exclusion list removes exactly `/miniconda.sh`, the downloaded
+   SWE-bench installer left over from image construction. Nested or similarly
+   named files remain; the D4 scan and scanner resource caps still apply.
    It uses the sealed image's bash/runtime, cat and sed; missing or unsafe runtime
    files fail the conversion. Image entrypoints and environment are ignored. The
    fixed execd PATH includes the common testbed environment locations. It uses
@@ -133,6 +137,9 @@ also requires the Docker image and Python packages listed above.
    the host. Every directory is resolved relative to a held root descriptor;
    absolute guest links remain inside that root. Fresh outputs are `rootfs.img`,
    `world.json` and `issue.txt`; source export and staging files stay host-only.
+   Failures print a fixed stage category (such as `work-directory`,
+   `image-export` or `rootfs-d4`) without subprocess output or exception text.
+   A D4 file byte cap failure reports `rootfs-d4-file-byte-cap`.
 
 3. Start a policy gateway separately using the configuration in
    `crates/hermetic-gateway/README.md`, with the same manifest clock, a pinned

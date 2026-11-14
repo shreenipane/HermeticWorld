@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) const SEALED_SHELL: &str = "/bin/bash";
+
 /// Pinned before any guest command runs; a later mount covering /proc cannot
 /// redirect internal process metadata, descriptor reopens, or helper execution.
 pub struct Proc {
@@ -161,6 +163,12 @@ impl Root {
     }
     pub fn regular(&self, path: &str) -> Result<File> {
         let pinned = self.node(path, fs::FileType::RegularFile)?;
+        self.regular_pinned(pinned)
+    }
+    fn regular_pinned(&self, pinned: OwnedFd) -> Result<File> {
+        if fs::FileType::from_raw_mode(fs::fstat(&pinned)?.st_mode) != fs::FileType::RegularFile {
+            return Err(Error::InvalidInput);
+        }
         // Ordinary files may only come from local guest storage. In particular,
         // procfs regular-looking streams such as kmsg must never be opened.
         match fs::fstatfs(&pinned)?.f_type as u64 {
@@ -170,6 +178,25 @@ impl Root {
         Ok(self
             .proc
             .reopen(&pinned, OFlags::RDONLY | OFlags::NONBLOCK)?)
+    }
+    pub(crate) fn sealed_shell(&self) -> Result<File> {
+        self.regular_pinned(self.image_node(SEALED_SHELL)?)
+    }
+    fn image_node(&self, path: &str) -> Result<OwnedFd> {
+        spec::path(path)?;
+        // IN_ROOT resolves absolute links and '..' within the held image, never
+        // the caller's filesystem root. The kernel bounds expansion by PATH_MAX
+        // and MAXSYMLINKS; magic links (including proc descriptor links) fail.
+        // O_PATH pins without opening a FIFO/device for I/O. Inspect that inode
+        // before its data open, then reopen only through the retained proc fd.
+        // Mounted runtime storage is not part of the sealed image either.
+        Ok(fs::openat2(
+            &self.dir,
+            relative(path),
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
+        )?)
     }
     pub fn read(&self, path: &str, cap: usize) -> Result<Vec<u8>> {
         read_file_capped(
@@ -295,6 +322,133 @@ pub fn stamp(fd: impl std::os::fd::AsFd, clock: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn sealed_shell_resolves_image_links_and_pins_the_inode() {
+        for target in ["usr/bin", "/usr/bin"] {
+            let image = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(image.path().join("usr/bin")).unwrap();
+            std::fs::create_dir(image.path().join("usr/lib")).unwrap();
+            std::fs::write(image.path().join("usr/lib/shell"), b"sealed shell").unwrap();
+            symlink("../lib/shell", image.path().join("usr/bin/bash")).unwrap();
+            symlink(target, image.path().join("bin")).unwrap();
+            let mut root = Root::open_root(image.path().to_str().unwrap()).unwrap();
+            let shell = root.sealed_shell().unwrap();
+            assert!(root.regular(SEALED_SHELL).is_err());
+            assert!(root.read(SEALED_SHELL, MAX_STRING).is_err());
+            assert!(root.atomic(SEALED_SHELL, b"attack", 1).is_err());
+            std::fs::rename(
+                image.path().join("usr/lib/shell"),
+                image.path().join("original"),
+            )
+            .unwrap();
+            std::fs::write(image.path().join("usr/lib/shell"), b"replacement").unwrap();
+            assert_eq!(read_capped(shell, MAX_STRING).unwrap(), b"sealed shell");
+        }
+    }
+
+    #[test]
+    fn sealed_shell_hostile_links_never_open_host_or_special_files() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"outside secret").unwrap();
+        let absolute = outside.path().join("sentinel").to_str().unwrap().to_owned();
+        let relative = format!("../../{}", absolute.trim_start_matches('/'));
+        for target in [
+            absolute.as_str(),
+            relative.as_str(),
+            "/proc/self/exe",
+            "/dev/null",
+            "bash",
+            "missing",
+            "/",
+        ] {
+            let image = tempfile::tempdir().unwrap();
+            std::fs::create_dir(image.path().join("bin")).unwrap();
+            symlink(target, image.path().join("bin/bash")).unwrap();
+            let root = Root::open_root(image.path().to_str().unwrap()).unwrap();
+            assert!(root.sealed_shell().is_err(), "{target}");
+        }
+        // Absolute and parent-relative targets must resolve against the held
+        // image even when the same target also names a real host file.
+        for target in [absolute.as_str(), relative.as_str()] {
+            let image = tempfile::tempdir().unwrap();
+            std::fs::create_dir(image.path().join("bin")).unwrap();
+            let guest_target = image.path().join(absolute.trim_start_matches('/'));
+            std::fs::create_dir_all(guest_target.parent().unwrap()).unwrap();
+            std::fs::write(guest_target, b"image file").unwrap();
+            symlink(target, image.path().join("bin/bash")).unwrap();
+            let root = Root::open_root(image.path().to_str().unwrap()).unwrap();
+            assert_eq!(
+                read_capped(root.sealed_shell().unwrap(), MAX_STRING).unwrap(),
+                b"image file"
+            );
+        }
+        let image = tempfile::tempdir().unwrap();
+        std::fs::create_dir(image.path().join("bin")).unwrap();
+        fs::mknodat(
+            fs::CWD,
+            image.path().join("fifo"),
+            fs::FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        symlink("/fifo", image.path().join("bin/bash")).unwrap();
+        let root = Root::open_root(image.path().to_str().unwrap()).unwrap();
+        assert!(root.sealed_shell().is_err());
+        let device = fs::open("/dev/null", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert!(root.regular_pinned(device).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside secret"
+        );
+    }
+
+    #[test]
+    fn sealed_shell_link_expansion_is_bounded() {
+        const KERNEL_MAXSYMLINKS: usize = 40;
+        for count in [KERNEL_MAXSYMLINKS, KERNEL_MAXSYMLINKS + 1] {
+            let image = tempfile::tempdir().unwrap();
+            std::fs::create_dir(image.path().join("bin")).unwrap();
+            std::fs::write(image.path().join("bin/shell"), b"sealed shell").unwrap();
+            for index in 0..count {
+                let name = if index == 0 {
+                    "bash".into()
+                } else {
+                    format!("link-{index}")
+                };
+                let next = if index + 1 == count {
+                    "shell".into()
+                } else {
+                    format!("link-{}", index + 1)
+                };
+                symlink(next, image.path().join("bin").join(name)).unwrap();
+            }
+            let root = Root::open_root(image.path().to_str().unwrap()).unwrap();
+            if count == KERNEL_MAXSYMLINKS {
+                assert_eq!(
+                    read_capped(root.sealed_shell().unwrap(), MAX_STRING).unwrap(),
+                    b"sealed shell"
+                );
+            } else {
+                assert!(root.sealed_shell().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_image_lookup_refuses_runtime_mounts_and_proc_magic_links() {
+        // Root::new has verified that /proc is procfs, so this is an actual
+        // mount boundary, with no mount privileges required for the test.
+        let root = Root::open_root("/").unwrap();
+        assert!(root.image_node("/proc").is_err());
+        let proc = root
+            .reroot(rustix::io::dup(&root.proc.dir).unwrap())
+            .unwrap();
+        assert!(proc.image_node("/self/exe").is_err());
+        assert!(proc.image_node("/self/root").is_err());
+    }
     #[test]
     fn pinned_proc_reopens_work_when_visible_proc_opens_are_denied() {
         const CHILD: &str = "HERMETIC_TEST_PINNED_PROC";

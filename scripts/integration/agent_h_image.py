@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -42,6 +43,18 @@ LIBRARY_DIRS = ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
                 "/lib64", "/usr/lib64", "/lib", "/usr/lib")
 GUEST_DIRS = ("sbin", "bin", "dev/pts", "dev/shm", "proc", "sys", "tmp", "run",
               "etc/hermetic", "root", "mnt/hermetic-overlay", "mnt/hermetic-root")
+# Reviewed root-only exclusions: SWE-bench's downloaded installer is not a
+# runtime input. Keep all other paths and the scanner's file byte cap intact.
+IMAGE_EXCLUSIONS = ("/miniconda.sh",)
+WORK_USAGE = ("Fresh output under an existing parent owned by the caller.\n"
+              "Parent: no symlink components; no group-writable or\n"
+              "world-writable mode.")
+
+
+@dataclass
+class BuildStatus:
+    # Only fixed stage names are emitted; exception messages may contain secrets.
+    category: str = "input"
 
 
 def refused():
@@ -244,6 +257,20 @@ class Tree:
         return data
 
 
+def exclude_image_leftovers(tree):
+    for path in IMAGE_EXCLUSIONS:
+        # Each reviewed path is a root leaf. Unlink through the held root;
+        # neither resolve a guest symlink nor recurse into a directory.
+        leaf = path.removeprefix("/")
+        try:
+            metadata = os.stat(leaf, dir_fd=tree.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+            refused()
+        os.unlink(leaf, dir_fd=tree.fd)
+
+
 def check_guest_runtime(tree):
     pending = deque((path, True) for path in ("/bin/bash", "/bin/cat", "/bin/sed"))
     seen = set()
@@ -419,15 +446,19 @@ def finish(work, instance, cutoffs, source):
     atomic_write(work / "world.json", encoded(manifest))
 
 
-def run(argv=None):
+def run(argv=None, *, status=None):
+    if status is None:
+        status = BuildStatus()
     parser = Parser(prog="agent-h-image", description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="mode", required=True)
-    fixture = sub.add_parser("fixture", allow_abbrev=False)
-    fixture.add_argument("work")
-    sealed = sub.add_parser("sealed", allow_abbrev=False)
+    fixture = sub.add_parser("fixture", allow_abbrev=False,
+                             formatter_class=argparse.RawTextHelpFormatter)
+    fixture.add_argument("work", help=WORK_USAGE)
+    sealed = sub.add_parser("sealed", allow_abbrev=False,
+                            formatter_class=argparse.RawTextHelpFormatter)
     sealed.add_argument("sealed_run")
     sealed.add_argument("instance")
-    sealed.add_argument("work")
+    sealed.add_argument("work", help=WORK_USAGE)
     args = parser.parse_args(argv)
     validate_path(args.work)
     # Validate all supplied metadata and stage fixture runtime before creating output.
@@ -441,19 +472,24 @@ def run(argv=None):
         base = None
         issue = b"Fix add(a, b) so that it adds its arguments.\n"
         runtime = host_runtime()
+    status.category = "work-directory"
     parent, _, directory, path = create_work(str(__file__), args.work)
     work = Path(path)
     try:
         os.umask(0o077)
+        status.category = "binary-build"
         binaries = build_tools(work)
+        status.category = "image-export"
         if runtime is None:
             source = {"image_id": export_image("hermetic/" + instance + ":sealed", work), "base_commit": base}
         else:
             os.mkdir(work / "tree", 0o700)
             source = {"fixture": "grader-task/repo", "runtime_sha256": {
                 name: hashlib.sha256(data).hexdigest() for name, data in sorted(runtime.items())}}
+        status.category = "guest-runtime"
         tree = Tree(work / "tree")
         try:
+            exclude_image_leftovers(tree)
             if runtime is not None:
                 for name, data in sorted(runtime.items()):
                     tree.write(name, data, 0o755)
@@ -470,6 +506,7 @@ def run(argv=None):
         finally:
             tree.close()
         atomic_write(work / "issue.txt", issue)
+        status.category = "rootfs-d4"
         finish(work, instance, cutoffs, source)
         print('Agent image ready: rootfs.img, world.json, issue.txt (D4 pass)')
         return 0
@@ -478,8 +515,22 @@ def run(argv=None):
         os.close(parent)
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    status = BuildStatus()
     try:
-        raise SystemExit(run())
-    except Exception:
-        raise SystemExit("Agent image build refused") from None
+        return run(argv, status=status)
+    except Exception as error:
+        category = status.category
+        # The rootfs builder currently reports scanner failures as RuntimeError.
+        # Recognize only its fixed cap marker; never print any of its contents.
+        if (category == "rootfs-d4" and type(error) is RuntimeError
+                and len(error.args) == 1 and isinstance(error.args[0], str)
+                and error.args[0].startswith("sealcheck d4-image failed (")
+                and "file byte cap exceeded" in error.args[0]):
+            category = "rootfs-d4-file-byte-cap"
+        print("Agent image build refused: " + category, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

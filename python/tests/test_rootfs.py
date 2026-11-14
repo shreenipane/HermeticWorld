@@ -132,6 +132,34 @@ requires_sealcheck = pytest.mark.skipif(not SEALCHECK_AVAILABLE, reason=SEALCHEC
 requires_debugfs = pytest.mark.skipif(DEBUGFS is None, reason="debugfs not found")
 
 
+@requires_mke2fs
+@requires_sealcheck
+def test_agent_installer_exclusion_preserves_real_d4_image_cap(tmp_path: Path) -> None:
+    sys.path.insert(0, str(Path(__file__).parents[2] / "scripts/integration"))
+    import agent_h_image as agent_image
+
+    src = tmp_path / "source"
+    src.mkdir()
+    with (src / "miniconda.sh").open("wb") as stream:
+        stream.truncate(141_000_000)
+    (src / "runtime").write_bytes(b"keep runtime")
+    tree = agent_image.Tree(src)
+    try:
+        agent_image.exclude_image_leftovers(tree)
+    finally:
+        tree.close()
+    agent_image.normalise_tree(src, T_EPOCH)
+    kwargs = dict(src=src, t_clock=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                  world_id="installer-exclusion", work_dir=tmp_path, root_owned=True)
+    assert build_rootfs(out_image=tmp_path / "clean.img", **kwargs)["d4"] == "pass"
+
+    # D4 reads the whole ext4 image with a separate 1 GiB cap. Excluding the
+    # installer must not bypass that guard or publish a refused image.
+    with pytest.raises(RuntimeError, match="file byte cap exceeded"):
+        build_rootfs(out_image=tmp_path / "refused.img", size_mib=1025, **kwargs)
+    assert not (tmp_path / "refused.img").exists()
+
+
 @pytest.fixture(autouse=True)
 def _sealcheck_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     if SEALCHECK_BIN is not None:
