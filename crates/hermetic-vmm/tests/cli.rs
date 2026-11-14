@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 fn plan(data: &[u8]) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hermetic-vmm"))
         .args(["plan", "-"])
-        .env("HERMETIC_TSC_KHZ", "2688000")
+        .env("HERMETIC_TSC_KHZ", "2000000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -78,7 +78,7 @@ fn cli_plan_and_direct_boot_args_share_calibration_and_reject_invalid_overrides(
     let base = support::spec(Role::Agent).boot_args;
     let output = Command::new(env!("CARGO_BIN_EXE_hermetic-vmm"))
         .args(["boot-args", &base])
-        .env("HERMETIC_TSC_KHZ", "2688000")
+        .env("HERMETIC_TSC_KHZ", "2000000")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));

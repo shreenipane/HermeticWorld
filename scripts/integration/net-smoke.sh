@@ -13,8 +13,8 @@ smoke_main() {
 WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
-FC="$U/.hermetic/tools/firecracker-1.18.0/firecracker"
-FC_SHA=b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba
+FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
+: "${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/target/net-smoke}"
 T=1700000000
 FIX="$top/scripts/integration/net-fixture"
@@ -22,7 +22,7 @@ FIX="$top/scripts/integration/net-fixture"
 for tap in hwtap-agent hwtap-net; do
   [ -e "/sys/class/net/$tap" ] || { echo "missing host tap $tap (see BOOT_NOTES.md)" >&2; exit 2; }
 done
-echo "$FC_SHA  $FC" | sha256sum -c --quiet
+# The runner verifies the measured build lock and held executable before launch.
 
 # 1. Static guest binaries, sealcheck and the host WorldServer.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q --target x86_64-unknown-linux-gnu \

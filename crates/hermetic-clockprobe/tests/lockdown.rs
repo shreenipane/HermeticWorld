@@ -223,3 +223,15 @@ fn lockdown_lists_match_kernel_build_policy() {
     assert_eq!(probe, policy);
     assert!(!probe.contains("PERF_EVENTS"));
 }
+
+#[test]
+fn disposable_canary_kernel_cannot_pass_production_lockdown() {
+    let without = config().replace("# CONFIG_HERMETIC_CLOCK_CANARY is not set\n", "");
+    assert!(lockdown::config_sealed(&without).unwrap());
+    for enabled in ["y", "m"] {
+        assert!(!lockdown::config_sealed(&format!(
+            "{without}CONFIG_HERMETIC_CLOCK_CANARY={enabled}\n"
+        ))
+        .unwrap());
+    }
+}

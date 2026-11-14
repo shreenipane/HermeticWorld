@@ -187,7 +187,7 @@ pub fn validate_boot_args(args: &str) -> Result<()> {
                 required[2] = true;
             }
             _ if arg.starts_with("tsc_early_khz=") => {
-                // Only the VMM appends this (host CPUID 0x15); specs may not set it.
+                // Only the VMM appends the fixed guest rate; specs may not set it.
                 let value = arg.strip_prefix("tsc_early_khz=").unwrap_or("");
                 if !crate::plan::valid_tsc_khz_text(value) {
                     return Err(Error::Validation("tsc_early_khz range/encoding"));

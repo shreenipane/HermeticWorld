@@ -2,7 +2,7 @@
   "boot_args": "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock hermetic.t={t_clock}",
   "build_host": "hermetic",
   "build_user": "hermetic",
-  "builder_image": "hermetic/kernel-builder:6.6-v1@sha256:TO-BE-FILLED-BY-OWNER",
+  "builder_image": "hermetic/kernel-builder:6.6-v1@sha256:29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238",
   "release_date": "2026-10-21T00:00:00Z",
   "sha256": "b24c40a9e2188695803358567edda51c4080176424a57dbefca45e5ac44ec225",
   "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.160.tar.xz",

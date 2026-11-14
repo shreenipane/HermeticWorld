@@ -510,11 +510,11 @@ fn tsc_early_khz_is_vmm_owned_and_bounded() {
     assert!(s.validate().is_err(), "specs must not set tsc_early_khz");
     let reqs: Vec<_> = api_requests(&spec(Role::Agent).validate().unwrap())
         .into_iter()
-        .map(|r| with_tsc_khz(r, 2_688_000).unwrap())
+        .map(|r| with_tsc_khz(r, 2_000_000).unwrap())
         .collect();
     let boot = reqs.iter().find(|r| r.path == "/boot-source").unwrap();
     let args = boot.body["boot_args"].as_str().unwrap();
-    assert!(args.ends_with(" tsc_early_khz=2688000"));
+    assert!(args.ends_with(" tsc_early_khz=2000000"));
     validate_boot_args(args).unwrap();
     assert!(reqs
         .iter()

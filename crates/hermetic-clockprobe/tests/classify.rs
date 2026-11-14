@@ -24,7 +24,7 @@ fn test_cmdline_and_freq_parsers() {
     });
     assert_eq!(compute_tsc_freq_from_cpuid(l15, None), Some(2_500_000_000));
 
-    let cpuinfo = "processor\t: 0\nmodel name\t: Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz\ncpu MHz\t\t: 2400.000\n";
+    let cpuinfo = "processor\t: 0\nmodel name\t: Intel(R) Xeon(R) CPU E5504 @ 2.00GHz\ncpu MHz\t\t: 2400.000\n";
     assert_eq!(parse_tsc_freq_from_cpuinfo(cpuinfo), Some(2_400_000_000));
 }
 
@@ -53,7 +53,7 @@ fn test_cpuid_classification() {
         CpuidLeafDump {
             leaf: 0x1,
             subleaf: 0,
-            eax: 0x0004_06f1, // Broadwell-EP baseline
+            eax: 0x0001_06a5, // Nehalem baseline
             ebx: 0,
             ecx: 0,
             edx: 0,
@@ -91,10 +91,7 @@ fn test_cpuid_classification() {
             edx: 0,
         },
     ];
-    let clean = classify_cpuid(
-        &clean_leaves,
-        Some("Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"),
-    );
+    let clean = classify_cpuid(&clean_leaves, Some("Intel(R) Xeon(R) CPU E5504 @ 2.00GHz"));
     assert_eq!(clean.result, ProbeResult::Blocked);
 
     let leaky_leaves = vec![CpuidLeafDump {
@@ -209,7 +206,7 @@ fn test_dmesg_posix_vmclock_cpuinfo_and_exit_codes() {
     assert_eq!(vmclock_leak.result, ProbeResult::Unavailable);
 
     let cpu_ok = classify_cpuinfo(Some(
-        "model name\t: Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 avx2\n",
+        "model name\t: Intel(R) Xeon(R) CPU E5504 @ 2.00GHz\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 sse4_2\n",
     ));
     assert_eq!(cpu_ok.result, ProbeResult::Blocked);
 

@@ -62,7 +62,7 @@ fn trusted_reboot_boot_source_passes_transport_and_rejects_malformed_initrd() {
         path: "/boot-source".into(),
         body: json!({
             "kernel_image_path":"/kernel", "initrd_path":"/initrd",
-            "boot_args":"root=/dev/vda ro clocksource=tsc tsc=reliable hermetic.t=1700000000 hermetic.initramfs=1 tsc_early_khz=2688000"
+            "boot_args":"root=/dev/vda ro clocksource=tsc tsc=reliable hermetic.t=1700000000 hermetic.initramfs=1 tsc_early_khz=2000000"
         }),
     };
     let (response, wire) = fake_request(
@@ -103,7 +103,7 @@ fn every_planned_request_passes_the_strict_transport_schema() {
     use hermetic_vmm::spec::Role;
     for role in [Role::Agent, Role::Net, Role::Extractor, Role::Grader] {
         let spec = support::spec(role).validate().unwrap();
-        for request in hermetic_vmm::plan::calibrated_api_requests(&spec, 2_688_000).unwrap() {
+        for request in hermetic_vmm::plan::calibrated_api_requests(&spec, 2_000_000).unwrap() {
             let (response, _) =
                 fake_request(request, b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), false);
             assert_eq!(response.unwrap().status, 204);
@@ -350,8 +350,8 @@ fn boot_source_transport_refuses_uncalibrated_or_aliased_tsc_before_connect() {
     for suffix in [
         "",
         " tsc_early_khz",
-        " tsc-early-khz=2688000",
-        " tsc_early_khz=2688000 tsc-early-khz=3000000",
+        " tsc-early-khz=2000000",
+        " tsc_early_khz=2000000 tsc-early-khz=3000000",
     ] {
         let req = ApiRequest {
             method: "PUT".into(),

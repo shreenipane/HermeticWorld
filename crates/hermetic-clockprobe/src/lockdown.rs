@@ -27,6 +27,7 @@ pub const REQUIRED: &[&str] = &[
     "BPF_SYSCALL",
 ];
 pub const FORBIDDEN: &[&str] = &[
+    "HERMETIC_CLOCK_CANARY",
     "MODULES",
     "DEVMEM",
     "DEVKMEM",

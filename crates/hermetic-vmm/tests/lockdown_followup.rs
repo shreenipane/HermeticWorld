@@ -31,15 +31,15 @@ fn tsc_append_rejects_duplicate_aliases_malformed_requests_and_cap_overflow() {
         let mut s = support::spec(Role::Agent);
         s.boot_args.push_str(&format!(" {arg}"));
         assert!(s.validate().is_err(), "{arg}");
-        assert!(calibrated_boot_args(&format!("{base} {arg}"), 2_688_000).is_err());
+        assert!(calibrated_boot_args(&format!("{base} {arg}"), 2_000_000).is_err());
     }
     let mut s = support::spec(Role::Agent);
     s.boot_args
         .push_str(&" ".repeat(MAX_BOOT_ARGS - s.boot_args.len()));
     assert!(s.validate().is_err());
     for (body, khz) in [
-        (json!({}), 2_688_000),
-        (json!({"boot_args":12}), 2_688_000),
+        (json!({}), 2_000_000),
+        (json!({"boot_args":12}), 2_000_000),
         (json!({"boot_args":base}), 0),
     ] {
         assert!(with_tsc_khz(
@@ -58,11 +58,11 @@ fn tsc_append_rejects_duplicate_aliases_malformed_requests_and_cap_overflow() {
 fn all_launch_roles_have_exactly_one_calibrated_boot_source() {
     for role in [Role::Agent, Role::Net, Role::Extractor, Role::Grader] {
         let s = support::spec(role).validate().unwrap();
-        let requests = calibrated_api_requests(&s, 2_688_000).unwrap();
+        let requests = calibrated_api_requests(&s, 2_000_000).unwrap();
         let boot = requests.iter().find(|r| r.path == "/boot-source").unwrap();
         let args = boot.body["boot_args"].as_str().unwrap();
         assert_eq!(args.matches("tsc_early_khz=").count(), 1);
-        assert!(args.ends_with(" tsc_early_khz=2688000"));
+        assert!(args.ends_with(" tsc_early_khz=2000000"));
     }
 }
 
@@ -104,9 +104,9 @@ fn word(template: &Value, leaf: u32, subleaf: u32, reg: &str, original: u32) -> 
 fn active_template_masks_pv_frequency_pmu_and_baseline_identity() {
     let t = cpu_template();
     assert_eq!(t, serde_json::from_str::<Value>(CPU_TEMPLATE).unwrap());
-    assert_eq!(word(&t, 1, 0, "eax", u32::MAX), 0x0004_06f1);
+    assert_eq!(word(&t, 1, 0, "eax", u32::MAX), 0x0001_06a5);
     assert_eq!(word(&t, 1, 0, "ecx", u32::MAX) & (1 << 31), 0);
-    for leaf in [0xa, 0x15, 0x16, 0x40000000, 0x40000001] {
+    for leaf in [0xa, 0x40000000, 0x40000001] {
         for reg in ["eax", "ebx", "ecx", "edx"] {
             assert_eq!(word(&t, leaf, 0, reg, u32::MAX), 0, "{leaf:x}:{reg}");
         }
@@ -122,7 +122,7 @@ fn active_template_masks_pv_frequency_pmu_and_baseline_identity() {
     }
     assert_eq!(
         String::from_utf8(brand).unwrap().trim_end_matches('\0'),
-        "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"
+        "Intel(R) Xeon(R) CPU E5504 @ 2.00GHz"
     );
     assert_eq!(t["msr_modifiers"], json!([]));
 }

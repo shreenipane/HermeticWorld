@@ -47,13 +47,18 @@ Both `PARAVIRT` and `KVM_GUEST` (including `PARAVIRT_CLOCK`) are disabled, follo
 the clock analysis's proposed nested experiment. This removes cooperative
 pvclock hooks; it does not filter a malicious CPL-0 hypercall or WRMSR.
 Multi-vCPU boot, TSC calibration, timers and performance require measurement.
-The VMM supplies the true TSC frequency before boot, with no guessed rate or
-clock fallback. AMD and nested hosts require `HERMETIC_TSC_KHZ`, verified by the
-operator against the virtual TSC. Invalid overrides fail closed even on a host
-with CPUID.15. `no-kvmclock` is inert with KVM_GUEST disabled and is retained only
+The patched VMM scales every guest TSC to 2 GHz and supplies that same frequency
+before boot. Unsupported CPU/scaling hosts fail closed. The optional legacy
+`HERMETIC_TSC_KHZ` setting may only equal `2000000`. `no-kvmclock` is inert with KVM_GUEST disabled and is retained only
 for lock/spec compatibility. `spec_boot_arguments` produces VmSpec inputs; direct
 Python launches must use `boot_arguments(t, vmm=Path(...))`, which delegates to
 the VMM resolver. All integration smokes route through lifecycle.
+
+Host filtering is now required in v1 (owner decision 2026-11-14). The pinned
+patch, Linux 7.0 source findings, offline builder and manager-only ring-0 canary
+are documented in [host filtering](clock-3b-host-filter.md). Earlier references
+below to host filtering being outside this branch are superseded by that work;
+full builds and owner nested-VM validation remain open.
 
 ## Manager build and VM checks
 
@@ -64,6 +69,8 @@ the kernel compilation container itself has `--network=none --pull=never`.
 The owner reported a nested-VM boot with both lockdown probes blocked on
 2026-11-14. The expanded CPU profile and other VM paths still need owner-run
 verification. These commands were not run during this offline review.
+Before the smokes, export `HERMETIC_FC_BIN` and `HERMETIC_FIRECRACKER_LOCK`
+from the measured patched build described in the host filtering guide.
 
 ```sh
 ./scripts/integration/kernel-build.sh \
@@ -111,12 +118,11 @@ does not attest hidden time. Review those records separately from these two
 lockdown checks. Host-KVM enforcement and CPU identity normalization remain
 separate components, as required by TR-VMM-3.
 
-## Owner decisions still open
+## Manager runtime validation
 
-A guest kernel exploit can execute `KVM_HC_CLOCK_PAIRING` or write wall-clock
-MSRs despite this policy. Host-side hypercall/MSR filtering is required and is
-unavailable in stock Firecracker. Keep `clock: faked` until the owner resolves
-that boundary. Stock CPU normalization also restores the hypervisor bit and
-can emit a host-derived brand frequency; complete identity normalization,
-portable AMD/nested templates and actual TSC scaling require VMM work.
-See [the source analysis and residual decisions](clock-3b-analysis.md).
+The pinned patch enforces host MSR/hypercall filtering, a fixed Nehalem/v2 CPUID
+profile and actual TSC scaling on cold boot and restore. Keep `clock: faked`
+until the manager completes the patched build, nested ring-0 canary, negative
+controls and restore tests on the deployment host. Unsupported hosts fail
+closed. See [the source analysis](clock-3b-analysis.md) for the exact profile,
+frequency and substrate timing limits.

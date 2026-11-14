@@ -27,7 +27,7 @@ def config(values=None):
 def lock():
     value = k.load_lock(ROOT / "kernel.lock.json")
     value.update(sha256=hashlib.sha256(b"source").hexdigest(),
-                 builder_image="hermetic/kernel-builder:6.6-v1@sha256:" + "a" * 64)
+                 builder_image=k.APPROVED_BUILDER_IMAGE)
     return value
 
 
@@ -35,7 +35,7 @@ def test_checked_in_lock_real_pins():
     raw = json.loads((ROOT / "kernel.lock.json").read_text())
     assert raw["sha256"] == "b24c40a9e2188695803358567edda51c4080176424a57dbefca45e5ac44ec225"
     assert raw["release_date"] == "2026-10-21T00:00:00Z"
-    assert raw["builder_image"] == "hermetic/kernel-builder:6.6-v1@sha256:TO-BE-FILLED-BY-OWNER"
+    assert raw["builder_image"] == k.APPROVED_BUILDER_IMAGE
     assert raw["version"] == "6.6.160"
     assert raw["source_url"] == "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.160.tar.xz"
     assert raw["build_user"] == "hermetic"
@@ -119,7 +119,8 @@ def test_lock_shape_identity_and_dates(lock):
 @pytest.mark.parametrize("field", ["sha256", "release_date", "builder_image"])
 def test_placeholder_field_named(lock, field):
     lock[field] = ("hermetic/builder@sha256:" if field == "builder_image" else "") + k.PLACEHOLDER
-    k.validate_lock(lock)
+    if field != "builder_image":
+        k.validate_lock(lock)
     with pytest.raises(k.KernelError, match=field):
         k.validate_lock(lock, for_build=True)
 
@@ -140,7 +141,7 @@ def test_docker_known_answer(lock):
         "--mount", "type=bind,src=/private/in,dst=/inputs,readonly",
         "--mount", "type=bind,src=/private/out,dst=/output",
         "--tmpfs", "/build:rw,exec,nosuid,nodev,size=8g,mode=1777", "--workdir=/build",
-        "--entrypoint=/bin/bash", "hermetic/kernel-builder:6.6-v1@sha256:" + "a" * 64, "/inputs/build.sh"]
+        "--entrypoint=/bin/bash", "sha256:" + k.APPROVED_BUILDER_DIGEST, "/inputs/build.sh"]
 
 
 @pytest.mark.parametrize("path", ["relative", "/tmp/a,readonly", "/tmp/a\n", "/tmp/../a"])
@@ -288,7 +289,7 @@ def test_cli_status_json_and_errors(tmp_path, capsys):
     assert main(["kernel-check-config", "--config", str(path)]) == 1
     assert "SECRET" not in capsys.readouterr().out
     assert main(["kernel-build", "--tarball", str(path), "--out", str(tmp_path)]) == 1
-    assert "placeholder" in capsys.readouterr().out
+    assert "source tarball sha256 mismatch" in capsys.readouterr().out
     # Test placeholder refusal using an explicit fixture copy
     placeholder_lock = tmp_path / "placeholder_lock.json"
     placeholder_lock.write_text(json.dumps({**k.load_lock(ROOT / "kernel.lock.json"), "sha256": k.PLACEHOLDER}))
@@ -724,10 +725,10 @@ def test_run_timeout_keeps_stderr_tail(tmp_path, monkeypatch):
 
 
 def test_local_builder_image_id_is_not_a_registry_digest(lock):
-    lock['builder_image'] = 'sha256:' + 'b' * 64
+    lock['builder_image'] = 'sha256:' + k.APPROVED_BUILDER_DIGEST
     assert k.validate_lock(lock, for_build=True) == lock
     argv = k.docker_arguments(lock, Path('/in'), Path('/out'))
-    assert argv[-2] == 'sha256:' + 'b' * 64
+    assert argv[-2] == 'sha256:' + k.APPROVED_BUILDER_DIGEST
     assert '--pull=never' in argv
 
 
@@ -737,7 +738,7 @@ def integration_inputs(tmp_path, lock, monkeypatch):
     kernel.mkdir()
     for name in ('Dockerfile', 'build.sh', 'base-x86_64.config', 'hermetic.config'):
         (kernel / name).write_bytes((ROOT / name).read_bytes())
-    lock['builder_image'] = 'hermetic/kernel-builder:6.6-v1@sha256:' + k.PLACEHOLDER
+    lock['builder_image'] = k.APPROVED_BUILDER_IMAGE
     (kernel / 'kernel.lock.json').write_text(json.dumps(lock))
     source = tmp_path / 'source.tar.xz'
     source.write_bytes(b'source')
@@ -760,7 +761,7 @@ def test_integration_resolves_local_id_and_uses_private_output(integration_input
         assert argv[5] == 'BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc'
         image_file = Path(argv[argv.index('--iidfile') + 1])
         assert image_file.is_relative_to(output)
-        image_file.write_text('sha256:' + 'c' * 64 + '\n')
+        image_file.write_text('sha256:' + k.APPROVED_BUILDER_DIGEST + '\n')
         calls.append('image')
 
     def build(lock_path, tarball, out, *, work_dir, output_identity, kernel_dir):
@@ -771,7 +772,7 @@ def test_integration_resolves_local_id_and_uses_private_output(integration_input
         info = output.stat()
         assert output_identity == (info.st_dev, info.st_ino)
         effective = k.load_lock(lock_path, for_build=True)
-        assert effective['builder_image'] == 'sha256:' + 'c' * 64
+        assert effective['builder_image'] == 'sha256:' + k.APPROVED_BUILDER_DIGEST
         (out / 'build-record.json').write_bytes(b'{"verified": true}\n')
         calls.append('kernel')
 
@@ -780,7 +781,7 @@ def test_integration_resolves_local_id_and_uses_private_output(integration_input
     assert k.integration_build(source, output) == b'{"verified": true}\n'
     assert calls == ['image', 'kernel']
     assert outside.read_bytes() == b'unchanged'
-    assert k.load_lock(output / 'kernel.lock.json', for_build=True)['builder_image'] == 'sha256:' + 'c' * 64
+    assert k.load_lock(output / 'kernel.lock.json', for_build=True)['builder_image'] == 'sha256:' + k.APPROVED_BUILDER_DIGEST
     assert (output / 'kernel.lock.json').stat().st_mode & 0o777 == 0o600
     assert sorted(p.name for p in output.iterdir()) == ['build-record.json', 'kernel.lock.json']
 
@@ -1057,8 +1058,8 @@ def test_direct_boot_arguments_route_through_vmm(tmp_path):
     resolver = _vmm_resolver_fixture(tmp_path,
         "assert sys.argv[1] == 'boot-args'\n"
         "assert 'tsc_early_khz' not in sys.argv[2]\n"
-        "print(sys.argv[2] + ' tsc_early_khz=2688000')\n")
-    expected = k.spec_boot_arguments(1704067200) + " tsc_early_khz=2688000"
+        "print(sys.argv[2] + ' tsc_early_khz=2000000')\n")
+    expected = k.spec_boot_arguments(1704067200) + " tsc_early_khz=2000000"
     assert k.boot_arguments(1704067200, vmm=resolver) == expected
     assert k.check_boot_arguments(expected) == []
     # The immutable lock/spec remain free of host frequency; only executable args get it.
@@ -1071,6 +1072,7 @@ def test_direct_boot_arguments_route_through_vmm(tmp_path):
     "print(sys.argv[2] + ' tsc_early_khz=0')\n",
     "print(sys.argv[2] + ' tsc_early_khz=02688000')\n",
     "print(sys.argv[2] + ' tsc_early_khz=10000001')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=2688000')\n",
     "print(sys.argv[2] + ' tsc_early_khz=2688000 extra=secret')\n",
     "sys.stdout.buffer.write(b'\\xff')\n",
     "print('x' * 100000)\n",
@@ -1096,3 +1098,10 @@ def test_direct_boot_arguments_deadline_symlinks_and_validation_before_open(tmp_
     # No attempt to inspect an invalid path for an invalid clock input.
     with pytest.raises(k.KernelError, match="t_clock"):
         k.boot_arguments(-1, vmm=tmp_path / "missing")
+
+
+def test_disposable_canary_kernel_is_refused_by_production_checker():
+    values = {name: rule.value for name, rule in k.RULES.items()}
+    values['CONFIG_HERMETIC_CLOCK_CANARY'] = 'y'
+    assert k.check_config(config(values)) == [k.Finding(
+        'CONFIG_HERMETIC_CLOCK_CANARY', 'forbidden option is enabled')]

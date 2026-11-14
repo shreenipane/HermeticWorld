@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 pub const VMM_OVERHEAD_MIB: u64 = 128;
 /// Accepted guest TSC frequency range in kHz (100 MHz to 10 GHz).
 pub const TSC_KHZ_RANGE: std::ops::RangeInclusive<u64> = 100_000..=10_000_000;
+/// Scaled in the pinned Firecracker build, independent of physical frequency.
+pub const GUEST_TSC_KHZ: u64 = 2_000_000;
 
 /// The host TSC frequency from CPUID leaf 0x15 (crystal Hz * EBX / EAX), in kHz.
 /// The guest kernel has no kvmclock, PIT, HPET or ACPI PM timer to calibrate
@@ -83,12 +85,15 @@ pub fn resolve_tsc_khz(cpuid: Option<u64>, operator: Option<&str>) -> crate::Res
     ))
 }
 
-/// Reject non-Unicode overrides too; an invalid operator setting is never absent.
+/// The patched VMM scales to this rate. Refuse stale physical-rate overrides,
+/// including non-Unicode settings, without querying any host CPU frequency.
 pub fn configured_tsc_khz() -> crate::Result<u64> {
-    resolve_tsc_khz_os(
-        host_tsc_khz(),
-        std::env::var_os("HERMETIC_TSC_KHZ").as_deref(),
-    )
+    if std::env::var_os("HERMETIC_TSC_KHZ").is_some_and(|value| value != "2000000") {
+        return Err(crate::Error::Validation(
+            "HERMETIC_TSC_KHZ must match fixed guest rate",
+        ));
+    }
+    Ok(GUEST_TSC_KHZ)
 }
 
 pub fn resolve_tsc_khz_os(
@@ -106,7 +111,7 @@ pub fn resolve_tsc_khz_os(
 
 /// Resolve the executable boot source before sending any configuration requests.
 pub fn with_tsc_khz(mut req: ApiRequest, khz: u64) -> crate::Result<ApiRequest> {
-    if !TSC_KHZ_RANGE.contains(&khz) {
+    if khz != GUEST_TSC_KHZ {
         return Err(crate::Error::Validation("TSC frequency range"));
     }
     if req.path == "/boot-source" {
@@ -123,7 +128,7 @@ pub fn with_tsc_khz(mut req: ApiRequest, khz: u64) -> crate::Result<ApiRequest> 
 
 pub fn calibrated_boot_args(args: &str, khz: u64) -> crate::Result<String> {
     crate::spec::validate_boot_args(args)?;
-    if !TSC_KHZ_RANGE.contains(&khz) || has_tsc_arg(args) {
+    if khz != GUEST_TSC_KHZ || has_tsc_arg(args) {
         return Err(crate::Error::Validation("TSC frequency is VMM-owned"));
     }
     let args = format!("{args} tsc_early_khz={khz}");
@@ -146,7 +151,7 @@ pub(crate) fn valid_calibrated_boot_args(args: &str) -> bool {
     let mut reserved = args.split_ascii_whitespace().filter(|a| has_tsc_arg(a));
     reserved
         .next()
-        .is_some_and(|a| a.starts_with("tsc_early_khz="))
+        .is_some_and(|a| a == "tsc_early_khz=2000000")
         && reserved.next().is_none()
 }
 

@@ -75,17 +75,12 @@ fn brand() -> Option<String> {
 }
 fn probe_cpuid() -> ProbeRecord {
     let mut leaves = Vec::new();
-    for leaf in [0, 1, 7, 0xa, 0x15, 0x16]
-        .into_iter()
-        .chain(0x4000_0000..=0x4000_0010)
-    {
-        // Dump every requested query, including unadvertised hypervisor
-        // leaves. Classification separately avoids interpreting unsupported
-        // basic-leaf aliases as frequency data.
-        if let Some((eax, ebx, ecx, edx)) = arch_x86::read_cpuid(leaf, 0) {
+    for (leaf, subleaf) in crate::baseline::queries() {
+        // Query the complete fixed profile, including zeroed PV leaves.
+        if let Some((eax, ebx, ecx, edx)) = arch_x86::read_cpuid(leaf, subleaf) {
             leaves.push(CpuidLeafDump {
                 leaf,
-                subleaf: 0,
+                subleaf,
                 eax,
                 ebx,
                 ecx,
@@ -93,15 +88,7 @@ fn probe_cpuid() -> ProbeRecord {
             });
         }
     }
-    // All queried structured feature subleaves are bounded, independent of a
-    // hostile maximum-subleaf value. The remaining leaves are explicitly
-    // outside this diagnostic's identity-coverage claim.
-    if cpuid(7, 0).is_some_and(|r| r.eax >= 1) {
-        if let Some(r) = cpuid(7, 1) {
-            leaves.push(r);
-        }
-    }
-    classify::classify_cpuid(&leaves, brand().as_deref())
+    crate::identity::inspect(&leaves, brand().as_deref())
 }
 fn probe_rdtsc(boot: Option<f64>) -> ProbeRecord {
     let start = Instant::now();

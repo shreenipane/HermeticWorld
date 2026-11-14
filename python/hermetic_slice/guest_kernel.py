@@ -43,6 +43,8 @@ MAX_STDERR_BYTES = 64 * 1024
 MAX_IMAGE_ID_BYTES = 72
 STDERR_LOG = "kernel-build.stderr.log"
 PLACEHOLDER = "TO-BE-FILLED-BY-OWNER"
+APPROVED_BUILDER_DIGEST = "29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238"
+APPROVED_BUILDER_IMAGE = "hermetic/kernel-builder:6.6-v1@sha256:" + APPROVED_BUILDER_DIGEST
 DEFAULT_KERNEL_DIR = Path(__file__).absolute().parent.parent.parent / "images" / "kernel"
 
 
@@ -80,7 +82,7 @@ for _purpose, _names in (
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("y", _purpose)
 for _purpose, _names in (
-    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK"),
+    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK HERMETIC_CLOCK_CANARY"),
     ("TR-VMM-4: prevent accidental host clock reads", "PTP_1588_CLOCK PTP_1588_CLOCK_KVM PTP_1588_CLOCK_VMW RTC_HCTOSYS"),
     ("TR-VMM-4: fixed build identity; config supplied separately", "LOCALVERSION_AUTO IKCONFIG"),
     ("T3.1: no time namespace needed", "TIME_NS"),
@@ -227,7 +229,7 @@ def boot_arguments(t_clock: int, *, vmm: Path) -> str:
     if not text.startswith(prefix) or not text.endswith("\n"):
         raise KernelError("invalid VMM boot arguments")
     value = text[len(prefix):-1]
-    if not re.fullmatch(r"[1-9][0-9]{5,7}", value) or not TSC_KHZ_MIN <= int(value) <= TSC_KHZ_MAX:
+    if value != "2000000":
         raise KernelError("invalid VMM TSC frequency")
     return text[:-1]
 
@@ -282,7 +284,7 @@ def validate_lock(lock: dict, *, for_build: bool = False) -> dict:
         raise KernelError("invalid lock field: source_url")
     if lock["sha256"] != PLACEHOLDER and not re.fullmatch(r"[0-9a-f]{64}", lock["sha256"]):
         raise KernelError("invalid lock field: sha256")
-    if not re.fullmatch(r"(?:sha256:[0-9a-f]{64}|[a-z0-9./:_-]+@sha256:(?:[0-9a-f]{64}|TO-BE-FILLED-BY-OWNER))", lock["builder_image"]):
+    if lock["builder_image"] not in (APPROVED_BUILDER_IMAGE, "sha256:" + APPROVED_BUILDER_DIGEST):
         raise KernelError("invalid lock field: builder_image")
     for field in ("build_user", "build_host"):
         if lock[field] != "hermetic":
@@ -473,7 +475,7 @@ def docker_arguments(lock: dict, input_dir: Path, output_dir: Path, *, uid: int 
         "--mount", f"type=bind,src={input_dir},dst=/inputs,readonly",
         "--mount", f"type=bind,src={output_dir},dst=/output",
         "--tmpfs", "/build:rw,exec,nosuid,nodev,size=8g,mode=1777",
-        "--workdir=/build", "--entrypoint=/bin/bash", lock["builder_image"], "/inputs/build.sh",
+        "--workdir=/build", "--entrypoint=/bin/bash", "sha256:" + APPROVED_BUILDER_DIGEST, "/inputs/build.sh",
     ]
 
 
@@ -663,8 +665,7 @@ def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Pa
 def integration_build(tarball: Path, output: Path) -> bytes:
     """Prepare a local builder, then build offline using its immutable image ID."""
     lock = load_lock(DEFAULT_KERNEL_DIR / "kernel.lock.json")
-    # Only the builder pin may be unresolved, and all inputs precede output creation.
-    validate_lock({**lock, "builder_image": "sha256:" + "0" * 64}, for_build=True)
+    validate_lock(lock, for_build=True)
     inputs = _build_inputs(DEFAULT_KERNEL_DIR)
     if hash_file(tarball, MAX_TARBALL_BYTES) != lock["sha256"]:
         raise KernelError("source tarball sha256 mismatch")

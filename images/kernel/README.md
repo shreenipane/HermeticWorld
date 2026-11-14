@@ -21,7 +21,7 @@ The lock file `kernel.lock.json` contains verified upstream pin values:
 - `source_url`: `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.160.tar.xz`
 - `sha256`: `b24c40a9e2188695803358567edda51c4080176424a57dbefca45e5ac44ec225` (verified against kernel.org `v6.x/sha256sums.asc`, whose signature verified with the kernel.org checksum autosigner key B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1)
 - `release_date`: `2026-10-21T00:00:00Z` (the 6.6.160 tarball release date)
-- `builder_image`: `hermetic/kernel-builder:6.6-v1@sha256:TO-BE-FILLED-BY-OWNER` (unresolved template; the integration script replaces this field with the local `sha256:<image ID>` after building)
+- `builder_image`: `hermetic/kernel-builder:6.6-v1@sha256:29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238` (owner-approved local image ID; Docker uses `sha256:29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238`)
 - Builder base image: `debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` (debian:bookworm-slim).
 
 ## Running the integration build
@@ -34,7 +34,7 @@ Run the integration build script `scripts/integration/kernel-build.sh` from the 
 
 The script:
 1. Validates the source hash and output directory, then builds the builder container image locally from `images/kernel/Dockerfile` using `--build-arg BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`, tagged as `hermetic/kernel-builder:6.6-v1`. Network access is permitted only during this docker build step to install build essentials (bison, flex, gcc, libelf-dev, libssl-dev, python3, xz-utils).
-2. Reads the image ID from Docker’s `--iidfile` and uses `sha256:<image ID>` as the immutable local builder reference. A local image ID is not a registry manifest digest and must not be appended to a repository name with `@`. Registry references with genuine manifest digests remain supported. After the builder image is built, the kernel build runs with `--network=none` and `--pull=never`.
+2. Reads the image ID from Docker’s `--iidfile` and uses `sha256:<image ID>` as the immutable local builder reference. A local image ID is not a registry manifest digest and must not be appended to a repository name with `@`. Validation requires the approved builder digest; a rebuilt image with a different ID is refused. After the builder image is built, the kernel build runs with `--network=none` and `--pull=never`.
 3. Prints the resulting `build-record.json` from the output directory.
 
 The script runs without `sudo` and stages files inside the specified output directory. Missing directories are created with mode 0700; an existing output directory must be caller-owned with mode 0700. Symlinked paths and special files are refused, and existing directories are never chmodded. The resolved `kernel.lock.json` is published atomically with mode 0600 after a successful build. Docker writes to its image store during builder preparation.
@@ -195,6 +195,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_FAIR_GROUP_SCHED` | `y` | TR-VMM-4: cgroup v2 controllers and device BPF |
 | `CONFIG_FHANDLE` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_FS_POSIX_ACL` | `y` | TR-VMM-4: root filesystems |
+| `CONFIG_HERMETIC_CLOCK_CANARY` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_HIBERNATION` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_HW_RANDOM` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
 | `CONFIG_HW_RANDOM_VIRTIO` | `y` | TR-VMM-5: virtio devices, vsock and entropy |
@@ -308,8 +309,8 @@ present with its exact value. The final config must identify Linux >= 5.10.
 The lock's boot string is VmSpec input. `spec_boot_arguments(t_clock)` produces
 that canonical input; lifecycle adds the VMM-owned `tsc_early_khz` before launch.
 Direct Python builders use `boot_arguments(t_clock, vmm=Path(...))`, which executes
-the pinned VMM resolver with bounded output and a deadline. AMD/nested hosts
-require the operator's `HERMETIC_TSC_KHZ`; no frequency is guessed.
+the pinned VMM resolver with bounded output and a deadline. It returns the fixed
+scaled guest rate `tsc_early_khz=2000000`. Unsupported CPU/scaling hosts fail closed.
 `no-kvmclock` remains for compatibility and is inert when KVM_GUEST is disabled.
 See [the clock analysis](../../docs/clock-3b-analysis.md) for host filtering and
-CPU normalization work still required before any hidden-clock claim.
+CPU/TSC enforcement and manager validation required before a hidden-clock claim.

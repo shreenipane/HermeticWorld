@@ -145,7 +145,7 @@ impl Runner for Fake {
         if self.fail.as_deref() == Some("tsc") {
             Err(Error::Validation("frequency unavailable"))
         } else {
-            Ok(2_688_000)
+            Ok(2_000_000)
         }
     }
     fn spawn(

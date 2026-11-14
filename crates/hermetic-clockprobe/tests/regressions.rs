@@ -123,7 +123,7 @@ fn small_rtc_divergence_and_hidden_cpu_brand_are_detected() {
     let leaf = CpuidLeafDump {
         leaf: 1,
         subleaf: 0,
-        eax: 0x0004_06f1,
+        eax: 0x0001_06a5,
         ebx: 0,
         ecx: 0,
         edx: 0,
@@ -314,5 +314,19 @@ fn unknown_clocksource_and_hypervisor_advertisements_cannot_pass_profile() {
             Some(BASELINE_BRAND),
         );
         assert_eq!(rec.result, ProbeResult::Leak, "{leaf:x}");
+    }
+}
+
+#[test]
+fn later_cpu_identity_and_flags_cannot_hide_behind_cpu_zero() {
+    let first = format!("processor: 0\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc\n\n");
+    for second in [
+        "processor: 1\nmodel name: host-secret-sku\nflags: fpu tsc\n".to_string(),
+        format!("processor: 1\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc amx_tile\n"),
+    ] {
+        assert_eq!(
+            classify_cpuinfo(Some(&(first.clone() + &second))).result,
+            ProbeResult::Leak
+        );
     }
 }
