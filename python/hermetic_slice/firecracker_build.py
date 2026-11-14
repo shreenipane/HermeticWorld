@@ -142,7 +142,7 @@ def docker_arguments(image: str, work: Path) -> list[str]:
             '--ulimit=fsize=2147483648:2147483648',
             '--user', f'{os.getuid()}:{os.getgid()}',
             '--tmpfs=/tmp:rw,nosuid,nodev,size=64m',
-            '--tmpfs=/target:rw,nosuid,nodev,size=4g',
+            '--tmpfs=/target:rw,exec,nosuid,nodev,size=4g',
             '-v', f'{work}/source:/build:rw', '-v', f'{work}/inputs:/inputs:ro',
             '-v', f'{work}/outputs:/outputs:rw', '--workdir=/build',
             '-e', 'CARGO_TARGET_DIR=/target', '-e', 'CARGO_HOME=/tmp/cargo',

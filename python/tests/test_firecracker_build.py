@@ -209,3 +209,18 @@ def test_build_timeout_removes_daemon_container_before_return(monkeypatch):
     assert calls[-1][1] == argv[:3] + ['rm', '--force', argv[argv.index('--name') + 1]]
     assert calls[-1][2]['timeout'] <= 30
     assert calls[-1][2]['env'] == {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+
+
+def test_target_tmpfs_allows_build_scripts_to_execute():
+    # Docker mounts --tmpfs noexec by default; cargo build scripts compiled into
+    # /target then fail with EACCES (manager build, 2026-11-14).
+    from pathlib import Path
+    from hermetic_slice import firecracker_build as fb
+    args = fb.docker_arguments("sha256:" + "0" * 64, Path("/attempt"))
+    target = [a for a in args if a.startswith("--tmpfs=/target:")]
+    assert len(target) == 1
+    options = target[0].split(":", 1)[1].split(",")
+    assert "exec" in options and "noexec" not in options
+    assert "nosuid" in options and "nodev" in options
+    tmp = [a for a in args if a.startswith("--tmpfs=/tmp:")]
+    assert len(tmp) == 1 and "exec" not in tmp[0].split(":", 1)[1].split(",")
