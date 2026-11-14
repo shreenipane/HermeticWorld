@@ -10,6 +10,7 @@ import secrets
 from typing import Any, Callable
 
 from hermetic_slice.agent_loop import AGENT_PRELUDE, AgentResult, Limits, run_agent
+from hermetic_slice.date_sentinel import DateSentinel, merge_summaries
 from hermetic_slice.dockerutil import run_docker
 from hermetic_slice.extract import extract_patch
 from hermetic_slice.world import start_world, stop_world, world_exec
@@ -26,6 +27,19 @@ def _sha256_of_file(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def _default_sentinel() -> DateSentinel:
+    """D12 sentinel for the real run day, this host's name and home directory."""
+    import datetime as _dt
+    import socket
+
+    names = [n for n in {socket.gethostname(), socket.getfqdn()} if n and n != "localhost"]
+    home = str(Path.home())
+    paths = [home] if len(home) > 1 else []
+    return DateSentinel(
+        _dt.datetime.now(_dt.timezone.utc).date(), host_names=names, host_paths=paths
+    )
+
+
 def run_task(
     task_dir: Path,
     *,
@@ -34,14 +48,23 @@ def run_task(
     run_dir: Path,
     image_tag_format: str = "hermetic/{id}:sealed",
     limits: Limits | None = None,
+    sentinel: DateSentinel | None = None,
+    extra_sentinel_summaries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Execute one task inside sealed world, extract patch, grade, and record results."""
+    """Execute one task inside sealed world, extract patch, grade, and record results.
+
+    ``date_leak_observed`` is the D12 result: the harness sentinel (prompts and
+    observations; default real date = today UTC, host name and home directory) merged with
+    ``extra_sentinel_summaries`` (e.g. the gateway's ``date_sentinel.json``).
+    """
     task_dir = Path(task_dir)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if limits is None:
         limits = Limits()
+    if sentinel is None:
+        sentinel = _default_sentinel()
 
     # 1. Read task.json and ONLY agent/problem_statement.md.
     task_path = task_dir / "task.json"
@@ -78,6 +101,7 @@ def run_task(
         extract: dict[str, Any] | None = None,
         grade: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        date_sentinel = merge_summaries([sentinel.summary(), *(extra_sentinel_summaries or [])])
         record: dict[str, Any] = {
             "schema": "hermetic-slice-run/v0-unsigned",
             "instance_id": instance_id,
@@ -105,7 +129,8 @@ def run_task(
             "grade": grade or {},
             "status": status,
             "error": error,
-            "date_leak_observed": None,
+            "date_leak_observed": date_sentinel["date_leak_observed"],
+            "date_sentinel": date_sentinel,
             "notes": "Phase 0: unsigned; transcript audit not run",
         }
         (run_dir / "run.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
@@ -139,6 +164,7 @@ def run_task(
             problem_statement,
             limits=limits,
             trajectory_path=trajectory_path,
+            sentinel=sentinel,
         )
         agent_info = {
             "agent_status": agent_res.status,

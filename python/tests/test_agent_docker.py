@@ -280,7 +280,8 @@ def test_run_task_docker_end_to_end(
     assert saved_record["grade"]["p2p_success"] == 2
     assert saved_record["grade"]["p2p_failure"] == 0
     assert saved_record["status"] == "completed"
-    assert saved_record["date_leak_observed"] is None
+    assert isinstance(saved_record["date_leak_observed"], bool)
+    assert saved_record["date_sentinel"]["date_leak_observed"] == saved_record["date_leak_observed"]
     assert "Phase 0: unsigned; transcript audit not run" in saved_record["notes"]
 
     # 2. Digests match the files

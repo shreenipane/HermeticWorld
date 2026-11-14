@@ -9,6 +9,7 @@ import re
 import time
 from typing import Any, Callable
 
+from hermetic_slice.date_sentinel import DateSentinel
 from hermetic_slice.model_client import ModelError, ModelReply
 
 AGENT_PRELUDE = (
@@ -81,8 +82,14 @@ def run_agent(
     *,
     limits: Limits | None = None,
     trajectory_path: Path | None = None,
+    sentinel: DateSentinel | None = None,
 ) -> AgentResult:
-    """Run the agent interaction loop against model and exec_fn."""
+    """Run the agent interaction loop against model and exec_fn.
+
+    With ``sentinel`` (D12, TR-SEC-5), every text sent to the model (system prompt, task
+    prompt, format-error turns) is scanned as ``prompt`` and every command output returned
+    from the world, before truncation, as ``observation``.
+    """
     if limits is None:
         limits = Limits()
 
@@ -103,6 +110,9 @@ def run_agent(
     history_elided = False
 
     init_prompt = instance_prompt(problem_statement)
+    if sentinel is not None:
+        sentinel.scan_text("prompt", SYSTEM_PROMPT)
+        sentinel.scan_text("prompt", init_prompt)
     messages: list[dict[str, str]] = [
         {"role": "user", "text": init_prompt}
     ]
@@ -179,6 +189,8 @@ def run_agent(
             fmt_error_text = (
                 "Your response must contain exactly one ```bash block holding one command or one &&-chained command."
             )
+            if sentinel is not None:
+                sentinel.scan_text("prompt", fmt_error_text)
             messages.append({"role": "model", "text": reply.text})
             messages.append({"role": "user", "text": fmt_error_text})
 
@@ -221,6 +233,8 @@ def run_agent(
 
         # Execute command
         code, raw_output = exec_fn(cmd, limits.command_timeout_s)
+        if sentinel is not None:
+            sentinel.scan_text("observation", raw_output)
 
         # Output truncation
         raw_len = len(raw_output)
