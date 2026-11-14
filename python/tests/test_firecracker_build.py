@@ -224,3 +224,24 @@ def test_target_tmpfs_allows_build_scripts_to_execute():
     assert "nosuid" in options and "nodev" in options
     tmp = [a for a in args if a.startswith("--tmpfs=/tmp:")]
     assert len(tmp) == 1 and "exec" not in tmp[0].split(":", 1)[1].split(",")
+
+
+def test_held_parent_resolves_to_real_path_not_proc_magic_link(tmp_path):
+    # runc rejects bind mounts from /proc/PID/fd paths with EINVAL (manager build, 2026-11-14).
+    import os
+    import pytest
+    from hermetic_slice import firecracker_build as fb
+    d = tmp_path / "parent"
+    d.mkdir(mode=0o700)
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        resolved = fb.held_directory_path(fd)
+        assert str(resolved) == os.path.realpath(d) and not str(resolved).startswith("/proc/")
+        os.rename(d, tmp_path / "moved")
+        (tmp_path / "parent").mkdir(mode=0o700)
+        assert fb.held_directory_path(fd) == tmp_path / "moved"
+        os.rmdir(tmp_path / "moved")
+        with pytest.raises((fb.k.KernelError, OSError)):
+            fb.held_directory_path(fd)
+    finally:
+        os.close(fd)

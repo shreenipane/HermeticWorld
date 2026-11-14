@@ -179,6 +179,21 @@ def run(argv: list[str]) -> None:
         raise k.KernelError('Firecracker build failed')
 
 
+def held_directory_path(fd: int) -> Path:
+    """Real path of a held private directory, for Docker bind mounts.
+
+    runc cannot bind-mount /proc/PID/fd magic links (EINVAL), so resolve the
+    descriptor and require the resolved path to be the same directory inode.
+    The caller has already required the directory to be private.
+    """
+    real = os.readlink(f'/proc/self/fd/{fd}')
+    held = os.fstat(fd)
+    seen = os.stat(real, follow_symlinks=False)
+    if not real.startswith('/') or (seen.st_dev, seen.st_ino) != (held.st_dev, held.st_ino):
+        raise k.KernelError('held output parent moved')
+    return Path(real)
+
+
 def build(tarball: Path, image: str, output: Path, *, runner=run) -> None:
     lock, archive, patch = inputs(tarball, image)
     files = source_files(archive)
@@ -195,7 +210,7 @@ def build(tarball: Path, image: str, output: Path, *, runner=run) -> None:
             pass
         else:
             raise k.KernelError('output must be fresh')
-        held_parent = Path(f'/proc/{os.getpid()}/fd/{parent}')
+        held_parent = held_directory_path(parent)
         with tempfile.TemporaryDirectory(prefix='.fc-build-', dir=held_parent) as temporary:
             work = Path(temporary)
             artifacts = []
