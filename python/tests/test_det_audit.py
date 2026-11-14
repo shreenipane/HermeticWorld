@@ -30,11 +30,13 @@ def test_warc_capture_known_answer_all_records_and_boundaries(tmp_path: Path) ->
     path.write_bytes(warc(b"2025-05-01T00:00:00Z") + warc())
     result = scan_tree(tmp_path, CLOCK)
     assert result.is_complete() and result.verdict == "gate"
+    BODY_SHA = "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5"  # sha256(b"body")
     assert [f.to_dict() for f in result.findings] == [
         {"path": "capture.warc", "member_chain": ["<warc:1>"], "carrier": "warc_date",
-         "found_date": CLOCK, "severity": "info", "implausible": False, "note": ""},
+         "found_date": CLOCK, "severity": "info", "implausible": False, "note": "", "payload_sha256": BODY_SHA},
         {"path": "capture.warc", "member_chain": ["<warc:2>"], "carrier": "warc_date",
-         "found_date": "2025-05-01T00:00:01Z", "severity": "gate", "implausible": False, "note": ""},
+         "found_date": "2025-05-01T00:00:01Z", "severity": "gate", "implausible": False, "note": "",
+         "payload_sha256": BODY_SHA},
     ]
     assert result.to_json() == scan_tree(tmp_path, CLOCK).to_json()
 
