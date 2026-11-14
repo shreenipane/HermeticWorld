@@ -202,6 +202,12 @@ impl Write for Pipe {
         Ok(())
     }
 }
+impl rpc::Connection for Pipe {
+    fn drain_reply(&mut self) -> io::Result<()> {
+        // The in-memory writer has already delivered every byte.
+        Ok(())
+    }
+}
 fn server(locked: bool) -> Server<Fake> {
     Server::new(
         Fake::default(),
@@ -925,6 +931,80 @@ fn shutdown_exact_order_retained_handle_and_disconnected_reply() {
         );
         assert_eq!(server.sys.events.len(), fail + 2);
         assert_eq!(server.sys.events.last().unwrap(), "PowerOff(Shutdown)");
+    }
+}
+
+#[test]
+fn reboot_smoke_shutdown_writes_complete_reply_and_drains_before_poweroff_even_on_drain_failure() {
+    struct QueuedSocket {
+        input: Cursor<Vec<u8>>,
+        queued: Vec<u8>,
+        trace: Rc<RefCell<Vec<String>>>,
+        fail_drain: bool,
+        fail_flush: bool,
+    }
+    impl Read for QueuedSocket {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for QueuedSocket {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            // Short writes split both the header and body.
+            let part = bytes.get(..bytes.len().min(2)).unwrap();
+            self.queued.extend_from_slice(part);
+            Ok(part.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            assert_eq!(self.queued, b"\x11\0\0\0{\"type\":\"frozen\"}");
+            self.trace.borrow_mut().push("flush-complete-frame".into());
+            if self.fail_flush {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl rpc::Connection for QueuedSocket {
+        fn drain_reply(&mut self) -> io::Result<()> {
+            assert_eq!(self.queued, b"\x11\0\0\0{\"type\":\"frozen\"}");
+            self.trace.borrow_mut().push("drain-complete-frame".into());
+            if self.fail_drain {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for (fail_flush, fail_drain) in [(false, false), (false, true), (true, false)] {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut server = server(false);
+        server.sys.trace = Some(trace.clone());
+        let mut socket = QueuedSocket {
+            input: Pipe::request(&Request::Shutdown {}).input,
+            queued: Vec::new(),
+            trace: trace.clone(),
+            fail_drain,
+            fail_flush,
+        };
+        assert_eq!(
+            server.serve_one(&mut socket),
+            if fail_flush || fail_drain {
+                Err(Error::Io)
+            } else {
+                Ok(())
+            }
+        );
+        let expected = if fail_flush {
+            vec!["flush-complete-frame", "PowerOff(Shutdown)"]
+        } else {
+            vec![
+                "flush-complete-frame",
+                "drain-complete-frame",
+                "PowerOff(Shutdown)",
+            ]
+        };
+        assert_eq!(trace.borrow().get(6..).unwrap(), expected);
     }
 }
 
