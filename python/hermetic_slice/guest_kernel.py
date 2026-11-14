@@ -45,6 +45,7 @@ STDERR_LOG = "kernel-build.stderr.log"
 PLACEHOLDER = "TO-BE-FILLED-BY-OWNER"
 APPROVED_BUILDER_DIGEST = "29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238"
 APPROVED_BUILDER_IMAGE = "hermetic/kernel-builder:6.6-v1@sha256:" + APPROVED_BUILDER_DIGEST
+MAX_BUILDER_ARCHIVE_BYTES = 4 * 1024**3
 DEFAULT_KERNEL_DIR = Path(__file__).absolute().parent.parent.parent / "images" / "kernel"
 
 
@@ -669,6 +670,41 @@ def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Pa
             return {"version": lock["version"], "sha256": hashes[0], "reproducible": verify_reproducible}
 
 
+BUILDER_ARCHIVE_ENV = "HERMETIC_KERNEL_BUILDER_ARCHIVE"
+
+
+def _approved_builder(config: Path, env: dict[str, str], log_fd: int) -> None:
+    """Make the approved builder image available by its immutable ID; never rebuild it.
+
+    The Dockerfile installs packages from a live archive, and the legacy builder
+    records build times, so a clean rebuild cannot reproduce the approved digest.
+    The image is taken from the local store, or loaded from a `docker save`
+    archive named by HERMETIC_KERNEL_BUILDER_ARCHIVE; either way only the exact
+    approved image ID is accepted (tagging by ID fails for any other image).
+    """
+    docker = ["/usr/bin/docker", "--config", str(config)]
+    tag = docker + ["image", "tag", "sha256:" + APPROVED_BUILDER_DIGEST, "hermetic/kernel-builder:6.6-v1"]
+    try:
+        _run(tag, env=env, stderr_parent=log_fd)
+        return
+    except KernelError:
+        pass
+    archive = os.environ.get(BUILDER_ARCHIVE_ENV, "")
+    if not archive:
+        raise KernelError("approved kernel builder image unavailable; set " + BUILDER_ARCHIVE_ENV +
+                          " to its saved archive (a rebuild yields a new digest that needs owner approval)")
+    path = Path(archive)
+    if not path.is_absolute():
+        raise KernelError("builder archive path must be absolute")
+    with regular(path, MAX_BUILDER_ARCHIVE_BYTES):
+        pass
+    _run(docker + ["image", "load", "--quiet", "--input", str(path)], env=env, stderr_parent=log_fd)
+    try:
+        _run(tag, env=env, stderr_parent=log_fd)
+    except KernelError:
+        raise KernelError("builder archive does not contain the approved image") from None
+
+
 def integration_build(tarball: Path, output: Path) -> bytes:
     """Prepare a local builder, then build offline using its immutable image ID."""
     lock = load_lock(DEFAULT_KERNEL_DIR / "kernel.lock.json")
@@ -688,14 +724,8 @@ def integration_build(tarball: Path, output: Path) -> bytes:
                 _atomic_bytes(staging, "Dockerfile", inputs["Dockerfile"])
                 os.mkdir("docker-config", mode=0o700, dir_fd=staging)
             env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "TZ": "UTC"}
-            _run(["/usr/bin/docker", "--config", str(stable / "docker-config"), "build",
-                  "--build-arg", "BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
-                  "-t", "hermetic/kernel-builder:6.6-v1", "--iidfile", str(stable / "image-id"),
-                  "-f", str(stable / "Dockerfile"), str(stable)], env=env, stderr_parent=out_fd)
-            image = read_file(stable / "image-id", MAX_IMAGE_ID_BYTES).strip()
-            if not re.fullmatch(b"sha256:[0-9a-f]{64}", image):
-                raise KernelError("invalid local builder image ID")
-            lock["builder_image"] = image.decode("ascii")
+            _approved_builder(stable / "docker-config", env, out_fd)
+            lock["builder_image"] = "sha256:" + APPROVED_BUILDER_DIGEST
             validate_lock(lock, for_build=True)
             _write_json(stable / "kernel.lock.json", lock)
             # Keep all integration staging inside the requested output directory.

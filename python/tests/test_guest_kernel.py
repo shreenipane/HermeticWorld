@@ -757,11 +757,10 @@ def test_integration_resolves_local_id_and_uses_private_output(integration_input
     def run(argv, *, env, stderr_parent):
         assert env == {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C', 'TZ': 'UTC'}
         assert os.fstat(stderr_parent).st_ino == output.stat().st_ino
-        assert argv[:5] == ['/usr/bin/docker', '--config', argv[2], 'build', '--build-arg']
-        assert argv[5] == 'BASE_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc'
-        image_file = Path(argv[argv.index('--iidfile') + 1])
-        assert image_file.is_relative_to(output)
-        image_file.write_text('sha256:' + k.APPROVED_BUILDER_DIGEST + '\n')
+        # The approved image is used by its immutable ID; nothing is rebuilt.
+        assert 'build' not in argv
+        assert argv[:3] == ['/usr/bin/docker', '--config', argv[2]]
+        assert argv[3:] == ['image', 'tag', 'sha256:' + k.APPROVED_BUILDER_DIGEST, 'hermetic/kernel-builder:6.6-v1']
         calls.append('image')
 
     def build(lock_path, tarball, out, *, work_dir, output_identity, kernel_dir):
@@ -1108,3 +1107,43 @@ def test_disposable_canary_kernel_is_refused_by_production_checker():
     values['CONFIG_HERMETIC_CLOCK_CANARY'] = 'y'
     assert k.check_config(config(values)) == [k.Finding(
         'CONFIG_HERMETIC_CLOCK_CANARY', 'forbidden option is enabled')]
+
+
+def test_builder_archive_is_loaded_only_when_the_approved_id_is_missing(integration_inputs, monkeypatch, tmp_path):
+    """Review finding (2026-11-14): a clean rebuild cannot reproduce the approved
+    digest, so the builder comes from the store or a saved archive, by ID only."""
+    source, output = integration_inputs
+    archive = tmp_path / 'builder.tar'
+    archive.write_bytes(b'saved image')
+    for case in ('loaded', 'wrong-archive', 'no-archive', 'relative', 'symlink'):
+        out = tmp_path / f'out-{case}'
+        out.mkdir(mode=0o700)
+        present = []
+        calls = []
+
+        def run(argv, *, env, stderr_parent):
+            calls.append(argv[3:5])
+            if argv[3:5] == ['image', 'tag'] and not present:
+                raise k.KernelError('kernel build subprocess failed')
+            if argv[3:5] == ['image', 'load']:
+                assert argv[-2:] == ['--input', str(archive if case != 'symlink' else link)]
+                if case == 'loaded':
+                    present.append(True)
+
+        link = tmp_path / f'link-{case}'
+        if case == 'symlink':
+            link.symlink_to(archive)
+        env_value = {'loaded': str(archive), 'wrong-archive': str(archive), 'no-archive': '',
+                     'relative': 'builder.tar', 'symlink': str(link)}[case]
+        monkeypatch.setenv(k.BUILDER_ARCHIVE_ENV, env_value)
+        monkeypatch.setattr(k, '_run', run)
+        monkeypatch.setattr(k, 'build_kernel', lambda lock_path, tarball, o, **kw: (o / 'build-record.json').write_bytes(b'{}\n'))
+        if case == 'loaded':
+            assert k.integration_build(source, out) == b'{}\n'
+            assert calls == [['image', 'tag'], ['image', 'load'], ['image', 'tag']]
+            assert k.load_lock(out / 'kernel.lock.json', for_build=True)['builder_image'] == 'sha256:' + k.APPROVED_BUILDER_DIGEST
+        else:
+            with pytest.raises(k.KernelError):
+                k.integration_build(source, out)
+            assert ['image', 'load'] not in calls or case == 'wrong-archive'
+            assert not (out / 'build-record.json').exists()

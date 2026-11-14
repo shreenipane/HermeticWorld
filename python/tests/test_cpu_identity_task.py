@@ -32,10 +32,13 @@ def test_unapproved_local_builder_is_refused_before_kernel_build(tmp_path, monke
         (kernel / name).write_bytes((ROOT / 'images/kernel' / name).read_bytes())
     monkeypatch.setattr(k, 'DEFAULT_KERNEL_DIR', kernel)
     def build_image(argv, **kwargs):
-        Path(argv[argv.index('--iidfile') + 1]).write_text('sha256:' + 'a' * 64)
+        # Only the approved ID can be tagged; any other local image is absent.
+        assert 'build' not in argv
+        raise k.KernelError('kernel build subprocess failed')
+    monkeypatch.delenv(k.BUILDER_ARCHIVE_ENV, raising=False)
     monkeypatch.setattr(k, '_run', build_image)
     monkeypatch.setattr(k, 'build_kernel', lambda *args, **kwargs: pytest.fail('unapproved builder used'))
     output = tmp_path / 'output'
-    with pytest.raises(k.KernelError, match='builder_image'):
+    with pytest.raises(k.KernelError, match='builder image unavailable'):
         k.integration_build(source, output)
     assert list(output.iterdir()) == []
