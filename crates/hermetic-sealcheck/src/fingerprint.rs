@@ -2710,6 +2710,14 @@ impl FingerprintSet {
                 None
             };
 
+            // Parse once per file; per-hunk parsing was quadratic in hunk count.
+            let tier2_parsed = crate::tier2::Tier2ParsedFile::parse(
+                &file_path,
+                base_src.as_deref(),
+                Some(post_fix_text.as_str()),
+            );
+            let mut tier2_ctx = tier2_parsed.context();
+
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 let mut lines = Vec::new();
                 let mut removed_markers = Vec::new();
@@ -2749,13 +2757,7 @@ impl FingerprintSet {
                 };
 
                 let (tier2_candidate_symbols, mut tier2_anchors) =
-                    crate::tier2::extract_hunk_symbols_and_anchors(
-                        &file_path,
-                        base_src.as_deref(),
-                        &removed_lines,
-                        &post_fix_text,
-                        &added_lines,
-                    );
+                    tier2_ctx.extract_hunk(&removed_lines, &added_lines);
 
                 // FIX 4: Add old file's base name and module as additional anchors
                 if let Some(old_p) = file.old_path.as_deref() {
