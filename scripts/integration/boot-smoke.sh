@@ -37,12 +37,10 @@ install -m 0755 "$BIN/hermetic-init" "$TREE/sbin/hermetic-init"   # early read-o
 if [ -n "${HERMETIC_LOCKDOWN_CONFIG:-}" ]; then
   install -m 0755 "$BIN/hermetic-clockprobe" "$TREE/sbin/hermetic-clockprobe"
   install -m 0600 "$HERMETIC_LOCKDOWN_CONFIG" "$TREE/etc/hermetic/guest-kernel.config"
-  # Newest substrate date: the kernel lock's pinned release date (listed, not hidden).
-  /usr/bin/python3 -I -c 'import json,re,sys
-d=json.load(open(sys.argv[1]))["release_date"]
-assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00Z", d), "release_date"
-open(sys.argv[2], "x").write(d[:10] + "\n")' "$(dirname "$HERMETIC_LOCKDOWN_CONFIG")/kernel.lock.json" "$TREE/etc/hermetic/substrate-bound"
-  chmod 0644 "$TREE/etc/hermetic/substrate-bound"
+  # Exactly the dates the guest kernel image contains (banner, version strings),
+  # listed as substrate; any other kernel-log date is a leak.
+  "$BIN/hermetic-clockprobe" --extract-substrate-dates < "$KERNEL" > "$TREE/etc/hermetic/substrate-dates"
+  chmod 0644 "$TREE/etc/hermetic/substrate-dates"
 fi
 install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"   # static; trivial command
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON

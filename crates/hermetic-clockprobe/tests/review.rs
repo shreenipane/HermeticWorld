@@ -185,42 +185,52 @@ fn nested_guest_clocksource_and_flags_are_the_fixed_profile() {
     }
 }
 
-/// Kernel log lines read in the nested lockdown guest (2026-11-14). The banner
-/// (pinned release date), ACPICA, device-mapper and Firecracker ACPI revisions
-/// are substrate dates at or before the kernel's release; a later date is not.
+/// Kernel log lines read in the nested lockdown guest (2026-11-14). Only the
+/// exact dates extracted from the kernel image are substrate; CodeRabbit's
+/// counterexample (a real date older than the kernel) must stay a leak.
 #[test]
-fn substrate_dates_up_to_the_sealed_bound_are_listed_not_leaks() {
+fn only_exact_substrate_dates_are_listed_not_leaks() {
     let log = "Linux version 6.6.160 (hermetic@hermetic) (gcc (Debian 12.2.0-14+deb12u1) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Wed Oct 21 00:00:00 UTC 2026\n\
 ACPI: XSDT 0x00000000000A0226 00003C (v01 FIRECK FCMVXSDT 00000000 FCAT 20240119)\n\
 ACPI: Core revision 20230628\n\
 device-mapper: ioctl: 4.48.0-ioctl (2023-03-01) initialised: dm-devel@redhat.com\n";
     let t = Some(1_700_000_000);
-    let bound = parse_substrate_bound("2026-10-21\n");
-    assert_eq!(bound, Some((2026, 10, 21)));
-    assert_eq!(classify_dmesg_dates_with_substrate(Some(log), false, t, bound).result, ProbeResult::Blocked);
-    // Without the sealed bound the strict rule still applies.
+    let dates = parse_substrate_dates("2023-03-01\n2026-10-21\n").unwrap();
+    assert_eq!(classify_dmesg_dates_with_substrate(Some(log), false, t, Some(&dates)).result, ProbeResult::Blocked);
     assert_eq!(classify_dmesg_dates(Some(log), false, t).result, ProbeResult::Leak);
-    // A date after the newest substrate date can only be real time.
-    for late in ["rtc: 2026-11-14 10:00:00\n", "Linux version 6.6.160 #1 SMP Wed Oct 22 00:00:00 UTC 2026\n"] {
-        let text = format!("{log}{late}");
-        let record = classify_dmesg_dates_with_substrate(Some(&text), false, t, bound);
-        assert_eq!(record.result, ProbeResult::Leak, "{late}");
+    for other in ["wall time: 2026-10-31\n", "host boot 2025-01-02\n", "rtc: 2026-11-14 10:00:00\n", "built Wed Oct 22 00:00:00 UTC 2026\n"] {
+        let text = format!("{log}{other}");
+        let record = classify_dmesg_dates_with_substrate(Some(&text), false, Some(0), Some(&dates));
+        assert_eq!(record.result, ProbeResult::Leak, "{other}");
         assert!(!record.to_json_line().contains("2026-11-14"));
-    }
-    for bad in ["2026-10-21", "2026-10-21\n\n", "2026-13-01\n", "26-10-21\n", "2026/10/21\n", "+026-10-21\n", "2026-1a-21\n", ""] {
-        assert_eq!(parse_substrate_bound(bad), None, "{bad:?}");
     }
 }
 
-/// Review findings (2026-11-14): impossible bound dates must be configuration
-/// errors, and a clock sample spanning a long stop must never be classified.
+/// The list is extracted by the probe's own parser from the kernel image.
 #[test]
-fn substrate_bound_rejects_impossible_dates_and_stale_clock_samples_are_refused() {
-    for bad in ["2026-02-30\n", "2026-02-29\n", "2026-04-31\n", "2026-06-31\n", "2026-11-31\n", "2026-01-00\n"] {
-        assert_eq!(parse_substrate_bound(bad), None, "{bad:?}");
+fn substrate_dates_are_extracted_exactly_from_image_strings() {
+    let mut image = b"\x7fELF\x00\x01Linux version 6.6.160 #1 SMP Wed Oct 21 00:00:00 UTC 2026\x00".to_vec();
+    image.extend_from_slice(b"\x00\xffdevice-mapper: ioctl: 4.48.0-ioctl (2023-03-01) initialised\x00\x00short\x00");
+    image.extend(std::iter::repeat_n(b'x', 1000));
+    image.extend_from_slice(b" 2024-02-29\x00");
+    assert_eq!(extract_substrate_dates(&image).unwrap(), "2023-03-01\n2024-02-29\n2026-10-21\n");
+    assert_eq!(extract_substrate_dates(b"\x00no dates here at all\x00"), None);
+    let list = extract_substrate_dates(&image).unwrap();
+    assert_eq!(parse_substrate_dates(&list).unwrap().len(), 3);
+}
+
+/// Review findings (2026-11-14): malformed or impossible list entries are
+/// configuration errors, and a clock sample spanning a long stop is refused.
+#[test]
+fn substrate_dates_reject_impossible_or_unordered_entries_and_stale_clock_samples_are_refused() {
+    for bad in ["2026-02-30\n", "2026-02-29\n", "2026-04-31\n", "2026-11-31\n", "2026-01-00\n",
+                "2026-10-21", "2026-10-21\n\n", "", "\n", "2026-13-01\n", "26-10-21\n", "2026/10/21\n",
+                "2026-10-21\n2023-03-01\n", "2026-10-21\n2026-10-21\n", "+026-10-21\n"] {
+        assert_eq!(parse_substrate_dates(bad), None, "{bad:?}");
     }
-    assert_eq!(parse_substrate_bound("2024-02-29\n"), Some((2024, 2, 29)));
-    assert_eq!(parse_substrate_bound("2026-01-31\n"), Some((2026, 1, 31)));
+    assert!(parse_substrate_dates("2024-02-29\n").is_some());
+    let many: String = (0..=MAX_SUBSTRATE_DATES).map(|i| format!("{:04}-01-01\n", 1970 + i)).collect();
+    assert_eq!(parse_substrate_dates(&many), None);
     use hermetic_clockprobe::probes::posix_sample_is_coherent as ok;
     assert!(ok(Some(10.0), Some(10.2)));
     assert!(ok(Some(10.0), Some(11.0)));

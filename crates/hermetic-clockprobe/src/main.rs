@@ -21,6 +21,27 @@ fn main() {
             }
             vec![hermetic_clockprobe::canary::inspect(&serial)]
         }
+        // Host-side build step: list the dates a substrate image (the guest
+        // kernel) contains. Pure parsing of stdin; no probe runs.
+        [arg] if arg == "--extract-substrate-dates" => {
+            let mut image = Vec::new();
+            if io::stdin()
+                .lock()
+                .take(classify::MAX_SUBSTRATE_IMAGE_BYTES + 1)
+                .read_to_end(&mut image)
+                .is_err()
+                || image.len() as u64 > classify::MAX_SUBSTRATE_IMAGE_BYTES
+            {
+                std::process::exit(1);
+            }
+            let Some(list) = classify::extract_substrate_dates(&image) else {
+                std::process::exit(1);
+            };
+            if io::stdout().lock().write_all(list.as_bytes()).is_err() {
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
         _ => std::process::exit(1),
     };
     let stdout = io::stdout();

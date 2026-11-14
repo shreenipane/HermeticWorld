@@ -210,7 +210,7 @@ fn probe_hpet(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
 fn probe_log(
     dev: &Root,
     expected: Option<u64>,
-    bound: Option<(u32, u32, u32)>,
+    dates: Option<&DateSet>,
 ) -> io::Result<ProbeRecord> {
     let mut file = match dev.device("kmsg", KMSG_RDEV) {
         Ok(file) => file,
@@ -232,7 +232,7 @@ fn probe_log(
     let mut record = [0u8; MAX_KMSG_RECORD_BYTES];
     for _ in 0..MAX_KMSG_RECORDS {
         match file.read(&mut record) {
-            Ok(0) => return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, bound)),
+            Ok(0) => return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, dates)),
             Ok(n) => {
                 if log.len().saturating_add(n) > MAX_DMESG_BYTES {
                     return Err(io::ErrorKind::InvalidData.into());
@@ -241,7 +241,7 @@ fn probe_log(
                 log.push_str(std::str::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData)?);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, bound))
+                return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, dates))
             }
             Err(e) => return Err(e),
         }
@@ -305,20 +305,23 @@ pub fn posix_sample_is_coherent(before: Option<f64>, after: Option<f64>) -> bool
         if b.is_finite() && a.is_finite() && a >= b && a - b <= MAX_POSIX_SAMPLE_SPAN_SECONDS)
 }
 
-/// Path, relative to /etc/hermetic, of the sealed newest substrate date.
-pub const SUBSTRATE_BOUND_FILE: &str = "substrate-bound";
+/// Path, relative to /etc/hermetic, of the sealed list of substrate dates.
+pub const SUBSTRATE_DATES_FILE: &str = "substrate-dates";
+
+type DateSet = std::collections::BTreeSet<(i32, u32, u32)>;
 
 /// Absent: the strict rule applies (every date must be T_clock). Present but
 /// malformed: an inspection error, never a silent fallback.
-fn substrate_bound() -> io::Result<Option<(u32, u32, u32)>> {
+fn substrate_dates() -> io::Result<Option<DateSet>> {
     let root = match Root::new(Path::new("/etc/hermetic")) {
         Ok(root) => root,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    match optional(root.text(SUBSTRATE_BOUND_FILE, 16))? {
+    let cap = (classify::MAX_SUBSTRATE_DATES * 11) as u64;
+    match optional(root.text(SUBSTRATE_DATES_FILE, cap))? {
         None => Ok(None),
-        Some(text) => classify::parse_substrate_bound(&text)
+        Some(text) => classify::parse_substrate_dates(&text)
             .map(Some)
             .ok_or_else(|| io::ErrorKind::InvalidData.into()),
     }
@@ -366,7 +369,7 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
         checked("hpet", probe_hpet(&sys, &dev)),
         checked(
             "dmesg_dates",
-            substrate_bound().and_then(|bound| probe_log(&dev, expected, bound)),
+            substrate_dates().and_then(|dates| probe_log(&dev, expected, dates.as_ref())),
         ),
         checked(
             "clocksource_sysfs",

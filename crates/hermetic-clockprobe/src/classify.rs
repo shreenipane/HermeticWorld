@@ -624,9 +624,12 @@ pub fn classify_dmesg_dates(
     classify_dmesg_dates_with_substrate(dmesg_text, access_denied, expected_t_clock, None)
 }
 
-/// Parse the sealed substrate bound: exactly `YYYY-MM-DD` and a newline.
-pub fn parse_substrate_bound(text: &str) -> Option<(u32, u32, u32)> {
-    let date = text.strip_suffix('\n')?;
+/// Largest sealed substrate date list.
+pub const MAX_SUBSTRATE_DATES: usize = 4096;
+/// Largest substrate image scanned for its own dates.
+pub const MAX_SUBSTRATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn parse_ymd(date: &str) -> Option<(i32, u32, u32)> {
     let b = date.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return None;
@@ -636,18 +639,57 @@ pub fn parse_substrate_bound(text: &str) -> Option<(u32, u32, u32)> {
         s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
     };
     let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    ((1970..=9999).contains(&y) && valid_date(y as i32, m, d)).then_some((y, m, d))
+    let y = i32::try_from(y).ok()?;
+    ((1970..=9999).contains(&y) && valid_date(y, m, d)).then_some((y, m, d))
 }
 
-/// As `classify_dmesg_dates`, with the newest substrate date (the guest kernel's
-/// pinned release date, sealed in the image). The substrate is listed, not
-/// hidden: version dates at or before that bound only show that the kernel
-/// exists. Any later date other than T_clock can only come from real time.
+/// Parse the sealed substrate date list: one `YYYY-MM-DD` per line, strictly
+/// increasing, newline-terminated, non-empty and at most `MAX_SUBSTRATE_DATES`.
+pub fn parse_substrate_dates(text: &str) -> Option<std::collections::BTreeSet<(i32, u32, u32)>> {
+    let body = text.strip_suffix('\n')?;
+    let mut dates = std::collections::BTreeSet::new();
+    let mut last = None;
+    for line in body.split('\n') {
+        let date = parse_ymd(line)?;
+        if last.is_some_and(|prev| prev >= date) || dates.len() == MAX_SUBSTRATE_DATES {
+            return None;
+        }
+        dates.insert(date);
+        last = Some(date);
+    }
+    Some(dates)
+}
+
+/// Every calendar date the probe's own parser finds in a substrate image's
+/// printable strings (the guest kernel's banner and version strings), as the
+/// sealed list. Pure parsing: no probe runs.
+pub fn extract_substrate_dates(image: &[u8]) -> Option<String> {
+    let mut dates = std::collections::BTreeSet::new();
+    for run in image.split(|b| !(0x20..0x7f).contains(b)).filter(|r| r.len() >= 8) {
+        let text = std::str::from_utf8(run).ok()?;
+        for date in find_all_dates(text) {
+            dates.insert(date);
+            if dates.len() > MAX_SUBSTRATE_DATES {
+                return None;
+            }
+        }
+    }
+    if dates.is_empty() {
+        return None;
+    }
+    Some(dates.iter().map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}\n")).collect())
+}
+
+/// As `classify_dmesg_dates`, with the sealed list of dates the substrate itself
+/// contains (extracted from the guest kernel image at build time). The
+/// substrate is listed, not hidden: a kernel-log date that is exactly one of
+/// those strings only shows that the kernel exists. Any other date except
+/// T_clock is a leak; there is no blanket cutoff.
 pub fn classify_dmesg_dates_with_substrate(
     dmesg_text: Option<&str>,
     access_denied: bool,
     expected_t_clock: Option<u64>,
-    substrate_bound: Option<(u32, u32, u32)>,
+    substrate_dates: Option<&std::collections::BTreeSet<(i32, u32, u32)>>,
 ) -> ProbeRecord {
     if access_denied {
         return ProbeRecord::new(
@@ -687,8 +729,7 @@ pub fn classify_dmesg_dates_with_substrate(
             );
         };
         for (y, m, d) in dates {
-            let substrate = substrate_bound
-                .is_some_and(|(by, bm, bd)| ymd_to_days(y, m, d) <= ymd_to_days(by as i32, bm, bd));
+            let substrate = substrate_dates.is_some_and(|set| set.contains(&(y, m, d)));
             let allowed = substrate
                 || match expected_ymd {
                     Some((ey, em, ed)) => {
@@ -1026,6 +1067,26 @@ fn classify_cpuinfo_section(content: Option<&str>) -> ProbeRecord {
     } else {
         ProbeRecord::new("cpuinfo", ProbeResult::Leak, None, leaks.join("; "))
     }
+}
+
+/// All dates in one printable run, by the same rules as the kernel-log scan;
+/// long runs are scanned in overlapping line-sized chunks.
+fn find_all_dates(text: &str) -> Vec<(i32, u32, u32)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + 256).min(chars.len());
+        let chunk: String = chars[start..end].iter().collect();
+        if let Ok(found) = find_dates_in_line(&chunk) {
+            out.extend(found);
+        }
+        if end == chars.len() {
+            break;
+        }
+        start += 224;
+    }
+    out
 }
 
 fn find_dates_in_line(line: &str) -> Result<Vec<(i32, u32, u32)>, ()> {
