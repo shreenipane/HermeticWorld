@@ -64,12 +64,19 @@ Exact source references:
 - Firecracker [VMClock](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/src/vmm/src/devices/acpi/vmclock.rs),
   `VmClock::new`, `activate`, `do_post_restore`.
 
-No host kernel patch is needed **if Xen interception is available**. If the
-owner's kernel lacks it, the safe alternatives are rebuilding the host with
-`CONFIG_KVM_XEN=y`, changing to an available non-TSC host clocksource (global
-performance and availability costs), or a host KVM patch rejecting hypercall 9
-before `kvm_pv_clock_pairing` (requires maintained host kernels). This branch
-cannot change the owner's host configuration. VMware backdoor enablement and
+No host kernel patch is needed **if Xen interception is available**. The
+current patch requires the advertised `KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL`
+capability and refuses to start without it. The **supported remedy** for a host
+that lacks it is rebuilding or upgrading the host kernel with `CONFIG_KVM_XEN=y`.
+
+Two other designs would also close hypercall 9, but neither works with this
+patch on its own: a non-TSC host clocksource (global performance and
+availability costs), or a host KVM patch rejecting hypercall 9 before
+`kvm_pv_clock_pairing` (requires maintained host kernels). Either would also
+need a coordinated VMM policy change that replaces the Xen-interception
+requirement with a check for that host property. Changing only the host leaves
+this patch unable to start. This branch cannot change the owner's host
+configuration. VMware backdoor enablement and
 any downstream KVM interfaces also require an owner host-policy check.
 
 ## Reproducible patched build
