@@ -222,8 +222,15 @@ The oracle passes on every slice task, and one agent run is graded.
 **Goal.** Reach `clock: hidden`, or prove it can't be done here and ship `faked`.
 
 ### Deliverables
+- [x] Guest root lockdown: modules, kernel memory/MSR devices, kexec, raw I/O and tracing disabled; forced early confidentiality lockdown; cgroup-device BPF retained. Owner reported nested-VM boot with module_load/ring0_paths blocked on 2026-11-14.
+- [x] VMM-owned bounded TSC calibration before jail creation; executable CLI and direct Python builder share resolution; AMD/nested hosts require HERMETIC_TSC_KHZ. Offline alias, cap, invalid-override and launch-path regressions.
+- [x] Clock-3b CPU template wired into plan, staged-input and API validation; golden fixtures and mask tests. Firecracker 1.18 field names verified in cached source; runtime applicability awaits owner VM checks.
+- [x] Document PERF_EVENTS forced by x86, inert no-kvmclock with PARAVIRT disabled, and kernel-exploit residual risk in docs/clock-3b-analysis.md and docs/guest-lockdown.md.
+- [ ] Owner/VMM decision: complete CPU identity policy and normalization; stock Firecracker restores hypervisor/brand state. Host frequency remains observable until actual TSC scaling is implemented.
+- [ ] Deferred: portable AMD/nested CPU templates and AMD validation; fail closed on unsupported template leaves, require the operator frequency where CPUID.15 is unavailable/untrusted.
+- [ ] Owner/host decision: hypercall and wall-clock MSR filtering against a guest kernel exploit; stock Firecracker cannot supply this boundary.
 - [ ] Compile and apply `firecracker-enforce-pv-cpuid.patch`; confirm #GP on the masked MSRs
-- [ ] Apply the `hide-kvmclock.cpu-template.json` CPU template
+- [ ] Verify the active `clock-3b.cpu-template.json` CPU profile in the owner VM; it includes the original `hide-kvmclock.cpu-template.json` clock-bit mask
 - [ ] Block the clock-pairing hypercall on the host. Try in order:
   1. a non-TSC host clocksource (`hpet` / `acpi_pm`)
   2. Xen hypercall interception (a second patch plus `CONFIG_KVM_XEN`)

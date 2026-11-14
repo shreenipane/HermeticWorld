@@ -268,12 +268,14 @@ impl VmSpec {
             ));
         }
         validate_boot_args(&self.boot_args)?;
-        if self
-            .boot_args
-            .split_ascii_whitespace()
-            .any(|a| a.starts_with("tsc_early_khz="))
-        {
+        if crate::plan::has_tsc_arg(&self.boot_args) {
             return Err(Error::Validation("tsc_early_khz is set by the VMM"));
+        }
+        // Reserve the longest VMM-owned suffix before any filesystem work.
+        if self.boot_args.len() > MAX_BOOT_ARGS - " tsc_early_khz=10000000".len() {
+            return Err(Error::Validation(
+                "boot argument cap including VMM TSC frequency",
+            ));
         }
         let words: Vec<_> = self.boot_args.split_ascii_whitespace().collect();
         if let Some(initrd) = &self.initrd {

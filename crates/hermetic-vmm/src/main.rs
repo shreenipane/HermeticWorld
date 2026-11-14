@@ -1,9 +1,25 @@
 #![forbid(unsafe_code)]
-use hermetic_vmm::{api_requests, fs::open_image, jail_plan, spec::VmSpec, Error};
+use hermetic_vmm::{fs::open_image, jail_plan, spec::VmSpec, Error};
 use std::io::Write;
 fn run() -> hermetic_vmm::Result<()> {
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("plan")) {
+    let command = args.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("boot-args")) {
+        let base = args
+            .next()
+            .and_then(|s| s.into_string().ok())
+            .ok_or(Error::Validation("missing boot arguments"))?;
+        if args.next().is_some() {
+            return Err(Error::Validation("unexpected argument"));
+        }
+        let calibrated = hermetic_vmm::plan::calibrated_boot_args(
+            &base,
+            hermetic_vmm::plan::configured_tsc_khz()?,
+        )?;
+        writeln!(std::io::stdout().lock(), "{calibrated}")?;
+        return Ok(());
+    }
+    if command.as_deref() != Some(std::ffi::OsStr::new("plan")) {
         return Err(Error::Validation(
             "usage: hermetic-vmm plan SPEC.json (or - for stdin)",
         ));
@@ -22,8 +38,11 @@ fn run() -> hermetic_vmm::Result<()> {
         VmSpec::read(open_image(&path)?)?
     }
     .validate()?;
-    let result =
-        serde_json::json!({"api_requests":api_requests(&spec),"jail_plan":jail_plan(&spec)});
+    let requests = hermetic_vmm::plan::calibrated_api_requests(
+        &spec,
+        hermetic_vmm::plan::configured_tsc_khz()?,
+    )?;
+    let result = serde_json::json!({"api_requests":requests,"jail_plan":jail_plan(&spec)});
     let mut output = serde_json::to_vec_pretty(&result).map_err(|_| Error::Io)?;
     output.push(b'\n');
     std::io::stdout().lock().write_all(&output)?;

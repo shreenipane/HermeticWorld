@@ -148,28 +148,52 @@ fn ptp(sys: &Root) -> io::Result<Vec<(String, String)>> {
     }
     Ok(clocks)
 }
-fn probe_rtc(sys: &Root, dev: &Root, expected: Option<u64>, boot: f64) -> io::Result<ProbeRecord> {
+/// Inspect every registered RTC; a hidden second RTC must not be skipped.
+pub fn inspect_rtc(
+    sys: &Root,
+    dev: &Root,
+    expected: Option<u64>,
+    boot: f64,
+) -> io::Result<ProbeRecord> {
     let entries = optional(sys.list("class/rtc"))?.unwrap_or_default();
-    let epoch = optional(sys.text("class/rtc/rtc0/since_epoch", MAX_SMALL_FILE_BYTES))?
+    let unregistered_rtc0 = !entries.iter().any(|entry| entry == "rtc0") && dev.present("rtc0")?;
+    let mut result =
+        classify::classify_rtc_sysfs_dev(&[], None, None, unregistered_rtc0, expected, boot);
+    for entry in entries {
+        let epoch = optional(sys.text(
+            &format!("class/rtc/{entry}/since_epoch"),
+            MAX_SMALL_FILE_BYTES,
+        ))?
         .map(|s| {
             s.trim()
                 .parse::<u64>()
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
         })
         .transpose()?;
-    let date = optional(sys.text("class/rtc/rtc0/date", MAX_SMALL_FILE_BYTES))?;
-    let time = optional(sys.text("class/rtc/rtc0/time", MAX_SMALL_FILE_BYTES))?;
-    let dt = date
-        .zip(time)
-        .map(|(d, t)| format!("{} {}", d.trim(), t.trim()));
-    Ok(classify::classify_rtc_sysfs_dev(
-        &entries,
-        epoch,
-        dt.as_deref(),
-        dev.present("rtc0")?,
-        expected,
-        boot,
-    ))
+        let date = optional(sys.text(&format!("class/rtc/{entry}/date"), MAX_SMALL_FILE_BYTES))?;
+        let time = optional(sys.text(&format!("class/rtc/{entry}/time"), MAX_SMALL_FILE_BYTES))?;
+        if date.is_some() != time.is_some() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let dt = date
+            .zip(time)
+            .map(|(d, t)| format!("{} {}", d.trim(), t.trim()));
+        let rec = classify::classify_rtc_sysfs_dev(
+            std::slice::from_ref(&entry),
+            epoch,
+            dt.as_deref(),
+            dev.present(&entry)?,
+            expected,
+            boot,
+        );
+        match rec.result {
+            ProbeResult::Leak => return Ok(rec),
+            ProbeResult::Error => result = rec,
+            ProbeResult::Unavailable if result.result != ProbeResult::Error => result = rec,
+            ProbeResult::Blocked | ProbeResult::Unavailable => {}
+        }
+    }
+    Ok(result)
 }
 fn probe_hpet(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
     let avail = sys.text(
@@ -303,7 +327,7 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
         ),
         checked(
             "rtc_sysfs_dev",
-            probe_rtc(&sys, &dev, expected, boot.unwrap_or(f64::NAN)),
+            inspect_rtc(&sys, &dev, expected, boot.unwrap_or(f64::NAN)),
         ),
         checked(
             "proc_driver_rtc",

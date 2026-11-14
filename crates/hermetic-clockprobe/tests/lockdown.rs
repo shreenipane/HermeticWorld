@@ -216,8 +216,10 @@ fn lockdown_lists_match_kernel_build_policy() {
         .trim_end_matches("\"),")
         .split_ascii_whitespace()
         .collect();
-    let probe: std::collections::BTreeSet<&str> =
-        hermetic_clockprobe::lockdown::FORBIDDEN.iter().copied().collect();
+    let probe: std::collections::BTreeSet<&str> = hermetic_clockprobe::lockdown::FORBIDDEN
+        .iter()
+        .copied()
+        .collect();
     assert_eq!(probe, policy);
     assert!(!probe.contains("PERF_EVENTS"));
 }

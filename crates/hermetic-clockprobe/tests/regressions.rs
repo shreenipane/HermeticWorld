@@ -289,3 +289,30 @@ fn nominal_frequency_parser_rejects_saturation_and_fractional_zero() {
         assert_eq!(parse_tsc_freq_from_cpuinfo(text), None);
     }
 }
+
+#[test]
+fn unknown_clocksource_and_hypervisor_advertisements_cannot_pass_profile() {
+    assert_eq!(
+        classify_clocksource_sysfs(Some("tsc"), Some("tsc new_host_clock")).result,
+        ProbeResult::Leak
+    );
+    for (leaf, eax, ecx) in [
+        (1, 0x000406f1, 1 << 31),
+        (0x40000000, 0x40000001, 0),
+        (0x40000001, 1 << 24, 0),
+        (0x40000010, 1, 0),
+    ] {
+        let rec = classify_cpuid(
+            &[CpuidLeafDump {
+                leaf,
+                subleaf: 0,
+                eax,
+                ebx: 0,
+                ecx,
+                edx: 0,
+            }],
+            Some(BASELINE_BRAND),
+        );
+        assert_eq!(rec.result, ProbeResult::Leak, "{leaf:x}");
+    }
+}

@@ -290,6 +290,9 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
         }
         match (leaf.leaf, leaf.subleaf) {
             (0x4000_0001, 0) => {
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 {
+                    leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
+                }
                 if (leaf.eax & (1 << 0)) != 0 {
                     leak_reasons.push("0x40000001:EAX[0] KVM_FEATURE_CLOCKSOURCE set".to_string());
                 }
@@ -299,6 +302,11 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                 if (leaf.eax & (1 << 5)) != 0 {
                     leak_reasons.push("0x40000001:EAX[5] KVM_FEATURE_STEAL_TIME set".to_string());
                 }
+            }
+            (0x4000_0000..=0x4000_0010, _)
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 =>
+            {
+                leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
             }
             (0x15, 0) => {
                 if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 {
@@ -311,6 +319,9 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                 }
             }
             (0x1, 0) => {
+                if leaf.ecx & (1 << 31) != 0 {
+                    leak_reasons.push("Hypervisor CPUID bit exposed".into());
+                }
                 // Baseline Broadwell-EP signature is 0x000406f1; newer server models (e.g. Skylake 0x5065x,
                 // Ice Lake 0x606ax, Sapphire Rapids 0x806fx, Emerald Rapids 0xc06fx) indicate newer host CPU.
                 let ext_model = (leaf.eax >> 16) & 0xF;
@@ -755,10 +766,7 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
     }
 
     for cs in avail.split_whitespace() {
-        if matches!(
-            cs,
-            "kvm-clock" | "hpet" | "acpi_pm" | "pit" | "hyperv_clocksource_tsc_page"
-        ) {
+        if cs != "tsc" {
             return ProbeRecord::new(
                 "clocksource_sysfs",
                 ProbeResult::Leak,

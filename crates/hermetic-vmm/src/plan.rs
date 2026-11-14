@@ -14,16 +14,37 @@ pub fn host_tsc_khz() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::__cpuid;
-        if __cpuid(0).eax < 0x15 {
+        let base = __cpuid(0);
+        if base.eax < 0x15 {
             return None;
         }
         let r = __cpuid(0x15);
-        tsc_khz_from_leaf15(r.eax, r.ebx, r.ecx)
+        tsc_khz_from_host_leaf15(
+            [base.ebx, base.edx, base.ecx],
+            __cpuid(1).ecx & (1 << 31) != 0,
+            r.eax,
+            r.ebx,
+            r.ecx,
+        )
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
         None
     }
+}
+
+/// Bare-metal Intel leaf-0x15 is trusted; other hosts need operator calibration.
+pub fn tsc_khz_from_host_leaf15(
+    vendor: [u32; 3],
+    virtualized: bool,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+) -> Option<u64> {
+    if virtualized || vendor != [0x756e6547, 0x49656e69, 0x6c65746e] {
+        return None;
+    }
+    tsc_khz_from_leaf15(eax, ebx, ecx)
 }
 
 /// Pure leaf-0x15 arithmetic, separated for tests.
@@ -54,34 +75,93 @@ pub fn resolve_tsc_khz(cpuid: Option<u64>, operator: Option<&str>) -> crate::Res
         Some(_) => return Err(crate::Error::Validation("HERMETIC_TSC_KHZ range/encoding")),
         None => None,
     };
+    if cpuid.is_some_and(|v| !TSC_KHZ_RANGE.contains(&v)) {
+        return Err(crate::Error::Validation("CPUID TSC frequency range"));
+    }
     cpuid.or(operator).ok_or(crate::Error::Validation(
         "host TSC frequency unavailable: no CPUID leaf 0x15 and no HERMETIC_TSC_KHZ",
     ))
 }
 
-/// Append the VMM-owned TSC frequency to a `/boot-source` request.
-pub fn with_tsc_khz(mut req: ApiRequest, khz: u64) -> ApiRequest {
-    if req.path == "/boot-source" {
-        if let Some(Value::String(args)) = req.body.get_mut("boot_args") {
-            args.push_str(&format!(" tsc_early_khz={khz}"));
-        }
-    }
-    req
+/// Reject non-Unicode overrides too; an invalid operator setting is never absent.
+pub fn configured_tsc_khz() -> crate::Result<u64> {
+    resolve_tsc_khz_os(
+        host_tsc_khz(),
+        std::env::var_os("HERMETIC_TSC_KHZ").as_deref(),
+    )
 }
-pub const CPU_TEMPLATE: &str = include_str!("../../../vmm/hide-kvmclock.cpu-template.json");
-/// The template is embedded so a plan cannot depend on a mutable host file.
-pub fn cpu_template() -> Value {
-    json!({
-        "cpuid_modifiers": [{
-            "leaf": "0x40000001",
-            "subleaf": "0x0",
-            "flags": 0,
-            "modifiers": [{
-                "register": "eax",
-                "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxxxxxx0xx0"
-            }]
-        }]
+
+pub fn resolve_tsc_khz_os(
+    cpuid: Option<u64>,
+    operator: Option<&std::ffi::OsStr>,
+) -> crate::Result<u64> {
+    let operator = operator
+        .map(|s| {
+            s.to_str()
+                .ok_or(crate::Error::Validation("HERMETIC_TSC_KHZ encoding"))
+        })
+        .transpose()?;
+    resolve_tsc_khz(cpuid, operator)
+}
+
+/// Resolve the executable boot source before sending any configuration requests.
+pub fn with_tsc_khz(mut req: ApiRequest, khz: u64) -> crate::Result<ApiRequest> {
+    if !TSC_KHZ_RANGE.contains(&khz) {
+        return Err(crate::Error::Validation("TSC frequency range"));
+    }
+    if req.path == "/boot-source" {
+        let args = req
+            .body
+            .get("boot_args")
+            .and_then(Value::as_str)
+            .ok_or(crate::Error::Validation("boot argument shape"))?;
+        let args = calibrated_boot_args(args, khz)?;
+        req.body["boot_args"] = json!(args);
+    }
+    Ok(req)
+}
+
+pub fn calibrated_boot_args(args: &str, khz: u64) -> crate::Result<String> {
+    crate::spec::validate_boot_args(args)?;
+    if !TSC_KHZ_RANGE.contains(&khz) || has_tsc_arg(args) {
+        return Err(crate::Error::Validation("TSC frequency is VMM-owned"));
+    }
+    let args = format!("{args} tsc_early_khz={khz}");
+    crate::spec::validate_boot_args(&args)?;
+    Ok(args)
+}
+
+pub(crate) fn has_tsc_arg(args: &str) -> bool {
+    args.split_ascii_whitespace().any(|a| {
+        a.split('=')
+            .next()
+            .is_some_and(|k| k.replace('-', "_") == "tsc_early_khz")
     })
+}
+
+pub(crate) fn valid_calibrated_boot_args(args: &str) -> bool {
+    if crate::spec::validate_boot_args(args).is_err() {
+        return false;
+    }
+    let mut reserved = args.split_ascii_whitespace().filter(|a| has_tsc_arg(a));
+    reserved
+        .next()
+        .is_some_and(|a| a.starts_with("tsc_early_khz="))
+        && reserved.next().is_none()
+}
+
+pub fn calibrated_api_requests(valid: &ValidatedSpec, khz: u64) -> crate::Result<Vec<ApiRequest>> {
+    api_requests(valid)
+        .into_iter()
+        .map(|req| with_tsc_khz(req, khz))
+        .collect()
+}
+
+pub const CPU_TEMPLATE: &str = include_str!("../../../vmm/clock-3b.cpu-template.json");
+/// The template is embedded so a plan cannot depend on a mutable host file.
+/// A malformed embedded template fails the object check in the API validator.
+pub fn cpu_template() -> Value {
+    serde_json::from_str(CPU_TEMPLATE).unwrap_or(Value::Null)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

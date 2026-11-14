@@ -15,6 +15,10 @@ pub const MAX_INHERITED_FDS: u64 = 1_048_576;
 /// Privileged/process and transport effects are injectable. Implementations must
 /// honour the supplied deadline, and kill on Drop, including failed starts.
 pub trait Runner {
+    /// Host frequency discovery is injectable for offline runners.
+    fn tsc_khz(&self) -> Result<u64> {
+        crate::plan::configured_tsc_khz()
+    }
     fn spawn(
         &mut self,
         spec: &ValidatedSpec,

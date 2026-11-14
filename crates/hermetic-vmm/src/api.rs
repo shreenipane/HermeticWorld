@@ -110,7 +110,7 @@ fn fields(body: &serde_json::Value, names: &[&str]) -> bool {
     })
 }
 fn valid_body(req: &ApiRequest) -> bool {
-    use crate::spec::{absolute_path, validate_boot_args, MAX_MEMORY_MIB, MAX_VCPUS};
+    use crate::spec::{absolute_path, MAX_MEMORY_MIB, MAX_VCPUS};
     let b = &req.body;
     let path = |key: &str| {
         b.get(key)
@@ -119,7 +119,7 @@ fn valid_body(req: &ApiRequest) -> bool {
     };
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("PUT", "/entropy") => fields(b, &[]),
-        ("PUT", "/cpu-config") => *b == crate::plan::cpu_template(),
+        ("PUT", "/cpu-config") => b.is_object() && *b == crate::plan::cpu_template(),
         ("PUT", "/machine-config") => {
             fields(b, &["vcpu_count", "mem_size_mib", "smt"])
                 && b.get("smt").and_then(|v| v.as_bool()) == Some(false)
@@ -137,7 +137,7 @@ fn valid_body(req: &ApiRequest) -> bool {
                 && path("kernel_image_path")
                 && b.get("boot_args")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|v| validate_boot_args(v).is_ok())
+                    .is_some_and(crate::plan::valid_calibrated_boot_args)
         }
         ("PUT", "/vsock") => {
             fields(b, &["guest_cid", "uds_path"])

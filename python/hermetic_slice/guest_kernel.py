@@ -167,10 +167,69 @@ def check_config(config_text: str | bytes) -> list[Finding]:
 BOOT_FIXED = "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock"
 
 
-def boot_arguments(t_clock: int) -> str:
+def spec_boot_arguments(t_clock: int) -> str:
+    """VmSpec input; lifecycle appends the VMM-owned TSC frequency before boot."""
     if type(t_clock) is not int or not 0 <= t_clock <= MAX_CLOCK:
         raise KernelError("t_clock must be bounded integral Unix seconds")
     return f"{BOOT_FIXED} hermetic.t={t_clock}"
+
+
+TSC_RESOLVE_TIMEOUT_S = 5
+TSC_KHZ_MIN = 100_000
+TSC_KHZ_MAX = 10_000_000
+
+
+def boot_arguments(t_clock: int, *, vmm: Path) -> str:
+    """Executable arguments for direct launch, resolved by the same VMM as lifecycle.
+
+    The lock and spec_boot_arguments contain only spec input, never host frequency.
+    """
+    base = spec_boot_arguments(t_clock)  # Validate before opening the executable.
+    try:
+        with regular(vmm, MAX_IMAGE_BYTES) as fd:
+            if not os.fstat(fd).st_mode & 0o111:
+                raise KernelError("VMM resolver must be executable")
+            with subprocess.Popen([f"/proc/self/fd/{fd}", "boot-args", base],
+                                  pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  start_new_session=True) as process:
+                try:
+                    complete = False
+                    output = bytearray()
+                    deadline = time.monotonic() + TSC_RESOLVE_TIMEOUT_S
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(process.stdout, selectors.EVENT_READ)
+                        while True:
+                            left = deadline - time.monotonic()
+                            if left <= 0 or not selector.select(left):
+                                raise KernelError("VMM resolver timed out")
+                            chunk = os.read(process.stdout.fileno(), MAX_BOOT_BYTES + 1 - len(output))
+                            if not chunk:
+                                break
+                            output.extend(chunk)
+                            if len(output) > MAX_BOOT_BYTES:
+                                raise KernelError("VMM resolver output exceeds cap")
+                    if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                        raise KernelError("VMM frequency resolution failed")
+                    complete = True
+                finally:
+                    # Kill the whole resolver group on errors, including pipe-holding children.
+                    if not complete:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=TSC_RESOLVE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        raise KernelError("VMM frequency resolution failed") from None
+    text = _text(bytes(output), MAX_BOOT_BYTES)
+    prefix = base + " tsc_early_khz="
+    if not text.startswith(prefix) or not text.endswith("\n"):
+        raise KernelError("invalid VMM boot arguments")
+    value = text[len(prefix):-1]
+    if not re.fullmatch(r"[1-9][0-9]{5,7}", value) or not TSC_KHZ_MIN <= int(value) <= TSC_KHZ_MAX:
+        raise KernelError("invalid VMM TSC frequency")
+    return text[:-1]
 
 
 def check_boot_arguments(arguments: str) -> list[Finding]:
@@ -187,6 +246,10 @@ def check_boot_arguments(arguments: str) -> list[Finding]:
             value = token.removeprefix("hermetic.t=")
             if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
                 findings.append(Finding("hermetic.t", "invalid clock value"))
+        elif token.startswith("tsc_early_khz="):
+            value = token.removeprefix("tsc_early_khz=")
+            if not re.fullmatch(r"[1-9][0-9]{5,7}", value) or not TSC_KHZ_MIN <= int(value) <= TSC_KHZ_MAX:
+                findings.append(Finding("tsc_early_khz", "invalid TSC frequency"))
         elif token not in BOOT_FIXED.split(" "):
             findings.append(Finding("boot", "unapproved boot argument"))
     for required in BOOT_FIXED.split(" "):

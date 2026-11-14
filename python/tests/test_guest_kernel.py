@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import time
 
 import pytest
 
@@ -78,26 +79,26 @@ def test_merged_fragments_and_generated_readme_table():
 def test_boot_known_answer():
     expected = ("console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro "
                 "init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock hermetic.t=1704067200")
-    assert k.boot_arguments(1704067200) == expected
+    assert k.spec_boot_arguments(1704067200) == expected
     assert k.check_boot_arguments(expected) == []
 
 
 @pytest.mark.parametrize("value", [-1, True, 1.1, "1", k.MAX_CLOCK + 1])
 def test_boot_clock_bounds(value):
     with pytest.raises(k.KernelError):
-        k.boot_arguments(value)
+        k.spec_boot_arguments(value)
 
 
 @pytest.mark.parametrize("token", k.BOOT_FIXED.split() + ["hermetic.t=0"])
 def test_each_boot_argument_required(token):
-    assert k.check_boot_arguments(" ".join(t for t in k.boot_arguments(0).split() if t != token))
+    assert k.check_boot_arguments(" ".join(t for t in k.spec_boot_arguments(0).split() if t != token))
 
 
 @pytest.mark.parametrize("suffix", [" rw", " ip=dhcp", " clocksource=kvm-clock", " hostname=host", " hermetic.t=1",
                                     " no-kvmclock=0", " quiet", " hermetic.t=-1", " hermetic.t=0001",
                                     " hermetic.t=253402300800", " hermetic.t=99999999999999999999", "\t"])
 def test_boot_rejections(suffix):
-    assert k.check_boot_arguments(k.boot_arguments(0) + suffix)
+    assert k.check_boot_arguments(k.spec_boot_arguments(0) + suffix)
 
 
 def test_lock_shape_identity_and_dates(lock):
@@ -617,8 +618,8 @@ def test_clock_and_identity_do_not_depend_on_host_locale(lock, monkeypatch):
     monkeypatch.setenv("TZ", "Pacific/Honolulu")
     monkeypatch.setenv("KBUILD_BUILD_HOST", "SECRET-HOST")
     assert k._banner_date(lock) == "Wed Oct 21 00:00:00 UTC 2026"
-    assert k.boot_arguments(0).endswith(" hermetic.t=0")
-    assert k.boot_arguments(k.MAX_CLOCK).endswith(" hermetic.t=253402300799")
+    assert k.spec_boot_arguments(0).endswith(" hermetic.t=0")
+    assert k.spec_boot_arguments(k.MAX_CLOCK).endswith(" hermetic.t=253402300799")
 
 
 def test_output_ancestor_replacement_uses_open_directory(build_inputs, tmp_path):
@@ -664,7 +665,7 @@ module = types.ModuleType(name)
 module.__file__ = '/inputs/guest_kernel.py'
 sys.modules[name] = module
 exec(compile(source, module.__file__, 'exec'), module.__dict__)
-assert module.boot_arguments(0).endswith(' hermetic.t=0')
+assert module.spec_boot_arguments(0).endswith(' hermetic.t=0')
 '''
     result = subprocess.run([sys.executable, '-I', '-B', '-c', code, k.__file__, str(entrypoint)],
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
@@ -1043,3 +1044,55 @@ def test_policy_does_not_forbid_options_x86_force_selects():
     # integration build fail after olddefconfig. Lockdown confidentiality mode
     # covers its kernel-reading paths instead.
     assert k.RULES.get("CONFIG_PERF_EVENTS") is None or k.RULES["CONFIG_PERF_EVENTS"].value != "n"
+
+
+def _vmm_resolver_fixture(tmp_path, body):
+    resolver = tmp_path / "vmm"
+    resolver.write_text("#!/usr/bin/python3\nimport sys, time\n" + body)
+    resolver.chmod(0o700)
+    return resolver
+
+
+def test_direct_boot_arguments_route_through_vmm(tmp_path):
+    resolver = _vmm_resolver_fixture(tmp_path,
+        "assert sys.argv[1] == 'boot-args'\n"
+        "assert 'tsc_early_khz' not in sys.argv[2]\n"
+        "print(sys.argv[2] + ' tsc_early_khz=2688000')\n")
+    expected = k.spec_boot_arguments(1704067200) + " tsc_early_khz=2688000"
+    assert k.boot_arguments(1704067200, vmm=resolver) == expected
+    assert k.check_boot_arguments(expected) == []
+    # The immutable lock/spec remain free of host frequency; only executable args get it.
+    assert "tsc_early_khz" not in k.spec_boot_arguments(1704067200)
+
+
+@pytest.mark.parametrize("body", [
+    "sys.exit(2)\n",
+    "print('secret-host-identity')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=0')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=02688000')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=10000001')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=2688000 extra=secret')\n",
+    "sys.stdout.buffer.write(b'\\xff')\n",
+    "print('x' * 100000)\n",
+])
+def test_direct_boot_arguments_fail_closed_and_never_echo_resolver_text(tmp_path, body):
+    resolver = _vmm_resolver_fixture(tmp_path, body)
+    with pytest.raises(k.KernelError) as exc:
+        k.boot_arguments(0, vmm=resolver)
+    assert "secret" not in str(exc.value)
+
+
+def test_direct_boot_arguments_deadline_symlinks_and_validation_before_open(tmp_path, monkeypatch):
+    resolver = _vmm_resolver_fixture(tmp_path, "time.sleep(60)\n")
+    monkeypatch.setattr(k, "TSC_RESOLVE_TIMEOUT_S", 0.1)
+    start = time.monotonic()
+    with pytest.raises(k.KernelError, match="timed out"):
+        k.boot_arguments(0, vmm=resolver)
+    assert time.monotonic() - start < 3
+    link = tmp_path / "link"
+    link.symlink_to(resolver)
+    with pytest.raises(k.KernelError):
+        k.boot_arguments(0, vmm=link)
+    # No attempt to inspect an invalid path for an invalid clock input.
+    with pytest.raises(k.KernelError, match="t_clock"):
+        k.boot_arguments(-1, vmm=tmp_path / "missing")

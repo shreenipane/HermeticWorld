@@ -44,6 +44,7 @@ pub struct Vmm<R: Runner> {
     jail: Option<PreparedJail>,
     state: State,
     boot_record: Option<BootRecord>,
+    tsc_khz: Option<u64>,
 }
 impl<R: Runner> Vmm<R> {
     pub fn new(spec: ValidatedSpec, runner: R) -> Self {
@@ -53,6 +54,7 @@ impl<R: Runner> Vmm<R> {
             jail: None,
             state: State::New,
             boot_record: None,
+            tsc_khz: None,
         }
     }
     pub fn state(&self) -> State {
@@ -92,6 +94,9 @@ impl<R: Runner> Vmm<R> {
     pub fn prepare(&mut self, timeout: Duration) -> Result<()> {
         self.require(&[State::New])?;
         let end = deadline(timeout)?;
+        let khz = self.runner.tsc_khz()?;
+        crate::plan::calibrated_api_requests(&self.spec, khz)?;
+        self.tsc_khz = Some(khz);
         match PreparedJail::prepare(&self.spec, end) {
             Ok(j) => {
                 self.jail = Some(j);
@@ -147,12 +152,11 @@ impl<R: Runner> Vmm<R> {
                     Err(e) => return Err(e),
                 }
             }
-            let tsc_khz = crate::plan::resolve_tsc_khz(
-                crate::plan::host_tsc_khz(),
-                std::env::var("HERMETIC_TSC_KHZ").ok().as_deref(),
+            let requests = crate::plan::calibrated_api_requests(
+                &self.spec,
+                self.tsc_khz.ok_or(Error::State)?,
             )?;
-            for req in crate::api_requests(&self.spec) {
-                let req = crate::plan::with_tsc_khz(req, tsc_khz);
+            for req in requests {
                 let step = match req.path.as_str() {
                     "/machine-config" => "configure machine",
                     "/cpu-config" => "configure CPU template",

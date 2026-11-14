@@ -163,7 +163,8 @@ fn all_roles_attach_entropy_and_template_without_metadata_or_balloon() {
 }
 #[test]
 fn template_changes_exactly_leaf_eax_bits_zero_and_three() {
-    let file: Value = serde_json::from_str(plan::CPU_TEMPLATE).unwrap();
+    let file: Value =
+        serde_json::from_str(include_str!("../../../vmm/hide-kvmclock.cpu-template.json")).unwrap();
     assert_eq!(
         file,
         json!({
@@ -509,7 +510,7 @@ fn tsc_early_khz_is_vmm_owned_and_bounded() {
     assert!(s.validate().is_err(), "specs must not set tsc_early_khz");
     let reqs: Vec<_> = api_requests(&spec(Role::Agent).validate().unwrap())
         .into_iter()
-        .map(|r| with_tsc_khz(r, 2_688_000))
+        .map(|r| with_tsc_khz(r, 2_688_000).unwrap())
         .collect();
     let boot = reqs.iter().find(|r| r.path == "/boot-source").unwrap();
     let args = boot.body["boot_args"].as_str().unwrap();

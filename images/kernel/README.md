@@ -302,3 +302,14 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_X86_IOPL_IOPERM` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_X86_MSR` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 <!-- END POLICY -->
+
+## Executable boot arguments
+
+The lock's boot string is VmSpec input. `spec_boot_arguments(t_clock)` produces
+that canonical input; lifecycle adds the VMM-owned `tsc_early_khz` before launch.
+Direct Python builders use `boot_arguments(t_clock, vmm=Path(...))`, which executes
+the pinned VMM resolver with bounded output and a deadline. AMD/nested hosts
+require the operator's `HERMETIC_TSC_KHZ`; no frequency is guessed.
+`no-kvmclock` remains for compatibility and is inert when KVM_GUEST is disabled.
+See [the clock analysis](../../docs/clock-3b-analysis.md) for host filtering and
+CPU normalization work still required before any hidden-clock claim.

@@ -32,7 +32,14 @@ be a signed `hermetic-run/v1` record.
 Host-side Firecracker orchestration for Linux x86_64. The library never mounts a
 guest disk. It forbids unsafe Rust and uses only the workspace's existing Rust
 dependencies. `hermetic-vmm plan SPEC.json` (absolute path), or `plan -` for stdin,
-prints a deterministic JSON object containing `api_requests` and `jail_plan`.
+prints a JSON object containing calibrated `api_requests` and `jail_plan`.
+The VMM resolves `tsc_early_khz` from eligible host CPUID.15 data, or requires
+`HERMETIC_TSC_KHZ` on AMD/nested hosts and hosts without complete data.
+Ordering and serialization are stable for the same spec and resolved rate.
+`boot-args BASE_ARGS` exposes the same resolution for direct launch builders;
+`api_requests` alone is a declarative spec plan and must be calibrated before
+transport. The active embedded CPU profile is `vmm/clock-3b.cpu-template.json`;
+see [its source checks and open limits](../../docs/clock-3b-analysis.md).
 The planner does not open image paths. Exit codes: 0 planned, 2 invalid/refused,
 1 I/O error. Errors contain fixed reasons, never input text, API fault bodies,
 host dates, process output or operating-system error strings.

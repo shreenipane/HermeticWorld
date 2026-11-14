@@ -24,7 +24,8 @@ Confidentiality lockdown is forced in the kernel config and initialized as an
 early LSM. Linux `security/lockdown/lockdown.c` registers `DEFINE_EARLY_LSM` when
 `SECURITY_LOCKDOWN_LSM_EARLY=y`, so the mutable normal LSM list cannot omit it.
 The forced level cannot be lowered by securityfs or by a weaker boot parameter.
-No boot arguments or CPU templates change here.
+The VMM supplies calibrated `tsc_early_khz` and the embedded clock-3b CPU profile;
+see [the clock analysis](clock-3b-analysis.md) for source checks and open limits.
 
 Confidentiality mode is retained, with no integrity-mode exception. In the
 pinned source, `kernel/bpf/syscall.c` does not call `security_locked_down` for
@@ -46,9 +47,13 @@ Both `PARAVIRT` and `KVM_GUEST` (including `PARAVIRT_CLOCK`) are disabled, follo
 the clock analysis's proposed nested experiment. This removes cooperative
 pvclock hooks; it does not filter a malicious CPL-0 hypercall or WRMSR.
 Multi-vCPU boot, TSC calibration, timers and performance require measurement.
-No guessed TSC frequency or clock fallback is introduced. If the nested boot
-stalls on TSC calibration, retain its diagnostics and resolve virtual TSC
-frequency enforcement in the VMM separately; do not silently re-enable pvclock.
+The VMM supplies the true TSC frequency before boot, with no guessed rate or
+clock fallback. AMD and nested hosts require `HERMETIC_TSC_KHZ`, verified by the
+operator against the virtual TSC. Invalid overrides fail closed even on a host
+with CPUID.15. `no-kvmclock` is inert with KVM_GUEST disabled and is retained only
+for lock/spec compatibility. `spec_boot_arguments` produces VmSpec inputs; direct
+Python launches must use `boot_arguments(t, vmm=Path(...))`, which delegates to
+the VMM resolver. All integration smokes route through lifecycle.
 
 ## Manager build and VM checks
 
@@ -56,7 +61,9 @@ Run these exact commands from the worktree root on the manager's nested-KVM
 machine. Every work directory below must be fresh. Builder preparation needs the
 cached pinned base image and package inputs as described in the kernel README;
 the kernel compilation container itself has `--network=none --pull=never`.
-These commands have not been run as part of the offline policy review.
+The owner reported a nested-VM boot with both lockdown probes blocked on
+2026-11-14. The expanded CPU profile and other VM paths still need owner-run
+verification. These commands were not run during this offline review.
 
 ```sh
 ./scripts/integration/kernel-build.sh \
@@ -103,3 +110,13 @@ report other clock/CPU leaks and incomplete coverage; its overall exit 0 alone
 does not attest hidden time. Review those records separately from these two
 lockdown checks. Host-KVM enforcement and CPU identity normalization remain
 separate components, as required by TR-VMM-3.
+
+## Owner decisions still open
+
+A guest kernel exploit can execute `KVM_HC_CLOCK_PAIRING` or write wall-clock
+MSRs despite this policy. Host-side hypercall/MSR filtering is required and is
+unavailable in stock Firecracker. Keep `clock: faked` until the owner resolves
+that boundary. Stock CPU normalization also restores the hypervisor bit and
+can emit a host-derived brand frequency; complete identity normalization,
+portable AMD/nested templates and actual TSC scaling require VMM work.
+See [the source analysis and residual decisions](clock-3b-analysis.md).
