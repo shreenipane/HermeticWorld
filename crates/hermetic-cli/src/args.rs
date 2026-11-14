@@ -160,6 +160,8 @@ pub struct RawVerifyBundleArgs {
 pub struct RawProbeArgs {
     pub world: String,
     pub json: bool,
+    pub clockprobe_output: Option<String>,
+    pub kernel_canary_serial: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +209,12 @@ pub struct VerifyBundleRequest {
 pub struct ProbeRequest {
     pub world: PathBuf,
     pub json: bool,
+    /// Captured `hermetic-clockprobe` JSON-lines output to classify (never run on the host).
+    #[serde(default)]
+    pub clockprobe_output: Option<PathBuf>,
+    /// Captured disposable-kernel canary serial transcript to classify.
+    #[serde(default)]
+    pub kernel_canary_serial: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -718,12 +726,24 @@ where
             let parsed = scan_tokens(
                 SubcommandKind::Probe,
                 rest,
-                &[("--world", FlagSpec::Value), ("--json", FlagSpec::Bool)],
+                &[
+                    ("--world", FlagSpec::Value),
+                    ("--json", FlagSpec::Bool),
+                    ("--clockprobe-output", FlagSpec::Value),
+                    ("--kernel-canary-serial", FlagSpec::Value),
+                ],
             )?;
             reject_any_positionals(SubcommandKind::Probe, &parsed)?;
             let world = require_value_flag(SubcommandKind::Probe, &parsed, "--world")?;
             let json = has_bool_flag(&parsed, "--json");
-            Ok(RawCommand::Probe(RawProbeArgs { world, json }))
+            let clockprobe_output = take_value_flag(&parsed, "--clockprobe-output");
+            let kernel_canary_serial = take_value_flag(&parsed, "--kernel-canary-serial");
+            Ok(RawCommand::Probe(RawProbeArgs {
+                world,
+                json,
+                clockprobe_output,
+                kernel_canary_serial,
+            }))
         }
         SubcommandKind::Run => {
             let parsed = scan_tokens(
@@ -812,9 +832,21 @@ pub fn validate_command(raw: RawCommand) -> Result<ValidatedCommand, ValidationE
         }
         RawCommand::Probe(args) => {
             let world = validate_path("--world", &args.world)?;
+            let clockprobe_output = args
+                .clockprobe_output
+                .as_deref()
+                .map(|v| validate_path("--clockprobe-output", v))
+                .transpose()?;
+            let kernel_canary_serial = args
+                .kernel_canary_serial
+                .as_deref()
+                .map(|v| validate_path("--kernel-canary-serial", v))
+                .transpose()?;
             Ok(ValidatedCommand::Probe(ProbeRequest {
                 world,
                 json: args.json,
+                clockprobe_output,
+                kernel_canary_serial,
             }))
         }
         RawCommand::Run(args) => {

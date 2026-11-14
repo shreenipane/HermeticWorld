@@ -534,8 +534,13 @@ dependencies = [
 name = "hermetic-cli"
 version = "0.1.0"
 dependencies = [
+ "hermetic-attest",
+ "hermetic-bundle",
+ "hermetic-clockprobe",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
