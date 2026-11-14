@@ -15,6 +15,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import zlib
 
 from . import guest_kernel as k
 
@@ -93,7 +94,7 @@ def source_files(archive: bytes) -> dict[str, bytes]:
             relative = PurePosixPath(*PurePosixPath(name).parts[1:])
             if any(str(parent) in files for parent in relative.parents):
                 raise k.KernelError('source file used as a directory')
-    except (tarfile.TarError, EOFError, OSError):
+    except (tarfile.TarError, EOFError, OSError, zlib.error):
         raise k.KernelError('invalid source archive') from None
     return files
 

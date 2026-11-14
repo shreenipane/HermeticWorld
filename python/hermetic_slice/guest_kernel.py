@@ -191,10 +191,11 @@ def boot_arguments(t_clock: int, *, vmm: Path) -> str:
         with regular(vmm, MAX_IMAGE_BYTES) as fd:
             if not os.fstat(fd).st_mode & 0o111:
                 raise KernelError("VMM resolver must be executable")
-            with subprocess.Popen([f"/proc/self/fd/{fd}", "boot-args", base],
-                                  pass_fds=(fd,), stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  start_new_session=True) as process:
+            process = subprocess.Popen([f"/proc/self/fd/{fd}", "boot-args", base],
+                                       pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       start_new_session=True)
+            try:
                 try:
                     complete = False
                     output = bytearray()
@@ -222,6 +223,10 @@ def boot_arguments(t_clock: int, *, vmm: Path) -> str:
                         except ProcessLookupError:
                             pass
                         process.wait(timeout=TSC_RESOLVE_TIMEOUT_S)
+            finally:
+                # Popen.__exit__ can wait forever after bounded reaping fails.
+                if process.stdout is not None:
+                    process.stdout.close()
     except (OSError, subprocess.TimeoutExpired):
         raise KernelError("VMM frequency resolution failed") from None
     text = _text(bytes(output), MAX_BOOT_BYTES)

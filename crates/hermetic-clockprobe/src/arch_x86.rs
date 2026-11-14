@@ -1,10 +1,185 @@
-//! The only unsafe module: CPUID and RDTSC via core::arch, with no memory
-//! operands, MSR instructions, hypercalls, port I/O, or writable guest pages.
+//! The only unsafe module: CPUID and RDTSC via core::arch, with no
+//! MSR instructions, hypercalls, port I/O, or writable guest pages.
 //! A separate zero-length init_module syscall checks compiled-out module support.
+//! Bounded Linux affinity wrappers keep a CPUID sample on one vCPU.
 //! Run only in the intended x86_64 guest with CR4.TSD clear (the sealed kernel
 //! default). A hostile kernel can forbid RDTSC; this diagnostic cannot attest
 //! to a kernel that actively falsifies its observations.
 #![allow(unsafe_code)]
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod affinity {
+    use std::io;
+
+    // Covers up to 8192 logical CPUs; larger kernel masks fail closed.
+    const MAX_AFFINITY_WORDS: usize = 128;
+    type Mask = [u64; MAX_AFFINITY_WORDS];
+
+    unsafe extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut Mask) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const Mask) -> i32;
+    }
+
+    fn invalid() -> io::Error {
+        io::ErrorKind::Other.into()
+    }
+    fn get() -> io::Result<Mask> {
+        let mut mask = [0; MAX_AFFINITY_WORDS];
+        // SAFETY: pid 0 selects this thread. The aligned buffer is writable
+        // for exactly the bounded size passed to the Linux libc wrapper.
+        if unsafe { sched_getaffinity(0, size_of::<Mask>(), &mut mask) } != 0 {
+            return Err(invalid());
+        }
+        Ok(mask)
+    }
+    fn set(mask: &Mask) -> io::Result<()> {
+        // SAFETY: pid 0 selects this thread; mask is an initialized aligned
+        // buffer readable for the supplied size. No other thread is changed.
+        if unsafe { sched_setaffinity(0, size_of::<Mask>(), mask) } != 0 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    struct Restore<F: FnMut(&Mask) -> io::Result<()>> {
+        original: Mask,
+        set: F,
+        active: bool,
+    }
+    impl<F: FnMut(&Mask) -> io::Result<()>> Restore<F> {
+        fn restore(&mut self) -> io::Result<()> {
+            self.active = false;
+            (self.set)(&self.original)
+        }
+    }
+    impl<F: FnMut(&Mask) -> io::Result<()>> Drop for Restore<F> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.restore();
+            }
+        }
+    }
+
+    fn inspect_with<T>(
+        get: impl FnOnce() -> io::Result<Mask>,
+        set: impl FnMut(&Mask) -> io::Result<()>,
+        inspect: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        let original = get()?;
+        let (index, word) = original
+            .iter()
+            .enumerate()
+            .find(|(_, word)| **word != 0)
+            .ok_or_else(invalid)?;
+        let mut selected = [0; MAX_AFFINITY_WORDS];
+        *selected.get_mut(index).ok_or_else(invalid)? = word & word.wrapping_neg();
+        let mut restore = Restore {
+            original,
+            set,
+            active: true,
+        };
+        (restore.set)(&selected)?;
+        let result = inspect();
+        restore.restore()?;
+        Ok(result)
+    }
+
+    pub(super) fn inspect<T>(inspect: impl FnOnce() -> T) -> io::Result<T> {
+        inspect_with(get, set, inspect)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::RefCell;
+
+        #[test]
+        fn cpuid_sampling_pins_one_cpu_and_restores_the_original_mask() {
+            let mut original = [0; MAX_AFFINITY_WORDS];
+            original[2] = 0b1010;
+            let current = RefCell::new(original);
+            let result = inspect_with(
+                || Ok(original),
+                |mask| {
+                    *current.borrow_mut() = *mask;
+                    Ok(())
+                },
+                || {
+                    for _ in crate::baseline::queries() {
+                        // Model arbitrary scheduling between CPUID queries:
+                        // only the selected CPU is eligible for every query.
+                        assert_eq!(
+                            current.borrow().iter().map(|w| w.count_ones()).sum::<u32>(),
+                            1
+                        );
+                        assert_eq!(current.borrow()[2], 0b10);
+                    }
+                    42
+                },
+            );
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(*current.borrow(), original);
+        }
+
+        #[test]
+        fn affinity_failures_do_not_sample_or_report_success() {
+            assert!(inspect_with(|| Err(invalid()), |_| Ok(()), || panic!("sampled")).is_err());
+            assert!(inspect_with(
+                || Ok([0; MAX_AFFINITY_WORDS]),
+                |_| Ok(()),
+                || panic!("sampled")
+            )
+            .is_err());
+            let mut original = [0; MAX_AFFINITY_WORDS];
+            original[0] = 3;
+            assert!(
+                inspect_with(|| Ok(original), |_| Err(invalid()), || panic!("sampled")).is_err()
+            );
+            let mut calls = 0;
+            assert!(inspect_with(
+                || Ok(original),
+                |_| {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(())
+                    } else {
+                        Err(invalid())
+                    }
+                },
+                || ()
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn linux_affinity_wrapper_pins_and_restores_the_calling_thread() {
+            let before = get().unwrap();
+            inspect(|| {
+                for _ in crate::baseline::queries() {
+                    assert_eq!(
+                        get().unwrap().iter().map(|w| w.count_ones()).sum::<u32>(),
+                        1
+                    );
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+            assert_eq!(get().unwrap(), before);
+        }
+    }
+}
+
+pub fn with_pinned_cpu<T>(inspect: impl FnOnce() -> T) -> std::io::Result<T> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        affinity::inspect(inspect)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = inspect;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
 
 pub fn read_tsc() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]

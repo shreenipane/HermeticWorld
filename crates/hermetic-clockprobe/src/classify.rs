@@ -648,13 +648,9 @@ pub fn classify_dmesg_dates(
     let mut suspicious_lines: Vec<String> = Vec::new();
 
     'lines: for raw_line in text.lines() {
-        // Strip /dev/kmsg prefix ("prio,seq,timestamp,-;message") if present
-        let msg = match raw_line.split_once(';') {
-            Some((_, after)) => after,
-            None => raw_line,
-        };
-
-        let Ok(dates) = find_dates_in_line(msg) else {
+        // The numeric kmsg header contains no calendar date. Scan the whole
+        // record so a semicolon in a plain message cannot hide earlier text.
+        let Ok(dates) = find_dates_in_line(raw_line) else {
             return ProbeRecord::new(
                 "dmesg_dates",
                 ProbeResult::Error,
@@ -1016,7 +1012,7 @@ fn find_dates_in_line(line: &str) -> Result<Vec<(i32, u32, u32)>, ()> {
 
     // Match "Mon DD HH:MM:SS YYYY" or "Mon DD YYYY"
     let tokens: Vec<&str> = line
-        .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')'))
         .filter(|s| !s.is_empty())
         .collect();
     for idx in 0..tokens.len() {

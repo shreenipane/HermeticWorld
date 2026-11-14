@@ -24,7 +24,10 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build --offline --locked --relea
 
 The only unsafe module is `src/arch_x86.rs`, for the RDTSC intrinsic and Linux x86_64
 module insertion syscalls with an empty image/invalid fd that cannot install code. CPUID's
-intrinsic is safe on the current compiler. The sealed guest must leave CR4.TSD
+intrinsic is safe on the current compiler. Linux affinity wrappers pin the calling thread to one allowed CPU while
+collecting CPUID and restore its previous mask; affinity failures are errors.
+These wrappers use a bounded 1024-byte mask and change only the calling thread.
+The sealed guest must leave CR4.TSD
 clear; a kernel actively blocking instructions or falsifying procfs is outside
 this diagnostic's trust assumptions. All other modules forbid unsafe code.
 MSRs are read only from the checked CPU-0 MSR character device; there are no

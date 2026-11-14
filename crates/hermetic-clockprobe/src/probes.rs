@@ -74,6 +74,9 @@ fn brand() -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 fn probe_cpuid() -> ProbeRecord {
+    arch_x86::with_pinned_cpu(sample_cpuid).unwrap_or_else(|_| error("cpuid"))
+}
+fn sample_cpuid() -> ProbeRecord {
     let mut leaves = Vec::new();
     for (leaf, subleaf) in crate::baseline::queries() {
         // Query the complete fixed profile, including zeroed PV leaves.

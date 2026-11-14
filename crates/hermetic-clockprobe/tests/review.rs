@@ -109,3 +109,17 @@ fn cpuinfo_rejects_duplicate_identity_fields_and_empty_flags() {
         assert!(!record.to_json_line().contains("host-secret"));
     }
 }
+
+#[test]
+fn log_dates_before_message_semicolons_are_not_discarded() {
+    for message in [
+        "Linux version secret-host Fri Nov 13 12:00:00 UTC 2026; booting",
+        "2026-11-13; booting",
+        "6,42,1234,-;2026-11-13; booting",
+    ] {
+        let record = classify_dmesg_dates(Some(message), false, Some(1_704_067_200));
+        assert_eq!(record.result, ProbeResult::Leak, "{message}");
+        assert!(!record.to_json_line().contains("secret-host"));
+        assert!(!record.to_json_line().contains("2026-11-13"));
+    }
+}
