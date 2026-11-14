@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::binary::extract_string_literal_content;
 use crate::fingerprint::HunkFingerprints;
@@ -117,31 +118,7 @@ pub struct StatementTarget<'tree> {
     pub block_start_byte: Option<usize>,
 }
 
-fn find_statement_for_row<'tree>(
-    node: tree_sitter::Node<'tree>,
-    row: usize,
-) -> Option<StatementTarget<'tree>> {
-    if node.start_position().row > row || node.end_position().row < row {
-        return None;
-    }
-
-    if is_simple_statement(node.kind()) {
-        return Some(StatementTarget {
-            node,
-            is_header: false,
-            block_start_byte: None,
-        });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.start_position().row <= row && row <= child.end_position().row {
-            if let Some(target) = find_statement_for_row(child, row) {
-                return Some(target);
-            }
-        }
-    }
-
+fn header_or_error_target(node: tree_sitter::Node<'_>, row: usize) -> Option<StatementTarget<'_>> {
     if is_compound_statement(node.kind()) || is_clause(node.kind()) {
         let block = find_block_child(node);
         let in_header = match block {
@@ -361,62 +338,215 @@ pub fn extract_hunk_symbols_and_anchors(
     fixed_src: &str,
     added_lines: &[usize],
 ) -> (HashSet<String>, Vec<String>) {
-    let Some(lang) = SupportedLanguage::for_path(file_path) else {
-        return (HashSet::new(), Vec::new());
-    };
+    let parsed = Tier2ParsedFile::parse(
+        file_path,
+        base_src.filter(|_| !removed_lines.is_empty()),
+        (!added_lines.is_empty()).then_some(fixed_src),
+    );
+    let mut ctx = parsed.context();
+    ctx.extract_hunk(removed_lines, added_lines)
+}
 
-    let Some(mut parser) = lang.make_parser() else {
-        return (HashSet::new(), Vec::new());
-    };
+/// The tier-2 parse trees of one changed file, parsed once for all of its hunks.
+///
+/// Parsing per hunk made extraction quadratic in hunk count (every hunk re-parsed the
+/// whole file); a file is parsed once and each hunk looks its rows up in the shared trees.
+pub struct Tier2ParsedFile<'src> {
+    file_path: &'src str,
+    supported: bool,
+    base: Option<(tree_sitter::Tree, &'src str)>,
+    fixed: Option<(tree_sitter::Tree, &'src str)>,
+}
 
-    let mut anchors = extract_file_anchors(file_path);
-    let mut symbols = HashSet::new();
+impl<'src> Tier2ParsedFile<'src> {
+    /// Parses `base_src` and `fixed_src` (each when given) with the grammar for `file_path`.
+    pub fn parse(
+        file_path: &'src str,
+        base_src: Option<&'src str>,
+        fixed_src: Option<&'src str>,
+    ) -> Self {
+        let mut out = Self {
+            file_path,
+            supported: false,
+            base: None,
+            fixed: None,
+        };
+        let Some(lang) = SupportedLanguage::for_path(file_path) else {
+            return out;
+        };
+        let Some(mut parser) = lang.make_parser() else {
+            return out;
+        };
+        out.supported = true;
+        out.base = base_src.and_then(|src| parser.parse(src.as_bytes(), None).map(|t| (t, src)));
+        out.fixed = fixed_src.and_then(|src| parser.parse(src.as_bytes(), None).map(|t| (t, src)));
+        out
+    }
 
-    // 1. Base parse for removed lines
-    if let Some(base) = base_src {
+    /// A per-file lookup context; it caches node children so row lookups stay logarithmic
+    /// in sibling count across all hunks.
+    pub fn context(&self) -> Tier2FileContext<'_> {
+        Tier2FileContext {
+            parsed: self,
+            base_children: ChildCache::default(),
+            fixed_children: ChildCache::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChildCache<'tree> {
+    map: HashMap<usize, Rc<[tree_sitter::Node<'tree>]>>,
+}
+
+impl<'tree> ChildCache<'tree> {
+    fn children(&mut self, node: tree_sitter::Node<'tree>) -> Rc<[tree_sitter::Node<'tree>]> {
+        self.map
+            .entry(node.id())
+            .or_insert_with(|| {
+                let mut cursor = node.walk();
+                node.children(&mut cursor).collect()
+            })
+            .clone()
+    }
+
+    /// Same result as `find_statement_for_row`, but descends by binary search over cached
+    /// children instead of a linear sibling scan.
+    fn find_statement_for_row(
+        &mut self,
+        node: tree_sitter::Node<'tree>,
+        row: usize,
+    ) -> Option<StatementTarget<'tree>> {
+        if node.start_position().row > row || node.end_position().row < row {
+            return None;
+        }
+        if is_simple_statement(node.kind()) {
+            return Some(StatementTarget {
+                node,
+                is_header: false,
+                block_start_byte: None,
+            });
+        }
+        // Siblings are ordered and do not overlap, so their end rows are non-decreasing.
+        let children = self.children(node);
+        let first = children.partition_point(|c| c.end_position().row < row);
+        for child in &children[first..] {
+            if child.start_position().row > row {
+                break;
+            }
+            if let Some(target) = self.find_statement_for_row(*child, row) {
+                return Some(target);
+            }
+        }
+        header_or_error_target(node, row)
+    }
+}
+
+/// Tier-2 extraction for the hunks of one parsed file.
+pub struct Tier2FileContext<'p> {
+    parsed: &'p Tier2ParsedFile<'p>,
+    base_children: ChildCache<'p>,
+    fixed_children: ChildCache<'p>,
+}
+
+impl<'p> Tier2FileContext<'p> {
+    /// Candidate symbols and anchors of one hunk: `removed_lines` are rows of the base
+    /// source, `added_lines` rows of the fixed source (both zero-based).
+    pub fn extract_hunk(
+        &mut self,
+        removed_lines: &[usize],
+        added_lines: &[usize],
+    ) -> (HashSet<String>, Vec<String>) {
+        if !self.parsed.supported {
+            return (HashSet::new(), Vec::new());
+        }
+        let mut anchors = AnchorList::new(extract_file_anchors(self.parsed.file_path));
+        let mut symbols = HashSet::new();
         if !removed_lines.is_empty() {
-            if let Some(tree) = parser.parse(base.as_bytes(), None) {
-                let root = tree.root_node();
-                let mut seen_ranges = HashSet::new();
-                for &row in removed_lines {
-                    if let Some(target) = find_statement_for_row(root, row) {
-                        let range = (
-                            target.node.start_byte(),
-                            target.node.end_byte(),
-                            target.is_header,
-                        );
-                        if seen_ranges.insert(range) {
-                            extract_symbols_from_statement(&target, base.as_bytes(), &mut symbols);
-                            extract_enclosing_anchors(target.node, base.as_bytes(), &mut anchors);
-                        }
-                    }
-                }
+            if let Some((tree, src)) = &self.parsed.base {
+                collect_rows(
+                    &mut self.base_children,
+                    tree.root_node(),
+                    src.as_bytes(),
+                    removed_lines,
+                    &mut symbols,
+                    &mut anchors,
+                );
+            }
+        }
+        if !added_lines.is_empty() {
+            if let Some((tree, src)) = &self.parsed.fixed {
+                collect_rows(
+                    &mut self.fixed_children,
+                    tree.root_node(),
+                    src.as_bytes(),
+                    added_lines,
+                    &mut symbols,
+                    &mut anchors,
+                );
+            }
+        }
+        (symbols, anchors.list)
+    }
+}
+
+fn collect_rows<'tree>(
+    cache: &mut ChildCache<'tree>,
+    root: tree_sitter::Node<'tree>,
+    source: &[u8],
+    rows: &[usize],
+    symbols: &mut HashSet<String>,
+    anchors: &mut AnchorList,
+) {
+    let mut seen_ranges = HashSet::new();
+    for &row in rows {
+        if let Some(target) = cache.find_statement_for_row(root, row) {
+            let range = (
+                target.node.start_byte(),
+                target.node.end_byte(),
+                target.is_header,
+            );
+            if seen_ranges.insert(range) {
+                extract_symbols_from_statement(&target, source, symbols);
+                anchors.add_enclosing(target.node, source);
             }
         }
     }
+}
 
-    // 2. Fixed parse for added lines
-    if !added_lines.is_empty() {
-        if let Some(tree) = parser.parse(fixed_src.as_bytes(), None) {
-            let root = tree.root_node();
-            let mut seen_ranges = HashSet::new();
-            for &row in added_lines {
-                if let Some(target) = find_statement_for_row(root, row) {
-                    let range = (
-                        target.node.start_byte(),
-                        target.node.end_byte(),
-                        target.is_header,
-                    );
-                    if seen_ranges.insert(range) {
-                        extract_symbols_from_statement(&target, fixed_src.as_bytes(), &mut symbols);
-                        extract_enclosing_anchors(target.node, fixed_src.as_bytes(), &mut anchors);
-                    }
-                }
-            }
+/// An ordered, deduplicated anchor list with constant-time membership.
+struct AnchorList {
+    list: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl AnchorList {
+    fn new(list: Vec<String>) -> Self {
+        let seen = list.iter().cloned().collect();
+        Self { list, seen }
+    }
+
+    fn push(&mut self, name: &str) {
+        if !name.is_empty() && !self.seen.contains(name) {
+            self.seen.insert(name.to_string());
+            self.list.push(name.to_string());
         }
     }
 
-    (symbols, anchors)
+    fn add_enclosing(&mut self, node: tree_sitter::Node, source: &[u8]) {
+        let mut curr = Some(node);
+        while let Some(n) = curr {
+            if matches!(n.kind(), "function_definition" | "class_definition") {
+                if let Some(name) = n
+                    .child_by_field_name("name")
+                    .and_then(|nn| nn.utf8_text(source).ok())
+                {
+                    self.push(name);
+                }
+            }
+            curr = n.parent();
+        }
+    }
 }
 
 pub fn find_first_anchor<'a>(text: &str, anchors: &'a [String]) -> Option<&'a str> {

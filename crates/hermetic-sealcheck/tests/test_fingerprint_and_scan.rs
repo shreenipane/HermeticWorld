@@ -370,3 +370,81 @@ fn test_regression_cr1_finding2_base_binary_subtracted_from_text_baseline() {
         "base tree utf16 binary lines must be subtracted by baseline: {gate_findings2:#?}"
     );
 }
+
+// TR-SC-1: known passing fixes are fingerprinted like the gold patch, deduplicated and
+// capped, with base-commit fingerprints subtracted.
+
+fn fix_base() -> tempfile::TempDir {
+    let base_dir = tempdir().expect("tempdir");
+    fs::create_dir_all(base_dir.path().join("app")).expect("mkdir");
+    let base = "def process_data(items):\n    total = 0\n    for item in items:\n        total += item.value\n    return total\n";
+    fs::write(base_dir.path().join("app/core.py"), base).expect("write base");
+    base_dir
+}
+
+fn fix_adding(line: &str) -> String {
+    format!("diff --git a/app/core.py b/app/core.py\n--- a/app/core.py\n+++ b/app/core.py\n@@ -2,3 +2,4 @@\n     total = 0\n     for item in items:\n+        {line}\n         total += item.value\n")
+}
+
+fn d2_gates(dir: &std::path::Path, fp: &FingerprintSet) -> usize {
+    let opts = ScanOptions {
+        visibility: Visibility::AgentVisible,
+        ..Default::default()
+    };
+    scan_tree(dir, fp, &opts)
+        .iter()
+        .filter(|f| f.severity == Severity::Gate && f.detector == "D2")
+        .count()
+}
+
+#[test]
+fn test_passing_fix_is_fingerprinted_and_base_subtracted() {
+    let base = fix_base();
+    let gold = fix_adding("validate_item_security_checks(item)");
+    let alt = fix_adding("ensure_item_value_is_sane_before_summing(item)");
+    let gold_only = FingerprintSet::from_task(&gold, "", base.path()).expect("fp");
+    let with_fix =
+        FingerprintSet::from_task_with_fixes(&gold, "", std::slice::from_ref(&alt), base.path())
+            .expect("fp");
+    assert_eq!(with_fix.hunks.len(), gold_only.hunks.len() + 1);
+
+    // A copy of the alternative fix gates only when the fix is fingerprinted.
+    let leak = tempdir().expect("tempdir");
+    fs::write(
+        leak.path().join("leaked.py"),
+        "def process_data(items):\n    total = 0\n    for item in items:\n        ensure_item_value_is_sane_before_summing(item)\n        total += item.value\n    return total\n",
+    )
+    .expect("leak");
+    assert_eq!(d2_gates(leak.path(), &gold_only), 0);
+    assert!(d2_gates(leak.path(), &with_fix) > 0);
+
+    // Base subtraction applies to the fix: the base tree itself has no gate.
+    assert_eq!(d2_gates(base.path(), &with_fix), 0);
+}
+
+#[test]
+fn test_passing_fixes_deduplicated_and_capped_at_20() {
+    use hermetic_sealcheck::fingerprint::{select_passing_fixes, MAX_PASSING_FIXES};
+    assert_eq!(MAX_PASSING_FIXES, 20);
+    let gold = fix_adding("validate_item_security_checks(item)");
+    let mut fixes = vec![gold.clone(), gold.replace('\n', "  \r\n")];
+    for i in 0..30 {
+        let f = fix_adding(&format!("check_number_{i}(item)"));
+        fixes.push(f.clone());
+        fixes.push(f);
+    }
+    let picked = select_passing_fixes(&gold, &fixes);
+    assert_eq!(
+        picked.len(),
+        20,
+        "duplicates of gold and of each other are skipped"
+    );
+    for (i, p) in picked.iter().enumerate() {
+        assert!(p.contains(&format!("check_number_{i}(item)")), "fix {i}");
+    }
+
+    let base = fix_base();
+    let fp = FingerprintSet::from_task_with_fixes(&gold, "", &fixes, base.path()).expect("fp");
+    let gold_only = FingerprintSet::from_task(&gold, "", base.path()).expect("fp");
+    assert_eq!(fp.hunks.len(), gold_only.hunks.len() + 20);
+}

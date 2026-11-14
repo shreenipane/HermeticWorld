@@ -193,6 +193,36 @@ struct CandidateHunk {
     tier2_candidate_symbols: HashSet<String>,
 }
 
+/// The most passing fixes fingerprinted besides the gold patch (TR-SC-1).
+pub const MAX_PASSING_FIXES: usize = 20;
+
+/// Patch text with line endings and trailing whitespace normalised, for deduplication.
+fn fix_dedup_key(patch: &str) -> String {
+    let mut key = String::with_capacity(patch.len());
+    for line in patch.lines() {
+        key.push_str(line.trim_end());
+        key.push('\n');
+    }
+    key.trim_end().to_string()
+}
+
+/// The first `MAX_PASSING_FIXES` fixes that differ from the gold patch and each other.
+pub fn select_passing_fixes<'a>(gold_patch: &str, fixes: &'a [String]) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    seen.insert(fix_dedup_key(gold_patch));
+    let mut out = Vec::new();
+    for fix in fixes {
+        if out.len() >= MAX_PASSING_FIXES {
+            break;
+        }
+        let key = fix_dedup_key(fix);
+        if !key.is_empty() && seen.insert(key) {
+            out.push(fix.as_str());
+        }
+    }
+    out
+}
+
 fn apply_patch_to_base(
     file_patch: &FilePatch,
     base_tree_root: &Path,
@@ -2637,17 +2667,61 @@ impl FingerprintSet {
         tier2_max_bytes: u64,
         work_budget: Option<usize>,
     ) -> Result<Self, FingerprintError> {
+        Self::from_task_with_fixes_caps_and_budget(
+            gold_patch_str,
+            test_patch_str,
+            &[],
+            base_tree_root,
+            tier2_max_files,
+            tier2_max_bytes,
+            work_budget,
+        )
+    }
+
+    /// Like `from_task`, but also fingerprints known passing fixes (TR-SC-1): up to
+    /// `MAX_PASSING_FIXES` deduplicated patches, each treated like the gold patch. A fix
+    /// identical to the gold patch or to an earlier fix is skipped; base-commit
+    /// fingerprints are subtracted as for the gold patch.
+    pub fn from_task_with_fixes(
+        gold_patch_str: &str,
+        test_patch_str: &str,
+        passing_fixes: &[String],
+        base_tree_root: &Path,
+    ) -> Result<Self, FingerprintError> {
+        Self::from_task_with_fixes_caps_and_budget(
+            gold_patch_str,
+            test_patch_str,
+            passing_fixes,
+            base_tree_root,
+            Self::DEFAULT_TIER2_MAX_FILES,
+            Self::DEFAULT_TIER2_MAX_BYTES,
+            None,
+        )
+    }
+
+    pub fn from_task_with_fixes_caps_and_budget(
+        gold_patch_str: &str,
+        test_patch_str: &str,
+        passing_fixes: &[String],
+        base_tree_root: &Path,
+        tier2_max_files: usize,
+        tier2_max_bytes: u64,
+        work_budget: Option<usize>,
+    ) -> Result<Self, FingerprintError> {
         let budget_limit = work_budget.unwrap_or(DEFAULT_MAX_FINGERPRINT_WORK);
         let mut budget = WorkBudget::new(budget_limit);
-        let gold_patch = parse_patch(gold_patch_str)?;
+        let mut fix_patches = vec![parse_patch(gold_patch_str)?];
+        for fix in select_passing_fixes(gold_patch_str, passing_fixes) {
+            fix_patches.push(parse_patch(fix)?);
+        }
         let test_patch = parse_patch(test_patch_str)?;
         let mut unresolved = UnresolvedNames::default();
 
         let mut candidate_hunks: Vec<CandidateHunk> = Vec::new();
         let mut global_hunk_counter = 0;
 
-        // 1. Process gold patch
-        for file in &gold_patch.files {
+        // 1. Process the gold patch and the selected passing fixes
+        for file in fix_patches.iter().flat_map(|p| p.files.iter()) {
             let file_path = file
                 .new_path
                 .as_deref()
@@ -2710,6 +2784,14 @@ impl FingerprintSet {
                 None
             };
 
+            // Parse once per file; per-hunk parsing was quadratic in hunk count.
+            let tier2_parsed = crate::tier2::Tier2ParsedFile::parse(
+                &file_path,
+                base_src.as_deref(),
+                Some(post_fix_text.as_str()),
+            );
+            let mut tier2_ctx = tier2_parsed.context();
+
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 let mut lines = Vec::new();
                 let mut removed_markers = Vec::new();
@@ -2749,13 +2831,7 @@ impl FingerprintSet {
                 };
 
                 let (tier2_candidate_symbols, mut tier2_anchors) =
-                    crate::tier2::extract_hunk_symbols_and_anchors(
-                        &file_path,
-                        base_src.as_deref(),
-                        &removed_lines,
-                        &post_fix_text,
-                        &added_lines,
-                    );
+                    tier2_ctx.extract_hunk(&removed_lines, &added_lines);
 
                 // FIX 4: Add old file's base name and module as additional anchors
                 if let Some(old_p) = file.old_path.as_deref() {

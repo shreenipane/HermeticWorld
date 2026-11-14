@@ -41,7 +41,7 @@
 //!
 //! The reader accepts versions 2, 3, 4 and 5 (a version-2 index has no member-time records,
 //! directory records, or symlink records; a version-3 index has member-time records but lacks
-//! directory and symlink records; a version-4 index lacks pyc code-object records). Older versions report their uncovered aspects via `not_covered`.
+//! directory and symlink records; a version-4 index lacks pyc code-object records and tier-2 context records). Older versions report their uncovered aspects via `not_covered`.
 //! Version 1 and anything else stay `UnsupportedVersion`.
 //!
 //! `fixed` holds a finding that depends on the unit alone (errors, bombs, skipped
@@ -81,7 +81,8 @@
 //!
 //! D1 (git stores), D3 (`.pyc` headers against source), D6 (OCI metadata), the D9
 //! instance-id check and external signatures need the live tree or the task's identity.
-//! A query report says so in `not_covered`.
+//! A query report says so in `not_covered`. Tier 2 ("T2") is covered by a version-5 index
+//! (tier-2 context records) and reported uncovered for older versions.
 //!
 //! # Reading hostile files
 //!
@@ -117,8 +118,10 @@ pub const MAX_ROOT_BYTES: u32 = 64 * 1024;
 
 /// Detectors a query can't answer from an index.
 ///
-/// Tier 2 ("T2") is not answered from the index: symbol tokens are not stored in layer indexes.
-pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"];
+///
+/// Tier 2 ("T2") is answered from a version-5 index, which stores each text unit's tier-2
+/// context; `not_covered_for_version` adds "T2" for older versions, which lack it.
+pub const NOT_COVERED: &[&str] = &["D1", "D3", "D6", "D9:instance_id", "D9:external"];
 
 /// Detectors not covered when querying an index of a given format version.
 pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
@@ -129,6 +132,7 @@ pub fn not_covered_for_version(version: u32) -> Vec<&'static str> {
         list.push("D4:directories_symlinks");
     }
     if version < 5 {
+        list.push("T2");
         list.push("D3b:pyc_code_objects");
     }
     list
@@ -147,7 +151,7 @@ const TAG_DIR: u8 = 10;
 const TAG_SYMLINK: u8 = 11;
 const TAG_PYC: u8 = 12;
 // Text context uses the existing bounded, splittable two-set record encoding.
-// Older indexes omit these optional records, so T2 remains conservatively uncovered.
+// Indexes older than version 5 omit these records, so their queries report T2 uncovered.
 const TIER2_CONTEXT_CHANNEL: &str = "tier2_context";
 
 #[derive(Debug, thiserror::Error)]

@@ -307,7 +307,12 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
     } else {
         let task = TaskInput::load(&args.task)?;
-        let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+        let fp = FingerprintSet::from_task_with_fixes(
+            &task.gold_patch,
+            &task.test_patch,
+            &task.passing_fixes,
+            &args.base_tree,
+        )?;
 
         let signatures = if let Some(ref sig_file) = args.signatures {
             BenchmarkSignatures::load_from_file(Some(task.instance_id.clone()), sig_file)?
@@ -550,10 +555,6 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 not_covered_set.push(s);
             }
         }
-        if !not_covered_set.contains(&"T2".to_string()) {
-            not_covered_set.push("T2".to_string());
-        }
-
         for (idx, index) in args.indexes.iter().enumerate() {
             let reader = hermetic_sealcheck::IndexReader::open(index)?;
             let v = reader.version();
@@ -591,7 +592,12 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
     } else {
         let task = TaskInput::load(&args.task)?;
-        let fp = FingerprintSet::from_task(&task.gold_patch, &task.test_patch, &args.base_tree)?;
+        let fp = FingerprintSet::from_task_with_fixes(
+            &task.gold_patch,
+            &task.test_patch,
+            &task.passing_fixes,
+            &args.base_tree,
+        )?;
 
         // The instance id is not matched in the trees (D9:instance_id is not covered),
         // but D0 on the problem statement runs exactly as in `scan`.

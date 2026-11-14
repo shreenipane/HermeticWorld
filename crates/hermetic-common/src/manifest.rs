@@ -47,6 +47,72 @@ pub struct TaskInput {
     pub gold_patch: String,
     pub test_patch: String,
     pub problem_statement: String,
+    #[serde(default)]
+    /// Known passing fixes (`staging/fixes/*.patch`, sorted by file name; TR-SC-1).
+    /// Missing directory means none. Only regular files are read; symlinks are skipped.
+    pub passing_fixes: Vec<String>,
+}
+
+/// The most fix files `TaskInput::load` reads from `staging/fixes/`.
+pub const MAX_FIX_FILES: usize = 256;
+/// The largest fix file `TaskInput::load` reads (16 MiB); larger files are an error.
+pub const MAX_FIX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn load_passing_fixes(dir: &Path) -> Result<Vec<String>, ManifestError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ManifestError::MissingFile(format!(
+                "{}: {}",
+                dir.display(),
+                e
+            )));
+        }
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ManifestError::MissingFile(format!(
+                "{}: {}",
+                dir.display(),
+                e
+            )));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| ManifestError::MissingFile(format!("{}: {}", dir.display(), e)))?;
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("patch") {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| ManifestError::MissingFile(format!("{}: {}", path.display(), e)))?;
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        if meta.len() > MAX_FIX_FILE_BYTES {
+            return Err(ManifestError::MissingFile(format!(
+                "{}: fix larger than {} bytes",
+                path.display(),
+                MAX_FIX_FILE_BYTES
+            )));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    paths.truncate(MAX_FIX_FILES);
+    paths
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .map_err(|e| ManifestError::MissingFile(format!("{}: {}", p.display(), e)))
+        })
+        .collect()
 }
 
 impl TaskInput {
@@ -83,6 +149,7 @@ impl TaskInput {
             gold_patch,
             test_patch,
             problem_statement,
+            passing_fixes: load_passing_fixes(&task_dir.join("staging").join("fixes"))?,
         })
     }
 }

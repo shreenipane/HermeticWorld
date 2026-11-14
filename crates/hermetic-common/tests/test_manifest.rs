@@ -111,3 +111,56 @@ fn test_task_input_missing_file_fails() {
         hermetic_common::manifest::ManifestError::MissingFile(_)
     ));
 }
+
+fn minimal_task_dir(task_dir: &std::path::Path) {
+    fs::create_dir_all(task_dir.join("staging")).expect("staging");
+    fs::create_dir_all(task_dir.join("agent")).expect("agent");
+    let json = r#"{"instance_id":"a__b-1","repo":"a/b","base_commit":"abc",
+        "cutoffs":{"t_world":"2024-01-01T00:00:00Z","t_clock":"2024-01-02T00:00:00Z","discarded":[]}}"#;
+    fs::write(task_dir.join("task.json"), json).expect("task.json");
+    fs::write(task_dir.join("staging/gold.patch"), "gold\n").expect("gold");
+    fs::write(task_dir.join("staging/test.patch"), "test\n").expect("test");
+    fs::write(task_dir.join("agent/problem_statement.md"), "p\n").expect("ps");
+}
+
+#[test]
+fn test_task_input_passing_fixes_absent_is_empty() {
+    let dir = tempdir().expect("tempdir");
+    minimal_task_dir(dir.path());
+    let loaded = TaskInput::load(dir.path()).expect("load");
+    assert!(loaded.passing_fixes.is_empty());
+}
+
+#[test]
+fn test_task_input_passing_fixes_sorted_regular_patch_files_only() {
+    let dir = tempdir().expect("tempdir");
+    let task_dir = dir.path();
+    minimal_task_dir(task_dir);
+    let fixes = task_dir.join("staging/fixes");
+    fs::create_dir_all(&fixes).expect("fixes");
+    fs::write(fixes.join("b.patch"), "fix b\n").expect("b");
+    fs::write(fixes.join("a.patch"), "fix a\n").expect("a");
+    fs::write(fixes.join("notes.txt"), "not a patch\n").expect("txt");
+    fs::create_dir_all(fixes.join("dir.patch")).expect("dir");
+    let outside = dir.path().join("outside.txt");
+    fs::write(&outside, "outside\n").expect("outside");
+    std::os::unix::fs::symlink(&outside, fixes.join("c.patch")).expect("symlink");
+    let loaded = TaskInput::load(task_dir).expect("load");
+    assert_eq!(
+        loaded.passing_fixes,
+        vec!["fix a\n".to_string(), "fix b\n".to_string()]
+    );
+}
+
+#[test]
+fn test_task_input_passing_fixes_symlinked_dir_is_not_followed() {
+    let dir = tempdir().expect("tempdir");
+    let task_dir = dir.path().join("task");
+    minimal_task_dir(&task_dir);
+    let real = dir.path().join("real_fixes");
+    fs::create_dir_all(&real).expect("real");
+    fs::write(real.join("a.patch"), "fix a\n").expect("a");
+    std::os::unix::fs::symlink(&real, task_dir.join("staging/fixes")).expect("symlink");
+    let loaded = TaskInput::load(&task_dir).expect("load");
+    assert!(loaded.passing_fixes.is_empty());
+}

@@ -378,3 +378,68 @@ fn test_cli_d9_exit_codes() {
         "image_only D9 leak must exit code 0"
     );
 }
+
+#[test]
+fn test_cli_scan_gates_on_a_passing_fix_from_staging_fixes() {
+    let bin_path = env!("CARGO_BIN_EXE_hermetic-sealcheck");
+    let parent_dir = tempdir().expect("tempdir");
+    let parent = parent_dir.path();
+    let base_tree = parent.join("repo");
+    fs::create_dir_all(&base_tree).expect("mkdir repo");
+    fs::write(
+        base_tree.join("main.py"),
+        "def main():\n    do_base_work_initial()\n",
+    )
+    .expect("write base");
+    let task = parent.join("task");
+    fs::create_dir_all(task.join("staging/fixes")).expect("mkdir fixes");
+    fs::create_dir_all(task.join("agent")).expect("mkdir agent");
+    fs::write(
+        task.join("task.json"),
+        r#"{"instance_id":"test__fix-1","repo":"test/repo","base_commit":"1234567890abcdef1234567890abcdef12345678",
+            "cutoffs":{"t_world":"2024-01-01T00:00:00Z","t_clock":"2024-01-02T00:00:00Z"}}"#,
+    )
+    .expect("task.json");
+    let patch = |line: &str| {
+        format!("diff --git a/main.py b/main.py\n--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,3 @@\n def main():\n+    {line}\n     do_base_work_initial()\n")
+    };
+    fs::write(
+        task.join("staging/gold.patch"),
+        patch("execute_gold_leak_line()"),
+    )
+    .expect("gold");
+    fs::write(task.join("staging/test.patch"), "").expect("test");
+    fs::write(task.join("agent/problem_statement.md"), "Fix it.\n").expect("ps");
+    let scan_root = parent.join("root");
+    fs::create_dir_all(&scan_root).expect("root");
+    fs::write(
+        scan_root.join("leaked.py"),
+        "def main():\n    execute_alternative_fix_leak_line()\n    do_base_work_initial()\n",
+    )
+    .expect("leak");
+    backdate_tree(parent);
+    let scan = || {
+        Command::new(bin_path)
+            .arg("scan")
+            .arg("--task")
+            .arg(&task)
+            .arg("--base-tree")
+            .arg(&base_tree)
+            .arg("--root")
+            .arg(&scan_root)
+            .status()
+            .expect("scan")
+            .code()
+    };
+    assert_eq!(
+        scan(),
+        Some(0),
+        "without the fix, the alternative leak is unknown"
+    );
+    fs::write(
+        task.join("staging/fixes/alt.patch"),
+        patch("execute_alternative_fix_leak_line()"),
+    )
+    .expect("fix");
+    assert_eq!(scan(), Some(2), "a copy of a known passing fix must gate");
+}
