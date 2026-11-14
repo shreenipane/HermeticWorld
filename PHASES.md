@@ -292,16 +292,140 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
 **Goal.** Broaden coverage. Every item is independent and can be cut.
 
 ### Deliverables
-- [ ] remaining: Web archive and search: a tantivy BM25 index per month, exact-capture replay, Common Crawl, Wayback, Software Heritage, and Stack Exchange rebuilt from post history
-- [ ] remaining: Other ecosystems: npm, crates.io, Go modules; research Maven
-- [ ] remaining: Other provider adapters for the gateway
-- [ ] remaining: Smart git protocol terminated in NetVM (for shallow clones)
-- [ ] remaining: State-task live grading from a snapshot (TR-VMM-6, §11.4)
-- [ ] remaining: Split mode for Mode G (agent in a second VM)
-- [ ] remaining: TEE quotes (SEV-SNP, TDX, Nitro)
-- [ ] remaining: aarch64 (pl031 RTC offset patch)
-- [ ] remaining: Resolve whether archived pages can be redistributed
+- [ ] Web archive and search: a tantivy BM25 index per month, exact-capture replay, Common Crawl, Wayback, Software Heritage, and Stack Exchange rebuilt from post history
+  - [x] Offline replay interchange format and authenticated reader (`python/hermetic_archive`): exact URL and nanosecond cutoff lookup, latest capture strictly before the cutoff per URL, payload hashes/sizes, selected response fields, GET/HEAD and redirects without following them. Digest-bound bounded file readers pin regular inodes and blob directories; hostile records, symlinks/FIFOs, substitution, authentication and known-answer tests. No page redistribution or live WorldServer routing is enabled.
+  - [x] Deterministic monthly search preparation format and authenticated reader: only captures strictly before the first day contribute documents, term frequencies or lengths; stable document IDs and ordered postings, explicit ASCII tokenization, named resource/query caps and hostile posting-reference tests. URL-ordered conjunctive candidate lookup supports inspecting the format; tantivy BM25 and the search service remain open.
+- [ ] Other ecosystems: npm, crates.io, Go modules; research Maven
+  - [x] Offline cutoff filters (`docs/phase4-plan.md`): npm filter reviewed and public input boundary bounded; `python/hermetic_ecosystem_cut` adds crates.io sparse-index `pubtime` and Go proxy `.info` `Time` filtering, exact nanosecond boundaries, deterministic output, unknown-date reports, duplicate/version validation and named input/output caps. Unknown crate yank dates use TR-PKG-2's not-yanked-and-listed rule; no current yank state is presented as historical truth.
+  - [x] Offline continuation: PyPI simple/JSON upload-time filtering and deterministic HTML rendering, with file-level cutoff boundaries, exclusion/reporting of unknown dates, strict bounded parsers and hostile-input tests. Reviewed preparation defects fixed: nested Cargo schema validation, canonical Go versions and output cap, npm direct-input NUL keys and descriptor-pinned publication preflight. No dependencies added or existing tests changed.
+  - [x] Offline frozen-store build (`python/hermetic_ecosystem_cut/mirror.py`): integrate crates/Go/PyPI/npm filters with digest-checked acquisition blobs; publish admitted metadata and downloads, local URLs, Cargo config, Go version case escaping and admitted-only `@latest`, deterministic hash manifests and separate operator reports. Private descriptor-pinned staging and complete-tree rename, named resource caps, hostile-input/publication tests and a production WorldServer `DirStore` integration test. Unverifiable retained npm non-latest tags fail closed in this builder; the existing filter contract remains open below. See `docs/phase4-plan.md` for recipe and CLI.
+  - [x] Offline publication manifest verification (`verify_mirror`): require the trusted world digest and cutoff, authenticate all served bytes and uncertainty reports, reject malformed inventories/order/paths/types and enforce the builder's named caps before returning immutable bytes. Blob acquisition now retains its root directory descriptor across all reads; directory and symlink substitution regressions failed before repair. No rootfs or WorldServer startup integration is claimed.
+  - [x] Offline payload identity review: replay/search consumers and mirror build/verification retain bounded input inventories and consume the exact immutable byte objects whose digests were checked. Five regressions failed before repair when entries changed during hashing; the repaired targeted suite passed 258 tests. Existing tests and dependencies are preserved; final gate results are in `docs/phase4-plan.md`.
+  - [x] Go info inventory review: retain a private copy before aggregate input validation so later caller substitutions cannot bypass `MAX_INPUT_BYTES` or change admission. Replacement and removal regressions both failed before repair; the targeted ecosystem/mirror suite passes 149 tests. Full Python gate: 2285 passed, 1 skipped, exit 0. Full Rust gate remains blocked by the same four VMM ancestor-ownership failures (exit 101). Existing tests and dependencies are preserved; exact gate results and remaining blockers are in `docs/phase4-plan.md`.
+  - [x] Direct npm tree identity review: capture containers during bounded validation and filter only the retained tree. Four regressions failed before repair when later caller changes injected oversized/cyclic metadata, removed a version or replaced its date. Two companion cases check typed refusal of dictionary resizing during validation. The targeted suite passes 174 tests; full Python gate: 2291 passed, 1 skipped, exit 0. Full Rust gate remains blocked by the same four VMM ancestor-ownership failures, exit 101. Existing tests and dependencies are preserved; exact gates and open prerequisites are recorded in `docs/phase4-plan.md`.
+  - [x] Offline npm resolver fixture: real deterministic tarballs, a scoped package and transitive dependency installed by a real npm client from exact frozen builder bytes with an empty cache/config. Assert admitted versions, lockfile integrity and requested downloads; refuse external sockets and disable lifecycle scripts. Local npm/Node are required; Cargo/Go fixtures remain open.
+  - [x] Offline guest install configurations for pip/npm/Cargo/Go (`hermetic_ecosystem_cut.install`): fixed frozen-store authorities intercepted by NetVM, no Go direct/VCS/toolchain fallback, no npm audit or lifecycle scripts, hash manifest and strict bundle verification before rootfs installation. Host environment independence and hostile path/content/manifest/cap tests. Rootfs installation and clean client environment/cache assembly remain integration work.
+  - [x] Real Cargo offline resolver fixture uses exact frozen index and deterministic archive bytes in Cargo's local-registry layout; asserts the admitted dependency executes, lockfile version/checksum match and corrupted archive bytes fail. A matching real Go file-proxy fixture is implemented but skipped here because no local Go executable is available; no Go validation is claimed.
+  - [x] Real pip offline wheel fixture installs an admitted root package and transitive dependency from exact frozen artifact bytes, with empty private home/cache and the delivered pip configuration. Future/undated wheels are absent; installed metadata and imported versions are checked. HTTP/NetVM resolver validation remains open.
+  - [x] Additional parser review: npm's shared byte parser rejects non-byte inputs and invalid or unbounded cap values before parsing, using fixed typed errors. Reproduced uncontrolled TypeError/AttributeError failures; regression tests added without changing existing tests.
+  - [x] I/O diagnostic review: npm's bounded reader and atomic writer suppress private OS exception causes as well as using fixed messages. Five regressions reproduce private paths/details in ordinary exception-chain logging before repair; existing tests are preserved.
+  - [x] Offline publisher review: fix npm's preflight-to-read path substitution using the retained parent and expected inode (two regressions); omit metadata routes for packages without admitted releases, preventing post-cutoff package-existence leaks (twelve regressions). All regressions were observed failing before repair. Keep excluded inventories in operator-only reports and retain full validation even for an empty admitted inventory.
+  - [ ] Deferred integration: source acquisition and dated immutable-manifest provenance, npm tag history, Go h1/sumdb provenance, cutoff-aware recording/resolver builds including build dependencies, HTTP/NetVM Cargo/Go install validation, execution of the Go fixture, rootfs client setup, E4 and monthly baseline sizing. The offline store establishes integrity of recipe-bound bytes; it does not establish source provenance or complete ecosystem support.
+  - [x] Initial Maven research: release-list metadata has no per-release publication time; snapshot metadata retains current entries. Supporting Maven requires dated, digest-bound artifact provenance or a historical snapshot, including POMs/plugins/parents/classifiers. Primary sources and remaining work are in `docs/phase4-plan.md`; no Maven support is claimed.
+  - [x] Resolved 2026-11-14 (owner decision: drop post-cutoff npm tags): with no tag history in a packument, `cut_packument` drops every `dist-tags` entry except `latest`, which is recomputed from admitted versions; the mirror serves only that. Proof: `test_tags_pointing_at_admitted_versions_are_still_dropped`, `test_mirror_npm_mutable_tags_are_dropped_and_never_published`.
+- [ ] Other provider adapters for the gateway
+- [ ] Smart git protocol terminated in NetVM (for shallow clones)
+  - [ ] Review 2026-11-15: the branch's three commits contain no smart Git implementation. NetVM still rejects POST; sealed reachable-object repository binding, upload-pack v2 shallow/deepen, a bounded pkt-line parser and hostile protocol tests remain open. Implementing them requires the NetVM transport and repository-serving components outside this preparation change set; see `docs/phase4-plan.md`.
+- [ ] State-task live grading from a snapshot (TR-VMM-6, §11.4)
+  - [x] Review 2026-11-15: retain the snapshot payload inventory before validating keys and collecting bytes. Two regressions reproduce missing-artifact acceptance and unchecked unknown-role `KeyError` before the fix; the targeted suite passes 120 tests. Full Python gate: 2294 passed, 1 skipped, exit 0. Rust gate: exit 101 at the four existing VMM ancestor-ownership failures; host mapping remains open. Details are in `docs/phase4-plan.md`.
+  - [x] Offline handoff and grading-path formats (`python/hermetic_state_snapshot.py`): canonical bounded manifests bind memory/state/base/overlay artifacts, run identity and CPU-model/Firecracker/kernel/initramfs/template digests; authenticated readers require independent destination-runtime pins. Records retain `shared` isolation and distinguish live grading from trusted-initramfs reboot with an explicit fallback reason. Hostile-input, compatibility, exact-byte, cap and environment-independence tests; no VM or filesystem access.
+  - [x] In-memory snapshot artifact verification: authenticate the handoff, validate the complete payload inventory and all size caps before hashing, then return the exact immutable verified bytes. Mapping substitution during hashing cannot replace returned payloads. Combined snapshot/error review tests pass (118 cases); full Python gate includes them.
+  - [x] Offline immutable snapshot-byte verification (`verify_snapshot_artifacts`): authenticate the handoff against independent pins, require exactly four bounded byte payloads, check all sizes before hashing any payload, and verify every digest. Return the exact verified bytes in stable role order, independent of later input-mapping changes. Hostile inventories, corrupt/truncated/growing bodies, wrong pins, named caps and ordering tests; streaming file acquisition and VM restore remain open.
+  - [ ] Trusted harness integration: close model/network access, pause and consistently snapshot memory plus disk, verify artifact bytes in isolation, match reserved drive/interface topology, redirect every interface to a tap without a peer before resume, attach/mount tests read-only, supervise grading, perform trusted-initramfs fallback, and embed the selected path in the signed run record. VM/KVM validation remains open.
+- [ ] Split mode for Mode G (agent in a second VM)
+- [ ] TEE quotes (SEV-SNP, TDX, Nitro)
+- [ ] aarch64 (pl031 RTC offset patch)
+- [x] Resolve whether archived pages can be redistributed: owner decision 2026-11-14, archived pages stay local-only and are never redistributed or published.
+
+### Preparation and remaining prerequisites (2026-11-14)
+
+- [x] Final branch/preparation review: the requested three-dot diff and branch-only
+  log remain empty at `9fa9070`; reviewed the uncommitted offline Phase 4 code,
+  tests and specifications as well. An offline 1,027-case field-mutation sweep
+  found no unexpected exception, and no additional verified defect was found.
+  No code, existing test, dependency or git state was changed. The npm history,
+  gateway startup and host UID-mapping findings below remain open; exact gate
+  results are recorded in `docs/phase4-plan.md`. Rust gate: exit 101 at the same
+  four VMM ancestor-ownership failures, after formatting/clippy and gateway
+  tests passed. Subsequent Python gate: 2291 passed, 1 skipped, 12 warnings,
+  exit 0. No full Rust gate success is claimed.
+
+- [x] Resolved 2026-11-14: `Server::http_with_deadlines` / `from_listener_with_deadlines` install the read deadlines before the accept thread starts, and the gateway binary uses them (proof: `deadlines_given_at_construction_bound_the_first_connection`). Original finding, gateway startup deadline race: `Server::http` begins accepting
+  before `GatewayServer::run_loop` installs request deadlines. A request queued
+  in that window caches unlimited body reads; installing deadlines later does
+  not bound it. Independently reproduced with an incomplete local request that
+  remained blocked after a subsequently installed 50 ms deadline. Requires
+  gateway/HTTP acceptance lifecycle work outside this preparation scope; see
+  `docs/phase4-plan.md`. No existing test or deadline policy was weakened.
+
+The branch started with no commits or diff relative to `main`; the preparation
+plan and interface details are in [docs/phase4-plan.md](docs/phase4-plan.md).
+No deliverable above is removed or reduced:
+
+- Web/search remains open: production WorldServer replay/search routing, source acquisition for
+  Common Crawl/Wayback/Software Heritage, Stack Exchange reconstruction, and D10
+  fingerprint/thread/revision provenance integration. BM25 requires tantivy,
+  which is not in the existing dependencies; adding it needs owner authorization
+  under the no-new-dependencies constraint. The new offline interchange formats
+  and readers do not replace that engine or its integration requirements.
+- Owner decisions: archived-page redistribution, the additional provider/endpoint
+  and pin set, and the TEE platform. Until redistribution is resolved, publish
+  recipes and manifests only, as architecture §6.5 requires.
+- Smart git termination in NetVM and the remote file layer for split Mode G
+  remain implementation work; end-to-end validation needs the NetVM/VM path.
+- State-task snapshot orchestration/grading, TEE quote verification, the aarch64 RTC patch,
+  E2 Track B and E5 remain open and need the matching VM/KVM or platform access.
+- Gate environment blocker: rust-gate's VMM filesystem/process fixtures refuse
+  `unsafe ancestor ownership` because this sandbox maps host root-owned `/` and
+  ancestors to unmapped UID 65534 (`/proc/self/uid_map`: `1000 0 1`). The production
+  ownership check is preserved. Full VMM gate validation needs a host with normal
+  UID mappings; changing that host/sandbox mapping is outside this branch.
+  The continuation reproduced the same four failures (`rust-gate` exit 101);
+  `py-gate` then passed with 1854 tests and exit 0. Details are in the plan.
+  The offline-store continuation reproduced them again in both Rust runs
+  (formatting/clippy passed, gate exit 101). Its final `py-gate` passed with
+  1920 tests and exit 0; all 66 new builder/cleanup cases pass, and the separate
+  production `DirStore` integration test passes. Source-provenance work and the
+  host mapping remain open; no full-gate success is claimed.
+  The input-identity/package-existence review and npm install continuation ran
+  both full gates twice more: Rust runs 5 and 6 each exited 101 with the same
+  four ownership failures after formatting/clippy passed. Python run 5 passed
+  1923 tests; the final run 6, including both repairs, passed 1939 tests with
+  exit 0. All 14 newly reproduced regression cases now pass; no existing tests
+  were changed. Exact results and remaining blockers are in the plan.
+  The client-config/replay/search continuation's Rust run 7 again exited 101
+  with those four ownership failures; Python run 7 passed 2127 tests with one
+  new Go-toolchain skip, 12 existing warnings and exit 0. The separate production
+  `DirStore` test passed. All new parser regressions and offline preparation
+  tests passed; no dependency, git state mutation or original test change was
+  made. The full Rust gate and historical npm tag policy remain OPEN.
+  The publication-authentication continuation's Rust run 8 exited 101 at the
+  same four VMM ownership failures after formatting/clippy passed. Python run 8
+  passed 2160 tests with one unavailable-Go skip, 12 existing warnings and exit
+  0; all 33 new publication tests pass. The separate production `DirStore`
+  integration passed. The two blob-root substitution regressions failed before
+  repair; no existing test was changed. The host mapping and npm history/policy
+  remain OPEN, with exact results in the plan.
+  The snapshot continuation's Rust run 9 exited 101 in the existing gateway
+  stalled-body test; a focused rerun passed, and an independent bounded
+  reproduction established the startup deadline race recorded above. Rust run
+  10 passed that test and exited 101 at the same four VMM ownership failures.
+  Python runs 9 and 10 passed with 2231 and 2278 tests respectively, one
+  unavailable-Go skip, 12 existing warnings and exit 0. Concurrent npm I/O error
+  disclosure repairs and artifact verification were reviewed and preserved;
+  five exception-chain regressions now pass without leaking private OS details.
+  No original test or production ownership check was weakened. Exact results
+  and the unresolved component/host prerequisites are in the plan.
+  The artifact-verification/diagnostic review's distinct-log final Rust gate
+  exited 101 at those same four VMM ownership failures after formatting, clippy
+  and gateway tests passed. Its subsequent full Python gate exited 0 with
+  2278 passed, one unavailable-Go skip and 12 existing warnings, including all
+  42 snapshot-byte cases and five diagnostic regressions. Logs and exact results
+  are in the plan; npm history, gateway startup integration and host UID mapping
+  remain OPEN. Git state and existing tests are preserved.
+  The retained-payload inventory review reproduced five archive/search/mirror
+  substitution failures and repaired all five. Its full Rust gate exited 101
+  at the same four VMM ancestor-ownership failures after formatting/clippy and
+  gateway tests passed; the subsequent full Python gate exited 0 with 2283
+  passed, one unavailable-Go skip and 12 existing warnings. No existing test,
+  dependency or production ownership check was changed. Exact results and logs
+  are in the plan; npm history, gateway startup and host UID mapping remain OPEN.
 
 ### Exit
 - E2 Track B: start fully sealed and open one channel at a time.
 - E5: date evidence at each clock level; 0 outside the substrate at `hidden`.
+
+### Integration findings, 2026-11-13 (grader path)
+- [x] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2).
+- [ ] Supervisor isolation: apply the `hermetic-grader-sandbox` plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill.
+- [x] Extraction format: the validator's HEXT v1 format is canonical; `hermetic-extract-agent` emits it byte for byte. Tree root is `patch:` / `repo_dir: ""` on both sides; `.` is refused. Cross-crate test `crates/hermetic-extract-agent/tests/validator_compat.rs`; grader smoke now runs agent then validator (done 2026-11-13).
