@@ -722,9 +722,18 @@ pub fn classify_dmesg_dates_with_substrate(
     if text.len() > MAX_TEXT_BYTES {
         return ProbeRecord::new("dmesg_dates", ProbeResult::Error, None, "Text cap exceeded");
     }
-    let expected_ymd = expected_t_clock
+    // Without a valid reference epoch no date can be judged, even in an empty log.
+    let Some((ey, em, ed)) = expected_t_clock
         .filter(|t| *t <= MAX_EPOCH)
-        .map(unix_to_ymd);
+        .map(unix_to_ymd)
+    else {
+        return ProbeRecord::new(
+            "dmesg_dates",
+            ProbeResult::Error,
+            None,
+            "Missing or invalid log reference epoch",
+        );
+    };
     let mut suspicious_lines: Vec<String> = Vec::new();
 
     'lines: for raw_line in text.lines() {
@@ -740,15 +749,7 @@ pub fn classify_dmesg_dates_with_substrate(
         };
         for (y, m, d) in dates {
             let substrate = substrate_dates.is_some_and(|set| set.contains(&(y, m, d)));
-            let allowed = substrate
-                || match expected_ymd {
-                    Some((ey, em, ed)) => {
-                        let found_days = ymd_to_days(y, m, d);
-                        let exp_days = ymd_to_days(ey, em, ed);
-                        found_days.abs_diff(exp_days) <= 1
-                    }
-                    None => y == 1970 && m == 1 && d == 1,
-                };
+            let allowed = substrate || ymd_to_days(y, m, d).abs_diff(ymd_to_days(ey, em, ed)) <= 1;
             if !allowed {
                 suspicious_lines.push(format!("date={y:04}-{m:02}-{d:02}"));
                 if suspicious_lines.len() >= MAX_DATE_FINDINGS {
@@ -943,7 +944,14 @@ pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
         );
     };
     let mut result = None;
-    for section in text.split("\n\n").filter(|part| !part.trim().is_empty()) {
+    for (index, section) in text
+        .split("\n\n")
+        .filter(|part| !part.trim().is_empty())
+        .enumerate()
+    {
+        if index >= MAX_ITEMS {
+            return ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "CPU item cap exceeded");
+        }
         let record = classify_cpuinfo_section(Some(section));
         if record.result == ProbeResult::Leak {
             return record;

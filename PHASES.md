@@ -16,7 +16,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 2: World | done 4 of 43 |
 | 3: VMs | done 21 of 47 |
 | 3b: Clock hiding | done 18 of 20 |
-| 4: Extensions | done 0 of 9 |
+| 4: Extensions | done 27 of 39 |
 
 ## Overview
 
