@@ -221,6 +221,11 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: Attestations: `hermetic-run/v1`, `hermetic-transcript-audit/v1`, score card (TR-ATT-*)
 - [ ] remaining: Harbor backend (TR-HB-1); prototype registration early, since it's a known risk
 - [ ] remaining: `hermetic-cli`: `seal`, `verify-bundle`, `probe`, `run`, `verify`
+  - [x] Strict argument parser and exit-code contract (0/2/64/65/70/74) for all five subcommands. Proof: `usage_error_classes_all_exit_64_with_usage_on_stderr`, `validation_rejects_invalid_inputs_before_dispatch`, `exit_code_table_and_not_implemented_backend` (`crates/hermetic-cli/tests/cli.rs`).
+  - [x] `verify-bundle` over `hermetic-bundle::verify`: ok/mismatch/expected-root, symlinked or non-directory root refused (65), inner symlink rejected (2). Proof: `verify_bundle_ok_mismatch_and_expected_root`, `verify_bundle_refuses_symlinked_root_and_nondirectory`, `verify_bundle_with_symlink_inside_is_problem_found` (`crates/hermetic-cli/tests/backend.rs`).
+  - [x] `probe` classifies supplied `--clockprobe-output` JSON lines and/or `--kernel-canary-serial` transcripts (never probes the host; no input fails closed, 70); symlink, FIFO and oversized inputs refused. Proof: `probe_classifies_clockprobe_output_blocked_leak_error`, `probe_kernel_canary_serial_pass_leak_and_malformed`, `probe_inputs_refuse_symlink_fifo_oversized_and_missing`, `probe_without_input_fails_closed_and_never_probes_host`.
+  - [ ] remaining: `verify`: run-record schema validation is wired (invalid record exits 2), but DSSE signature check and bundle cross-check are not, so a valid record fails closed with exit 70. Proof of fail-closed: `verify_valid_record_fails_closed_on_signature_check`, `verify_invalid_record_is_problem_found`, `verify_refuses_hostile_record_and_bundle_paths`.
+  - [ ] remaining: `seal` (cutoff computation, world build, sealcheck gate) and `run` (microVM orchestration) fail closed with fixed messages, exit 70. Proof: `seal_fails_closed_with_fixed_message_and_exit_70`, `run_fails_closed_with_fixed_message_and_exit_70`.
 - [ ] remaining: `clock: faked`
 
 ### Exit
