@@ -217,11 +217,12 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: Differential runs R0, R1 and R2 in parallel; R3 advisory (cut list: R3, then R2)
 - [ ] remaining: Escape probe (TR-SEC-6)
 - [ ] remaining: Real-date sentinel D12 (TR-SEC-5): scanner exists; runtime/probe/gateway wiring and `date_leak_observed` aggregation remain open (see detector audit above).
-- [ ] remaining: Classifier (TR-CLS-*)
+- [x] Classifier (TR-CLS-1, TR-CLS-2): baseline exact-match/overlap label (`python/hermetic_classifier/baseline.py`) plus run classifier `python -m hermetic_classifier.run EVIDENCE` (`run.py`) combining sealcheck, R0-R3, patches, clock probe and D12 into label, status (attest precedence) and flags; strict bounded JSON, fail closed. Proof: `test_retrieved_in_sealed_world_gives_review`, `test_gate_leak_but_derived_is_disagreement_review`, `test_success_without_patches_is_unclassified_review`, `test_status_precedence`, `test_malformed_fields_raise`, `test_parse_evidence_rejects_hostile_json` (`python/tests/test_run_classifier.py`), `python/tests/test_classifier.py`.
+  - [ ] remaining: evidence producer (runner writing `hermetic-run-evidence/v1` from real runs) and D12 runtime wiring; until then `date_leak_observed` absent is flagged `date_sentinel_not_run`.
 - [ ] remaining: Attestations: `hermetic-run/v1`, `hermetic-transcript-audit/v1`, score card (TR-ATT-*)
 - [ ] remaining: Harbor backend (TR-HB-1); prototype registration early, since it's a known risk
 - [ ] remaining: `hermetic-cli`: `seal`, `verify-bundle`, `probe`, `run`, `verify`
-- [ ] remaining: `clock: faked`
+- [x] `clock: faked`: microVM runs are `faked` unless patched Firecracker, host hypercall block, a complete probe (every required record exactly once) with every record blocked (clock pairing `unavailable` only with a blocked ring-0 canary) and no D12 hit all hold; container runs are `real`. Proof: `test_full_blocked_probe_with_host_filter_is_hidden`, `test_missing_host_filter_gives_faked`, `test_missing_probe_gives_faked`, `test_incomplete_probe_gives_faked`, `test_any_record_not_blocked_gives_faked`, `test_clock_pairing_unavailable_needs_blocked_canary`, `test_duplicate_probe_record_gives_faked_even_if_both_blocked`, `test_date_leak_observed_gives_faked_and_review`, `test_container_substrate_is_real` (`python/tests/test_run_classifier.py`).
 
 ### Exit
 - E1: zero canary recovery per channel.
