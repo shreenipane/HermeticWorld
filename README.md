@@ -4,7 +4,7 @@ A time-sealed evaluation environment for AI agents. Each task runs in a world fr
 
 The first component, **sealcheck**, proves before a run that nothing created after that moment is reachable.
 
-> **Status:** Phase 0 (vertical slice) is complete and Phase 1 (sealcheck) is in progress. See [PHASES.md](PHASES.md) and [BUILD_LOG.md](BUILD_LOG.md).
+> **Status (2026-11-14):** Phase 0 (vertical slice) is complete. Phases 1–3 are in progress: sealing, worlds, VMs and grading run end to end, and the first sealed agent run (Mode H) has completed. Phase 3b reaches `clock: hidden` in a nested VM (full clock probe and ring-0 canary pass on the patched Firecracker). Phase 4 preparation is under way. See [PHASES.md](PHASES.md) and [BUILD_LOG.md](BUILD_LOG.md).
 
 ## Why
 
