@@ -3,7 +3,7 @@
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::arch_x86;
 use crate::classify::{self, CpuidLeafDump, ProbeRecord, ProbeResult};
@@ -264,17 +264,15 @@ fn probe_vmclock(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
 /// Partial std-only clock read. std exposes realtime; /proc/uptime exposes
 /// boottime. std cannot sample CLOCK_TAI or the absolute CLOCK_MONOTONIC value.
 /// Never substitute one clock for another or claim complete clock coverage.
-fn probe_posix(proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
-    let rt = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::ErrorKind::InvalidData)?
-        .as_secs_f64();
-    let boot = uptime(proc)?;
-    let Some(t) = expected else {
-        return Ok(error("posix_clocks"));
-    };
-    let leaked = (rt - t as f64 - boot).abs() > classify::CLOCK_TOLERANCE_SECONDS;
-    Ok(ProbeRecord::new("posix_clocks",if leaked { ProbeResult::Leak } else { ProbeResult::Unavailable },None,"Realtime checked against hermetic.t and guest boottime; CLOCK_MONOTONIC and CLOCK_TAI require an approved safe syscall wrapper"))
+fn probe_posix(_proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
+    use arch_x86::{clock_seconds, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_TAI};
+    // Sample the boot-relative clocks around realtime so the comparisons share
+    // one instant to well within the tolerance.
+    let boot = clock_seconds(CLOCK_BOOTTIME);
+    let mono = clock_seconds(CLOCK_MONOTONIC);
+    let rt = clock_seconds(CLOCK_REALTIME);
+    let tai = clock_seconds(CLOCK_TAI);
+    Ok(classify::classify_posix_clocks(rt, mono, boot, tai, expected))
 }
 fn uptime(proc: &Root) -> io::Result<f64> {
     let text = proc.text("uptime", MAX_SMALL_FILE_BYTES)?;

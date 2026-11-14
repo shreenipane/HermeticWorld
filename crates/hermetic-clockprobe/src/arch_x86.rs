@@ -2,6 +2,7 @@
 //! MSR instructions, hypercalls, port I/O, or writable guest pages.
 //! A separate zero-length init_module syscall checks compiled-out module support.
 //! Bounded Linux affinity wrappers keep a CPUID sample on one vCPU.
+//! A read-only clock_gettime wrapper samples the guest's POSIX clocks.
 //! Run only in the intended x86_64 guest with CR4.TSD clear (the sealed kernel
 //! default). A hostile kernel can forbid RDTSC; this diagnostic cannot attest
 //! to a kernel that actively falsifies its observations.
@@ -251,4 +252,42 @@ pub fn empty_module_calls() -> Option<(i64, i64)> {
     {
         None
     }
+}
+
+/// Linux clock ids read by the POSIX clock probe.
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_BOOTTIME: i32 = 7;
+pub const CLOCK_TAI: i32 = 11;
+
+/// Seconds on `clock` via the libc vDSO/syscall wrapper; None on failure or for
+/// any other id. It only reads the clock into a local timespec.
+#[cfg(target_os = "linux")]
+pub fn clock_seconds(clock: i32) -> Option<f64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    if ![CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI].contains(&clock) {
+        return None;
+    }
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is a valid, aligned, writable timespec owned by this frame, and
+    // only the four allowlisted clock ids reach libc.
+    if unsafe { clock_gettime(clock, &mut ts) } != 0 {
+        return None;
+    }
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return None;
+    }
+    Some(ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn clock_seconds(_clock: i32) -> Option<f64> {
+    None
 }
