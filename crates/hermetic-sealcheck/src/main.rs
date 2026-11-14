@@ -550,10 +550,6 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 not_covered_set.push(s);
             }
         }
-        if !not_covered_set.contains(&"T2".to_string()) {
-            not_covered_set.push("T2".to_string());
-        }
-
         for (idx, index) in args.indexes.iter().enumerate() {
             let reader = hermetic_sealcheck::IndexReader::open(index)?;
             let v = reader.version();

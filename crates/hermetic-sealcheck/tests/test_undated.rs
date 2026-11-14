@@ -427,7 +427,6 @@ fn test_scan_and_query_undated_equivalence() {
             "D6",
             "D9:instance_id",
             "D9:external",
-            "T2",
             "D4",
             "D5a"
         ])
