@@ -621,6 +621,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "hermetic-common",
+ "hermetic-sealcheck",
  "hex",
  "serde",
  "serde_json",
