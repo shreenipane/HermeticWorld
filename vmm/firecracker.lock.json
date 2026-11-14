@@ -7,5 +7,5 @@
   "jailer_sha256": "ddadbaa15b5c942271a83b7040ca7259c8ccf92a9e08d44cce0b86fa407ba460",
   "source_url": "https://codeload.github.com/firecracker-microvm/firecracker/tar.gz/refs/tags/v1.18.0",
   "source_sha256": "89f02fe6867edcf0a0154305d5533a611e48eaa99ba11d24aa2f076492bef615",
-  "patch_sha256": "33cbd093b0cceb18b0b6671612b9b7bd7450e77c5127f424c67710f0d8bc8579"
+  "patch_sha256": "b1ce4b064ff051e1d878a654b0141f3ebf8ff4faf395623417f4fb2aaec0ba26"
 }

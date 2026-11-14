@@ -105,7 +105,7 @@ this base and toolchain, and the two builds were byte-for-byte reproducible:
 | Artifact | Measured SHA256 |
 | --- | --- |
 | Final vendored builder image | `1c040b0c5ada03792b5696a2c8f837e07c86645018a436c3a57af828505a2caf` |
-| Firecracker | `8dae26b13769d055ecf64b0318853335e0e0cda84b7bab3fa0c1324d5252686b` |
+| Firecracker | `9826f47425bbce514009080adb9f1a60bf776cf942c4c66b2a00d05a1d99c9ad` |
 | Jailer | `276e5bc2a17fbb23e5478f6bb245697f99e8c84426cbcf7f2700d8958674518b` |
 
 These measurements document the manager's build. Continue to use its measured

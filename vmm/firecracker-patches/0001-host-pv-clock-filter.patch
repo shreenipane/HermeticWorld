@@ -45,7 +45,7 @@
              }
 --- /dev/null
 +++ b/src/vmm/src/arch/x86_64/clock_filter.rs
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,230 @@
 +// SPDX-License-Identifier: Apache-2.0
 +//! Host enforcement for guests that can execute arbitrary kernel instructions.
 +use kvm_bindings::{
@@ -118,10 +118,21 @@
 +    let count = input.as_slice().iter().find(|e| e.function == 1 && e.index == 0)
 +        .map(|e| ((e.ebx >> 16) & 0xff) as u8).ok_or_else(|| errno::Error::new(libc::EINVAL))?;
 +    let expected = sealed_cpuid(index, count)?;
++    // KVM rewrites CPUID.0xD.0:EBX at runtime (kvm_update_cpuid_runtime) to the
++    // save-area size of the guest's XCR0. The profile has no XSAVE, so XCR0 stays
++    // x87-only and a saved readback holds exactly KVM_XSAVE_LEGACY_SIZE. Accept only
++    // that one recomputed field, then install the sealed template unchanged.
++    let mut saved = input.clone();
++    if let Some(e) = saved.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0) {
++        if e.ebx == KVM_XSAVE_LEGACY_SIZE { e.ebx = 0; }
++    }
 +    // Serialization order is fixed as well as values, flags, and padding.
-+    if input != &expected { return Err(errno::Error::new(libc::EINVAL)); }
++    if saved != expected { return Err(errno::Error::new(libc::EINVAL)); }
 +    Ok(expected)
 +}
++
++/// KVM's CPUID.0xD.0:EBX for an x87-only XCR0 (legacy area plus header).
++pub const KVM_XSAVE_LEGACY_SIZE: u32 = 0x240;
 +
 +/// Deny old/new KVM PV MSRs and the Hyper-V/Xen synthetic range, in both directions.
 +pub fn ranges() -> [MsrFilterRange<'static>; 3] {
@@ -216,6 +227,24 @@
 +                    bad.as_mut_slice()[pos].eax ^= 1;
 +                    assert!(restore_cpuid(&bad, index, Some(baseline::TSC_KHZ)).is_err());
 +                }
++            }
++        }
++        // A snapshot holds KVM's readback, not the template: 0xD.0 EBX is recomputed.
++        for count in [1, 2] {
++            let mut readback = sealed_cpuid(0, count).unwrap();
++            let e = readback.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0).unwrap();
++            e.ebx = KVM_XSAVE_LEGACY_SIZE;
++            let restored = restore_cpuid(&readback, 0, Some(baseline::TSC_KHZ)).unwrap();
++            assert_eq!(restored, sealed_cpuid(0, count).unwrap());
++            for other in [0x200, 0x340, 0x440, 0x988, 1] {
++                let mut bad = readback.clone();
++                bad.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0).unwrap().ebx = other;
++                assert!(restore_cpuid(&bad, 0, Some(baseline::TSC_KHZ)).is_err(), "{other:#x}");
++            }
++            for (leaf, sub) in [(4, 0), (1, 0), (0x16, 0)] {
++                let mut bad = readback.clone();
++                bad.as_mut_slice().iter_mut().find(|e| e.function == leaf && e.index == sub).unwrap().ebx ^= KVM_XSAVE_LEGACY_SIZE;
++                assert!(restore_cpuid(&bad, 0, Some(baseline::TSC_KHZ)).is_err());
 +            }
 +        }
 +        assert!(sealed_cpuid(0, 0).is_err());
