@@ -9,9 +9,12 @@ pub const TSC_KHZ_RANGE: std::ops::RangeInclusive<u64> = 100_000..=10_000_000;
 pub const GUEST_TSC_KHZ: u64 = 2_000_000;
 
 /// The host TSC frequency from CPUID leaf 0x15 (crystal Hz * EBX / EAX), in kHz.
-/// The guest kernel has no kvmclock, PIT, HPET or ACPI PM timer to calibrate
-/// against, so the VMM passes this exact value as `tsc_early_khz=`. Returns
-/// None when the leaf is absent or incomplete; nothing is guessed.
+/// The VMM scales the guest TSC to `GUEST_TSC_KHZ` (KVM_SET_TSC_KHZ). The guest
+/// learns that rate only from the pinned CPU template's leaf 0x15, which makes the
+/// kernel mark the frequency known and register `tsc` directly; no
+/// `tsc_early_khz=` is passed, because it bypasses leaf 0x15, leaves the guest on
+/// `tsc-early` and schedules a refinement against emulated timers. Returns None
+/// when the host leaf is absent or incomplete; nothing is guessed.
 pub fn host_tsc_khz() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -131,9 +134,9 @@ pub fn calibrated_boot_args(args: &str, khz: u64) -> crate::Result<String> {
     if khz != GUEST_TSC_KHZ || has_tsc_arg(args) {
         return Err(crate::Error::Validation("TSC frequency is VMM-owned"));
     }
-    let args = format!("{args} tsc_early_khz={khz}");
-    crate::spec::validate_boot_args(&args)?;
-    Ok(args)
+    // The rate is fixed by the CPU template (leaf 0x15) and KVM scaling; the
+    // boot arguments carry no frequency.
+    Ok(args.to_string())
 }
 
 pub(crate) fn has_tsc_arg(args: &str) -> bool {
@@ -148,11 +151,7 @@ pub(crate) fn valid_calibrated_boot_args(args: &str) -> bool {
     if crate::spec::validate_boot_args(args).is_err() {
         return false;
     }
-    let mut reserved = args.split_ascii_whitespace().filter(|a| has_tsc_arg(a));
-    reserved
-        .next()
-        .is_some_and(|a| a == "tsc_early_khz=2000000")
-        && reserved.next().is_none()
+    !has_tsc_arg(args)
 }
 
 pub fn calibrated_api_requests(valid: &ValidatedSpec, khz: u64) -> crate::Result<Vec<ApiRequest>> {

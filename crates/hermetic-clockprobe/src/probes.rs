@@ -207,7 +207,11 @@ fn probe_hpet(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
         &events,
     ))
 }
-fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
+fn probe_log(
+    dev: &Root,
+    expected: Option<u64>,
+    bound: Option<(u32, u32, u32)>,
+) -> io::Result<ProbeRecord> {
     let mut file = match dev.device("kmsg", KMSG_RDEV) {
         Ok(file) => file,
         Err(e)
@@ -228,7 +232,7 @@ fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
     let mut record = [0u8; MAX_KMSG_RECORD_BYTES];
     for _ in 0..MAX_KMSG_RECORDS {
         match file.read(&mut record) {
-            Ok(0) => return Ok(classify::classify_dmesg_dates(Some(&log), false, expected)),
+            Ok(0) => return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, bound)),
             Ok(n) => {
                 if log.len().saturating_add(n) > MAX_DMESG_BYTES {
                     return Err(io::ErrorKind::InvalidData.into());
@@ -237,7 +241,7 @@ fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
                 log.push_str(std::str::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData)?);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(classify::classify_dmesg_dates(Some(&log), false, expected))
+                return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, bound))
             }
             Err(e) => return Err(e),
         }
@@ -286,6 +290,25 @@ fn checked(name: &str, result: io::Result<ProbeRecord>) -> ProbeRecord {
     result.unwrap_or_else(|_| error(name))
 }
 
+/// Path, relative to /etc/hermetic, of the sealed newest substrate date.
+pub const SUBSTRATE_BOUND_FILE: &str = "substrate-bound";
+
+/// Absent: the strict rule applies (every date must be T_clock). Present but
+/// malformed: an inspection error, never a silent fallback.
+fn substrate_bound() -> io::Result<Option<(u32, u32, u32)>> {
+    let root = match Root::new(Path::new("/etc/hermetic")) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match optional(root.text(SUBSTRATE_BOUND_FILE, 16))? {
+        None => Ok(None),
+        Some(text) => classify::parse_substrate_bound(&text)
+            .map(Some)
+            .ok_or_else(|| io::ErrorKind::InvalidData.into()),
+    }
+}
+
 pub fn run_all_probes() -> Vec<ProbeRecord> {
     let (Ok(proc), Ok(sys), Ok(dev)) = (
         Root::new(Path::new("/proc")),
@@ -326,7 +349,10 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
             }),
         ),
         checked("hpet", probe_hpet(&sys, &dev)),
-        checked("dmesg_dates", probe_log(&dev, expected)),
+        checked(
+            "dmesg_dates",
+            substrate_bound().and_then(|bound| probe_log(&dev, expected, bound)),
+        ),
         checked(
             "clocksource_sysfs",
             (|| {

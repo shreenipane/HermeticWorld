@@ -150,3 +150,64 @@ fn monotonic_origin_cannot_predate_guest_boottime() {
         assert_eq!(record.result, ProbeResult::Blocked);
     }
 }
+
+/// Values read inside the nested lockdown guest (patched Firecracker, no
+/// tsc_early_khz, 2026-11-14): the kernel's jiffies sources and the KVM- and
+/// template-determined `cpuid_fault`/`pti` flags carry no host evidence.
+#[test]
+fn nested_guest_clocksource_and_flags_are_the_fixed_profile() {
+    let record = classify_clocksource_sysfs(Some("tsc\n"), Some("tsc refined-jiffies jiffies \n"));
+    assert_eq!(record.result, ProbeResult::Blocked);
+    for (current, available) in [
+        ("tsc-early", "tsc-early refined-jiffies jiffies"),
+        ("tsc", "tsc kvm-clock"),
+        ("tsc", "tsc hpet"),
+        ("tsc", "tsc acpi_pm"),
+        ("tsc", "tsc jiffies2"),
+    ] {
+        assert_eq!(
+            classify_clocksource_sysfs(Some(current), Some(available)).result,
+            ProbeResult::Leak,
+            "{current} / {available}"
+        );
+    }
+    let flags = "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm cpuid_fault pti";
+    let cpuinfo = |flags: &str| {
+        format!("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: {}\nflags\t\t: {flags}\n", hermetic_clockprobe::baseline::BRAND)
+    };
+    assert_eq!(classify_cpuinfo(Some(&cpuinfo(flags))).result, ProbeResult::Blocked);
+    for extra in ["hypervisor", "avx", "md_clear", "arch_capabilities"] {
+        assert_eq!(
+            classify_cpuinfo(Some(&cpuinfo(&format!("{flags} {extra}")))).result,
+            ProbeResult::Leak,
+            "{extra}"
+        );
+    }
+}
+
+/// Kernel log lines read in the nested lockdown guest (2026-11-14). The banner
+/// (pinned release date), ACPICA, device-mapper and Firecracker ACPI revisions
+/// are substrate dates at or before the kernel's release; a later date is not.
+#[test]
+fn substrate_dates_up_to_the_sealed_bound_are_listed_not_leaks() {
+    let log = "Linux version 6.6.160 (hermetic@hermetic) (gcc (Debian 12.2.0-14+deb12u1) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Wed Oct 21 00:00:00 UTC 2026\n\
+ACPI: XSDT 0x00000000000A0226 00003C (v01 FIRECK FCMVXSDT 00000000 FCAT 20240119)\n\
+ACPI: Core revision 20230628\n\
+device-mapper: ioctl: 4.48.0-ioctl (2023-03-01) initialised: dm-devel@redhat.com\n";
+    let t = Some(1_700_000_000);
+    let bound = parse_substrate_bound("2026-10-21\n");
+    assert_eq!(bound, Some((2026, 10, 21)));
+    assert_eq!(classify_dmesg_dates_with_substrate(Some(log), false, t, bound).result, ProbeResult::Blocked);
+    // Without the sealed bound the strict rule still applies.
+    assert_eq!(classify_dmesg_dates(Some(log), false, t).result, ProbeResult::Leak);
+    // A date after the newest substrate date can only be real time.
+    for late in ["rtc: 2026-11-14 10:00:00\n", "Linux version 6.6.160 #1 SMP Wed Oct 22 00:00:00 UTC 2026\n"] {
+        let text = format!("{log}{late}");
+        let record = classify_dmesg_dates_with_substrate(Some(&text), false, t, bound);
+        assert_eq!(record.result, ProbeResult::Leak, "{late}");
+        assert!(!record.to_json_line().contains("2026-11-14"));
+    }
+    for bad in ["2026-10-21", "2026-10-21\n\n", "2026-13-01\n", "26-10-21\n", "2026/10/21\n", "+026-10-21\n", "2026-1a-21\n", ""] {
+        assert_eq!(parse_substrate_bound(bad), None, "{bad:?}");
+    }
+}

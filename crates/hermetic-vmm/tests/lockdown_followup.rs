@@ -55,14 +55,15 @@ fn tsc_append_rejects_duplicate_aliases_malformed_requests_and_cap_overflow() {
 }
 
 #[test]
-fn all_launch_roles_have_exactly_one_calibrated_boot_source() {
+fn all_launch_roles_boot_without_a_tsc_frequency_argument() {
     for role in [Role::Agent, Role::Net, Role::Extractor, Role::Grader] {
         let s = support::spec(role).validate().unwrap();
         let requests = calibrated_api_requests(&s, 2_000_000).unwrap();
         let boot = requests.iter().find(|r| r.path == "/boot-source").unwrap();
         let args = boot.body["boot_args"].as_str().unwrap();
-        assert_eq!(args.matches("tsc_early_khz=").count(), 1);
-        assert!(args.ends_with(" tsc_early_khz=2000000"));
+        // No role may pass a frequency that would bypass CPUID leaf 0x15.
+        assert_eq!(args.matches("tsc_early_khz").count(), 0);
+        assert!(args.contains("clocksource=tsc"));
     }
 }
 

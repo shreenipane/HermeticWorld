@@ -1058,17 +1058,20 @@ def test_direct_boot_arguments_route_through_vmm(tmp_path):
     resolver = _vmm_resolver_fixture(tmp_path,
         "assert sys.argv[1] == 'boot-args'\n"
         "assert 'tsc_early_khz' not in sys.argv[2]\n"
-        "print(sys.argv[2] + ' tsc_early_khz=2000000')\n")
-    expected = k.spec_boot_arguments(1704067200) + " tsc_early_khz=2000000"
+        "print(sys.argv[2])\n")
+    expected = k.spec_boot_arguments(1704067200)
     assert k.boot_arguments(1704067200, vmm=resolver) == expected
     assert k.check_boot_arguments(expected) == []
-    # The immutable lock/spec remain free of host frequency; only executable args get it.
-    assert "tsc_early_khz" not in k.spec_boot_arguments(1704067200)
+    # The frequency reaches the guest only through the pinned CPUID leaf 0x15.
+    assert "tsc_early_khz" not in expected
+    for arg in ("tsc_early_khz=2000000", "tsc-early-khz=2000000", "tsc_early_khz"):
+        assert [f.option for f in k.check_boot_arguments(expected + " " + arg)] == ["tsc_early_khz"]
 
 
 @pytest.mark.parametrize("body", [
     "sys.exit(2)\n",
     "print('secret-host-identity')\n",
+    "print(sys.argv[2] + ' tsc_early_khz=2000000')\n",
     "print(sys.argv[2] + ' tsc_early_khz=0')\n",
     "print(sys.argv[2] + ' tsc_early_khz=02688000')\n",
     "print(sys.argv[2] + ' tsc_early_khz=10000001')\n",

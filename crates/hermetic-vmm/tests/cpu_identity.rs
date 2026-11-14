@@ -13,10 +13,9 @@ fn executable_frequency_is_constant_without_host_calibration() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(
-        output.stdout,
-        format!("{base} tsc_early_khz={}\n", baseline::TSC_KHZ).as_bytes()
-    );
+    // The VMM confirms the fixed rate and returns the arguments unchanged.
+    assert_eq!(baseline::TSC_KHZ, 2_000_000);
+    assert_eq!(output.stdout, format!("{base}\n").as_bytes());
     for khz in [100_000, 2_400_000, 2_688_000, 10_000_000] {
         assert!(calibrated_boot_args(base, khz).is_err());
     }

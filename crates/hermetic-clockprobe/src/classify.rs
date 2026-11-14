@@ -621,6 +621,34 @@ pub fn classify_dmesg_dates(
     access_denied: bool,
     expected_t_clock: Option<u64>,
 ) -> ProbeRecord {
+    classify_dmesg_dates_with_substrate(dmesg_text, access_denied, expected_t_clock, None)
+}
+
+/// Parse the sealed substrate bound: exactly `YYYY-MM-DD` and a newline.
+pub fn parse_substrate_bound(text: &str) -> Option<(u32, u32, u32)> {
+    let date = text.strip_suffix('\n')?;
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u32> {
+        let s = date.get(r)?;
+        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
+    };
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    ((1970..=9999).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d))
+}
+
+/// As `classify_dmesg_dates`, with the newest substrate date (the guest kernel's
+/// pinned release date, sealed in the image). The substrate is listed, not
+/// hidden: version dates at or before that bound only show that the kernel
+/// exists. Any later date other than T_clock can only come from real time.
+pub fn classify_dmesg_dates_with_substrate(
+    dmesg_text: Option<&str>,
+    access_denied: bool,
+    expected_t_clock: Option<u64>,
+    substrate_bound: Option<(u32, u32, u32)>,
+) -> ProbeRecord {
     if access_denied {
         return ProbeRecord::new(
             "dmesg_dates",
@@ -659,14 +687,17 @@ pub fn classify_dmesg_dates(
             );
         };
         for (y, m, d) in dates {
-            let allowed = match expected_ymd {
-                Some((ey, em, ed)) => {
-                    let found_days = ymd_to_days(y, m, d);
-                    let exp_days = ymd_to_days(ey, em, ed);
-                    found_days.abs_diff(exp_days) <= 1
-                }
-                None => y == 1970 && m == 1 && d == 1,
-            };
+            let substrate = substrate_bound
+                .is_some_and(|(by, bm, bd)| ymd_to_days(y, m, d) <= ymd_to_days(by as i32, bm, bd));
+            let allowed = substrate
+                || match expected_ymd {
+                    Some((ey, em, ed)) => {
+                        let found_days = ymd_to_days(y, m, d);
+                        let exp_days = ymd_to_days(ey, em, ed);
+                        found_days.abs_diff(exp_days) <= 1
+                    }
+                    None => y == 1970 && m == 1 && d == 1,
+                };
             if !allowed {
                 suspicious_lines.push(format!("date={y:04}-{m:02}-{d:02}"));
                 if suspicious_lines.len() >= MAX_DATE_FINDINGS {
@@ -723,8 +754,10 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
         );
     }
 
+    // The x86 kernel always registers the tick-based jiffies sources; they count
+    // guest timer interrupts and carry no host clock. Anything else is a leak.
     for cs in avail.split_whitespace() {
-        if cs != "tsc" {
+        if !matches!(cs, "tsc" | "refined-jiffies" | "jiffies") {
             return ProbeRecord::new(
                 "clocksource_sysfs",
                 ProbeResult::Leak,
@@ -970,6 +1003,11 @@ fn classify_cpuinfo_section(content: Option<&str>) -> ProbeRecord {
                 "sse4_2",
                 "popcnt",
                 "lahf_lm",
+                // KVM emulates CPUID faulting for every guest (MSR_PLATFORM_INFO).
+                "cpuid_fault",
+                // The template exposes no IA32_ARCH_CAPABILITIES (leaf 7 is zero), so
+                // the guest kernel always enables page-table isolation.
+                "pti",
             ];
             if !BASELINE_FLAGS.contains(&flag) {
                 leaks.push("CPU flag differs from fixed baseline");

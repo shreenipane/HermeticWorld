@@ -143,3 +143,21 @@ fn every_registered_rtc_is_checked_and_partial_dates_fail_closed() {
     fs::write(sys.0.join("class/rtc/rtc0/date"), "2024-01-01\n").unwrap();
     assert!(inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0).is_err());
 }
+
+/// The nested lockdown guest's /dev held over 512 nodes (256 legacy PTY pairs),
+/// so the vmclock probe errored at the old cap (2026-11-14).
+#[test]
+fn lockdown_dev_with_legacy_ptys_fits_the_enumeration_cap() {
+    let f = Fixture::new();
+    let root = f.root();
+    for c in "pqrstuvwxyzabcde".chars() {
+        for h in "0123456789abcdef".chars() {
+            fs::write(f.0.join(format!("pty{c}{h}")), b"").unwrap();
+            fs::write(f.0.join(format!("tty{c}{h}")), b"").unwrap();
+        }
+    }
+    for name in ["console", "kmsg", "null", "ptmx", "hwrng", "full"] {
+        fs::write(f.0.join(name), b"").unwrap();
+    }
+    assert_eq!(root.list(".").unwrap().len(), 518);
+}

@@ -74,7 +74,8 @@ fn cli_plan_and_direct_boot_args_share_calibration_and_reject_invalid_overrides(
         .unwrap()["body"]["boot_args"]
         .as_str()
         .unwrap();
-    assert_eq!(args.matches("tsc_early_khz=").count(), 1);
+    // The frequency reaches the guest only via the pinned CPUID leaf 0x15.
+    assert_eq!(args.matches("tsc_early_khz").count(), 0);
     let base = support::spec(Role::Agent).boot_args;
     let output = Command::new(env!("CARGO_BIN_EXE_hermetic-vmm"))
         .args(["boot-args", &base])

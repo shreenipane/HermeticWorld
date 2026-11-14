@@ -3,6 +3,20 @@ use crate::baseline;
 use crate::classify::{CpuidLeafDump, ProbeRecord, ProbeResult};
 use std::collections::BTreeSet;
 
+/// KVM recomputes CPUID.0xD.0:EBX on every XCR0 change as the save-area size of
+/// the enabled state. The template advertises no XSAVE, so the guest keeps the
+/// reset XCR0 (x87 only) and KVM reports the legacy area plus header, 0x240,
+/// on every host. All other registers must equal the installed template.
+pub const KVM_XSAVE_LEGACY_SIZE: u32 = 0x240;
+
+pub fn expected(leaf: u32, subleaf: u32, index: u8, count: u8) -> Option<[u32; 4]> {
+    let mut r = baseline::registers(leaf, subleaf, index, count)?;
+    if (leaf, subleaf) == (0xd, 0) {
+        r[1] = KVM_XSAVE_LEGACY_SIZE;
+    }
+    Some(r)
+}
+
 pub fn inspect(leaves: &[CpuidLeafDump], brand: Option<&str>) -> ProbeRecord {
     let record = |result, detail| ProbeRecord::new("cpuid", result, None, detail);
     if leaves.len() > baseline::MAX_CPUID_ENTRIES {
@@ -18,7 +32,7 @@ pub fn inspect(leaves: &[CpuidLeafDump], brand: Option<&str>) -> ProbeRecord {
         if !seen.insert((leaf.leaf, leaf.subleaf)) {
             return record(ProbeResult::Error, "Duplicate CPU profile evidence");
         }
-        if baseline::registers(leaf.leaf, leaf.subleaf, index, count)
+        if expected(leaf.leaf, leaf.subleaf, index, count)
             != Some([leaf.eax, leaf.ebx, leaf.ecx, leaf.edx])
         {
             return record(ProbeResult::Leak, "CPUID differs from fixed CPU profile");

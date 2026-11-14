@@ -3,7 +3,7 @@ use hermetic_clockprobe::{baseline, classify::*, identity};
 fn profile(index: u8, count: u8) -> Vec<CpuidLeafDump> {
     baseline::queries()
         .map(|(leaf, subleaf)| {
-            let [eax, ebx, ecx, edx] = baseline::registers(leaf, subleaf, index, count).unwrap();
+            let [eax, ebx, ecx, edx] = identity::expected(leaf, subleaf, index, count).unwrap();
             CpuidLeafDump {
                 leaf,
                 subleaf,
@@ -111,4 +111,76 @@ fn documented_cpu_register_baseline_matches_guest_checker() {
     ] {
         assert!(guide.contains(&row), "documented baseline differs: {row}");
     }
+}
+
+/// CPUID as read inside the nested lockdown guest (patched Firecracker, vCPU 1 of
+/// 2, 2026-11-14). Leaf 0xD.0 EBX is KVM's runtime x87 save-area size, which
+/// the probe once reported as a leak; every value must classify as blocked.
+#[test]
+fn nested_guest_dump_with_kvm_xsave_size_is_the_fixed_profile() {
+    let dump: &[(u32, u32, [u32; 4])] = &[
+        (0x00000000, 0, [0x00000016, 0x756e6547, 0x6c65746e, 0x49656e69]),
+        (0x00000001, 0, [0x000106a5, 0x01020800, 0x00982201, 0x178bfbff]),
+        (0x00000002, 0, [0x00000001, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000003, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000004, 0, [0x04000121, 0x01c0003f, 0x0000003f, 0x00000000]),
+        (0x00000004, 1, [0x04000122, 0x01c0003f, 0x0000003f, 0x00000000]),
+        (0x00000004, 2, [0x04000143, 0x01c0003f, 0x000001ff, 0x00000000]),
+        (0x00000004, 3, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000005, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000006, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000007, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000007, 1, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000007, 2, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000007, 3, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000008, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000009, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000a, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000b, 0, [0x00000000, 0x00000001, 0x00000100, 0x00000001]),
+        (0x0000000b, 1, [0x00000001, 0x00000002, 0x00000201, 0x00000001]),
+        (0x0000000b, 2, [0x00000000, 0x00000000, 0x00000002, 0x00000001]),
+        (0x0000000b, 3, [0x00000000, 0x00000000, 0x00000003, 0x00000001]),
+        (0x0000000c, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000d, 0, [0x00000000, 0x00000240, 0x00000000, 0x00000000]),
+        (0x0000000d, 1, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000d, 2, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000d, 3, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000e, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x0000000f, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000010, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000011, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000012, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000013, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000014, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x00000015, 0, [0x00000001, 0x00000050, 0x017d7840, 0x00000000]),
+        (0x00000016, 0, [0x000007d0, 0x000007d0, 0x00000064, 0x00000000]),
+        (0x40000000, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x40000001, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x80000000, 0, [0x80000008, 0x00000000, 0x00000000, 0x00000000]),
+        (0x80000001, 0, [0x00000000, 0x00000000, 0x00000001, 0x20100800]),
+        (0x80000002, 0, [0x65746e49, 0x2952286c, 0x6f655820, 0x2952286e]),
+        (0x80000003, 0, [0x55504320, 0x35354520, 0x40203430, 0x302e3220]),
+        (0x80000004, 0, [0x7a484730, 0x00000000, 0x00000000, 0x00000000]),
+        (0x80000005, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x80000006, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
+        (0x80000007, 0, [0x00000000, 0x00000000, 0x00000000, 0x00000100]),
+        (0x80000008, 0, [0x00003024, 0x00000000, 0x00000000, 0x00000000]),
+    ];
+    let leaves: Vec<CpuidLeafDump> = baseline::queries()
+        .map(|(leaf, subleaf)| {
+            let [eax, ebx, ecx, edx] = dump
+                .iter()
+                .find(|(l, s, _)| (*l, *s) == (leaf, subleaf))
+                .map(|(_, _, r)| *r)
+                .unwrap_or_else(|| identity::expected(leaf, subleaf, 1, 2).unwrap());
+            CpuidLeafDump { leaf, subleaf, eax, ebx, ecx, edx }
+        })
+        .collect();
+    assert_eq!(identity::inspect(&leaves, Some(baseline::BRAND)).result, ProbeResult::Blocked);
+    // The template itself still installs zero; only KVM's runtime value is accepted.
+    assert_eq!(baseline::registers(0xd, 0, 1, 2).unwrap()[1], 0);
+    let mut stale = leaves.clone();
+    let d = stale.iter_mut().find(|r| (r.leaf, r.subleaf) == (0xd, 0)).unwrap();
+    d.ebx = 0;
+    assert_eq!(identity::inspect(&stale, Some(baseline::BRAND)).result, ProbeResult::Leak);
 }

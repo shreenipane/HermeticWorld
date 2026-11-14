@@ -62,7 +62,7 @@ fn trusted_reboot_boot_source_passes_transport_and_rejects_malformed_initrd() {
         path: "/boot-source".into(),
         body: json!({
             "kernel_image_path":"/kernel", "initrd_path":"/initrd",
-            "boot_args":"root=/dev/vda ro clocksource=tsc tsc=reliable hermetic.t=1700000000 hermetic.initramfs=1 tsc_early_khz=2000000"
+            "boot_args":"root=/dev/vda ro clocksource=tsc tsc=reliable hermetic.t=1700000000 hermetic.initramfs=1"
         }),
     };
     let (response, wire) = fake_request(
@@ -345,10 +345,12 @@ fn pathname_client_connects_to_fake_firecracker() {
 }
 
 #[test]
-fn boot_source_transport_refuses_uncalibrated_or_aliased_tsc_before_connect() {
+fn boot_source_transport_refuses_any_tsc_frequency_argument_before_connect() {
+    // The frequency comes only from the pinned CPUID leaf 0x15; a boot argument
+    // would bypass it and leave the guest on tsc-early (nested probe, 2026-11-14).
     let base = "ro clocksource=tsc tsc=reliable hermetic.t=1700000000";
     for suffix in [
-        "",
+        " tsc_early_khz=2000000",
         " tsc_early_khz",
         " tsc-early-khz=2000000",
         " tsc_early_khz=2000000 tsc-early-khz=3000000",

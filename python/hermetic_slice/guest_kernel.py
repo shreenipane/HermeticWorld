@@ -230,12 +230,10 @@ def boot_arguments(t_clock: int, *, vmm: Path) -> str:
     except (OSError, subprocess.TimeoutExpired):
         raise KernelError("VMM frequency resolution failed") from None
     text = _text(bytes(output), MAX_BOOT_BYTES)
-    prefix = base + " tsc_early_khz="
-    if not text.startswith(prefix) or not text.endswith("\n"):
+    # The VMM confirms the fixed 2 GHz guest rate and returns the arguments
+    # unchanged: the frequency reaches the guest only through CPUID leaf 0x15.
+    if text != base + "\n":
         raise KernelError("invalid VMM boot arguments")
-    value = text[len(prefix):-1]
-    if value != "2000000":
-        raise KernelError("invalid VMM TSC frequency")
     return text[:-1]
 
 
@@ -253,10 +251,9 @@ def check_boot_arguments(arguments: str) -> list[Finding]:
             value = token.removeprefix("hermetic.t=")
             if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
                 findings.append(Finding("hermetic.t", "invalid clock value"))
-        elif token.startswith("tsc_early_khz="):
-            value = token.removeprefix("tsc_early_khz=")
-            if not re.fullmatch(r"[1-9][0-9]{5,7}", value) or not TSC_KHZ_MIN <= int(value) <= TSC_KHZ_MAX:
-                findings.append(Finding("tsc_early_khz", "invalid TSC frequency"))
+        elif key.replace("-", "_") == "tsc_early_khz":
+            # It would bypass the pinned CPUID leaf 0x15 frequency.
+            findings.append(Finding("tsc_early_khz", "TSC frequency must not be a boot argument"))
         elif token not in BOOT_FIXED.split(" "):
             findings.append(Finding("boot", "unapproved boot argument"))
     for required in BOOT_FIXED.split(" "):
