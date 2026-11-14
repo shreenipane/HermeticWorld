@@ -723,6 +723,7 @@ dependencies = [
  "bzip2",
  "clap",
  "flate2",
+ "hermetic-clockprobe",
  "hermetic-common",
  "hex",
  "rusqlite",
