@@ -99,7 +99,14 @@ fn runs_sealed_task_through_host_harness() -> Result<(), Box<dyn std::error::Err
     let runner = hermetic_vmm::runner::DevUnjailed::new(launcher.to_str().unwrap()).unwrap();
     let mut vm = Vmm::new(fixture.spec.clone().validate().unwrap(), runner);
     diagnostics::run(&mut vm, |vm| -> Result<(), Box<dyn std::error::Error>> {
-        vm.prepare(Duration::from_secs(120)).unwrap();
+        if let Err(error) = vm.prepare(Duration::from_secs(120)) {
+            let category = match &error {
+                hermetic_vmm::Error::Step(category) => *category,
+                _ => "prepare",
+            };
+            println!("agent-vm-category: {category}");
+            return Err(error.into());
+        }
         vm.start(Duration::from_secs(10)).unwrap();
         vm.wait_ready(Duration::from_secs(30)).unwrap();
         let socket = vm.jail().unwrap().root.descriptor_path("vsock");
@@ -118,6 +125,7 @@ fn runs_sealed_task_through_host_harness() -> Result<(), Box<dyn std::error::Err
         let task = required("HERMETIC_AGENT_TASK");
         let gateway = required("HERMETIC_AGENT_GATEWAY");
         let pinned = required("HERMETIC_AGENT_MODEL");
+        let steps = std::env::var_os("HERMETIC_AGENT_STEPS").unwrap_or_else(|| "60".into());
         let mut harness = Command::new(&python)
             .args([
                 "-m",
@@ -144,6 +152,7 @@ fn runs_sealed_task_through_host_harness() -> Result<(), Box<dyn std::error::Err
             .env_clear()
             .env("PYTHONPATH", format!("{top}/python"))
             .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("HERMETIC_AGENT_STEPS", steps)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

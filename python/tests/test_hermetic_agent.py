@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +24,108 @@ from hermetic_agent.protocol import (ExecdClient, MAX_FRAME_BYTES, MAX_OUTPUT_BY
 from hermetic_agent.task import task_clock
 
 CLOCK = "2001-02-03T04:05:06Z"
+
+
+@pytest.mark.parametrize("limit,cost", [(1, False), (60, False), (250, False), (60, True)])
+def test_limits_are_recorded_submissions_with_full_trajectory(tmp_path, monkeypatch, limit, cost):
+    import types
+    from hermetic_agent import runner
+
+    class LimitsExceeded(Exception):
+        pass
+
+    class Agent:
+        def __init__(self, model, environment, **config):
+            self.model, self.messages, self.config = model, [], config
+
+        def step(self):
+            if self.model.n_calls >= self.config["step_limit"] or cost:
+                raise LimitsExceeded("private upstream detail")
+            self.model.n_calls += 1
+            self.add_message("assistant", "```bash\ntrue\n```", host_time="private")
+            self.add_message("user", "observation")
+
+        def run(self, task):
+            self.add_message("system", "world")
+            self.add_message("user", task)
+            while True:
+                try:
+                    self.step()
+                except LimitsExceeded:
+                    return "LimitsExceeded", "private upstream detail"
+
+    @contextlib.contextmanager
+    def upstream(_):
+        yield Agent, LimitsExceeded
+
+    monkeypatch.setattr(runner, "_upstream", upstream)
+    model = types.SimpleNamespace(config=types.SimpleNamespace(t_clock=CLOCK), n_calls=0)
+    result = runner.run(model, object(), "fix", config_dir=str(tmp_path), step_limit=limit)
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "steps_exhausted"
+    assert model.n_calls == (0 if cost else limit)
+    assert len(result["messages"]) == 2 + 2 * model.n_calls
+    assert all(set(message) == {"role", "content", "timestamp"} for message in result["messages"])
+    assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("value,expected", [(None, 60), ("1", 1), ("120", 120), ("250", 250),
+    ("0", None), ("251", None), ("-1", None), ("+1", None), (" 60", None),
+    ("1.0", None), ("", None), ("9" * 5000, None), ("\udcff", None)])
+def test_agent_steps_environment_is_bounded_before_any_write(tmp_path, monkeypatch, value, expected):
+    from hermetic_agent.runner import configured_steps
+    if value is None:
+        monkeypatch.delenv("HERMETIC_AGENT_STEPS", raising=False)
+    else:
+        monkeypatch.setenv("HERMETIC_AGENT_STEPS", value)
+    if expected is None:
+        with pytest.raises(LimitError, match="Step limit"):
+            configured_steps()
+    else:
+        assert configured_steps() == expected
+    assert not list(tmp_path.iterdir())
+
+
+def test_cli_retains_limit_trajectory_and_succeeds(tmp_path, monkeypatch):
+    import hermetic_agent.__main__ as cli
+    manifest, task = tmp_path / "world.json", tmp_path / "task.txt"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": CLOCK}}))
+    task.write_text("fix")
+    result = {"status": "unresolved", "reason": "steps_exhausted",
+              "messages": [{"role": "user", "content": "retained", "timestamp": 981173106}]}
+    def run(*args, **kwargs):
+        assert kwargs["step_limit"] == 120
+        return result
+    monkeypatch.setattr(cli, "run", run)
+    monkeypatch.setenv("HERMETIC_AGENT_STEPS", "120")
+    trajectory = tmp_path / "trajectory.json"
+    monkeypatch.setattr(sys, "argv", ["hermetic_agent", "--manifest", str(manifest), "--task", str(task),
+        "--gateway", "http://127.0.0.1:8080", "--vsock", "/not-contacted", "--cwd", "/work",
+        "--config-dir", str(tmp_path), "--trajectory", str(trajectory),
+        "--command-log", str(tmp_path / "commands.jsonl")])
+    assert cli.main() == 0
+    assert json.loads(trajectory.read_bytes()) == result
+    assert trajectory.stat().st_mode & 0o777 == 0o600
+
+
+def test_limit_trajectory_retains_json_escaped_history_within_history_cap(tmp_path, monkeypatch):
+    import hermetic_agent.__main__ as cli
+    from hermetic_agent.model import MAX_HISTORY_BYTES
+    manifest, task = tmp_path / "world.json", tmp_path / "task.txt"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": CLOCK}}))
+    task.write_text("fix")
+    content = "\x01" * (3 * 1024 * 1024)
+    assert len(content.encode()) < MAX_HISTORY_BYTES
+    result = {"status": "unresolved", "reason": "steps_exhausted",
+              "messages": [{"role": "user", "content": content, "timestamp": 981173106}]}
+    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: result)
+    trajectory = tmp_path / "trajectory.json"
+    monkeypatch.setattr(sys, "argv", ["hermetic_agent", "--manifest", str(manifest), "--task", str(task),
+        "--gateway", "http://127.0.0.1:8080", "--vsock", "/not-contacted", "--cwd", "/work",
+        "--config-dir", str(tmp_path), "--trajectory", str(trajectory),
+        "--command-log", str(tmp_path / "commands.jsonl")])
+    assert cli.main() == 0
+    assert json.loads(trajectory.read_bytes()) == result
 
 
 @contextlib.contextmanager
@@ -326,6 +429,62 @@ def test_runner_uses_real_pinned_agent_and_world_clock(tmp_path, monkeypatch):
     assert CLOCK in result["messages"][0]["content"]
     assert str(tmp_path) not in json.dumps(result)
     assert not any(name in sys.modules for name in ("litellm", "tiktoken", "huggingface_hub"))
+
+
+@pytest.mark.parametrize("steps", [60, 250])
+def test_real_pinned_runner_records_exhaustion_at_requested_steps(tmp_path, steps):
+    if importlib.util.find_spec("minisweagent") is None:
+        pytest.skip("optional harness extra is not installed")
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    code = '''
+import sys
+from hermetic_agent.runner import run
+from hermetic_agent.model import ModelConfig
+class Model:
+    config = ModelConfig("pinned", "2001-02-03T04:05:06Z")
+    n_calls, cost = 0, 0.0
+    def get_template_vars(self):
+        return {"model_name": "pinned", "t_clock": self.config.t_clock}
+    def query(self, messages):
+        self.n_calls += 1
+        return {"content": "```bash\\ntrue\\n```"}
+class Environment:
+    def get_template_vars(self):
+        return {"cwd": "/testbed"}
+    def execute(self, action, cwd=""):
+        return {"output": "kept observation", "returncode": 0}
+steps = int(sys.argv[2])
+model = Model()
+result = run(model, Environment(), "fix", config_dir=sys.argv[1], step_limit=steps)
+assert result["status"] == "unresolved" and result["reason"] == "steps_exhausted"
+assert model.n_calls == steps
+assert len(result["messages"]) == 3 + 2 * steps
+assert sum("kept observation" in row["content"] for row in result["messages"]) == steps
+assert {row["timestamp"] for row in result["messages"]} == {981173106}
+assert not any(name in sys.modules for name in ("litellm", "tiktoken", "huggingface_hub"))
+print("retained")
+'''
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), PYTHONDONTWRITEBYTECODE="1")
+    result = subprocess.run([sys.executable, "-c", code, str(private), str(steps)],
+                            env=env, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout == b"retained\n"
+
+
+def test_model_accepts_history_for_the_last_permitted_step():
+    from hermetic_agent.runner import MAX_STEPS
+    def respond(*args):
+        return 200, json.dumps({"type": "message", "content": [{"type": "text", "text": "ok"}],
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+    messages = [{"role": "system", "content": "world"}, {"role": "user", "content": "task"}]
+    for _ in range(MAX_STEPS - 1):
+        messages.extend([{"role": "assistant", "content": "action"}, {"role": "user", "content": "result"}])
+    with gateway(respond) as url:
+        model = HermeticGatewayModel(url, "pinned", t_clock=CLOCK)
+        model.n_calls = MAX_STEPS - 1
+        assert model.query(messages) == {"content": "ok"}
+    assert model.n_calls == MAX_STEPS
 
 
 def test_model_rejects_valid_json_in_truncated_http_body():

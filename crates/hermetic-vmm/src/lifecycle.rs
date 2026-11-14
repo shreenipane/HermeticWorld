@@ -94,8 +94,19 @@ impl<R: Runner> Vmm<R> {
     pub fn prepare(&mut self, timeout: Duration) -> Result<()> {
         self.require(&[State::New])?;
         let end = deadline(timeout)?;
-        let khz = self.runner.tsc_khz()?;
-        crate::plan::calibrated_api_requests(&self.spec, khz)?;
+        // TSC and request checks fail before any jail or runner side effect:
+        // no kill or cleanup is sent to a runner that was never spawned.
+        let khz = match self
+            .runner
+            .tsc_khz()
+            .and_then(|khz| crate::plan::calibrated_api_requests(&self.spec, khz).map(|_| khz))
+        {
+            Ok(khz) => khz,
+            Err(error) => {
+                self.state = State::Failed;
+                return Err(Error::Step(prepare_category(&error)));
+            }
+        };
         self.tsc_khz = Some(khz);
         match PreparedJail::prepare(&self.spec, end) {
             Ok(j) => {
@@ -103,7 +114,7 @@ impl<R: Runner> Vmm<R> {
                 self.state = State::Prepared;
                 Ok(())
             }
-            Err(_) => Err(self.failure("prepare")),
+            Err(error) => Err(self.failure(prepare_category(&error))),
         }
     }
     pub fn start(&mut self, timeout: Duration) -> Result<()> {
@@ -314,6 +325,16 @@ impl<R: Runner> Drop for Vmm<R> {
                 }
             }
         }
+    }
+}
+
+fn prepare_category(error: &Error) -> &'static str {
+    match error {
+        Error::IoNoSpace => "prepare-io-no-space",
+        Error::Io => "prepare-io",
+        Error::Validation(_) => "prepare-validation",
+        Error::Deadline(_) => "prepare-deadline",
+        _ => "prepare",
     }
 }
 

@@ -13,9 +13,10 @@ from .protocol import parse_json
 
 MAX_MODEL_BODY_BYTES = 4 * 1024 * 1024
 MAX_HISTORY_BYTES = 8 * 1024 * 1024
-MAX_MESSAGES = 256
 MAX_MODEL_TIMEOUT_SECONDS = 300
 MAX_MODEL_CALLS = 250
+# Initial system/task messages, action/observation pairs, and terminal message.
+MAX_MESSAGES = 2 * MAX_MODEL_CALLS + 3
 MAX_TOTAL_TOKENS = 4_000_000
 
 

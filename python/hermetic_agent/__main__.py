@@ -7,7 +7,7 @@ from hermetic_safe_io import atomic_write
 from .environment import ExecdEnvironment
 from .errors import HarnessError, ProtocolError
 from .model import HermeticGatewayModel
-from .runner import run, MAX_TRAJECTORY_BYTES
+from .runner import run, configured_steps, MAX_TRAJECTORY_BYTES
 from .task import read_input, task_clock
 from .journal import CommandJournal, validate_output
 
@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--model", default="pinned")
     args = parser.parse_args()
     try:
+        step_limit = configured_steps()
         clock = task_clock(args.manifest)
         task = read_input(args.task).decode("utf-8")
         if args.script:
@@ -34,12 +35,14 @@ def main():
             raise ProtocolError("Trajectory and command log must be distinct")
         journal = CommandJournal(args.command_log, t_clock=clock)
         environment = ExecdEnvironment(args.vsock, cwd=args.cwd, journal=journal)
-        result = run(model, environment, task, config_dir=args.config_dir)
+        result = run(model, environment, task, config_dir=args.config_dir, step_limit=step_limit)
         raw = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
         if len(raw) > MAX_TRAJECTORY_BYTES:
             raise HarnessError("Trajectory byte limit")
         atomic_write(args.trajectory, raw + b"\n")
-        return 0 if result["status"] == "Submitted" else 2
+        return 0 if (result["status"] == "Submitted" or
+                     (result["status"] == "unresolved" and
+                      result.get("reason") in ("steps_exhausted", "time_exhausted"))) else 2
     except (HarnessError, UnicodeError, OSError, ValueError):
         print("Harness refused run")
         return 2

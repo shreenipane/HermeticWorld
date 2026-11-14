@@ -45,9 +45,16 @@ execd frames 4 MiB + 64 KiB, observations 64 KiB, run output 16 MiB, gateway
 responses 4 MiB, history 8 MiB, journals 16 MiB, at most 250 steps, and a
 5400-second run deadline. A command timeout is at most 300 seconds. Each
 transport has an absolute deadline, including slow headers and partial frames.
+Serialized trajectories allow 64 MiB to retain JSON-escaped bounded history.
 `wire-vectors.json` is asserted against Rust's real execd encoder and consumed
 by the Python tests; these are execd's u32-LE JSON frames, distinct from the
 WorldServer HTTP frames in hermetic-common.
+
+`HERMETIC_AGENT_STEPS` selects the step limit (default 60, range 1 through
+`MAX_STEPS`, currently 250). Invalid values fail before creating run files.
+Step or cost exhaustion is a recorded submission: `trajectory.json` retains
+the messages with `status: "unresolved"` and `reason: "steps_exhausted"`, and
+the harness exits successfully. This exit is not a grading verdict.
 
 ## Offline checks and owner-run VM smoke
 
@@ -163,7 +170,11 @@ also requires the Docker image and Python packages listed above.
    loopback gateway. The session has a 5700-second outer deadline; the harness
    retains its shorter step, command and run caps. The new private run directory
    retains `trajectory.json` and `commands.jsonl`. A successful exit means the
-   harness submitted; it is not a grader verdict. Clean extraction and GraderVM
+   harness recorded a submission, including step/cost exhaustion. The runner
+   stages VM images under a fresh 0700 `tmp` directory inside the run directory,
+   overriding an inherited system `TMPDIR`. Prepare failures report only fixed
+   categories, including `prepare-io-no-space`, `prepare-io`,
+   `prepare-validation` and `prepare-deadline`. Clean extraction and GraderVM
    validation of a real task remain a separate integration step.
 
 Both `world.json` files use `hermetic-agent-input/v1`: a harness world manifest

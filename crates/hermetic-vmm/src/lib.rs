@@ -16,6 +16,7 @@ pub use spec::{ValidatedSpec, VmSpec};
 pub enum Error {
     Validation(&'static str),
     Io,
+    IoNoSpace,
     Protocol,
     Api(u16),
     Deadline(&'static str),
@@ -27,6 +28,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Validation(rule) => write!(f, "refused: {rule}"),
             Self::Io => f.write_str("I/O operation failed"),
+            Self::IoNoSpace => f.write_str("I/O operation failed: no-space"),
             Self::Protocol => f.write_str("invalid Firecracker response"),
             Self::Api(status) => write!(f, "Firecracker refused request ({status})"),
             Self::Deadline(step) => write!(f, "deadline exceeded: {step}"),
@@ -37,13 +39,21 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
-    fn from(_: std::io::Error) -> Self {
-        Self::Io
+    fn from(error: std::io::Error) -> Self {
+        match error.raw_os_error() {
+            Some(code)
+                if code == rustix::io::Errno::NOSPC.raw_os_error()
+                    || code == rustix::io::Errno::DQUOT.raw_os_error() =>
+            {
+                Self::IoNoSpace
+            }
+            _ => Self::Io,
+        }
     }
 }
 impl From<rustix::io::Errno> for Error {
-    fn from(_: rustix::io::Errno) -> Self {
-        Self::Io
+    fn from(error: rustix::io::Errno) -> Self {
+        Self::from(std::io::Error::from(error))
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;

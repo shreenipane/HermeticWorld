@@ -347,6 +347,67 @@ def test_task_runner_retains_private_evidence_directory(tmp_path, monkeypatch):
     assert "--ignored" in seen[1][0] and "--exact" in seen[1][0]
 
 
+def task_runner_inputs(tmp_path, monkeypatch):
+    manifest, issue = tmp_path / "world.json", tmp_path / "issue.txt"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": image.FIXTURE_CLOCK}}))
+    issue.write_text("fix")
+    for key in ("HERMETIC_ROOTFS", "HERMETIC_FC_BIN", "HERMETIC_KERNEL", "HERMETIC_AGENT_PYTHON"):
+        monkeypatch.setenv(key, "/not-executed")
+    monkeypatch.setenv("HERMETIC_AGENT_MANIFEST", str(manifest))
+    monkeypatch.setenv("HERMETIC_AGENT_TASK", str(issue))
+    monkeypatch.setenv("HERMETIC_AGENT_GATEWAY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HERMETIC_AGENT_MODEL", "pinned")
+
+
+def test_task_runner_stages_images_in_private_work_local_tmp(tmp_path, monkeypatch):
+    import agent_h_run
+    task_runner_inputs(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    monkeypatch.setenv("HERMETIC_AGENT_STEPS", "120")
+    work = tmp_path / "new"
+    def command(argv, **kwargs):
+        env = kwargs["env"]
+        assert env["HERMETIC_AGENT_STEPS"] == "120"
+        assert env["TMPDIR"] == str(work / "tmp")
+        assert (work / "tmp").stat().st_mode & 0o777 == 0o700
+        # Check the actual inherited default, including a poisoned TMPDIR in the caller.
+        result = subprocess.run([sys.executable, "-c",
+            "import tempfile; print(tempfile.TemporaryDirectory().name)"],
+            env=env, capture_output=True, timeout=10, check=True)
+        assert result.stdout.decode().strip().startswith(str(work / "tmp") + "/")
+    monkeypatch.setattr(agent_h_run, "command", command)
+    assert agent_h_run.run([str(work)]) == 0
+
+
+@pytest.mark.parametrize("steps", ["0", "251", "private-value", "9" * 5000])
+def test_task_runner_invalid_steps_creates_no_work(tmp_path, monkeypatch, steps):
+    import agent_h_run
+    from hermetic_agent.errors import LimitError
+    task_runner_inputs(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMETIC_AGENT_STEPS", steps)
+    work = tmp_path / "new"
+    monkeypatch.setattr(agent_h_run, "command", lambda *args, **kwargs: pytest.fail("subprocess before validation"))
+    with pytest.raises(LimitError, match="Step limit"):
+        agent_h_run.run([str(work)])
+    assert not work.exists()
+
+
+@pytest.mark.parametrize("category", ["prepare-io-no-space", "prepare-io", "prepare-validation",
+                                       "prepare-deadline", "prepare"])
+def test_task_runner_reports_only_safe_prepare_category(tmp_path, monkeypatch, capsys, category):
+    import agent_h_run
+    from e2e_seal import CommandFailure
+    task_runner_inputs(tmp_path, monkeypatch)
+    def command(argv, **kwargs):
+        if "--no-run" not in argv:
+            raise CommandFailure(101, b"private-value\nagent-vm-category: " + category.encode() + b"\n")
+    monkeypatch.setattr(agent_h_run, "command", command)
+    assert agent_h_run.main([str(tmp_path / "new")]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"Task VM run refused: {category}; any created run directory is retained\n"
+
+
 @pytest.mark.parametrize("clock", ["1601-01-01T00:00:00Z", "1979-12-31T23:59:59Z",
                                   "2100-01-01T00:00:00Z", "9999-12-31T23:59:59Z"])
 def test_converter_refuses_clocks_execd_cannot_boot_before_creating_work(tmp_path, clock):
