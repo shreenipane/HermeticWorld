@@ -123,3 +123,30 @@ fn log_dates_before_message_semicolons_are_not_discarded() {
         assert!(!record.to_json_line().contains("2026-11-13"));
     }
 }
+
+#[test]
+fn monotonic_origin_cannot_predate_guest_boottime() {
+    let epoch = 1_704_067_200;
+    for tai in [None, Some(epoch as f64 + 10.0)] {
+        let record = classify_posix_clocks(
+            Some(epoch as f64 + 10.0),
+            Some(864_000.0),
+            Some(10.0),
+            tai,
+            Some(epoch),
+        );
+        assert_eq!(record.result, ProbeResult::Leak);
+        assert!(!record.to_json_line().contains("864000"));
+    }
+    // Boottime includes suspend; monotonic may legitimately be smaller.
+    for monotonic in [0.0, 10.0, 1000.0] {
+        let record = classify_posix_clocks(
+            Some(epoch as f64 + 1000.0),
+            Some(monotonic),
+            Some(1000.0),
+            Some(epoch as f64 + 1000.0),
+            Some(epoch),
+        );
+        assert_eq!(record.result, ProbeResult::Blocked);
+    }
+}

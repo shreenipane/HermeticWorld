@@ -785,6 +785,12 @@ pub fn classify_posix_clocks(
 
     let mut leaks = Vec::new();
 
+    // CLOCK_BOOTTIME includes suspend time while CLOCK_MONOTONIC does not.
+    // A monotonic age beyond boottime cannot have the guest's boot origin.
+    if mono - boot > CLOCK_TOLERANCE_SECONDS {
+        leaks.push("CLOCK_MONOTONIC exceeds guest boottime");
+    }
+
     if tai.is_some_and(|v| (v - rt).abs() > 5.0) {
         leaks.push("CLOCK_TAI offset differs from the fixed guest policy");
     }
