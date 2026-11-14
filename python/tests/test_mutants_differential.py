@@ -325,3 +325,19 @@ def test_command_runner_reads_disk_and_refuses_symlink(tmp_path: Path) -> None:
     bad = CommandRunner((sys.executable, str(script), "link", str(disk)), timeout_s=30)
     with pytest.raises(OSError):
         bad(req)
+
+@pytest.mark.parametrize("field", ["status", "exit"])
+@pytest.mark.parametrize("bad", [[], {}, None, 42])
+def test_disk_json_result_types_fail_closed(field: str, bad: object) -> None:
+    obj = json.loads(_payload())
+    if field == "status":
+        obj["tests"][T] = bad
+    else:
+        obj["supervisor"]["exit"] = bad
+    image = _with_payload(json.dumps(obj, separators=(",", ":")).encode())
+    with pytest.raises(DiskTamper):
+        decode_disk(image)
+    reqs = _reqs()
+    verdict = run_differential(list(reqs.values()), _plan(), lambda _: image, timeout_s=5)
+    assert verdict.status == "tampered"
+    assert all(v == "tamper:invalid_json" for v in verdict.runs.values())

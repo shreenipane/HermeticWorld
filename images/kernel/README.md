@@ -219,6 +219,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_KPROBES` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_KPROBE_EVENTS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_KVM_GUEST` | `n` | Phase 3b: deny guest root access to kernel code and memory |
+| `CONFIG_LEGACY_PTYS` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_LOCALVERSION` | `""` | TR-VMM-4: no local version or host suffix |
 | `CONFIG_LOCALVERSION_AUTO` | `n` | TR-VMM-4: fixed build identity; config supplied separately |
 | `CONFIG_LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY` | `y` | Phase 3b: deny guest root access to kernel code and memory |

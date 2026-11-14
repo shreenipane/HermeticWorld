@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -58,6 +59,8 @@ import uuid
 from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.intake import iso_utc
 from hermetic_slice.repo_sealer import remove_tree_at
+from hermetic_slice.substrate import BOUND_PATH, DATES_PATH, substrate_files as kernel_substrate_files
+from hermetic_slice.guest_kernel import DEFAULT_KERNEL_DIR
 
 HERMETIC_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "hermetic.world")
 NAMESPACE = HERMETIC_NAMESPACE
@@ -671,6 +674,7 @@ def write_rootfs_tar(
     mtime_ceiling: int,
     limits: RootfsLimits | None = None,
     dir_fd: int | None = None,
+    substrate_files: dict[str, bytes] | None = None,
 ) -> TreeScan:
     """Walk src (never following symlinks) and write the cleaned tree as a deterministic tar.
 
@@ -683,6 +687,10 @@ def write_rootfs_tar(
     guard = _SpaceGuard(dir_fd if dir_fd is not None else Path(tar_path).parent)
     guard.reserve(0, force=True)
     hardlink_first: dict[tuple[int, int], str] = {}
+    substrate_files = substrate_files or {}
+    if set(substrate_files) - {BOUND_PATH, DATES_PATH}:
+        raise ValueError("invalid generated substrate path")
+    substrate_dirs: set[str] = set()
 
     # src is either a directory descriptor the caller opened with open_dir_anchored (kept
     # open by the caller) or a path, which is opened the same anchored way here.
@@ -716,6 +724,15 @@ def write_rootfs_tar(
                     parts = frame.parts + (name,)
                     rel = "/".join(parts)
                     mode = listed.st_mode
+
+                    if substrate_files and rel in ("etc", "etc/hermetic"):
+                        if not stat.S_ISDIR(mode):
+                            raise ValueError("substrate parent must be a real directory")
+                        substrate_dirs.add(rel)
+                    if rel in substrate_files or substrate_files and rel == DATES_PATH:
+                        # Replace metadata in the archive, never through the source path.
+                        # Without a matching image, omit any caller-supplied date exemptions.
+                        continue
 
                     if _is_special_file(mode):
                         scan.skipped_special.append(rel)
@@ -767,6 +784,34 @@ def write_rootfs_tar(
                         _add_regular(tf, frame.fd, name, rel, listed, mtime_ceiling, limits, scan, guard, hardlink_first)
                     else:
                         scan.skipped_special.append(rel)
+                if substrate_files:
+                    for rel in ("etc", "etc/hermetic", *sorted(substrate_files)):
+                        if rel in substrate_dirs:
+                            continue
+                        is_dir = rel in ("etc", "etc/hermetic")
+                        if len(rel.split("/")) - (not is_dir) > limits.max_depth:
+                            raise RootfsLimitError("substrate metadata exceeds depth cap")
+                        scan.entries_seen += 1
+                        if scan.entries_seen > limits.max_entries:
+                            raise RootfsLimitError("substrate metadata exceeds entry cap")
+                        info = tarfile.TarInfo(rel)
+                        info.uid = info.gid = 0
+                        info.mtime = max(0, mtime_ceiling)
+                        info.mode = 0o755 if is_dir else 0o644
+                        info.type = tarfile.DIRTYPE if is_dir else tarfile.REGTYPE
+                        data = b"" if is_dir else substrate_files[rel]
+                        if scan.data_bytes + len(data) > limits.max_bytes or scan.logical_bytes + len(data) > limits.max_logical_bytes:
+                            raise RootfsLimitError("substrate metadata exceeds byte cap")
+                        info.size = len(data)
+                        guard.reserve(tarfile.BLOCKSIZE * 3 + len(data))
+                        tf.addfile(info, None if is_dir else io.BytesIO(data))
+                        scan.inodes += 1
+                        if is_dir:
+                            scan.dir_blocks += 1
+                        else:
+                            scan.data_bytes += len(data)
+                            scan.logical_bytes += len(data)
+                            scan.data_blocks += (len(data) + BLOCK_SIZE - 1) // BLOCK_SIZE
     finally:
         if root_fd >= 0:
             os.close(root_fd)
@@ -1099,6 +1144,9 @@ def build_rootfs(
     sealcheck_bin: Path | None = None,
     work_dir: Path | None = None,
     limits: RootfsLimits | None = None,
+    kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
+    kernel_image: Path | None = None,
+    clockprobe_bin: Path | None = None,
 ) -> dict:
     """Build a reproducible ext4 root filesystem image with D4 guard.
 
@@ -1115,10 +1163,14 @@ def build_rootfs(
         work_dir: Directory in which a private work directory is created (default: system temp).
             The tar stream and the image are built there; the image is published only after D4.
         limits: Resource caps (default: RootfsLimits.from_env()).
+        kernel_lock: Validated kernel lock supplying sealed release-date metadata.
+        kernel_image: Optional matching kernel image for exact substrate dates.
+        clockprobe_bin: Offline date extractor; required with kernel_image.
 
     Returns:
         dict containing build metadata and verification result.
     """
+    substrate = kernel_substrate_files(kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
     src = Path(src)
     if not src.is_dir():
         raise FileNotFoundError(f"Source directory does not exist or is not a directory: {src}")
@@ -1182,7 +1234,8 @@ def build_rootfs(
 
         # 1-2. Walk the source once: TR-SEAL-8 clean-up, special files skipped, caps enforced
         scan = write_rootfs_tar(
-            src_fd, "rootfs.tar", mtime_ceiling=source_date_epoch, limits=limits, dir_fd=work_fd
+            src_fd, "rootfs.tar", mtime_ceiling=source_date_epoch, limits=limits, dir_fd=work_fd,
+            substrate_files=substrate,
         )
         tar_fd = os.open("rootfs.tar", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=work_fd)
 

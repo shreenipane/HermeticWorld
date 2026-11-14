@@ -58,61 +58,112 @@ pub const MAX_FIX_FILES: usize = 256;
 /// The largest fix file `TaskInput::load` reads (16 MiB); larger files are an error.
 pub const MAX_FIX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Bound directory traversal and aggregate fix bytes independently of file count.
+pub const MAX_FIX_DIRECTORY_ENTRIES: usize = 4096;
+pub const MAX_TOTAL_FIX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
 fn load_passing_fixes(dir: &Path) -> Result<Vec<String>, ManifestError> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Ok(Vec::new()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(ManifestError::MissingFile(format!(
-                "{}: {}",
-                dir.display(),
-                e
-            )));
-        }
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(ManifestError::MissingFile(format!(
-                "{}: {}",
-                dir.display(),
-                e
-            )));
-        }
+    use std::collections::BTreeSet;
+    use std::fs::{File, OpenOptions};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Component;
+    const O_PATH: i32 = 0o10000000;
+    const O_NOFOLLOW: i32 = 0o400000;
+    const O_DIRECTORY: i32 = 0o200000;
+    let refused = || ManifestError::MissingFile("passing fixes input refused".into());
+    let child_path = |parent: &File, name: &std::ffi::OsStr| {
+        Path::new(&format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name)
     };
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| ManifestError::MissingFile(format!("{}: {}", dir.display(), e)))?;
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("patch") {
-            continue;
+    let mut held = File::open(if dir.is_absolute() { "/" } else { "." })?;
+    // Hold every directory component. A missing/non-directory fixes leaf means
+    // no optional fixes, preserving the intake contract.
+    let components: Vec<_> = dir.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::RootDir | Component::CurDir => continue,
+            _ => return Err(refused()),
+        };
+        let path = child_path(&held, name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) if index + 1 == components.len() => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            _ => return Err(refused()),
         }
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| ManifestError::MissingFile(format!("{}: {}", path.display(), e)))?;
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        if meta.len() > MAX_FIX_FILE_BYTES {
-            return Err(ManifestError::MissingFile(format!(
-                "{}: fix larger than {} bytes",
-                path.display(),
-                MAX_FIX_FILE_BYTES
-            )));
-        }
-        paths.push(path);
+        held = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+            .open(path)
+            .map_err(|_| refused())?;
     }
-    paths.sort();
-    paths.truncate(MAX_FIX_FILES);
-    paths
-        .iter()
-        .map(|p| {
-            std::fs::read_to_string(p)
-                .map_err(|e| ManifestError::MissingFile(format!("{}: {}", p.display(), e)))
-        })
-        .collect()
+    let entries =
+        std::fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd())).map_err(|_| refused())?;
+    let mut names = BTreeSet::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_FIX_DIRECTORY_ENTRIES {
+            return Err(refused());
+        }
+        let name = entry.map_err(|_| refused())?.file_name();
+        if Path::new(&name).extension().and_then(|x| x.to_str()) == Some("patch") {
+            let meta =
+                std::fs::symlink_metadata(child_path(&held, &name)).map_err(|_| refused())?;
+            if !meta.is_file() {
+                continue;
+            }
+            if meta.len() > MAX_FIX_FILE_BYTES {
+                return Err(refused());
+            }
+            names.insert(name);
+            if names.len() > MAX_FIX_FILES {
+                names.pop_last();
+            }
+        }
+    }
+    let mut total = 0u64;
+    let mut fixes = Vec::new();
+    for name in names {
+        let path = child_path(&held, &name);
+        let before = std::fs::symlink_metadata(&path).map_err(|_| refused())?;
+        if !before.is_file() {
+            continue;
+        }
+        let pinned = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| refused())?;
+        let after = pinned.metadata().map_err(|_| refused())?;
+        if (before.dev(), before.ino(), before.mode()) != (after.dev(), after.ino(), after.mode())
+            || !after.is_file()
+            || after.len() > MAX_FIX_FILE_BYTES
+        {
+            return Err(refused());
+        }
+        let file =
+            File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(|_| refused())?;
+        let cap = MAX_FIX_FILE_BYTES.min(MAX_TOTAL_FIX_BYTES.saturating_sub(total));
+        let mut text = String::new();
+        file.take(cap + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| refused())?;
+        if text.len() as u64 > cap {
+            return Err(refused());
+        }
+        total += text.len() as u64;
+        fixes.push(text);
+    }
+    Ok(fixes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_passing_fixes(_dir: &Path) -> Result<Vec<String>, ManifestError> {
+    Err(ManifestError::MissingFile(
+        "safe passing fixes access requires Linux".into(),
+    ))
 }
 
 impl TaskInput {

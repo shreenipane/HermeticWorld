@@ -221,7 +221,7 @@ impl RunClassification {
     }
 }
 
-/// The record must state exactly the classifier's clock level, D12 verdict and status.
+/// Bind the classifier to this run digest and require matching clock, D12 and status.
 pub fn check_against_classification(
     record: &RunRecord,
     classification: &RunClassification,
@@ -234,6 +234,11 @@ pub fn check_against_classification(
     }
     if record.run_status != classification.status {
         return Err(VerifyError::ClassificationMismatch("run_status"));
+    }
+    let digest = crate::canonical::compute_run_digest(record)
+        .map_err(|e| VerifyError::Envelope(DsseError::CanonicalJson(e)))?;
+    if digest != classification.run_digest {
+        return Err(VerifyError::ClassificationMismatch("run_digest"));
     }
     Ok(())
 }

@@ -195,3 +195,122 @@ def test_one_entry_error_makes_overall_error(tmp_path: Path) -> None:
     report = run_deep_audit(root, "d7-recipe.json", CopyBuilder())
     assert [e["verdict"] for e in report["entries"]] == ["identical", "error"]
     assert report["verdict"] == "error"
+
+
+def test_deep_audit_compares_pinned_artifact_after_builder_replaces_path(tmp_path: Path) -> None:
+    root = _world(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "mod.py").write_text("host secret\n")
+
+    class ReplacingBuilder(CopyBuilder):
+        def build(self, request: BuildRequest) -> None:
+            super().build(request)
+            (root / "dist").rename(root / "old-dist")
+            (root / "dist").symlink_to(outside)
+
+    report = run_deep_audit(root, "d7-recipe.json", ReplacingBuilder())
+    assert report["verdict"] == "identical", report
+    assert "host secret" not in _text(report)
+    assert str(tmp_path) not in _text(report)
+
+
+@pytest.mark.parametrize("kind", ["fifo", "device"])
+def test_deep_audit_refuses_special_artifact_before_open(tmp_path: Path, monkeypatch, kind: str) -> None:
+    root = _world(tmp_path, [_entry(artifact="dist/special")])
+    path = root / "dist" / "special"
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        # Simulate device metadata at the lstat boundary without requiring root.
+        path.write_bytes(b"")
+        original_stat = os.stat
+        import stat
+
+        def device_stat(name, *args, **kwargs):
+            st = original_stat(name, *args, **kwargs)
+            if name == "special":
+                return os.stat_result((stat.S_IFCHR | 0o600, *st[1:]))
+            return st
+        monkeypatch.setattr(os, "stat", device_stat)
+    original_open = os.open
+
+    def guarded_open(name, *args, **kwargs):
+        assert name != "special", "special artifact must be refused before open"
+        return original_open(name, *args, **kwargs)
+    monkeypatch.setattr(os, "open", guarded_open)
+    builder = CopyBuilder()
+    assert run_deep_audit(root, "d7-recipe.json", builder)["verdict"] == "error"
+    assert builder.requests == []
+
+
+@pytest.mark.parametrize("data", [
+    json.dumps({"schema": RECIPE_SCHEMA, "entries": [_entry(args=["\ud800"])]}).encode(),
+    json.dumps({"schema": RECIPE_SCHEMA, "entries": [_entry(source="\ud800")]}).encode(),
+    ('{"schema":"' + RECIPE_SCHEMA + '","entries":[],"entries":[]}').encode(),
+])
+def test_recipe_hostile_json_fails_closed(data: bytes) -> None:
+    with pytest.raises(HermeticD7Error):
+        parse_recipe(data)
+
+
+def test_builder_typed_errors_do_not_disclose_host_paths(tmp_path: Path) -> None:
+    root = _world(tmp_path)
+
+    class TypedFailure:
+        def build(self, request: BuildRequest) -> None:
+            raise HermeticD7Error(f"private builder location {request.output_dir}")
+
+    report = run_deep_audit(root, "d7-recipe.json", TypedFailure())
+    assert report["verdict"] == "error"
+    assert report["entries"][0]["error"]["message"] == "isolated builder failed"
+    assert "/tmp" not in _text(report) and str(tmp_path) not in _text(report)
+
+
+def test_builder_output_listing_stops_at_named_cap(tmp_path: Path, monkeypatch) -> None:
+    from contextlib import contextmanager
+    from hermetic_d7.deep_audit import MAX_BUILDER_OUTPUT_ENTRIES
+
+    root = _world(tmp_path)
+    output = None
+    reads = 0
+    real_scandir, real_listdir = os.scandir, os.listdir
+
+    class FloodBuilder:
+        def build(self, request: BuildRequest) -> None:
+            nonlocal output
+            output = request.output_dir
+            for i in range(MAX_BUILDER_OUTPUT_ENTRIES + 1):
+                (output / str(i)).write_bytes(b"")
+
+    def is_output(path):
+        return output is not None and not isinstance(path, int) and Path(path) == output
+
+    @contextmanager
+    def capped_scandir(path):
+        nonlocal reads
+        with real_scandir(path) as entries:
+            if not is_output(path):
+                yield entries
+                return
+
+            def counted():
+                nonlocal reads
+                for entry in entries:
+                    reads += 1
+                    assert reads <= MAX_BUILDER_OUTPUT_ENTRIES, "unbounded output directory read"
+                    yield entry
+            yield counted()
+
+    def capped_listdir(path):
+        if is_output(path):
+            with capped_scandir(path) as entries:
+                return [entry.name for entry in entries]
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "scandir", capped_scandir)
+    monkeypatch.setattr(os, "listdir", capped_listdir)
+    report = run_deep_audit(root, "d7-recipe.json", FloodBuilder())
+    assert report["verdict"] == "error"
+    assert report["entries"][0]["error"]["type"] == "BuildFailedError"
+    assert reads == MAX_BUILDER_OUTPUT_ENTRIES

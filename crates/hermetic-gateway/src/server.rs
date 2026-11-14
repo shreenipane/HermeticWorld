@@ -206,6 +206,7 @@ pub struct GatewayServer {
     stream_total_deadline: Duration,
     /// Real-date sentinel (D12) over agent requests and forwarded upstream responses.
     sentinel: Arc<DateSentinel>,
+    sentinel_persist: Arc<Mutex<()>>,
 }
 
 impl GatewayServer {
@@ -293,6 +294,7 @@ impl GatewayServer {
             write_deadlines: (RESPONSE_WRITE_DEADLINE, STREAM_CHUNK_WRITE_DEADLINE),
             stream_total_deadline: STREAM_TOTAL_WRITE_DEADLINE,
             sentinel,
+            sentinel_persist: Arc::new(Mutex::new(())),
         })
     }
 
@@ -398,13 +400,13 @@ impl GatewayServer {
     /// Writes the sentinel summary to `DATE_SENTINEL_FILE` in the log directory. A failure
     /// to write marks the scan incomplete (so the result fails closed when next read).
     fn persist_sentinel(&self) {
-        let ok = serde_json::to_vec(&self.sentinel.summary())
-            .ok()
-            .and_then(|bytes| {
-                let dir = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir).ok()?;
-                crate::fsutil::write_state_file(&dir, DATE_SENTINEL_FILE, &bytes).ok()
-            })
-            .is_some();
+        let ok = persist_snapshot(&self.sentinel, &self.sentinel_persist, |bytes| {
+            let Some(dir) = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir).ok()
+            else {
+                return false;
+            };
+            crate::fsutil::write_state_file(&dir, DATE_SENTINEL_FILE, bytes).is_ok()
+        });
         if !ok {
             self.sentinel.mark_incomplete("gateway", "persist_failed");
         }
@@ -1212,5 +1214,78 @@ fn watch_disconnect(stream: TcpStream, slot: Weak<StreamSlotGuard>) {
             }
             Err(_) => return,
         }
+    }
+}
+
+// Snapshot inside the persistence lock: an older clean snapshot must never
+// overwrite a newer leak record when request workers finish concurrently.
+fn persist_snapshot(
+    sentinel: &DateSentinel,
+    lock: &std::sync::Mutex<()>,
+    write: impl FnOnce(&[u8]) -> bool,
+) -> bool {
+    let Ok(_guard) = lock.lock() else {
+        return false;
+    };
+    serde_json::to_vec(&sentinel.summary())
+        .ok()
+        .is_some_and(|bytes| write(&bytes))
+}
+
+#[cfg(test)]
+mod sentinel_persist_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_persistence_serializes_snapshot_and_publication() {
+        use std::sync::{mpsc, Mutex};
+        let sentinel = Arc::new(
+            DateSentinel::new(D12Options {
+                real_date: time::Date::from_calendar_date(2030, time::Month::June, 15).unwrap(),
+                tolerance_days: 0,
+                host_names: vec![],
+                host_paths: vec![],
+            })
+            .unwrap(),
+        );
+        let lock = Arc::new(Mutex::new(()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let first = {
+            let (sentinel, lock, writes) = (sentinel.clone(), lock.clone(), writes.clone());
+            std::thread::spawn(move || {
+                persist_snapshot(&sentinel, &lock, |bytes| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writes.lock().unwrap().push(bytes.to_vec());
+                    true
+                })
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        sentinel.mark_incomplete("test", "cap");
+        let second = {
+            let (sentinel, lock, writes) = (sentinel.clone(), lock.clone(), writes.clone());
+            std::thread::spawn(move || {
+                persist_snapshot(&sentinel, &lock, |bytes| {
+                    writes.lock().unwrap().push(bytes.to_vec());
+                    done_tx.send(()).unwrap();
+                    true
+                })
+            })
+        };
+        let premature = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap());
+        assert!(second.join().unwrap());
+        assert!(
+            !premature,
+            "newer snapshot was published ahead of an older writer"
+        );
+        let writes = writes.lock().unwrap();
+        let last: SentinelSummary = serde_json::from_slice(writes.last().unwrap()).unwrap();
+        assert!(last.date_leak_observed && last.scan_incomplete);
     }
 }

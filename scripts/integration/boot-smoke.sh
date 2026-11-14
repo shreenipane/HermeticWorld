@@ -14,17 +14,38 @@ FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
 : "${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
 export CARGO_TARGET_DIR="$U/hermetic/cargo-target/$(basename "$top")"
 T=1700000000
+case "${HERMETIC_ESCAPE_PROBE:-0}" in
+  0|1) ;;
+  *) echo 'HERMETIC_ESCAPE_PROBE must be 0 or 1' >&2; return 1 ;;
+esac
+case "${HERMETIC_FULL_PROBE:-0}" in
+  0|1) ;;
+  *) echo 'HERMETIC_FULL_PROBE must be 0 or 1' >&2; return 1 ;;
+esac
+if [ "${HERMETIC_FULL_PROBE:-0}" = 1 ]; then
+  if [ -z "${HERMETIC_LOCKDOWN_CONFIG:-}" ] || [ "${HERMETIC_ESCAPE_PROBE:-0}" = 1 ]; then
+    echo 'full probe requires HERMETIC_LOCKDOWN_CONFIG and a separate run from the escape probe' >&2
+    return 1
+  fi
+fi
 BOOT_TEST=boots_guest_and_reads_guest_clock
 if [ -n "${HERMETIC_LOCKDOWN_CONFIG:-}" ]; then
   PYTHONPATH=python python3 -B -m hermetic_slice kernel-check-config --config "$HERMETIC_LOCKDOWN_CONFIG"
   BOOT_TEST=boots_guest_
 fi
 
+if [ "${HERMETIC_ESCAPE_PROBE:-0}" = 1 ]; then
+  BOOT_TEST=runs_guest_escape_probe
+fi
+if [ "${HERMETIC_FULL_PROBE:-0}" = 1 ]; then
+  BOOT_TEST=runs_guest_full_clock_probe
+fi
+
 # The runner verifies the measured build lock and held executable before launch.
 
 # 1. Static execd + sealcheck, rootfs tree, image with D4.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q \
-  -p hermetic-sealcheck -p hermetic-clockprobe --target x86_64-unknown-linux-gnu
+  -p hermetic-sealcheck -p hermetic-clockprobe -p hermetic-escapeprobe --target x86_64-unknown-linux-gnu
 bash scripts/build-trusted-execd.sh
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 umask 022
@@ -33,14 +54,13 @@ TREE="$WORK/tree"; rm -rf "$TREE"
 for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
          mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
 install -m 0755 "$BIN/hermetic-execd" "$TREE/sbin/hermetic-execd"
+if [ "${HERMETIC_ESCAPE_PROBE:-0}" = 1 ]; then
+  install -m 0755 "$BIN/hermetic-escapeprobe" "$TREE/sbin/hermetic-escapeprobe"
+fi
 install -m 0755 "$BIN/hermetic-init" "$TREE/sbin/hermetic-init"   # early read-only /proc, then exec execd
 if [ -n "${HERMETIC_LOCKDOWN_CONFIG:-}" ]; then
   install -m 0755 "$BIN/hermetic-clockprobe" "$TREE/sbin/hermetic-clockprobe"
   install -m 0600 "$HERMETIC_LOCKDOWN_CONFIG" "$TREE/etc/hermetic/guest-kernel.config"
-  # Exactly the dates the guest kernel image contains (banner, version strings),
-  # listed as substrate; any other kernel-log date is a leak.
-  "$BIN/hermetic-clockprobe" --extract-substrate-dates < "$KERNEL" > "$TREE/etc/hermetic/substrate-dates"
-  chmod 0644 "$TREE/etc/hermetic/substrate-dates"
 fi
 install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"   # static; trivial command
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
@@ -49,15 +69,19 @@ cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
  "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}
 JSON
 find "$TREE" -exec touch -h -d @$T {} +
-/usr/bin/python3 -I - "$top/python" "$TREE" "$WORK/rootfs.img" "$WORK/sealcheck" "$WORK" <<'PY'
+/usr/bin/python3 -I - "$top/python" "$TREE" "$WORK/rootfs.img" "$WORK/sealcheck" "$WORK" "${HERMETIC_LOCKDOWN_CONFIG:-}" "$KERNEL" "$BIN/hermetic-clockprobe" <<'PY'
 import sys, json
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from hermetic_slice.rootfs import build_rootfs
+metadata = {}
+if sys.argv[6]:
+    metadata = dict(kernel_lock=Path(sys.argv[6]).parent / "kernel.lock.json",
+                    kernel_image=Path(sys.argv[7]), clockprobe_bin=Path(sys.argv[8]))
 r = build_rootfs(Path(sys.argv[2]), Path(sys.argv[3]),
     t_clock=datetime.fromtimestamp(1700000000, timezone.utc), world_id="boot-smoke",
-    sealcheck_bin=Path(sys.argv[4]), work_dir=Path(sys.argv[5]))
+    sealcheck_bin=Path(sys.argv[4]), work_dir=Path(sys.argv[5]), **metadata)
 print(json.dumps({k: r[k] for k in ("image", "sha256", "d4")}))
 PY
 chmod 0400 "$WORK/rootfs.img"
@@ -66,7 +90,7 @@ echo "$WORK/rootfs.img" | grep -q . && ls -l "$WORK/rootfs.img"
 # 2+3. Boot via dev-unjailed runner (owner-run ignored test): kernel mounts the base
 # read-only and devtmpfs, init=/sbin/hermetic-init mounts read-only /proc and execs
 # execd, which sets the clock first. The test reads the status frame and runs one command.
-HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/rootfs.img" \
+HERMETIC_ESCAPE_AGGREGATOR="$BIN/hermetic-escapeprobe" HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/rootfs.img" \
   "$U/.hermetic/bin/rust-gate" --exclude hermetic-common --exclude hermetic-gateway \
   --exclude hermetic-sealcheck --exclude hermetic-trust --exclude hermetic-world-server \
   --exclude tiny_http --features dev-unjailed --test guest "$BOOT_TEST" \

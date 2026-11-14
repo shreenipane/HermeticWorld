@@ -97,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     build_rootfs_parser.add_argument("--world-id", required=True, help="World identifier")
     build_rootfs_parser.add_argument("--size-mib", type=int, default=None, help="Filesystem size in MiB")
     build_rootfs_parser.add_argument("--sealcheck-bin", type=Path, default=None, help="Path to sealcheck binary")
+    build_rootfs_parser.add_argument("--kernel-lock", type=Path, default=Path(__file__).absolute().parent.parent.parent / "images/kernel/kernel.lock.json")
+    build_rootfs_parser.add_argument("--kernel-image", type=Path, help="Matching kernel image for exact substrate dates")
+    build_rootfs_parser.add_argument("--clockprobe-bin", type=Path, help="Offline substrate date extractor")
     build_rootfs_parser.add_argument(
         "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
     )
@@ -606,6 +609,9 @@ def main(argv: list[str] | None = None) -> int:
                 size_mib=args.size_mib,
                 sealcheck_bin=args.sealcheck_bin,
                 work_dir=args.work_dir,
+                kernel_lock=args.kernel_lock,
+                kernel_image=args.kernel_image,
+                clockprobe_bin=args.clockprobe_bin,
             )
             print(json.dumps(res, indent=2))
             return 0

@@ -24,7 +24,8 @@ Confidentiality lockdown is forced in the kernel config and initialized as an
 early LSM. Linux `security/lockdown/lockdown.c` registers `DEFINE_EARLY_LSM` when
 `SECURITY_LOCKDOWN_LSM_EARLY=y`, so the mutable normal LSM list cannot omit it.
 The forced level cannot be lowered by securityfs or by a weaker boot parameter.
-The VMM supplies calibrated `tsc_early_khz` and the embedded clock-3b CPU profile;
+The VMM scales the TSC to 2 GHz and supplies the rate through the embedded CPU
+profile's CPUID leaf 0x15. `tsc_early_khz` is forbidden;
 see [the clock analysis](clock-3b-analysis.md) for source checks and open limits.
 
 Confidentiality mode is retained, with no integrity-mode exception. In the
@@ -39,6 +40,8 @@ smoke below must exercise device-BPF loading and attachment under this policy.
 
 Virtio blk/net/vsock/console/MMIO/rng, ext4, overlayfs, devtmpfs, dm-verity,
 seccomp, namespaces, nftables and legacy iptables/TPROXY/conntrack remain `=y`.
+`LEGACY_PTYS=n` removes the unused legacy PTY nodes; `UNIX98_PTYS=y` retains
+normal terminal support. The manager must rebuild the kernel for this policy.
 The policy checker rejects `=m` for every required driver; the build checks the
 final `olddefconfig`, not just the fragment. See the generated table in
 [the kernel README](../images/kernel/README.md).
@@ -68,8 +71,8 @@ machine. Every work directory below must be fresh. Builder preparation needs the
 cached pinned base image and package inputs as described in the kernel README;
 the kernel compilation container itself has `--network=none --pull=never`.
 The owner reported a nested-VM boot with both lockdown probes blocked on
-2026-11-14. The expanded CPU profile and other VM paths still need owner-run
-verification. These commands were not run during this offline review.
+2026-11-14. The full probe also passed in the nested guest on 2026-11-14; multiple vCPUs,
+pause/resume, restore and deployment-host validation remain outstanding. These commands were not run during this offline review.
 Before the smokes, export `HERMETIC_FC_BIN` and `HERMETIC_FIRECRACKER_LOCK`
 from the measured patched build described in the host filtering guide.
 
@@ -96,6 +99,26 @@ execd, runs `/sbin/hermetic-clockprobe --lockdown-only` through execd, and requi
 exactly `module_load` and `ring0_paths`, both `blocked`, exit 0, with no timeout or
 truncation. It also runs the existing clock/command boot test unchanged. The
 normal offline Rust gate tests the response validation without booting a VM.
+
+To repeat the complete diagnostic, use a fresh work directory:
+
+```sh
+HERMETIC_FULL_PROBE=1 HERMETIC_LOCKDOWN_CONFIG="$PWD/guest-lockdown-kernel/.config" \
+  bash scripts/integration/boot-smoke.sh "$PWD/guest-lockdown-full-probe"
+```
+
+This mode mounts securityfs and runs `/sbin/hermetic-clockprobe` with no arguments.
+It requires exit 0, all 14 records exactly once, and every result blocked except
+`clock_pairing_hc`, which may be unavailable and is covered separately by the
+ring-0 canary. Truncated, timed-out, duplicate or missing records fail. Full and
+escape probe modes require separate runs.
+
+The smoke uses the production rootfs builder to install `substrate-bound` from
+the matching kernel lock release date and `substrate-dates` extracted from the
+matching kernel image. Both files are 0644 with root ownership and clamped
+mtimes. Only exact listed dates are exempt from T_clock ±1 day in kernel logs;
+`substrate-bound` grants no general cutoff exemption. Production world builds
+use the same `kernel_lock`, `kernel_image` and `clockprobe_bin` arguments.
 
 For an existing pristine AgentVM, stage the static binary and the corresponding
 verified final `.config` as `/sbin/hermetic-clockprobe` (0755) and

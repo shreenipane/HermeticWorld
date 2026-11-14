@@ -34,6 +34,8 @@ from typing import Any, Protocol
 from hermetic_d7.compare import AUDIT_POLICY_STATEMENT, compare_artifacts
 from hermetic_d7.normalise import (
     HermeticD7Error,
+    MAX_ARTIFACT_BYTES,
+    READ_CHUNK_SIZE,
     InvalidArtifactError,
     ResourceLimitError,
     ResourceLimits,
@@ -46,6 +48,7 @@ MAX_RECIPE_BYTES = 1024 * 1024
 MAX_RECIPE_ENTRIES = 256
 MAX_ARGS = 64
 MAX_ARG_BYTES = 1024
+MAX_BUILDER_OUTPUT_ENTRIES = 2
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _BUILDER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 _ENTRY_KEYS = {"id", "artifact", "source", "builder", "args"}
@@ -105,7 +108,7 @@ def _read_no_follow(root_fd: int, rel: str, cap: int) -> bytes:
         chunks = []
         total = 0
         while True:
-            chunk = os.read(fd, 65536)
+            chunk = os.read(fd, min(READ_CHUNK_SIZE, cap - total + 1))
             if not chunk:
                 break
             total += len(chunk)
@@ -118,27 +121,89 @@ def _read_no_follow(root_fd: int, rel: str, cap: int) -> bytes:
 
 
 def _open_no_follow(root_fd: int, rel: str, *, directory: bool) -> int:
-    """Open `rel` below `root_fd`, refusing a symlink at every component."""
-    parts = rel.split("/") if rel else []
+    """Pin each component, inspect it before opening, and refuse special files."""
     current = os.dup(root_fd)
     try:
+        parts = rel.split("/")
         for index, part in enumerate(parts):
-            last = index == len(parts) - 1
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-            if not last or directory:
+            is_dir = index < len(parts) - 1 or directory
+            before = os.stat(part, dir_fd=current, follow_symlinks=False)
+            if not (stat.S_ISDIR(before.st_mode) if is_dir else
+                    stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
+                raise SecurityViolationError("recipe input is a link or special file")
+            flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            if is_dir:
                 flags |= os.O_DIRECTORY
+            pinned = os.open(part, flags, dir_fd=current)
             try:
-                nxt = os.open(part, flags, dir_fd=current)
-            except OSError as exc:
-                raise SecurityViolationError(
-                    f"cannot open {rel!r} without following links ({exc.strerror})"
-                ) from None
+                after = os.fstat(pinned)
+                if (before.st_dev, before.st_ino, before.st_mode) != (
+                    after.st_dev, after.st_ino, after.st_mode
+                ):
+                    raise SecurityViolationError("recipe input changed during inspection")
+                nxt = os.open(f"/proc/self/fd/{pinned}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            finally:
+                os.close(pinned)
             os.close(current)
             current = nxt
         return current
+    except OSError:
+        os.close(current)
+        raise SecurityViolationError("cannot open recipe input safely") from None
     except BaseException:
         os.close(current)
         raise
+
+
+def _snapshot(fd: int, destination: Path, limits: ResourceLimits) -> None:
+    """Copy a held artifact into private storage without reopening its pathname."""
+    count = 0
+    total = 0
+
+    def copy(source: int, target: Path, depth: int) -> None:
+        nonlocal count, total
+        metadata = os.fstat(source)
+        if stat.S_ISDIR(metadata.st_mode):
+            if depth > limits.max_nesting_depth:
+                raise ResourceLimitError("artifact directory depth cap exceeded")
+            target.mkdir(mode=0o700)
+            names = []
+            with os.scandir(source) as entries:
+                for entry in entries:
+                    count += 1
+                    if count > limits.max_archive_members:
+                        raise ResourceLimitError("artifact member count cap exceeded")
+                    names.append(entry.name)
+            for name in sorted(names):
+                child = _open_no_follow(source, name, directory=False)
+                try:
+                    copy(child, target / name, depth + 1)
+                finally:
+                    os.close(child)
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            cap = MAX_ARTIFACT_BYTES if depth == 0 else limits.max_member_bytes
+            if metadata.st_size > cap:
+                raise ResourceLimitError("artifact byte cap exceeded")
+            size = 0
+            output_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(output_fd, "wb") as output:
+                while size <= cap:
+                    chunk = os.read(source, min(READ_CHUNK_SIZE, cap - size + 1))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > cap or total > limits.max_total_decompressed_bytes:
+                        raise ResourceLimitError("artifact byte cap exceeded")
+                    output.write(chunk)
+                os.fchmod(output.fileno(), 0o700 if metadata.st_mode & 0o111 else 0o600)
+        else:
+            raise SecurityViolationError("artifact link or special file refused")
+
+    try:
+        copy(fd, destination, 0)
+    except OSError:
+        raise SecurityViolationError("artifact snapshot failed") from None
 
 
 def _entry(raw: Any, index: int) -> RecipeEntry:
@@ -153,7 +218,8 @@ def _entry(raw: Any, index: int) -> RecipeEntry:
         not isinstance(args, list)
         or len(args) > MAX_ARGS
         or not all(
-            isinstance(a, str) and "\x00" not in a and len(a.encode()) <= MAX_ARG_BYTES
+            isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= MAX_ARG_BYTES
+            and not any(0xD800 <= ord(c) <= 0xDFFF for c in a)
             for a in args
         )
     ):
@@ -161,8 +227,8 @@ def _entry(raw: Any, index: int) -> RecipeEntry:
     paths = []
     for key in ("artifact", "source"):
         value = raw[key]
-        if not isinstance(value, str):
-            raise InvalidArtifactError(f"recipe entry {ident!r} {key} must be a string")
+        if not isinstance(value, str) or any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+            raise InvalidArtifactError(f"recipe entry {ident!r} {key} must be a valid string")
         try:
             paths.append(validate_member_path(value, is_dir=False))
         except HermeticD7Error:
@@ -170,13 +236,22 @@ def _entry(raw: Any, index: int) -> RecipeEntry:
     return RecipeEntry(ident, paths[0], paths[1], builder, tuple(args))
 
 
+def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise InvalidArtifactError("duplicate recipe key")
+        out[key] = value
+    return out
+
+
 def parse_recipe(data: bytes) -> list[RecipeEntry]:
     """Validate a recipe mapping strictly; any defect refuses the whole recipe."""
     if len(data) > MAX_RECIPE_BYTES:
         raise ResourceLimitError("recipe exceeds byte cap")
     try:
-        doc = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_strict_pairs)
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise InvalidArtifactError("recipe is not valid UTF-8 JSON") from None
     if not isinstance(doc, dict) or set(doc) != {"schema", "entries"}:
         raise InvalidArtifactError("recipe must have exactly 'schema' and 'entries'")
@@ -197,7 +272,6 @@ def parse_recipe(data: bytes) -> list[RecipeEntry]:
 
 def _audit_entry(
     root_fd: int,
-    root: Path,
     entry: RecipeEntry,
     builder: IsolatedBuilder,
     limits: ResourceLimits,
@@ -205,25 +279,40 @@ def _audit_entry(
     result: dict[str, Any] = {"artifact": entry.artifact, "builder": entry.builder, "id": entry.id}
     try:
         # Pin both inputs without following links before anything is built.
-        os.close(_open_no_follow(root_fd, entry.artifact, directory=False))
-        source_fd = _open_no_follow(root_fd, entry.source, directory=True)
+        artifact_fd = _open_no_follow(root_fd, entry.artifact, directory=False)
         try:
-            with tempfile.TemporaryDirectory(prefix="d7-") as out:
+            source_fd = _open_no_follow(root_fd, entry.source, directory=True)
+        except BaseException:
+            os.close(artifact_fd)
+            raise
+        try:
+            with tempfile.TemporaryDirectory(prefix="d7-") as work:
                 name = entry.artifact.rsplit("/", 1)[-1]
+                private = Path(work)
+                shipped = private / "shipped" / name
+                shipped.parent.mkdir(mode=0o700)
+                _snapshot(artifact_fd, shipped, limits)
+                out = private / "output"
+                out.mkdir(mode=0o700)
                 try:
                     builder.build(BuildRequest(entry, source_fd, Path(out), name))
-                except HermeticD7Error:
-                    raise
                 except Exception:
+                    if type(builder) is RefusingBuilder:
+                        raise BuildFailedError("no isolated builder configured; deep audit refuses host builds") from None
                     raise BuildFailedError("isolated builder failed") from None
-                listing = sorted(os.listdir(out))
+                with os.scandir(out) as entries:
+                    listing = [e.name for _, e in zip(range(MAX_BUILDER_OUTPUT_ENTRIES), entries)]
                 if listing != [name]:
                     raise BuildFailedError("builder must produce exactly the named artifact")
                 if stat.S_ISLNK(os.lstat(os.path.join(out, name)).st_mode):
                     raise SecurityViolationError("builder output is a symlink")
-                report = compare_artifacts(root / entry.artifact, Path(out) / name, limits)
+                report = compare_artifacts(shipped, Path(out) / name, limits)
         finally:
             os.close(source_fd)
+            os.close(artifact_fd)
+    except OSError:
+        result.update(verdict="error", error={"type": "SecurityViolationError", "message": "artifact access failed"})
+        return result
     except HermeticD7Error as exc:
         result.update(verdict="error", error={"type": type(exc).__name__, "message": str(exc)})
         return result
@@ -270,7 +359,7 @@ def run_deep_audit(
         try:
             entries = parse_recipe(_read_no_follow(root_fd, recipe, MAX_RECIPE_BYTES))
             report["entries"] = [
-                _audit_entry(root_fd, root, e, active_builder, active_limits) for e in entries
+                _audit_entry(root_fd, e, active_builder, active_limits) for e in entries
             ]
         finally:
             os.close(root_fd)

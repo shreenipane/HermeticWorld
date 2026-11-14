@@ -363,7 +363,7 @@ fn classification(clock: &str, status: &str, flags: &[&str]) -> String {
     };
     serde_json::json!({
         "schema": "hermetic-run-classification/v1",
-        "run_digest": format!("sha256:{}", "a".repeat(64)),
+        "run_digest": compute_run_digest(&sample_run_record()).unwrap(),
         "clock": clock,
         "clock_reasons": reasons,
         "label": "derived",
@@ -402,6 +402,8 @@ fn record_must_match_classifier_clock_date_leak_and_status() {
             VerifyError::ClassificationMismatch("date_leak_observed")
         );
         r.date_leak_observed = true;
+        let mut c = c;
+        c.run_digest = compute_run_digest(&r).unwrap();
         check_against_classification(&r, &c).unwrap();
     }
 }
@@ -461,4 +463,16 @@ fn verifier_trait_object_is_usable() {
     let (_, verifier) = keys();
     let v: &dyn Verifier = &verifier;
     assert!(v.verify(None, b"x", &[0u8; 64]).is_err());
+}
+
+#[test]
+fn classifier_from_another_run_is_rejected_even_when_verdicts_match() {
+    let rec = sample_run_record();
+    let mut c =
+        RunClassification::from_json_str(&classification("hidden", "resolved", &[])).unwrap();
+    c.run_digest = Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    assert_eq!(
+        check_against_classification(&rec, &c).unwrap_err(),
+        VerifyError::ClassificationMismatch("run_digest")
+    );
 }

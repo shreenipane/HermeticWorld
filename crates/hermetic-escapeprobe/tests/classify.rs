@@ -264,3 +264,65 @@ fn expected_names_unique_safe_and_cover_spec_list() {
         assert!(names.iter().any(|n| n.starts_with(prefix)), "{prefix}");
     }
 }
+
+#[test]
+fn vsock_scan_preserves_ports_excludes_control_and_fits_exec_budget() {
+    let ports: Vec<_> = vsock_ports().collect();
+    assert!(!ports.contains(&5000));
+    assert_eq!(&ports[..1024], &(1..=1024).collect::<Vec<_>>());
+    assert_eq!(ports.len(), 1024 + VSOCK_EXTRA_PORTS.len() - 1);
+    let network_attempts = MAX_RESOLVERS * (REAL_NAMES.len() + DELEGATION.len())
+        + PUBLIC_RESOLVERS.len()
+        + RAW_TCP.len()
+        + ICMP.len()
+        + IPV6_TCP.len()
+        + 1
+        + QUIC.len();
+    let worst = CONNECT_TIMEOUT * network_attempts as u32
+        + VSOCK_TIMEOUT * (ports.len() * VSOCK_CIDS.len()) as u32;
+    assert!(worst < MAX_PROBE_RUNTIME);
+    assert!(MAX_PROBE_RUNTIME < std::time::Duration::from_secs(200));
+    let start = std::time::Instant::now();
+    for cid in VSOCK_CIDS {
+        let mut seen = Vec::new();
+        let result = scan_vsock(
+            *cid,
+            start + MAX_PROBE_RUNTIME,
+            || start,
+            |c, p, t| {
+                assert_eq!(c, *cid);
+                assert_eq!(t, VSOCK_TIMEOUT);
+                seen.push(p);
+                Attempt::Timeout
+            },
+        );
+        assert_eq!(seen, ports);
+        assert_eq!(result.0, EscapeResult::Blocked);
+    }
+}
+
+#[test]
+fn vsock_runtime_exhaustion_is_error_and_never_extends_deadline() {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let end = start + Duration::from_millis(1);
+    let now = std::cell::Cell::new(start);
+    let mut calls = 0;
+    let result = scan_vsock(
+        2,
+        end,
+        || now.get(),
+        |_, _, timeout| {
+            assert_eq!(timeout, Duration::from_millis(1));
+            now.set(end);
+            calls += 1;
+            Attempt::Timeout
+        },
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(result.0, EscapeResult::Error);
+    assert_eq!(
+        scan_vsock(2, end, || end, |_, _, _| panic!("expired scan connected")).0,
+        EscapeResult::Error
+    );
+}

@@ -40,8 +40,10 @@ Basic/extended maximum leaves, 36-bit physical and 48-bit virtual addresses,
 32 KiB L1 instruction/data caches, 256 KiB L2, no L3, and feature flags are fixed.
 Topology describes one thread per core in one package; only the bounded vCPU
 count/index from the machine specification varies (maximum 32). Unused leaves,
-including KVM/PV, PMU, XSAVE, thermal, security-feature and newer extended leaves,
-are zero. Leaf 0xb reports only guest topology. The patch constructs a new bounded
+including KVM/PV, PMU, thermal, security-feature and newer extended leaves,
+are zero. XSAVE is not advertised; KVM recomputes leaf 0xD.0 EBX as `0x240`
+for reset XCR0 (x87 only). The guest probe and snapshot validator accept exactly
+that runtime size; the installed template still supplies zero. Leaf 0xb reports only guest topology. The patch constructs a new bounded
 CPUID set after upstream normalization on cold boot, so normalization cannot
 restore host brand, vendor, cache, flags, maximum leaves or frequency suffixes.
 Snapshot restoration requires exactly the same canonical profile and rate;
@@ -60,15 +62,16 @@ failure records contain fixed reasons rather than host register values.
 
 ## Fixed TSC rate on every launch path
 
-Every launch uses `tsc_early_khz=2000000`. Lifecycle validates it before creating
-the jail; CLI `plan`, CLI `boot-args` and Python direct-launch resolution use the
-same value. The legacy `HERMETIC_TSC_KHZ` setting is optional and may only equal
-`2000000`; any other value, including non-Unicode text, fails closed without
-being echoed. Host CPUID calibration helpers remain for offline arithmetic tests
-but are no longer called by executable launch paths. Specs cannot supply the
-reserved parameter, including bare or hyphenated aliases. Argument caps include
-the suffix. Python resolution pins the executable descriptor, bounds output and
-has a five-second deadline.
+Every launch learns the fixed 2 GHz rate through the pinned CPUID leaf 0x15.
+`tsc_early_khz` is forbidden, including bare and hyphenated aliases: it bypasses
+leaf 0x15, leaves the guest using `tsc-early` and schedules timer refinement.
+Without that argument Linux marks the rate known (`tsc_known_freq`) and registers
+`tsc` directly. Lifecycle, CLI `plan`, CLI `boot-args` and Python direct-launch
+resolution enforce the same rule before launch. The legacy `HERMETIC_TSC_KHZ`
+setting is optional and may only equal `2000000`; any other value, including
+non-Unicode text, fails closed without being echoed. Host calibration helpers
+remain only for offline arithmetic tests. Python resolution pins the executable
+descriptor, bounds output and has a five-second deadline.
 
 The pinned patch requires `KVM_CAP_TSC_CONTROL` on every VM, calls
 `KVM_SET_TSC_KHZ(2000000)` on each vCPU before cold boot and restore, and verifies
@@ -111,3 +114,28 @@ manager verified the full reproducible pinned-container build, nested ring-0
 canary and stock negative control on 2026-11-14; measurements and results are in
 the host filtering guide. Multiple vCPUs, pause/resume, snapshot restore and TSC
 stability remain required before changing the advertised clock level.
+
+## Kernel-log substrate dates and full probe
+
+The production rootfs and NetVM world builders install `etc/hermetic/substrate-bound`
+from the validated kernel lock's `release_date` as `YYYY-MM-DD` plus a newline.
+This is release metadata, not a date cutoff. Supply the matching `kernel_image`
+and `clockprobe_bin` together to extract and seal `etc/hermetic/substrate-dates`
+using the probe's own offline parser. The CLI exposes `--kernel-lock`,
+`--kernel-image` and `--clockprobe-bin`. The image and extractor are held by
+verified descriptors; output is capped at 4096 sorted, unique calendar dates
+and extraction has a 60-second deadline. The rootfs tar stream adds the files
+without modifying the source tree; NetVM publishes them in its atomic tree.
+
+Kernel-log dates pass only within T_clock ±1 day or when exactly present in that
+sealed date list. Dates earlier than the release date get no general exemption.
+A missing list retains the strict T_clock rule; malformed lists fail closed.
+The available clocksource profile permits `tsc`, `jiffies` and `refined-jiffies`,
+with `tsc` required as the current source. KVM/template flags `cpuid_fault` and
+`pti` are part of the expected cpuinfo profile.
+
+`HERMETIC_FULL_PROBE=1` with `HERMETIC_LOCKDOWN_CONFIG` selects the full boot smoke:
+no probe arguments, exit 0, all 14 records exactly once and blocked, except
+`clock_pairing_hc` may be unavailable. That userspace exception requires the
+separate ring-0 canary before claiming hidden time. The manager's nested full
+probe passed on 2026-11-14; deployment-host validation remains outstanding.

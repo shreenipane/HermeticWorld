@@ -126,6 +126,7 @@ pub fn parse_clockprobe_lines(bytes: &[u8]) -> Result<Vec<ProbeRecord>, String> 
 
 fn probes_outcome(records: &[ProbeRecord]) -> Outcome {
     let code = determine_exit_code(records);
+    let incomplete = records.iter().any(|r| r.result == ProbeResult::Unavailable);
     let list: Vec<Value> = records
         .iter()
         .map(|r| serde_json::json!({"probe": r.probe, "result": r.result.as_str()}))
@@ -136,11 +137,13 @@ fn probes_outcome(records: &[ProbeRecord]) -> Outcome {
         .map(|r| r.probe.as_str())
         .collect();
     let outcome = match code {
+        0 if incomplete => Outcome::problem("probe coverage unavailable; result is incomplete"),
         0 => Outcome::success(format!("{} probe records, no leak", records.len())),
         2 => Outcome::problem(format!("clock leak observed: {}", leaks.join(","))),
         _ => Outcome::problem("probe error recorded; result is inconclusive"),
     };
     let verdict = match code {
+        0 if incomplete => "incomplete",
         0 => "blocked",
         2 => "leak",
         _ => "error",

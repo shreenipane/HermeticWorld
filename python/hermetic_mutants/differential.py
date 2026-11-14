@@ -238,7 +238,7 @@ def decode_disk(image: bytes) -> RunResult:
         raise DiskTamper("invalid_json")
     if not isinstance(sup, dict) or set(sup) != {"exit", "tests_started", "tests_finished"}:
         raise DiskTamper("invalid_json")
-    if sup["exit"] not in EXITS:
+    if not isinstance(sup["exit"], str) or sup["exit"] not in EXITS:
         raise DiskTamper("invalid_json")
     if not _valid_variant_set(variant_set):
         raise DiskTamper("invalid_variant_set")
@@ -247,7 +247,7 @@ def decode_disk(image: bytes) -> RunResult:
     for node_id, status in tests.items():
         if not _valid_node_id(node_id):
             raise DiskTamper("invalid_node_id")
-        if status not in TEST_STATUSES:
+        if not isinstance(status, str) or status not in TEST_STATUSES:
             raise DiskTamper("invalid_json")
     started, finished = _u32(sup["tests_started"]), _u32(sup["tests_finished"])
     passed = sum(1 for s in tests.values() if s == "passed")

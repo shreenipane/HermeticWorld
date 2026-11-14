@@ -86,6 +86,7 @@ fn module_load_requires_absent_syscall_not_permissions_or_invalid_image() {
 
 #[test]
 fn every_root_interface_rule_fails_closed() {
+    assert!(FORBIDDEN.contains(&"LEGACY_PTYS"));
     let good = config();
     assert!(lockdown::config_sealed(&good).unwrap());
     for name in REQUIRED {

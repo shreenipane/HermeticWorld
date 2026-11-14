@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 
 from hermetic_safe_io import open_parent, open_regular, UnsafePathError
+from hermetic_slice.guest_kernel import DEFAULT_KERNEL_DIR
+from hermetic_slice.substrate import substrate_files
 
 NETVM_ADDRESS = "10.0.2.3"
 AGENT_ADDRESS = "10.0.2.15"
@@ -136,6 +138,9 @@ def build_netvm_tree(
     busybox_bin: Path,
     dns_table: Path,
     t_clock: datetime,
+    kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
+    kernel_image: Path | None = None,
+    clockprobe_bin: Path | None = None,
 ) -> Path:
     """Create a fresh NetVM rootfs tree at ``tree`` (which must not exist)."""
     if t_clock.tzinfo is None or t_clock.utcoffset() is None:
@@ -153,6 +158,8 @@ def build_netvm_tree(
         "etc/hermetic/dns.json": (table, 0o444),
         "etc/hermetic/netvm.json": (json.dumps({"t_clock": epoch}).encode(), 0o444),
     }
+    files.update({name: (data, 0o644) for name, data in substrate_files(
+        kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin).items()})
     parent, leaf = open_parent(tree)
     staged = None
     directory = None
@@ -226,11 +233,16 @@ def build_netvm_image(
     world_id: str,
     sealcheck_bin: Path | None = None,
     work_dir: Path | None = None,
+    kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
+    kernel_image: Path | None = None,
+    clockprobe_bin: Path | None = None,
 ) -> dict:
     """Build the NetVM tree and a D4-checked read-only ext4 image from it."""
     from hermetic_slice.rootfs import build_rootfs
 
-    build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock)
+    build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock,
+                     kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
     return build_rootfs(
-        tree, out_image, t_clock=t_clock, world_id=world_id, sealcheck_bin=sealcheck_bin, work_dir=work_dir
+        tree, out_image, t_clock=t_clock, world_id=world_id, sealcheck_bin=sealcheck_bin, work_dir=work_dir,
+        kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin,
     )

@@ -57,13 +57,22 @@ def _rel_path(value: Any) -> str:
     return value
 
 
+def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ProvenanceError("duplicate provenance key")
+        out[key] = value
+    return out
+
+
 def parse_provenance(data: bytes) -> tuple[dict[tuple[str, int], dict[str, Any]], frozenset[str]]:
     """Strictly parse a manifest into {(path, record): entry} and the scrubbed set."""
     if len(data) > MAX_PROVENANCE_BYTES:
         raise ProvenanceError("provenance manifest exceeds byte cap")
     try:
-        doc = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_strict_pairs)
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise ProvenanceError("provenance manifest is not valid UTF-8 JSON") from None
     if not isinstance(doc, dict) or set(doc) != {"schema", "records", "scrubbed_payloads"}:
         raise ProvenanceError("provenance manifest has unexpected keys")
@@ -87,7 +96,7 @@ def parse_provenance(data: bytes) -> tuple[dict[tuple[str, int], dict[str, Any]]
         digest = raw["payload_sha256"]
         if not isinstance(digest, str) or not _HEX64.fullmatch(digest):
             raise ProvenanceError("payload_sha256 must be lowercase sha256 hex")
-        if raw["scrub"] not in _SCRUB_VALUES:
+        if not isinstance(raw["scrub"], str) or raw["scrub"] not in _SCRUB_VALUES:
             raise ProvenanceError("scrub must be 'applied' or 'not_applicable'")
         if not isinstance(raw["revision_date"], str):
             raise ProvenanceError("revision_date must be an RFC 3339 UTC string")

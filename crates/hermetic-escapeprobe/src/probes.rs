@@ -2,13 +2,16 @@
 //! constants; records carry fixed labels, never addresses read at run time.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::classify::{self, Attempt, EscapeRecord, EscapeResult};
 use crate::{dns, sys};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
-pub const VSOCK_TIMEOUT: Duration = Duration::from_millis(500);
+pub const VSOCK_TIMEOUT: Duration = Duration::from_millis(50);
+/// Leaves more than a minute for execd framing/cleanup under its 290 s exec cap.
+pub const MAX_PROBE_RUNTIME: Duration = Duration::from_secs(180);
+pub const EXECD_PORT: u32 = 5000;
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 pub const MOUNTINFO: &str = "/proc/self/mountinfo";
 pub const MAX_RESOLV_BYTES: usize = 16 * 1024;
@@ -251,7 +254,17 @@ fn dns_query(server: Ipv4Addr, id: u16, name: &str, qtype: u16) -> (EscapeResult
 }
 
 pub fn run_all() -> Vec<EscapeRecord> {
+    run_with(|_| {})
+}
+
+/// Deliver each completed record immediately, before starting the next probe.
+pub fn run_with(mut emit: impl FnMut(&EscapeRecord)) -> Vec<EscapeRecord> {
+    let end = Instant::now() + MAX_PROBE_RUNTIME;
     let mut out = Vec::new();
+    let mut push = |record: EscapeRecord| {
+        emit(&record);
+        out.push(record);
+    };
     let mut id: u16 = 0x4857;
 
     let resolvers = sys::read_bounded(RESOLV_CONF, MAX_RESOLV_BYTES)
@@ -270,33 +283,33 @@ pub fn run_all() -> Vec<EscapeRecord> {
                     }
                 },
             };
-            out.push(rec(probe, r));
+            push(rec(probe, r));
         }
     }
     for (label, server) in PUBLIC_RESOLVERS {
         id = id.wrapping_add(1);
-        out.push(rec(
+        push(rec(
             format!("dns.public.{label}"),
             dns_query(*server, id, "www.google.com", dns::QTYPE_A),
         ));
     }
     for (label, ip, port) in RAW_TCP {
         let a = sys::tcp_connect(SocketAddr::new((*ip).into(), *port), CONNECT_TIMEOUT);
-        out.push(rec(
+        push(rec(
             format!("ip.tcp.{label}"),
             classify::classify_attempt(a),
         ));
     }
     for (label, ip) in ICMP {
         let a = sys::icmp_echo(*ip, CONNECT_TIMEOUT);
-        out.push(rec(
+        push(rec(
             format!("icmp.echo.{label}"),
             classify::classify_attempt(a),
         ));
     }
     for (label, ip, port) in IPV6_TCP {
         let a = sys::tcp_connect(SocketAddr::new((*ip).into(), *port), CONNECT_TIMEOUT);
-        out.push(rec(
+        push(rec(
             format!("ipv6.tcp.{label}"),
             classify::classify_attempt(a),
         ));
@@ -309,7 +322,7 @@ pub fn run_all() -> Vec<EscapeRecord> {
             53,
         );
         let o = sys::udp_exchange(dst, &q, CONNECT_TIMEOUT, dns::MAX_RESPONSE_BYTES);
-        out.push(rec(
+        push(rec(
             "ipv6.udp.google_dns".into(),
             classify_dns_exchange(id, o),
         ));
@@ -322,62 +335,77 @@ pub fn run_all() -> Vec<EscapeRecord> {
             CONNECT_TIMEOUT,
             2048,
         );
-        out.push(rec(format!("quic.udp443.{label}"), classify_datagram(o)));
+        push(rec(format!("quic.udp443.{label}"), classify_datagram(o)));
     }
     for cid in VSOCK_CIDS {
-        let ports = (1..=1024u32).chain(VSOCK_EXTRA_PORTS.iter().copied());
-        let mut attempts = Vec::new();
-        for port in ports {
-            let a = sys::vsock_connect(*cid, port, VSOCK_TIMEOUT);
-            attempts.push(a);
-            if classify::classify_attempt(a).0 == EscapeResult::Leak {
-                break;
-            }
-            // Without AF_VSOCK one answer covers the whole scan.
-            if a == Attempt::Errno(libc::EAFNOSUPPORT) {
-                break;
-            }
-        }
-        out.push(rec(
+        push(rec(
             format!("vsock.cid{cid}.scan"),
-            classify_scan(&attempts),
+            scan_vsock(*cid, end, Instant::now, sys::vsock_connect),
         ));
     }
     for (label, path) in DEVICES {
-        out.push(rec(
+        push(rec(
             format!("device.{label}"),
             classify::classify_device_open(sys::open_device(path)),
         ));
     }
-    out.push(rec(
+    push(rec(
         "hostfs.mounts".into(),
         match sys::read_bounded(MOUNTINFO, classify::MAX_MOUNTINFO_BYTES) {
             Ok(t) => classify::classify_mountinfo(&t),
             Err(_) => (EscapeResult::Error, "mount table unreadable"),
         },
     ));
-    out.push(rec(
+    push(rec(
         "kernel.module_load".into(),
         classify::classify_module_load(sys::init_module_empty()),
     ));
     for g in GATEWAY_PROBES {
-        out.push(EscapeRecord::new(
+        push(EscapeRecord::new(
             *g,
             EscapeResult::Unavailable,
             "gateway probe not configured",
         ));
     }
     let mut buf = [0u8; 32];
-    out.push(rec(
+    push(rec(
         "positive.getrandom_nonblock".into(),
         classify::classify_getrandom(sys::getrandom_nonblock(&mut buf), buf.len()),
     ));
     for p in INSTALL_PROBES {
-        out.push(EscapeRecord::new(
+        push(EscapeRecord::new(
             *p,
             EscapeResult::Unavailable,
             "install check not configured",
         ));
     }
     out
+}
+
+/// The control listener is outside the escape surface. Probe every other
+/// listed port in stable order; an incomplete scan must never claim blocked.
+pub fn vsock_ports() -> impl Iterator<Item = u32> {
+    (1..=1024u32)
+        .chain(VSOCK_EXTRA_PORTS.iter().copied())
+        .filter(|port| *port != EXECD_PORT)
+}
+
+pub fn scan_vsock(
+    cid: u32,
+    end: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut connect: impl FnMut(u32, u32, Duration) -> Attempt,
+) -> (EscapeResult, &'static str) {
+    let mut attempts = Vec::new();
+    for port in vsock_ports() {
+        let Some(remaining) = end.checked_duration_since(now()).filter(|d| !d.is_zero()) else {
+            return (EscapeResult::Error, "scan runtime cap exceeded");
+        };
+        let a = connect(cid, port, VSOCK_TIMEOUT.min(remaining));
+        attempts.push(a);
+        if a == Attempt::Reached || a == Attempt::Errno(libc::EAFNOSUPPORT) {
+            break;
+        }
+    }
+    classify_scan(&attempts)
 }

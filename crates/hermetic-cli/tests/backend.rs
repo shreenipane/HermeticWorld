@@ -216,10 +216,10 @@ fn probe_classifies_clockprobe_output_blocked_leak_error() {
         p(&f),
         "--json",
     ]);
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(code, ExitCode::PROBLEM_FOUND, "{err}");
     assert_eq!(
         out,
-        "{\"command\":\"probe\",\"details\":{\"records\":[{\"probe\":\"rdtsc\",\"result\":\"blocked\"},{\"probe\":\"hpet\",\"result\":\"unavailable\"}],\"verdict\":\"blocked\"},\"ok\":true,\"summary\":\"2 probe records, no leak\"}\n"
+        "{\"command\":\"probe\",\"details\":{\"records\":[{\"probe\":\"rdtsc\",\"result\":\"blocked\"},{\"probe\":\"hpet\",\"result\":\"unavailable\"}],\"verdict\":\"incomplete\"},\"ok\":false,\"summary\":\"probe coverage unavailable; result is incomplete\"}\n"
     );
 
     fs::write(
@@ -251,6 +251,35 @@ fn probe_classifies_clockprobe_output_blocked_leak_error() {
     ]);
     assert_eq!(code, ExitCode::PROBLEM_FOUND);
     assert!(out.contains("inconclusive"));
+}
+
+#[test]
+fn probe_unavailable_is_incomplete_and_never_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("probe.jsonl");
+    for (result, expected_code, verdict) in [
+        ("blocked", ExitCode::SUCCESS, "blocked"),
+        ("unavailable", ExitCode::PROBLEM_FOUND, "incomplete"),
+        ("leak", ExitCode::PROBLEM_FOUND, "leak"),
+        ("error", ExitCode::PROBLEM_FOUND, "error"),
+    ] {
+        fs::write(
+            &f,
+            format!("{{\"probe\":\"hpet\",\"result\":\"{result}\",\"detail\":\"fixed reason\"}}\n"),
+        )
+        .unwrap();
+        let (code, out, _) = exec(&[
+            "probe",
+            "--world",
+            p(dir.path()),
+            "--clockprobe-output",
+            p(&f),
+            "--json",
+        ]);
+        assert_eq!(code, expected_code);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["details"]["verdict"], verdict);
+    }
 }
 
 #[test]

@@ -164,3 +164,34 @@ fn test_task_input_passing_fixes_symlinked_dir_is_not_followed() {
     let loaded = TaskInput::load(&task_dir).expect("load");
     assert!(loaded.passing_fixes.is_empty());
 }
+
+#[test]
+fn passing_fixes_directory_and_byte_caps_fail_closed() {
+    use hermetic_common::manifest::{MAX_FIX_DIRECTORY_ENTRIES, MAX_FIX_FILE_BYTES};
+    let dir = tempdir().unwrap();
+    minimal_task_dir(dir.path());
+    let fixes = dir.path().join("staging/fixes");
+    fs::create_dir(&fixes).unwrap();
+    let large = fs::File::create(fixes.join("a.patch")).unwrap();
+    large.set_len(MAX_FIX_FILE_BYTES + 1).unwrap();
+    assert!(TaskInput::load(dir.path()).is_err());
+    fs::remove_file(fixes.join("a.patch")).unwrap();
+    for i in 0..=MAX_FIX_DIRECTORY_ENTRIES {
+        fs::File::create(fixes.join(format!("{i}.txt"))).unwrap();
+    }
+    assert!(TaskInput::load(dir.path()).is_err());
+}
+
+#[test]
+fn passing_fixes_refuses_symlinked_ancestor() {
+    let dir = tempdir().unwrap();
+    let task = dir.path().join("task");
+    minimal_task_dir(&task);
+    let staging = task.join("staging");
+    fs::create_dir(staging.join("fixes")).unwrap();
+    fs::write(staging.join("fixes/a.patch"), "private").unwrap();
+    let outside = dir.path().join("outside");
+    fs::rename(&staging, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &staging).unwrap();
+    assert!(TaskInput::load(&task).is_err());
+}

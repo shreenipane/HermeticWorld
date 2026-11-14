@@ -131,3 +131,16 @@ def test_oversized_manifest_is_refused() -> None:
 
     with pytest.raises(ProvenanceError, match="cap"):
         parse_provenance(b" " * (MAX_PROVENANCE_BYTES + 1))
+
+@pytest.mark.parametrize("scrub", [[], {}, None, 1])
+def test_provenance_scrub_types_fail_closed(tmp_path: Path, scrub: object) -> None:
+    data = manifest([rec("a.warc", 1, b"x", scrub=scrub)])
+    with pytest.raises(ProvenanceError):
+        parse_provenance(data)
+    assert verify_provenance(scan_tree(tmp_path, CLOCK), data, T)["verdict"] == "error"
+
+
+def test_duplicate_provenance_keys_cannot_hide_records() -> None:
+    data = manifest([]).replace(b'"records": []', b'"records": [], "records": []')
+    with pytest.raises(ProvenanceError, match="duplicate"):
+        parse_provenance(data)

@@ -83,7 +83,7 @@ for _purpose, _names in (
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("y", _purpose)
 for _purpose, _names in (
-    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK HERMETIC_CLOCK_CANARY"),
+    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK HERMETIC_CLOCK_CANARY LEGACY_PTYS"),
     ("TR-VMM-4: prevent accidental host clock reads", "PTP_1588_CLOCK PTP_1588_CLOCK_KVM PTP_1588_CLOCK_VMW RTC_HCTOSYS"),
     ("TR-VMM-4: fixed build identity; config supplied separately", "LOCALVERSION_AUTO IKCONFIG"),
     ("T3.1: no time namespace needed", "TIME_NS"),
@@ -171,7 +171,7 @@ BOOT_FIXED = "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda roo
 
 
 def spec_boot_arguments(t_clock: int) -> str:
-    """VmSpec input; lifecycle appends the VMM-owned TSC frequency before boot."""
+    """VmSpec input; frequency comes from the pinned CPUID profile and KVM scaling."""
     if type(t_clock) is not int or not 0 <= t_clock <= MAX_CLOCK:
         raise KernelError("t_clock must be bounded integral Unix seconds")
     return f"{BOOT_FIXED} hermetic.t={t_clock}"

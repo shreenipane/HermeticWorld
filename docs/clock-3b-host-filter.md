@@ -214,6 +214,17 @@ measured reproducible artifacts above, nested ring-0 MSR/hypercall enforcement,
 and the stock Firecracker negative control. The successful nested run exercised
 Xen interception on that tested host configuration.
 
+**Verified full userspace probe (manager, 2026-11-14):** no arguments, exit 0,
+every record blocked except `clock_pairing_hc` (unavailable; covered by the
+ring-0 canary above). The guest uses pinned CPUID 0x15 and KVM scaling for its
+2 GHz rate; no `tsc_early_khz` argument is allowed. KVM's runtime XSAVE size
+`0x240`, `cpuid_fault`/`pti`, and tick-based jiffies clocksources are expected.
+Kernel-log dates are exempt only when exactly in the sealed `substrate-dates`
+list extracted from the image, or within T_clock ±1 day; the release-date
+`substrate-bound` metadata is not a general exemption. Repeat with
+`HERMETIC_FULL_PROBE=1` and the matching `HERMETIC_LOCKDOWN_CONFIG` in boot-smoke.
+The new `LEGACY_PTYS=n` policy requires a manager kernel rebuild before that run.
+
 **OPEN:** independent deployment-host configuration/downstream-interface audit,
 multiple vCPUs, pause/resume, snapshot restore and TSC stability. These require
 manager host resources. The completed build and nested canary do not establish
