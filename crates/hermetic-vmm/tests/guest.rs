@@ -666,6 +666,75 @@ fn guest_not_yet_listening_is_retryable() {
     join.join().unwrap();
 }
 
+#[test]
+fn guest_reply_fragmentation_preserves_the_complete_frame() {
+    use std::io::Read;
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let observer = client.try_clone().unwrap();
+    let end = deadline(Duration::from_secs(3)).unwrap();
+    let join = std::thread::spawn(move || {
+        // Wait until the client consumes each byte before sending the next.
+        // Separate writes alone do not guarantee separate stream reads.
+        let mut send = |bytes: &[u8]| {
+            for byte in bytes {
+                server.write_all(&[*byte]).unwrap();
+                while rustix::io::ioctl_fionread(&observer).unwrap() != 0 {
+                    assert!(Instant::now() < end, "fragment consumption deadline");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        // The request is small enough to remain queued while the fake sends
+        // its reply; the real transport must still finish the CONNECT first.
+        send(b"OK 5000\n");
+        let body = br#"{"type":"status","guest_time_unix":1700000000}"#;
+        send(&(body.len() as u32).to_le_bytes());
+        send(body);
+        let mut request = [0; 34];
+        server.read_exact(&mut request).unwrap();
+        assert_eq!(&request[..13], b"CONNECT 5000\n");
+        assert_eq!(&request[13..17], &17u32.to_le_bytes());
+        assert_eq!(&request[17..], br#"{"type":"status"}"#);
+    });
+    let reply = guest_status_stream(client, end);
+    join.join().unwrap();
+    assert_eq!(reply.unwrap().guest_time_unix, T_CLOCK);
+}
+
+#[test]
+fn guest_early_or_truncated_reply_is_a_protocol_error() {
+    use std::io::Read;
+    let body = br#"{"type":"status","guest_time_unix":1700000000}"#;
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(body);
+    for prefix in 0..frame.len() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let partial = frame[..prefix].to_vec();
+        let join = std::thread::spawn(move || {
+            let mut request = [0; 13];
+            server.read_exact(&mut request).unwrap();
+            server.write_all(b"OK 5000\n").unwrap();
+            let mut request = [0; 21];
+            server.read_exact(&mut request).unwrap();
+            server.write_all(&partial).unwrap();
+        });
+        let reply = guest_status_stream(client, deadline(Duration::from_secs(1)).unwrap());
+        join.join().unwrap();
+        assert!(matches!(reply, Err(Error::Protocol)), "prefix {prefix}");
+    }
+    // A binary frame cannot substitute for Firecracker's CONNECT response,
+    // even if it would otherwise decode as a valid status reply.
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let join = std::thread::spawn(move || {
+        let mut request = [0; 13];
+        server.read_exact(&mut request).unwrap();
+        server.write_all(&frame).unwrap();
+    });
+    let reply = guest_status_stream(client, deadline(Duration::from_secs(1)).unwrap());
+    join.join().unwrap();
+    assert!(matches!(reply, Err(Error::Protocol)));
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LockdownRecord {
