@@ -40,6 +40,13 @@ def _build_parser() -> _SafeArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the D7 CLI and return 0 (identical), 2 (differs), or 1 (error)."""
+    args_list = list(argv) if argv is not None else sys.argv[1:]
+    if args_list[:1] == ["--deep-audit"]:
+        from hermetic_d7.deep_audit import run_deep_audit_cli
+
+        deep = run_deep_audit_cli(args_list[1:])
+        print(format_report_json(deep))
+        return {"identical": 0, "differs": 2}.get(deep["verdict"], 1)
     parser = _build_parser()
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
