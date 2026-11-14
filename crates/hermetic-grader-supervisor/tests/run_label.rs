@@ -137,3 +137,55 @@ fn real_label_reader_rejects_links_special_files_and_oversized_input() {
     file.set_len(7).unwrap();
     assert!(os.read_run_label(&image).is_err());
 }
+
+#[test]
+fn recovery_preserves_drive_identity_before_and_after_results_and_rejects_corruption() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config");
+    let disk = temp.path().join("result");
+    std::fs::write(&config_path, config()).unwrap();
+    for run in [RunName::R0, RunName::R1, RunName::R2, RunName::R3] {
+        let label = encode_run_label(run);
+        let clean = encode_result_disk(&ResultPayload {
+            run,
+            variant_set: "00".repeat(32),
+            tests: Default::default(),
+            supervisor: SupervisorSummary {
+                exit: SupervisorExit::Clean,
+                tests_started: 0,
+                tests_finished: 0,
+            },
+        })
+        .unwrap();
+        for image in [&label, &clean] {
+            let mut fake = FakeOs::new();
+            fake.insert_file(&config_path, config());
+            fake.insert_file(&disk, image.clone());
+            write_infra_error(&mut fake, &config_path, &disk).unwrap();
+            let expected = fake.written_file(&disk).unwrap();
+            let payload = decode_result_disk(expected).unwrap();
+            assert_eq!(payload.run, run);
+            assert_eq!(payload.supervisor.exit, SupervisorExit::Crash);
+            assert!(!fake.events().iter().any(|e| matches!(e, OsEvent::Spawn(_))));
+
+            std::fs::write(&disk, image).unwrap();
+            write_infra_error(&mut RealOs::new(), &config_path, &disk).unwrap();
+            assert_eq!(std::fs::read(&disk).unwrap(), expected);
+        }
+        for mut image in [label, clean] {
+            *image.last_mut().unwrap() = 1;
+            let mut fake = FakeOs::new();
+            fake.insert_file(&config_path, config());
+            fake.insert_file(&disk, image.clone());
+            assert!(write_infra_error(&mut fake, &config_path, &disk).is_err());
+            assert!(!fake
+                .events()
+                .iter()
+                .any(|e| matches!(e, OsEvent::Spawn(_) | OsEvent::WriteFileAtomic { .. })));
+
+            std::fs::write(&disk, &image).unwrap();
+            assert!(write_infra_error(&mut RealOs::new(), &config_path, &disk).is_err());
+            assert_eq!(std::fs::read(&disk).unwrap(), image);
+        }
+    }
+}

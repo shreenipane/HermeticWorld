@@ -219,3 +219,47 @@ def test_rootfs_image_fixture_discards_images_after_assertions(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not list(basetemp.rglob("*.img"))
     assert not list(basetemp.glob("test_finding2*"))
+
+
+def test_replaceable_ancestor_is_refused_but_sticky_shared_ancestor_is_allowed(tmp_path):
+    """Review finding (2026-11-14): only the final parent was checked, so a
+    non-sticky, other-writable ancestor could be renamed and replaced by a
+    symlink the shell would later follow."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    private = shared / "alice"
+    private.mkdir(mode=0o700)
+    shared.chmod(0o777)  # writable by others, not sticky
+    try:
+        with pytest.raises(ValueError, match="ancestor another user can replace"):
+            smoke.create_work("x-smoke.sh", str(private / "job"))
+        assert not (private / "job").exists()
+        shared.chmod(0o1777)  # sticky: entries can only be renamed by their owners
+        parent, name, child, path = smoke.create_work("x-smoke.sh", str(private / "job"))
+        os.close(child)
+        os.close(parent)
+        assert path == str(private / "job")
+    finally:
+        shared.chmod(0o755)
+    with pytest.raises(ValueError, match="absolute"):
+        smoke.open_directory("relative/dir")
+
+
+def test_signal_during_cleanup_stops_deletion_and_retains_artifacts(tmp_path):
+    """Review finding (2026-11-14): a signal recorded during cleanup must stop
+    deletion and fail the run instead of removing everything and returning 0."""
+    parent, name, child, path = smoke.create_work("x-smoke.sh", str(tmp_path / "w"))
+    try:
+        for i in range(5):
+            (Path(path) / f"f{i}").write_text("x")
+        calls = []
+        def cancelled():
+            calls.append(1)
+            return len(calls) > 2
+        with pytest.raises(smoke.Cancelled):
+            smoke.cleanup(parent, name, child, cancelled=cancelled)
+        assert (tmp_path / "w").is_dir()
+        assert 0 < len(list((tmp_path / "w").iterdir())) < 5
+    finally:
+        os.close(child)
+        os.close(parent)

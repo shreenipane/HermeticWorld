@@ -99,6 +99,9 @@ pub trait Os {
     /// Opaque handle representing a spawned child process tree and its result pipe.
     type Child;
 
+    /// Fixed phase labels only; never include repository input or OS details.
+    fn phase(&mut self, _phase: &'static str) {}
+
     /// Returns monotonic elapsed duration since supervisor startup.
     fn now_monotonic(&self) -> Duration;
 
@@ -107,8 +110,13 @@ pub trait Os {
 
     /// Read the fixed-size host boot input. Never forwarded to a sandbox helper.
     fn read_run_label(&mut self, path: &Path) -> Result<crate::RunName, OsError> {
-        let image = self.read_file(path, crate::RESULT_DISK_BYTES)?;
+        let image = self.read_result_disk(path)?;
         crate::label::decode_run_label(&image).ok_or_else(|| os_error("run_label", "invalid"))
+    }
+
+    /// Read at most one fixed-size result image, including the host boot input.
+    fn read_result_disk(&mut self, path: &Path) -> Result<Vec<u8>, OsError> {
+        self.read_file(path, crate::RESULT_DISK_BYTES)
     }
 
     /// Spawns a child process in a new process group with `argv`, `env`, `cwd`,
@@ -223,11 +231,15 @@ const MAX_DROP_POLLS: usize = 200;
 impl Os for RealOs {
     type Child = RealChild;
 
+    fn phase(&mut self, phase: &'static str) {
+        eprintln!("grader-supervisor phase {phase}");
+    }
+
     fn now_monotonic(&self) -> Duration {
         self.epoch.elapsed()
     }
 
-    fn read_run_label(&mut self, path: &Path) -> Result<crate::RunName, OsError> {
+    fn read_result_disk(&mut self, path: &Path) -> Result<Vec<u8>, OsError> {
         // Only the fixed guest result device may be opened as a block device.
         // Offline callers use regular images with the same strict format.
         let kind = if path == Path::new("/dev/vdb") {
@@ -242,7 +254,10 @@ impl Os for RealOs {
         file.take((crate::RESULT_DISK_BYTES as u64).saturating_add(1))
             .read_to_end(&mut image)
             .map_err(|e| os_error("read_run_label", e))?;
-        crate::label::decode_run_label(&image).ok_or_else(|| os_error("run_label", "invalid"))
+        if image.len() != crate::RESULT_DISK_BYTES {
+            return Err(os_error("read_run_label", "invalid size"));
+        }
+        Ok(image)
     }
 
     fn read_file(&mut self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, OsError> {
@@ -290,7 +305,7 @@ impl Os for RealOs {
             .env_clear()
             .stdin(Stdio::from(fd))
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .process_group(0)
             .spawn()
             .map_err(|e| os_error("spawn", e))?;
@@ -301,7 +316,9 @@ impl Os for RealOs {
             exited: None,
         };
         handle.pipe = handle.child.stdout.take();
+        self.phase("launch-input");
         crate::sandbox::write_spec(&mut peer, spec).map_err(|e| os_error("launch_input", e))?;
+        self.phase("launch-handshake");
         let mut pid = [0; 4];
         peer.read_exact(&mut pid)
             .map_err(|e| os_error("launch_handshake", e))?;
@@ -315,6 +332,7 @@ impl Os for RealOs {
         );
         peer.write_all(&[1])
             .map_err(|e| os_error("launch_ack", e))?;
+        self.phase("init-pinned");
         let pipe = handle
             .pipe
             .as_ref()

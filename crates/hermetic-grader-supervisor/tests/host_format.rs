@@ -54,3 +54,80 @@ fn supervisor_result_disk_is_accepted_by_host_parser() {
         "guest and host images must be byte-identical"
     );
 }
+
+#[test]
+fn recovery_replaces_clean_results_with_host_infra_error_without_spawning_tests() {
+    use hermetic_grader_result::{verdict, GradingPlan, VerdictStatus};
+    use hermetic_grader_supervisor::{write_infra_error, FakeOs, OsEvent, RunConfig};
+    use std::path::Path;
+
+    let mut recovered = Vec::new();
+    for run in [RunName::R0, RunName::R1, RunName::R2] {
+        let config = RunConfig {
+            argv: vec!["pytest".into()],
+            env: BTreeMap::new(),
+            cwd: "/work/repo".into(),
+            sandbox: Default::default(),
+            deadline_seconds: 120,
+            expected_test_ids: vec!["t.py::test_a".into()],
+            variant_set: VARIANT.into(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config");
+        let disk_path = tmp.path().join("result");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let clean = ResultPayload {
+            run,
+            variant_set: VARIANT.into(),
+            tests: BTreeMap::from([("t.py::test_a".into(), FinalTestOutcome::Passed)]),
+            supervisor: SupervisorSummary {
+                exit: SupervisorExit::Clean,
+                tests_started: 1,
+                tests_finished: 1,
+            },
+        };
+        std::fs::write(&disk_path, encode_result_disk(&clean).unwrap()).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-grader-supervisor"))
+            .arg("--infra-error")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--result-disk")
+            .arg(&disk_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr,
+            b"grader-supervisor phase infra-error-write\ngrader-supervisor phase infra-error-synced\n");
+        let bytes = std::fs::read(&disk_path).unwrap();
+        let parsed = parse_disk_bytes(&bytes).unwrap();
+        assert_eq!(parsed.supervisor.exit, HostExit::Crash);
+        assert_eq!(parsed.tests["t.py::test_a"], TestStatus::Missing);
+        recovered.push(Ok(parsed));
+
+        let mut fake = FakeOs::new();
+        fake.insert_file("config", serde_json::to_vec(&config).unwrap());
+        fake.insert_file("disk", encode_result_disk(&clean).unwrap());
+        write_infra_error(&mut fake, Path::new("config"), Path::new("disk")).unwrap();
+        assert_eq!(fake.written_file(Path::new("disk")).unwrap(), bytes);
+        assert!(!fake.events().iter().any(|e| matches!(e, OsEvent::Spawn(_))));
+        fake.insert_file("config", b"{}".to_vec());
+        let before = fake.events().len();
+        assert!(write_infra_error(&mut fake, Path::new("config"), Path::new("untouched")).is_err());
+        assert!(fake.written_file(Path::new("untouched")).is_none());
+        assert_eq!(fake.events().len(), before + 1);
+    }
+    let plan = GradingPlan {
+        f2p: ["t.py::test_a".into()].into(),
+        p2p: Default::default(),
+        mutated: Default::default(),
+        equivalents: Default::default(),
+    };
+    let r2 = recovered.pop().unwrap();
+    let r1 = recovered.pop().unwrap();
+    let r0 = recovered.pop().unwrap();
+    assert_eq!(
+        verdict(r0, r1, r2, None, &plan).status,
+        VerdictStatus::InfraError
+    );
+}

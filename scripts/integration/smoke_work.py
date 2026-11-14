@@ -50,10 +50,25 @@ def private_mkdir(parent, name):
         os.umask(previous)
 
 
+def trusted_ancestor(metadata):
+    """An ancestor no other user can replace: owned by root or the caller, and
+    either not group/other-writable or sticky (then each entry in it can only be
+    renamed by its owner, which the next component's check constrains)."""
+    if metadata.st_uid not in (0, os.getuid()):
+        return False
+    return not metadata.st_mode & 0o022 or bool(metadata.st_mode & stat.S_ISVTX)
+
+
 def open_directory(path, *, create=False):
+    # Every ancestor is checked, not just the final parent: the shell later
+    # follows the pathname, so a replaceable ancestor would redirect it.
+    if not path.startswith("/"):
+        raise ValueError("work path must be absolute")
     parts = path_parts(path)
-    directory = os.open("/" if path.startswith("/") else ".", DIR_FLAGS)
+    directory = os.open("/", DIR_FLAGS)
     try:
+        if not trusted_ancestor(os.fstat(directory)):
+            raise ValueError("work path has an ancestor another user can replace")
         for part in parts:
             if create:
                 try:
@@ -63,6 +78,8 @@ def open_directory(path, *, create=False):
             child = open_child(directory, part)
             os.close(directory)
             directory = child
+            if not trusted_ancestor(os.fstat(directory)):
+                raise ValueError("work path has an ancestor another user can replace")
         metadata = os.fstat(directory)
         if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
             raise ValueError("work parent must be owned by the caller and not writable by others")
@@ -85,6 +102,7 @@ def create_work(script, requested):
         root = os.environ.get("HERMETIC_SMOKE_DIR") or os.path.join(
             os.environ["HOME"], ".cache", "hermetic-smoke"
         )
+        root = os.path.abspath(root)
         path_parts(root)
         parent = open_directory(root, create=True)
         path = Path(root).absolute()
@@ -107,11 +125,17 @@ def create_work(script, requested):
         raise
 
 
-def remove_contents(directory, device, budget, depth=0):
+class Cancelled(Exception):
+    """A signal arrived during cleanup; the remaining artifacts are retained."""
+
+
+def remove_contents(directory, device, budget, depth=0, cancelled=lambda: False):
     if depth > MAX_CLEANUP_DEPTH:
         raise ValueError("smoke cleanup depth cap exceeded")
     with os.scandir(directory) as entries:
         for entry in entries:
+            if cancelled():
+                raise Cancelled()
             budget[0] -= 1
             if budget[0] < 0:
                 raise ValueError("smoke cleanup entry cap exceeded")
@@ -121,7 +145,7 @@ def remove_contents(directory, device, budget, depth=0):
                 try:
                     if identity(metadata) != identity(os.fstat(child)) or metadata.st_dev != device:
                         raise ValueError("smoke cleanup directory changed or crossed a filesystem")
-                    remove_contents(child, device, budget, depth + 1)
+                    remove_contents(child, device, budget, depth + 1, cancelled)
                     current = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
                     if identity(current) != identity(metadata):
                         raise ValueError("smoke cleanup directory changed")
@@ -133,12 +157,14 @@ def remove_contents(directory, device, budget, depth=0):
                 os.unlink(entry.name, dir_fd=directory)
 
 
-def cleanup(parent, name, directory):
+def cleanup(parent, name, directory, cancelled=lambda: False):
     original = os.fstat(directory)
     current = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if not stat.S_ISDIR(current.st_mode) or identity(current) != identity(original):
         raise ValueError("smoke work directory was replaced; refusing cleanup")
-    remove_contents(directory, original.st_dev, [MAX_CLEANUP_ENTRIES])
+    remove_contents(directory, original.st_dev, [MAX_CLEANUP_ENTRIES], cancelled=cancelled)
+    if cancelled():
+        raise Cancelled()
     current = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if identity(current) != identity(original):
         raise ValueError("smoke work directory was replaced; refusing cleanup")
@@ -177,12 +203,17 @@ def run(script, requested=None):
         elif result < 0:
             result = 128 - result
         if result == 0:
-            cleanup(parent, name, directory)
+            cleanup(parent, name, directory, cancelled=lambda: received_signal is not None)
+    except Cancelled:
+        result = 128 + received_signal
     except (OSError, ValueError):
         result = 1
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        # A signal that arrived after cleanup finished still fails the run.
+        if received_signal is not None and result == 0:
+            result = 128 + received_signal
         os.close(directory)
         os.close(parent)
         if result != 0:

@@ -496,6 +496,49 @@ bash scripts/integration/grader-vm-smoke.sh
 bash scripts/integration/grader-smoke.sh
 ```
 
+For the intermittent grader shutdown hang, repeat at least four full VM smokes
+(24 boots), always with fresh work directories:
+
+```sh
+for attempt in 1 2 3 4; do bash scripts/integration/grader-vm-smoke.sh || exit "$?"; done
+```
+
+On a VM exit timeout the test prints the retained serial capture, with every
+line prefixed `grader serial:` so the shell filter preserves it. Static
+`grader-supervisor phase` labels identify configuration, descriptor handoff,
+sandbox stages, namespace-init wait, cgroup cleanup and result-disk sync. Repo
+stdout and stderr remain redirected to `/dev/null` before exec. PID 1 also
+traces global sync and poweroff, without host timestamps or input values.
+
+PID 1 allows the configured run deadline (up to 24 hours) plus 60 seconds for
+supervisor startup and teardown. It never waits unboundedly after SIGKILL.
+Global sync runs on a worker with a 10-second limit. After either failure,
+PID 1 kills children, reaps for at most 5 seconds, then allows 30 seconds for
+`--infra-error` to write a fully validated `crash` result. The host verdict
+classifies this as `infra_error`. Recovery never executes repository code or
+publishes a result while children remain. If recovery itself fails, PID 1 emits
+`grader-init phase recovery-failed`; the smoke collector rejects the drive even
+if Firecracker exits normally. Any future production collector must also reject
+this marker and a full 64 KiB serial capture, which can hide a later failure
+marker, rather than accept a possibly stale result. These bounds preserve
+the poweroff path through a stalled child or sync syscall; a stalled kernel or
+failed reboot still requires the host VM deadline.
+
+The `guest-lockdown` branch (commit `155dfae`) fixes the lockdown kernel's TSC
+calibration stall by having the VMM append `tsc_early_khz`. With kvmclock hidden
+and no PIT, HPET or ACPI PM timer, that kernel cannot calibrate the TSC itself.
+The VMM uses host CPUID leaf 0x15, or a validated `HERMETIC_TSC_KHZ` operator
+value when that leaf is unavailable, and fails closed if neither is available.
+VM specs cannot supply this argument. This is VMM-owned calibration context,
+not a change to the sealed realtime clock, and is not merged here.
+
+The diagnostics remain needed: TSC calibration explains a pre-init boot stall,
+while supervisor startup, test-tree teardown, result sync and reboot can fail
+independently. The original one-in-18-boot shutdown hang has not been reproduced
+in this restricted environment or established to share the TSC cause. KVM
+repetition and confirmation of reset/persistence on the pinned kernel remain
+OPEN; offline tests do not establish its root cause.
+
 The supervisor mounts cgroup v2 privately and attaches the ordered device BPF
 rules before joining the test cgroup. Only `ENODEV` from mounting cgroup2 permits
 omitting that layer, for kernels built without cgroup v2. Such kernels still get
