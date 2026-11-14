@@ -1,10 +1,12 @@
 """Offline known answers for the historical requests test service."""
 
+import errno
 import gzip
 import http.client
 import json
 import socket
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -48,11 +50,43 @@ def request(service, path, method="GET", body=None, headers=()):
 def raw(service, packet):
     with socket.create_connection(("127.0.0.1", service.port), timeout=3) as connection:
         connection.sendall(packet)
-        connection.shutdown(socket.SHUT_WR)
+        try:
+            connection.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            if error.errno != errno.ENOTCONN:
+                raise
         try:
             return connection.recv(hb.MAX_RESPONSE_BYTES + hb.MAX_HEADER_BYTES)
         except ConnectionResetError:
             return b""
+
+
+@pytest.mark.parametrize("shutdown_errno", [errno.ENOTCONN, errno.EBADF])
+@pytest.mark.parametrize("received", [b"", b"unexpected response", ConnectionResetError()],
+                         ids=["eof", "response", "reset"])
+def test_raw_shutdown_only_tolerates_enotconn(monkeypatch, shutdown_errno, received):
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.shutdown.side_effect = OSError(shutdown_errno, "shutdown failed")
+    connection.recv.side_effect = [received]
+    connect = MagicMock(return_value=connection)
+    monkeypatch.setattr(socket, "create_connection", connect)
+    service = MagicMock(port=8765)
+    packet = b"GET /get HTTP/1.1\r\nHost: httpbin.org\r\n\r\n"
+
+    if shutdown_errno == errno.ENOTCONN:
+        expected = b"" if isinstance(received, ConnectionResetError) else received
+        assert raw(service, packet) == expected
+        connection.recv.assert_called_once_with(hb.MAX_RESPONSE_BYTES + hb.MAX_HEADER_BYTES)
+    else:
+        with pytest.raises(OSError) as error:
+            raw(service, packet)
+        assert error.value.errno == shutdown_errno
+        connection.recv.assert_not_called()
+    connect.assert_called_once_with(("127.0.0.1", service.port), timeout=3)
+    connection.sendall.assert_called_once_with(packet)
+    connection.shutdown.assert_called_once_with(socket.SHUT_WR)
+    connection.__exit__.assert_called_once()
 
 
 def test_get_known_answer_and_no_host_metadata(monkeypatch):

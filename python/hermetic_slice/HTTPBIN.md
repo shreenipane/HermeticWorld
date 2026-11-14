@@ -6,10 +6,11 @@ The reviewed requests base is
 ["httpbin-v1"]` for this repository and base in `task.json`. The canonical
 World Manifest accepts the same optional list, commits it in the world root,
 and rejects unknown services and duplicate declarations. Existing requests
-tasks without a declaration have an exact repository/base migration default;
-grading does not modify their artifacts. An explicit empty list disables it.
-When a World Manifest declares services it takes precedence, and conflicting
-task declarations fail before creating the grading container.
+tasks without a manifest or declaration have an exact repository/base migration
+default; grading does not modify their artifacts. An explicit empty list disables
+it. An existing World Manifest takes precedence: omission of `test_services`
+means an empty list, matching its canonical world root. Conflicting task
+declarations fail before creating the grading container.
 
 For container grading and the oracle, `grader.grade` reads the standalone
 stdlib service through a pinned, capped regular file descriptor, activates the

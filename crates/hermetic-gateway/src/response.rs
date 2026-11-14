@@ -816,14 +816,7 @@ impl<R: Read> SanitizingSseReader<R> {
                 }
                 SseOutcome::Reject => self.finish_with(standard_error_event(API_ERROR)),
             },
-            Ok(None) => {
-                // Commit usage before the HTTP writer can signal response EOF
-                // to the client. The handler's later release is idempotent.
-                if let Some(guard) = &self.slot_guard {
-                    let _ = guard.record_and_release();
-                }
-                self.eof = true;
-            }
+            Ok(None) => self.eof = true,
             Err(FetchError::Oversized) | Err(FetchError::Invalid) => {
                 self.finish_with(standard_error_event(API_ERROR))
             }
@@ -853,6 +846,12 @@ impl<R: Read> Read for SanitizingSseReader<R> {
         }
 
         if self.buffer.is_empty() {
+            // Clean EOF and terminal error events both finish the response.
+            // Commit usage before the HTTP writer can expose EOF to the client.
+            // The handler's later release is idempotent.
+            if let Some(guard) = &self.slot_guard {
+                let _ = guard.record_and_release();
+            }
             return Ok(0);
         }
 

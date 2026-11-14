@@ -38,3 +38,29 @@ fn streaming_usage_is_committed_before_response_eof() {
     drop(slot);
     assert_eq!(quota.snapshot().output_tokens, 15);
 }
+
+#[test]
+fn rejected_stream_usage_is_committed_before_response_eof() {
+    let quota = Arc::new(QuotaTracker::new(QuotasConfig::default()));
+    quota.check_and_acquire(0).unwrap();
+    let usage = Arc::new(Mutex::new(StreamUsage::default()));
+    let slot = Arc::new(StreamSlotGuard::new(quota.clone(), usage.clone()));
+    let clock = GuestClock::frozen(
+        time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+        Duration::from_secs(120),
+    );
+    let payload = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\nevent: message_delta\ndata: not-json\n\n";
+    let mut reader =
+        SanitizingSseReader::with_slot_guard(Cursor::new(payload), clock, usage, slot.clone());
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    assert!(output.contains("api_error"));
+    let snapshot = quota.snapshot();
+    assert_eq!(snapshot.input_tokens, 10);
+    assert_eq!(snapshot.output_tokens, 15);
+    assert_eq!(snapshot.concurrent_requests, 0);
+    slot.record_and_release().unwrap();
+    drop(reader);
+    drop(slot);
+    assert_eq!(quota.snapshot().output_tokens, 15);
+}

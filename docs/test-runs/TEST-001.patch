@@ -1,0 +1,24 @@
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+index b8b365ad3..4ce46d0be 100644
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -286,7 +286,18 @@ class PyobjMixin(PyobjContext):
+             parts.append(name)
+         parts.reverse()
+         s = ".".join(parts)
+-        return s.replace(".[", "[")
++# NOTE: Historically "getmodpath" performed a "replace(".[", "[")"
++        # on the module path string to normalise representations of parameter
++        # values that contained ".[" (e.g. "..[").  This early change was
++        # made to accommodate an older workspace that stored identifiers in a
++        # format where a leading dot before an opening bracket was undesirable.
++        # We discovered that this transformation corrupts real test names that
++        # legitimately contain a dot before a bracket, such as the pytest
++        # parametrize value "..[" which ends up as "test_boo[.[]" in the
++        # headline.  The correct behaviour is to preserve the original
++        # representation.  Therefore we simply return the joined path
++        # without the replace.
++        return s
+ 
+     def reportinfo(self):
+         # XXX caching?

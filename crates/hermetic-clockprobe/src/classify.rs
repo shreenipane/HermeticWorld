@@ -668,9 +668,17 @@ pub fn classify_dmesg_dates(
     if text.len() > MAX_TEXT_BYTES {
         return ProbeRecord::new("dmesg_dates", ProbeResult::Error, None, "Text cap exceeded");
     }
-    let expected_ymd = expected_t_clock
+    let Some(expected_ymd) = expected_t_clock
         .filter(|t| *t <= MAX_EPOCH)
-        .map(unix_to_ymd);
+        .map(unix_to_ymd)
+    else {
+        return ProbeRecord::new(
+            "dmesg_dates",
+            ProbeResult::Error,
+            None,
+            "Missing or invalid log reference epoch",
+        );
+    };
     let mut suspicious_lines: Vec<String> = Vec::new();
 
     'lines: for raw_line in text.lines() {
@@ -689,14 +697,10 @@ pub fn classify_dmesg_dates(
             );
         };
         for (y, m, d) in dates {
-            let allowed = match expected_ymd {
-                Some((ey, em, ed)) => {
-                    let found_days = ymd_to_days(y, m, d);
-                    let exp_days = ymd_to_days(ey, em, ed);
-                    found_days.abs_diff(exp_days) <= 1
-                }
-                None => y == 1970 && m == 1 && d == 1,
-            };
+            let (ey, em, ed) = expected_ymd;
+            let found_days = ymd_to_days(y, m, d);
+            let exp_days = ymd_to_days(ey, em, ed);
+            let allowed = found_days.abs_diff(exp_days) <= 1;
             if !allowed {
                 suspicious_lines.push(format!("date={y:04}-{m:02}-{d:02}"));
                 if suspicious_lines.len() >= MAX_DATE_FINDINGS {
@@ -755,10 +759,7 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
     }
 
     for cs in avail.split_whitespace() {
-        if matches!(
-            cs,
-            "kvm-clock" | "hpet" | "acpi_pm" | "pit" | "hyperv_clocksource_tsc_page"
-        ) {
+        if cs != "tsc" {
             return ProbeRecord::new(
                 "clocksource_sysfs",
                 ProbeResult::Leak,
@@ -891,18 +892,43 @@ pub fn classify_vmclock(
 
 /// Probe 12: /proc/cpuinfo model name and flags.
 pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
-    let Some(text) = content else {
+    let Some(text) = content.filter(|text| text.len() <= MAX_TEXT_BYTES) else {
         return ProbeRecord::new(
             "cpuinfo",
             ProbeResult::Error,
             None,
-            "Failed to read /proc/cpuinfo",
+            "Missing or oversized CPU information",
         );
     };
-
-    if text.len() > MAX_TEXT_BYTES {
-        return ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "Text cap exceeded");
+    let mut result = None;
+    for (index, section) in text
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .enumerate()
+    {
+        if index >= MAX_ITEMS {
+            return ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "CPU item cap exceeded");
+        }
+        let record = classify_cpuinfo_section(section);
+        if result.as_ref().is_none_or(|previous: &ProbeRecord| {
+            previous.result != ProbeResult::Leak
+                && (record.result != ProbeResult::Blocked
+                    || previous.result == ProbeResult::Blocked)
+        }) {
+            result = Some(record);
+        }
     }
+    result.unwrap_or_else(|| {
+        ProbeRecord::new(
+            "cpuinfo",
+            ProbeResult::Error,
+            None,
+            "CPU information missing",
+        )
+    })
+}
+
+fn classify_cpuinfo_section(text: &str) -> ProbeRecord {
     let mut model_name: Option<String> = None;
     let mut flags: Option<String> = None;
 
@@ -915,15 +941,21 @@ pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
                 "flags" if flags.is_none() => {
                     flags = Some(v.trim().to_string());
                 }
+                "model name" | "flags" => {
+                    return ProbeRecord::new(
+                        "cpuinfo",
+                        ProbeResult::Error,
+                        None,
+                        "Duplicate CPU field",
+                    );
+                }
                 _ => {}
             }
         }
-        if model_name.is_some() && flags.is_some() {
-            break;
-        }
     }
 
-    if model_name.is_none() || flags.is_none() {
+    if model_name.as_deref().is_none_or(str::is_empty) || flags.as_deref().is_none_or(str::is_empty)
+    {
         return ProbeRecord::new(
             "cpuinfo",
             ProbeResult::Error,

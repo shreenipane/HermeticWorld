@@ -42,6 +42,7 @@ IO_CHUNK_BYTES = 65536
 MAX_TESTS = 100_000
 MAX_TEST_ID_BYTES = 4096
 MAX_ARCHIVE_PATH_BYTES = 4096
+MAX_ROOTFS_BYTES = 64 * 1024**3
 
 
 class SealError(Exception):
@@ -221,6 +222,16 @@ def directory_at(root, parts):
         os.close(current)
 
 
+def new_directory(path):
+    """Create and pin a directory after checking every ancestor without following links."""
+    parent, leaf = open_parent(path)
+    try:
+        os.mkdir(leaf, 0o700, dir_fd=parent)
+        return open_child(parent, leaf)
+    finally:
+        os.close(parent)
+
+
 def unpack_export(archive, destination):
     """Validate the complete export before writing; never use tar extract/extractall."""
     descriptor = open_regular(archive, MAX_EXPORT_BYTES)
@@ -271,8 +282,7 @@ def unpack_export(archive, destination):
                         raise SealError("archive_directory_cap")
             # All ancestors are fresh directories in a private work area. Hard links
             # become independent files, so chmod and later cleanup cannot affect aliases.
-            os.mkdir(destination, 0o700)
-            root, _ = open_parent(Path(destination) / ".probe")
+            root = new_directory(destination)
             try:
                 for parts in sorted(dirs, key=lambda p: (len(p), p)):
                     with directory_at(root, parts[:-1]) as parent:
@@ -351,7 +361,7 @@ def prepare_oracle(row, task_dir, output):
         "PASS_TO_PASS.json": encoded(row["PASS_TO_PASS"]),
     }
     cutoffs = read_json(Path(task_dir) / "task.json")["cutoffs"]
-    os.mkdir(output, 0o700)
+    os.close(new_directory(output))
     for name, data in sorted(artifacts.items()):
         atomic_write(Path(output) / name, data)
     atomic_write(Path(output) / "inputs.json", encoded({
@@ -392,6 +402,90 @@ def normalise_tree(root, epoch):
         os.close(parent)
 
 
+def validate_scan_report(step, value):
+    """Exit zero alone cannot certify coverage of every stored payload."""
+    if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
+        raise SealError("invalid_scan_report")
+    findings = value["findings"]
+    if any(not isinstance(f, dict) or f.get("severity") not in ("gate", "review", "info")
+           or f.get("visibility", "agent_visible") not in ("agent_visible", "image_only")
+           for f in findings):
+        raise SealError("invalid_scan_report")
+    if step == "D10":
+        if value.get("detector") != "D10" or value.get("verdict") not in ("pass", "gate"):
+            raise SealError("invalid_scan_report")
+        if value.get("complete") is not True:
+            raise SealError("detector_incomplete")
+        gated = value["verdict"] == "gate"
+    else:
+        if value.get("schema") != "hermetic-sealcheck/v0" or type(value.get("gate")) is not bool:
+            raise SealError("invalid_scan_report")
+        if not isinstance(value.get("not_covered", []), list):
+            raise SealError("invalid_scan_report")
+        if value.get("not_covered") or any(f.get("channel") == "d8_error" for f in findings):
+            raise SealError("detector_incomplete")
+        gated = value["gate"]
+    if gated or any(f.get("severity") == "gate" and
+                    f.get("visibility", "agent_visible") == "agent_visible" for f in findings):
+        raise SealError("detector_gate")
+    return len(findings)
+
+
+def file_evidence(path, cap):
+    """Stream a pinned artifact, rejecting growth and returning no host metadata."""
+    digest = hashlib.sha256()
+    size = 0
+    with os.fdopen(open_regular(path, cap), "rb") as stream:
+        while True:
+            chunk = stream.read(min(IO_CHUNK_BYTES, cap - size + 1))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > cap:
+                raise SealError("artifact_byte_cap")
+            digest.update(chunk)
+    return {"digest": "sha256:" + digest.hexdigest(), "size_bytes": size}
+
+
+def prepare_bundle_evidence(work, instance):
+    """Retain verified construction outputs without inventing missing world inputs.
+
+    Oracle patches, raw OCI metadata, source exports and credentials are deliberately
+    outside this handoff. This record is staging evidence, not a shippable bundle.
+    """
+    work = Path(work)
+    task_path = work / "tasks" / instance / "task.json"
+    task_raw = read_regular_file_bounded(task_path, MAX_REPORT_BYTES)
+    task = parse_json_bytes(task_raw, MAX_REPORT_BYTES)
+    if not isinstance(task, dict) or task.get("instance_id") != instance:
+        raise SealError("task_identity_mismatch")
+    services = task.get("test_services", [])
+    if services not in ([], ["httpbin-v1"]):
+        raise SealError("invalid_test_services")
+    reports = {}
+    for step in ("sealcheck_tiers", "D8", "D10"):
+        raw = read_regular_file_bounded(work / (step + ".json"), MAX_REPORT_BYTES)
+        report = parse_json_bytes(raw, MAX_REPORT_BYTES)
+        validate_scan_report(step, report)
+        reports[step] = {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                         "size_bytes": len(raw)}
+    rootfs = file_evidence(work / "rootfs.img", MAX_ROOTFS_BYTES)
+    build = read_json(work / "rootfs-report.json")
+    if (not isinstance(build, dict) or build.get("d4") != "pass" or build.get("sha256") != rootfs["digest"][7:]
+            or type(build.get("size_bytes")) is not int or build["size_bytes"] != rootfs["size_bytes"]):
+        raise SealError("rootfs_evidence_mismatch")
+    evidence = {
+        "schema": "hermetic-bundle-evidence/v1", "task_id": instance,
+        "seal_level": "repo_only", "substrate_at_t": "none", "complete": False,
+        "rootfs": rootfs, "scans": reports,
+        "task": {"digest": "sha256:" + hashlib.sha256(task_raw).hexdigest(),
+                 "size_bytes": len(task_raw)},
+        "test_services": services,
+    }
+    atomic_write(work / "bundle-evidence.json", encoded(evidence))
+    return evidence
+
+
 def worker(action, work, instance):
     """Existing modules run in a process with resource limits and a private HOME/TMPDIR."""
     resource.setrlimit(resource.RLIMIT_AS, (MAX_WORKER_MEMORY, MAX_WORKER_MEMORY))
@@ -415,6 +509,7 @@ def worker(action, work, instance):
                     http_post_json=make_http_post_json(cache, token=token) if token else None)
         prepare_oracle(row, task_dir, work / "oracle-inputs")
     elif action == "repository":
+        from hermetic_slice.netvm import RESOLV_CONF
         from hermetic_slice.repo_sealer import seal_repo, remove_tree_at
         import shutil
         task = read_json(task_dir / "task.json")
@@ -431,7 +526,7 @@ def worker(action, work, instance):
         for name, data in {
             "hostname": b"world\n",
             "hosts": b"127.0.0.1 localhost\n::1 localhost\n",
-            "resolv.conf": b"nameserver 10.0.0.1\noptions ndots:0\n",
+            "resolv.conf": RESOLV_CONF.encode("ascii"),
         }.items():
             atomic_write(tree / "etc" / name, data)
         # Remove target bytecode and the same caches omitted by build_rootfs, so
@@ -470,6 +565,8 @@ def worker(action, work, instance):
                               t_clock=datetime.fromisoformat(task["cutoffs"]["t_clock"]),
                               sealcheck_bin=work / "sealcheck", work_dir=work)
         atomic_write(work / "rootfs-report.json", encoded(result))
+    elif action == "evidence":
+        prepare_bundle_evidence(work, instance)
     else:
         raise SealError("unknown_worker_step")
 
@@ -557,18 +654,19 @@ def run(argv=None):
         for step, argv in scans:
             report = command(argv, env=env)
             value = parse_json_bytes(report, MAX_REPORT_BYTES)
-            if not isinstance(value, dict):
-                raise SealError("invalid_scan_report")
-            if value.get("gate") is True or value.get("verdict") == "gate":
-                raise SealError("detector_gate")
+            findings = validate_scan_report(step, value)
             atomic_write(work / (step + ".json"), report)
-            emit(step, "pass", findings=len(value.get("findings", [])))
+            emit(step, "pass", findings=findings)
+        step = "bundle_evidence"
+        command([sys.executable, "-I", "-B", str(Path(__file__).absolute()), "--worker", "evidence",
+                 str(work), args.instance], env=env)
+        emit(step, "pass", artifact="bundle-evidence.json", complete=False)
         step = "world_manifest"
         # These inputs must come from the package-world and trust construction
         # components. Empty roots or arbitrary exemption lists would certify a
         # different world. Do not publish a manifest or success in their absence.
         emit(step, "open", reason="package_world_and_trust_evidence_unavailable",
-             missing=["D5b_inventory_and_release_metadata", "package_closure_and_baseline",
+             missing=["canonical_repository_tree_digest", "D5b_inventory_and_release_metadata", "package_closure_and_baseline",
                       "substrate_inventory_and_exemptions", "installed_world_trust_and_run_spec"],
              detectors={"D7": "not_applicable_without_deep_audit", "D11": "post_run_only",
                         "D12": "requires_runtime_probe"},

@@ -40,6 +40,19 @@ def test_sealed_manifest_is_authoritative_and_conflicts_fail_closed(tmp_path):
     assert ts.load_test_services(tmp_path, task()).names == ("httpbin-v1",)
 
 
+def test_manifest_default_services_match_the_explicit_empty_list(tmp_path):
+    for declaration in ({}, {"test_services": []}):
+        (tmp_path / "manifest.json").write_text(json.dumps(declaration))
+        # The canonical manifest gives these documents the same world root.
+        plan = ts.load_test_services(tmp_path, task())
+        assert plan.names == ()
+        assert plan.t_clock is None
+        assert plan.command("container") == ["exec", "container", "/bin/bash", "/eval.sh"]
+        assert ts.load_test_services(tmp_path, dict(task(), test_services=[])).names == ()
+        with pytest.raises(ValueError, match="conflicting"):
+            ts.load_test_services(tmp_path, dict(task(), test_services=["httpbin-v1"]))
+
+
 @pytest.mark.parametrize("names", [None, "httpbin-v1", ["arbitrary-command"], ["httpbin-v1", "httpbin-v1"], [{}]])
 def test_invalid_manifest_services_are_rejected(tmp_path, names):
     (tmp_path / "manifest.json").write_text(json.dumps({"test_services": names}))

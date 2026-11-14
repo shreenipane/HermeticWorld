@@ -636,7 +636,7 @@ pub(crate) fn handle_stream(
                         config.chunk_write_timeout,
                         err_deadline,
                     );
-                    let _ = stream.shutdown(Shutdown::Both);
+                    stream.finish();
                     return;
                 }
                 Err(_) => {
@@ -648,7 +648,7 @@ pub(crate) fn handle_stream(
                         config.chunk_write_timeout,
                         err_deadline,
                     );
-                    let _ = stream.shutdown(Shutdown::Both);
+                    stream.finish();
                     return;
                 }
             };
@@ -662,7 +662,7 @@ pub(crate) fn handle_stream(
                     config.chunk_write_timeout,
                     err_deadline,
                 );
-                let _ = stream.shutdown(Shutdown::Both);
+                stream.finish();
                 return;
             }
 

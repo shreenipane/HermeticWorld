@@ -86,7 +86,7 @@ def load_test_services(task_dir: Path, task: dict) -> TestServicePlan:
     try:
         raw = read_regular(task_dir / "manifest.json", MAX_MANIFEST_BYTES)
     except FileNotFoundError:
-        manifest = {}
+        manifest = None
     else:
         try:
             manifest = json.loads(raw, object_pairs_hook=_object)
@@ -94,8 +94,8 @@ def load_test_services(task_dir: Path, task: dict) -> TestServicePlan:
             raise ValueError("invalid test-service manifest") from None
         if not isinstance(manifest, dict):
             raise ValueError("invalid test-service manifest")
-    if "test_services" in manifest:
-        sealed = _validate(manifest["test_services"])
+    if manifest is not None:
+        sealed = _validate(manifest.get("test_services", []))
         if names is not None and names != sealed:
             raise ValueError("conflicting test-service declarations")
         names = sealed
@@ -113,7 +113,7 @@ def load_test_services(task_dir: Path, task: dict) -> TestServicePlan:
             raise ValueError()
         epoch = int(clock.astimezone(timezone.utc).timestamp())
         httpbin_service.fixed_date(epoch)
-        if "cutoffs" in manifest and manifest["cutoffs"]["t_clock"] != value:
+        if manifest is not None and "cutoffs" in manifest and manifest["cutoffs"]["t_clock"] != value:
             raise ValueError()
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ValueError("invalid test-service clock") from None

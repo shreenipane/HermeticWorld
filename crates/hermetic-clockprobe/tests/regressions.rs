@@ -289,3 +289,28 @@ fn nominal_frequency_parser_rejects_saturation_and_fractional_zero() {
         assert_eq!(parse_tsc_freq_from_cpuinfo(text), None);
     }
 }
+
+#[test]
+fn cpuinfo_checks_every_processor_and_rejects_incomplete_later_records() {
+    let baseline = format!("processor: 0\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc\n\n");
+    for later in [
+        "processor: 1\nmodel name: Newer CPU\nflags: fpu tsc\n",
+        &format!("processor: 1\nmodel name: {BASELINE_BRAND}\nflags: fpu avx512_fp16\n"),
+    ] {
+        for text in [format!("{baseline}{later}"), format!("{later}\n{baseline}")] {
+            assert_eq!(classify_cpuinfo(Some(&text)).result, ProbeResult::Leak);
+        }
+    }
+    assert_eq!(
+        classify_cpuinfo(Some(&format!("{baseline}processor: 1\nflags: fpu\n"))).result,
+        ProbeResult::Error
+    );
+    assert_eq!(
+        classify_cpuinfo(Some(&baseline.repeat(2))).result,
+        ProbeResult::Blocked
+    );
+    assert_eq!(
+        classify_cpuinfo(Some(&baseline.repeat(MAX_ITEMS + 1))).result,
+        ProbeResult::Error
+    );
+}

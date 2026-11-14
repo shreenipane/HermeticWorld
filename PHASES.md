@@ -1,7 +1,7 @@
 # Hermetic World: Phases
 
 - **Status:** derived from §15 of [HERMETIC_WORLD_ARCHITECTURE.md](HERMETIC_WORLD_ARCHITECTURE.md). Requirement IDs refer to [TRD.md](TRD.md).
-- **Last updated:** 2026-11-11
+- **Last updated:** 2026-11-14
 
 Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -11,8 +11,8 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 |---|---|---|---|---|
 | 0 | Vertical slice | WSL2 Ubuntu + Docker | Oracle passes on every slice task; one agent run graded | **Done** 2026-11-11 |
 | 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | In progress |
-| 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
-| 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
+| 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | In progress; construction and oracle integration open |
+| 3 | VMs | Linux x86 + KVM | E1, E8, E9 | In progress; runtime components merged, VM acceptance open |
 | 3b | Clock hiding | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Source audit/proposal; nested tests open |
 | 4 | Extensions | Linux x86 + KVM | E2 Track B; E5 | Not started |
 
@@ -24,6 +24,47 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 **Cut list.** If time runs out, drop in this order: Phase 4 → Phase 3b → Mode G → R3 → R2.
 
 **Smallest publishable result:** the Phase 1 leak report plus the Phase 2 ablation (E2 Track A).
+
+### Integration status, 2026-11-13/14
+
+Recorded from `git log --all --since=2026-11-13`; a merge into `int-night`
+does not mean a merge into `main` or completed VM acceptance. No phase exit
+criterion is removed by an open dependency.
+
+| Branch | State at this review | Delivered work and remaining acceptance |
+|---|---|---|
+| `int-night` | Head `2f0856c`; not merged into `main` | Includes the five topic merges below and `77e4eae`: destination-independent service-port interception, AgentVM /32 routing and fragment-watermark boot fix. Review and prepared-host VM reruns remain necessary. |
+| `agent-h` | Separate branch `e1f7457`, pending review | Optional host harness over execd vsock, deterministic wire vectors, command evidence, Chat Completions gateway adapter and owner-run smoke. No end-to-end VM acceptance recorded by these commits. |
+| `guest-lockdown` | Separate branch `155dfae` (after `038272f`, `8096b58`), pending integration | Forced confidentiality lockdown, removal of root kernel/memory interfaces and paravirtual clock hooks, lockdown probes, VMM-owned `tsc_early_khz`. x86 force-selects PERF_EVENTS; lockdown restricts its kernel-reading uses. Kernel rebuild and all VM smoke checks remain open. |
+| `clock-3b` | `10d8f5c`, merged into `int-night` by `2f0856c` | Source audit, bounded read-only diagnostic, separate kernel/CPU proposals and nested test plan. Host denial, complete probes and nested acceptance remain open; retain `clock: faked`. |
+| `empty-stmt` | Points to `main` at `9fa9070`; no separate branch changes | No empty-statement implementation is present on this branch. The head records the main-fix merge for direct/initramfs execd boot ordering. |
+| `httpbin-world` | `aca4738`, merged into `int-night` by `a10f64a` | Bounded local httpbin profile, task/manifest declaration and container-grader lifecycle. Historical requests oracle, AgentVM dispatch and GraderVM lifecycle remain open. |
+| `netvm-tls` | `31dd4b3`, merged into `int-night` by `ccfc5ab` | Sealed CA-material boot transfer, TLS termination and verified offline HTTPS tests; prepared-host two-VM verification and dm-verity remain open. |
+| `e2e-1` | `62a29e7`, merged into `int-night` by `39173b3` | Real-task export/intake/repository/rootfs/scanning orchestration and private oracle inputs. Deliberately exits 1 before world publication until package, substrate, trust and run-spec evidence is supplied. |
+| `t37-noop` | `b7d8a51`, merged into `int-night` by `2de8b60` | Removes generated no-op assignments under the recorded architecture §11.2 decision; other equivalent/mutant rewrites and shortfall reporting remain. |
+
+Main's 2026-11-13 merges also include component review fixes, the detector audit,
+HEXT alignment (`d74a79b`), grader PID 1 (`7deae2d`), offline grader-chain
+integration (`64143d6`), supervisor isolation (`f9bf272`), NetVM PID 1
+(`553d5b3`), AgentVM eth0 setup (`559fe3a`), run-label isolation (`6097c74`),
+trusted reboot initramfs (`2bad653`) and boot-order repair (`4b6549b`). These
+deliver implementations and smoke entrypoints; the phase exits still require
+their specified measurements and VM runs.
+
+Deferred work retained in full:
+
+- [ ] Host-side hypercall/MSR filtering: root with kernel execution can still
+  invoke KVM CLOCK_PAIRING or wall/system MSRs; guest lockdown and CPUID masks
+  do not establish host denial. Requires host/VMM changes and canary tests.
+- [ ] AMD hosts (and nested hosts without usable CPUID.15) need an accurate
+  operator-supplied `HERMETIC_TSC_KHZ` with `guest-lockdown`; the resolver fails
+  closed without it. No guessed frequency or hidden-clock claim.
+- [ ] Httpbin wire-protocol methods/bodies: versioned protocol decision pending
+  for request headers/bodies, per-authority method policy, dynamic dispatch and
+  auditing. Keep the requests oracle and AgentVM/GraderVM service integration open.
+- [ ] CPU identity template: select a cutoff-specific policy and address stock
+  Firecracker host-vendor/Intel-brand normalization plus other identity leaves.
+  The experimental JSON alone does not implement this policy.
 
 ---
 
@@ -82,7 +123,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] D11: advisory patch inspection, test-infrastructure paths, runner sections, monkeypatching and shadowing; standard unified diffs and quoted paths supported; bounded CLI/library inputs.
   - [ ] D12: advisory text/file scanner implemented with bounded no-follow traversal. Open: host run/probe/gateway integration scanning every guest egress and prompts, and recording `date_leak_observed`, is not wired (TR-SEC-5). `python/hermetic_slice/runner.py` still emits null; the attestation field alone does not implement the sentinel.
   - [ ] Shared path policy: decide whether to reject non-UTF-8 roots/paths or encode their bytes losslessly across scan, index and SARIF. D4/D8 currently normalize rendered strings against the original root; a non-UTF-8 root can retain its host prefix, and lossy path identities can collide.
-  - [ ] Gate findings outside this detector task: dispositions queues identify directories only by device/inode, allowing replacement when an inode is reused (`python/hermetic_slice/dispositions.py`); the E3 patch helper assumes its temporary directory cannot be inside a repository (`python/hermetic_slice/e3.py`). Their existing regression tests fail with worktree-backed temporary storage; fixes belong to those components.
+  - [x] Gate findings outside this detector task: dispositions directory identity under inode reuse and E3 temporary patches inside a repository fixed on `ws-bugs` (`297b00b`), merged into main on 2026-11-13; the same change bounds long socket paths.
 - [x] Thread scrub and mutable-content revision rule (TR-SEAL-9) (T1.13)
   - [x] Deferred (T1.13 review, non-blocking): scrub URL matching misses aliases of the same resource (`www.github.com`, `http://`, trailing-dot host, empty path segments, `/repositories/{id}/...`); canonicalise or deny them before a WorldServer maps aliases to stored content — aliases canonicalised; unverifiable repository-ID routes denied; regression cases added.
   - [x] Deferred (T1.13 review): the CLI secret-safety test calls `intake` with arguments the parser rejects, so the exception path is never exercised; use valid arguments and assert the mock ran — valid CLI arguments, mocked dataset, call and error-output assertions.
@@ -90,7 +131,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] Deferred (T1.13 review): task publication wraps every failure as `task_publication_failed` and drops the cause; pass `IntakeError` through and keep the error class — typed intake failures preserved; unexpected exceptions remain sanitised; stale-tree cleanup now has entry/depth caps and checks opened directory identity.
   - [x] Deferred (T1.13 review): decide whether the scrub fallback paths should return the as-scraped statement with `problem_statement_revision = as_scraped` and a warning (today they exclude content) — retain exclusion per §4: no verified history means no content; tested with GitHub alias denial.
   - [x] Deferred (T1.13 review): fixture `pytest_issue_6189_edits.json` has a creation edit dated before the issue's creation; the cache case in `test_http.py` can pass before the bounded-read check — impossible edit removed; cache-growth case now asserts bounded_read executed.
-  - [ ] Deferred (gates): Docker tests use fixed image and network names (`hermetic-test/fake-swebench`, `hermetic-world-test-inst-1-net`), so two py-gate runs at once make `test_cli_seal_images` and `test_world_probe_cli` fail; use per-run names
+  - [x] Deferred (gates): fixed Docker image/network names replaced with per-run names on `flaky-fix` (`513f4e9`) and `sealer-test-iso` (`a158e9a`), merged into main on 2026-11-13.
 - [x] Dispositions: `repaired` / `excluded`, never silent (§5.5) (T1.14)
   - [x] Deferred (T1.14 review, non-blocking): a report with an inline manifest is rejected on rerun after publication changed the disk manifest, so an interrupted repair cannot finish in that case; reconcile the inline manifest with verified repair metadata — only the verified repair transition is reconciled; interrupted and complete reruns tested.
   - [x] Deferred (T1.14 review): Python checks UTF-8 span boundaries after merging spans (`redact_problem_statement("é", [(0,1),(1,2)])` succeeds; Rust rejects); validate every supplied boundary first — all original boundaries checked, including adjacent and nested spans.
@@ -124,8 +165,9 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Deferred (T2.4): `_make_output_dirs` still creates missing output directories by path (the directory is then opened anchored and checked before any write)
   - [ ] Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
   - [ ] Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
-- [ ] Open, postponed by the owner on 2026-11-12 (T2.2): gateway deadline handling. `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run; investigation found no slot leak (load timing, inferred, not reproduced) but a real defect: the next request's head deadline is armed at hand-off and overwrites the current request's body deadline (body deadline cut to the head deadline; kept-alive connections closed after any request longer than the head deadline). A first fix is on branch `t2.2` (`b0c7867`, not merged) and was rejected in review: its wait for request completion is unbounded (a retained writer plus a client disconnect parks the connection thread forever), two loosened timing tests no longer prove their deadline, and the two new regressions are not deterministic. Review: `t2.2-codex-deadline-rearm-20261112`
-  - [ ] Also found by CodeRabbit on main (2026-11-12): keep the body deadline active until the body reader finishes (`crates/vendor/tiny_http/src/client.rs:162`); do not release a successor before its predecessor finishes (`util/sequential.rs:172`); do not block while dropping a waiting reader (`util/sequential.rs:159`). Details: `cr-main-crates-20261112.log`
+- [x] T2.2 deadline repair, merged into main on 2026-11-13 (`ae2e6ef`): each header reader gets its own deadline cell, armed only after body-reader handoff; completed requests cannot clear a successor's deadline. This supersedes the rejected `t2.2` attempt (`b0c7867`).
+  - [x] Body-reader deadline lifetime and connection-slot lifetime fixes are included in `ae2e6ef`, with regression tests. This records the implementation; it does not assert that every previously observed load-dependent timeout has been reproduced or resolved.
+  - [ ] Remaining sequential-stream concerns: do not release a successor before its predecessor finishes; do not block while dropping a waiting reader (`crates/vendor/tiny_http/src/util/sequential.rs`). The latter still calls blocking `recv().unwrap()`; these items are not closed by the deadline-cell repair.
 - [ ] Package world (TR-PKG-*)
   - [ ] Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [ ] Yanked-release handling (simple-index yank rewriting in `python/hermetic_yank`, merged 2026-11-13; wiring into the package mirror still open)
@@ -161,6 +203,10 @@ The oracle passes on every slice task, and one agent run is graded.
 - [x] Manifest with `world_root`
 - [ ] Reproducibility check (E7)
 - [ ] E4 oracle harness: gold passes, `FAIL_TO_PASS` fails on base, per-test parity with the official harness, flaky-test detection (3×), pytest plugin list (oracle result analysis in `python/hermetic_oracle`, merged 2026-11-13; harness run still open)
+  - [x] On `int-night`: `httpbin-v1` local profile with bounded deterministic endpoints, manifest/task registration and container-grader startup/cleanup (`aca4738`).
+  - [ ] Historical requests oracle still needs HTTPS/hardcoded-host routing and timeout semantics; AgentVM needs the versioned WorldServer protocol decision, and GraderVM needs service lifecycle/loopback/interpreter/result-fd isolation. See [HTTPBIN.md](python/hermetic_slice/HTTPBIN.md).
+  - [x] On `int-night`: stage-one real-task sealing (`62a29e7`) retains bounded private artifacts and prepares exact oracle inputs without executing them on the host.
+  - [ ] Stage-one completion: supply D5b inventory/release metadata, package closure/baseline roots, substrate inventory/exemptions, installed trust and run spec before manifest publication. Current runner exits 1 with an open verdict; oracle execution remains separate. See [E2E_SEAL.md](scripts/integration/E2E_SEAL.md).
 - [ ] E2 design: a paired subset of 50–100 tasks stratified by repo and year, ≥ 2 seeds, bootstrap intervals, McNemar, drift control
 
 ### Exit
@@ -180,7 +226,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] `hermetic-vmm`: Firecracker + jailer orchestration (TR-VMM-1) (T3.3 merged: spec validation, request plan with the kvmclock-hiding CPU template, jail plan, lifecycle, API client, dev-unjailed mode; Firecracker v1.18.0 pinned)
   - [ ] Open (T3.3): run the jailer tests as root (owner runs `sudo -v` first) and the in-VM boot test once a guest kernel and rootfs exist
   - [x] Open (T3.3): confirm the status-frame format against `hermetic-execd` (T3.1): execd now emits the guest clock the vmm decoder expects; to be proven end to end at the first VM boot
-- [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
+- [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (T3.2 tooling and first builds merged; Linux 6.6.160 integration in `870c859`; lockdown branch rebuild/acceptance still open)
 - [x] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (T3.1, merged 2026-11-13 after review+fix; status frame now carries the guest clock for the vmm decoder)
   - [x] Early proc handoff: `init=/sbin/hermetic-init` shim mounts read-only procfs then execs execd (clock-first kept); guest kernel moved to 6.6.160 with devtmpfs automount and initrd support; dev-unjailed boot smoke in `scripts/integration/boot-smoke.sh`
   - [x] TR-EXD-6 trusted-reboot initramfs: reproducible `newc` builder with known-answer hash, `hermetic.initramfs=1` clock-first devtmpfs/base assembly, pinned and bounded hermetic-vmm initrd snapshot, and host boot record; first boot uses the base-resident `init=/sbin/hermetic-init` shim
@@ -197,9 +243,12 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] Open: dm-verity for NetVM (TR-NET-1). No veritysetup tool is installed; pinned kernel has DM_INIT disabled; guest-kernel boot policy requires root=/dev/vda and rejects dm setup arguments. Requires authenticated root-hash metadata and VMM boot wiring; precise plan and corruption checks in BOOT_NOTES.md. Current image is D4-checked read-only ext4.
   - [ ] Open: two-VM boot/network verification; this environment has no /dev/kvm. Run `scripts/integration/net-smoke.sh "$HOME/hermetic-netvm-smoke"` on the prepared host with a policy-checked kernel including built-in legacy IPv4 filtering, NAT, conntrack and REDIRECT (see BOOT_NOTES.md, Network VM).
 - [ ] AgentVM on a CoW world; Mode H through vsock 5000
+  - [ ] Separate `agent-h` branch (`e1f7457`): host harness and Chat Completions adapter implemented, pending review/integration and prepared-host `agent-h-smoke.sh`. Exact count_tokens and inline-document mappings remain a provider-policy decision; unsupported requests fail closed.
 - [ ] Mode G: `/opt/agent` volume, model path NetVM → gateway (cut list: optional)
 - [ ] ExtractorVM plus host validator (TR-EXT-*)
+  - [x] Components, canonical HEXT compatibility and offline chain merged on 2026-11-13; prepared-host VM extraction/validation acceptance remains open.
 - [ ] GraderVM supervisor and isolation (TR-GR-1 to TR-GR-5)
+  - [x] Grader PID 1, supervisor sandbox-plan application, deadline/diagnostic handling and offline chain merged on 2026-11-13 (`7deae2d`, `f9bf272`, `f872ad1`, `64143d6`); complete VM and forgery acceptance remains open.
 - [ ] `hermetic_mutants`: variant pool, base-failing assertion finder, validation (TR-GR-8, TR-GR-9)
   - [x] Owner decision (2026-11-13): HERMETIC_WORLD_ARCHITECTURE.md §11.2 takes precedence over the T3.7 brief's no-op insertion requirement. Removed no-op assignments from equivalent and paired mutant generation; kept the other rewrites and shortfall reporting. Regression tests cover all generated variants, marker strings, docstrings and deterministic known answers.
 - [ ] Differential runs R0, R1 and R2 in parallel; R3 advisory (cut list: R3, then R2)
@@ -227,8 +276,17 @@ The oracle passes on every slice task, and one agent run is graded.
 - [x] Add the std-only, read-only `hermetic-clockprobe` workspace crate with
   bounded descriptor-based inspection and offline classification/regression fixtures.
   `unavailable` is incomplete coverage, even with exit 0.
+  - [x] Integration review: inspect every supplied CPU record, reject unexpected
+    available clocksources, and require a valid log cutoff; offline regressions
+    demonstrate the former false negatives.
 - [x] Keep the kernel/CPU proposals separate in `images/kernel/clock-3b.config`
   and `vmm/clock-3b.cpu-template.json`; active settings are unchanged.
+  - [ ] Reconcile the old clock proposal's `PERF_EVENTS=n` request and matching
+    artifact test with the kernel policy on `guest-lockdown`: pinned Linux
+    6.6.160 `arch/x86/Kconfig` unconditionally selects PERF_EVENTS. The proposed
+    fragment cannot retain every requested value after olddefconfig, so its
+    current artifact test does not establish a buildable policy. Kernel-policy
+    integration and acceptance remain open.
 - [x] Document the exact [execd baseline command and nested test matrix](docs/clock-3b-config-and-test-plan.md).
 - [ ] Manager: run today's AgentVM baseline and the nested kernel/VMM tests.
 - [ ] Close root clock channels: CPUID clearing alone does not deny the wall/system
@@ -275,5 +333,5 @@ channel coverage pass. This source audit and diagnostic do not attest `hidden`.
 
 ### Integration findings, 2026-11-13 (grader path)
 - [x] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2).
-- [ ] Supervisor isolation: apply the `hermetic-grader-sandbox` plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill.
+- [x] Supervisor isolation: `sup-isolation` (`f9bf272`), merged into main on 2026-11-13, applies the sandbox plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, devices and cgroup v2 policy), isolated result descriptor and process-group teardown. Prepared-host VM acceptance remains part of Phase 3.
 - [x] Extraction format: the validator's HEXT v1 format is canonical; `hermetic-extract-agent` emits it byte for byte. Tree root is `patch:` / `repo_dir: ""` on both sides; `.` is refused. Cross-crate test `crates/hermetic-extract-agent/tests/validator_compat.rs`; grader smoke now runs agent then validator (done 2026-11-13).

@@ -37,6 +37,19 @@ FAIL_TO_PASS/PASS_TO_PASS JSON lists, and an input digest record. It is prepared
 during intake, outside the guest tree. It is data for a future GraderVM run;
 preparation is not an oracle verdict.
 
+After the scans, `bundle-evidence.json` records the SHA-256 and byte size of
+the actual rootfs, each scan report and task record, plus the declared test
+services. Rootfs bytes must match the builder's D4-passing report; scans must
+explicitly pass with complete coverage. In particular, `not_covered`, D8
+inspection errors and incomplete D10 scans stop the run. The evidence uses
+relative artifact names, excludes private oracle data and host paths, is written
+atomically with mode 0600, and always records `complete: false`. This staging
+handoff supplies available content evidence; it is not a world manifest or a
+shippable world bundle. Repository Merkle roots require a repair to the manifest
+component's canonical tree-digest tool: its existing walk is unbounded and uses
+paths after inspecting their type. It cannot safely digest a mutable hostile
+tree. No substitute hash scheme is invented here.
+
 This integration cannot yet finish a world bundle. It exits 1 with an `open`
 world-manifest verdict after the available scans pass, because existing
 construction components do not supply the complete class-B inventory/release

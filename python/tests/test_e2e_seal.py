@@ -138,6 +138,27 @@ def test_export_import_keeps_guest_links_and_breaks_hardlinks(tmp_path):
     assert int(outside.stat().st_mtime) != 1700000000
 
 
+@pytest.mark.parametrize("operation", ["unpack", "oracle"])
+def test_output_symlink_ancestor_is_rejected_before_mkdir(tmp_path, operation):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(outside, target_is_directory=True)
+    destination = link / "output"
+    archive = tmp_path / "source.tar"
+    make_tar(archive, [("file", "file", b"payload")])
+    _, row, _ = e2e.load_record(FIXTURE, INSTANCE)
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "task.json").write_text('{"cutoffs":{"t_clock":"2014-01-01T00:00:00Z"}}')
+    with pytest.raises(OSError):
+        if operation == "unpack":
+            e2e.unpack_export(archive, destination)
+        else:
+            e2e.prepare_oracle(row, task, destination)
+    assert list(outside.iterdir()) == []
+
+
 @pytest.mark.parametrize("cap,value", [("MAX_FILE_BYTES", 1), ("MAX_TREE_BYTES", 1), ("MAX_MEMBERS", 1)])
 def test_export_resource_caps(tmp_path, monkeypatch, cap, value):
     archive = tmp_path / "source.tar"
@@ -242,7 +263,7 @@ def test_repository_worker_seals_real_objects_and_preserves_source_edits(tmp_pat
     assert int((repo / "source.py").stat().st_mtime) == 1388534400
     assert (etc / "hostname").read_bytes() == b"world\n"
     assert (etc / "hosts").read_bytes() == b"127.0.0.1 localhost\n::1 localhost\n"
-    assert (etc / "resolv.conf").read_bytes() == b"nameserver 10.0.0.1\noptions ndots:0\n"
+    assert (etc / "resolv.conf").read_bytes() == b"nameserver 10.0.2.3\noptions ndots:0\n"
     objects = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
                              env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
                              capture_output=True, timeout=10, check=True)
@@ -341,9 +362,11 @@ def test_orchestration_is_ordered_and_stops_without_false_world(tmp_path, monkey
         if "scan" in argv:
             if failure == "sealcheck_tiers":
                 raise e2e.CommandFailure(2, b'{"gate":true}')
-            return b'{"gate":false,"findings":[],"not_covered":[]}'
-        if "d8" in argv or "--root" in argv:
-            return b'{"findings":[],"verdict":"pass"}'
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}'
+        if "d8" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
+        if "--root" in argv:
+            return b'{"detector":"D10","findings":[],"verdict":"pass","complete":true}'
         return b""
     monkeypatch.setattr(e2e, "command", fake_command)
     original_umask = os.umask(0o077)
@@ -361,7 +384,7 @@ def test_orchestration_is_ordered_and_stops_without_false_world(tmp_path, monkey
         assert (work / (failure + ".failed-output")).is_file()
     else:
         assert [e["step"] for e in events] == ["record", "image_export", "unpack", "intake", "repository",
-                                                 "rootfs", "sealcheck_tiers", "D8", "D10", "world_manifest"]
+                                                 "rootfs", "sealcheck_tiers", "D8", "D10", "bundle_evidence", "world_manifest"]
         assert events[-1]["verdict"] == "open"
         assert "D5b_inventory_and_release_metadata" in events[-1]["missing"]
         assert events[-1]["detectors"]["D11"] == "post_run_only"
