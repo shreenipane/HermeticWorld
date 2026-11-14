@@ -7,6 +7,7 @@ pub mod containers;
 pub mod d1;
 pub mod d11;
 pub mod d12;
+pub mod d12_runtime;
 pub mod d5a;
 pub mod d6;
 pub mod d8;

@@ -26,6 +26,37 @@ pub struct GatewayConfigFile {
 
     #[serde(default = "default_upstream_read_timeout_s")]
     pub upstream_read_timeout_s: u64,
+
+    /// Real-date sentinel (D12, TR-SEC-5) host data to look for. The real date itself is the
+    /// host's current UTC date at gateway start.
+    #[serde(default)]
+    pub date_sentinel: DateSentinelConfig,
+}
+
+/// Host names and host paths the D12 sentinel looks for in gateway traffic. Never logged.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DateSentinelConfig {
+    #[serde(default)]
+    pub host_names: Vec<String>,
+    #[serde(default)]
+    pub host_paths: Vec<String>,
+    #[serde(default = "default_tolerance_days")]
+    pub tolerance_days: u32,
+}
+
+fn default_tolerance_days() -> u32 {
+    1
+}
+
+impl std::fmt::Debug for DateSentinelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DateSentinelConfig")
+            .field("host_names", &self.host_names.len())
+            .field("host_paths", &self.host_paths.len())
+            .field("tolerance_days", &self.tolerance_days)
+            .finish()
+    }
 }
 
 fn default_upstream_base_url() -> String {
@@ -46,6 +77,7 @@ pub struct GatewayConfig {
     pub log_dir: PathBuf,
     pub api_key_file: PathBuf,
     pub upstream_read_timeout_s: u64,
+    pub date_sentinel: DateSentinelConfig,
     /// Loaded once into memory; never logged.
     api_key: String,
 }
@@ -62,6 +94,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("log_dir", &self.log_dir)
             .field("api_key_file", &self.api_key_file)
             .field("upstream_read_timeout_s", &self.upstream_read_timeout_s)
+            .field("date_sentinel", &self.date_sentinel)
             .field("api_key", &"<redacted>")
             .finish()
     }
@@ -116,6 +149,7 @@ impl GatewayConfig {
             log_dir: parsed.log_dir,
             api_key_file: parsed.api_key_file,
             upstream_read_timeout_s: parsed.upstream_read_timeout_s,
+            date_sentinel: parsed.date_sentinel,
             api_key,
         })
     }
@@ -141,12 +175,18 @@ impl GatewayConfig {
             log_dir,
             api_key_file,
             upstream_read_timeout_s: 120,
+            date_sentinel: DateSentinelConfig::default(),
             api_key,
         }
     }
 
     pub fn with_upstream_read_timeout_s(mut self, timeout_s: u64) -> Self {
         self.upstream_read_timeout_s = timeout_s;
+        self
+    }
+
+    pub fn with_date_sentinel(mut self, cfg: DateSentinelConfig) -> Self {
+        self.date_sentinel = cfg;
         self
     }
 
