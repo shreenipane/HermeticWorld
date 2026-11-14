@@ -23,6 +23,7 @@ members = [
     "crates/hermetic-vmm",
     "crates/hermetic-bundle",
     "crates/hermetic-grader-result",
+    "crates/hermetic-escapeprobe",
 ]
 resolver = "2"
 

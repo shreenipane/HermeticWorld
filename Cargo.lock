@@ -568,6 +568,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-escapeprobe"
+version = "0.1.0"
+dependencies = [
+ "hermetic-netvm-dns",
+ "libc",
+]
+
+[[package]]
 name = "hermetic-execd"
 version = "0.1.0"
 dependencies = [
