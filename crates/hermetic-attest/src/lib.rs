@@ -48,3 +48,11 @@ pub use score_card::{
     MAX_SCORE_CARD_RECORDS,
 };
 pub use status::{compute_run_status, GradingInputs};
+pub mod offline_key;
+pub mod verify;
+
+pub use offline_key::{ed25519_key_id, Ed25519Signer, Ed25519Verifier, KeyError};
+pub use verify::{
+    check_against_classification, verify_audit_attestation, verify_run_attestation, ReplayGuard,
+    RunBinding, RunClassification, VerifyError,
+};

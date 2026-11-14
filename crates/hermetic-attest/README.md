@@ -119,9 +119,13 @@ process running as the same host user or host root.
 
 ---
 
-## 4. Deferred Work
+## 4. Verification Policy
+
+`verify::verify_run_attestation` verifies the envelope, checks the record against a `RunBinding` (expected task id, world root, world bundle digest `version_tuple.world_version`, sealcheck report digest, grader image digest) and admits the run digest once into a `ReplayGuard` (a second envelope for the same record is a replay). `verify_audit_attestation` accepts an audit only for a run already admitted. `check_against_classification` requires the record's `clock`, `date_leak_observed` and `run_status` to equal the run classifier output (`hermetic-run-classification/v1`); a `date_sentinel_not_run` flag counts as an observed leak. A record with `clock: hidden` and `date_leak_observed: true` is invalid.
+
+## 5. Deferred Work
 
 The following cryptographic operations are specified for future phases:
 
-1. **Real Offline-Key and Sigstore Keyless Signing**: Cryptographic key management (e.g. ED25519 offline keys and Sigstore Fulcio/Rekor integration) is deferred. The crate provides the `Signer` and `Verifier` trait abstractions alongside a deterministic test implementation.
+1. **Sigstore Keyless Signing**: Fulcio/Rekor integration is deferred. Offline-key signing is implemented (`offline_key`): Ed25519 over the DSSE PAE, private key as PKCS#8 handed in by path (symlinks and non-regular files refused) or by an open descriptor, key id `sha256:<hex of SHA-256 of the public key>`; the verifier holds a fixed trusted key set and refuses missing or unknown key ids. The crate has no default key location.
 2. **TEE Hardware Quote Verification**: Attestation quote verification against hardware root certificates (AMD KDS, Intel PCS, AWS Nitro PKI) is deferred. The crate defines the data model (`TeeQuote`, `TeePlatform`) and preserves quote bytes in the canonical statement.

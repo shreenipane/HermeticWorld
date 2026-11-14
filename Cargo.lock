@@ -514,6 +514,7 @@ name = "hermetic-attest"
 version = "0.1.0"
 dependencies = [
  "hermetic-common",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
