@@ -211,3 +211,20 @@ device-mapper: ioctl: 4.48.0-ioctl (2023-03-01) initialised: dm-devel@redhat.com
         assert_eq!(parse_substrate_bound(bad), None, "{bad:?}");
     }
 }
+
+/// Review findings (2026-11-14): impossible bound dates must be configuration
+/// errors, and a clock sample spanning a long stop must never be classified.
+#[test]
+fn substrate_bound_rejects_impossible_dates_and_stale_clock_samples_are_refused() {
+    for bad in ["2026-02-30\n", "2026-02-29\n", "2026-04-31\n", "2026-06-31\n", "2026-11-31\n", "2026-01-00\n"] {
+        assert_eq!(parse_substrate_bound(bad), None, "{bad:?}");
+    }
+    assert_eq!(parse_substrate_bound("2024-02-29\n"), Some((2024, 2, 29)));
+    assert_eq!(parse_substrate_bound("2026-01-31\n"), Some((2026, 1, 31)));
+    use hermetic_clockprobe::probes::posix_sample_is_coherent as ok;
+    assert!(ok(Some(10.0), Some(10.2)));
+    assert!(ok(Some(10.0), Some(11.0)));
+    for (b, a) in [(Some(10.0), Some(71.0)), (Some(10.0), Some(11.01)), (Some(10.0), Some(9.0)), (None, Some(1.0)), (Some(1.0), None), (Some(f64::NAN), Some(1.0)), (Some(1.0), Some(f64::INFINITY))] {
+        assert!(!ok(b, a), "{b:?} {a:?}");
+    }
+}

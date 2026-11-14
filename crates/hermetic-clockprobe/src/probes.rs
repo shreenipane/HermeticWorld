@@ -266,13 +266,20 @@ fn probe_vmclock(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
 /// Never substitute one clock for another or claim complete clock coverage.
 fn probe_posix(_proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
     use arch_x86::{clock_seconds, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_TAI};
-    // Sample the boot-relative clocks around realtime so the comparisons share
-    // one instant to well within the tolerance.
-    let boot = clock_seconds(CLOCK_BOOTTIME);
-    let mono = clock_seconds(CLOCK_MONOTONIC);
-    let rt = clock_seconds(CLOCK_REALTIME);
-    let tai = clock_seconds(CLOCK_TAI);
-    Ok(classify::classify_posix_clocks(rt, mono, boot, tai, expected))
+    // Bracket the samples with BOOTTIME: a stop or scheduling delay between reads
+    // would otherwise look like a clock offset. Retry a bounded number of times,
+    // then report an inspection error rather than classify stale samples.
+    for _ in 0..POSIX_SAMPLE_ATTEMPTS {
+        let boot = clock_seconds(CLOCK_BOOTTIME);
+        let mono = clock_seconds(CLOCK_MONOTONIC);
+        let rt = clock_seconds(CLOCK_REALTIME);
+        let tai = clock_seconds(CLOCK_TAI);
+        let after = clock_seconds(CLOCK_BOOTTIME);
+        if posix_sample_is_coherent(boot, after) {
+            return Ok(classify::classify_posix_clocks(rt, mono, boot, tai, expected));
+        }
+    }
+    Ok(error("posix_clocks"))
 }
 fn uptime(proc: &Root) -> io::Result<f64> {
     let text = proc.text("uptime", MAX_SMALL_FILE_BYTES)?;
@@ -286,6 +293,16 @@ fn uptime(proc: &Root) -> io::Result<f64> {
 }
 fn checked(name: &str, result: io::Result<ProbeRecord>) -> ProbeRecord {
     result.unwrap_or_else(|_| error(name))
+}
+
+const POSIX_SAMPLE_ATTEMPTS: usize = 3;
+/// Largest BOOTTIME span across one set of clock reads; far below the
+/// classifier's tolerance, so a coherent sample cannot produce a false leak.
+pub const MAX_POSIX_SAMPLE_SPAN_SECONDS: f64 = 1.0;
+
+pub fn posix_sample_is_coherent(before: Option<f64>, after: Option<f64>) -> bool {
+    matches!((before, after), (Some(b), Some(a))
+        if b.is_finite() && a.is_finite() && a >= b && a - b <= MAX_POSIX_SAMPLE_SPAN_SECONDS)
 }
 
 /// Path, relative to /etc/hermetic, of the sealed newest substrate date.

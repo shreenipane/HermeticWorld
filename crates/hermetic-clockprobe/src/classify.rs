@@ -636,7 +636,7 @@ pub fn parse_substrate_bound(text: &str) -> Option<(u32, u32, u32)> {
         s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
     };
     let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    ((1970..=9999).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d))
+    ((1970..=9999).contains(&y) && valid_date(y as i32, m, d)).then_some((y, m, d))
 }
 
 /// As `classify_dmesg_dates`, with the newest substrate date (the guest kernel's
