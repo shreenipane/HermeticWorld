@@ -74,7 +74,7 @@ from the measured patched build described in the host filtering guide.
 
 ```sh
 ./scripts/integration/kernel-build.sh \
-  /home/flingboot/.hermetic/cache/kernel-src/linux-6.6.160.tar.xz \
+  "$HOME"/.hermetic/cache/kernel-src/linux-6.6.160.tar.xz \
   "$PWD/guest-lockdown-kernel"
 PYTHONPATH=python python3 -B -m hermetic_slice kernel-check-config \
   --config "$PWD/guest-lockdown-kernel/.config"
