@@ -233,6 +233,176 @@ fn boots_guest_and_reads_guest_clock() {
         eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
     }
 }
+
+/// Boot once, poison disk PID 1 candidates and execd, freeze the upper, then
+/// boot a copy with a trusted initrd. No touched executable may run before the
+/// host explicitly authorizes the new PID 1.
+#[cfg(feature = "dev-unjailed")]
+#[test]
+#[ignore = "needs /dev/kvm and pinned inputs; run scripts/integration/reboot-smoke.sh"]
+fn reboots_touched_disk_with_trusted_initramfs() {
+    use hermetic_vmm::spec::Initrd;
+    use sha2::{Digest, Sha256};
+    fn call(socket: &str, request: serde_json::Value, end: Instant) -> serde_json::Value {
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let reply = guest_call(api::connect(socket, end).unwrap(), &bytes, end).unwrap();
+        serde_json::from_slice(&reply).unwrap()
+    }
+    fn ready(vm: &Vmm<hermetic_vmm::runner::DevUnjailed>) -> (String, serde_json::Value) {
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        loop {
+            match guest_status(&socket, end) {
+                Ok(status) => {
+                    assert!(status.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+                    return (
+                        socket.clone(),
+                        call(&socket, serde_json::json!({"type":"status"}), end),
+                    );
+                }
+                Err(Error::Io) => {
+                    assert!(Instant::now() < end, "execd readiness deadline");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("execd readiness: {e}"),
+            }
+        }
+    }
+    let first = environment().expect("smoke requires pinned Firecracker, kernel and rootfs");
+    let archive = std::env::var("HERMETIC_INITRD").expect("HERMETIC_INITRD");
+    let pin = std::env::var("HERMETIC_INITRD_SHA256").expect("HERMETIC_INITRD_SHA256");
+    let mut reboot = support::Fixture::new();
+    reboot.spec.jail.firecracker = first.spec.jail.firecracker.clone();
+    reboot.spec.kernel_image = first.spec.kernel_image.clone();
+    reboot.spec.root_drive.path = first.spec.root_drive.path.clone();
+    reboot.spec.networks.clear();
+    reboot.spec.boot_args = first
+        .spec
+        .boot_args
+        .replace("init=/sbin/hermetic-init", "hermetic.initramfs=1");
+    reboot.spec.initrd = Some(Initrd {
+        path: archive,
+        sha256: pin,
+    });
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&first)).unwrap();
+    let mut vm = Vmm::new(first.spec.clone().validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+    vm.wait_ready(Duration::from_secs(30)).unwrap();
+    let (socket, status) = ready(&vm);
+    assert_eq!(status["locked"], false);
+    let end = deadline(Duration::from_secs(30)).unwrap();
+    for path in [
+        "/sbin/hermetic-init",
+        "/sbin/hermetic-execd",
+        "/sbin/init",
+        "/init",
+        "/work/reboot-proof",
+    ] {
+        assert_eq!(
+            call(
+                &socket,
+                serde_json::json!({"type":"upload","path":path,"data":b"touched-disk".to_vec()}),
+                end
+            )["type"],
+            "ok"
+        );
+    }
+    let spec = br#"{"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,"entrypoint":["/bin/busybox","touch","/work/unauthorized"],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n","resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}"#;
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"upload", "path":"/etc/hermetic/run-spec.json", "data":spec.to_vec()}),
+            end
+        )["type"],
+        "ok"
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"shutdown"}), end)["type"],
+        "frozen"
+    );
+    vm.stop(Duration::from_secs(2)).unwrap();
+    let touched = vm.jail().unwrap().root.descriptor_path("drive-overlay");
+    std::fs::copy(touched, &reboot.spec.drives[0].path).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&reboot)).unwrap();
+    let mut vm = Vmm::new(reboot.spec.clone().validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+    vm.wait_ready(Duration::from_secs(30)).unwrap();
+    let (socket, status) = ready(&vm);
+    assert_eq!(status["locked"], true);
+    let end = deadline(Duration::from_secs(30)).unwrap();
+    let denied = call(
+        &socket,
+        serde_json::json!({"type":"exec","argv":["/bin/busybox","true"],"tty":false,"timeout_ms":1000}),
+        end,
+    );
+    assert_eq!(
+        denied,
+        serde_json::json!({"type":"error","reason":"locked"})
+    );
+    let marker = call(
+        &socket,
+        serde_json::json!({"type":"download","path":"/work/reboot-proof"}),
+        end,
+    );
+    assert_eq!(marker["data"], serde_json::json!(b"touched-disk".to_vec()));
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"download","path":"/work/unauthorized"}),
+            end
+        )["type"],
+        "error"
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"authorize"}), end)["type"],
+        "ok"
+    );
+    let exec = guest_exec(&socket, &["/bin/busybox", "echo", "trusted-reboot-ok"], end).unwrap();
+    assert_eq!(exec.code, Some(0));
+    assert_eq!(exec.output, b"trusted-reboot-ok\n");
+    // This child helper must come from the initramfs: disk execd was poisoned.
+    assert_eq!(
+        call(
+            &socket,
+            serde_json::json!({"type":"download","path":"/sbin/hermetic-execd"}),
+            end
+        )["data"],
+        serde_json::json!(b"touched-disk".to_vec())
+    );
+    let record = serde_json::to_vec(vm.boot_record().unwrap()).unwrap();
+    assert_eq!(vm.boot_record().unwrap().boot_path, "trusted_initramfs");
+    let output = std::env::var("HERMETIC_REBOOT_RECORD_OUT").expect("HERMETIC_REBOOT_RECORD_OUT");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)
+        .unwrap();
+    file.write_all(&record).unwrap();
+    file.sync_all().unwrap();
+    // The pin recorded by the host is exactly the staged archive's digest.
+    let staged = std::fs::read(vm.jail().unwrap().root.descriptor_path("initrd")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(staged)),
+        vm.boot_record()
+            .unwrap()
+            .initrd_sha256
+            .as_ref()
+            .unwrap()
+            .as_str()
+    );
+    assert_eq!(
+        call(&socket, serde_json::json!({"type":"shutdown"}), end)["type"],
+        "frozen"
+    );
+    vm.stop(Duration::from_secs(2)).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+    eprintln!("trusted reboot: touched disk, locked startup, authorization, trusted child helper, boot record passed");
+}
 /// The guest serial line `grader-init SECONDS clock`, printed right after the
 /// grader PID 1 sets the clock.
 fn grader_clock_line(serial: &[u8]) -> Option<u64> {
@@ -259,11 +429,17 @@ fn grader_clock_line_is_strict() {
         assert_eq!(grader_clock_line(bad), None);
     }
 }
-
 fn grader_exit_diagnostics(exit: Result<()>, serial: &[u8], output: &mut impl Write) -> Result<()> {
-    let exit = if String::from_utf8_lossy(serial)
-        .lines()
-        .any(|line| line.trim_end_matches('\r') == "grader-init phase recovery-failed")
+    // The runner keeps only the first MAX_CAPTURE_BYTES bytes. A full capture
+    // cannot prove that recovery succeeded: its failure marker may be lost.
+    let full = serial.len() >= hermetic_vmm::runner::MAX_CAPTURE_BYTES;
+    let serial = serial
+        .get(..hermetic_vmm::runner::MAX_CAPTURE_BYTES)
+        .unwrap_or(serial);
+    let exit = if full
+        || String::from_utf8_lossy(serial)
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "grader-init phase recovery-failed")
     {
         Err(Error::Protocol)
     } else {
@@ -301,6 +477,99 @@ fn grader_timeout_prints_console_and_supervisor_phases_before_returning_error() 
     .is_err());
     assert!(output.ends_with(b"grader serial: grader-init phase recovery-failed\n"));
 }
+#[test]
+fn grader_recovery_failure_marker_must_occupy_entire_serial_line() {
+    for serial in [
+        b"grader-init phase recovery-failed\n".as_slice(),
+        b"booting\r\ngrader-init phase recovery-failed\r\npoweroff\r\n",
+    ] {
+        let mut output = Vec::new();
+        assert_eq!(
+            grader_exit_diagnostics(Ok(()), serial, &mut output),
+            Err(Error::Protocol)
+        );
+        assert!(output.starts_with(b"grader serial: VM exit failed; console follows\n"));
+    }
+    for serial in [
+        b"prefix grader-init phase recovery-failed\n".as_slice(),
+        b"grader-init phase recovery-failed suffix\r\n",
+        b"grader-init phase recovery-failed-extra\n",
+    ] {
+        let mut output = Vec::new();
+        assert_eq!(grader_exit_diagnostics(Ok(()), serial, &mut output), Ok(()));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn grader_full_serial_capture_cannot_hide_recovery_failure() {
+    let cap = hermetic_vmm::runner::MAX_CAPTURE_BYTES;
+    let serial = vec![b'x'; cap];
+    let mut output = Vec::new();
+    // The capture keeps the first bytes only. A recovery-failed marker emitted
+    // after this prefix would be discarded, even if the VM exits normally.
+    assert_eq!(
+        grader_exit_diagnostics(Ok(()), &serial, &mut output),
+        Err(Error::Protocol)
+    );
+    assert!(output.starts_with(b"grader serial: VM exit failed; console follows\n"));
+
+    output.clear();
+    assert_eq!(
+        grader_exit_diagnostics(Ok(()), serial.get(..cap - 1).unwrap(), &mut output),
+        Ok(())
+    );
+    assert!(output.is_empty());
+}
+
+/// Host-only HGRL v1 input, identical layout/size for every run. Never placed in
+/// boot arguments, VM identity, rootfs or any sandbox-visible descriptor.
+fn grader_run_input(run: &str) -> Option<Vec<u8>> {
+    if !matches!(run, "R0" | "R1" | "R2" | "R3") {
+        return None;
+    }
+    let mut image = b"HGRL\0\x01".to_vec();
+    image.extend_from_slice(run.as_bytes());
+    image.resize(1024 * 1024, 0);
+    Some(image)
+}
+
+#[test]
+fn grader_run_input_known_answer_and_strict_labels() {
+    for run in ["R0", "R1", "R2", "R3"] {
+        let image = grader_run_input(run).unwrap();
+        assert_eq!(image.len() as u64, hermetic_vmm::spec::GRADER_RESULT_BYTES);
+        assert_eq!(&image[..6], b"HGRL\0\x01");
+        assert_eq!(&image[6..8], run.as_bytes());
+        assert!(image[8..].iter().all(|b| *b == 0));
+    }
+    for bad in ["", "R4", "r0", "R0\n", "R0 secret", "R0\0"] {
+        assert!(grader_run_input(bad).is_none());
+    }
+}
+
+/// Preserve bounded development console diagnostics before reporting failure.
+fn grader_exit_result(
+    result: Result<()>,
+    console: impl FnOnce() -> (Vec<u8>, Vec<u8>),
+    report: &mut impl Write,
+) -> Result<()> {
+    if result.is_err() {
+        // wait_exit kills the VM on failure. console_output retains both
+        // bounded captures after cleanup, unlike serial().
+        let (serial, errors) = console();
+        for (name, bytes) in [("serial", serial), ("stderr", errors)] {
+            let capped = bytes
+                .get(..bytes.len().min(hermetic_vmm::runner::MAX_CAPTURE_BYTES))
+                .unwrap_or_default();
+            for line in String::from_utf8_lossy(capped).lines() {
+                let _ = writeln!(report, "grader timeout: {name}: {line}");
+            }
+        }
+    }
+    result
+}
+
 /// Boots a grader image with `init=/sbin/hermetic-grader-init` (no vsock, no
 /// network), waits for the guest to power off, checks the guest clock line and
 /// copies the 1 MiB result drive to HERMETIC_GRADER_RESULT_OUT for the host verdict.
@@ -325,6 +594,9 @@ fn boots_grader_and_collects_result_drive() {
             }
         }
         let mut f = support::Fixture::grader();
+        let run = std::env::var("HERMETIC_GRADER_RUN").expect("set HERMETIC_GRADER_RUN");
+        let input = grader_run_input(&run).expect("invalid grader run label");
+        std::fs::write(&f.spec.drives[0].path, input).unwrap();
         f.spec.jail.firecracker = vars[0].clone();
         f.spec.kernel_image = vars[1].clone();
         f.spec.root_drive.path = vars[2].clone();
@@ -342,7 +614,8 @@ fn boots_grader_and_collects_result_drive() {
         vm.start(Duration::from_secs(10)).unwrap();
         vm.wait_ready(Duration::from_secs(30)).unwrap();
         let exit = vm.wait_exit(Duration::from_secs(300));
-        let (serial, _) = vm.runner().console_output();
+        let (serial, errors) = vm.runner().console_output();
+        let exit = grader_exit_result(exit, || (serial.clone(), errors), &mut std::io::stderr());
         grader_exit_diagnostics(exit, &serial, &mut std::io::stderr())
             .expect("grader VM did not power off");
         let guest = grader_clock_line(&serial).expect("grader-init clock line on serial");
@@ -367,6 +640,48 @@ fn boots_grader_and_collects_result_drive() {
     {
         eprintln!("skipped: build with --features dev-unjailed");
     }
+}
+
+#[test]
+fn grader_exit_timeout_retains_bounded_serial_and_errors_after_cleanup() {
+    let mut report = Vec::new();
+    let serial = b"tsc: Unable to calibrate against PIT\ngrader-init 1700000000 clock\n";
+    assert_eq!(
+        grader_exit_result(
+            Err(Error::Step("wait-exit")),
+            || (serial.to_vec(), b"VMM failure\n".to_vec()),
+            &mut report,
+        ),
+        Err(Error::Step("wait-exit"))
+    );
+    assert_eq!(
+        report,
+        b"grader timeout: serial: tsc: Unable to calibrate against PIT\ngrader timeout: serial: grader-init 1700000000 clock\ngrader timeout: stderr: VMM failure\n"
+    );
+    report.clear();
+    assert!(grader_exit_result(
+        Err(Error::Step("wait-exit")),
+        || (
+            vec![b'x'; hermetic_vmm::runner::MAX_CAPTURE_BYTES + 1],
+            Vec::new()
+        ),
+        &mut report,
+    )
+    .is_err());
+    assert_eq!(
+        report.len(),
+        b"grader timeout: serial: \n".len() + hermetic_vmm::runner::MAX_CAPTURE_BYTES
+    );
+    report.clear();
+    assert_eq!(
+        grader_exit_result(
+            Ok(()),
+            || panic!("successful exit needs no diagnostics"),
+            &mut report
+        ),
+        Ok(())
+    );
+    assert!(report.is_empty());
 }
 #[test]
 #[ignore = "owner only: root, cgroup v2 cpu/memory/pids delegation, preconfigured isolated netns/taps, /dev/kvm, and pinned jailer/Firecracker; see README"]

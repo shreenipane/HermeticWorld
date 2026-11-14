@@ -191,7 +191,7 @@ fn hostile_configuration_is_refused_before_spawn_or_result_write() {
         assert!(sandbox::build_plan(&s).is_err(), "{cwd}");
     }
     let mut os = FakeOs::new();
-    let config = serde_json::json!({"argv":["sh","-c","touch /victim"],"cwd":"/work/repo","deadline_seconds":1,"expected_test_ids":[],"run":"R0","variant_set":"00".repeat(32)});
+    let config = serde_json::json!({"argv":["sh","-c","touch /victim"],"cwd":"/work/repo","deadline_seconds":1,"expected_test_ids":[],"variant_set":"00".repeat(32)});
     os.insert_file(Path::new("/config"), serde_json::to_vec(&config).unwrap());
     assert!(run_supervisor(&mut os, Path::new("/config"), Path::new("/result")).is_err());
     assert_eq!(os.events(), &[OsEvent::ReadFile("/config".into())]);
@@ -476,13 +476,17 @@ while not os.path.exists('/tmp/heartbeat'): time.sleep(0.01)
         sandbox: spec.sandbox,
         deadline_seconds: if case == "timeout" { 1 } else { 10 },
         expected_test_ids: vec!["probe".into()],
-        run: RunName::R0,
         variant_set: "00".repeat(32),
     };
     let config = tmp.path().join("config");
     let disk = tmp.path().join("disk");
     std::fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
     let mut os = RealOs::with_launcher(env!("CARGO_BIN_EXE_hermetic-grader-supervisor").into());
+    std::fs::write(
+        &disk,
+        hermetic_grader_supervisor::label::encode_run_label(RunName::R0),
+    )
+    .unwrap();
     let report = run_supervisor(&mut os, &config, &disk).unwrap();
     assert_eq!(
         report.payload.supervisor.exit,
@@ -541,7 +545,7 @@ fn invalid_config_and_cli_never_echo_secrets() {
 
 #[test]
 fn config_parser_enforces_its_cap_before_deserialization() {
-    let mut bytes=serde_json::to_vec(&serde_json::json!({"argv":["pytest"],"cwd":"/work/repo","deadline_seconds":1,"expected_test_ids":[],"run":"R0","variant_set":"00".repeat(32)})).unwrap();
+    let mut bytes=serde_json::to_vec(&serde_json::json!({"argv":["pytest"],"cwd":"/work/repo","deadline_seconds":1,"expected_test_ids":[],"variant_set":"00".repeat(32)})).unwrap();
     bytes.resize(MAX_CONFIG_BYTES + 1, b' ');
     assert!(RunConfig::from_json_bytes(&bytes).is_err());
 }

@@ -2012,12 +2012,28 @@ fn t112_final_finding1_index_records_tier2_truncation_gap() {
 
 #[test]
 fn test_regression_cr1_finding1_tier2_query_performance_with_many_findings() {
+    use std::time::Duration;
+
+    const HUNKS: usize = 30;
+    const BASE_UNITS: usize = 250;
+    const SCALE: usize = 4;
+    const SAMPLES: usize = 3;
+    const MAX_QUERY_TIME: Duration = Duration::from_secs(60);
+
     let base = tempdir().expect("tempdir");
     let mut patch =
         String::from("diff --git a/service.py b/service.py\n--- a/service.py\n+++ b/service.py\n");
     let mut base_code = String::new();
-    for i in 0..30 {
+    let mut fixed_code = String::new();
+    let mut prose = String::from("In service.py use these symbols:\n");
+    for i in 0..HUNKS {
         base_code.push_str(&format!("def func_{i}():\n    return {i}\n"));
+        fixed_code.push_str(&format!(
+            "def func_{i}():\n    val_{i} = compute_val_{i}(\"strict_check_{i}\")\n    if val_{i} > 1000:\n        raise ValueError(\"limit\")\n    return {i}\n"
+        ));
+        prose.push_str(&format!(
+            "func_{i} val_{i} compute_val_{i} strict_check_{i}\n"
+        ));
         patch.push_str(&format!(
             "@@ -{line},2 +{line},4 @@\n def func_{i}():\n+    val_{i} = compute_val_{i}(\"strict_check_{i}\")\n+    if val_{i} > 1000:\n+        raise ValueError(\"limit\")\n     return {i}\n",
             line = i * 2 + 1
@@ -2025,24 +2041,95 @@ fn test_regression_cr1_finding1_tier2_query_performance_with_many_findings() {
     }
     fs::write(base.path().join("service.py"), &base_code).expect("write base");
     let fp = FingerprintSet::from_task(&patch, "", base.path()).expect("fp");
+    assert_eq!(fp.hunks.len(), HUNKS);
 
-    let dir = tempdir().expect("tempdir");
-    for i in 0..250 {
-        fs::write(
-            dir.path().join(format!("file_{i:04}.bin")),
-            b"\0hello binary data stream",
-        )
-        .expect("write");
+    let make_index = |units: usize| {
+        let tree = tempdir().expect("tempdir");
+        for i in 0..units {
+            // Interleave gates and review-only units so the accumulated findings grow
+            // while tier-2 checks both suppression and matching on later units.
+            let (kind, text) = if i % 2 == 0 {
+                ("gate", &fixed_code)
+            } else {
+                ("review", &prose)
+            };
+            fs::write(tree.path().join(format!("file_{i:04}_{kind}.txt")), text).expect("write");
+        }
+        index_of(tree.path())
+    };
+    let (_small_dir, small_index) = make_index(BASE_UNITS);
+    let (_large_dir, large_index) = make_index(BASE_UNITS * SCALE);
+    let o = opts();
+
+    let measure = |index: &Path, units: usize| {
+        let start = Instant::now();
+        let findings = query_index(index, &fp, &o).expect("query_index");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < MAX_QUERY_TIME,
+            "query exceeded ceiling: {elapsed:?}"
+        );
+        let mut by_file: std::collections::HashMap<&str, Vec<&Finding>> =
+            std::collections::HashMap::new();
+        for finding in &findings {
+            let name = Path::new(&finding.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("fixture file name");
+            by_file.entry(name).or_default().push(finding);
+        }
+        for i in 0..units {
+            let kind = if i % 2 == 0 { "gate" } else { "review" };
+            let suffix = format!("file_{i:04}_{kind}.txt");
+            let unit_findings = by_file.get(suffix.as_str()).expect("unit findings");
+            for hunk in 0..HUNKS {
+                assert!(
+                    unit_findings.iter().any(|f| {
+                        f.detector == "D2"
+                            && f.hunk == Some(hunk)
+                            && if kind == "gate" {
+                                f.severity == Severity::Gate
+                            } else {
+                                f.channel == "tier2" && f.severity == Severity::Review
+                            }
+                    }),
+                    "missing {kind} finding for unit {i}, hunk {hunk}"
+                );
+            }
+            assert!(unit_findings.iter().all(|f| if kind == "gate" {
+                f.channel != "tier2"
+            } else {
+                f.severity != Severity::Gate
+            }));
+        }
+        elapsed
+    };
+    // Compare 4N with N on this machine, rather than imposing a 600 ms deadline
+    // that fails under concurrent gate/VM load. Linear work should grow about 4x;
+    // allow 8x plus 25 ms of timer noise, but reject the ~16x growth of scanning
+    // all accumulated findings per hunk. Warm both indexes, alternate order and
+    // take medians to reduce cache and scheduling noise. The 60 s ceiling bounds
+    // each query; fixture/result checks ensure this exercises real tier-2 work.
+    measure(&small_index, BASE_UNITS);
+    measure(&large_index, BASE_UNITS * SCALE);
+    let mut small_times = Vec::with_capacity(SAMPLES);
+    let mut large_times = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        if sample % 2 == 0 {
+            small_times.push(measure(&small_index, BASE_UNITS));
+            large_times.push(measure(&large_index, BASE_UNITS * SCALE));
+        } else {
+            large_times.push(measure(&large_index, BASE_UNITS * SCALE));
+            small_times.push(measure(&small_index, BASE_UNITS));
+        }
     }
-    let index_file = dir.path().join("layer.idx");
-    write_index(dir.path(), &index_file).expect("write_index");
-
-    let start = Instant::now();
-    let findings = query_index(&index_file, &fp, &opts()).expect("query_index");
-    let elapsed = start.elapsed();
+    small_times.sort_unstable();
+    large_times.sort_unstable();
+    let small = small_times[SAMPLES / 2];
+    let large = large_times[SAMPLES / 2];
+    println!("tier2 query scaling: N={small:?}, 4N={large:?}");
     assert!(
-        elapsed.as_millis() < 600,
-        "query took too long ({elapsed:?}), quadratic loop over findings detected"
+        large <= small * 8 + Duration::from_millis(25),
+        "query growth is not near-linear: N={small:?}, 4N={large:?}"
     );
-    assert!(!findings.is_empty());
 }

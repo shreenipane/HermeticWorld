@@ -256,7 +256,8 @@ def test_only_in_one_side(tmp_path: Path) -> None:
     assert "only-in-B:\n  - extra_dir (dir)\n  - right_only.tar.gz (file, tar)" in rendered
 
 
-def test_refused_special_objects_and_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("socket_directory_name", ["", "socket_parent_" * 10])
+def test_refused_special_objects_and_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_directory_name: str) -> None:
     """Requirement 1 & 5: Refuse symlinks, hard links, FIFOs, sockets, and devices with typed errors."""
     # 1. Symlink inside directory
     w_sym = tmp_path / "w_sym"
@@ -289,12 +290,16 @@ def test_refused_special_objects_and_symlinks(tmp_path: Path, monkeypatch: pytes
     assert "pipe.fifo" in str(exc_fifo.value)
 
     # 4. Unix domain socket
-    w_sock = tmp_path / "w_sock"
-    w_sock.mkdir()
+    w_sock = tmp_path / "w_sock" / socket_directory_name
+    w_sock.mkdir(parents=True)
     sock_path = w_sock / "control.sock"
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        srv.bind(str(sock_path))
+        directory_fd = os.open(w_sock, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            srv.bind(f"/proc/self/fd/{directory_fd}/{sock_path.name}")
+        finally:
+            os.close(directory_fd)
         with pytest.raises(UnsupportedEntryError) as exc_sock:
             build_manifest(w_sock)
         assert "control.sock" in str(exc_sock.value)

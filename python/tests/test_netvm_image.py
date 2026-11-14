@@ -193,7 +193,7 @@ def test_smoke_boot_probe_fails_before_building_when_kvm_is_missing(tmp_path: Pa
         pytest.skip("this regression exercises the missing-KVM path")
     target = tmp_path / "unused"
     result = subprocess.run(
-        [str(ROOT / "scripts/integration/net-smoke.sh"), str(target)],
+        ["bash", str(ROOT / "scripts/integration/net-smoke.sh"), str(target)],
         cwd=ROOT, capture_output=True, timeout=10,
     )
     assert result.returncode != 0
@@ -216,7 +216,7 @@ def test_smoke_preserves_and_prints_test_diagnostics(tmp_path: Path, exit_code: 
     # Run the script's actual test invocation with an offline cargo stand-in;
     # image building and VM boot are deliberately outside this regression.
     script = (ROOT / "scripts/integration/net-smoke.sh").read_text()
-    tail = script[script.index("# 5. Boot both VMs"):]
+    tail = script[script.index("# 5. Boot both VMs"):].split("\n}\n", 1)[0]
     setup = '''
 set -euo pipefail
 WORK=$1

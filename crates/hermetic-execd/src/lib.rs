@@ -5,6 +5,7 @@ pub mod boot;
 pub mod early;
 pub mod fs;
 pub mod grader;
+pub mod network;
 pub mod real;
 pub mod rpc;
 pub mod spec;
@@ -25,6 +26,7 @@ pub enum Error {
     Limit,
     Io,
     Boot,
+    Network,
     Locked,
     Timeout,
     Shutdown,

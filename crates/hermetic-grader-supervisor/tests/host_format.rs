@@ -70,7 +70,6 @@ fn recovery_replaces_clean_results_with_host_infra_error_without_spawning_tests(
             sandbox: Default::default(),
             deadline_seconds: 120,
             expected_test_ids: vec!["t.py::test_a".into()],
-            run,
             variant_set: VARIANT.into(),
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -108,6 +107,7 @@ fn recovery_replaces_clean_results_with_host_infra_error_without_spawning_tests(
 
         let mut fake = FakeOs::new();
         fake.insert_file("config", serde_json::to_vec(&config).unwrap());
+        fake.insert_file("disk", encode_result_disk(&clean).unwrap());
         write_infra_error(&mut fake, Path::new("config"), Path::new("disk")).unwrap();
         assert_eq!(fake.written_file(Path::new("disk")).unwrap(), bytes);
         assert!(!fake.events().iter().any(|e| matches!(e, OsEvent::Spawn(_))));

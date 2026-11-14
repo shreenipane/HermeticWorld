@@ -33,7 +33,9 @@ kernel mounts. The trusted initramfs remains the TR-EXD-6 reboot path
 
 The base contains ordinary, symlink-free directories `/mnt/hermetic-overlay`,
 `/mnt/hermetic-root`, `/dev`, `/proc`, `/sys`, `/dev/pts`, `/dev/shm`, `/tmp`,
-`/run`, `/etc` and the spec's working directory. `/tmp` and `/run` are sealed
+`/run`, `/etc` and the spec's working directory. Network-enabled images also
+contain a static, regular, symlink-free `/bin/busybox` with `ip` and `sysctl`
+applets. `/tmp` and `/run` are sealed
 overlay directories, never tmpfs. `/etc/resolv.conf` is absent or a regular
 file, not the symlink used by some distributions. Devices are provided by the
 kernel, not taken from a previously touched disk. Standard error must be the
@@ -63,7 +65,8 @@ connection separately from a successful frozen shutdown.
 
 The normal effect order is clock, read-write ext4 mount, retain upper descriptor,
 create upper/work, assemble overlayfs, move devtmpfs, switch root, mount proc,
-sysfs, devpts and `/dev/shm`, stamp `/dev`, validate/apply the spec, optionally
+sysfs, devpts and `/dev/shm`, stamp `/dev`, validate/apply the spec (including
+network setup), optionally
 start its initial command, then bind vsock 5000. A failed step runs no later
 boot step. The read-only root is checked before mounting the upper disk.
 Mount targets and lower/upper/work directories are pinned descriptors. Device
@@ -91,7 +94,8 @@ are ignored by the grader; the clock option follows the same strict rule.
 
 ## Run spec
 
-All fields are required; unknown fields, including resource fields, and duplicate
+All fields except `network` are required; unknown fields, including resource and
+network fields, and duplicate
 environment keys are refused. This guest schema extends the manifest's current
 smaller run-spec schema; it reuses `hermetic_common::Resources`, while requiring
 explicit numeric `uid` and `gid`. The launcher must produce this guest JSON,
@@ -107,9 +111,32 @@ rather than pass a manifest's string-valued `user` through unchanged.
   "command": ["--foreground"],
   "hostname": "world",
   "resolv_conf": "nameserver 10.0.0.1\n",
+  "network": {"address": "10.0.0.15", "prefix": 24, "gateway": "10.0.0.1", "mtu": 1500},
   "resources": {"vcpus": 2, "memory_mib": 512, "disk_mib": 1024, "wall_time_s": 300}
 }
 ```
+
+Omit `network` (or use `null`) for a networkless image. When present, all four
+members are required: canonical IPv4 address strings, a prefix in 1–30 and an
+MTU in 576–1500. Address and gateway must be distinct usable RFC1918 hosts in
+the same subnet, excluding network/broadcast addresses. The launcher sets
+`gateway` to NetVM's link address and points `resolv_conf` at NetVM; execd cannot
+authenticate the peer's address. This configures only the fixed `eth0` device.
+
+After clock setup, root assembly and resolver installation, execd disables IPv6
+for all/default interfaces, brings up loopback, sets eth0's MTU and address,
+brings eth0 up and adds the default route via NetVM. All seven applets must
+succeed before the entrypoint or vsock listener starts. A failure/timeout
+powers off with a static reason; applet output is drained and discarded.
+The implementation uses busybox `ip`/`sysctl` with fixed argument positions
+instead of adding unsafe netlink code or a dependency. Validated address and
+numeric fields are rendered canonically, with no shell or PATH lookup.
+Boot commands run as uid/gid 0 with no supplementary groups, an empty
+environment, cwd `/`, a 64 MiB address-space cap and a 5-second deadline per
+command (including startup), using the existing supervised child path.
+The busybox inode is pinned from the sealed base before switching root; no
+overlay replacement can redirect execution. Network setup is boot convenience,
+not an AgentVM security boundary; NetVM/host isolation still enforces egress.
 
 The initial argv concatenates entrypoint and command. Empty arrays start no
 initial process. The initial child is supervised and its output is drained and
@@ -235,11 +262,31 @@ outside every disk writable by the agent. The trusted handoff executes this
 binary as PID 1 from that initramfs, never `/sbin/init` from a touched disk, and
 provides the early proc/dev/console interfaces described above. Include ordinary
 staging directories `/mnt/hermetic-base`, `/mnt/hermetic-overlay` and
-`/mnt/hermetic-root`. Pass `hermetic.initramfs=1`, `hermetic.t=...`, and the
+`/mnt/hermetic-root`. For networking, `/bin/busybox` is pinned from the separately
+mounted sealed base before overlay assembly, while the trusted child helper
+comes from the initramfs. Pass `hermetic.initramfs=1`, `hermetic.t=...`, and the
 appropriate overlay/spec options. The sealed base is `/dev/vda`, separate from
 the writable upper `/dev/vdb` by default.
 
-This mode sets the clock first, mounts `/dev/vda` read-only as the overlay lower,
+Build the archive with `python -m hermetic_slice.initramfs --execd EXECD
+--early-init HERMETIC_INIT --t-clock 1700000000 --output trusted.cpio` (set
+`PYTHONPATH=python` from the worktree root). Both inputs must be static ELF64
+x86-64 binaries, built with `bash scripts/build-trusted-execd.sh`. This offline,
+locked build remaps workspace and Cargo source paths to fixed `/src` and `/cargo`
+prefixes, so compiler panic locations do not expose host usernames or paths.
+The builder checks
+the ELF program headers and rejects interpreters and dynamic dependencies.
+It emits uncompressed `newc`, sorted names, fixed inode numbers, uid/gid 0,
+T_clock mtimes, zero device metadata except the generated 5:1 console, and zero
+padding. It reads no host directory contents or metadata into the archive.
+`/init` is the early proc shim; `/sbin/hermetic-execd` is the trusted daemon.
+Publication is atomic and mode 0600 in a caller-owned, private directory.
+The printed SHA-256 must be pinned in the trusted VMM specification, independently
+of anything on the touched disk. Identical binary inputs and T_clock produce
+identical archives; binary toolchain reproducibility remains a build input.
+
+This mode sets the clock first, mounts fresh devtmpfs (the kernel skips its
+devtmpfs automount when running an initramfs), mounts `/dev/vda` read-only as the overlay lower,
 and then performs the ordinary assembly. Status reports `locked:true`.
 Neither the image's entry point nor any exec request is started until host CID 2
 sends `authorize`. Status, upload, download and shutdown work while locked.
@@ -249,15 +296,25 @@ not on any value read from a touched disk. A fresh boot never remembers a prior
 authorization. The executable used for child helpers is retained from the trusted
 initramfs; it is not rediscovered on the overlay.
 
+The builder caps each executable at `MAX_BINARY_BYTES` (24 MiB), the archive at
+`MAX_INITRD_BYTES` (64 MiB), ELF program headers at `MAX_PROGRAM_HEADERS` (128),
+dynamic entries at `MAX_DYNAMIC_ENTRIES` (4096), and publication attempts at
+`MAX_PUBLICATION_ATTEMPTS` (16). Only trusted regular input files are opened,
+through pinned descriptors; symlink components, FIFOs and devices are refused.
+
 ## Caps
 
-Caps are named constants in `src/lib.rs` and `src/boot.rs`.
+Caps are named constants in `src/lib.rs`, `src/boot.rs`, `src/spec.rs` and
+`src/network.rs`.
 
 | Constant | Limit |
 | --- | --- |
 | `MAX_CMDLINE` | 4 KiB |
 | `MIN_CLOCK`, `MAX_CLOCK` | 315532800–4102444799 |
 | `MAX_SPEC` | 64 KiB JSON |
+| `MIN_NETWORK_PREFIX`, `MAX_NETWORK_PREFIX` | 1–30 |
+| `MIN_NETWORK_MTU`, `MAX_NETWORK_MTU` | 576–1500 bytes |
+| `NETWORK_COMMAND_TIMEOUT_MS`, `NETWORK_MEMORY_MIB` | 5000 ms per applet; 64 MiB address space; seven sequential commands, zero retained output bytes |
 | `MAX_ENV`, `MAX_ENV_NAME`, `MAX_STRING` | 128 entries; 128-byte names; 4096-byte strings |
 | `MAX_HOSTNAME` | 63 lowercase ASCII letters/digits/hyphens |
 | `MAX_PATH`, `MAX_COMPONENTS`, `MAX_COMPONENT_BYTES` | 4096 bytes; 128 components; 255 bytes/component |
@@ -292,6 +349,8 @@ only `sys.rs` allows it, with individually documented syscall wrappers.
 | Clock parsing, bounds, fatal silence | `cmdline_strict_clock_bounds_defaults_and_initramfs`, `every_boot_failure_stops_later_effects_and_reports_reason` |
 | TR-EXD-1, TR-EXD-2 boot order and every failure | `boot_known_answer_no_tmp_or_run_tmpfs`, `every_boot_failure_stops_later_effects_and_reports_reason` |
 | Strict spec, all validation before applying, stable env | `spec_strict_fields_caps_names_ids_paths_and_resources`, `frames_known_answer_unknown_malformed_oversize_and_every_truncation` |
+| Network validation, boot order, fixed argv, credentials, failure/timeout | `network_spec_strict_schema_subnet_hosts_and_numeric_caps`, `network_boot_order_fixed_argv_root_environment_and_every_failure`, `network_validates_before_commands_and_rejects_failure_signal_and_timeout` |
+| Trusted network executable on reboot, symlink/FIFO refusal | `network_executable_is_pinned_before_overlay_and_special_files_fail_closed` |
 | Credentials, per-command spec | `credentials_drop_in_groups_gid_uid_order_and_stop_on_failure`, `exec_applies_spec_tty_timeout_and_both_output_caps_and_reaps` |
 | TR-EXD-3 entry point, maintenance, orphan handling | `initramfs_exec_is_locked_until_explicit_authorize`, `generic_listener_is_serial_and_services_pid1_maintenance`, `reaper_handles_adopted_children_without_stealing_managed_statuses`, `startup_handshake_requires_armed_channel_and_exec_or_reports_failure_and_timeout`, `helper_reports_validation_failure_and_does_not_drop_credentials` |
 | TR-EXD-3 signals, actual PTY | `signal_forwarding_targets_foreground_and_preserves_entrypoint`, `allocated_pty_has_real_terminal_and_output_is_drained` |

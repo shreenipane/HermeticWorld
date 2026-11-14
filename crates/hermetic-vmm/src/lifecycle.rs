@@ -31,11 +31,19 @@ pub enum State {
     Destroyed,
     Failed,
 }
+/// Host-side evidence of the boot actually started; no host paths or clocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BootRecord {
+    pub vm_id: String,
+    pub boot_path: &'static str,
+    pub initrd_sha256: Option<String>,
+}
 pub struct Vmm<R: Runner> {
     spec: ValidatedSpec,
     runner: R,
     jail: Option<PreparedJail>,
     state: State,
+    boot_record: Option<BootRecord>,
 }
 impl<R: Runner> Vmm<R> {
     pub fn new(spec: ValidatedSpec, runner: R) -> Self {
@@ -44,10 +52,15 @@ impl<R: Runner> Vmm<R> {
             runner,
             jail: None,
             state: State::New,
+            boot_record: None,
         }
     }
     pub fn state(&self) -> State {
         self.state
+    }
+    /// Include this record in the enclosing run record, including after teardown.
+    pub fn boot_record(&self) -> Option<&BootRecord> {
+        self.boot_record.as_ref()
     }
     pub fn runner(&self) -> &R {
         &self.runner
@@ -155,6 +168,16 @@ impl<R: Runner> Vmm<R> {
                     end,
                 )
                 .map_err(|_| Error::Step("InstanceStart"))?;
+            let s = self.spec.spec();
+            self.boot_record = Some(BootRecord {
+                vm_id: s.id.clone(),
+                boot_path: if s.initrd.is_some() {
+                    "trusted_initramfs"
+                } else {
+                    "sealed_disk"
+                },
+                initrd_sha256: s.initrd.as_ref().map(|i| i.sha256.clone()),
+            });
             self.runner
                 .request(&socket, &ApiRequest::new("GET", "/", json!({})), end)?;
             remaining(end, "wait-ready")?;

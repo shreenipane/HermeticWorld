@@ -119,18 +119,29 @@ impl Directory {
     fn image(&self, name: &std::ffi::OsStr) -> Result<File> {
         let before = fs::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
         regular(&before)?;
-        let file = File::from(fs::openat(&self.0, name, flags(), Mode::empty())?);
-        let after = fs::fstat(&file)?;
+        let pinned = fs::openat(
+            &self.0,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let after = fs::fstat(&pinned)?;
         regular(&after)?;
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
             return Err(Error::Validation("image changed"));
         }
+        // Reopen the inspected inode through the kernel, never the mutable name.
+        let file = File::from(fs::open(
+            format!("/proc/self/fd/{}", pinned.as_raw_fd()),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
         Ok(file)
     }
     fn publish(
         &self,
         name: &str,
-        mut source: Option<&mut File>,
+        mut source: Option<&mut dyn Read>,
         writable: bool,
         owner: (u32, u32),
         budget: &mut u64,
@@ -212,6 +223,39 @@ pub fn open_image(path: &str) -> Result<File> {
     let name = p.file_name().ok_or(Error::Io)?;
     dir.image(name)
 }
+fn initrd_snapshot(
+    source: &mut File,
+    expected: &str,
+    end: Instant,
+) -> Result<std::io::Cursor<Vec<u8>>> {
+    use sha2::{Digest, Sha256};
+    let size = source.metadata()?.len();
+    if size == 0 || size > crate::spec::MAX_INITRD_BYTES {
+        return Err(Error::Validation("initrd size cap"));
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0; COPY_BUFFER_BYTES];
+    loop {
+        remaining(end, "initrd-read")?;
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(n) as u64 > crate::spec::MAX_INITRD_BYTES {
+            return Err(Error::Validation("initrd size cap"));
+        }
+        bytes.extend_from_slice(buffer.get(..n).ok_or(Error::Io)?);
+    }
+    if bytes.is_empty() {
+        return Err(Error::Validation("initrd size cap"));
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != expected {
+        return Err(Error::Validation("initrd SHA-256 mismatch"));
+    }
+    // Copy this immutable snapshot, not the source inode after hashing.
+    Ok(std::io::Cursor::new(bytes))
+}
+
 /// Owns parent, VM and root descriptors until teardown; replacement is refused.
 pub struct PreparedJail {
     base: Directory,
@@ -228,10 +272,11 @@ impl PreparedJail {
         // All sources are opened and checked before creating a single artifact.
         let mut executable = open_image(&valid.spec().jail.firecracker)?;
         let mut sources = Vec::new();
+        let mut initrd_bytes = None;
         let mut total = executable.metadata()?.len();
         for entry in &plan.files {
             remaining(end, "prepare-open")?;
-            let file = entry.source.as_ref().map(|p| open_image(p)).transpose()?;
+            let mut file = entry.source.as_ref().map(|p| open_image(p)).transpose()?;
             let size = match &file {
                 Some(f) => f.metadata()?.len(),
                 None => 4096,
@@ -241,6 +286,14 @@ impl PreparedJail {
                 && size != crate::spec::GRADER_RESULT_BYTES
             {
                 return Err(Error::Validation("GraderVM result drive must be 1 MiB"));
+            }
+            if entry.destination == "initrd" {
+                let pin = valid.spec().initrd.as_ref().ok_or(Error::Io)?;
+                initrd_bytes = Some(initrd_snapshot(
+                    file.as_mut().ok_or(Error::Io)?,
+                    &pin.sha256,
+                    end,
+                )?);
             }
             total = total.checked_add(size).ok_or(Error::Io)?;
             if total > MAX_TOTAL_IMAGE_BYTES {
@@ -308,9 +361,14 @@ impl PreparedJail {
             fs::fchmod(&binary, Mode::from_raw_mode(0o555))?;
             binary.sync_all()?;
             for (entry, source) in plan.files.iter().zip(sources.iter_mut()) {
+                let input: Option<&mut dyn Read> = if entry.destination == "initrd" {
+                    initrd_bytes.as_mut().map(|b| b as &mut dyn Read)
+                } else {
+                    source.as_mut().map(|f| f as &mut dyn Read)
+                };
                 jail.root.publish(
                     &entry.destination,
-                    source.as_mut(),
+                    input,
                     entry.writable,
                     (plan.uid, plan.gid),
                     &mut budget,
@@ -486,6 +544,43 @@ fn remove_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initrd_snapshot_rejects_empty_read_even_when_metadata_nonempty() {
+        use sha2::{Digest, Sha256};
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"trusted").unwrap();
+        // EOF models the read result if the inode is truncated between its
+        // metadata check and the first read. The snapshot itself must be nonempty.
+        let empty_pin = format!("{:x}", Sha256::digest(b""));
+        let end = crate::deadline(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            initrd_snapshot(&mut input, &empty_pin, end),
+            Err(Error::Validation("initrd size cap"))
+        ));
+    }
+
+    #[test]
+    fn initrd_snapshot_remains_hash_pinned_after_in_place_source_mutation() {
+        use sha2::{Digest, Sha256};
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"trusted").unwrap();
+        input.rewind().unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"trusted"));
+        let end = crate::deadline(std::time::Duration::from_secs(2)).unwrap();
+        let mut snapshot = initrd_snapshot(&mut input, &expected, end).unwrap();
+        input.rewind().unwrap();
+        input.write_all(b"hostile").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = Directory(File::open(temp.path()).unwrap());
+        fs::fchmod(&dir.0, Mode::from_raw_mode(0o700)).unwrap();
+        dir.publish("initrd", Some(&mut snapshot), false, (0, 0), &mut 4096, end)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("initrd")).unwrap(),
+            b"trusted"
+        );
+    }
 
     #[test]
     fn review_ancestor_rejects_group_write_for_every_gid() {

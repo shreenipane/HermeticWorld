@@ -183,13 +183,15 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] Guest kernel build: config, boot args, pinned build timestamp (TR-VMM-4, TR-VMM-5) (in progress: T3.2, brief in `agy-tasks/`)
 - [x] `hermetic-execd`: clock-first boot, run spec, vsock RPC, shutdown freeze (TR-EXD-*) (T3.1, merged 2026-11-13 after review+fix; status frame now carries the guest clock for the vmm decoder)
   - [x] Early proc handoff: `init=/sbin/hermetic-init` shim mounts read-only procfs then execs execd (clock-first kept); guest kernel moved to 6.6.160 with devtmpfs automount and initrd support; dev-unjailed boot smoke in `scripts/integration/boot-smoke.sh`
-  - [ ] Open: TR-EXD-6 trusted-reboot initramfs (build it reproducibly, `hermetic.initramfs=1`) and hermetic-vmm initrd wiring; first boot uses the base-resident `init=/sbin/hermetic-init` shim
+  - [x] TR-EXD-6 trusted-reboot initramfs: reproducible `newc` builder with known-answer hash, `hermetic.initramfs=1` clock-first devtmpfs/base assembly, pinned and bounded hermetic-vmm initrd snapshot, and host boot record; first boot uses the base-resident `init=/sbin/hermetic-init` shim
+  - [ ] Open: run `bash scripts/integration/reboot-smoke.sh /tmp/hermetic-reboot-smoke` on a KVM-capable host to verify the touched-disk reboot; this sandbox has no `/dev/kvm`
+  - [ ] Open: propagate the VMM host boot record into the signed `hermetic-attest::RunRecord`; that component's schema has no boot-path/initrd field and requires a separate record-schema change
   - [ ] Open: upload publication can be raced by a guest process replacing the temporary entry before rename; needs a writer-quiescence or owned-inode publication design
   - [ ] Open: synchronous filesystem I/O can stall the single RPC loop; needs isolated filesystem workers
 - [ ] NetVM: dm-verity image, DNS table, TPROXY + TLS, drop everything else (TR-NET-*)
   - [x] First-cut runtime: PID 1 clock setup, fixed eth0 addresses, table DNS, HTTP filter to persistent serialized WorldServer frames (CID 2 port 5001), ingress/egress service-port filter, forwarding and IPv6 off; offline transport/policy tests
-  - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver in run spec and trusted harness network commands through execd
-  - [ ] Open: automatic eth0 initialization from the AgentVM run spec requires an execd schema/boot change; this cut supplies trusted harness commands and sets the existing resolver field.
+  - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver and network in run spec
+  - [x] Automatic eth0 initialization from the AgentVM run spec: validated IPv4 address/prefix, on-link NetVM gateway and MTU; fixed, bounded trusted busybox commands after clock/root setup and before entrypoint/vsock; fail closed; offline validation/order/failure tests. Network smoke inspects setup instead of supplying harness commands; VM verification remains below.
   - [ ] Open: TLS termination, world-CA private-key delivery at boot and leaf minting (TR-NET-1/3/4); 443 currently dropped
   - [ ] Open: TPROXY (TR-NET-3); first cut owns manifest world addresses as /32s and listens directly on port 80
   - [ ] Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image
@@ -227,6 +229,7 @@ The oracle passes on every slice task, and one agent run is graded.
   2. Xen hypercall interception (a second patch plus `CONFIG_KVM_XEN`)
   3. a host kernel patch (only on hardware you control)
 - [ ] Check TSC stability without kvmclock
+- [ ] Sporadic grader/guest boot stall: the `guest-lockdown` branch supplies VMM-owned `tsc_early_khz` to avoid TSC calibration without PIT/HPET/PM timers or kvmclock. Integration and repeated KVM verification remain open; see `scripts/integration/BOOT_NOTES.md`. Grader shutdown and deadline diagnostics remain needed independently.
 - [ ] Add the eighth check to `clock-leak-probe.md`: the hypercall from a guest kernel module
 - [ ] Run the probe, plus a control run on unpatched Firecracker
 

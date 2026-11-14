@@ -8,6 +8,7 @@
 //! terminate, and atomically writes a deterministic 1 MiB `HGRD` result disk.
 
 pub mod disk;
+pub mod label;
 pub mod os;
 pub mod records;
 pub mod run;

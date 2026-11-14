@@ -9,6 +9,126 @@ use std::{
 };
 use support::Fixture;
 const TIMEOUT: Duration = Duration::from_secs(2);
+
+fn reboot_fixture() -> Fixture {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    f.spec.networks.clear();
+    let path = f.temp.path().join("trusted.cpio");
+    fs::write(&path, b"trusted-initrd").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    f.spec.initrd = Some(Initrd {
+        path: path.to_str().unwrap().into(),
+        sha256: format!("{:x}", Sha256::digest(b"trusted-initrd")),
+    });
+    f.spec.boot_args = f
+        .spec
+        .boot_args
+        .replace("init=/sbin/hermetic-execd", "hermetic.initramfs=1");
+    f
+}
+
+#[test]
+fn initrd_rejects_bad_hash_special_symlink_and_oversize_before_artifacts() {
+    for kind in [
+        "hash",
+        "empty",
+        "size",
+        "symlink",
+        "ancestor",
+        "fifo",
+        "device",
+        "directory",
+    ] {
+        let mut f = reboot_fixture();
+        let pin = f.spec.initrd.as_mut().unwrap();
+        match kind {
+            "hash" => pin.sha256 = "0".repeat(64),
+            "empty" => {
+                fs::write(&pin.path, b"").unwrap();
+            }
+            "size" => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&pin.path)
+                    .unwrap()
+                    .set_len(MAX_INITRD_BYTES + 1)
+                    .unwrap();
+            }
+            "symlink" => {
+                fs::remove_file(&pin.path).unwrap();
+                symlink(&f.spec.kernel_image, &pin.path).unwrap();
+            }
+            "ancestor" => {
+                symlink(f.temp.path(), f.temp.path().join("alias")).unwrap();
+                pin.path = f
+                    .temp
+                    .path()
+                    .join("alias/trusted.cpio")
+                    .to_str()
+                    .unwrap()
+                    .into();
+            }
+            "fifo" => {
+                fs::remove_file(&pin.path).unwrap();
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &pin.path,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap();
+            }
+            "device" => pin.path = "/dev/null".into(),
+            "directory" => pin.path = f.temp.path().to_str().unwrap().into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            PreparedJail::prepare(
+                &f.spec.clone().validate().unwrap(),
+                deadline(TIMEOUT).unwrap()
+            )
+            .is_err(),
+            "{kind}"
+        );
+        assert!(!f.temp.path().join("firecracker").exists(), "{kind}");
+    }
+}
+
+#[test]
+fn trusted_reboot_copies_pinned_bytes_and_records_actual_boot_without_host_data() {
+    let f = reboot_fixture();
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    assert!(vm.boot_record().is_none());
+    vm.prepare(TIMEOUT).unwrap();
+    assert!(vm.boot_record().is_none());
+    let image = f.root().join("initrd");
+    assert_eq!(fs::read(&image).unwrap(), b"trusted-initrd");
+    assert_eq!(fs::metadata(&image).unwrap().mode() & 0o777, 0o400);
+    fs::write(&f.spec.initrd.as_ref().unwrap().path, b"altered-source").unwrap();
+    assert_eq!(fs::read(&image).unwrap(), b"trusted-initrd");
+    vm.start(TIMEOUT).unwrap();
+    vm.wait_ready(TIMEOUT).unwrap();
+    let json = serde_json::to_value(vm.boot_record().unwrap()).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"vm_id":"vm-0", "boot_path":"trusted_initramfs", "initrd_sha256":f.spec.initrd.as_ref().unwrap().sha256})
+    );
+    vm.stop(TIMEOUT).unwrap();
+    vm.destroy(TIMEOUT).unwrap();
+    assert_eq!(
+        serde_json::to_value(vm.boot_record().unwrap()).unwrap(),
+        json
+    );
+    let f = Fixture::new();
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    vm.wait_ready(TIMEOUT).unwrap();
+    assert_eq!(vm.boot_record().unwrap().boot_path, "sealed_disk");
+    assert!(vm.boot_record().unwrap().initrd_sha256.is_none());
+}
 #[derive(Default)]
 struct Fake {
     events: Vec<String>,

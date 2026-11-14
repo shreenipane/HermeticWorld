@@ -108,6 +108,17 @@ pub trait Os {
     /// Reads up to `max_bytes` from `path`. Fails if the file exceeds `max_bytes`.
     fn read_file(&mut self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, OsError>;
 
+    /// Read the fixed-size host boot input. Never forwarded to a sandbox helper.
+    fn read_run_label(&mut self, path: &Path) -> Result<crate::RunName, OsError> {
+        let image = self.read_result_disk(path)?;
+        crate::label::decode_run_label(&image).ok_or_else(|| os_error("run_label", "invalid"))
+    }
+
+    /// Read at most one fixed-size result image, including the host boot input.
+    fn read_result_disk(&mut self, path: &Path) -> Result<Vec<u8>, OsError> {
+        self.read_file(path, crate::RESULT_DISK_BYTES)
+    }
+
     /// Spawns a child process in a new process group with `argv`, `env`, `cwd`,
     /// and an attached result pipe.
     fn spawn(&mut self, spec: &SpawnSpec) -> Result<Self::Child, OsError>;
@@ -226,6 +237,27 @@ impl Os for RealOs {
 
     fn now_monotonic(&self) -> Duration {
         self.epoch.elapsed()
+    }
+
+    fn read_result_disk(&mut self, path: &Path) -> Result<Vec<u8>, OsError> {
+        // Only the fixed guest result device may be opened as a block device.
+        // Offline callers use regular images with the same strict format.
+        let kind = if path == Path::new("/dev/vdb") {
+            rustix::fs::FileType::BlockDevice
+        } else {
+            rustix::fs::FileType::RegularFile
+        };
+        let file = crate::sandbox::open_path(path, rustix::fs::OFlags::RDONLY, kind)
+            .map(File::from)
+            .map_err(|e| os_error("open_run_label", e))?;
+        let mut image = Vec::new();
+        file.take((crate::RESULT_DISK_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut image)
+            .map_err(|e| os_error("read_run_label", e))?;
+        if image.len() != crate::RESULT_DISK_BYTES {
+            return Err(os_error("read_run_label", "invalid size"));
+        }
+        Ok(image)
     }
 
     fn read_file(&mut self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, OsError> {
