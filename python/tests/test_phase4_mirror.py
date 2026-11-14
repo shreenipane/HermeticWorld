@@ -221,12 +221,17 @@ def test_mirror_missing_admitted_artifact_aborts(kind):
         mirror.build_mirror(encoded(recipe), blobs)
 
 
-def test_mirror_npm_mutable_tag_refused_until_history_is_available():
+def test_mirror_npm_mutable_tags_are_dropped_and_never_published():
+    # Owner decision (2026-11-14): without tag history only a recomputed
+    # "latest" is served; a tag added after the cutoff never reaches the guest.
     recipe, blobs = fixture()
     replace_metadata(recipe, blobs, "npm", lambda value: value["dist-tags"].update(
-        {"added-after-cutoff-2026": "1.0.0"}))
-    with pytest.raises(CutError, match="tag history required"):
-        mirror.build_mirror(encoded(recipe), blobs)
+        {"added-after-cutoff-2026": "1.0.0", "next": "1.0.0"}))
+    build = mirror.build_mirror(encoded(recipe), blobs)
+    files = dict(build.files)
+    packument = json.loads(files["registry.npmjs.org/@scope/demo/index.html"])
+    assert set(packument["dist-tags"]) == {"latest"}
+    assert not any(b"added-after-cutoff-2026" in body for _, body in build.files)
 
 
 @pytest.mark.parametrize("field,value", [("integrity", "sha512-bad"), ("shasum", "a" * 40),

@@ -263,7 +263,7 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
   - [x] Offline publisher review: fix npm's preflight-to-read path substitution using the retained parent and expected inode (two regressions); omit metadata routes for packages without admitted releases, preventing post-cutoff package-existence leaks (twelve regressions). All regressions were observed failing before repair. Keep excluded inventories in operator-only reports and retain full validation even for an empty admitted inventory.
   - [ ] Deferred integration: source acquisition and dated immutable-manifest provenance, npm tag history, Go h1/sumdb provenance, cutoff-aware recording/resolver builds including build dependencies, HTTP/NetVM Cargo/Go install validation, execution of the Go fixture, rootfs client setup, E4 and monthly baseline sizing. The offline store establishes integrity of recipe-bound bytes; it does not establish source provenance or complete ecosystem support.
   - [x] Initial Maven research: release-list metadata has no per-release publication time; snapshot metadata retains current entries. Supporting Maven requires dated, digest-bound artifact provenance or a historical snapshot, including POMs/plugins/parents/classifiers. Primary sources and remaining work are in `docs/phase4-plan.md`; no Maven support is claimed.
-  - [ ] OPEN, major: `python/hermetic_npm_cut/cut.py` retains non-latest `dist-tags` whenever they target an admitted version. A tag named `added-after-cutoff-2026` pointing to a 2020 release survives a 2020 cutoff. The packument has no tag-history input, so the correct historical tag set cannot be recovered. Requires the acquisition component's timestamped capture/history contract (or an owner-approved change to the existing preserved-tag behavior); no claim that current registry metadata is historical truth. Immutable manifest provenance also belongs to that acquisition contract.
+  - [x] Resolved 2026-11-14 (owner decision: drop post-cutoff npm tags): with no tag history in a packument, `cut_packument` drops every `dist-tags` entry except `latest`, which is recomputed from admitted versions; the mirror serves only that. Proof: `test_tags_pointing_at_admitted_versions_are_still_dropped`, `test_mirror_npm_mutable_tags_are_dropped_and_never_published`.
 - [ ] Other provider adapters for the gateway
 - [ ] Smart git protocol terminated in NetVM (for shallow clones)
 - [ ] State-task live grading from a snapshot (TR-VMM-6, §11.4)
@@ -274,7 +274,7 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
 - [ ] Split mode for Mode G (agent in a second VM)
 - [ ] TEE quotes (SEV-SNP, TDX, Nitro)
 - [ ] aarch64 (pl031 RTC offset patch)
-- [ ] Resolve whether archived pages can be redistributed
+- [x] Resolve whether archived pages can be redistributed: owner decision 2026-11-14, archived pages stay local-only and are never redistributed or published.
 
 ### Preparation and remaining prerequisites (2026-11-14)
 

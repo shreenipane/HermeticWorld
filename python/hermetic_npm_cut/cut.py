@@ -549,17 +549,13 @@ def cut_packument(
             best_latest_sv = sv
             best_latest_ver = ver
 
-    # Recompute dist-tags
+    # Recompute dist-tags. A packument carries no tag history: a tag's name and
+    # target can be set after the cutoff even when it points at an admitted
+    # version (e.g. "added-after-cutoff-2026" -> a 2020 release). Owner decision
+    # (2026-11-14): drop every tag except "latest", which is recomputed from the
+    # admitted versions alone.
     recomputed_tags: dict[str, str] = {}
-    tags_dropped: list[str] = []
-    for tag in sorted(raw_dist_tags.keys()):
-        if tag == "latest":
-            continue
-        target_ver = raw_dist_tags[tag]
-        if target_ver in kept_versions:
-            recomputed_tags[tag] = target_ver
-        else:
-            tags_dropped.append(tag)
+    tags_dropped: list[str] = sorted(tag for tag in raw_dist_tags if tag != "latest")
 
     if best_latest_ver is not None:
         recomputed_tags["latest"] = best_latest_ver
