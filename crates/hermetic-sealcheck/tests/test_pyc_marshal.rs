@@ -2254,3 +2254,82 @@ fn t112_priorcheck2_marker_lookalike_literal_is_not_a_gap() {
         );
     }
 }
+
+const ALL_20000_CHILD: &str = "HERMETIC_PYC_ALL_20000_CHILD";
+
+/// With a sufficient budget, every one of 20,000 changed functions and every one of 20,000
+/// added functions gets a code-object fingerprint. Runs in a child limited to 2 GiB of
+/// address space (inside the 5 GB gate cap) and 300 s.
+#[test]
+fn test_all_20000_functions_changed_and_added_complete_with_sufficient_budget() {
+    if std::env::var_os(ALL_20000_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "test_all_20000_functions_changed_and_added_complete_with_sufficient_budget",
+            ALL_20000_CHILD,
+            2 * 1024 * 1024,
+            300,
+        ));
+        return;
+    }
+    let parent = tempdir().expect("tempdir");
+    let n = 20_000;
+    let mut base = String::new();
+    for i in 0..n {
+        base.push_str(&format!("def f{i}():\n    return {i}\n"));
+    }
+    fs::write(parent.path().join("large.py"), &base).expect("base");
+    let budget = Some(100_000_000);
+
+    let mut change_patch = String::from(
+        "diff --git a/large.py b/large.py\n--- a/large.py\n+++ b/large.py\n@@ -1,40000 +1,40000 @@\n",
+    );
+    for i in 0..n {
+        change_patch.push_str(&format!(
+            " def f{i}():\n-    return {i}\n+    return {}\n",
+            i + 1_000_000
+        ));
+    }
+    let fp = FingerprintSet::from_task_with_budget(&change_patch, "", parent.path(), budget)
+        .expect("changing 20000 functions completes with a sufficient budget");
+    let changed: std::collections::HashMap<&str, _> = fp
+        .hunks
+        .iter()
+        .flat_map(|h| h.pyc_fingerprints.iter())
+        .map(|f| (f.function_name.as_str(), f))
+        .collect();
+    for i in 0..n {
+        let f = changed
+            .get(format!("f{i}").as_str())
+            .unwrap_or_else(|| panic!("changed function f{i} has no fingerprint"));
+        assert!(
+            f.added.contains(&(i + 1_000_000).to_string()),
+            "f{i}: {:?}",
+            f.added
+        );
+    }
+
+    let mut add_patch = String::from(
+        "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,40000 @@\n",
+    );
+    for i in 0..n {
+        add_patch.push_str(&format!("+def g{i}():\n+    return {}\n", i + 1_000_000));
+    }
+    let fp = FingerprintSet::from_task_with_budget(&add_patch, "", parent.path(), budget)
+        .expect("adding 20000 functions completes with a sufficient budget");
+    let added: std::collections::HashMap<&str, _> = fp
+        .hunks
+        .iter()
+        .flat_map(|h| h.pyc_fingerprints.iter())
+        .map(|f| (f.function_name.as_str(), f))
+        .collect();
+    for i in 0..n {
+        let f = added
+            .get(format!("g{i}").as_str())
+            .unwrap_or_else(|| panic!("added function g{i} has no fingerprint"));
+        assert!(
+            f.added.contains(&(i + 1_000_000).to_string()),
+            "g{i}: {:?}",
+            f.added
+        );
+    }
+}
