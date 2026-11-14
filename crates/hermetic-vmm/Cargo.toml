@@ -16,4 +16,5 @@ rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event", "mou
 sha2 = { workspace = true }
 
 [dev-dependencies]
+hermetic-netvm-core = { path = "../hermetic-netvm-core" }
 tempfile = { workspace = true }

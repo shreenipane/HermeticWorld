@@ -455,6 +455,28 @@ fn grader_run_input_known_answer_and_strict_labels() {
     }
 }
 
+/// Preserve bounded development console diagnostics before reporting failure.
+fn grader_exit_result(
+    result: Result<()>,
+    console: impl FnOnce() -> (Vec<u8>, Vec<u8>),
+    report: &mut impl Write,
+) -> Result<()> {
+    if result.is_err() {
+        // wait_exit kills the VM on failure. console_output retains both
+        // bounded captures after cleanup, unlike serial().
+        let (serial, errors) = console();
+        for (name, bytes) in [("serial", serial), ("stderr", errors)] {
+            let capped = bytes
+                .get(..bytes.len().min(hermetic_vmm::runner::MAX_CAPTURE_BYTES))
+                .unwrap_or_default();
+            for line in String::from_utf8_lossy(capped).lines() {
+                let _ = writeln!(report, "grader timeout: {name}: {line}");
+            }
+        }
+    }
+    result
+}
+
 /// Boots a grader image with `init=/sbin/hermetic-grader-init` (no vsock, no
 /// network), waits for the guest to power off, checks the guest clock line and
 /// copies the 1 MiB result drive to HERMETIC_GRADER_RESULT_OUT for the host verdict.
@@ -498,8 +520,12 @@ fn boots_grader_and_collects_result_drive() {
         vm.prepare(Duration::from_secs(120)).unwrap();
         vm.start(Duration::from_secs(10)).unwrap();
         vm.wait_ready(Duration::from_secs(30)).unwrap();
-        vm.wait_exit(Duration::from_secs(300))
-            .expect("grader VM did not power off");
+        grader_exit_result(
+            vm.wait_exit(Duration::from_secs(300)),
+            || vm.runner().console_output(),
+            &mut std::io::stderr(),
+        )
+        .expect("grader VM did not power off");
         let serial = vm.runner().serial();
         let guest = grader_clock_line(&serial).expect("grader-init clock line on serial");
         eprintln!("grader serial: grader-init clock={guest}");
@@ -523,6 +549,48 @@ fn boots_grader_and_collects_result_drive() {
     {
         eprintln!("skipped: build with --features dev-unjailed");
     }
+}
+
+#[test]
+fn grader_exit_timeout_retains_bounded_serial_and_errors_after_cleanup() {
+    let mut report = Vec::new();
+    let serial = b"tsc: Unable to calibrate against PIT\ngrader-init 1700000000 clock\n";
+    assert_eq!(
+        grader_exit_result(
+            Err(Error::Step("wait-exit")),
+            || (serial.to_vec(), b"VMM failure\n".to_vec()),
+            &mut report,
+        ),
+        Err(Error::Step("wait-exit"))
+    );
+    assert_eq!(
+        report,
+        b"grader timeout: serial: tsc: Unable to calibrate against PIT\ngrader timeout: serial: grader-init 1700000000 clock\ngrader timeout: stderr: VMM failure\n"
+    );
+    report.clear();
+    assert!(grader_exit_result(
+        Err(Error::Step("wait-exit")),
+        || (
+            vec![b'x'; hermetic_vmm::runner::MAX_CAPTURE_BYTES + 1],
+            Vec::new()
+        ),
+        &mut report,
+    )
+    .is_err());
+    assert_eq!(
+        report.len(),
+        b"grader timeout: serial: \n".len() + hermetic_vmm::runner::MAX_CAPTURE_BYTES
+    );
+    report.clear();
+    assert_eq!(
+        grader_exit_result(
+            Ok(()),
+            || panic!("successful exit needs no diagnostics"),
+            &mut report
+        ),
+        Ok(())
+    );
+    assert!(report.is_empty());
 }
 #[test]
 #[ignore = "owner only: root, cgroup v2 cpu/memory/pids delegation, preconfigured isolated netns/taps, /dev/kvm, and pinned jailer/Firecracker; see README"]

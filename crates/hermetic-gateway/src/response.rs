@@ -816,7 +816,14 @@ impl<R: Read> SanitizingSseReader<R> {
                 }
                 SseOutcome::Reject => self.finish_with(standard_error_event(API_ERROR)),
             },
-            Ok(None) => self.eof = true,
+            Ok(None) => {
+                // Commit usage before the HTTP writer can signal response EOF
+                // to the client. The handler's later release is idempotent.
+                if let Some(guard) = &self.slot_guard {
+                    let _ = guard.record_and_release();
+                }
+                self.eof = true;
+            }
             Err(FetchError::Oversized) | Err(FetchError::Invalid) => {
                 self.finish_with(standard_error_event(API_ERROR))
             }

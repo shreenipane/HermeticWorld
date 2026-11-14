@@ -326,3 +326,45 @@ def test_runner_uses_real_pinned_agent_and_world_clock(tmp_path, monkeypatch):
     assert CLOCK in result["messages"][0]["content"]
     assert str(tmp_path) not in json.dumps(result)
     assert not any(name in sys.modules for name in ("litellm", "tiktoken", "huggingface_hub"))
+
+
+def test_model_rejects_valid_json_in_truncated_http_body():
+    body = json.dumps({"type":"message", "content":[{"type":"text","text":"accepted"}],
+                       "usage":{"input_tokens":1,"output_tokens":1}}).encode()
+    with socket.socket(socket.AF_INET) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(3)
+        def serve():
+            with listener.accept()[0] as connection:
+                connection.recv(8192)
+                connection.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body) + 10}\r\n\r\n".encode() + body)
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            with pytest.raises(GatewayError):
+                HermeticGatewayModel(f"http://127.0.0.1:{listener.getsockname()[1]}", "pinned", t_clock=CLOCK).query(
+                    [{"role":"user","content":"x"}])
+        finally:
+            thread.join(4)
+            assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("alias", ["same", "normalized"])
+def test_cli_refuses_trajectory_overwriting_command_evidence(tmp_path, monkeypatch, alias):
+    import hermetic_agent.__main__ as cli
+    manifest, task, script = (tmp_path / name for name in ("world.json", "task.txt", "script.json"))
+    manifest.write_text(json.dumps({"cutoffs":{"t_clock":CLOCK}}))
+    task.write_text("fix")
+    script.write_text('["true"]')
+    journal = tmp_path / "evidence.jsonl"
+    trajectory = str(journal) if alias == "same" else str(tmp_path) + "/./evidence.jsonl"
+    def run(model, environment, task, **kwargs):
+        environment._journal.record({"type":"command", "action":"true", "cwd":"/work"})
+        return {"status":"Submitted", "messages":[]}
+    monkeypatch.setattr(cli, "run", run)
+    monkeypatch.setattr(sys, "argv", ["hermetic_agent", "--manifest", str(manifest), "--task", str(task),
+        "--script", str(script), "--vsock", "/not-contacted", "--cwd", "/work", "--config-dir", str(tmp_path),
+        "--trajectory", trajectory, "--command-log", str(journal)])
+    assert cli.main() == 2
+    assert not journal.exists()

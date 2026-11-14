@@ -280,7 +280,33 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         .map_err(|_| "invalid_config")?,
     )
     .map_err(str::to_owned)?;
-    let table = DnsTable::from_file(std::path::Path::new(dns_path)).map_err(|_| "invalid_dns")?;
+    let mut dns_bytes = Vec::new();
+    use std::io::Read;
+    files::regular(
+        std::path::Path::new(dns_path),
+        hermetic_netvm_dns::MAX_TABLE_JSON_BYTES as u64,
+    )
+    .map_err(|_| "invalid_dns")?
+    .take(hermetic_netvm_dns::MAX_TABLE_JSON_BYTES as u64 + 1)
+    .read_to_end(&mut dns_bytes)
+    .map_err(|_| "invalid_dns")?;
+    let table =
+        DnsTable::from_json_str(std::str::from_utf8(&dns_bytes).map_err(|_| "invalid_dns")?)
+            .map_err(|_| "invalid_dns")?;
+    let tls_config = if pid1 {
+        let identity = config.tls.as_ref().ok_or("invalid_tls_identity")?;
+        if hermetic_netvm_core::tls::digest(&dns_bytes) != identity.dns_sha256 {
+            return Err("invalid_tls_identity".into());
+        }
+        let ca =
+            hermetic_netvm_core::tls::receive_guest(&config).map_err(|_| "invalid_tls_material")?;
+        Some(
+            hermetic_netvm_core::tls::server_config(ca, &table, config.t_clock)
+                .map_err(|_| "invalid_tls_material")?,
+        )
+    } else {
+        None
+    };
     runtime::world_addresses(&table).map_err(str::to_owned)?;
     let filter = WorldFilter::new(&table);
     let upstream = if pid1 {
@@ -310,8 +336,15 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         })
         .map_err(str::to_owned)?;
     }
+    let https = if pid1 {
+        Some(TcpListener::bind("0.0.0.0:443").map_err(|_| "bind_failed")?)
+    } else {
+        None
+    };
     let dns = UdpSocket::bind(dns_addr).map_err(|_| "bind_failed")?;
     let http = TcpListener::bind(http_addr).map_err(|_| "bind_failed")?;
+    let filter = Arc::new(filter);
+    let upstream = Arc::new(upstream);
     let server = RunningNetvm::start(
         dns,
         http,
@@ -323,11 +356,39 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
             config.t_clock,
         ),
         Arc::new(WorldDns(table)),
-        Arc::new(filter),
-        Arc::new(upstream),
+        filter.clone(),
+        upstream.clone(),
         Arc::new(StderrLogSink),
     )
     .map_err(|_| "start_failed")?;
+    let tls_thread = if let (Some(listener), Some(tls_config)) = (https, tls_config) {
+        let shutdown = server.shutdown_flag();
+        let metrics = Arc::new(hermetic_netvm_core::Metrics::new(Arc::new(StderrLogSink)));
+        Some(
+            std::thread::Builder::new()
+                .name("hermetic-https".into())
+                .spawn(move || {
+                    hermetic_netvm_core::tls::run_loop(
+                        listener,
+                        tls_config,
+                        hermetic_netvm_core::http::HttpRuntimeConfig::bounded(
+                            1,
+                            5000,
+                            2000,
+                            30000,
+                            config.t_clock,
+                        ),
+                        filter,
+                        upstream,
+                        metrics,
+                        shutdown,
+                    );
+                })
+                .map_err(|_| "start_failed")?,
+        )
+    } else {
+        None
+    };
     if pid1 {
         runtime::write_ready_status(std::io::stderr()).map_err(|_| "status_failed")?;
     }
@@ -336,6 +397,9 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         std::thread::sleep(IDLE_SLEEP);
     }
     server.stop();
+    if let Some(thread) = tls_thread {
+        let _ = thread.join();
+    }
     Ok(())
 }
 

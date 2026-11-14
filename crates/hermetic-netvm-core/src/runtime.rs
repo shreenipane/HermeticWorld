@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! First-cut NetVM boot policy: only static DNS and intercepted plain HTTP.
+//! NetVM boot policy: static DNS and sealed HTTP/HTTPS host filtering.
 use crate::{
     dns::DnsResponder,
     http::{FilterDecision, RequestFilter},
@@ -13,7 +13,8 @@ use std::{collections::BTreeSet, io::Read, net::Ipv4Addr};
 pub const NETVM_ADDRESS: &str = "10.0.2.3";
 pub const NETVM_CIDR: &str = "10.0.2.3/24";
 pub const AGENT_ADDRESS: &str = "10.0.2.15";
-pub const AGENT_CIDR: &str = "10.0.2.15/24";
+pub const AGENT_CIDR: &str = "10.0.2.15/32";
+pub const NETVM_PEER_ROUTE: &str = "10.0.2.3/32";
 /// First three octets of the private link between AgentVM and NetVM (10.0.2.0/24).
 pub const LINK_PREFIX: [u8; 3] = [10, 0, 2];
 pub const BUSYBOX: &str = "/sbin/hermetic-busybox";
@@ -23,6 +24,11 @@ pub const MIN_CLOCK: i64 = 315532800;
 pub const MAX_CLOCK: i64 = 4102444799;
 pub const BOOT_COMMAND_TIMEOUT_MS: u64 = 5000;
 pub const BOOT_POLL_MS: u64 = 5;
+/// NAT state and fragment reassembly bounds, installed before eth0 comes up.
+pub const MAX_CONNTRACK_ENTRIES: u32 = 1024;
+pub const CONNTRACK_IDLE_SECONDS: u32 = 30;
+pub const MAX_FRAGMENT_BYTES: u32 = 262144;
+pub const FRAGMENT_TIMEOUT_SECONDS: u32 = 5;
 
 /// Emitted only after network configuration and both service loops have started.
 /// All fields describe sealed policy; no wall clock or host configuration is read.
@@ -37,6 +43,8 @@ pub fn write_ready_status(mut out: impl std::io::Write) -> std::io::Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct WorldConfig {
     pub t_clock: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::tls::TlsIdentity>,
 }
 impl WorldConfig {
     pub fn parse(reader: impl Read) -> Result<Self, &'static str> {
@@ -51,6 +59,9 @@ impl WorldConfig {
         let config: Self = serde_json::from_slice(&data).map_err(|_| "invalid_config")?;
         if !(MIN_CLOCK..=MAX_CLOCK).contains(&config.t_clock) {
             return Err("invalid_config");
+        }
+        if let Some(tls) = &config.tls {
+            tls.validate().map_err(|_| "invalid_config")?;
         }
         Ok(config)
     }
@@ -72,10 +83,7 @@ impl WorldFilter {
     }
 }
 impl RequestFilter for WorldFilter {
-    fn check(&self, head: &[u8], tls: bool, _sni: Option<&str>) -> FilterDecision {
-        if tls {
-            return FilterDecision::Reject;
-        }
+    fn check(&self, head: &[u8], tls: bool, sni: Option<&str>) -> FilterDecision {
         let parsed = match parse_request_head(head) {
             Ok(p) => p,
             Err(_) => return FilterDecision::Reject,
@@ -84,10 +92,14 @@ impl RequestFilter for WorldFilter {
         let method = parsed.method.clone();
         let mut policy_head = parsed;
         policy_head.method = "GET".into();
-        match decide(&policy_head, &self.hosts, Scheme::Http) {
+        let scheme = if tls { Scheme::Https } else { Scheme::Http };
+        match decide(&policy_head, &self.hosts, scheme) {
             Decision::MethodNotAllowed => FilterDecision::NotAllowed,
             Decision::Reject(_) => FilterDecision::Reject,
             Decision::Forward(mut req) => {
+                if tls && sni.is_none_or(|sni| !sni.eq_ignore_ascii_case(&req.host)) {
+                    return FilterDecision::Reject;
+                }
                 if method != "GET" && method != "HEAD" {
                     return FilterDecision::NotAllowed;
                 }
@@ -148,17 +160,38 @@ pub fn world_addresses(table: &DnsTable) -> Result<Vec<Ipv4Addr>, &'static str> 
 
 /// NetVM network bring-up. No forwarding and no IPv6: the only reachable
 /// services are the DNS socket on `NETVM_ADDRESS:53` and the HTTP socket on port 80
-/// of `NETVM_ADDRESS` and of each world address (assigned as /32 on eth0, so no
-/// netfilter redirect is needed). Every other destination is not local and is
-/// dropped because forwarding is off.
+/// of any destination address (REDIRECT in PREROUTING). World /32 aliases also
+/// answer ARP for manifest addresses. Every other service is dropped.
 pub fn boot_commands(table: &DnsTable) -> Result<Vec<BootCommand>, &'static str> {
     let mut out = vec![
         busy(&["sysctl", "-w", "net.ipv4.ip_forward=0"]),
         busy(&["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"]),
         busy(&["sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=1"]),
-        busy(&["ip", "link", "set", "lo", "up"]),
-        busy(&["ip", "addr", "add", NETVM_CIDR, "dev", "eth0"]),
     ];
+    for (key, value) in [
+        ("net.netfilter.nf_conntrack_max", MAX_CONNTRACK_ENTRIES),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_established",
+            CONNTRACK_IDLE_SECONDS,
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_syn_recv",
+            FRAGMENT_TIMEOUT_SECONDS,
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_time_wait",
+            FRAGMENT_TIMEOUT_SECONDS,
+        ),
+        // Linux requires low <= high even while changing the watermarks.
+        // Lower low first: its boot default (3 MiB) exceeds our high cap.
+        ("net.ipv4.ipfrag_low_thresh", MAX_FRAGMENT_BYTES),
+        ("net.ipv4.ipfrag_high_thresh", MAX_FRAGMENT_BYTES),
+        ("net.ipv4.ipfrag_time", FRAGMENT_TIMEOUT_SECONDS),
+    ] {
+        out.push(busy(&["sysctl", "-w", &format!("{key}={value}")]));
+    }
+    out.push(busy(&["ip", "link", "set", "lo", "up"]));
+    out.push(busy(&["ip", "addr", "add", NETVM_CIDR, "dev", "eth0"]));
     for ip in world_addresses(table)? {
         let cidr = format!("{ip}/32");
         out.push(busy(&["ip", "addr", "add", &cidr, "dev", "eth0"]));
@@ -195,6 +228,7 @@ pub fn agent_commands() -> Vec<Vec<String>> {
         &["ip", "link", "set", "lo", "up"],
         &["ip", "addr", "add", AGENT_CIDR, "dev", "eth0"],
         &["ip", "link", "set", "eth0", "up"],
+        &["ip", "route", "add", NETVM_PEER_ROUTE, "dev", "eth0"],
         &route,
     ]
     .iter()
@@ -312,16 +346,86 @@ mod tests {
     }
 
     #[test]
+    fn interception_state_is_capped_before_network_and_every_failure_stops_boot() {
+        let t = table(&[("a.example", &["10.9.0.1"])]);
+        let plan = boot_commands(&t).unwrap();
+        let up = plan
+            .iter()
+            .position(|c| c.args == ["ip", "link", "set", "eth0", "up"])
+            .unwrap();
+        for required in [
+            "net.netfilter.nf_conntrack_max=1024",
+            "net.netfilter.nf_conntrack_tcp_timeout_established=30",
+            "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5",
+            "net.netfilter.nf_conntrack_tcp_timeout_time_wait=5",
+            "net.ipv4.ipfrag_high_thresh=262144",
+            "net.ipv4.ipfrag_time=5",
+        ] {
+            assert!(plan
+                .iter()
+                .take(up)
+                .any(|c| c.args == ["sysctl", "-w", required]));
+        }
+        for fail_at in 0..plan.len() {
+            let mut seen = Vec::new();
+            assert_eq!(
+                configure(&t, |c| {
+                    seen.push(c.clone());
+                    if seen.len() == fail_at + 1 {
+                        Err("boot_failed")
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err("boot_failed")
+            );
+            assert_eq!(seen, plan[..=fail_at]);
+        }
+    }
+
+    #[test]
+    fn fragment_watermarks_boot_with_linux_defaults() {
+        // Linux 6.6 ip4_frags_ns_ctl_register gives high_thresh a minimum
+        // of low_thresh, and low_thresh a maximum of high_thresh.
+        let mut low = 3 * 1024 * 1024u32;
+        let mut high = 4 * 1024 * 1024u32;
+        configure(&table(&[]), |command| {
+            if command.args.first().map(String::as_str) == Some("sysctl") {
+                let (key, value) = command.args[2].split_once('=').unwrap();
+                let value: u32 = value.parse().unwrap();
+                match key {
+                    "net.ipv4.ipfrag_low_thresh" if value <= high => low = value,
+                    "net.ipv4.ipfrag_high_thresh" if value >= low => high = value,
+                    "net.ipv4.ipfrag_low_thresh" | "net.ipv4.ipfrag_high_thresh" => {
+                        return Err("boot_failed");
+                    }
+                    _ => {}
+                }
+            }
+            if command.args == ["ip", "link", "set", "eth0", "up"] {
+                assert_eq!(high, MAX_FRAGMENT_BYTES);
+                assert!(low <= high);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(high, MAX_FRAGMENT_BYTES);
+    }
+
+    #[test]
     fn agent_side_routes_only_via_netvm() {
         let cmds = agent_commands();
         assert!(cmds.iter().all(|c| c[0] == "/bin/busybox"));
         let flat: Vec<String> = cmds.iter().map(|c| c[1..].join(" ")).collect();
-        assert!(flat.contains(&"ip addr add 10.0.2.15/24 dev eth0".to_owned()));
+        assert!(flat.contains(&"ip addr add 10.0.2.15/32 dev eth0".to_owned()));
         assert_eq!(
             flat.iter()
                 .filter(|c| c.starts_with("ip route"))
                 .collect::<Vec<_>>(),
-            ["ip route add default via 10.0.2.3 dev eth0"]
+            [
+                "ip route add 10.0.2.3/32 dev eth0",
+                "ip route add default via 10.0.2.3 dev eth0"
+            ]
         );
         assert_eq!(RESOLV_CONF, "nameserver 10.0.2.3\noptions ndots:0\n");
     }

@@ -539,6 +539,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermetic-clockprobe"
+version = "0.1.0"
+
+[[package]]
 name = "hermetic-cmdlog"
 version = "0.1.0"
 dependencies = [
@@ -667,9 +671,12 @@ dependencies = [
  "hermetic-common",
  "hermetic-netvm-dns",
  "hermetic-netvm-http",
+ "hermetic-trust",
  "hermetic-world-server",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
 ]
@@ -749,6 +756,7 @@ name = "hermetic-vmm"
 version = "0.1.0"
 dependencies = [
  "hermetic-common",
+ "hermetic-netvm-core",
  "rustix",
  "serde",
  "serde_json",

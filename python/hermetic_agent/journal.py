@@ -17,9 +17,11 @@ def validate_output(path):
         try:
             entry = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
-            return
-        if not stat.S_ISREG(entry.st_mode):
+            entry = None
+        if entry is not None and not stat.S_ISREG(entry.st_mode):
             raise ProtocolError("Output must be a regular file")
+        parent = os.fstat(directory)
+        return parent.st_dev, parent.st_ino, leaf
     finally:
         os.close(directory)
 

@@ -339,6 +339,82 @@ impl Upstream for StaticUpstream {
     }
 }
 
+pub(crate) enum HttpStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, crate::tls::DeadlineTcp>>),
+}
+impl HttpStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_read_timeout(timeout),
+            Self::Tls(s) => {
+                s.sock
+                    .set_deadline(Instant::now() + timeout.unwrap_or_default());
+                Ok(())
+            }
+        }
+    }
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)?;
+        if let Self::Plain(s) = self {
+            s.set_write_timeout(timeout)?;
+        }
+        Ok(())
+    }
+    fn set_nodelay(&self, value: bool) -> std::io::Result<()> {
+        if let Self::Plain(s) = self {
+            s.set_nodelay(value)?;
+        }
+        Ok(())
+    }
+    fn reset(&self) {
+        match self {
+            Self::Plain(s) => {
+                let _ = crate::sys::reset_tcp(s);
+            }
+            Self::Tls(s) => s.sock.reset(),
+        }
+    }
+    fn finish(&mut self) {
+        if let Self::Tls(s) = self {
+            s.conn.send_close_notify();
+            let _ = s.flush();
+        }
+        let _ = self.shutdown(Shutdown::Both);
+    }
+    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.shutdown(how),
+            Self::Tls(s) => {
+                s.sock.shutdown();
+                Ok(())
+            }
+        }
+    }
+}
+impl Read for HttpStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+impl Write for HttpStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum HeadReadError {
     Timeout,
@@ -348,7 +424,7 @@ enum HeadReadError {
 }
 
 fn read_http_head(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     head_timeout: Duration,
 ) -> Result<Vec<u8>, HeadReadError> {
     let deadline = Instant::now() + head_timeout;
@@ -407,7 +483,7 @@ enum StreamWriteError {
 }
 
 fn write_all_with_deadlines(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     mut data: &[u8],
     chunk_write_timeout: Duration,
     overall_deadline: Instant,
@@ -477,7 +553,27 @@ fn format_response_head(status: u16, filtered_headers: &[(String, String)]) -> V
 
 /// Processes a single accepted TCP stream end-to-end (strictly one request per connection).
 pub fn handle_http_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
+    tls: bool,
+    sni: Option<&str>,
+    config: HttpRuntimeConfig,
+    filter: &dyn RequestFilter,
+    upstream: &dyn Upstream,
+    metrics: &Metrics,
+) {
+    handle_stream(
+        HttpStream::Plain(stream),
+        tls,
+        sni,
+        config,
+        filter,
+        upstream,
+        metrics,
+    );
+}
+
+pub(crate) fn handle_stream(
+    mut stream: HttpStream,
     tls: bool,
     sni: Option<&str>,
     config: HttpRuntimeConfig,
@@ -511,7 +607,7 @@ pub fn handle_http_connection(
     match filter.check(&head, tls, sni) {
         FilterDecision::Reject => {
             metrics.inc_http_rejected();
-            let _ = stream.shutdown(Shutdown::Both);
+            stream.reset();
         }
         FilterDecision::NotAllowed => {
             metrics.inc_http_not_allowed();
@@ -523,7 +619,7 @@ pub fn handle_http_connection(
                 deadline,
             );
             let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            stream.finish();
         }
         FilterDecision::Forward(request_json) => {
             metrics.inc_http_forwarded();
@@ -634,7 +730,7 @@ pub fn handle_http_connection(
             }
 
             let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            stream.finish();
             metrics.inc_http_responses_completed();
         }
     }

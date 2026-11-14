@@ -12,6 +12,7 @@ pub mod headers;
 pub mod http;
 pub mod runtime;
 mod sys;
+pub mod tls;
 pub mod upstream;
 
 use std::collections::BTreeMap;

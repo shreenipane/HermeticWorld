@@ -428,7 +428,7 @@ impl SseReader {
             if let Some((slot, _)) = &self.accounting {
                 // Account on receipt, before a client can abandon buffered Anthropic events.
                 slot.set_usage(usage.prompt_tokens, usage.completion_tokens);
-                let _ = slot.check_live(0);
+                slot.check_live(0).map_err(|_| bad_stream())?;
             }
         }
         if chunk.choices.len() > 1 {

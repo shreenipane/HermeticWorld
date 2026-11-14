@@ -40,6 +40,7 @@ fn sample_manifest() -> WorldManifest {
         world_ca_cert_sha256:
             "blake3:0000000000000000000000000000000000000000000000000000000000000007".to_string(),
         trust_store_paths: Vec::new(),
+        test_services: Vec::new(),
         run_spec: RunSpec {
             env: BTreeMap::new(),
             workdir: "/testbed".to_string(),

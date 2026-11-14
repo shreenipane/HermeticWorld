@@ -994,3 +994,10 @@ def test_netvm_filter_requires_builtin_legacy_tables():
         assert k.RULES[option].value == "y"
         assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
         assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
+
+
+def test_netvm_redirect_requires_builtin_nat_and_conntrack():
+    for option in ("CONFIG_NF_CONNTRACK", "CONFIG_NF_NAT", "CONFIG_IP_NF_NAT", "CONFIG_NETFILTER_XT_TARGET_REDIRECT"):
+        assert k.RULES[option].value == "y"
+        assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
+        assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]

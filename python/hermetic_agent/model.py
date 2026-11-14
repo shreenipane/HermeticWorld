@@ -144,6 +144,8 @@ class HermeticGatewayModel:
                 output.extend(part)
             if len(output) > MAX_MODEL_BODY_BYTES:
                 raise LimitError("Model response byte limit")
+            if response.length not in (None, 0):
+                raise GatewayError("Truncated gateway response")
         except (OSError, http.client.HTTPException):
             raise GatewayError("Gateway transport failed") from None
         finally:

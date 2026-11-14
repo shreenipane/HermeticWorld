@@ -27,7 +27,14 @@ PY
 umask 077
 export CARGO_TARGET_DIR="$HOME/hermetic/cargo-target/$(basename "$top")"
 # Builds static inputs and a sealed base, and proves the first-boot path.
-bash scripts/integration/boot-smoke.sh "$WORK/first"
+# The parent owns these artifacts until the touched-disk reboot finishes.
+# Standalone boot-smoke's wrapper removes them immediately on success.
+(
+  export HERMETIC_SMOKE_WORK="$WORK/first"
+  mkdir "$HERMETIC_SMOKE_WORK"
+  source scripts/integration/boot-smoke.sh
+  smoke_main
+)
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 PIN="$(/usr/bin/python3 -I - "$top/python" "$BIN" "$WORK/trusted.cpio" <<'PY'
 import sys

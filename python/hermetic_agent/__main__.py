@@ -5,7 +5,7 @@ import json
 
 from hermetic_safe_io import atomic_write
 from .environment import ExecdEnvironment
-from .errors import HarnessError
+from .errors import HarnessError, ProtocolError
 from .model import HermeticGatewayModel
 from .runner import run, MAX_TRAJECTORY_BYTES
 from .task import read_input, task_clock
@@ -30,7 +30,8 @@ def main():
             model = ScriptedModel(parse_json(read_input(args.script)), t_clock=clock)
         else:
             model = HermeticGatewayModel(args.gateway, args.model, t_clock=clock)
-        validate_output(args.trajectory)
+        if validate_output(args.trajectory) == validate_output(args.command_log):
+            raise ProtocolError("Trajectory and command log must be distinct")
         journal = CommandJournal(args.command_log, t_clock=clock)
         environment = ExecdEnvironment(args.vsock, cwd=args.cwd, journal=journal)
         result = run(model, environment, task, config_dir=args.config_dir)

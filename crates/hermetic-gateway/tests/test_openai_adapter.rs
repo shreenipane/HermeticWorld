@@ -355,3 +355,131 @@ fn malformed_generated_content_still_consumes_reported_budget() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn unreadable_chat_usage_ends_run_before_another_upstream_call() {
+    for (body, encoding) in [
+        (vec![0xff], None),
+        (b"not decoded".to_vec(), Some("gzip")),
+        (
+            vec![b' '; hermetic_gateway::upstream::UpstreamClient::MAX_RESPONSE_BYTES + 1],
+            None,
+        ),
+    ] {
+        let fixture = Fixture::new(1000);
+        let upstream = fixture.upstream.clone();
+        let worker = std::thread::spawn(move || {
+            let req = upstream
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let mut response = tiny_http::Response::from_data(body);
+            if let Some(encoding) = encoding {
+                response.add_header(
+                    tiny_http::Header::from_bytes("Content-Encoding", encoding).unwrap(),
+                );
+            }
+            let _ = req.respond(response);
+        });
+        assert_eq!(fixture.post(&base_request(false)).status(), 429);
+        worker.join().unwrap();
+        assert_eq!(fixture.post(&base_request(false)).status(), 429);
+        assert!(fixture
+            .upstream
+            .recv_timeout(Duration::from_millis(20))
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn streaming_usage_breach_does_not_read_another_upstream_event() {
+    use hermetic_gateway::{
+        quota::{QuotaTracker, QuotasConfig},
+        response::{StreamSlotGuard, StreamUsage},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    struct Frames {
+        frames: std::collections::VecDeque<Cursor<Vec<u8>>>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl Read for Frames {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            while let Some(frame) = self.frames.front_mut() {
+                let n = frame.read(buf)?;
+                if n > 0 {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    return Ok(n);
+                }
+                self.frames.pop_front();
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no further frame",
+            ))
+        }
+    }
+    let quota = Arc::new(QuotaTracker::new(QuotasConfig {
+        max_output_tokens: Some(2),
+        ..Default::default()
+    }));
+    quota.check_and_acquire(0).unwrap();
+    let slot = Arc::new(StreamSlotGuard::new(
+        quota.clone(),
+        Arc::new(Mutex::new(StreamUsage::default())),
+    ));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let frames = [
+        json!({"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":3}}),
+        json!({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":4}}),
+    ]
+    .into_iter()
+    .map(|v| Cursor::new(format!("data: {v}\n\n").into_bytes()))
+    .collect();
+    let mut reader = openai::SseReader::new(
+        Box::new(Frames {
+            frames,
+            reads: reads.clone(),
+        }),
+        "pinned".into(),
+    )
+    .with_accounting(slot.clone(), quota.clone());
+    assert!(reader.read_to_end(&mut Vec::new()).is_err());
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert!(quota.is_limit_exceeded());
+    drop(reader);
+    slot.record_and_release().unwrap_err();
+    assert_eq!(quota.snapshot().output_tokens, 3);
+}
+
+#[test]
+fn chat_usage_accumulates_input_and_output_once_across_requests() {
+    let fixture = Fixture::new(7);
+    let upstream = fixture.upstream.clone();
+    let worker = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let req = upstream
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            req.respond(tiny_http::Response::from_string(
+                json!({"choices":[{"index":0,
+                "message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":5,"completion_tokens":4}})
+                .to_string(),
+            ))
+            .unwrap();
+        }
+    });
+    assert_eq!(fixture.post(&base_request(false)).status(), 200);
+    assert_eq!(fixture.post(&base_request(false)).status(), 429);
+    worker.join().unwrap();
+    let log = std::fs::read_to_string(&fixture.log_path).unwrap();
+    let record: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(record["quotas"]["input_tokens"], 10);
+    assert_eq!(record["quotas"]["output_tokens"], 8);
+}

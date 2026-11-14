@@ -1,0 +1,6 @@
+{
+  "offline_source": "python/tests/fixtures/grader/psf__requests-2317.row.json",
+  "retrieval": "copied byte-for-byte from the existing repository fixture; upstream provenance was not re-fetched",
+  "sha256": "4069e71d0cb3d5927ca1ed005a9ee2f6f73fef9ea7136e6115436089980b368e",
+  "source_url": "https://huggingface.co/datasets/princeton-nlp/SWE-bench"
+}

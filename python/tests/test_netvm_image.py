@@ -74,12 +74,33 @@ def test_constants_match_rust_runtime() -> None:
 
     assert const("NETVM_ADDRESS") == netvm.NETVM_ADDRESS
     assert const("AGENT_CIDR") == netvm.AGENT_CIDR
+    assert const("NETVM_PEER_ROUTE") == netvm.NETVM_PEER_ROUTE
     assert const("RESOLV_CONF") == netvm.RESOLV_CONF
     assert const("BUSYBOX") == "/sbin/hermetic-busybox"
     for cmd in netvm.AGENT_NETWORK_COMMANDS:
         literal = ", ".join(f'"{a}"' for a in cmd[1:])
-        literal = literal.replace('"10.0.2.15/24"', "AGENT_CIDR").replace('"10.0.2.3"', "NETVM_ADDRESS")
+        literal = literal.replace('"10.0.2.15/32"', "AGENT_CIDR").replace('"10.0.2.3"', "NETVM_ADDRESS").replace('"10.0.2.3/32"', "NETVM_PEER_ROUTE")
         assert literal in src, literal
+
+
+def test_agent_routes_link_neighbours_and_public_addresses_through_filter() -> None:
+    import ipaddress
+    routes = []
+    # Interpret the emitted commands as connected and explicit IPv4 routes.
+    # The former /24 assigned a direct route for 10.0.2.2, bypassing NetVM.
+    for cmd in netvm.AGENT_NETWORK_COMMANDS:
+        if cmd[1:4] == ("ip", "addr", "add"):
+            routes.append((ipaddress.ip_interface(cmd[4]).network, None))
+        elif cmd[1:4] == ("ip", "route", "add"):
+            prefix = "0.0.0.0/0" if cmd[4] == "default" else cmd[4]
+            via = cmd[6] if cmd[5] == "via" else None
+            if via is not None:
+                # The gateway must already have a direct link route.
+                assert any(ipaddress.ip_address(via) in net and hop is None for net, hop in routes)
+            routes.append((ipaddress.ip_network(prefix), via))
+    for addr in ("10.0.2.1", "10.0.2.2", "10.9.0.1", "169.254.169.254", "192.168.0.1", "1.1.1.1"):
+        matching = [(net, via) for net, via in routes if ipaddress.ip_address(addr) in net]
+        assert max(matching, key=lambda r: r[0].prefixlen)[1] == netvm.NETVM_ADDRESS
 
 
 @pytest.mark.parametrize("bad", [
@@ -149,7 +170,10 @@ def test_image_builder_preserves_existing_tree_on_invalid_input(tmp_path: Path) 
     tree.mkdir()
     (tree / "keep").write_bytes(b"untouched")
     with pytest.raises(ValueError):
-        netvm.build_netvm_image(tree, tmp_path / "out.img", world_id="test", **args)
+        import hashlib
+        identity = {"world_id": "test", "dns_sha256": hashlib.sha256(args["dns_table"].read_bytes()).hexdigest(),
+                    "ca_sha256": "a" * 64, "material_sha256": "b" * 64}
+        netvm.build_netvm_image(tree, tmp_path / "out.img", world_id="test", tls_identity=identity, **args)
     assert (tree / "keep").read_bytes() == b"untouched"
 
 
@@ -239,3 +263,56 @@ cargo() {
     assert b"ip addr; ip route; ip neigh; /etc/resolv.conf" in saved
     printed = run.stderr if exit_code else run.stdout
     assert saved in printed
+
+
+def test_tls_identity_is_validated_before_output_and_no_secrets_enter_tree(tmp_path):
+    import hashlib
+    args = _inputs(tmp_path)
+    identity = {"world_id": "test-world", "dns_sha256": hashlib.sha256(args["dns_table"].read_bytes()).hexdigest(),
+                "ca_sha256": "a" * 64, "material_sha256": "b" * 64}
+    for bad in ({**identity, "dns_sha256": "0" * 64}, {**identity, "ca_key_pem": "PRIVATE KEY"},
+                {**identity, "world_id": "../host"}, {**identity, "material_sha256": "x" * 64}):
+        with pytest.raises(ValueError, match="invalid TLS identity"):
+            netvm.build_netvm_tree(tmp_path / "bad-tree", **args, tls_identity=bad)
+        assert not (tmp_path / "bad-tree").exists()
+        assert not list(tmp_path.glob(".netvm-tree.*"))
+    tree = netvm.build_netvm_tree(tmp_path / "tls-tree", **args, tls_identity=identity)
+    config = json.loads((tree / "etc/hermetic/netvm.json").read_bytes())
+    assert config == {"t_clock": 1700000000, "tls": identity}
+    for path in tree.rglob("*"):
+        if path.is_file():
+            assert b"PRIVATE KEY" not in path.read_bytes()
+            assert b"ca_seed" not in path.read_bytes()
+
+
+def test_merge_preserves_run_spec_point_to_point_network_and_verified_https():
+    smoke = (ROOT / "scripts/integration/net-smoke.sh").read_text()
+    assert '"prefix":32' in smoke
+    assert '"prefix":24' not in smoke
+    assert "netvm_tls_fixture" in smoke and "netvm_fetch" in smoke
+    probe = (ROOT / "crates/hermetic-vmm/tests/net_guest.rs").read_text()
+    assert "hermetic-https-fetch /etc/hermetic/ca.der" in probe
+    assert "hermetic-https-fetch /etc/hermetic/unrelated.der" in probe
+    for relative in ("PHASES.md", "crates/hermetic-netvm-core/README.md", "crates/hermetic-vmm/tests/net_guest.rs", "scripts/integration/BOOT_NOTES.md"):
+        source = (ROOT / relative).read_text()
+        assert "<<<<<<<" not in source and ">>>>>>>" not in source
+    assert "cd /home/flingboot/.hermetic/worktrees/netvm-tls" not in (ROOT / "scripts/integration/BOOT_NOTES.md").read_text()
+
+
+def test_tls_image_world_mismatch_has_no_filesystem_effects(tmp_path):
+    args = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="does not match image world"):
+        netvm.build_netvm_image(tmp_path / "tree", tmp_path / "image", **args, world_id="world-a",
+                               tls_identity={"world_id": "world-b"})
+    assert not (tmp_path / "tree").exists()
+    assert not (tmp_path / "image").exists()
+
+
+def test_image_builder_requires_tls_identity_before_filesystem_effects(tmp_path, monkeypatch):
+    from hermetic_slice import rootfs
+    monkeypatch.setattr(rootfs, "build_rootfs", lambda *a, **kw: pytest.fail("building an unbootable TLS image"))
+    args = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="TLS identity is required"):
+        netvm.build_netvm_image(tmp_path / "tree", tmp_path / "image", **args, world_id="test")
+    assert not (tmp_path / "tree").exists()
+    assert not (tmp_path / "image").exists()

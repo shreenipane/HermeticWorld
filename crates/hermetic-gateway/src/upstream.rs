@@ -24,6 +24,19 @@ pub struct UpstreamClient {
     config: Arc<GatewayConfig>,
 }
 
+/// A sent Chat request must either report usage or transfer that duty to its stream.
+struct UnverifiedChatUsage(Option<Arc<crate::quota::QuotaTracker>>);
+
+impl Drop for UnverifiedChatUsage {
+    fn drop(&mut self) {
+        if let Some(quota) = &self.0 {
+            if !quota.is_limit_exceeded() {
+                quota.trigger_limit_exceeded("Unverifiable upstream token usage".into());
+            }
+        }
+    }
+}
+
 impl UpstreamClient {
     pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB limit
     /// A non-2xx body is only inspected for its error type and is never forwarded, so far
@@ -105,11 +118,19 @@ impl UpstreamClient {
             req = req.timeout(t);
         }
 
+        let mut unverified = UnverifiedChatUsage(if openai {
+            accounting.as_ref().map(|(_, quota)| quota.clone())
+        } else {
+            None
+        });
         let call_res = req.send_string(&rebuilt_json);
 
         match call_res {
             Ok(resp) => {
                 let status = resp.status();
+                if !(200..300).contains(&status) {
+                    unverified.0 = None;
+                }
                 let mut headers = Vec::new();
                 for h_name in resp.headers_names() {
                     if let Some(val) = resp.header(&h_name) {
@@ -150,11 +171,13 @@ impl UpstreamClient {
                         headers,
                         reader: if openai {
                             let reader = crate::openai::SseReader::new(resp.into_reader(), model);
-                            Box::new(if let Some((slot, quota)) = accounting {
+                            let reader = if let Some((slot, quota)) = accounting {
                                 reader.with_accounting(slot, quota)
                             } else {
                                 reader
-                            })
+                            };
+                            unverified.0 = None;
+                            Box::new(reader)
                         } else {
                             resp.into_reader()
                         },
@@ -197,6 +220,7 @@ impl UpstreamClient {
                                     slot.set_usage(input, output);
                                     let _ = slot.check_live(0);
                                 }
+                                unverified.0 = None;
                             }
                             Err(error) => {
                                 if let Some((_, quota)) = &accounting {
@@ -219,6 +243,7 @@ impl UpstreamClient {
                 }
             }
             Err(ureq::Error::Status(status, resp)) => {
+                unverified.0 = None;
                 let mut headers = Vec::new();
                 for h_name in resp.headers_names() {
                     if let Some(val) = resp.header(&h_name) {

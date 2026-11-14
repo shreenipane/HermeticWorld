@@ -107,7 +107,7 @@ PY
     HERMETIC_GRADER_RUN="$r" \
       timeout 400 cargo test -q -p hermetic-vmm --features dev-unjailed --test guest \
       boots_grader_and_collects_result_drive -- --ignored --nocapture --exact 2>&1 \
-      | grep -E '^grader serial:|test result:|panicked'
+      | grep -E '^grader serial:|^grader timeout:|test result:|panicked'
     [ -s "$D/host/$r.img" ] || { echo "grader VM FAILED for $v $r" >&2; exit 1; }
   done
 
