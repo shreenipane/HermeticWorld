@@ -53,6 +53,24 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 ### Next
 - Integrate guest-lockdown into agent-h and int-day; rerun smokes; push after scans. Phase 4 continues (smart git in NetVM, acquisition, state grading, web archive).
 
+## 2026-11-14: Phase 4 offline ecosystem preparation
+
+- **Phase:** 4
+- **Type:** build | docs
+- **Requirements:** TR-PKG-2, TR-PKG-6, architecture §6.4
+
+### Done
+- Reviewed the requested branch diff/log (both empty at start) and the required specifications.
+- Added bounded, deterministic crates.io sparse-index and Go proxy metadata cutoff filters, with unknown-date and yank-uncertainty reports and offline hostile-input/known-answer tests.
+- Fixed npm direct-input resource/type validation, non-finite numbers, configuration validation order, publication path aliases and an error that echoed an untrusted version. New regressions were observed failing before fixes; no existing tests changed.
+- Researched the Maven metadata/provenance gap and recorded all unfinished Phase 4 work in PHASES.md and docs/phase4-plan.md.
+
+### Results / open questions
+- Targeted Python suite: 85 passed before the complete gates.
+- OPEN: historical npm non-latest dist-tags require timestamped source provenance or an owner-approved change to the existing tag-preservation contract.
+- `cargo fmt --all` and `git diff --check`: exit 0. `rust-gate`: exit 101; four VMM fixtures refuse filesystem ancestors remapped to UID 65534 by this sandbox. Ownership checks and tests are preserved; normal host UID mappings are required.
+- `py-gate` (after rust-gate): exit 0; 1768 passed, 12 existing deprecation warnings in 165.65 s. Full gate details are in docs/phase4-plan.md.
+
 ## 2026-11-13: review-and-fix of every written branch; first real guest kernel build (Phases 1, 2, 3)
 
 - **Phase:** 1, 2, 3

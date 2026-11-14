@@ -117,14 +117,11 @@ def test_rules_1_2_3_4_5_packument_cut() -> None:
         "2.0.0-beta.1": "2023-04-01T00:00:00Z",
     }
 
-    # Rule 3: Recompute dist-tags (tag survives only if pointing at kept version; latest re-pointed to highest stable version)
-    assert report.tags_dropped == ["future-tag"]
+    # Rule 3: only "latest" survives, re-pointed to the highest admitted stable
+    # version; every other tag may have been created after the cutoff.
+    assert report.tags_dropped == ["future-tag", "legacy", "next"]
     assert report.latest == "1.2.0"
-    assert out["dist-tags"] == {
-        "latest": "1.2.0",
-        "legacy": "1.0.0",
-        "next": "2.0.0-beta.1",
-    }
+    assert out["dist-tags"] == {"latest": "1.2.0"}
 
     # Rule 4: Leak keys removal
     assert "users" not in out
@@ -160,8 +157,8 @@ def test_rule2_rule3_empty_and_prerelease_only() -> None:
     }
     out_pre, report_pre = cut_packument(packument_pre, cutoff="2023-04-01T00:00:00Z")
     assert report_pre.latest is None
-    assert report_pre.tags_dropped == ["latest"]
-    assert out_pre["dist-tags"] == {"alpha": "0.1.0-alpha.1"}
+    assert report_pre.tags_dropped == ["alpha", "latest"]
+    assert out_pre["dist-tags"] == {}
     assert "readme" not in out_pre
     assert "readmeFilename" not in out_pre
 
@@ -449,3 +446,20 @@ def test_review_hostile_packuments_raise_typed_errors() -> None:
     for doc in hostile_values:
         with pytest.raises(HermeticNpmCutError):
             cut_packument(doc, _CUTOFF)
+
+
+def test_tags_pointing_at_admitted_versions_are_still_dropped():
+    """Review finding: without tag history, a tag created after the cutoff can
+    point at an admitted release and would reveal post-cutoff activity."""
+    packument = {
+        "name": "tagged",
+        "dist-tags": {"latest": "2.0.0", "added-after-cutoff-2026": "1.0.0", "lts": "1.0.0"},
+        "time": {"created": "2020-01-01T00:00:00Z", "modified": "2026-05-01T00:00:00Z",
+                 "1.0.0": "2020-01-01T00:00:00Z", "2.0.0": "2026-05-01T00:00:00Z"},
+        "versions": {"1.0.0": {"name": "tagged", "version": "1.0.0"},
+                     "2.0.0": {"name": "tagged", "version": "2.0.0"}},
+    }
+    out, report = cut_packument(packument, cutoff="2020-06-01T00:00:00Z")
+    assert out["dist-tags"] == {"latest": "1.0.0"}
+    assert report.tags_dropped == ["added-after-cutoff-2026", "lts"]
+    assert "added-after-cutoff-2026" not in json.dumps(out)

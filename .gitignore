@@ -18,3 +18,5 @@ out/
 *.log
 .*-gate-*.log
 .*-gate-tmp/
+.g-tmp/
+*.log

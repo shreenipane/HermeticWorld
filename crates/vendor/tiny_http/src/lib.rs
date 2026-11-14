@@ -292,6 +292,19 @@ impl Server {
         Self::from_listener(listener, config.ssl)
     }
 
+    /// HERMETIC PATCH: a plain HTTP server whose read deadlines are in force before
+    /// its accept thread starts, so no connection is ever read without them.
+    pub fn http_with_deadlines<A>(
+        addr: A,
+        deadlines: RequestDeadlines,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
+    where
+        A: ToSocketAddrs,
+    {
+        let listener = ConfigListenAddr::from_socket_addrs(addr)?.bind()?;
+        Self::from_listener_with_deadlines(listener, None, deadlines)
+    }
+
     /// Builds a new server using the specified TCP listener.
     ///
     /// This is useful if you've constructed TcpListener using some less usual method
@@ -299,6 +312,17 @@ impl Server {
     pub fn from_listener<L: Into<Listener>>(
         listener: L,
         ssl_config: Option<SslConfig>,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        Self::from_listener_with_deadlines(listener, ssl_config, RequestDeadlines::default())
+    }
+
+    /// HERMETIC PATCH: as `from_listener`, with read deadlines installed before the
+    /// accept thread starts (closing the window in which a queued connection would
+    /// otherwise be read with no deadline).
+    pub fn from_listener_with_deadlines<L: Into<Listener>>(
+        listener: L,
+        ssl_config: Option<SslConfig>,
+        initial_deadlines: RequestDeadlines,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = listener.into();
         // building the "close" variable
@@ -342,7 +366,7 @@ impl Server {
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
-        let deadlines = Arc::new(std::sync::Mutex::new(RequestDeadlines::default()));
+        let deadlines = Arc::new(std::sync::Mutex::new(initial_deadlines));
         let inside_deadlines = deadlines.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads

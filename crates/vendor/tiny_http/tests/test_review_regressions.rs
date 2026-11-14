@@ -60,3 +60,27 @@ fn outstanding_requests_and_extracted_writers_hold_connection_slots() {
     assert_eq!(request.url(), "/recovered");
     request.close_without_response();
 }
+
+/// Gateway startup race (2026-11-14): a connection accepted before the
+/// application installs deadlines was read with none, forever. Deadlines given
+/// at construction apply to the very first connection.
+#[test]
+fn deadlines_given_at_construction_bound_the_first_connection() {
+    use std::time::Instant;
+    use tiny_http::RequestDeadlines;
+    let deadlines = RequestDeadlines {
+        head: Some(Duration::from_millis(50)),
+        body: Some(Duration::from_millis(50)),
+    };
+    let server = Server::http_with_deadlines("127.0.0.1:0", deadlines).unwrap();
+    let mut client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+    client.set_read_timeout(Some(WAIT)).unwrap();
+    // Incomplete request line, sent before anything calls set_request_deadlines.
+    client.write_all(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let start = Instant::now();
+    let mut buf = [0u8; 64];
+    let n = client.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "connection must be closed without a response");
+    assert!(start.elapsed() < Duration::from_secs(3), "head deadline was not in force");
+    assert!(server.try_recv().unwrap().is_none());
+}
