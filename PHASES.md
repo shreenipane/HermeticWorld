@@ -289,7 +289,7 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
   tests passed. Subsequent Python gate: 2291 passed, 1 skipped, 12 warnings,
   exit 0. No full Rust gate success is claimed.
 
-- [ ] OPEN, major, gateway startup deadline race: `Server::http` begins accepting
+- [x] Resolved 2026-11-14: `Server::http_with_deadlines` / `from_listener_with_deadlines` install the read deadlines before the accept thread starts, and the gateway binary uses them (proof: `deadlines_given_at_construction_bound_the_first_connection`). Original finding, gateway startup deadline race: `Server::http` begins accepting
   before `GatewayServer::run_loop` installs request deadlines. A request queued
   in that window caches unlimited body reads; installing deadlines later does
   not bound it. Independently reproduced with an incomplete local request that

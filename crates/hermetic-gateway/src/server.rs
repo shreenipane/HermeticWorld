@@ -390,6 +390,12 @@ impl GatewayServer {
         }
     }
 
+    /// The client read deadlines; pass them to `Server::http_with_deadlines` so they
+    /// apply from the first accepted connection.
+    pub fn client_deadlines(&self) -> RequestDeadlines {
+        self.client_deadlines
+    }
+
     pub fn run_loop(&self, server: Server) {
         server.set_request_deadlines(self.client_deadlines);
         while self.running.load(Ordering::SeqCst) {

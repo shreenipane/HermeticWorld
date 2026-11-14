@@ -54,7 +54,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let server_http = match Server::http(&args.listen) {
+    // Deadlines are installed before the accept thread starts; a connection queued
+    // before run_loop must never be read without them.
+    let server_http = match Server::http_with_deadlines(&args.listen, gateway.client_deadlines()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to bind server on '{}': {e}", args.listen);
