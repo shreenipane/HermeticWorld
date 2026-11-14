@@ -164,3 +164,27 @@ pub fn open_log_file(dir: &File, name: &str) -> io::Result<File> {
     }
     Ok(file)
 }
+
+/// Replaces the contents of `dir/name` (created 0600 if missing; an existing entry must be a
+/// regular file, never a symlink or FIFO).
+pub fn write_state_file(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(flags::O_NOFOLLOW | O_NONBLOCK)
+        .open(fd_path(dir, std::ffi::OsStr::new(name)))
+        .map_err(|e| invalid(format!("cannot open state file {name}: {e}")))?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(invalid(format!("state file {name} is not a regular file")));
+    }
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
