@@ -28,8 +28,14 @@ fn unsupported() -> GatewayError {
     GatewayError::InvalidRequest("Unsupported Chat Completions request feature".into())
 }
 
+/// Exact remote Chat Completions endpoints; anything else must be an explicit loopback.
+pub const ALLOWED_REMOTE_BASE_URLS: &[&str] = &[
+    "https://generativelanguage.googleapis.com/v1beta/openai",
+    "https://integrate.api.nvidia.com/v1",
+];
+
 pub fn validate_base_url(url: &str) -> Result<(), String> {
-    if url.trim_end_matches('/') == "https://generativelanguage.googleapis.com/v1beta/openai" {
+    if ALLOWED_REMOTE_BASE_URLS.contains(&url.trim_end_matches('/')) {
         return Ok(());
     }
     // Offline tests may use an explicitly loopback HTTP upstream. No credentials, redirects,

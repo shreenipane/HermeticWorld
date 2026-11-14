@@ -483,3 +483,19 @@ fn chat_usage_accumulates_input_and_output_once_across_requests() {
     assert_eq!(record["quotas"]["input_tokens"], 10);
     assert_eq!(record["quotas"]["output_tokens"], 8);
 }
+
+#[test]
+fn nvidia_endpoint_is_admitted_only_exactly() {
+    assert!(openai::validate_base_url("https://integrate.api.nvidia.com/v1").is_ok());
+    assert!(openai::validate_base_url("https://integrate.api.nvidia.com/v1/").is_ok());
+    for url in [
+        "http://integrate.api.nvidia.com/v1",
+        "https://integrate.api.nvidia.com/v1/extra",
+        "https://integrate.api.nvidia.com",
+        "https://user@integrate.api.nvidia.com/v1",
+        "https://integrate.api.nvidia.com.evil.example/v1",
+        "https://integrate.api.nvidia.com:8443/v1",
+    ] {
+        assert!(openai::validate_base_url(url).is_err(), "{url}");
+    }
+}
