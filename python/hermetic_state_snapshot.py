@@ -149,8 +149,11 @@ def verify_snapshot_artifacts(raw_manifest: bytes, expected_sha256: str,
     """
     handoff = verify_snapshot_handoff(raw_manifest, expected_sha256, run_sha256, runtime_sha256)
     declarations = _handoff(handoff.manifest)["artifacts"]
-    if (type(artifacts) is not dict or len(artifacts) != len(ARTIFACT_CAPS)
-            or set(artifacts) != set(ARTIFACT_CAPS)):
+    if type(artifacts) is not dict or len(artifacts) != len(ARTIFACT_CAPS):
+        raise SnapshotError("invalid snapshot payload inventory")
+    # Validate and collect from one private inventory across caller mutations.
+    artifacts = artifacts.copy()
+    if len(artifacts) != len(ARTIFACT_CAPS) or set(artifacts) != set(ARTIFACT_CAPS):
         raise SnapshotError("invalid snapshot payload inventory")
     ordered = tuple(sorted(artifacts.items()))
     total = 0

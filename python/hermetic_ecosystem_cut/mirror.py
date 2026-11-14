@@ -169,6 +169,8 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
         raise CutError("mirror blob count cap or type violation")
     # Preserve the byte objects checked below across hashing and later use.
     blobs = blobs.copy()
+    if len(blobs) > MAX_BLOBS:
+        raise CutError("mirror blob count cap or type violation")
     total = len(raw_recipe)
     for digest, content in blobs.items():
         _digest(digest)
@@ -438,6 +440,8 @@ def verify_mirror(raw_manifest: bytes, files: dict[str, bytes], reports: bytes,
             or type(files) is not dict or len(files) != len(entries)):
         raise CutError("invalid mirror publication inventory")
     files = files.copy()
+    if len(files) != len(entries):
+        raise CutError("invalid mirror publication inventory")
     # Bound all bodies before hashing any served content, including extras.
     total = len(raw_manifest) + len(reports)
     for path, body in files.items():

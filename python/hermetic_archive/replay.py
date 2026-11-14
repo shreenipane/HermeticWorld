@@ -64,7 +64,7 @@ def _entries(value) -> list[dict]:
 
 
 def build_replay_index(raw_recipe: bytes, blobs: dict[str, bytes]) -> ReplayBuild:
-    """Select the latest exact capture per URL at or before the supplied cutoff.
+    """Select the latest exact capture per URL strictly before the supplied cutoff.
 
     Recipe schema is hermetic-replay-recipe/v1. All records and payloads, even
     excluded records, are validated. Only selected blobs leave this function.
@@ -82,7 +82,7 @@ def build_replay_index(raw_recipe: bytes, blobs: dict[str, bytes]) -> ReplayBuil
             raise f.ArchiveError("archive payload size mismatch")
         date = f.timestamp(entry["captured"])
         previous = selected.get(entry["url"])
-        if date <= boundary and (previous is None or date > f.timestamp(previous["captured"])):
+        if date < boundary and (previous is None or date > f.timestamp(previous["captured"])):
             selected[entry["url"]] = entry
     ordered = [selected[key] for key in sorted(selected)]
     raw = f.bounded_encoding({"schema": SCHEMA, "cutoff": recipe["cutoff"], "captures": ordered})
@@ -97,7 +97,7 @@ def _parse(raw_index: bytes, expected_sha256: str, cutoff: str) -> list[dict]:
         raise f.ArchiveError("archive schema or cutoff mismatch")
     entries = _entries(value["captures"])
     urls = [entry["url"] for entry in entries]
-    if urls != sorted(set(urls)) or any(f.timestamp(entry["captured"]) > boundary for entry in entries):
+    if urls != sorted(set(urls)) or any(f.timestamp(entry["captured"]) >= boundary for entry in entries):
         raise f.ArchiveError("archive index order or admission violation")
     return entries
 

@@ -195,6 +195,8 @@ and build any @latest response exclusively from admitted versions.
         raise CutError("info record cap or type violation")
     # Retain the immutable records covered by the aggregate budget while parsing.
     infos = infos.copy()
+    if len(infos) > MAX_RECORDS:
+        raise CutError("info record cap or type violation")
     total_input = len(raw_list)
     for key, data in infos.items():
         _version(key, go=True)

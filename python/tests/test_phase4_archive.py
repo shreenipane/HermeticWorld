@@ -12,7 +12,7 @@ CUTOFF = "2023-04-01T00:00:00.000000001Z"
 URL = "https://example.org/article?a=1"
 
 
-def capture(body=b"admitted", date=CUTOFF, url=URL, **updates):
+def capture(body=b"admitted", date="2023-04-01T00:00:00Z", url=URL, **updates):
     entry = dict(url=url, captured=date, source="wayback", record_sha256="a" * 64,
                  payload_sha256=f.sha(body), size=len(body), status=200,
                  content_type="text/html; charset=utf-8", location=None)
@@ -26,9 +26,11 @@ def recipe(entries, cutoff=CUTOFF):
 
 def fixture():
     entries = [capture(b"older", "2023-03-01T00:00:00Z"), capture(),
+               capture(b"at-cutoff-secret", CUTOFF),
                capture(b"future-secret", "2023-04-01T00:00:00.000000002Z"),
                capture(b"future-page", "2024-01-01T00:00:00Z", "https://example.org/future")]
-    bodies = {f.sha(body): body for body in (b"older", b"admitted", b"future-secret", b"future-page")}
+    bodies = {f.sha(body): body for body in (b"older", b"admitted", b"at-cutoff-secret",
+                                           b"future-secret", b"future-page")}
     return recipe(entries), bodies
 
 

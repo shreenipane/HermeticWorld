@@ -113,6 +113,8 @@ def payloads(blobs, references: set[str]) -> dict[str, bytes]:
     # Hashing may release the interpreter lock. Keep the same immutable bodies
     # for validation and consumption if the caller changes its mapping.
     blobs = blobs.copy()
+    if len(blobs) > MAX_RECORDS:
+        raise ArchiveError("archive payload count cap or type violation")
     total = 0
     for key, body in blobs.items():
         digest(key)

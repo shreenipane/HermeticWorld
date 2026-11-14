@@ -1,5 +1,136 @@
 # Phase 4 preparation
 
+## Web archive and search review 2026-11-15
+
+Reviewed the three branch commits (`git diff main...phase4-prep` and
+`git log main..phase4-prep`), the archive/search implementation and tests,
+surrounding package/snapshot and descriptor-based I/O changes, architecture
+sections 4 and 6.5, TRD.md and PHASES.md. `.review/` is absent. Existing
+uncommitted inventory repairs and their regression tests were preserved.
+
+- Fixed (major): replay selected and accepted captures exactly at the world
+  cutoff. The current brief requires captures strictly before it, superseding
+  the older inclusive replay contract in architecture section 6.5. Both the
+  builder and authenticated reader now enforce that boundary in nanoseconds,
+  including timestamp aliases. File loading rejects such an index before
+  opening payload files. All five cases in
+  `test_phase4_archive_cutoff_review.py` failed before the repair. The existing
+  replay fixture's default capture moved one nanosecond before its cutoff and
+  an exact-cutoff candidate was added to its excluded inventory. This necessary
+  fixture correction preserves every existing assertion.
+- OPEN (major): `hermetic_archive` consumes hand-authored recipe records and
+  payload mappings; no Common Crawl/Wayback capture import or Stack Exchange
+  post-history reconstruction is implemented. A source label and record digest
+  alone do not establish capture dates or historical revisions. Completing this
+  requires the acquisition/provenance contract and its integration with the D10
+  payload-fingerprint and thread/revision checks in the sealing component;
+  those checks are outside this preparation change set. No source acquisition
+  or reconstruction completion is claimed.
+- OPEN (major): `search.py` emits a JSON term inventory and URL-ordered
+  conjunctive candidates, with no tantivy BM25 preparation or ranking engine.
+  Tantivy is absent from the dependency manifests. Adding the required engine
+  conflicts with this review's no-new-dependencies constraint, and substituting
+  another engine would cut scope. The monthly BM25 deliverable remains open.
+
+The preserved inventory repairs were independently verified against the committed
+branch code, loaded in memory with read-only `git show` (no file or git state
+replacement). Together with the new cutoff regressions, all 12 cases failed on
+that code and pass on the working tree. These cover count-cap bypass between
+validation and copying for archive payloads, mirror blobs and Go info records;
+unverified mirror entries returned after inventory growth; and missing snapshot
+artifacts or unchecked unknown-role `KeyError` after inventory mutation. The
+existing seven tests and repairs were retained without modification.
+
+Archived pages remain private local bytes. This review enables no publication,
+redistribution or WorldServer routing. No dependencies or git state changed.
+
+### Web/archive review validation
+
+`cargo fmt --all` and `git diff --check` exited 0. The focused replay/search/
+identity/count suite passed 169 tests, exit 0. The first targeted `py-gate` run
+containing only the new cutoff regressions ended `5 failed in 0.03s`, exit 1;
+the focused post-fix `py-gate` ended `169 passed in 0.18s`, exit 0. The independent
+committed-code comparison ended `12 failed in 0.07s`, exit 1, and its working-tree
+counterpart ended `12 passed in 0.07s`, exit 0.
+
+The full Rust gate ran from the worktree root and exited 101. Formatting/clippy
+and preceding tests passed; four VMM fixtures failed at
+`Validation("unsafe ancestor ownership")`. `/proc/self/uid_map` is `1000 0 1`,
+and both `/` and `/home` are represented as owned by UID 65534. The ownership
+policy correctly refuses them. Repair requires host namespace configuration
+outside the worktree, so this prerequisite remains OPEN. No existing test or
+ownership check was weakened. Final Rust lines:
+
+```text
+test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p hermetic-vmm --lib`
+```
+
+The full Python gate ran after the Rust gate completed and exited 0. Final lines:
+
+```text
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2304 passed, 1 skipped, 12 warnings in 237.31s (0:03:57)
+```
+
+Both full gates ran in the foreground and were awaited. Logs:
+`.phase4-archive-rust-gate-1.log` and `.phase4-archive-py-gate-1.log`.
+Verdict remains OPEN for the missing acquisition/history and tantivy deliverables
+and the host UID mapping. No full Rust gate success or complete Phase 4 seal is
+claimed.
+
+## Branch review 2026-11-15
+
+Reviewed `git diff main...phase4-prep` and `git log main..phase4-prep`:
+`ce2c08a`, `dbe40d3` and `3651120`, with 45 changed files. `.review/` is
+absent. Read the added preparation boundaries, their tests, the gateway deadline
+change, repository sealing requirements and the NetVM HTTP transport/policy.
+
+- Fixed a snapshot inventory check/use race in `verify_snapshot_artifacts`.
+  It validated the caller's mapping before collecting a fresh view of that
+  mapping. Removing `memory` between those operations returned a verified
+  three-artifact bundle; adding an unknown role raised unchecked `KeyError`.
+  Retain a private inventory before validating its keys and collecting payloads.
+  Both cases of `test_snapshot_inventory_is_retained_before_validation` failed
+  before the fix and pass afterward; the targeted snapshot/error suite passes
+  120 tests. No existing tests or dependencies changed.
+- OPEN (major scope gap): none of these commits implements the requested smart
+  Git deliverable. `hermetic-netvm-http::policy::decide` accepts GET/HEAD only;
+  an upload-pack POST is rejected. There is no upload-pack v2 shallow/deepen
+  implementation, pkt-line parser or corresponding hostile-input tests in the
+  branch. No cutoff-bound reachable-object repository service is connected to
+  such a handler. Repair requires the NetVM transport and repository-serving
+  components outside this preparation change set, so it remains open under the
+  review instruction to leave work in another component open. The deliverable
+  stays unchecked in PHASES.md; no completed shallow-clone support is claimed.
+
+`cargo fmt --all` passed (exit 0). The full Rust gate passed formatting/clippy
+but exited 101 at four VMM fixtures: `publication_is_atomic_no_replace_and_enforces_remaining_copy_budget`,
+`launcher_exit_keeps_surviving_vm_child_alive_until_stop_or_drop`,
+`output_capture_is_capped_and_silent_child_is_killed_on_drop` and
+`real_process_clears_environment_closes_descriptors_and_owns_group`. Each reports
+`Validation("unsafe ancestor ownership")`. `/proc/self/uid_map` is `1000 0 1`;
+`/` and `/home` appear owned by UID 65534, which the VMM ancestor check correctly
+refuses. Changing the host mapping is outside this worktree; this gate blocker
+remains open, with no ownership check or test weakened. Exact final Rust lines:
+
+```text
+test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p hermetic-vmm --lib`
+```
+
+The full Python gate ran after the Rust gate and exited 0. Its final lines:
+
+```text
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2294 passed, 1 skipped, 12 warnings in 183.73s (0:03:03)
+```
+
+`git diff --check` passed. No git state mutation commands were run. Current logs:
+`.phase4-current-review-rust-gate.log` and `.phase4-current-review-py-gate.log`.
+
 Plan: review the branch and required specifications; implement the first offline
 ecosystem filters that need neither an owner decision nor a VM; add hostile-input,
 cutoff-boundary and deterministic-output tests; format and run both complete gates.
@@ -488,7 +619,7 @@ extras abort. Acquisition evidence identifiers do not authenticate a claimed
 date or replace D10 payload fingerprints/thread/revision provenance.
 
 The result is a `ReplayBuild` with canonical `hermetic-replay-index/v1` bytes
-and only the selected payloads. Selection is the latest capture at or before the
+and only the selected payloads. Selection is the latest capture strictly before the
 exact nanosecond cutoff for each exact URL. Output sorts URLs and blob digests.
 URLs are ASCII canonical HTTP(S) DNS URLs with lowercase scheme/authority,
 an explicit `/` path, no credentials, port, fragment, backslash, raw controls or
