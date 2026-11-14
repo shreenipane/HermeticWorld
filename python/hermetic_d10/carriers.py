@@ -31,6 +31,7 @@ from email.utils import parsedate_to_datetime
 import io
 import lzma
 from pathlib import PurePosixPath
+import hashlib
 import re
 import stat
 import struct
@@ -190,9 +191,10 @@ class Finding:
     severity: str
     implausible: bool = False
     note: str = ""
+    payload_sha256: str = ""
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "path": self.path,
             "member_chain": list(self.member_chain),
             "carrier": self.carrier,
@@ -201,6 +203,9 @@ class Finding:
             "implausible": self.implausible,
             "note": self.note,
         }
+        if self.payload_sha256:
+            out["payload_sha256"] = self.payload_sha256
+        return out
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1179,7 @@ def inspect_warc_bytes(
             carrier="warc_date",
             found_date=format_rfc3339_utc(capture),
             severity="gate" if capture > t_clock else "info",
+            payload_sha256=hashlib.sha256(data[body_start:body_end]).hexdigest(),
         ))
         offset = body_end + 4
     if not record:

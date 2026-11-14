@@ -11,6 +11,7 @@ pub mod d12_runtime;
 pub mod d5a;
 pub mod d6;
 pub mod d8;
+pub mod d8_image;
 pub mod diff;
 pub mod ext4;
 pub mod fingerprint;

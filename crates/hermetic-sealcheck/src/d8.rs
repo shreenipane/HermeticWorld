@@ -2202,6 +2202,8 @@ pub fn check_d8(root: &Path, t_clock: OffsetDateTime, visibility: Visibility) ->
     check_kernel(root, t_clock, visibility, &mut findings);
     check_dated_logs(root, t_clock, visibility, &mut findings);
     check_python_build(root, t_clock, visibility, &mut findings);
+    crate::d8_image::check_kernel_images(root, t_clock, visibility, &mut findings);
+    findings.extend(crate::d8_image::check_cpu_template(t_clock, visibility));
     for finding in &mut findings {
         if let Ok(relative) = Path::new(&finding.path).strip_prefix(root) {
             finding.path = relative.to_string_lossy().into_owned();
