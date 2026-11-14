@@ -520,3 +520,105 @@ def test_image_cli_reports_safe_failure_category_only(tmp_path, monkeypatch, cap
     assert not (work / "world.json").exists()
     if stage == "work-directory":
         assert not work.exists()
+
+
+def test_conda_cache_exact_exclusion_preserves_runtime_and_neighbors(tmp_path):
+    root = tmp_path / "tree"
+    cache = root / "opt/miniconda3/pkgs"
+    (cache / "package/nested").mkdir(parents=True)
+    (cache / "package/nested/archive").write_bytes(b"cache")
+    (root / "opt/miniconda3/envs/testbed").mkdir(parents=True)
+    (root / "opt/miniconda3/envs/testbed/runtime").write_bytes(b"runtime")
+    (root / "opt/miniconda3/pkgs.keep").write_bytes(b"neighbor")
+    (root / "testbed/opt/miniconda3/pkgs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "secret"
+    sentinel.write_bytes(b"private")
+    (cache / "link").symlink_to(outside, target_is_directory=True)
+    # Conda environments may hardlink package-cache files. Removing the cache
+    # must neither alter their contents nor their modes.
+    os.link(root / "opt/miniconda3/envs/testbed/runtime", cache / "hardlink")
+    tree = image.Tree(root)
+    try:
+        image.exclude_image_leftovers(tree)
+    finally:
+        tree.close()
+    assert not cache.exists()
+    assert sentinel.read_bytes() == b"private"
+    assert (root / "opt/miniconda3/envs/testbed/runtime").read_bytes() == b"runtime"
+    assert (root / "opt/miniconda3/pkgs.keep").read_bytes() == b"neighbor"
+    assert (root / "testbed/opt/miniconda3/pkgs").is_dir()
+
+
+@pytest.mark.parametrize("component", ["opt", "opt/miniconda3", "opt/miniconda3/pkgs"])
+def test_conda_cache_exclusion_never_traverses_symlinks(tmp_path, component):
+    root = tmp_path / "tree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"private")
+    link = root / component
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    tree = image.Tree(root)
+    try:
+        if component.endswith("pkgs"):
+            image.exclude_image_leftovers(tree)
+            assert not link.is_symlink()
+        else:
+            with pytest.raises((ValueError, OSError)):
+                image.exclude_image_leftovers(tree)
+    finally:
+        tree.close()
+    assert (outside / "sentinel").read_bytes() == b"private"
+
+
+@pytest.mark.parametrize("limit", ["entries", "depth"])
+def test_conda_cache_exclusion_has_traversal_budgets(tmp_path, monkeypatch, limit):
+    root = tmp_path / "tree"
+    cache = root / "opt/miniconda3/pkgs"
+    (cache / "a/b/c").mkdir(parents=True)
+    (cache / "file").write_bytes(b"cache")
+    monkeypatch.setattr(image, "MAX_EXCLUSION_" + limit.upper(), 1, raising=False)
+    tree = image.Tree(root)
+    try:
+        with pytest.raises(ValueError):
+            image.exclude_image_leftovers(tree)
+    finally:
+        tree.close()
+
+
+def test_converter_rootfs_logical_budget_matches_sparse_builder_budget(tmp_path, monkeypatch):
+    from hermetic_slice.rootfs import DEFAULT_MAX_LOGICAL_BYTES
+    source = tmp_path / "tree"
+    source.mkdir()
+    logical_size = 25 * 1024**3
+    with (source / "sparse-runtime").open("wb") as stream:
+        stream.truncate(logical_size)
+    archive = tmp_path / "sparse.tar"
+    observed = []
+    def build(src, output, **kwargs):
+        observed.append(kwargs["limits"])
+        scan = write_rootfs_tar(src, archive, mtime_ceiling=0, limits=kwargs["limits"])
+        assert scan.logical_bytes == logical_size
+        assert archive.stat().st_size < 64 * 1024
+        with tarfile.open(archive) as packaged:
+            assert packaged.getmember("sparse-runtime").size == logical_size
+        return {"d4": "pass", "sha256": "c" * 64, "skipped_special": []}
+    monkeypatch.setattr(image, "build_rootfs", build)
+    image.finish(tmp_path, "fixture", {"t_clock": image.FIXTURE_CLOCK}, {})
+    assert observed[0].max_logical_bytes == DEFAULT_MAX_LOGICAL_BYTES
+    assert observed[0].max_bytes == 24 * 1024**3
+
+
+def test_conda_cache_refuses_special_files(tmp_path):
+    cache = tmp_path / "opt/miniconda3/pkgs"
+    cache.mkdir(parents=True)
+    os.mkfifo(cache / "fifo")
+    tree = image.Tree(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            image.exclude_image_leftovers(tree)
+    finally:
+        tree.close()

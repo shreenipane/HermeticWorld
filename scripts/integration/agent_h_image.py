@@ -21,7 +21,7 @@ sys.path.insert(0, str(TOP / "scripts/integration"))
 from hermetic_agent.task import clock_value, read_input
 from hermetic_agent.protocol import parse_json
 from hermetic_safe_io import atomic_write, open_parent, open_regular, validate_path
-from hermetic_slice.rootfs import build_rootfs, RootfsLimits
+from hermetic_slice.rootfs import build_rootfs, RootfsLimits, DEFAULT_MAX_LOGICAL_BYTES
 from e2e_seal import command, encoded, unpack_export, normalise_tree, MAX_EXPORT_BYTES
 from smoke_work import create_work, open_child
 
@@ -43,9 +43,11 @@ LIBRARY_DIRS = ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
                 "/lib64", "/usr/lib64", "/lib", "/usr/lib")
 GUEST_DIRS = ("sbin", "bin", "dev/pts", "dev/shm", "proc", "sys", "tmp", "run",
               "etc/hermetic", "root", "mnt/hermetic-overlay", "mnt/hermetic-root")
-# Reviewed root-only exclusions: SWE-bench's downloaded installer is not a
-# runtime input. Keep all other paths and the scanner's file byte cap intact.
-IMAGE_EXCLUSIONS = ("/miniconda.sh",)
+# Reviewed exact exclusions: downloaded installer and conda package cache are
+# unused at runtime. Environment hardlinks survive unlinking the cache names.
+IMAGE_EXCLUSIONS = ("/miniconda.sh", "/opt/miniconda3/pkgs")
+MAX_EXCLUSION_ENTRIES = 500_000
+MAX_EXCLUSION_DEPTH = 128
 WORK_USAGE = ("Fresh output under an existing parent owned by the caller.\n"
               "Parent: no symlink components; no group-writable or\n"
               "world-writable mode.")
@@ -258,17 +260,61 @@ class Tree:
 
 
 def exclude_image_leftovers(tree):
-    for path in IMAGE_EXCLUSIONS:
-        # Each reviewed path is a root leaf. Unlink through the held root;
-        # neither resolve a guest symlink nor recurse into a directory.
-        leaf = path.removeprefix("/")
-        try:
-            metadata = os.stat(leaf, dir_fd=tree.fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+    remaining = MAX_EXCLUSION_ENTRIES
+
+    def remove(parent, name, depth, *, recursive, missing_ok=False):
+        nonlocal remaining
+        if depth > MAX_EXCLUSION_DEPTH or remaining <= 0:
             refused()
-        os.unlink(leaf, dir_fd=tree.fd)
+        remaining -= 1
+        try:
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        if stat.S_ISDIR(metadata.st_mode) and recursive:
+            child = open_child(parent, name)
+            try:
+                if metadata.st_dev != os.fstat(tree.fd).st_dev:
+                    refused()
+                names = []
+                with os.scandir(child) as entries:
+                    for entry in entries:
+                        if len(names) >= remaining:
+                            refused()
+                        names.append(entry.name)
+                for entry in sorted(names):
+                    remove(child, entry, depth + 1, recursive=True)
+                after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (metadata.st_dev, metadata.st_ino) != (after.st_dev, after.st_ino):
+                    refused()
+                os.rmdir(name, dir_fd=parent)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            os.unlink(name, dir_fd=parent)
+        else:
+            refused()
+
+    for path in IMAGE_EXCLUSIONS:
+        parts = path.removeprefix("/").split("/")
+        parent = os.dup(tree.fd)
+        try:
+            # Deliberately use physical directories, never Tree.directory's
+            # guest symlink resolver, for the exact exclusion parent.
+            for component in parts[:-1]:
+                try:
+                    child = open_child(parent, component)
+                except FileNotFoundError:
+                    break
+                os.close(parent)
+                parent = child
+            else:
+                remove(parent, parts[-1], 0, recursive=path == "/opt/miniconda3/pkgs",
+                       missing_ok=True)
+        finally:
+            os.close(parent)
 
 
 def check_guest_runtime(tree):
@@ -434,7 +480,7 @@ def finish(work, instance, cutoffs, source):
                           t_clock=datetime.fromtimestamp(epoch, timezone.utc), world_id=instance,
                           sealcheck_bin=work / "sealcheck", work_dir=work,
                           limits=RootfsLimits(max_bytes=24 * 1024**3, max_entries=500_000,
-                                              max_depth=128, max_logical_bytes=24 * 1024**3),
+                                              max_depth=128, max_logical_bytes=DEFAULT_MAX_LOGICAL_BYTES),
                           root_owned=True)
     if result.get("d4") != "pass" or result.get("skipped_special"):
         refused()
