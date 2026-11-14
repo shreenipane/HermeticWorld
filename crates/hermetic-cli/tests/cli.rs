@@ -205,6 +205,8 @@ fn happy_path_probe_human_and_canonical_json() {
         vec![RecordedCall::Probe(ProbeRequest {
             world: PathBuf::from("/worlds/w1"),
             json: false,
+            clockprobe_output: None,
+            kernel_canary_serial: None,
         })]
     );
 
@@ -225,6 +227,8 @@ fn happy_path_probe_human_and_canonical_json() {
         vec![RecordedCall::Probe(ProbeRequest {
             world: PathBuf::from("/worlds/w1"),
             json: true,
+            clockprobe_output: None,
+            kernel_canary_serial: None,
         })]
     );
 }
@@ -865,7 +869,7 @@ hermetic - Seal and evaluate Hermetic World software-engineering benchmarks
 USAGE:
   hermetic seal --src DIR --out DIR --t-clock RFC3339 --world-id ID [--seal-level strict|repo_only]
   hermetic verify-bundle DIR [--root sha256:HEX]
-  hermetic probe --world DIR [--json]
+  hermetic probe --world DIR [--clockprobe-output FILE] [--kernel-canary-serial FILE] [--json]
   hermetic run --world DIR --task ID --agent-mode H|G [--clock faked|hidden] [--json]
   hermetic verify --record FILE [--bundle DIR]
   hermetic --version
@@ -874,7 +878,7 @@ USAGE:
 SUBCOMMANDS:
   seal           Seal a source repository into a deterministic Hermetic World
   verify-bundle  Verify integrity and root digest of a sealed world bundle
-  probe          Inspect world metadata and sealing guarantees
+  probe          Classify captured clock probe output (never probes the host)
   run            Execute a benchmark task inside a sealed world
   verify         Verify a recorded evaluation run against a bundle
   help           Show general or subcommand help

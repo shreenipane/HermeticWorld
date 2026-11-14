@@ -275,7 +275,10 @@ pub fn clock_seconds(clock: i32) -> Option<f64> {
     if ![CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI].contains(&clock) {
         return None;
     }
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: ts is a valid, aligned, writable timespec owned by this frame, and
     // only the four allowlisted clock ids reach libc.
     if unsafe { clock_gettime(clock, &mut ts) } != 0 {
