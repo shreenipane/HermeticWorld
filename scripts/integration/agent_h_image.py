@@ -233,9 +233,11 @@ class Tree:
                     os.unlink(temporary, dir_fd=directory)
             os.close(directory)
 
-    def read(self, path):
+    def read(self, path, *, executable=False):
         fd = self.directory(path, regular=True)
         with os.fdopen(fd, "rb") as source:
+            if executable and not os.fstat(source.fileno()).st_mode & 0o111:
+                refused()
             data = source.read(MAX_BINARY_BYTES + 1)
         if len(data) > MAX_BINARY_BYTES:
             refused()
@@ -243,23 +245,23 @@ class Tree:
 
 
 def check_guest_runtime(tree):
-    pending = deque(("/bin/bash", "/bin/cat", "/bin/sed"))
+    pending = deque((path, True) for path in ("/bin/bash", "/bin/cat", "/bin/sed"))
     seen = set()
     total = 0
     while pending:
-        path = pending.popleft()
-        if path in seen:
+        path, executable = pending.popleft()
+        if (path, executable) in seen:
             continue
         if len(seen) >= MAX_RUNTIME_FILES:
             refused()
-        seen.add(path)
-        data = tree.read(path)
+        seen.add((path, executable))
+        data = tree.read(path, executable=executable)
         total += len(data)
         if total > MAX_RUNTIME_BYTES:
             refused()
         interpreter, needed = elf_dependencies(data)
         if interpreter:
-            pending.append(interpreter)
+            pending.append((interpreter, True))
         for name in needed:
             for directory in LIBRARY_DIRS:
                 candidate = directory + "/" + name
@@ -268,7 +270,7 @@ def check_guest_runtime(tree):
                 except FileNotFoundError:
                     continue
                 os.close(fd)
-                pending.append(candidate)
+                pending.append((candidate, False))
                 break
             else:
                 refused()

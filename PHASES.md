@@ -13,7 +13,7 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 | 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | In progress |
 | 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
 | 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
-| 3b | Clock hiding | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Source audit/proposal; nested tests open |
+| 3b | Clock hiding (host filter required in v1) | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Host patch and offline checks prepared; owner build/VM validation pending |
 | 4 | Extensions | Linux x86 + KVM | E2 Track B; E5 | Not started |
 
 ```
@@ -21,7 +21,7 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
                    └───▶ 4
 ```
 
-**Cut list.** If time runs out, drop in this order: Phase 4 → Phase 3b → Mode G → R3 → R2.
+**Cut list.** If time runs out, drop in this order: Phase 4 → Mode G → R3 → R2. Phase 3b host filtering is required in v1 (owner decision 2026-11-14).
 
 **Smallest publishable result:** the Phase 1 leak report plus the Phase 2 ablation (E2 Track A).
 
@@ -225,34 +225,24 @@ The oracle passes on every slice task, and one agent run is graded.
 
 ## Phase 3b: Clock hiding
 
-**Goal.** Reach `clock: hidden`, or record the remaining channels and ship `faked`.
+**Goal.** Reach `clock: hidden` with guest lockdown, host clock filtering, fixed
+CPU identity and a fixed guest TSC rate. All are v1 requirements; retain `faked`
+until deployment validation passes.
 
-- [x] Import and audit the clock analysis against Linux 6.6.160 and Firecracker
-  v1.18.0; [source evidence and corrected claims](docs/clock-3b-analysis.md).
-- [x] Add the std-only, read-only `hermetic-clockprobe` workspace crate with
-  bounded descriptor-based inspection and offline classification/regression fixtures.
-  `unavailable` is incomplete coverage, even with exit 0.
-- [x] Keep the kernel/CPU proposals separate in `images/kernel/clock-3b.config`
-  and `vmm/clock-3b.cpu-template.json`; active settings are unchanged.
-- [x] Document the exact [execd baseline command and nested test matrix](docs/clock-3b-config-and-test-plan.md).
-- [ ] Manager: run today's AgentVM baseline and the nested kernel/VMM tests.
-- [ ] Close root clock channels: CPUID clearing alone does not deny the wall/system
-  MSRs with stock Firecracker. Per-vCPU PV enforcement gates these MSRs, but in
-  the inspected KVM it does **not** gate CLOCK_PAIRING. Hypercall 9 rejects CPL3
-  and exposes real UTC to a CPL0 caller when the host clocksource supports it.
-  EXIT_HYPERCALL cannot filter number 9 in this kernel. Host/VMM denial and the
-  proposed guest restriction policy require an owner decision and runtime tests.
-- [ ] Resolve CPU identity: stock Firecracker normalization restores host vendor
-  and overwrites Intel brand modifiers, potentially retaining a host frequency.
-  Full cutoff-specific CPUID normalization is not established by the proposal.
-- [ ] Resolve reported PIT/TSC boot stall: `tsc=reliable` supplies no frequency;
-  zeroing .15/.16 can remove calibration routes. Test accurate `tsc_early_khz`
-  (frequency exposed, so `faked`); a fixed hidden rate needs actual KVM TSC scaling
-  and consistent calibration, not an invented number. Firecracker does create a PIT.
-- [ ] Complete safe CLOCK_TAI/absolute CLOCK_MONOTONIC/RTC ioctl sampling; the
-  std-only and CPUID/RDTSC-only unsafe constraints need a wrapper/design decision.
-- [ ] Decide residual timing/identity risks; validate device ABIs, payloads,
-  images, boot/serial strings, all vCPUs and snapshot history before `hidden`.
+### Deliverables
+- [x] Guest root lockdown: modules, kernel memory/MSR devices, kexec, raw I/O and tracing disabled; forced early confidentiality lockdown; cgroup-device BPF retained. Owner reported nested-VM boot with module_load/ring0_paths blocked on 2026-11-14.
+- [x] Owner-approved kernel builder digest pinned and required by validation; Docker uses the approved local image ID.
+- [x] Fixed 2 GHz guest TSC on lifecycle, CLI and direct Python paths; no host-rate calibration enters guest arguments. The patched VMM requires TSC-control capability, sets and verifies each vCPU rate on cold boot/restore, and rejects incompatible snapshots/hosts.
+- [x] Fixed 2009 Nehalem CPU identity with x86-64-v2 feature ceiling, complete cache/topology/extended-leaf policy and zero PV/PMU/XSAVE state. The pinned patch replaces host normalization output; clockprobe checks every profile register. AMD and unsupported nested hosts fail closed.
+- [x] Document PERF_EVENTS forced by x86, inert no-kvmclock with PARAVIRT disabled, and substrate timing limits in docs/clock-3b-analysis.md and docs/guest-lockdown.md.
+- [x] Host filtering is v1: pinned Firecracker 1.18 patch denies both directions of all clock MSRs, enables PV CPUID enforcement on boot/restore and intercepts pairing through Xen; unsupported hosts fail closed. Source research: docs/clock-3b-host-filter.md.
+- [x] Offline double-build wrapper, measured build-lock and real-runner executable verification; source/patch pins and failure regressions.
+- [x] Opt-in built-in ring-0 canary patch/config and bounded serial validator; no VM run during review.
+- [ ] Owner: prepare the immutable Rust 1.97.0/vendor builder, compile full Firecracker and canary, measure patched hashes, verify CONFIG_KVM_XEN and interception capability on host 7.0.
+- [ ] Owner: nested-VM negative controls and ring-0 canary on cold boot, multiple vCPUs and snapshot restore; stock smokes cannot certify v1.
+- [ ] Check TSC stability without kvmclock
+- [ ] Add the eighth check to `clock-leak-probe.md`: the hypercall from a guest kernel module
+- [ ] Run the probe, plus a control run on unpatched Firecracker
 
 **Exit.** Retain `clock: faked` until the missing denial tests and complete
 channel coverage pass. This source audit and diagnostic do not attest `hidden`.

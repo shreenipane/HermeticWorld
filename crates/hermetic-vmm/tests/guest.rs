@@ -762,3 +762,134 @@ fn agent_h_diagnostics_preserve_success_errors_and_panics() {
     .unwrap_err();
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"readiness deadline"));
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LockdownRecord {
+    probe: String,
+    result: String,
+    detail: String,
+}
+fn lockdown_reply_passes(reply: &GuestExec) -> bool {
+    if reply.kind != "exec" || reply.code != Some(0) || reply.truncated || reply.timed_out {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&reply.output) else {
+        return false;
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for line in text.lines().take(3) {
+        let Ok(record) = serde_json::from_str::<LockdownRecord>(line) else {
+            return false;
+        };
+        if record.result != "blocked"
+            || record.detail.is_empty()
+            || !matches!(record.probe.as_str(), "module_load" | "ring0_paths")
+            || !names.insert(record.probe)
+        {
+            return false;
+        }
+    }
+    names.len() == 2
+}
+
+#[test]
+fn lockdown_vm_reply_requires_both_probes_blocked_and_complete() {
+    let module = r#"{"probe":"module_load","result":"blocked","detail":"compiled out"}"#;
+    let ring0 = r#"{"probe":"ring0_paths","result":"blocked","detail":"sealed"}"#;
+    let good = format!("{module}\n{ring0}\n");
+    let mut reply = GuestExec {
+        kind: "exec".into(),
+        code: Some(0),
+        output: good.as_bytes().to_vec(),
+        truncated: false,
+        timed_out: false,
+    };
+    assert!(lockdown_reply_passes(&reply));
+    for bad in [
+        module.to_string(),
+        format!("{module}\n{module}\n"),
+        good.replace("blocked", "unavailable"),
+        good.replace("blocked", "error"),
+        good.replace("blocked", "leak"),
+        format!("{good}{module}\n"),
+        format!("{good}bad\n"),
+    ] {
+        reply.output = bad.into_bytes();
+        assert!(!lockdown_reply_passes(&reply));
+    }
+    reply.output = good.into_bytes();
+    reply.code = Some(2);
+    assert!(!lockdown_reply_passes(&reply));
+    reply.code = Some(0);
+    reply.truncated = true;
+    assert!(!lockdown_reply_passes(&reply));
+    reply.truncated = false;
+    reply.timed_out = true;
+    assert!(!lockdown_reply_passes(&reply));
+}
+
+#[test]
+#[ignore = "needs dev-unjailed, KVM and sealed probe/config in rootfs; use HERMETIC_LOCKDOWN_CONFIG with boot-smoke.sh"]
+fn boots_guest_and_checks_root_lockdown() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        let f = environment().expect("lockdown smoke requires pinned VM inputs");
+        let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+        let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+        vm.prepare(Duration::from_secs(120)).unwrap();
+        vm.start(Duration::from_secs(10)).unwrap();
+        vm.wait_ready(Duration::from_secs(30)).unwrap();
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        loop {
+            match guest_status(&socket, end) {
+                Ok(status) => {
+                    assert_eq!(status.kind, "status");
+                    break;
+                }
+                Err(Error::Io) => {
+                    assert!(Instant::now() < end, "execd readiness deadline");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("execd readiness: {e}"),
+            }
+        }
+        let mount = guest_exec(
+            &socket,
+            &[
+                "/bin/busybox",
+                "mount",
+                "-t",
+                "securityfs",
+                "securityfs",
+                "/sys/kernel/security",
+            ],
+            end,
+        )
+        .unwrap();
+        assert_eq!(mount.code, Some(0), "securityfs mount failed");
+        assert!(!mount.truncated && !mount.timed_out);
+        let reply = guest_exec(
+            &socket,
+            &["/sbin/hermetic-clockprobe", "--lockdown-only"],
+            end,
+        )
+        .unwrap();
+        eprintln!(
+            "clockprobe code={:?} truncated={} timed_out={} output:\n{}",
+            reply.code,
+            reply.truncated,
+            reply.timed_out,
+            String::from_utf8_lossy(&reply.output[..reply.output.len().min(4096)])
+        );
+        assert!(
+            lockdown_reply_passes(&reply),
+            "module_load and ring0_paths must both report blocked"
+        );
+        vm.stop(Duration::from_secs(2)).unwrap();
+        vm.destroy(Duration::from_secs(10)).unwrap();
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    panic!("lockdown smoke requires dev-unjailed feature");
+}

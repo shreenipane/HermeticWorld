@@ -1,6 +1,6 @@
 # hermetic-clockprobe
 
-Read-only, std-only guest diagnostic for Phase 3b. Run as root in the intended
+Std-only guest diagnostic for Phase 3b. Run as root in the intended
 x86_64 Linux guest, before handing it to an adversary. Never run the real probes
 on the host: their purpose is to collect potentially sensitive guest-visible
 clock and CPU evidence for the manager. Fixed order and JSON escaping are
@@ -20,7 +20,8 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build --offline --locked --relea
   --target x86_64-unknown-linux-gnu -p hermetic-clockprobe
 ```
 
-The only unsafe module is `src/arch_x86.rs`, for the RDTSC intrinsic. CPUID's
+The only unsafe module is `src/arch_x86.rs`, for the RDTSC intrinsic and Linux x86_64
+module insertion syscalls with an empty image/invalid fd that cannot install code. CPUID's
 intrinsic is safe on the current compiler. The sealed guest must leave CR4.TSD
 clear; a kernel actively blocking instructions or falsifying procfs is outside
 this diagnostic's trust assumptions. All other modules forbid unsafe code.
@@ -32,7 +33,8 @@ lstats before opening, checks descriptor identity/type, and only activates
 regular files or the specifically checked kmsg/MSR devices. Relative sysfs
 symlinks are expanded within the pinned root; escaping/absolute symlinks fail
 closed. It uses its own `/proc/self/fd/N` links to act on pinned descriptors;
-procfs must be the trusted kernel procfs. No guest-supplied executable is run.
+procfs must be the trusted kernel procfs. No guest-supplied executable is run. The module syscalls check only an empty
+image and invalid fd, and accept raw -ENOSYS from both as evidence of compiled-out support.
 Reads reject cap+1 and invalid UTF-8 rather than accepting truncated prefixes.
 Caps: small files 4096 bytes, cpuinfo 65536 bytes, log 262144 bytes, directory
 512 entries, path 4096 bytes/64 components, symlink expansion 32 links. Kmsg
@@ -41,8 +43,10 @@ become `error`, never `blocked`. Optional absence and log-access denial are dist
 
 | Probe | Classification and limits |
 | --- | --- |
+| module_load | Empty init_module and invalid-fd finit_module must both return raw -ENOSYS; permission/invalid-image errors do not pass. |
+| ring0_paths | Require a matching verified final config, live confidentiality lockdown, disabled unprivileged BPF and absent dangerous proc/sysfs driver interfaces. See the manager contract below. |
 | rdtsc | CPUID.15 ratio or a 20 ms RDTSC/Instant rate estimate; counter age exceeding guest uptime by 60 s is `leak` evidence of a prior origin, not proof of physical host boot time. Missing comparison data is `unavailable`. Base MHz/brand MHz is not used as a guaranteed TSC rate. |
-| cpuid | Dump all requested queries 0,1,7,7:1,A,15,16,40000000..40000010 and brand. Nonbaseline identity/frequency/PV features in this subset are policy `leak` observations; unknown/unqueried leaves remain outside coverage. Broadwell-EP is an experimental baseline, not an assertion about all task cutoffs. |
+| cpuid | Compare every basic, extended, cache, topology, frequency and PV register against the fixed Nehalem/v2 profile. Missing/duplicate evidence is an error; any mismatch is a leak. Brand and CPUID frequencies must match the fixed 2 GHz guest. |
 | kvmclock_msr | Absence of /dev/cpu/0/msr is `blocked` for this userspace path. Readable/rejected MSRs are `unavailable` for WRMSR/page-content exploits: RDMSR returns a guest address/control word, not UTC. |
 | clock_pairing_hc | Inspect PTP names; always `unavailable` without a safe successful clock-pairing read. Device presence is not success. No raw hypercall is issued. |
 | rtc_sysfs_dev / proc_driver_rtc | Compare parsed date against hermetic.t + guest uptime (60 s tolerance); absent interfaces are `blocked`; malformed proc dates are `error`. Device-only RTC access is `unavailable` pending a safe RTC_RD_TIME wrapper. |
@@ -60,7 +64,19 @@ hardware. Imported draft assertions about readable MSRs, device presence,
 frequency masking and banner exemption were corrected because those assertions
 encoded false security conclusions. No pre-existing repository test was changed.
 
-See [analysis](../../docs/clock-3b-analysis.md) and
-[manager command and nested test plan](../../docs/clock-3b-config-and-test-plan.md).
+See [guest lockdown policy and manager commands](../../docs/guest-lockdown.md).
+`--lockdown-only` emits just the two lockdown records for execd integration.
+The manager must supply the verified matching config at
+`/etc/hermetic/guest-kernel.config` and mount securityfs first.
+Lockdown config reads are capped at 2 MiB, with 4096-byte lines; live state
+reads are capped at 4096 bytes. The checks run before adversary handoff;
+a substituted config or malicious kernel is outside their trust boundary.
 Full POSIX/RTC ioctl coverage needs a safe wrapper already used elsewhere in the
 workspace or an expanded unsafe allowance. Neither is silently added here.
+
+`--kernel-canary-serial` is a manager-only, offline transcript validator. It
+reads at most 262145 bytes from stdin and requires all six expected kernel
+canary payloads exactly once. It executes no hardware probes. The disposable
+built-in kernel patch, config, opt-in argument and expected outputs are in
+[the host filter guide](../../docs/clock-3b-host-filter.md). The normal probes
+continue to report incomplete ring-0 coverage unless that canary is run.

@@ -43,6 +43,8 @@ MAX_STDERR_BYTES = 64 * 1024
 MAX_IMAGE_ID_BYTES = 72
 STDERR_LOG = "kernel-build.stderr.log"
 PLACEHOLDER = "TO-BE-FILLED-BY-OWNER"
+APPROVED_BUILDER_DIGEST = "29ad57ab16edc3ddcb8b44de77061336a4cabc6812243bedac48e815529da238"
+APPROVED_BUILDER_IMAGE = "hermetic/kernel-builder:6.6-v1@sha256:" + APPROVED_BUILDER_DIGEST
 DEFAULT_KERNEL_DIR = Path(__file__).absolute().parent.parent.parent / "images" / "kernel"
 
 
@@ -65,7 +67,8 @@ class Rule:
 # One policy drives the checker, config fragments and README requirement table.
 RULES: dict[str, Rule] = {}
 for _purpose, _names in (
-    ("TR-VMM-4: x86 microVM boot", "64BIT X86_64 SMP HYPERVISOR_GUEST KVM_GUEST PCI BLOCK BLK_DEV MODULES NET NETDEVICES INET UNIX PROC_FS SYSFS TMPFS MULTIUSER TTY SERIAL_8250 SERIAL_8250_CONSOLE PRINTK ELF_CORE BINFMT_ELF BINFMT_SCRIPT UNIX98_PTYS DEVTMPFS FHANDLE"),
+    ("Phase 3b: deny guest root access to kernel code and memory", "SECURITY SECURITYFS SECURITY_LOCKDOWN_LSM SECURITY_LOCKDOWN_LSM_EARLY LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY BPF_UNPRIV_DEFAULT_OFF"),
+    ("TR-VMM-4: x86 microVM boot", "64BIT X86_64 SMP HYPERVISOR_GUEST PCI BLOCK BLK_DEV NET NETDEVICES INET UNIX PROC_FS SYSFS TMPFS MULTIUSER TTY SERIAL_8250 SERIAL_8250_CONSOLE PRINTK ELF_CORE BINFMT_ELF BINFMT_SCRIPT UNIX98_PTYS DEVTMPFS FHANDLE"),
     ("execd boot contract: the kernel mounts devtmpfs at /dev before PID 1", "DEVTMPFS_MOUNT"),
     ("execd: PID 1 reaps orphans via /proc/<pid>/task/<tid>/children", "PROC_CHILDREN"),
     ("TR-EXD-6: trusted initramfs support (uncompressed or gzip only)", "BLK_DEV_INITRD RD_GZIP"),
@@ -79,6 +82,7 @@ for _purpose, _names in (
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("y", _purpose)
 for _purpose, _names in (
+    ("Phase 3b: deny guest root access to kernel code and memory", "MODULES DEVMEM DEVKMEM KEXEC KEXEC_FILE KEXEC_CORE X86_MSR X86_CPUID PROC_KCORE HIBERNATION X86_IOPL_IOPERM BPF_KPROBE_OVERRIDE KPROBES KPROBE_EVENTS UPROBE_EVENTS BPF_EVENTS ACPI_CUSTOM_METHOD ACPI_TABLE_UPGRADE PARAVIRT KVM_GUEST PARAVIRT_CLOCK HERMETIC_CLOCK_CANARY"),
     ("TR-VMM-4: prevent accidental host clock reads", "PTP_1588_CLOCK PTP_1588_CLOCK_KVM PTP_1588_CLOCK_VMW RTC_HCTOSYS"),
     ("TR-VMM-4: fixed build identity; config supplied separately", "LOCALVERSION_AUTO IKCONFIG"),
     ("T3.1: no time namespace needed", "TIME_NS"),
@@ -165,10 +169,69 @@ def check_config(config_text: str | bytes) -> list[Finding]:
 BOOT_FIXED = "console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/vda rootfstype=ext4 ro init=/sbin/hermetic-init clocksource=tsc tsc=reliable no-kvmclock"
 
 
-def boot_arguments(t_clock: int) -> str:
+def spec_boot_arguments(t_clock: int) -> str:
+    """VmSpec input; lifecycle appends the VMM-owned TSC frequency before boot."""
     if type(t_clock) is not int or not 0 <= t_clock <= MAX_CLOCK:
         raise KernelError("t_clock must be bounded integral Unix seconds")
     return f"{BOOT_FIXED} hermetic.t={t_clock}"
+
+
+TSC_RESOLVE_TIMEOUT_S = 5
+TSC_KHZ_MIN = 100_000
+TSC_KHZ_MAX = 10_000_000
+
+
+def boot_arguments(t_clock: int, *, vmm: Path) -> str:
+    """Executable arguments for direct launch, resolved by the same VMM as lifecycle.
+
+    The lock and spec_boot_arguments contain only spec input, never host frequency.
+    """
+    base = spec_boot_arguments(t_clock)  # Validate before opening the executable.
+    try:
+        with regular(vmm, MAX_IMAGE_BYTES) as fd:
+            if not os.fstat(fd).st_mode & 0o111:
+                raise KernelError("VMM resolver must be executable")
+            with subprocess.Popen([f"/proc/self/fd/{fd}", "boot-args", base],
+                                  pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  start_new_session=True) as process:
+                try:
+                    complete = False
+                    output = bytearray()
+                    deadline = time.monotonic() + TSC_RESOLVE_TIMEOUT_S
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(process.stdout, selectors.EVENT_READ)
+                        while True:
+                            left = deadline - time.monotonic()
+                            if left <= 0 or not selector.select(left):
+                                raise KernelError("VMM resolver timed out")
+                            chunk = os.read(process.stdout.fileno(), MAX_BOOT_BYTES + 1 - len(output))
+                            if not chunk:
+                                break
+                            output.extend(chunk)
+                            if len(output) > MAX_BOOT_BYTES:
+                                raise KernelError("VMM resolver output exceeds cap")
+                    if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                        raise KernelError("VMM frequency resolution failed")
+                    complete = True
+                finally:
+                    # Kill the whole resolver group on errors, including pipe-holding children.
+                    if not complete:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=TSC_RESOLVE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        raise KernelError("VMM frequency resolution failed") from None
+    text = _text(bytes(output), MAX_BOOT_BYTES)
+    prefix = base + " tsc_early_khz="
+    if not text.startswith(prefix) or not text.endswith("\n"):
+        raise KernelError("invalid VMM boot arguments")
+    value = text[len(prefix):-1]
+    if value != "2000000":
+        raise KernelError("invalid VMM TSC frequency")
+    return text[:-1]
 
 
 def check_boot_arguments(arguments: str) -> list[Finding]:
@@ -185,6 +248,10 @@ def check_boot_arguments(arguments: str) -> list[Finding]:
             value = token.removeprefix("hermetic.t=")
             if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
                 findings.append(Finding("hermetic.t", "invalid clock value"))
+        elif token.startswith("tsc_early_khz="):
+            value = token.removeprefix("tsc_early_khz=")
+            if value != "2000000":
+                findings.append(Finding("tsc_early_khz", "invalid TSC frequency"))
         elif token not in BOOT_FIXED.split(" "):
             findings.append(Finding("boot", "unapproved boot argument"))
     for required in BOOT_FIXED.split(" "):
@@ -217,7 +284,7 @@ def validate_lock(lock: dict, *, for_build: bool = False) -> dict:
         raise KernelError("invalid lock field: source_url")
     if lock["sha256"] != PLACEHOLDER and not re.fullmatch(r"[0-9a-f]{64}", lock["sha256"]):
         raise KernelError("invalid lock field: sha256")
-    if not re.fullmatch(r"(?:sha256:[0-9a-f]{64}|[a-z0-9./:_-]+@sha256:(?:[0-9a-f]{64}|TO-BE-FILLED-BY-OWNER))", lock["builder_image"]):
+    if lock["builder_image"] not in (APPROVED_BUILDER_IMAGE, "sha256:" + APPROVED_BUILDER_DIGEST):
         raise KernelError("invalid lock field: builder_image")
     for field in ("build_user", "build_host"):
         if lock[field] != "hermetic":
@@ -408,7 +475,7 @@ def docker_arguments(lock: dict, input_dir: Path, output_dir: Path, *, uid: int 
         "--mount", f"type=bind,src={input_dir},dst=/inputs,readonly",
         "--mount", f"type=bind,src={output_dir},dst=/output",
         "--tmpfs", "/build:rw,exec,nosuid,nodev,size=8g,mode=1777",
-        "--workdir=/build", "--entrypoint=/bin/bash", lock["builder_image"], "/inputs/build.sh",
+        "--workdir=/build", "--entrypoint=/bin/bash", "sha256:" + APPROVED_BUILDER_DIGEST, "/inputs/build.sh",
     ]
 
 
@@ -598,8 +665,7 @@ def build_kernel(lock_path: Path, tarball: Path, output: Path, *, kernel_dir: Pa
 def integration_build(tarball: Path, output: Path) -> bytes:
     """Prepare a local builder, then build offline using its immutable image ID."""
     lock = load_lock(DEFAULT_KERNEL_DIR / "kernel.lock.json")
-    # Only the builder pin may be unresolved, and all inputs precede output creation.
-    validate_lock({**lock, "builder_image": "sha256:" + "0" * 64}, for_build=True)
+    validate_lock(lock, for_build=True)
     inputs = _build_inputs(DEFAULT_KERNEL_DIR)
     if hash_file(tarball, MAX_TARBALL_BYTES) != lock["sha256"]:
         raise KernelError("source tarball sha256 mismatch")

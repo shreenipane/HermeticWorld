@@ -362,3 +362,51 @@ def test_converter_guest_clock_boundaries_match_execd(tmp_path, clock):
     root = task(tmp_path, cutoffs={"t_world": clock, "t_clock": clock})
     cutoffs, _, _ = image.task_inputs(root, "pytest-dev__pytest-6202")
     assert cutoffs["t_clock"] == clock
+
+
+@pytest.mark.parametrize("non_executable", ["bash", "cat", "sed", "loader"])
+def test_converter_refuses_runtime_without_execute_permission(tmp_path, non_executable):
+    # A minimal ELF with PT_INTERP exercises the loader's mode as well as the
+    # three required command modes, without executing any image-provided code.
+    raw = bytearray(static_elf())
+    raw.extend(bytes(56))
+    interpreter = b"/lib/loader\0"
+    struct.pack_into("<HH", raw, 54, 56, 2)
+    struct.pack_into("<IIQQQQQQ", raw, 120, 3, 0, len(raw), 0, 0,
+                     len(interpreter), len(interpreter), 1)
+    raw.extend(interpreter)
+    tree = image.Tree(tmp_path)
+    try:
+        for name in ("bash", "cat", "sed"):
+            tree.write("bin/" + name, bytes(raw), 0o755)
+        tree.write("lib/loader", static_elf(), 0o755)
+        image.check_guest_runtime(tree)
+        path = "lib/loader" if non_executable == "loader" else "bin/" + non_executable
+        (tmp_path / path).chmod(0o644)
+        with pytest.raises(ValueError, match="Agent image input refused"):
+            image.check_guest_runtime(tree)
+    finally:
+        tree.close()
+
+
+@pytest.mark.parametrize("clock", ["1601-01-01T00:00:00Z", "1979-12-31T23:59:59Z",
+                                  "2100-01-01T00:00:00Z", "9999-12-31T23:59:59Z"])
+def test_task_runner_refuses_unbootable_clock_before_creating_work(tmp_path, monkeypatch, clock):
+    import agent_h_run
+    manifest = tmp_path / "world.json"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": clock}}))
+    issue = tmp_path / "issue.txt"
+    issue.write_text("fix")
+    for key in ("HERMETIC_ROOTFS", "HERMETIC_FC_BIN", "HERMETIC_KERNEL", "HERMETIC_AGENT_PYTHON"):
+        monkeypatch.setenv(key, "/not-executed")
+    monkeypatch.setenv("HERMETIC_AGENT_MANIFEST", str(manifest))
+    monkeypatch.setenv("HERMETIC_AGENT_TASK", str(issue))
+    monkeypatch.setenv("HERMETIC_AGENT_GATEWAY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HERMETIC_AGENT_MODEL", "pinned")
+    calls = []
+    monkeypatch.setattr(agent_h_run, "command", lambda *args, **kwargs: calls.append(args))
+    work = tmp_path / "never"
+    with pytest.raises(ValueError):
+        agent_h_run.run([str(work)])
+    assert not work.exists()
+    assert not calls

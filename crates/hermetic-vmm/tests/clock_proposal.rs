@@ -1,4 +1,4 @@
-//! The separate experiment must remain valid x86 Firecracker v1.18.0 input.
+//! The fixed profile must remain valid x86 Firecracker v1.18.0 input.
 //! These tests validate the artifact and mask behavior, not VMM/KVM denial.
 #![forbid(unsafe_code)]
 use serde::Deserialize;
@@ -61,7 +61,10 @@ fn modifiers() -> BTreeMap<(u32, u32, String), (u32, u32)> {
         let l = u32::from_str_radix(leaf.leaf.trim_start_matches("0x"), 16).unwrap();
         let sub = u32::from_str_radix(leaf.subleaf.trim_start_matches("0x"), 16).unwrap();
         assert!(seen.insert((l, sub)), "duplicate CPUID key");
-        assert_eq!(leaf.flags, if l == 7 { 1 } else { 0 });
+        assert_eq!(
+            leaf.flags,
+            if matches!(l, 4 | 7 | 0xb | 0xd) { 1 } else { 0 }
+        );
         for reg in leaf.modifiers {
             assert!(["eax", "ebx", "ecx", "edx"].contains(&reg.register.as_str()));
             let (mask, value) = bitmap(&reg.bitmap, 32);
@@ -87,18 +90,18 @@ fn apply(
 #[test]
 fn proposal_schema_and_pv_mask_known_answer() {
     let regs = modifiers();
-    assert_eq!(apply(&regs, 0x4000_0001, 0, "eax", u32::MAX), 0xfeff_ffd6);
+    assert_eq!(apply(&regs, 0x4000_0001, 0, "eax", u32::MAX), 0);
     assert_eq!(apply(&regs, 0x4000_0001, 0, "eax", 0), 0);
 }
 #[test]
-fn proposal_preserves_avx_consistency_and_removes_new_feature_subleaves() {
+fn proposal_removes_avx_consistently_and_fixes_frequency() {
     let regs = modifiers();
     let ecx = apply(&regs, 1, 0, "ecx", u32::MAX);
     for bit in [12, 26, 27, 28, 29] {
-        assert_ne!(ecx & (1 << bit), 0, "AVX/FMA/F16C/XSAVE dependency");
+        assert_eq!(ecx & (1 << bit), 0, "AVX/FMA/F16C/XSAVE dependency");
     }
     let ebx = apply(&regs, 7, 0, "ebx", u32::MAX);
-    assert_ne!(ebx & (1 << 5), 0, "AVX2 remains paired with AVX");
+    assert_eq!(ebx & (1 << 5), 0, "AVX2 removed together with AVX");
     assert_eq!(
         ebx & ((1 << 16)
             | (1 << 17)
@@ -116,8 +119,15 @@ fn proposal_preserves_avx_consistency_and_removes_new_feature_subleaves() {
     }
     for r in ["eax", "ebx", "ecx", "edx"] {
         assert_eq!(apply(&regs, 7, 1, r, u32::MAX), 0);
-        for leaf in [0xa, 0x15, 0x16] {
+        for leaf in [0xa, 0xd] {
             assert_eq!(apply(&regs, leaf, 0, r, u32::MAX), 0);
+        }
+    }
+    for (leaf, expected) in [(0x15, [1, 80, 25_000_000, 0]), (0x16, [2000, 2000, 100, 0])] {
+        for (reg, value) in ["eax", "ebx", "ecx", "edx"].into_iter().zip(expected) {
+            for input in [0, u32::MAX] {
+                assert_eq!(apply(&regs, leaf, 0, reg, input), value);
+            }
         }
     }
     assert_eq!(
@@ -135,11 +145,11 @@ fn desired_brand_encoding_is_exact_but_not_runtime_attestation() {
             bytes.extend(apply(&regs, leaf, 0, r, 0).to_le_bytes());
         }
     }
-    let expected = b"Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz";
+    let expected = b"Intel(R) Xeon(R) CPU E5504 @ 2.00GHz";
     assert_eq!(&bytes[..expected.len()], expected);
     assert!(bytes[expected.len()..].iter().all(|b| *b == 0));
-    // Stock Firecracker normalizes this again; the documentation must retain
-    // that limitation, and the manager must inspect actual guest CPUID.
+    // The pinned patch replaces normalization output; the manager must still
+    // inspect actual guest CPUID before certifying the deployment.
 }
 #[test]
 fn kernel_proposal_closes_root_interfaces_and_keeps_runtime_features() {

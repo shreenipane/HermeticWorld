@@ -106,3 +106,40 @@ fn pinned_root_survives_path_replacement_and_refuses_special_files() {
         .success());
     assert!(root.text("fifo", 10).is_err());
 }
+
+#[test]
+fn every_registered_rtc_is_checked_and_partial_dates_fail_closed() {
+    use hermetic_clockprobe::{classify::ProbeResult, probes::inspect_rtc};
+    let sys = Fixture::new();
+    let dev = Fixture::new();
+    for name in ["rtc0", "rtc1"] {
+        fs::create_dir_all(sys.0.join(format!("class/rtc/{name}"))).unwrap();
+        fs::write(
+            sys.0.join(format!("class/rtc/{name}/since_epoch")),
+            "1704067200\n",
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Blocked
+    );
+    fs::write(dev.0.join("rtc0"), "").unwrap();
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Blocked
+    );
+    fs::write(sys.0.join("class/rtc/rtc1/since_epoch"), "1794600000\n").unwrap();
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Leak
+    );
+    fs::write(sys.0.join("class/rtc/rtc0/date"), "2024-01-01\n").unwrap();
+    assert!(inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0).is_err());
+}

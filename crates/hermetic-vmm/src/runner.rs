@@ -15,6 +15,10 @@ pub const MAX_INHERITED_FDS: u64 = 1_048_576;
 /// Privileged/process and transport effects are injectable. Implementations must
 /// honour the supplied deadline, and kill on Drop, including failed starts.
 pub trait Runner {
+    /// Guest frequency policy is injectable for offline failure tests.
+    fn tsc_khz(&self) -> Result<u64> {
+        crate::plan::configured_tsc_khz()
+    }
     fn spawn(
         &mut self,
         spec: &ValidatedSpec,
@@ -66,6 +70,9 @@ impl Runner for JailerRunner {
             return Err(Error::Validation("jailer runner requires root"));
         }
         let binary = open_image(&spec.spec().jail.jailer)?;
+        let pin = crate::pin::BuildPin::configured()?;
+        pin.verify(&binary, true, end)?;
+        pin.verify(&jail.executable()?, false, end)?;
         let namespace = open_image(&format!("/run/netns/{}", spec.spec().jail.netns))?;
         let mut args = jail.pinned_jailer_args(plan);
         let namespace_path = format!("/proc/{}/fd/{}", std::process::id(), namespace.as_raw_fd());
@@ -165,8 +172,10 @@ impl Runner for DevUnjailed {
             .root
             .replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1);
         let args = vec!["--api-sock".into(), format!("{}api.socket", self.root)];
+        let binary = jail.executable()?;
+        crate::pin::BuildPin::configured()?.verify(&binary, false, end)?;
         let process = OwnedProcess::spawn(
-            jail.executable()?,
+            binary,
             &args,
             spec,
             self.launcher

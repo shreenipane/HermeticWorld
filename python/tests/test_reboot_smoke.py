@@ -51,11 +51,13 @@ def test_reboot_keeps_first_boot_image_until_reboot_finishes(tmp_path, boot_exit
         'import os\nfrom pathlib import Path\n'
         "assert Path(os.environ['HERMETIC_ROOTFS']).read_bytes() == b'sealed'\n"
         "assert Path(os.environ['HERMETIC_INITRD']).read_bytes() == b'trusted'\n"
+        "assert os.environ['HERMETIC_FC_BIN'] == 'selected-patched-firecracker'\n"
         "Path(os.environ['HERMETIC_REBOOT_RECORD_OUT']).write_text('reboot complete')\n"
     )
     for command in commands.iterdir():
         command.chmod(0o700)
     env = dict(os.environ, HOME=str(tmp_path),
+               HERMETIC_FC_BIN='selected-patched-firecracker',
                PATH=f"{commands}:{os.environ['PATH']}", PYTHONDONTWRITEBYTECODE="1")
     standalone = tmp_path / "standalone"
     result = subprocess.run(["bash", str(boot), str(standalone)], env=env,

@@ -118,7 +118,7 @@ pub const MAX_ITEMS: usize = 512;
 pub const MAX_DATE_FINDINGS: usize = 5;
 pub const MAX_EPOCH: u64 = 253_402_300_799;
 pub const CLOCK_TOLERANCE_SECONDS: f64 = 60.0;
-pub const BASELINE_BRAND: &str = "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz";
+pub const BASELINE_BRAND: &str = crate::baseline::BRAND;
 
 pub fn parse_hermetic_t_from_cmdline(cmdline: &str) -> Option<u64> {
     if cmdline.len() > MAX_TEXT_BYTES {
@@ -290,6 +290,9 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
         }
         match (leaf.leaf, leaf.subleaf) {
             (0x4000_0001, 0) => {
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 {
+                    leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
+                }
                 if (leaf.eax & (1 << 0)) != 0 {
                     leak_reasons.push("0x40000001:EAX[0] KVM_FEATURE_CLOCKSOURCE set".to_string());
                 }
@@ -300,25 +303,34 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                     leak_reasons.push("0x40000001:EAX[5] KVM_FEATURE_STEAL_TIME set".to_string());
                 }
             }
+            (0x4000_0000..=0x4000_0010, _)
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 =>
+            {
+                leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
+            }
             (0x15, 0) => {
-                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 {
-                    leak_reasons.push("0x15 TSC crystal ratio leaf non-zero".to_string());
+                let actual = [leaf.eax, leaf.ebx, leaf.ecx, leaf.edx];
+                if actual != [0; 4] && Some(actual) != crate::baseline::registers(0x15, 0, 0, 1) {
+                    leak_reasons.push("0x15 differs from fixed guest TSC ratio".to_string());
                 }
             }
             (0x16, 0) => {
-                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 {
-                    leak_reasons.push("0x16 processor frequency leaf non-zero".to_string());
+                let actual = [leaf.eax, leaf.ebx, leaf.ecx, leaf.edx];
+                if actual != [0; 4] && Some(actual) != crate::baseline::registers(0x16, 0, 0, 1) {
+                    leak_reasons.push("0x16 differs from fixed guest frequency".to_string());
                 }
             }
             (0x1, 0) => {
-                // Baseline Broadwell-EP signature is 0x000406f1; newer server models (e.g. Skylake 0x5065x,
-                // Ice Lake 0x606ax, Sapphire Rapids 0x806fx, Emerald Rapids 0xc06fx) indicate newer host CPU.
+                if leaf.ecx & (1 << 31) != 0 {
+                    leak_reasons.push("Hypervisor CPUID bit exposed".into());
+                }
+                // Family/model/stepping are fixed even on newer physical CPUs.
                 let ext_model = (leaf.eax >> 16) & 0xF;
                 let model = (leaf.eax >> 4) & 0xF;
                 let full_model = (ext_model << 4) | model;
-                if leaf.eax != 0x0004_06f1 {
+                if leaf.eax != crate::baseline::SIGNATURE {
                     leak_reasons.push(format!(
-                        "0x1:EAX model 0x{:02x} differs from Broadwell baseline signature",
+                        "0x1:EAX model 0x{:02x} differs from fixed baseline signature",
                         full_model
                     ));
                 }
@@ -333,22 +345,8 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                 leak_reasons.push("post-baseline structured feature subleaf exposed".into());
             }
             (0x7, 0) => {
-                const BASELINE_EBX: u32 = (1 << 0)
-                    | (1 << 1)
-                    | (1 << 3)
-                    | (1 << 5)
-                    | (1 << 7)
-                    | (1 << 8)
-                    | (1 << 9)
-                    | (1 << 10)
-                    | (1 << 18)
-                    | (1 << 19)
-                    | (1 << 20);
-                if leaf.eax != 0 || leaf.ecx != 0 || leaf.edx != 0 || leaf.ebx & !BASELINE_EBX != 0
-                {
-                    leak_reasons.push(
-                        "Structured features differ from the proposed baseline subset".into(),
-                    );
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 {
+                    leak_reasons.push("Structured features exceed the v2 profile".into());
                 }
                 if (leaf.ebx & (1 << 16)) != 0 {
                     leak_reasons.push("0x7:0:EBX[16] AVX512F exposed".to_string());
@@ -755,10 +753,7 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
     }
 
     for cs in avail.split_whitespace() {
-        if matches!(
-            cs,
-            "kvm-clock" | "hpet" | "acpi_pm" | "pit" | "hyperv_clocksource_tsc_page"
-        ) {
+        if cs != "tsc" {
             return ProbeRecord::new(
                 "clocksource_sysfs",
                 ProbeResult::Leak,
@@ -891,6 +886,33 @@ pub fn classify_vmclock(
 
 /// Probe 12: /proc/cpuinfo model name and flags.
 pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
+    let Some(text) = content.filter(|text| text.len() <= MAX_TEXT_BYTES) else {
+        return ProbeRecord::new(
+            "cpuinfo",
+            ProbeResult::Error,
+            None,
+            "CPU information missing or over cap",
+        );
+    };
+    let mut result = None;
+    for section in text.split("\n\n").filter(|part| !part.trim().is_empty()) {
+        let record = classify_cpuinfo_section(Some(section));
+        if record.result == ProbeResult::Leak {
+            return record;
+        }
+        if result
+            .as_ref()
+            .is_none_or(|r: &ProbeRecord| r.result != ProbeResult::Error)
+        {
+            result = Some(record);
+        }
+    }
+    result.unwrap_or_else(|| {
+        ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "CPU information empty")
+    })
+}
+
+fn classify_cpuinfo_section(content: Option<&str>) -> ProbeRecord {
     let Some(text) = content else {
         return ProbeRecord::new(
             "cpuinfo",
@@ -963,54 +985,25 @@ pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
                 "fxsr",
                 "sse",
                 "sse2",
-                "ss",
                 "ht",
                 "syscall",
                 "nx",
-                "pdpe1gb",
-                "rdtscp",
                 "lm",
                 "constant_tsc",
+                "nonstop_tsc",
+                "tsc_reliable",
                 "rep_good",
                 "nopl",
                 "xtopology",
                 "cpuid",
                 "tsc_known_freq",
                 "pni",
-                "pclmulqdq",
                 "ssse3",
-                "fma",
                 "cx16",
-                "pcid",
                 "sse4_1",
                 "sse4_2",
-                "x2apic",
-                "movbe",
                 "popcnt",
-                "tsc_deadline_timer",
-                "aes",
-                "xsave",
-                "avx",
-                "f16c",
-                "rdrand",
-                "hypervisor",
                 "lahf_lm",
-                "abm",
-                "3dnowprefetch",
-                "fsgsbase",
-                "tsc_adjust",
-                "bmi1",
-                "avx2",
-                "smep",
-                "bmi2",
-                "erms",
-                "invpcid",
-                "rdseed",
-                "adx",
-                "smap",
-                "xsaveopt",
-                "arat",
-                "osxsave",
             ];
             if !BASELINE_FLAGS.contains(&flag) {
                 leaks.push(format!("leaked flag: {flag}"));

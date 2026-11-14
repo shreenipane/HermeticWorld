@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).absolute().parent))
-from agent_h_image import TOP, command, MAX_BUILD_SECONDS
+from agent_h_image import TOP, command, MAX_BUILD_SECONDS, MIN_GUEST_CLOCK, MAX_GUEST_CLOCK
 from hermetic_agent.task import clock_value, task_clock, read_input
 from hermetic_agent.model import HermeticGatewayModel
 from smoke_work import create_work
@@ -23,6 +23,9 @@ def run(argv):
         if not env.get(key):
             raise ValueError()
     clock = task_clock(env["HERMETIC_AGENT_MANIFEST"])
+    epoch = clock_value(clock)
+    if not MIN_GUEST_CLOCK <= epoch <= MAX_GUEST_CLOCK:
+        raise ValueError("Guest clock outside boot range")
     read_input(env["HERMETIC_AGENT_TASK"]).decode("utf-8")
     # Validate the endpoint before creating a directory or starting any subprocess.
     HermeticGatewayModel(env["HERMETIC_AGENT_GATEWAY"], env["HERMETIC_AGENT_MODEL"], t_clock=clock)
@@ -30,7 +33,7 @@ def run(argv):
     try:
         os.mkdir("config", 0o700, dir_fd=directory)
         env.update(HERMETIC_AGENT_WORK=work, HERMETIC_AGENT_TOP=str(TOP),
-                   HERMETIC_AGENT_T_CLOCK=str(clock_value(clock)))
+                   HERMETIC_AGENT_T_CLOCK=str(epoch))
         env["CARGO_TARGET_DIR"] = str(TOP / ".review/cargo-target")
         command(["cargo", "test", "--offline", "--locked", "-p", "hermetic-vmm",
                  "--features", "dev-unjailed", "--test", "agent_h_task", "--no-run"],

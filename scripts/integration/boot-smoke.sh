@@ -10,23 +10,21 @@ smoke_main() {
 WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
-FC_SRC="$U/.hermetic/tools/firecracker/release-v1.18.0-x86_64/firecracker-v1.18.0-x86_64"
-FC_DIR="$U/.hermetic/tools/firecracker-1.18.0"
-FC_SHA=b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba
+FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
+: "${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
 export CARGO_TARGET_DIR="$U/hermetic/cargo-target/$(basename "$top")"
 T=1700000000
-
-# 0. Pinned Firecracker (verified against vmm/firecracker.lock.json), basename 'firecracker'.
-if [ ! -x "$FC_DIR/firecracker" ]; then
-  echo "$FC_SHA  $FC_SRC" | sha256sum -c --quiet
-  mkdir -p "$FC_DIR"; chmod 0755 "$FC_DIR"
-  install -m 0755 "$FC_SRC" "$FC_DIR/firecracker"
+BOOT_TEST=boots_guest_and_reads_guest_clock
+if [ -n "${HERMETIC_LOCKDOWN_CONFIG:-}" ]; then
+  PYTHONPATH=python python3 -B -m hermetic_slice kernel-check-config --config "$HERMETIC_LOCKDOWN_CONFIG"
+  BOOT_TEST=boots_guest_
 fi
-echo "$FC_SHA  $FC_DIR/firecracker" | sha256sum -c --quiet
+
+# The runner verifies the measured build lock and held executable before launch.
 
 # 1. Static execd + sealcheck, rootfs tree, image with D4.
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q \
-  -p hermetic-sealcheck --target x86_64-unknown-linux-gnu
+  -p hermetic-sealcheck -p hermetic-clockprobe --target x86_64-unknown-linux-gnu
 bash scripts/build-trusted-execd.sh
 BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 umask 022
@@ -36,6 +34,10 @@ for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
          mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
 install -m 0755 "$BIN/hermetic-execd" "$TREE/sbin/hermetic-execd"
 install -m 0755 "$BIN/hermetic-init" "$TREE/sbin/hermetic-init"   # early read-only /proc, then exec execd
+if [ -n "${HERMETIC_LOCKDOWN_CONFIG:-}" ]; then
+  install -m 0755 "$BIN/hermetic-clockprobe" "$TREE/sbin/hermetic-clockprobe"
+  install -m 0600 "$HERMETIC_LOCKDOWN_CONFIG" "$TREE/etc/hermetic/guest-kernel.config"
+fi
 install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"   # static; trivial command
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
 {"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,
@@ -60,10 +62,10 @@ echo "$WORK/rootfs.img" | grep -q . && ls -l "$WORK/rootfs.img"
 # 2+3. Boot via dev-unjailed runner (owner-run ignored test): kernel mounts the base
 # read-only and devtmpfs, init=/sbin/hermetic-init mounts read-only /proc and execs
 # execd, which sets the clock first. The test reads the status frame and runs one command.
-HERMETIC_FC_BIN="$FC_DIR/firecracker" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/rootfs.img" \
+HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/rootfs.img" \
   "$U/.hermetic/bin/rust-gate" --exclude hermetic-common --exclude hermetic-gateway \
   --exclude hermetic-sealcheck --exclude hermetic-trust --exclude hermetic-world-server \
-  --exclude tiny_http --features dev-unjailed --test guest boots_guest_and_reads_guest_clock \
+  --exclude tiny_http --features dev-unjailed --test guest "$BOOT_TEST" \
   -- --ignored --nocapture
 
 }
