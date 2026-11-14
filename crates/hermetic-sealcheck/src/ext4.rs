@@ -2,6 +2,8 @@
 //!
 //! Checks that no inode or superblock timestamp in an ext4 image is later than `T_clock`.
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -9,7 +11,11 @@ use crate::scan::{Finding, Severity, Visibility};
 
 const SUPERBLOCK_OFFSET: usize = 1024;
 const SUPERBLOCK_SIZE: usize = 1024;
-pub const MAX_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_BLOCK_BYTES: usize = 64 * 1024;
+const MAX_METADATA_READ_BYTES: u64 = MAX_IMAGE_BYTES;
+const MAX_EXTENT_DEPTH: u16 = 5;
+const MAX_EXTENT_NODES: u64 = 1_000_000;
 const MAX_IMAGE_INODES: u64 = 1_000_000;
 const MAX_IMAGE_FINDINGS: usize = 100_000;
 const EXT4_MAGIC: u16 = 0xEF53;
@@ -64,7 +70,9 @@ fn ext4_decode_extra_time(base: u32, extra: u32) -> Result<(i64, u32), Ext4Error
     let mut sec = (base as i32) as i64;
     let epoch = (extra & 3) as u64;
     if epoch != 0 {
-        sec += (epoch << 32) as i64;
+        sec = sec
+            .checked_add((epoch << 32) as i64)
+            .ok_or_else(|| malformed("inode timestamp overflow"))?;
     }
     let nsec = (extra & 0xFFFF_FFFC) >> 2;
     if nsec >= 1_000_000_000 {
@@ -75,21 +83,174 @@ fn ext4_decode_extra_time(base: u32, extra: u32) -> Result<(i64, u32), Ext4Error
     Ok((sec, nsec))
 }
 
-/// Decode superblock timestamp with optional `_hi` extension byte.
-fn decode_sb_time(sb: &[u8], lo_off: usize, hi_off: usize) -> i64 {
-    let lo_end = match lo_off.checked_add(4) {
-        Some(e) => e,
-        None => return 0,
-    };
-    if lo_end > sb.len() {
-        return 0;
+fn malformed(message: &str) -> Ext4Error {
+    Ext4Error::Malformed(message.into())
+}
+
+fn bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], Ext4Error> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| malformed("field offset overflow"))?;
+    data.get(offset..end)
+        .and_then(|field| field.try_into().ok())
+        .ok_or_else(|| malformed("field out of bounds"))
+}
+
+fn decode_sb_time(sb: &[u8], lo_off: usize, hi_off: usize) -> Result<i64, Ext4Error> {
+    let lo = u32::from_le_bytes(bytes(sb, lo_off)?);
+    let hi = sb
+        .get(hi_off)
+        .ok_or_else(|| malformed("timestamp out of bounds"))?;
+    Ok((((u64::from(*hi)) << 32) | u64::from(lo)) as i64)
+}
+
+trait Positioned {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Ext4Error>;
+}
+
+impl Positioned for File {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Ext4Error> {
+        self.read_exact_at(buffer, offset)?;
+        Ok(())
     }
-    let lo = u32::from_le_bytes([sb[lo_off], sb[lo_off + 1], sb[lo_off + 2], sb[lo_off + 3]]);
-    let hi = if hi_off < sb.len() { sb[hi_off] } else { 0 };
-    if lo == 0 && hi == 0 {
-        return 0;
+}
+
+impl Positioned for &[u8] {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Ext4Error> {
+        let start = usize::try_from(offset).map_err(|_| malformed("read offset overflow"))?;
+        let end = start
+            .checked_add(buffer.len())
+            .ok_or_else(|| malformed("read end overflow"))?;
+        buffer.copy_from_slice(
+            self.get(start..end)
+                .ok_or_else(|| malformed("truncated image"))?,
+        );
+        Ok(())
     }
-    (((hi as u64) << 32) | (lo as u64)) as i64
+}
+
+struct Image<R> {
+    source: R,
+    len: u64,
+    read_bytes: u64,
+    extent_nodes: u64,
+}
+
+impl<R: Positioned> Image<R> {
+    fn new(source: R, len: u64) -> Result<Self, Ext4Error> {
+        if len > MAX_IMAGE_BYTES {
+            return Err(malformed("image byte cap exceeded"));
+        }
+        Ok(Self {
+            source,
+            len,
+            read_bytes: 0,
+            extent_nodes: 0,
+        })
+    }
+
+    fn range(&self, offset: u64, len: u64) -> Result<(), Ext4Error> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(malformed("image range out of bounds"));
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Ext4Error> {
+        if len > MAX_BLOCK_BYTES {
+            return Err(malformed("image read size cap exceeded"));
+        }
+        self.range(offset, len as u64)?;
+        self.read_bytes = self
+            .read_bytes
+            .checked_add(len as u64)
+            .filter(|total| *total <= MAX_METADATA_READ_BYTES)
+            .ok_or_else(|| malformed("image metadata read cap exceeded"))?;
+        let mut buffer = vec![0; len];
+        self.source.read_at(&mut buffer, offset)?;
+        Ok(buffer)
+    }
+}
+
+// Validate physical extent ranges without reading file contents. Sparse holes
+// require no reads. Index depth decreases on every edge; nodes and I/O share
+// image-wide budgets so repeated or cyclic hostile references cannot run away.
+fn check_extents<R: Positioned>(
+    image: &mut Image<R>,
+    node: &[u8],
+    block_size: u64,
+    total_blocks: u64,
+    expected_depth: Option<u16>,
+) -> Result<(), Ext4Error> {
+    let magic = u16::from_le_bytes(bytes(node, 0)?);
+    let entries = u16::from_le_bytes(bytes(node, 2)?);
+    let capacity = u16::from_le_bytes(bytes(node, 4)?);
+    let depth = u16::from_le_bytes(bytes(node, 6)?);
+    if magic != 0xf30a
+        || depth > MAX_EXTENT_DEPTH
+        || expected_depth.is_some_and(|expected| expected != depth)
+        || entries > capacity
+        || usize::from(capacity) > node.len().saturating_sub(12) / 12
+    {
+        return Err(malformed("invalid extent header"));
+    }
+    image.extent_nodes = image
+        .extent_nodes
+        .checked_add(1)
+        .filter(|count| *count <= MAX_EXTENT_NODES)
+        .ok_or_else(|| malformed("extent node cap exceeded"))?;
+    let mut previous_end = 0u64;
+    for entry in node
+        .get(12..)
+        .ok_or_else(|| malformed("invalid extent node"))?
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .take(usize::from(entries))
+    {
+        let logical = u64::from(u32::from_le_bytes(bytes(entry, 0)?));
+        if logical < previous_end {
+            return Err(malformed("unordered extents"));
+        }
+        if depth == 0 {
+            let raw_len = u16::from_le_bytes(bytes(entry, 4)?);
+            let len = u64::from(if raw_len > 32768 {
+                raw_len - 32768
+            } else {
+                raw_len
+            });
+            let start = (u64::from(u16::from_le_bytes(bytes(entry, 6)?)) << 32)
+                | u64::from(u32::from_le_bytes(bytes(entry, 8)?));
+            if len == 0 || start == 0 || start.checked_add(len).is_none_or(|end| end > total_blocks)
+            {
+                return Err(malformed("extent past end of image"));
+            }
+            previous_end = logical
+                .checked_add(len)
+                .ok_or_else(|| malformed("extent overflow"))?;
+        } else {
+            let start = (u64::from(u16::from_le_bytes(bytes(entry, 8)?)) << 32)
+                | u64::from(u32::from_le_bytes(bytes(entry, 4)?));
+            if start == 0 || start >= total_blocks {
+                return Err(malformed("extent index past end of image"));
+            }
+            let offset = start
+                .checked_mul(block_size)
+                .ok_or_else(|| malformed("extent offset overflow"))?;
+            let child = image.read(offset, block_size as usize)?;
+            check_extents(
+                image,
+                &child,
+                block_size,
+                total_blocks,
+                depth.checked_sub(1),
+            )?;
+            previous_end = logical
+                .checked_add(1)
+                .ok_or_else(|| malformed("extent overflow"))?;
+        }
+    }
+    Ok(())
 }
 
 fn format_ext4_time(sec: i64, nsec: u32) -> String {
@@ -104,22 +265,23 @@ fn format_ext4_time(sec: i64, nsec: u32) -> String {
     }
 }
 
-fn parse_ext4(
+fn parse_ext4<R: Positioned>(
     image_display: &str,
-    data: &[u8],
+    image: &mut Image<R>,
     t_clock: OffsetDateTime,
 ) -> Result<Vec<Finding>, Ext4Error> {
-    if data.len() < SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE {
+    if image.len < (SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE) as u64 {
         return Err(Ext4Error::Malformed(format!(
             "image too small for superblock ({} < 2048 bytes)",
-            data.len()
+            image.len
         )));
     }
 
-    let sb = &data[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE];
+    let sb_data = image.read(SUPERBLOCK_OFFSET as u64, SUPERBLOCK_SIZE)?;
+    let sb = sb_data.as_slice();
 
     // Magic check
-    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    let magic = u16::from_le_bytes(bytes(sb, 0x38)?);
     if magic != EXT4_MAGIC {
         return Err(Ext4Error::Malformed(format!(
             "bad magic 0x{magic:04x}, expected 0xef53"
@@ -127,7 +289,7 @@ fn parse_ext4(
     }
 
     // Incompatible feature checks
-    let s_feature_incompat = u32::from_le_bytes([sb[0x60], sb[0x61], sb[0x62], sb[0x63]]);
+    let s_feature_incompat = u32::from_le_bytes(bytes(sb, 0x60)?);
     if (s_feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG) != 0 {
         return Err(Ext4Error::Unsupported("meta_bg".into()));
     }
@@ -145,7 +307,7 @@ fn parse_ext4(
     }
 
     // Block size: 1024 << s_log_block_size
-    let s_log_block_size = u32::from_le_bytes([sb[0x18], sb[0x19], sb[0x1A], sb[0x1B]]);
+    let s_log_block_size = u32::from_le_bytes(bytes(sb, 0x18)?);
     if s_log_block_size > 6 {
         return Err(Ext4Error::Malformed(format!(
             "invalid block size log {s_log_block_size}"
@@ -157,7 +319,7 @@ fn parse_ext4(
     };
 
     // Inode size
-    let s_inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]) as usize;
+    let s_inode_size = u16::from_le_bytes(bytes(sb, 0x58)?) as usize;
     if s_inode_size < 128 || !s_inode_size.is_power_of_two() || (s_inode_size as u64) > block_size {
         return Err(Ext4Error::Malformed(format!(
             "invalid inode size {s_inode_size}"
@@ -165,8 +327,8 @@ fn parse_ext4(
     }
 
     // Inodes per group and total inodes
-    let s_inodes_per_group = u32::from_le_bytes([sb[0x28], sb[0x29], sb[0x2A], sb[0x2B]]) as u64;
-    let s_inodes_count = u32::from_le_bytes([sb[0x00], sb[0x01], sb[0x02], sb[0x03]]) as u64;
+    let s_inodes_per_group = u32::from_le_bytes(bytes(sb, 0x28)?) as u64;
+    let s_inodes_count = u32::from_le_bytes(bytes(sb, 0x00)?) as u64;
     if s_inodes_count > MAX_IMAGE_INODES {
         return Err(Ext4Error::Malformed("image inode cap exceeded".into()));
     }
@@ -193,7 +355,7 @@ fn parse_ext4(
         Some(b) => b,
         None => return Err(Ext4Error::Malformed("inode table size overflow".into())),
     };
-    if itable_group_bytes > data.len() as u64 {
+    if itable_group_bytes > image.len {
         return Err(Ext4Error::Malformed(
             "inodes per group table exceeds image size".into(),
         ));
@@ -201,7 +363,7 @@ fn parse_ext4(
 
     // 64-bit feature and descriptor size
     let is_64bit = (s_feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
-    let s_desc_size = u16::from_le_bytes([sb[0xFE], sb[0xFF]]) as usize;
+    let s_desc_size = u16::from_le_bytes(bytes(sb, 0xFE)?) as usize;
     let desc_size = if is_64bit {
         if s_desc_size != 0 {
             s_desc_size
@@ -223,13 +385,13 @@ fn parse_ext4(
     }
 
     // Blocks per group and total blocks
-    let s_blocks_per_group = u32::from_le_bytes([sb[0x20], sb[0x21], sb[0x22], sb[0x23]]) as u64;
+    let s_blocks_per_group = u32::from_le_bytes(bytes(sb, 0x20)?) as u64;
     if s_blocks_per_group == 0 {
         return Err(Ext4Error::Malformed("blocks per group is zero".into()));
     }
-    let s_blocks_count_lo = u32::from_le_bytes([sb[0x04], sb[0x05], sb[0x06], sb[0x07]]) as u64;
+    let s_blocks_count_lo = u32::from_le_bytes(bytes(sb, 0x04)?) as u64;
     let s_blocks_count_hi = if is_64bit {
-        u32::from_le_bytes([sb[0x150], sb[0x151], sb[0x152], sb[0x153]]) as u64
+        u32::from_le_bytes(bytes(sb, 0x150)?) as u64
     } else {
         0
     };
@@ -239,7 +401,7 @@ fn parse_ext4(
     }
 
     // Group count calculation
-    let s_first_data_block = u32::from_le_bytes([sb[0x14], sb[0x15], sb[0x16], sb[0x17]]) as u64;
+    let s_first_data_block = u32::from_le_bytes(bytes(sb, 0x14)?) as u64;
     let remaining_blocks = match total_blocks.checked_sub(s_first_data_block) {
         Some(b) => b,
         None => {
@@ -276,7 +438,7 @@ fn parse_ext4(
         Some(end) => end,
         None => return Err(Ext4Error::Malformed("gdt end overflow".into())),
     };
-    if gdt_end > data.len() as u64 {
+    if gdt_end > image.len {
         return Err(Ext4Error::Malformed(
             "descriptor table past the end of image".into(),
         ));
@@ -285,9 +447,11 @@ fn parse_ext4(
         Some(b) => b,
         None => return Err(Ext4Error::Malformed("total blocks bytes overflow".into())),
     };
-    if total_image_bytes > data.len() as u64 {
+    if total_image_bytes > image.len {
         return Err(Ext4Error::Malformed("group count past the file".into()));
     }
+    // No metadata pointer may use trailing bytes outside the filesystem.
+    image.len = total_image_bytes;
 
     let t_clock_secs = t_clock.unix_timestamp();
     let t_clock_nanos = t_clock.nanosecond();
@@ -308,7 +472,7 @@ fn parse_ext4(
     ];
 
     for (field, lo_off, hi_off) in sb_times {
-        let sec = decode_sb_time(sb, lo_off, hi_off);
+        let sec = decode_sb_time(sb, lo_off, hi_off)?;
         if sec == 0 {
             // A zero time is "unset", not a violation
             continue;
@@ -347,49 +511,26 @@ fn parse_ext4(
                 ))
             }
         };
-        let gd_offset = match usize::try_from(gd_offset_u64) {
-            Ok(off) => off,
-            Err(_) => {
-                return Err(Ext4Error::Malformed(
-                    "group descriptor offset overflow".into(),
-                ))
-            }
-        };
-        let gd_end = match gd_offset.checked_add(desc_size) {
-            Some(end) => end,
-            None => {
-                return Err(Ext4Error::Malformed(
-                    "group descriptor offset overflow".into(),
-                ))
-            }
-        };
-        let gd = match data.get(gd_offset..gd_end) {
-            Some(slice) => slice,
-            None => {
-                return Err(Ext4Error::Malformed(
-                    "group descriptor out of bounds".into(),
-                ))
-            }
-        };
+        let gd_data = image.read(gd_offset_u64, desc_size)?;
+        let gd = gd_data.as_slice();
 
-        let bg_flags = u16::from_le_bytes([gd[0x12], gd[0x13]]);
+        let bg_flags = u16::from_le_bytes(bytes(gd, 0x12)?);
         if (bg_flags & EXT4_BG_INODE_UNINIT) != 0 {
             // Skip uninitialized inode table
             continue;
         }
 
-        let bg_inode_bitmap_lo =
-            u32::from_le_bytes([gd[0x04], gd[0x05], gd[0x06], gd[0x07]]) as u64;
+        let bg_inode_bitmap_lo = u32::from_le_bytes(bytes(gd, 0x04)?) as u64;
         let bg_inode_bitmap_hi = if is_64bit && desc_size >= 64 {
-            u32::from_le_bytes([gd[0x24], gd[0x25], gd[0x26], gd[0x27]]) as u64
+            u32::from_le_bytes(bytes(gd, 0x24)?) as u64
         } else {
             0
         };
         let inode_bitmap_block = bg_inode_bitmap_lo | (bg_inode_bitmap_hi << 32);
 
-        let bg_inode_table_lo = u32::from_le_bytes([gd[0x08], gd[0x09], gd[0x0A], gd[0x0B]]) as u64;
+        let bg_inode_table_lo = u32::from_le_bytes(bytes(gd, 0x08)?) as u64;
         let bg_inode_table_hi = if is_64bit && desc_size >= 64 {
-            u32::from_le_bytes([gd[0x28], gd[0x29], gd[0x2A], gd[0x2B]]) as u64
+            u32::from_le_bytes(bytes(gd, 0x28)?) as u64
         } else {
             0
         };
@@ -399,47 +540,13 @@ fn parse_ext4(
             Some(off) => off,
             None => return Err(Ext4Error::Malformed("bitmap offset overflow".into())),
         };
-        let bitmap_offset = match usize::try_from(bitmap_offset_u64) {
-            Ok(off) => off,
-            Err(_) => return Err(Ext4Error::Malformed("bitmap offset overflow".into())),
-        };
-        let block_size_usize = match usize::try_from(block_size) {
-            Ok(sz) => sz,
-            Err(_) => return Err(Ext4Error::Malformed("block size overflow".into())),
-        };
-        let bitmap_end = match bitmap_offset.checked_add(block_size_usize) {
-            Some(end) => end,
-            None => return Err(Ext4Error::Malformed("bitmap offset overflow".into())),
-        };
-        let bitmap_slice = match data.get(bitmap_offset..bitmap_end) {
-            Some(s) => s,
-            None => return Err(Ext4Error::Malformed("inode bitmap out of bounds".into())),
-        };
-
-        let itable_size_u64 = match s_inodes_per_group.checked_mul(s_inode_size as u64) {
-            Some(sz) => sz,
-            None => return Err(Ext4Error::Malformed("inode table size overflow".into())),
-        };
-        let itable_size = match usize::try_from(itable_size_u64) {
-            Ok(sz) => sz,
-            Err(_) => return Err(Ext4Error::Malformed("inode table size overflow".into())),
-        };
-        let itable_offset_u64 = match inode_table_block.checked_mul(block_size) {
-            Some(off) => off,
-            None => return Err(Ext4Error::Malformed("inode table offset overflow".into())),
-        };
-        let itable_offset = match usize::try_from(itable_offset_u64) {
-            Ok(off) => off,
-            Err(_) => return Err(Ext4Error::Malformed("inode table offset overflow".into())),
-        };
-        let itable_end = match itable_offset.checked_add(itable_size) {
-            Some(end) => end,
-            None => return Err(Ext4Error::Malformed("inode table offset overflow".into())),
-        };
-        let itable_slice = match data.get(itable_offset..itable_end) {
-            Some(s) => s,
-            None => return Err(Ext4Error::Malformed("inode table out of bounds".into())),
-        };
+        let bitmap_slice = image.read(bitmap_offset_u64, block_size as usize)?;
+        let itable_offset = inode_table_block
+            .checked_mul(block_size)
+            .ok_or_else(|| malformed("inode table offset overflow"))?;
+        image.range(itable_offset, itable_group_bytes)?;
+        let mut inode_block = Vec::new();
+        let mut inode_block_offset = None;
 
         for i in 0..s_inodes_per_group {
             let inode_num = match g
@@ -462,53 +569,56 @@ fn parse_ext4(
                 ));
             }
 
-            if (bitmap_slice[byte_idx] & (1 << bit_idx)) == 0 {
+            if (*bitmap_slice
+                .get(byte_idx)
+                .ok_or_else(|| malformed("inode bitmap index out of bounds"))?
+                & (1 << bit_idx))
+                == 0
+            {
                 // Inode not in use
                 continue;
             }
 
-            let i_usize = match usize::try_from(i) {
-                Ok(idx) => idx,
-                Err(_) => return Err(Ext4Error::Malformed("inode index overflow".into())),
-            };
-            let in_off = match i_usize.checked_mul(s_inode_size) {
-                Some(off) => off,
-                None => return Err(Ext4Error::Malformed("inode offset overflow".into())),
-            };
-            let in_end = match in_off.checked_add(s_inode_size) {
-                Some(end) => end,
-                None => return Err(Ext4Error::Malformed("inode slice overflow".into())),
-            };
-            let inode_slice = match itable_slice.get(in_off..in_end) {
-                Some(s) => s,
-                None => return Err(Ext4Error::Malformed("inode slice out of bounds".into())),
-            };
+            let inode_offset = i
+                .checked_mul(s_inode_size as u64)
+                .and_then(|off| itable_offset.checked_add(off))
+                .ok_or_else(|| malformed("inode offset overflow"))?;
+            let block_offset = inode_offset
+                .checked_sub(inode_offset % block_size)
+                .ok_or_else(|| malformed("inode block offset overflow"))?;
+            if inode_block_offset != Some(block_offset) {
+                inode_block = image.read(block_offset, block_size as usize)?;
+                inode_block_offset = Some(block_offset);
+            }
+            let start = (inode_offset % block_size) as usize;
+            let end = start
+                .checked_add(s_inode_size)
+                .ok_or_else(|| malformed("inode slice overflow"))?;
+            let inode_slice = inode_block
+                .get(start..end)
+                .ok_or_else(|| malformed("inode slice out of bounds"))?;
 
             // The allocation bitmap is authoritative. An allocated inode with a
             // deletion time is inconsistent, never an excuse to skip its times.
-            let dtime = u32::from_le_bytes([
-                inode_slice[0x14],
-                inode_slice[0x15],
-                inode_slice[0x16],
-                inode_slice[0x17],
-            ]);
+            let dtime = u32::from_le_bytes(bytes(inode_slice, 0x14)?);
             if dtime != 0 {
                 return Err(Ext4Error::Malformed(
                     "allocated inode has a deletion time".into(),
                 ));
             }
 
-            let flags = u32::from_le_bytes([
-                inode_slice[0x20],
-                inode_slice[0x21],
-                inode_slice[0x22],
-                inode_slice[0x23],
-            ]);
+            let flags = u32::from_le_bytes(bytes(inode_slice, 0x20)?);
+            if flags & 0x0008_0000 != 0 {
+                let root = inode_slice
+                    .get(0x28..0x64)
+                    .ok_or_else(|| malformed("extent root out of bounds"))?;
+                check_extents(image, root, block_size, total_blocks, None)?;
+            }
             let is_ea_inode = (flags & EXT4_EA_INODE_FL) != 0;
 
             let has_extra = s_inode_size > 128 && inode_slice.len() >= 130;
             let extra_isize = if has_extra {
-                u16::from_le_bytes([inode_slice[0x80], inode_slice[0x81]]) as usize
+                u16::from_le_bytes(bytes(inode_slice, 0x80)?) as usize
             } else {
                 0
             };
@@ -520,20 +630,10 @@ fn parse_ext4(
 
             // 1. i_atime
             if !is_ea_inode {
-                let atime_lo = u32::from_le_bytes([
-                    inode_slice[0x08],
-                    inode_slice[0x09],
-                    inode_slice[0x0A],
-                    inode_slice[0x0B],
-                ]);
+                let atime_lo = u32::from_le_bytes(bytes(inode_slice, 0x08)?);
                 let (atime_sec, atime_nsec) = if extra_isize >= 16 && inode_slice.len() >= 0x8C + 4
                 {
-                    let extra = u32::from_le_bytes([
-                        inode_slice[0x8C],
-                        inode_slice[0x8D],
-                        inode_slice[0x8E],
-                        inode_slice[0x8F],
-                    ]);
+                    let extra = u32::from_le_bytes(bytes(inode_slice, 0x8C)?);
                     ext4_decode_extra_time(atime_lo, extra)?
                 } else {
                     ((atime_lo as i32) as i64, 0)
@@ -550,19 +650,9 @@ fn parse_ext4(
             }
 
             // 2. i_ctime
-            let ctime_lo = u32::from_le_bytes([
-                inode_slice[0x0C],
-                inode_slice[0x0D],
-                inode_slice[0x0E],
-                inode_slice[0x0F],
-            ]);
+            let ctime_lo = u32::from_le_bytes(bytes(inode_slice, 0x0C)?);
             let (ctime_sec, ctime_nsec) = if extra_isize >= 8 && inode_slice.len() >= 0x84 + 4 {
-                let extra = u32::from_le_bytes([
-                    inode_slice[0x84],
-                    inode_slice[0x85],
-                    inode_slice[0x86],
-                    inode_slice[0x87],
-                ]);
+                let extra = u32::from_le_bytes(bytes(inode_slice, 0x84)?);
                 ext4_decode_extra_time(ctime_lo, extra)?
             } else {
                 ((ctime_lo as i32) as i64, 0)
@@ -577,19 +667,9 @@ fn parse_ext4(
             }
 
             // 3. i_mtime
-            let mtime_lo = u32::from_le_bytes([
-                inode_slice[0x10],
-                inode_slice[0x11],
-                inode_slice[0x12],
-                inode_slice[0x13],
-            ]);
+            let mtime_lo = u32::from_le_bytes(bytes(inode_slice, 0x10)?);
             let (mtime_sec, mtime_nsec) = if extra_isize >= 12 && inode_slice.len() >= 0x88 + 4 {
-                let extra = u32::from_le_bytes([
-                    inode_slice[0x88],
-                    inode_slice[0x89],
-                    inode_slice[0x8A],
-                    inode_slice[0x8B],
-                ]);
+                let extra = u32::from_le_bytes(bytes(inode_slice, 0x88)?);
                 ext4_decode_extra_time(mtime_lo, extra)?
             } else {
                 ((mtime_lo as i32) as i64, 0)
@@ -605,20 +685,10 @@ fn parse_ext4(
 
             // 4. i_crtime (creation time in large inodes)
             if extra_isize >= 20 && inode_slice.len() >= 0x90 + 4 {
-                let crtime_lo = u32::from_le_bytes([
-                    inode_slice[0x90],
-                    inode_slice[0x91],
-                    inode_slice[0x92],
-                    inode_slice[0x93],
-                ]);
+                let crtime_lo = u32::from_le_bytes(bytes(inode_slice, 0x90)?);
                 let (crtime_sec, crtime_nsec) =
                     if extra_isize >= 24 && inode_slice.len() >= 0x94 + 4 {
-                        let extra = u32::from_le_bytes([
-                            inode_slice[0x94],
-                            inode_slice[0x95],
-                            inode_slice[0x96],
-                            inode_slice[0x97],
-                        ]);
+                        let extra = u32::from_le_bytes(bytes(inode_slice, 0x94)?);
                         ext4_decode_extra_time(crtime_lo, extra)?
                     } else {
                         ((crtime_lo as i32) as i64, 0)
@@ -662,10 +732,8 @@ pub fn scan_ext4_slice(
     data: &[u8],
     t_clock: OffsetDateTime,
 ) -> Result<Vec<Finding>, Ext4Error> {
-    if data.len() as u64 > MAX_IMAGE_BYTES {
-        return Err(Ext4Error::Malformed("image byte cap exceeded".into()));
-    }
-    parse_ext4(image_display, data, t_clock)
+    let mut image = Image::new(data, data.len() as u64)?;
+    parse_ext4(image_display, &mut image, t_clock)
 }
 
 /// Stable evidence label, including when the image arrives on an inherited descriptor.
@@ -687,6 +755,12 @@ pub fn scan_ext4_image(
     t_clock: OffsetDateTime,
 ) -> Result<Vec<Finding>, Ext4Error> {
     let display = image_display(image_path);
-    let data = crate::safe_fs::read(image_path, MAX_IMAGE_BYTES)?;
-    scan_ext4_slice(&display, &data, t_clock)
+    let file = crate::safe_fs::open_regular(image_path)?;
+    let length = file.metadata()?.len();
+    let mut image = Image::new(file, length)?;
+    let findings = parse_ext4(&display, &mut image, t_clock)?;
+    if image.source.metadata()?.len() != length {
+        return Err(malformed("image size changed during scan"));
+    }
+    Ok(findings)
 }

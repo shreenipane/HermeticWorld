@@ -297,7 +297,8 @@ def test_merge_preserves_run_spec_point_to_point_network_and_verified_https():
     for relative in ("PHASES.md", "crates/hermetic-netvm-core/README.md", "crates/hermetic-vmm/tests/net_guest.rs", "scripts/integration/BOOT_NOTES.md"):
         source = (ROOT / relative).read_text()
         assert "<<<<<<<" not in source and ">>>>>>>" not in source
-    assert "cd /home/flingboot/.hermetic/worktrees/netvm-tls" not in (ROOT / "scripts/integration/BOOT_NOTES.md").read_text()
+    # Boot notes must not embed any local home directory.
+    assert re.search(r"/home/[^/\s]+/", (ROOT / "scripts/integration/BOOT_NOTES.md").read_text()) is None
 
 
 def test_tls_image_world_mismatch_has_no_filesystem_effects(tmp_path):

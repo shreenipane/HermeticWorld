@@ -274,6 +274,47 @@ def test_resource_caps_and_listener_are_local(service, monkeypatch):
     assert raw(service, b"GET /get HTTP/1.1\r\nHost: httpbin.org\r\n\r\n") == b""
 
 
+def test_exhausted_service_half_closes_before_bounded_discard(monkeypatch):
+    events = []
+    class Connection:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            events.append("close")
+        def shutdown(self, direction):
+            assert direction == socket.SHUT_WR
+            events.append("eof")
+        def settimeout(self, timeout):
+            assert 0 < timeout <= hb.IO_TIMEOUT_SECONDS
+        def recv(self, size):
+            assert events[0] == "eof"
+            events.append(size)
+            return b"x" * size
+    class Listener:
+        def accept(self):
+            return Connection(), None
+    service = hb.Service(1700000000, port=0)
+    service.listener.close()
+    service.listener = Listener()
+    monkeypatch.setattr(hb, "MAX_REQUESTS", 0)
+    monkeypatch.setattr(hb, "MAX_REFUSAL_DRAIN_BYTES", hb.MAX_READ_CHUNK_BYTES + 3)
+    service._worker()
+    assert service.requests == 0
+    assert events == ["eof", hb.MAX_READ_CHUNK_BYTES, 3, "close"]
+
+
+def test_refusal_discard_has_an_absolute_deadline(monkeypatch):
+    now = iter((0, hb.IO_TIMEOUT_SECONDS + 1))
+    monkeypatch.setattr(hb.time, "monotonic", lambda: next(now))
+    class Connection:
+        def shutdown(self, direction):
+            assert direction == socket.SHUT_WR
+        def recv(self, size):
+            pytest.fail("expired refusal must not read")
+    # The helper needs no service state or listener.
+    hb.Service._discard(None, Connection())
+
+
 def test_stream_response_cap_is_checked_before_join(monkeypatch):
     monkeypatch.setattr(hb, "MAX_RESPONSE_BYTES", 200)
     with pytest.raises(hb.InvalidRequest):

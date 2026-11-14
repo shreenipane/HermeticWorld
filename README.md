@@ -41,6 +41,11 @@ If a derived document disagrees with the specification, the specification wins. 
 
 ## Platform
 
+The optional [Mode H host harness](python/hermetic_agent/README.md) runs the
+pinned agent through execd and the [policy gateway](crates/hermetic-gateway/README.md).
+The gateway also supports a Chat Completions upstream. Its offline adapter
+tests run in the normal gates; the VM smoke remains owner-run.
+
 - Linux x86_64 with KVM and Firecracker microVMs (aarch64 later).
 - Core in **Rust**. The Harbor bridge, package resolvers, test rewriting and classifier are in **Python**.
 - Phases 0–1 need no VMs and run in containers. Phase 3 onwards needs KVM, either bare metal or EC2 with nested virtualization.

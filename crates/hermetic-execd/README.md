@@ -142,10 +142,18 @@ The initial argv concatenates entrypoint and command. Empty arrays start no
 initial process. The initial child is supervised and its output is drained and
 discarded so it cannot block or consume a logging budget. It is not restarted.
 RPC exec supplies a complete argv, using the same environment, cwd, credentials
-and resource declarations each time. Programs must be absolute regular files
-and all path components must be symlink-free; no PATH search, shell expansion,
-passwd/group lookup or inherited environment is used. Resolve `/bin/sh` or other
-symlink aliases to their actual regular paths in the sealed image/spec.
+and resource declarations each time. Programs must be absolute regular files.
+The `/bin/bash` shell is pinned from the sealed base before overlay assembly on
+both first boot and trusted-initramfs reboot. Its image symlinks (including
+`/bin -> usr/bin` and absolute targets) resolve inside that held root with
+`openat2(IN_ROOT | NO_MAGICLINKS | NO_XDEV)`; mounted runtime filesystems cannot
+supply the shell. Kernel `PATH_MAX` (4096 bytes) and
+`MAXSYMLINKS` (40 traversals) bound resolution. Only a regular inode on local
+guest storage is opened for reading, through its pinned descriptor; absent or
+invalid base shells fail closed when requested, without an overlay fallback.
+Every other program path and all cwd/upload/download paths remain symlink-free.
+No PATH search, shell expansion, passwd/group lookup or inherited environment
+is used. Resolve `/bin/sh` or other aliases to their regular image/spec paths.
 
 The same pinned trusted execd executable launches a child helper. Pinned
 cwd/executable descriptors and a bounded startup channel cross into it; the

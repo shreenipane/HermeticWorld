@@ -582,7 +582,7 @@ def run(argv=None):
     parser.add_argument("work", nargs="?")
     parser.add_argument("--sealcheck", default=os.environ.get("HERMETIC_SEALCHECK_BIN"))
     args = parser.parse_args(argv)
-    if not re.fullmatch(r"[A-Za-z0-9_.]+__[A-Za-z0-9_.-]+-[0-9]{1,12}", args.instance) or len(args.instance) > 200:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9]{1,12}", args.instance) or len(args.instance) > 200:
         raise SealError("invalid_instance_id")
     fixture = TOP / "scripts/integration/fixtures/swebench" / (args.instance + ".json")
     raw, row, digest = load_record(fixture, args.instance, fixture.with_suffix(".source.json"))

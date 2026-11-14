@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, UpstreamProtocol};
 use crate::error::GatewayError;
 use std::error::Error;
 use std::io::Read;
@@ -24,11 +24,25 @@ pub struct UpstreamClient {
     config: Arc<GatewayConfig>,
 }
 
+/// A sent Chat request must either report usage or transfer that duty to its stream.
+struct UnverifiedChatUsage(Option<Arc<crate::quota::QuotaTracker>>);
+
+impl Drop for UnverifiedChatUsage {
+    fn drop(&mut self) {
+        if let Some(quota) = &self.0 {
+            if !quota.is_limit_exceeded() {
+                quota.trigger_limit_exceeded("Unverifiable upstream token usage".into());
+            }
+        }
+    }
+}
+
 impl UpstreamClient {
     pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB limit
     /// A non-2xx body is only inspected for its error type and is never forwarded, so far
     /// less of it is read (bounds memory per in-flight request).
     pub const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
+    pub const MAX_CHAT_TOTAL_SECONDS: u64 = 300;
 
     pub fn new(config: Arc<GatewayConfig>) -> Self {
         let agent = ureq::AgentBuilder::new()
@@ -49,42 +63,104 @@ impl UpstreamClient {
         beta_header: Option<&str>,
         is_streaming: bool,
         overall_timeout: Option<std::time::Duration>,
+        accounting: Option<(
+            Arc<crate::response::StreamSlotGuard>,
+            Arc<crate::quota::QuotaTracker>,
+        )>,
     ) -> Result<UpstreamResponse, GatewayError> {
+        let openai = self.config.upstream_protocol == UpstreamProtocol::OpenaiChat;
+        let (endpoint, rebuilt_json) = if openai {
+            crate::openai::validate_base_url(&self.config.upstream_base_url)
+                .map_err(GatewayError::InvalidRequest)?;
+            crate::openai::request(rebuilt_json, endpoint)?
+        } else {
+            (endpoint.to_string(), rebuilt_json.to_string())
+        };
+        let model = serde_json::from_str::<serde_json::Value>(&rebuilt_json)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|v| v.as_str()).map(str::to_owned))
+            .ok_or_else(|| GatewayError::InvalidRequest("Missing pinned model".into()))?;
         let url = format!(
             "{}{}",
             self.config.upstream_base_url.trim_end_matches('/'),
             endpoint
         );
-
         let mut req = self
             .agent
             .post(&url)
-            .set("x-api-key", self.config.api_key())
-            .set("anthropic-version", &self.config.anthropic_version)
             .set("content-type", "application/json");
+        if openai {
+            req = req.set(
+                "authorization",
+                &format!("Bearer {}", self.config.api_key()),
+            );
+        } else {
+            req = req
+                .set("x-api-key", self.config.api_key())
+                .set("anthropic-version", &self.config.anthropic_version);
+        }
 
         if let Some(betas) = beta_header {
-            if !betas.trim().is_empty() {
+            if !openai && !betas.trim().is_empty() {
                 req = req.set("anthropic-beta", betas);
             }
         }
 
         // Overall deadline (connect, send and the whole response body), e.g. the time left
         // under the wall-time quota.
+        let overall_timeout = if openai {
+            let cap = std::time::Duration::from_secs(Self::MAX_CHAT_TOTAL_SECONDS);
+            Some(overall_timeout.unwrap_or(cap).min(cap))
+        } else {
+            overall_timeout
+        };
         if let Some(t) = overall_timeout {
             req = req.timeout(t);
         }
 
-        let call_res = req.send_string(rebuilt_json);
+        let mut unverified = UnverifiedChatUsage(if openai {
+            accounting.as_ref().map(|(_, quota)| quota.clone())
+        } else {
+            None
+        });
+        let call_res = req.send_string(&rebuilt_json);
 
         match call_res {
             Ok(resp) => {
                 let status = resp.status();
+                if !(200..300).contains(&status) {
+                    unverified.0 = None;
+                }
                 let mut headers = Vec::new();
                 for h_name in resp.headers_names() {
                     if let Some(val) = resp.header(&h_name) {
                         headers.push((h_name, val.to_string()));
                     }
+                }
+
+                if openai && (200..300).contains(&status) {
+                    if headers.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-encoding") && value != "identity"
+                    }) {
+                        return Err(GatewayError::UpstreamError(
+                            "Encoded upstream response refused".into(),
+                        ));
+                    }
+                    headers.retain(|(name, _)| {
+                        !matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "content-type" | "content-length" | "content-encoding"
+                        )
+                    });
+                    headers.push((
+                        "content-type".into(),
+                        if is_streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        }
+                        .into(),
+                    ));
                 }
 
                 // Only a 2xx response may be streamed; anything else (with redirects off, a
@@ -93,7 +169,18 @@ impl UpstreamClient {
                     Ok(UpstreamResponse::Stream {
                         status,
                         headers,
-                        reader: resp.into_reader(),
+                        reader: if openai {
+                            let reader = crate::openai::SseReader::new(resp.into_reader(), model);
+                            let reader = if let Some((slot, quota)) = accounting {
+                                reader.with_accounting(slot, quota)
+                            } else {
+                                reader
+                            };
+                            unverified.0 = None;
+                            Box::new(reader)
+                        } else {
+                            resp.into_reader()
+                        },
                     })
                 } else {
                     let cap = if (200..300).contains(&status) {
@@ -104,10 +191,8 @@ impl UpstreamClient {
                     // Read at most cap + 1 bytes: more than the cap is refused, never cut.
                     let mut reader = resp.into_reader().take(cap as u64 + 1);
                     let mut raw = Vec::new();
-                    if let Err(e) = reader.read_to_end(&mut raw) {
-                        return Err(GatewayError::UpstreamTimeout(format!(
-                            "Upstream read timed out: {e}"
-                        )));
+                    if reader.read_to_end(&mut raw).is_err() {
+                        return Err(GatewayError::UpstreamTimeout("Upstream read failed".into()));
                     }
                     if raw.len() > cap {
                         if (200..300).contains(&status) {
@@ -126,6 +211,30 @@ impl UpstreamClient {
                     } else {
                         String::from_utf8_lossy(&raw).into_owned()
                     };
+                    let body = if openai && (200..300).contains(&status) {
+                        // Usage is independent of the generated content's validity. Even an
+                        // invalid/truncated tool argument consumed tokens and must be charged.
+                        match crate::openai::reported_usage(&body) {
+                            Ok((input, output)) => {
+                                if let Some((slot, _)) = &accounting {
+                                    slot.set_usage(input, output);
+                                    let _ = slot.check_live(0);
+                                }
+                                unverified.0 = None;
+                            }
+                            Err(error) => {
+                                if let Some((_, quota)) = &accounting {
+                                    quota.trigger_limit_exceeded(
+                                        "Unverifiable upstream token usage".into(),
+                                    );
+                                }
+                                return Err(error);
+                            }
+                        }
+                        crate::openai::response(&body, &model)?
+                    } else {
+                        body
+                    };
                     Ok(UpstreamResponse::Body {
                         status,
                         headers,
@@ -134,6 +243,7 @@ impl UpstreamClient {
                 }
             }
             Err(ureq::Error::Status(status, resp)) => {
+                unverified.0 = None;
                 let mut headers = Vec::new();
                 for h_name in resp.headers_names() {
                     if let Some(val) = resp.header(&h_name) {
@@ -156,22 +266,22 @@ impl UpstreamClient {
                         e.source().and_then(|s| s.downcast_ref::<std::io::Error>())
                     {
                         if io_err.kind() == std::io::ErrorKind::TimedOut {
-                            return Err(GatewayError::UpstreamTimeout(format!(
-                                "Upstream transport timed out: {err_str}"
-                            )));
+                            return Err(GatewayError::UpstreamTimeout(
+                                "Upstream transport timed out".into(),
+                            ));
                         }
                     }
                 }
                 if err_str.to_lowercase().contains("timed out")
                     || err_str.to_lowercase().contains("timeout")
                 {
-                    return Err(GatewayError::UpstreamTimeout(format!(
-                        "Upstream transport timed out: {err_str}"
-                    )));
+                    return Err(GatewayError::UpstreamTimeout(
+                        "Upstream transport timed out".into(),
+                    ));
                 }
-                Err(GatewayError::UpstreamError(format!(
-                    "Upstream transport error: {err_str}"
-                )))
+                Err(GatewayError::UpstreamError(
+                    "Upstream transport failed".into(),
+                ))
             }
         }
     }

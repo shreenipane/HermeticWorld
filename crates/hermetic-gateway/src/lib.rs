@@ -7,6 +7,7 @@ pub mod fsutil;
 pub mod history;
 pub mod log;
 pub mod nonce;
+pub mod openai;
 pub mod quota;
 pub mod response;
 pub mod server;

@@ -16,7 +16,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
@@ -44,20 +44,7 @@ fn invalid(msg: String) -> io::Error {
 /// Reads a regular file (leaf symlinks, FIFOs, devices and sockets refused) of at most `cap`
 /// bytes.
 pub fn read_regular_file_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(flags::O_NOFOLLOW | O_NONBLOCK)
-        .open(path)
-        .map_err(|e| {
-            invalid(format!(
-                "cannot open {} as a regular file without following symlinks: {e}",
-                path.display()
-            ))
-        })?;
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(invalid(format!("{} is not a regular file", path.display())));
-    }
+    let (file, meta) = open_input(path)?;
     if meta.len() > cap {
         return Err(invalid(format!(
             "{} is larger than the {cap}-byte limit",
@@ -73,6 +60,79 @@ pub fn read_regular_file_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
         )));
     }
     Ok(buf)
+}
+
+/// Reads a secret only when its pinned inode has exactly owner read/write permissions.
+pub fn read_secret_file_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_input(path)?;
+    if meta.permissions().mode() & 0o7777 != 0o600 || meta.len() > cap {
+        return Err(invalid(
+            "secret file requires mode 0600 and bounded size".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(invalid("secret file exceeds byte cap".into()));
+    }
+    Ok(bytes)
+}
+
+fn open_input(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    const MAX_PATH_COMPONENTS: usize = 256;
+    const O_PATH: i32 = 0o10000000;
+    if path.as_os_str().len() > 4096 {
+        return Err(invalid("input path too long".into()));
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags::O_DIRECTORY | flags::O_NOFOLLOW)
+        .open(if path.is_absolute() { "/" } else { "." })?;
+    let mut parts = path.components().peekable();
+    let mut count = 0usize;
+    while let Some(part) = parts.next() {
+        count = count.saturating_add(1);
+        if count > MAX_PATH_COMPONENTS {
+            return Err(invalid("input path too deep".into()));
+        }
+        let name = match part {
+            Component::Normal(name) => name,
+            Component::RootDir | Component::CurDir => continue,
+            _ => return Err(invalid("invalid input path".into())),
+        };
+        let entry = fd_path(&directory, name);
+        let before = std::fs::symlink_metadata(&entry)?;
+        if parts.peek().is_some() {
+            if !before.is_dir() {
+                return Err(invalid("unsafe input directory".into()));
+            }
+            let next = open_dir_at(&directory, name)?;
+            let after = next.metadata()?;
+            if before.dev() != after.dev() || before.ino() != after.ino() {
+                return Err(invalid("input directory changed".into()));
+            }
+            directory = next;
+        } else {
+            if !before.is_file() {
+                return Err(invalid("input is not a regular file".into()));
+            }
+            // O_PATH pins without opening a device if the name is raced after lstat.
+            let pinned = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_PATH | flags::O_NOFOLLOW)
+                .open(entry)?;
+            let after = pinned.metadata()?;
+            if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
+                return Err(invalid("input file changed".into()));
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
+            return Ok((file, after));
+        }
+    }
+    Err(invalid("input requires a file name".into()))
 }
 
 fn fd_path(dir: &File, name: &std::ffi::OsStr) -> PathBuf {

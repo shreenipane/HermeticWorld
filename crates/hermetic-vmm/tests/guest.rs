@@ -755,6 +755,103 @@ fn guest_early_or_truncated_reply_is_a_protocol_error() {
     assert!(matches!(reply, Err(Error::Protocol)));
 }
 
+#[cfg(feature = "dev-unjailed")]
+#[path = "support/agent_h.rs"]
+mod agent_h_diagnostics;
+
+#[cfg(feature = "dev-unjailed")]
+#[test]
+fn agent_h_failure_report_caps_each_stream_without_utf8_expansion() {
+    let mut output = Vec::new();
+    agent_h_diagnostics::report(
+        (b"execd 1700000000 Io\n".to_vec(), b"VMM failure\n".to_vec()),
+        &mut output,
+    );
+    assert_eq!(output, b"agent VM failure: serial:\nexecd 1700000000 Io\n\nagent VM failure: stderr:\nVMM failure\n\n");
+    output.clear();
+    let cap = hermetic_vmm::runner::MAX_CAPTURE_BYTES;
+    agent_h_diagnostics::report((vec![0xff; cap + 1], vec![b'e'; cap + 1]), &mut output);
+    assert_eq!(
+        output.len(),
+        2 * cap + b"agent VM failure: serial:\n\nagent VM failure: stderr:\n\n".len()
+    );
+    assert_eq!(output.iter().filter(|b| **b == 0xff).count(), cap);
+}
+
+#[cfg(feature = "dev-unjailed")]
+#[test]
+fn agent_h_status_rejects_hostile_fields_without_panics() {
+    for bad in [
+        serde_json::json!(null),
+        serde_json::json!([]),
+        serde_json::json!({"type":"status"}),
+        serde_json::json!({"type":"status","guest_time_unix":"secret"}),
+        serde_json::json!({"type":"status","guest_time_unix":i64::MIN}),
+        serde_json::json!({"type":"status","guest_time_unix":1700000020}),
+        serde_json::json!({"type":"error","guest_time_unix":1700000000}),
+    ] {
+        assert_eq!(
+            agent_h_diagnostics::status(&bad, 1700000000),
+            Err(Error::Protocol)
+        );
+    }
+    assert_eq!(
+        agent_h_diagnostics::status(
+            &serde_json::json!({"type":"status","guest_time_unix":1700000000}),
+            1700000000
+        ),
+        Ok(())
+    );
+}
+
+#[cfg(feature = "dev-unjailed")]
+#[test]
+fn agent_h_overlay_uses_pinned_config_instead_of_host_defaults() {
+    let command = agent_h_diagnostics::overlay_command(1700000000);
+    let settings: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+    let path = settings
+        .get(std::ffi::OsStr::new("MKE2FS_CONFIG"))
+        .and_then(|v| *v)
+        .unwrap();
+    assert_eq!(
+        path,
+        std::ffi::OsStr::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../python/hermetic_slice/data/mke2fs-hermetic.conf"
+        ))
+    );
+    assert_eq!(settings.len(), 5);
+    assert_eq!(
+        settings.get(std::ffi::OsStr::new("E2FSPROGS_FAKE_TIME")),
+        Some(&Some(std::ffi::OsStr::new("1700000000")))
+    );
+}
+
+#[cfg(feature = "dev-unjailed")]
+#[test]
+fn agent_h_diagnostics_preserve_success_errors_and_panics() {
+    let mut vm = Vmm::new(
+        support::spec(hermetic_vmm::spec::Role::Agent)
+            .validate()
+            .unwrap(),
+        hermetic_vmm::runner::DevUnjailed::default(),
+    );
+    assert_eq!(
+        agent_h_diagnostics::run(&mut vm, |_| Ok::<_, Error>(7)),
+        Ok(7)
+    );
+    assert_eq!(
+        agent_h_diagnostics::run(&mut vm, |_| Err::<(), _>(Error::Protocol)),
+        Err(Error::Protocol)
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ =
+            agent_h_diagnostics::run(&mut vm, |_| -> Result<()> { panic!("readiness deadline") });
+    }))
+    .unwrap_err();
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"readiness deadline"));
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LockdownRecord {

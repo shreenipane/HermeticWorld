@@ -34,6 +34,8 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_FIELDS = 64
 MAX_CHUNKS = 8192
 MAX_CHUNK_LINE_BYTES = 128
+MAX_REFUSAL_DRAIN_BYTES = (MAX_REQUEST_LINE_BYTES + MAX_HEADER_BYTES + MAX_BODY_BYTES
+                           + MAX_CHUNKS * (MAX_CHUNK_LINE_BYTES + 2))
 MAX_READ_CHUNK_BYTES = 65536
 MAX_STREAM_RECORDS = 1000
 MAX_REDIRECTS = 20
@@ -529,6 +531,25 @@ class Service:
         for worker in self.workers:
             worker.join(IO_TIMEOUT_SECONDS + MAX_DELAY_SECONDS + ACCEPT_POLL_SECONDS)
 
+    def _discard(self, connection):
+        # Send EOF first, then consume bounded unread input so a refused request
+        # does not turn a normal client half-close into a connection reset.
+        deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        remaining = MAX_REFUSAL_DRAIN_BYTES
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            while remaining:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                connection.settimeout(left)
+                data = connection.recv(min(remaining, MAX_READ_CHUNK_BYTES))
+                if not data:
+                    return
+                remaining -= len(data)
+        except OSError:
+            pass
+
     def _worker(self):
         while not self.stopping.is_set() and time.monotonic() < self.deadline:
             try:
@@ -539,9 +560,12 @@ class Service:
                 return
             with connection:
                 with self.lock:
-                    if self.requests >= MAX_REQUESTS:
-                        return
-                    self.requests += 1
+                    exhausted = self.requests >= MAX_REQUESTS
+                    if not exhausted:
+                        self.requests += 1
+                if exhausted:
+                    self._discard(connection)
+                    return
                 reader = _Reader(connection)
                 try:
                     method, target, headers, body = reader.request()

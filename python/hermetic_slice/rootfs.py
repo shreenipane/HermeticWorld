@@ -452,12 +452,12 @@ class TreeScan:
     dir_blocks: int = 0
 
 
-def make_tarinfo(name: str, st: os.stat_result, mtime_ceiling: int) -> tarfile.TarInfo:
+def make_tarinfo(name: str, st: os.stat_result, mtime_ceiling: int, *, root_owned: bool = False) -> tarfile.TarInfo:
     """Tar header fields from the SOURCE inode: numeric uid/gid, full permission bits, clamped mtime."""
     info = tarfile.TarInfo(name)
     info.mode = stat.S_IMODE(st.st_mode)
-    info.uid = st.st_uid
-    info.gid = st.st_gid
+    info.uid = 0 if root_owned else st.st_uid
+    info.gid = 0 if root_owned else st.st_gid
     info.uname = ""
     info.gname = ""
     info.mtime = max(0, min(int(st.st_mtime), mtime_ceiling))
@@ -675,6 +675,7 @@ def write_rootfs_tar(
     limits: RootfsLimits | None = None,
     dir_fd: int | None = None,
     substrate_files: dict[str, bytes] | None = None,
+    root_owned: bool = False,
 ) -> TreeScan:
     """Walk src (never following symlinks) and write the cleaned tree as a deterministic tar.
 
@@ -682,6 +683,8 @@ def write_rootfs_tar(
     The tar file is created exclusively with mode 0600; free space on its filesystem is checked
     before and while writing.
     """
+    if type(root_owned) is not bool:
+        raise ValueError("root_owned must be boolean")
     limits = limits or RootfsLimits.from_env()
     scan = TreeScan(removed=[], skipped_special=[])
     guard = _SpaceGuard(dir_fd if dir_fd is not None else Path(tar_path).parent)
@@ -707,7 +710,7 @@ def write_rootfs_tar(
         with os.fdopen(out_fd, "wb") as raw:
             with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tf:
                 root_st = os.fstat(root_fd)
-                root_info = make_tarinfo(".", root_st, mtime_ceiling)
+                root_info = make_tarinfo(".", root_st, mtime_ceiling, root_owned=root_owned)
                 root_info.type = tarfile.DIRTYPE
                 tf.addfile(root_info)
                 stack.append(_Frame(root_fd, (), _list_directory(root_fd, "", scan, limits)))
@@ -757,7 +760,7 @@ def write_rootfs_tar(
                             opened = os.fstat(child_fd)
                             if not stat.S_ISDIR(opened.st_mode) or not _same_inode(listed, opened):
                                 raise SourceChangedError(f"Source directory changed during build: {rel}")
-                            info = make_tarinfo(rel, opened, mtime_ceiling)
+                            info = make_tarinfo(rel, opened, mtime_ceiling, root_owned=root_owned)
                             info.type = tarfile.DIRTYPE
                             guard.reserve(tarfile.BLOCKSIZE * 2)
                             tf.addfile(info)
@@ -772,7 +775,7 @@ def write_rootfs_tar(
                             target = os.readlink(name, dir_fd=frame.fd)
                         except OSError as exc:
                             raise SourceChangedError(f"Source symlink changed during build: {rel}") from exc
-                        info = make_tarinfo(rel, listed, mtime_ceiling)
+                        info = make_tarinfo(rel, listed, mtime_ceiling, root_owned=root_owned)
                         info.type = tarfile.SYMTYPE
                         info.linkname = target
                         guard.reserve(tarfile.BLOCKSIZE * 3)
@@ -781,7 +784,7 @@ def write_rootfs_tar(
                         if len(os.fsencode(target)) >= 60:
                             scan.symlink_blocks += 1
                     elif stat.S_ISREG(mode):
-                        _add_regular(tf, frame.fd, name, rel, listed, mtime_ceiling, limits, scan, guard, hardlink_first)
+                        _add_regular(tf, frame.fd, name, rel, listed, mtime_ceiling, limits, scan, guard, hardlink_first, root_owned)
                     else:
                         scan.skipped_special.append(rel)
                 if substrate_files:
@@ -836,6 +839,7 @@ def _add_regular(
     scan: TreeScan,
     guard: _SpaceGuard,
     hardlink_first: dict[tuple[int, int], str],
+    root_owned: bool = False,
 ) -> None:
     try:
         fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=dir_fd)
@@ -849,7 +853,7 @@ def _add_regular(
             raise SourceChangedError(f"Source file changed during build: {rel}")
         key = (opened.st_dev, opened.st_ino)
         if opened.st_nlink > 1 and key in hardlink_first:
-            info = make_tarinfo(rel, opened, mtime_ceiling)
+            info = make_tarinfo(rel, opened, mtime_ceiling, root_owned=root_owned)
             info.type = tarfile.LNKTYPE
             info.linkname = hardlink_first[key]
             guard.reserve(tarfile.BLOCKSIZE * 3)
@@ -871,7 +875,7 @@ def _add_regular(
                 f"Source tree data exceeds {limits.max_bytes} bytes (at {rel}); "
                 f"raise {ENV_MAX_BYTES} if this is intended"
             )
-        info = make_tarinfo(rel, opened, mtime_ceiling)
+        info = make_tarinfo(rel, opened, mtime_ceiling, root_owned=root_owned)
         info.type = tarfile.REGTYPE
         if segments == [(0, size)] or size == 0:
             info.size = size
@@ -1147,6 +1151,7 @@ def build_rootfs(
     kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
     kernel_image: Path | None = None,
     clockprobe_bin: Path | None = None,
+    root_owned: bool = False,
 ) -> dict:
     """Build a reproducible ext4 root filesystem image with D4 guard.
 
@@ -1166,11 +1171,14 @@ def build_rootfs(
         kernel_lock: Validated kernel lock supplying sealed release-date metadata.
         kernel_image: Optional matching kernel image for exact substrate dates.
         clockprobe_bin: Offline date extractor; required with kernel_image.
+        root_owned: Emit uid/gid 0 for trees staged by an unprivileged converter.
 
     Returns:
         dict containing build metadata and verification result.
     """
     substrate = kernel_substrate_files(kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
+    if type(root_owned) is not bool:
+        raise ValueError("root_owned must be boolean")
     src = Path(src)
     if not src.is_dir():
         raise FileNotFoundError(f"Source directory does not exist or is not a directory: {src}")
@@ -1236,6 +1244,7 @@ def build_rootfs(
         scan = write_rootfs_tar(
             src_fd, "rootfs.tar", mtime_ceiling=source_date_epoch, limits=limits, dir_fd=work_fd,
             substrate_files=substrate,
+            root_owned=root_owned,
         )
         tar_fd = os.open("rootfs.tar", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=work_fd)
 
