@@ -636,7 +636,9 @@ fn parse_ymd(date: &str) -> Option<(i32, u32, u32)> {
     }
     let num = |r: std::ops::Range<usize>| -> Option<u32> {
         let s = date.get(r)?;
-        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())?
     };
     let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let y = i32::try_from(y).ok()?;
@@ -665,7 +667,10 @@ pub fn parse_substrate_dates(text: &str) -> Option<std::collections::BTreeSet<(i
 /// sealed list. Pure parsing: no probe runs.
 pub fn extract_substrate_dates(image: &[u8]) -> Option<String> {
     let mut dates = std::collections::BTreeSet::new();
-    for run in image.split(|b| !(0x20..0x7f).contains(b)).filter(|r| r.len() >= 8) {
+    for run in image
+        .split(|b| !(0x20..0x7f).contains(b))
+        .filter(|r| r.len() >= 8)
+    {
         let text = std::str::from_utf8(run).ok()?;
         for date in find_all_dates(text) {
             dates.insert(date);
@@ -677,7 +682,12 @@ pub fn extract_substrate_dates(image: &[u8]) -> Option<String> {
     if dates.is_empty() {
         return None;
     }
-    Some(dates.iter().map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}\n")).collect())
+    Some(
+        dates
+            .iter()
+            .map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}\n"))
+            .collect(),
+    )
 }
 
 /// As `classify_dmesg_dates`, with the sealed list of dates the substrate itself

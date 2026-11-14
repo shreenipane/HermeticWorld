@@ -515,7 +515,9 @@ fn tsc_early_khz_is_vmm_owned_and_bounded() {
     let boot = reqs.iter().find(|r| r.path == "/boot-source").unwrap();
     let args = boot.body["boot_args"].as_str().unwrap();
     validate_boot_args(args).unwrap();
-    assert!(reqs.iter().all(|r| !r.body.to_string().contains("tsc_early_khz")));
+    assert!(reqs
+        .iter()
+        .all(|r| !r.body.to_string().contains("tsc_early_khz")));
 }
 
 #[test]

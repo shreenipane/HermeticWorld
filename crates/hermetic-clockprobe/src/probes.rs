@@ -232,7 +232,14 @@ fn probe_log(
     let mut record = [0u8; MAX_KMSG_RECORD_BYTES];
     for _ in 0..MAX_KMSG_RECORDS {
         match file.read(&mut record) {
-            Ok(0) => return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, dates)),
+            Ok(0) => {
+                return Ok(classify::classify_dmesg_dates_with_substrate(
+                    Some(&log),
+                    false,
+                    expected,
+                    dates,
+                ))
+            }
             Ok(n) => {
                 if log.len().saturating_add(n) > MAX_DMESG_BYTES {
                     return Err(io::ErrorKind::InvalidData.into());
@@ -241,7 +248,12 @@ fn probe_log(
                 log.push_str(std::str::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData)?);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(classify::classify_dmesg_dates_with_substrate(Some(&log), false, expected, dates))
+                return Ok(classify::classify_dmesg_dates_with_substrate(
+                    Some(&log),
+                    false,
+                    expected,
+                    dates,
+                ))
             }
             Err(e) => return Err(e),
         }
@@ -276,7 +288,9 @@ fn probe_posix(_proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
         let tai = clock_seconds(CLOCK_TAI);
         let after = clock_seconds(CLOCK_BOOTTIME);
         if posix_sample_is_coherent(boot, after) {
-            return Ok(classify::classify_posix_clocks(rt, mono, boot, tai, expected));
+            return Ok(classify::classify_posix_clocks(
+                rt, mono, boot, tai, expected,
+            ));
         }
     }
     Ok(error("posix_clocks"))
