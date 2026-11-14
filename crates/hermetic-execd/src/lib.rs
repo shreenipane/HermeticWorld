@@ -86,6 +86,7 @@ pub const MAX_DRAIN_READS: usize = 16;
 pub const IO_BUFFER: usize = 8192;
 pub const MAX_FINAL_DRAIN_READS: usize = MAX_COMMAND_OUTPUT / IO_BUFFER + MAX_DRAIN_READS;
 pub const FRAME_TIMEOUT_MS: u64 = 5000;
+pub const REPLY_LINGER_MS: u64 = 1000;
 pub const VSOCK_PORT: u32 = 5000;
 
 pub fn read_capped(reader: impl std::io::Read, cap: usize) -> Result<Vec<u8>> {

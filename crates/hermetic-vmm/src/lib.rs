@@ -3,6 +3,7 @@
 pub mod api;
 pub mod fs;
 pub mod lifecycle;
+pub mod pin;
 pub mod plan;
 pub mod runner;
 pub mod spec;

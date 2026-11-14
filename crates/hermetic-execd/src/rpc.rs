@@ -100,8 +100,14 @@ pub fn write_frame(value: &impl Serialize, writer: &mut impl Write) -> Result<()
     Ok(())
 }
 
+pub trait Connection: Read + Write {
+    /// After the complete frame is flushed, wait for peer consumption or a
+    /// bounded transport linger before the VM can power off.
+    fn drain_reply(&mut self) -> std::io::Result<()>;
+}
+
 pub trait Listener {
-    type Stream: Read + Write;
+    type Stream: Connection;
     /// Nonblocking accept. Stream must enforce FRAME_TIMEOUT_MS for reads/writes.
     fn accept(&mut self) -> Result<Option<Self::Stream>>;
 }
@@ -187,12 +193,15 @@ impl<S: Sys> Server<S> {
     }
     /// One request per connection bounds both connection and command concurrency.
     /// Always power off after a shutdown attempt, even if the reply disconnects.
-    pub fn serve_one(&mut self, stream: &mut (impl Read + Write)) -> Result<()> {
+    pub fn serve_one(&mut self, stream: &mut impl Connection) -> Result<()> {
         let reply = read_frame::<Request>(stream)
             .and_then(|r| self.dispatch(r))
             .unwrap_or_else(|reason| Reply::Error { reason });
-        let written = write_frame(&reply, stream);
+        let mut written = write_frame(&reply, stream);
         if self.stopped {
+            if written.is_ok() {
+                written = stream.drain_reply().map_err(Error::from);
+            }
             self.sys.effect(Effect::PowerOff(Error::Shutdown))?;
         }
         written

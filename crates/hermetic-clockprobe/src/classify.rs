@@ -118,7 +118,7 @@ pub const MAX_ITEMS: usize = 512;
 pub const MAX_DATE_FINDINGS: usize = 5;
 pub const MAX_EPOCH: u64 = 253_402_300_799;
 pub const CLOCK_TOLERANCE_SECONDS: f64 = 60.0;
-pub const BASELINE_BRAND: &str = "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz";
+pub const BASELINE_BRAND: &str = crate::baseline::BRAND;
 
 pub fn parse_hermetic_t_from_cmdline(cmdline: &str) -> Option<u64> {
     if cmdline.len() > MAX_TEXT_BYTES {
@@ -222,19 +222,17 @@ pub fn classify_rdtsc(
         return ProbeRecord::new(
             "rdtsc",
             ProbeResult::Unavailable,
-            Some(format!("tsc={tsc_val}")),
+            None,
             "TSC frequency unknown; masking does not establish an isolated counter origin",
         );
     };
 
     let est_uptime_sec = (tsc_val as f64) / (hz as f64);
-    let val_str = format!("tsc={tsc_val},freq_hz={hz},est_uptime_sec={est_uptime_sec:.3}");
-
     if !guest_boottime_sec.is_some_and(|b| b.is_finite() && b >= 0.0) {
         return ProbeRecord::new(
             "rdtsc",
             ProbeResult::Unavailable,
-            Some(val_str),
+            None,
             "Guest uptime unavailable; cannot compare counter origins",
         );
     }
@@ -247,14 +245,14 @@ pub fn classify_rdtsc(
         ProbeRecord::new(
             "rdtsc",
             ProbeResult::Leak,
-            Some(val_str),
+            None,
             "TSC-estimated uptime exceeds guest VM uptime by >60s; counter origin may predate guest boot (not proof of host uptime)",
         )
     } else {
         ProbeRecord::new(
             "rdtsc",
             ProbeResult::Blocked,
-            Some(val_str),
+            None,
             "Sampled TSC counter age does not exceed guest uptime by the diagnostic tolerance",
         )
     }
@@ -277,19 +275,20 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
     }
 
     let mut leak_reasons: Vec<String> = Vec::new();
-    let mut hex_entries: Vec<String> = Vec::with_capacity(leaves.len());
 
     let max_basic = leaves
         .iter()
         .find(|leaf| leaf.leaf == 0 && leaf.subleaf == 0)
         .map(|leaf| leaf.eax);
     for leaf in leaves {
-        hex_entries.push(leaf.format_hex());
         if leaf.leaf < 0x4000_0000 && max_basic.is_some_and(|maximum| leaf.leaf > maximum) {
             continue;
         }
         match (leaf.leaf, leaf.subleaf) {
             (0x4000_0001, 0) => {
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 {
+                    leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
+                }
                 if (leaf.eax & (1 << 0)) != 0 {
                     leak_reasons.push("0x40000001:EAX[0] KVM_FEATURE_CLOCKSOURCE set".to_string());
                 }
@@ -300,27 +299,30 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                     leak_reasons.push("0x40000001:EAX[5] KVM_FEATURE_STEAL_TIME set".to_string());
                 }
             }
+            (0x4000_0000..=0x4000_0010, _)
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 =>
+            {
+                leak_reasons.push("Hypervisor/PV CPUID state exposed".into());
+            }
             (0x15, 0) => {
-                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 {
-                    leak_reasons.push("0x15 TSC crystal ratio leaf non-zero".to_string());
+                let actual = [leaf.eax, leaf.ebx, leaf.ecx, leaf.edx];
+                if actual != [0; 4] && Some(actual) != crate::baseline::registers(0x15, 0, 0, 1) {
+                    leak_reasons.push("0x15 differs from fixed guest TSC ratio".to_string());
                 }
             }
             (0x16, 0) => {
-                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 {
-                    leak_reasons.push("0x16 processor frequency leaf non-zero".to_string());
+                let actual = [leaf.eax, leaf.ebx, leaf.ecx, leaf.edx];
+                if actual != [0; 4] && Some(actual) != crate::baseline::registers(0x16, 0, 0, 1) {
+                    leak_reasons.push("0x16 differs from fixed guest frequency".to_string());
                 }
             }
             (0x1, 0) => {
-                // Baseline Broadwell-EP signature is 0x000406f1; newer server models (e.g. Skylake 0x5065x,
-                // Ice Lake 0x606ax, Sapphire Rapids 0x806fx, Emerald Rapids 0xc06fx) indicate newer host CPU.
-                let ext_model = (leaf.eax >> 16) & 0xF;
-                let model = (leaf.eax >> 4) & 0xF;
-                let full_model = (ext_model << 4) | model;
-                if leaf.eax != 0x0004_06f1 {
-                    leak_reasons.push(format!(
-                        "0x1:EAX model 0x{:02x} differs from Broadwell baseline signature",
-                        full_model
-                    ));
+                if leaf.ecx & (1 << 31) != 0 {
+                    leak_reasons.push("Hypervisor CPUID bit exposed".into());
+                }
+                // Family/model/stepping are fixed even on newer physical CPUs.
+                if leaf.eax != crate::baseline::SIGNATURE {
+                    leak_reasons.push("CPU signature differs from fixed baseline".into());
                 }
             }
             (0xa, 0) if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 => {
@@ -333,22 +335,8 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
                 leak_reasons.push("post-baseline structured feature subleaf exposed".into());
             }
             (0x7, 0) => {
-                const BASELINE_EBX: u32 = (1 << 0)
-                    | (1 << 1)
-                    | (1 << 3)
-                    | (1 << 5)
-                    | (1 << 7)
-                    | (1 << 8)
-                    | (1 << 9)
-                    | (1 << 10)
-                    | (1 << 18)
-                    | (1 << 19)
-                    | (1 << 20);
-                if leaf.eax != 0 || leaf.ecx != 0 || leaf.edx != 0 || leaf.ebx & !BASELINE_EBX != 0
-                {
-                    leak_reasons.push(
-                        "Structured features differ from the proposed baseline subset".into(),
-                    );
+                if leaf.eax != 0 || leaf.ebx != 0 || leaf.ecx != 0 || leaf.edx != 0 {
+                    leak_reasons.push("Structured features exceed the v2 profile".into());
                 }
                 if (leaf.ebx & (1 << 16)) != 0 {
                     leak_reasons.push("0x7:0:EBX[16] AVX512F exposed".to_string());
@@ -365,21 +353,15 @@ pub fn classify_cpuid(leaves: &[CpuidLeafDump], brand_string: Option<&str>) -> P
         leak_reasons.push("CPU brand differs from the fixed baseline".into());
     }
 
-    let dump_str = hex_entries.join(";");
     if leak_reasons.is_empty() {
         ProbeRecord::new(
             "cpuid",
             if brand_string.is_some() { ProbeResult::Blocked } else { ProbeResult::Unavailable },
-            Some(dump_str),
+            None,
             "No profile violation found in the supplied CPUID subset; unqueried inputs remain untested",
         )
     } else {
-        ProbeRecord::new(
-            "cpuid",
-            ProbeResult::Leak,
-            Some(dump_str),
-            leak_reasons.join("; "),
-        )
+        ProbeRecord::new("cpuid", ProbeResult::Leak, None, leak_reasons.join("; "))
     }
 }
 
@@ -414,7 +396,7 @@ pub fn classify_kvmclock_msr(
             return ProbeRecord::new(
                 "kvmclock_msr",
                 ProbeResult::Leak,
-                Some(format!("wall_clock_sec={sec}")),
+                None,
                 "A caller-supplied wall-clock page epoch was observed; it is not an RDMSR value",
             );
         }
@@ -506,7 +488,7 @@ pub fn classify_rtc_sysfs_dev(
         } else {
             ProbeResult::Blocked
         },
-        Some(format!("since_epoch={epoch}")),
+        None,
         "RTC date compared with configured epoch and guest uptime",
     )
 }
@@ -578,7 +560,7 @@ pub fn classify_proc_driver_rtc(
                 return ProbeRecord::new(
                     "proc_driver_rtc",
                     ProbeResult::Leak,
-                    Some(combined),
+                    None,
                     "RTC date diverges from the configured epoch and guest uptime",
                 );
             }
@@ -605,25 +587,17 @@ pub fn classify_hpet(
     available_clocksources: Option<&str>,
     clockevent_devices: &[String],
 ) -> ProbeRecord {
-    let mut leaks = Vec::new();
-    if dev_hpet_exists {
-        leaks.push("/dev/hpet exists".to_string());
-    }
-    if let Some(avail) = available_clocksources {
-        for cs in avail.split_whitespace() {
-            if matches!(cs, "hpet" | "acpi_pm" | "pit") {
-                leaks.push(format!("available_clocksource contains {cs}"));
-            }
-        }
-    }
-    for dev in clockevent_devices {
-        let lower = dev.trim().to_ascii_lowercase();
-        if lower.contains("hpet") || lower.contains("pit") {
-            leaks.push(format!("clockevent device {lower} present"));
-        }
-    }
-
-    if leaks.is_empty() {
+    let present = dev_hpet_exists
+        || available_clocksources.is_some_and(|avail| {
+            avail
+                .split_whitespace()
+                .any(|cs| matches!(cs, "hpet" | "acpi_pm" | "pit"))
+        })
+        || clockevent_devices.iter().any(|dev| {
+            let lower = dev.trim().to_ascii_lowercase();
+            lower.contains("hpet") || lower.contains("pit")
+        });
+    if !present {
         ProbeRecord::new(
             "hpet",
             ProbeResult::Blocked,
@@ -634,7 +608,7 @@ pub fn classify_hpet(
         ProbeRecord::new(
             "hpet",
             ProbeResult::Unavailable,
-            Some(leaks.join("; ")),
+            None,
             "Legacy timer present; presence alone establishes neither wall time nor counter origin",
         )
     }
@@ -646,6 +620,86 @@ pub fn classify_dmesg_dates(
     dmesg_text: Option<&str>,
     access_denied: bool,
     expected_t_clock: Option<u64>,
+) -> ProbeRecord {
+    classify_dmesg_dates_with_substrate(dmesg_text, access_denied, expected_t_clock, None)
+}
+
+/// Largest sealed substrate date list.
+pub const MAX_SUBSTRATE_DATES: usize = 4096;
+/// Largest substrate image scanned for its own dates.
+pub const MAX_SUBSTRATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn parse_ymd(date: &str) -> Option<(i32, u32, u32)> {
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u32> {
+        let s = date.get(r)?;
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())?
+    };
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let y = i32::try_from(y).ok()?;
+    ((1970..=9999).contains(&y) && valid_date(y, m, d)).then_some((y, m, d))
+}
+
+/// Parse the sealed substrate date list: one `YYYY-MM-DD` per line, strictly
+/// increasing, newline-terminated, non-empty and at most `MAX_SUBSTRATE_DATES`.
+pub fn parse_substrate_dates(text: &str) -> Option<std::collections::BTreeSet<(i32, u32, u32)>> {
+    let body = text.strip_suffix('\n')?;
+    let mut dates = std::collections::BTreeSet::new();
+    let mut last = None;
+    for line in body.split('\n') {
+        let date = parse_ymd(line)?;
+        if last.is_some_and(|prev| prev >= date) || dates.len() == MAX_SUBSTRATE_DATES {
+            return None;
+        }
+        dates.insert(date);
+        last = Some(date);
+    }
+    Some(dates)
+}
+
+/// Every calendar date the probe's own parser finds in a substrate image's
+/// printable strings (the guest kernel's banner and version strings), as the
+/// sealed list. Pure parsing: no probe runs.
+pub fn extract_substrate_dates(image: &[u8]) -> Option<String> {
+    let mut dates = std::collections::BTreeSet::new();
+    for run in image
+        .split(|b| !(0x20..0x7f).contains(b))
+        .filter(|r| r.len() >= 8)
+    {
+        let text = std::str::from_utf8(run).ok()?;
+        for date in find_all_dates(text) {
+            dates.insert(date);
+            if dates.len() > MAX_SUBSTRATE_DATES {
+                return None;
+            }
+        }
+    }
+    if dates.is_empty() {
+        return None;
+    }
+    Some(
+        dates
+            .iter()
+            .map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}\n"))
+            .collect(),
+    )
+}
+
+/// As `classify_dmesg_dates`, with the sealed list of dates the substrate itself
+/// contains (extracted from the guest kernel image at build time). The
+/// substrate is listed, not hidden: a kernel-log date that is exactly one of
+/// those strings only shows that the kernel exists. Any other date except
+/// T_clock is a leak; there is no blanket cutoff.
+pub fn classify_dmesg_dates_with_substrate(
+    dmesg_text: Option<&str>,
+    access_denied: bool,
+    expected_t_clock: Option<u64>,
+    substrate_dates: Option<&std::collections::BTreeSet<(i32, u32, u32)>>,
 ) -> ProbeRecord {
     if access_denied {
         return ProbeRecord::new(
@@ -668,27 +722,15 @@ pub fn classify_dmesg_dates(
     if text.len() > MAX_TEXT_BYTES {
         return ProbeRecord::new("dmesg_dates", ProbeResult::Error, None, "Text cap exceeded");
     }
-    let Some(expected_ymd) = expected_t_clock
+    let expected_ymd = expected_t_clock
         .filter(|t| *t <= MAX_EPOCH)
-        .map(unix_to_ymd)
-    else {
-        return ProbeRecord::new(
-            "dmesg_dates",
-            ProbeResult::Error,
-            None,
-            "Missing or invalid log reference epoch",
-        );
-    };
+        .map(unix_to_ymd);
     let mut suspicious_lines: Vec<String> = Vec::new();
 
     'lines: for raw_line in text.lines() {
-        // Strip /dev/kmsg prefix ("prio,seq,timestamp,-;message") if present
-        let msg = match raw_line.split_once(';') {
-            Some((_, after)) => after,
-            None => raw_line,
-        };
-
-        let Ok(dates) = find_dates_in_line(msg) else {
+        // The numeric kmsg header contains no calendar date. Scan the whole
+        // record so a semicolon in a plain message cannot hide earlier text.
+        let Ok(dates) = find_dates_in_line(raw_line) else {
             return ProbeRecord::new(
                 "dmesg_dates",
                 ProbeResult::Error,
@@ -697,10 +739,16 @@ pub fn classify_dmesg_dates(
             );
         };
         for (y, m, d) in dates {
-            let (ey, em, ed) = expected_ymd;
-            let found_days = ymd_to_days(y, m, d);
-            let exp_days = ymd_to_days(ey, em, ed);
-            let allowed = found_days.abs_diff(exp_days) <= 1;
+            let substrate = substrate_dates.is_some_and(|set| set.contains(&(y, m, d)));
+            let allowed = substrate
+                || match expected_ymd {
+                    Some((ey, em, ed)) => {
+                        let found_days = ymd_to_days(y, m, d);
+                        let exp_days = ymd_to_days(ey, em, ed);
+                        found_days.abs_diff(exp_days) <= 1
+                    }
+                    None => y == 1970 && m == 1 && d == 1,
+                };
             if !allowed {
                 suspicious_lines.push(format!("date={y:04}-{m:02}-{d:02}"));
                 if suspicious_lines.len() >= MAX_DATE_FINDINGS {
@@ -721,7 +769,7 @@ pub fn classify_dmesg_dates(
         ProbeRecord::new(
             "dmesg_dates",
             ProbeResult::Leak,
-            Some(suspicious_lines.join(" | ")),
+            None,
             "Kernel boot log contains dates outside T_clock tolerance; build dates need substrate triage",
         )
     }
@@ -747,24 +795,25 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
             "Available clocksources missing",
         );
     };
-    let val = format!("current={curr},available={avail}");
 
     if curr != "tsc" {
         return ProbeRecord::new(
             "clocksource_sysfs",
             ProbeResult::Leak,
-            Some(val),
-            format!("Expected current_clocksource=tsc, got {curr}"),
+            None,
+            "Current clocksource differs from fixed profile",
         );
     }
 
+    // The x86 kernel always registers the tick-based jiffies sources; they count
+    // guest timer interrupts and carry no host clock. Anything else is a leak.
     for cs in avail.split_whitespace() {
-        if cs != "tsc" {
+        if !matches!(cs, "tsc" | "refined-jiffies" | "jiffies") {
             return ProbeRecord::new(
                 "clocksource_sysfs",
                 ProbeResult::Leak,
-                Some(val),
-                format!("Forbidden clocksource '{cs}' listed in available_clocksource"),
+                None,
+                "Available clocksource differs from fixed profile",
             );
         }
     }
@@ -772,7 +821,7 @@ pub fn classify_clocksource_sysfs(current: Option<&str>, available: Option<&str>
     ProbeRecord::new(
         "clocksource_sysfs",
         ProbeResult::Blocked,
-        Some(val),
+        None,
         "Current and available clocksource names match the inspected profile",
     )
 }
@@ -812,26 +861,28 @@ pub fn classify_posix_clocks(
             "Missing or invalid hermetic.t reference",
         );
     };
-    let tai_text = tai
-        .map(|v| format!("{v:.3}"))
-        .unwrap_or_else(|| "unavailable".into());
-    let summary = format!("realtime={rt:.3},monotonic={mono:.3},boottime={boot:.3},tai={tai_text}");
+    let summary = if tai.is_some() {
+        "tai=available"
+    } else {
+        "tai=unavailable"
+    };
 
     let mut leaks = Vec::new();
 
-    if let Some(tai_val) = tai.filter(|v| (*v - rt).abs() > 5.0) {
-        leaks.push(format!(
-            "CLOCK_TAI - CLOCK_REALTIME offset ({:.1}s) differs from the fixed guest TAI-offset policy",
-            tai_val - rt
-        ));
+    // CLOCK_BOOTTIME includes suspend time while CLOCK_MONOTONIC does not.
+    // A monotonic age beyond boottime cannot have the guest's boot origin.
+    if mono - boot > CLOCK_TOLERANCE_SECONDS {
+        leaks.push("CLOCK_MONOTONIC exceeds guest boottime");
+    }
+
+    if tai.is_some_and(|v| (v - rt).abs() > 5.0) {
+        leaks.push("CLOCK_TAI offset differs from the fixed guest policy");
     }
 
     {
         let expected_rt = (t_clock as f64) + boot;
         if (rt - expected_rt).abs() > 60.0 {
-            leaks.push(format!(
-                "CLOCK_REALTIME ({rt:.1}s) differs from hermetic.t+boottime ({expected_rt:.1}s)"
-            ));
+            leaks.push("CLOCK_REALTIME differs from hermetic.t plus boottime");
         }
     }
 
@@ -839,14 +890,14 @@ pub fn classify_posix_clocks(
         ProbeRecord::new(
             "posix_clocks",
             if tai.is_some() { ProbeResult::Blocked } else { ProbeResult::Unavailable },
-            Some(summary),
+            Some(summary.into()),
             "Sampled clocks checked against the configured epoch; missing TAI prevents full coverage",
         )
     } else {
         ProbeRecord::new(
             "posix_clocks",
             ProbeResult::Leak,
-            Some(summary),
+            Some(summary.into()),
             leaks.join("; "),
         )
     }
@@ -858,33 +909,24 @@ pub fn classify_vmclock(
     ptp_clocks: &[(String, String)], // (device_name, clock_name)
     acpi_vmclock_nodes: &[String],
 ) -> ProbeRecord {
-    let mut leaks = Vec::new();
-    if !dev_vmclock_nodes.is_empty() {
-        leaks.push(format!("dev nodes: {}", dev_vmclock_nodes.join(",")));
-    }
-    for (dev, name) in ptp_clocks {
-        let lower = name.trim().to_ascii_lowercase();
-        if lower.contains("vmclock") || lower.contains("kvm") {
-            leaks.push(format!("PTP device {dev} bound to {lower}"));
-        }
-    }
-
-    if !leaks.is_empty() {
+    let present = !dev_vmclock_nodes.is_empty()
+        || ptp_clocks.iter().any(|(_, name)| {
+            let lower = name.trim().to_ascii_lowercase();
+            lower.contains("vmclock") || lower.contains("kvm")
+        });
+    if present {
         return ProbeRecord::new(
             "vmclock",
             ProbeResult::Unavailable,
-            Some(leaks.join("; ")),
+            None,
             "VMClock or PTP interface present; no timestamp or ABI validity read was performed",
         );
     }
 
     let detail = if acpi_vmclock_nodes.is_empty() {
-        "No /dev/vmclock*, PTP VMClock/KVM device, or VMClock ACPI node present".to_string()
+        "No /dev/vmclock*, PTP VMClock/KVM device, or VMClock ACPI node present"
     } else {
-        format!(
-            "ACPI firmware node(s) {:?} present without driver or /dev/vmclock* exposure",
-            acpi_vmclock_nodes
-        )
+        "ACPI firmware node present without driver or /dev/vmclock* exposure"
     };
 
     ProbeRecord::new("vmclock", ProbeResult::Blocked, None, detail)
@@ -897,59 +939,57 @@ pub fn classify_cpuinfo(content: Option<&str>) -> ProbeRecord {
             "cpuinfo",
             ProbeResult::Error,
             None,
-            "Missing or oversized CPU information",
+            "CPU information missing or over cap",
         );
     };
     let mut result = None;
-    for (index, section) in text
-        .split("\n\n")
-        .filter(|s| !s.trim().is_empty())
-        .enumerate()
-    {
-        if index >= MAX_ITEMS {
-            return ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "CPU item cap exceeded");
+    for section in text.split("\n\n").filter(|part| !part.trim().is_empty()) {
+        let record = classify_cpuinfo_section(Some(section));
+        if record.result == ProbeResult::Leak {
+            return record;
         }
-        let record = classify_cpuinfo_section(section);
-        if result.as_ref().is_none_or(|previous: &ProbeRecord| {
-            previous.result != ProbeResult::Leak
-                && (record.result != ProbeResult::Blocked
-                    || previous.result == ProbeResult::Blocked)
-        }) {
+        if result
+            .as_ref()
+            .is_none_or(|r: &ProbeRecord| r.result != ProbeResult::Error)
+        {
             result = Some(record);
         }
     }
     result.unwrap_or_else(|| {
-        ProbeRecord::new(
-            "cpuinfo",
-            ProbeResult::Error,
-            None,
-            "CPU information missing",
-        )
+        ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "CPU information empty")
     })
 }
 
-fn classify_cpuinfo_section(text: &str) -> ProbeRecord {
+fn classify_cpuinfo_section(content: Option<&str>) -> ProbeRecord {
+    let Some(text) = content else {
+        return ProbeRecord::new(
+            "cpuinfo",
+            ProbeResult::Error,
+            None,
+            "Failed to read /proc/cpuinfo",
+        );
+    };
+
+    if text.len() > MAX_TEXT_BYTES {
+        return ProbeRecord::new("cpuinfo", ProbeResult::Error, None, "Text cap exceeded");
+    }
     let mut model_name: Option<String> = None;
     let mut flags: Option<String> = None;
 
     for line in text.lines() {
         if let Some((k, v)) = line.split_once(':') {
-            match k.trim() {
-                "model name" if model_name.is_none() => {
-                    model_name = Some(v.trim().to_string());
-                }
-                "flags" if flags.is_none() => {
-                    flags = Some(v.trim().to_string());
-                }
-                "model name" | "flags" => {
-                    return ProbeRecord::new(
-                        "cpuinfo",
-                        ProbeResult::Error,
-                        None,
-                        "Duplicate CPU field",
-                    );
-                }
-                _ => {}
+            let slot = match k.trim() {
+                "model name" => &mut model_name,
+                "flags" => &mut flags,
+                _ => continue,
+            };
+            if slot.replace(v.trim().to_string()).is_some() {
+                return ProbeRecord::new(
+                    "cpuinfo",
+                    ProbeResult::Error,
+                    None,
+                    "Duplicate CPU identity field",
+                );
             }
         }
     }
@@ -966,7 +1006,7 @@ fn classify_cpuinfo_section(text: &str) -> ProbeRecord {
     let mut leaks = Vec::new();
     if let Some(ref model) = model_name {
         if model.trim() != BASELINE_BRAND {
-            leaks.push(format!("unmasked host model name: {model}"));
+            leaks.push("CPU model differs from fixed baseline");
         }
     }
 
@@ -995,82 +1035,68 @@ fn classify_cpuinfo_section(text: &str) -> ProbeRecord {
                 "fxsr",
                 "sse",
                 "sse2",
-                "ss",
                 "ht",
                 "syscall",
                 "nx",
-                "pdpe1gb",
-                "rdtscp",
                 "lm",
                 "constant_tsc",
+                "nonstop_tsc",
+                "tsc_reliable",
                 "rep_good",
                 "nopl",
                 "xtopology",
                 "cpuid",
                 "tsc_known_freq",
                 "pni",
-                "pclmulqdq",
                 "ssse3",
-                "fma",
                 "cx16",
-                "pcid",
                 "sse4_1",
                 "sse4_2",
-                "x2apic",
-                "movbe",
                 "popcnt",
-                "tsc_deadline_timer",
-                "aes",
-                "xsave",
-                "avx",
-                "f16c",
-                "rdrand",
-                "hypervisor",
                 "lahf_lm",
-                "abm",
-                "3dnowprefetch",
-                "fsgsbase",
-                "tsc_adjust",
-                "bmi1",
-                "avx2",
-                "smep",
-                "bmi2",
-                "erms",
-                "invpcid",
-                "rdseed",
-                "adx",
-                "smap",
-                "xsaveopt",
-                "arat",
-                "osxsave",
+                // KVM emulates CPUID faulting for every guest (MSR_PLATFORM_INFO).
+                "cpuid_fault",
+                // The template exposes no IA32_ARCH_CAPABILITIES (leaf 7 is zero), so
+                // the guest kernel always enables page-table isolation.
+                "pti",
             ];
             if !BASELINE_FLAGS.contains(&flag) {
-                leaks.push(format!("leaked flag: {flag}"));
+                leaks.push("CPU flag differs from fixed baseline");
+                break;
             }
         }
     }
-
-    let summary = format!(
-        "model={},flags={}",
-        model_name.as_deref().unwrap_or("<unknown>"),
-        flags.as_deref().unwrap_or("<unknown>")
-    );
 
     if leaks.is_empty() {
         ProbeRecord::new(
             "cpuinfo",
             ProbeResult::Blocked,
-            Some(summary),
+            None,
             "/proc/cpuinfo shows baseline CPU model and no kvmclock or post-cutoff ISA flags",
         )
     } else {
-        ProbeRecord::new(
-            "cpuinfo",
-            ProbeResult::Leak,
-            Some(summary),
-            leaks.join("; "),
-        )
+        ProbeRecord::new("cpuinfo", ProbeResult::Leak, None, leaks.join("; "))
     }
+}
+
+/// All dates in one printable run, by the same rules as the kernel-log scan;
+/// long runs are scanned in overlapping line-sized chunks.
+fn find_all_dates(text: &str) -> Vec<(i32, u32, u32)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + 256).min(chars.len());
+        let chunk: String = chars[start..end].iter().collect();
+        if let Ok(found) = find_dates_in_line(&chunk) {
+            out.extend(found);
+        }
+        if end == chars.len() {
+            break;
+        }
+        start += 224;
+    }
+    out
 }
 
 fn find_dates_in_line(line: &str) -> Result<Vec<(i32, u32, u32)>, ()> {
@@ -1101,7 +1127,7 @@ fn find_dates_in_line(line: &str) -> Result<Vec<(i32, u32, u32)>, ()> {
 
     // Match "Mon DD HH:MM:SS YYYY" or "Mon DD YYYY"
     let tokens: Vec<&str> = line
-        .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')'))
         .filter(|s| !s.is_empty())
         .collect();
     for idx in 0..tokens.len() {

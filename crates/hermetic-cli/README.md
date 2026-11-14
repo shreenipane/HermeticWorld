@@ -15,7 +15,7 @@ Strict, deterministic command-line front end and dispatch layer for **Hermetic W
 
 hermetic seal --src DIR --out DIR --t-clock RFC3339 --world-id ID [--seal-level strict|repo_only]
 hermetic verify-bundle DIR [--root sha256:HEX]
-hermetic probe --world DIR [--json]
+hermetic probe --world DIR [--clockprobe-output FILE] [--kernel-canary-serial FILE] [--json]
 hermetic run --world DIR --task ID --agent-mode H|G [--clock faked|hidden] [--json]
 hermetic verify --record FILE [--bundle DIR]
 hermetic --version

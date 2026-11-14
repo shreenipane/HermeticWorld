@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 use hermetic_sealcheck::fingerprint::build_tier2_idf;
+use hermetic_sealcheck::index::not_covered_for_version;
 use hermetic_sealcheck::scan::{scan_problem_statement, ScanOptions, Severity};
 use hermetic_sealcheck::tier2::{
     extract_unit_symbols_and_anchors, find_first_anchor, match_tier2_for_unit,
@@ -172,12 +173,15 @@ fn test_malformed_python_tolerated_no_panic() {
 }
 
 #[test]
-fn test_not_covered_includes_t2() {
+fn test_t2_coverage_follows_index_version() {
     assert!(
-        NOT_COVERED.contains(&"T2"),
-        "NOT_COVERED must contain 'T2': {:?}",
-        NOT_COVERED
+        !NOT_COVERED.contains(&"T2"),
+        "T2 must not be in the version-independent list: {NOT_COVERED:?}"
     );
+    assert!(!not_covered_for_version(5).contains(&"T2"));
+    for v in [2, 3, 4] {
+        assert!(not_covered_for_version(v).contains(&"T2"), "version {v}");
+    }
 }
 
 #[test]
@@ -936,4 +940,93 @@ fn t112_final_finding1_extraction_stops_at_budget_and_reports_truncation() {
     assert!(!small.truncated);
     assert!(small.symbols.contains("obj.attr.method"));
     assert!(small.symbols.contains("attr.method"));
+}
+
+// =========================================================================
+// Tier-2 extraction is not quadratic in hunk count
+// =========================================================================
+
+/// A base of `n` functions, eight lines apart, and a patch changing each in its own hunk.
+fn many_hunk_case(n: usize) -> (String, String) {
+    let mut base = String::new();
+    for i in 0..n {
+        base.push_str(&format!("def f{i}():\n    return {i}\n\n\n\n\n\n\n"));
+    }
+    let mut patch = String::from("diff --git a/many.py b/many.py\n--- a/many.py\n+++ b/many.py\n");
+    for i in 0..n {
+        let line = i * 8 + 1;
+        patch.push_str(&format!(
+            "@@ -{line},2 +{line},2 @@\n def f{i}():\n-    return {i}\n+    return {}\n",
+            i + 1_000_000
+        ));
+    }
+    (base, patch)
+}
+
+#[test]
+fn test_tier2_per_file_parse_matches_per_hunk_extraction() {
+    let (base, patch) = many_hunk_case(40);
+    let parent = tempdir().expect("tempdir");
+    fs::write(parent.path().join("many.py"), &base).expect("base");
+    let fp = FingerprintSet::from_task(&patch, "", parent.path()).expect("fingerprints");
+    assert_eq!(fp.hunks.len(), 40);
+    let fixed: String = (0..40)
+        .map(|i| format!("def f{i}():\n    return {}\n\n\n\n\n\n\n", i + 1_000_000))
+        .collect();
+    let fixed = fixed.trim_end_matches('\n');
+    for (i, hunk) in fp.hunks.iter().enumerate() {
+        let row = i * 8 + 1;
+        let (_, anchors) = hermetic_sealcheck::tier2::extract_hunk_symbols_and_anchors(
+            "many.py",
+            Some(&base),
+            &[row],
+            fixed,
+            &[row],
+        );
+        assert_eq!(hunk.tier2_anchors, anchors, "hunk {i}");
+        assert!(hunk.tier2_anchors.contains(&format!("f{i}")), "hunk {i}");
+    }
+}
+
+const MANY_HUNKS_CHILD: &str = "HERMETIC_TIER2_MANY_HUNKS_CHILD";
+
+/// 4,000 hunks in a 32,000-line file. Re-parsing the file for every hunk (the old
+/// behaviour) takes minutes; one parse per file finishes well inside the bound. Runs in a
+/// memory-limited child so a regression cannot exhaust the host.
+#[test]
+fn test_tier2_many_hunks_one_file_is_not_quadratic() {
+    if std::env::var_os(MANY_HUNKS_CHILD).is_none() {
+        assert!(passes_in_limited_child(
+            "test_tier2_many_hunks_one_file_is_not_quadratic",
+            MANY_HUNKS_CHILD,
+            CHILD_MEM_KIB,
+            60,
+        ));
+        return;
+    }
+    let n = 4_000;
+    let (base, patch) = many_hunk_case(n);
+    let parent = tempdir().expect("tempdir");
+    fs::write(parent.path().join("many.py"), &base).expect("base");
+    let fp = FingerprintSet::from_task_with_budget(&patch, "", parent.path(), Some(usize::MAX))
+        .expect("fingerprints");
+    assert_eq!(fp.hunks.len(), n);
+    for (i, hunk) in fp.hunks.iter().enumerate() {
+        assert!(hunk.tier2_anchors.contains(&format!("f{i}")), "hunk {i}");
+    }
+}
+
+#[test]
+fn test_unicode_names_data_has_licence_note() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+    let note = fs::read_to_string(dir.join("LICENSE-UNICODE")).expect("licence note");
+    assert!(note.contains("data/unicode_names.txt"));
+    assert!(note.contains("Unicode 16.0.0"));
+    assert!(note.contains("gen_unicode_names.py"));
+    assert!(note.contains("UNICODE LICENSE V3"));
+    let data = fs::read_to_string(dir.join("unicode_names.txt")).expect("data");
+    assert!(
+        data.contains("Unicode 16.0.0"),
+        "note and data must name the same version"
+    );
 }

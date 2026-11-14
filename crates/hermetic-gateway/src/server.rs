@@ -23,6 +23,29 @@ use crate::response::{
     GuestClock, SanitizingSseReader, StreamSlotGuard, StreamUsage,
 };
 use crate::upstream::{UpstreamClient, UpstreamResponse};
+use hermetic_sealcheck::d12::D12Options;
+use hermetic_sealcheck::d12_runtime::{DateSentinel, SentinelSummary, SseScanner};
+
+/// File in the log directory holding the D12 sentinel summary (counts only, no matched text).
+pub const DATE_SENTINEL_FILE: &str = "date_sentinel.json";
+
+/// Scans the bytes of a forwarded SSE stream with the D12 sentinel as they are handed out.
+struct SentinelReader<R: Read> {
+    inner: R,
+    scanner: SseScanner,
+}
+
+impl<R: Read> Read for SentinelReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            self.scanner.finish();
+        } else {
+            self.scanner.feed(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
 
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
@@ -181,6 +204,9 @@ pub struct GatewayServer {
     write_deadlines: (Duration, Duration),
     /// Overall bound on writing one stream.
     stream_total_deadline: Duration,
+    /// Real-date sentinel (D12) over agent requests and forwarded upstream responses.
+    sentinel: Arc<DateSentinel>,
+    sentinel_persist: Arc<Mutex<()>>,
 }
 
 impl GatewayServer {
@@ -232,6 +258,16 @@ impl GatewayServer {
             )
             .map_err(|e| format!("Failed to create host logger: {e}"))?,
         );
+        let sentinel_cfg = &config_arc.date_sentinel;
+        let sentinel = Arc::new(
+            DateSentinel::new(D12Options {
+                real_date: time::OffsetDateTime::now_utc().date(),
+                tolerance_days: sentinel_cfg.tolerance_days,
+                host_names: sentinel_cfg.host_names.clone(),
+                host_paths: sentinel_cfg.host_paths.clone(),
+            })
+            .map_err(|e| format!("Invalid date sentinel config: {e}"))?,
+        );
         let upstream = Arc::new(UpstreamClient::new(config_arc.clone()));
         let running = Arc::new(AtomicBool::new(true));
 
@@ -257,6 +293,8 @@ impl GatewayServer {
             },
             write_deadlines: (RESPONSE_WRITE_DEADLINE, STREAM_CHUNK_WRITE_DEADLINE),
             stream_total_deadline: STREAM_TOTAL_WRITE_DEADLINE,
+            sentinel,
+            sentinel_persist: Arc::new(Mutex::new(())),
         })
     }
 
@@ -339,6 +377,38 @@ impl GatewayServer {
         // The fallback was validated as a header value at startup, so this always succeeds.
         if let Ok(h) = header {
             headers.push(h);
+        }
+    }
+
+    /// Replaces the D12 sentinel options (tests pin the real date with this).
+    pub fn with_date_sentinel(mut self, opts: D12Options) -> Result<Self, String> {
+        self.sentinel = Arc::new(DateSentinel::new(opts).map_err(|e| e.to_string())?);
+        Ok(self)
+    }
+
+    /// Replaces the sentinel itself (tests use a small byte cap).
+    pub fn with_date_sentinel_instance(mut self, sentinel: DateSentinel) -> Self {
+        self.sentinel = Arc::new(sentinel);
+        self
+    }
+
+    /// Current D12 sentinel summary: the gateway's `date_leak_observed` input.
+    pub fn date_sentinel_summary(&self) -> SentinelSummary {
+        self.sentinel.summary()
+    }
+
+    /// Writes the sentinel summary to `DATE_SENTINEL_FILE` in the log directory. A failure
+    /// to write marks the scan incomplete (so the result fails closed when next read).
+    fn persist_sentinel(&self) {
+        let ok = persist_snapshot(&self.sentinel, &self.sentinel_persist, |bytes| {
+            let Some(dir) = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir).ok()
+            else {
+                return false;
+            };
+            crate::fsutil::write_state_file(&dir, DATE_SENTINEL_FILE, bytes).is_ok()
+        });
+        if !ok {
+            self.sentinel.mark_incomplete("gateway", "persist_failed");
         }
     }
 
@@ -485,7 +555,13 @@ impl GatewayServer {
         }
     }
 
-    pub fn handle_agent_request(&self, mut request: Request) {
+    /// Handles one agent request, then records the D12 sentinel summary.
+    pub fn handle_agent_request(&self, request: Request) {
+        self.handle_agent_request_inner(request);
+        self.persist_sentinel();
+    }
+
+    fn handle_agent_request_inner(&self, mut request: Request) {
         let peer = request.try_clone_peer_tcp_stream();
         let method = request.method().clone();
         let url = request.url().to_string();
@@ -658,6 +734,12 @@ impl GatewayServer {
             }
         };
 
+        // 4a. D12: every request body that leaves the VM is scanned, even one refused below.
+        match std::str::from_utf8(&body_bytes) {
+            Ok(text) => self.sentinel.scan_json("agent_request", text),
+            Err(_) => self.sentinel.scan_bytes("agent_request", &body_bytes),
+        }
+
         // 4b. Validate UTF-8
         let body_str = match std::str::from_utf8(&body_bytes) {
             Ok(s) => s,
@@ -791,6 +873,8 @@ impl GatewayServer {
                     let _ = slot.record_and_release();
                     let status = if status < 400 { 502 } else { status };
                     let (sanitized_body, _) = sanitize_error_body(status, &upstream_body);
+                    self.sentinel
+                        .scan_json("upstream_response", &sanitized_body);
                     let body_bytes = sanitized_body.into_bytes();
                     let body_len = body_bytes.len();
 
@@ -860,6 +944,7 @@ impl GatewayServer {
                         return;
                     };
 
+                    self.sentinel.scan_json("upstream_response", &final_body);
                     slot.set_usage(usage.input_tokens, usage.output_tokens);
                     if let Err(breach) = slot.record_and_release() {
                         // This response crossed a hard token cap: it is not delivered.
@@ -945,6 +1030,11 @@ impl GatewayServer {
                     slot.usage_handle(),
                     slot.clone(),
                 );
+
+                let sse_reader = SentinelReader {
+                    inner: sse_reader,
+                    scanner: SseScanner::new(self.sentinel.clone(), "upstream_stream"),
+                };
 
                 let mut resp_headers = Vec::new();
                 for (k, v) in &filtered.agent_headers {
@@ -1124,5 +1214,78 @@ fn watch_disconnect(stream: TcpStream, slot: Weak<StreamSlotGuard>) {
             }
             Err(_) => return,
         }
+    }
+}
+
+// Snapshot inside the persistence lock: an older clean snapshot must never
+// overwrite a newer leak record when request workers finish concurrently.
+fn persist_snapshot(
+    sentinel: &DateSentinel,
+    lock: &std::sync::Mutex<()>,
+    write: impl FnOnce(&[u8]) -> bool,
+) -> bool {
+    let Ok(_guard) = lock.lock() else {
+        return false;
+    };
+    serde_json::to_vec(&sentinel.summary())
+        .ok()
+        .is_some_and(|bytes| write(&bytes))
+}
+
+#[cfg(test)]
+mod sentinel_persist_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_persistence_serializes_snapshot_and_publication() {
+        use std::sync::{mpsc, Mutex};
+        let sentinel = Arc::new(
+            DateSentinel::new(D12Options {
+                real_date: time::Date::from_calendar_date(2030, time::Month::June, 15).unwrap(),
+                tolerance_days: 0,
+                host_names: vec![],
+                host_paths: vec![],
+            })
+            .unwrap(),
+        );
+        let lock = Arc::new(Mutex::new(()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let first = {
+            let (sentinel, lock, writes) = (sentinel.clone(), lock.clone(), writes.clone());
+            std::thread::spawn(move || {
+                persist_snapshot(&sentinel, &lock, |bytes| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writes.lock().unwrap().push(bytes.to_vec());
+                    true
+                })
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        sentinel.mark_incomplete("test", "cap");
+        let second = {
+            let (sentinel, lock, writes) = (sentinel.clone(), lock.clone(), writes.clone());
+            std::thread::spawn(move || {
+                persist_snapshot(&sentinel, &lock, |bytes| {
+                    writes.lock().unwrap().push(bytes.to_vec());
+                    done_tx.send(()).unwrap();
+                    true
+                })
+            })
+        };
+        let premature = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap());
+        assert!(second.join().unwrap());
+        assert!(
+            !premature,
+            "newer snapshot was published ahead of an older writer"
+        );
+        let writes = writes.lock().unwrap();
+        let last: SentinelSummary = serde_json::from_slice(writes.last().unwrap()).unwrap();
+        assert!(last.date_leak_observed && last.scan_incomplete);
     }
 }

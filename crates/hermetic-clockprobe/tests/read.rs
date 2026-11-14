@@ -106,3 +106,58 @@ fn pinned_root_survives_path_replacement_and_refuses_special_files() {
         .success());
     assert!(root.text("fifo", 10).is_err());
 }
+
+#[test]
+fn every_registered_rtc_is_checked_and_partial_dates_fail_closed() {
+    use hermetic_clockprobe::{classify::ProbeResult, probes::inspect_rtc};
+    let sys = Fixture::new();
+    let dev = Fixture::new();
+    for name in ["rtc0", "rtc1"] {
+        fs::create_dir_all(sys.0.join(format!("class/rtc/{name}"))).unwrap();
+        fs::write(
+            sys.0.join(format!("class/rtc/{name}/since_epoch")),
+            "1704067200\n",
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Blocked
+    );
+    fs::write(dev.0.join("rtc0"), "").unwrap();
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Blocked
+    );
+    fs::write(sys.0.join("class/rtc/rtc1/since_epoch"), "1794600000\n").unwrap();
+    assert_eq!(
+        inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0)
+            .unwrap()
+            .result,
+        ProbeResult::Leak
+    );
+    fs::write(sys.0.join("class/rtc/rtc0/date"), "2024-01-01\n").unwrap();
+    assert!(inspect_rtc(&sys.root(), &dev.root(), Some(1704067200), 0.0).is_err());
+}
+
+/// The nested lockdown guest's /dev held over 512 nodes (256 legacy PTY pairs),
+/// so the vmclock probe errored at the old cap (2026-11-14).
+#[test]
+fn lockdown_dev_with_legacy_ptys_fits_the_enumeration_cap() {
+    let f = Fixture::new();
+    let root = f.root();
+    for c in "pqrstuvwxyzabcde".chars() {
+        for h in "0123456789abcdef".chars() {
+            fs::write(f.0.join(format!("pty{c}{h}")), b"").unwrap();
+            fs::write(f.0.join(format!("tty{c}{h}")), b"").unwrap();
+        }
+    }
+    for name in ["console", "kmsg", "null", "ptmx", "hwrng", "full"] {
+        fs::write(f.0.join(name), b"").unwrap();
+    }
+    assert_eq!(root.list(".").unwrap().len(), 518);
+}

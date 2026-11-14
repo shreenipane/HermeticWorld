@@ -1,0 +1,11 @@
+[package]
+name = "hermetic-escapeprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Guest root escape probe (TR-SEC-6): tries every documented way out of AgentVM and reports each attempt; host-side report aggregation."
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+hermetic-netvm-dns = { path = "../hermetic-netvm-dns" }

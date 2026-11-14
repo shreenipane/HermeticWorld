@@ -3,7 +3,7 @@
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::arch_x86;
 use crate::classify::{self, CpuidLeafDump, ProbeRecord, ProbeResult};
@@ -74,18 +74,16 @@ fn brand() -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 fn probe_cpuid() -> ProbeRecord {
+    arch_x86::with_pinned_cpu(sample_cpuid).unwrap_or_else(|_| error("cpuid"))
+}
+fn sample_cpuid() -> ProbeRecord {
     let mut leaves = Vec::new();
-    for leaf in [0, 1, 7, 0xa, 0x15, 0x16]
-        .into_iter()
-        .chain(0x4000_0000..=0x4000_0010)
-    {
-        // Dump every requested query, including unadvertised hypervisor
-        // leaves. Classification separately avoids interpreting unsupported
-        // basic-leaf aliases as frequency data.
-        if let Some((eax, ebx, ecx, edx)) = arch_x86::read_cpuid(leaf, 0) {
+    for (leaf, subleaf) in crate::baseline::queries() {
+        // Query the complete fixed profile, including zeroed PV leaves.
+        if let Some((eax, ebx, ecx, edx)) = arch_x86::read_cpuid(leaf, subleaf) {
             leaves.push(CpuidLeafDump {
                 leaf,
-                subleaf: 0,
+                subleaf,
                 eax,
                 ebx,
                 ecx,
@@ -93,15 +91,7 @@ fn probe_cpuid() -> ProbeRecord {
             });
         }
     }
-    // All queried structured feature subleaves are bounded, independent of a
-    // hostile maximum-subleaf value. The remaining leaves are explicitly
-    // outside this diagnostic's identity-coverage claim.
-    if cpuid(7, 0).is_some_and(|r| r.eax >= 1) {
-        if let Some(r) = cpuid(7, 1) {
-            leaves.push(r);
-        }
-    }
-    classify::classify_cpuid(&leaves, brand().as_deref())
+    crate::identity::inspect(&leaves, brand().as_deref())
 }
 fn probe_rdtsc(boot: Option<f64>) -> ProbeRecord {
     let start = Instant::now();
@@ -148,28 +138,52 @@ fn ptp(sys: &Root) -> io::Result<Vec<(String, String)>> {
     }
     Ok(clocks)
 }
-fn probe_rtc(sys: &Root, dev: &Root, expected: Option<u64>, boot: f64) -> io::Result<ProbeRecord> {
+/// Inspect every registered RTC; a hidden second RTC must not be skipped.
+pub fn inspect_rtc(
+    sys: &Root,
+    dev: &Root,
+    expected: Option<u64>,
+    boot: f64,
+) -> io::Result<ProbeRecord> {
     let entries = optional(sys.list("class/rtc"))?.unwrap_or_default();
-    let epoch = optional(sys.text("class/rtc/rtc0/since_epoch", MAX_SMALL_FILE_BYTES))?
+    let unregistered_rtc0 = !entries.iter().any(|entry| entry == "rtc0") && dev.present("rtc0")?;
+    let mut result =
+        classify::classify_rtc_sysfs_dev(&[], None, None, unregistered_rtc0, expected, boot);
+    for entry in entries {
+        let epoch = optional(sys.text(
+            &format!("class/rtc/{entry}/since_epoch"),
+            MAX_SMALL_FILE_BYTES,
+        ))?
         .map(|s| {
             s.trim()
                 .parse::<u64>()
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
         })
         .transpose()?;
-    let date = optional(sys.text("class/rtc/rtc0/date", MAX_SMALL_FILE_BYTES))?;
-    let time = optional(sys.text("class/rtc/rtc0/time", MAX_SMALL_FILE_BYTES))?;
-    let dt = date
-        .zip(time)
-        .map(|(d, t)| format!("{} {}", d.trim(), t.trim()));
-    Ok(classify::classify_rtc_sysfs_dev(
-        &entries,
-        epoch,
-        dt.as_deref(),
-        dev.present("rtc0")?,
-        expected,
-        boot,
-    ))
+        let date = optional(sys.text(&format!("class/rtc/{entry}/date"), MAX_SMALL_FILE_BYTES))?;
+        let time = optional(sys.text(&format!("class/rtc/{entry}/time"), MAX_SMALL_FILE_BYTES))?;
+        if date.is_some() != time.is_some() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let dt = date
+            .zip(time)
+            .map(|(d, t)| format!("{} {}", d.trim(), t.trim()));
+        let rec = classify::classify_rtc_sysfs_dev(
+            std::slice::from_ref(&entry),
+            epoch,
+            dt.as_deref(),
+            dev.present(&entry)?,
+            expected,
+            boot,
+        );
+        match rec.result {
+            ProbeResult::Leak => return Ok(rec),
+            ProbeResult::Error => result = rec,
+            ProbeResult::Unavailable if result.result != ProbeResult::Error => result = rec,
+            ProbeResult::Blocked | ProbeResult::Unavailable => {}
+        }
+    }
+    Ok(result)
 }
 fn probe_hpet(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
     let avail = sys.text(
@@ -193,7 +207,11 @@ fn probe_hpet(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
         &events,
     ))
 }
-fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
+fn probe_log(
+    dev: &Root,
+    expected: Option<u64>,
+    dates: Option<&DateSet>,
+) -> io::Result<ProbeRecord> {
     let mut file = match dev.device("kmsg", KMSG_RDEV) {
         Ok(file) => file,
         Err(e)
@@ -214,7 +232,14 @@ fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
     let mut record = [0u8; MAX_KMSG_RECORD_BYTES];
     for _ in 0..MAX_KMSG_RECORDS {
         match file.read(&mut record) {
-            Ok(0) => return Ok(classify::classify_dmesg_dates(Some(&log), false, expected)),
+            Ok(0) => {
+                return Ok(classify::classify_dmesg_dates_with_substrate(
+                    Some(&log),
+                    false,
+                    expected,
+                    dates,
+                ))
+            }
             Ok(n) => {
                 if log.len().saturating_add(n) > MAX_DMESG_BYTES {
                     return Err(io::ErrorKind::InvalidData.into());
@@ -223,7 +248,12 @@ fn probe_log(dev: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
                 log.push_str(std::str::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData)?);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(classify::classify_dmesg_dates(Some(&log), false, expected))
+                return Ok(classify::classify_dmesg_dates_with_substrate(
+                    Some(&log),
+                    false,
+                    expected,
+                    dates,
+                ))
             }
             Err(e) => return Err(e),
         }
@@ -246,17 +276,24 @@ fn probe_vmclock(sys: &Root, dev: &Root) -> io::Result<ProbeRecord> {
 /// Partial std-only clock read. std exposes realtime; /proc/uptime exposes
 /// boottime. std cannot sample CLOCK_TAI or the absolute CLOCK_MONOTONIC value.
 /// Never substitute one clock for another or claim complete clock coverage.
-fn probe_posix(proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
-    let rt = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::ErrorKind::InvalidData)?
-        .as_secs_f64();
-    let boot = uptime(proc)?;
-    let Some(t) = expected else {
-        return Ok(error("posix_clocks"));
-    };
-    let leaked = (rt - t as f64 - boot).abs() > classify::CLOCK_TOLERANCE_SECONDS;
-    Ok(ProbeRecord::new("posix_clocks",if leaked { ProbeResult::Leak } else { ProbeResult::Unavailable },Some(format!("realtime={rt:.3},boottime={boot:.3}")),"Realtime checked against hermetic.t and guest boottime; CLOCK_MONOTONIC and CLOCK_TAI require an approved safe syscall wrapper"))
+fn probe_posix(_proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
+    use arch_x86::{clock_seconds, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_TAI};
+    // Bracket the samples with BOOTTIME: a stop or scheduling delay between reads
+    // would otherwise look like a clock offset. Retry a bounded number of times,
+    // then report an inspection error rather than classify stale samples.
+    for _ in 0..POSIX_SAMPLE_ATTEMPTS {
+        let boot = clock_seconds(CLOCK_BOOTTIME);
+        let mono = clock_seconds(CLOCK_MONOTONIC);
+        let rt = clock_seconds(CLOCK_REALTIME);
+        let tai = clock_seconds(CLOCK_TAI);
+        let after = clock_seconds(CLOCK_BOOTTIME);
+        if posix_sample_is_coherent(boot, after) {
+            return Ok(classify::classify_posix_clocks(
+                rt, mono, boot, tai, expected,
+            ));
+        }
+    }
+    Ok(error("posix_clocks"))
 }
 fn uptime(proc: &Root) -> io::Result<f64> {
     let text = proc.text("uptime", MAX_SMALL_FILE_BYTES)?;
@@ -270,6 +307,38 @@ fn uptime(proc: &Root) -> io::Result<f64> {
 }
 fn checked(name: &str, result: io::Result<ProbeRecord>) -> ProbeRecord {
     result.unwrap_or_else(|_| error(name))
+}
+
+const POSIX_SAMPLE_ATTEMPTS: usize = 3;
+/// Largest BOOTTIME span across one set of clock reads; far below the
+/// classifier's tolerance, so a coherent sample cannot produce a false leak.
+pub const MAX_POSIX_SAMPLE_SPAN_SECONDS: f64 = 1.0;
+
+pub fn posix_sample_is_coherent(before: Option<f64>, after: Option<f64>) -> bool {
+    matches!((before, after), (Some(b), Some(a))
+        if b.is_finite() && a.is_finite() && a >= b && a - b <= MAX_POSIX_SAMPLE_SPAN_SECONDS)
+}
+
+/// Path, relative to /etc/hermetic, of the sealed list of substrate dates.
+pub const SUBSTRATE_DATES_FILE: &str = "substrate-dates";
+
+type DateSet = std::collections::BTreeSet<(i32, u32, u32)>;
+
+/// Absent: the strict rule applies (every date must be T_clock). Present but
+/// malformed: an inspection error, never a silent fallback.
+fn substrate_dates() -> io::Result<Option<DateSet>> {
+    let root = match Root::new(Path::new("/etc/hermetic")) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let cap = (classify::MAX_SUBSTRATE_DATES * 11) as u64;
+    match optional(root.text(SUBSTRATE_DATES_FILE, cap))? {
+        None => Ok(None),
+        Some(text) => classify::parse_substrate_dates(&text)
+            .map(Some)
+            .ok_or_else(|| io::ErrorKind::InvalidData.into()),
+    }
 }
 
 pub fn run_all_probes() -> Vec<ProbeRecord> {
@@ -293,7 +362,7 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
             .map(|(d, n)| format!("{d}:{n}"))
             .collect::<Vec<_>>()
     });
-    vec![
+    let mut records = vec![
         probe_rdtsc(boot),
         probe_cpuid(),
         checked("kvmclock_msr", probe_msr(&dev)),
@@ -303,7 +372,7 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
         ),
         checked(
             "rtc_sysfs_dev",
-            probe_rtc(&sys, &dev, expected, boot.unwrap_or(f64::NAN)),
+            inspect_rtc(&sys, &dev, expected, boot.unwrap_or(f64::NAN)),
         ),
         checked(
             "proc_driver_rtc",
@@ -312,7 +381,10 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
             }),
         ),
         checked("hpet", probe_hpet(&sys, &dev)),
-        checked("dmesg_dates", probe_log(&dev, expected)),
+        checked(
+            "dmesg_dates",
+            substrate_dates().and_then(|dates| probe_log(&dev, expected, dates.as_ref())),
+        ),
         checked(
             "clocksource_sysfs",
             (|| {
@@ -336,5 +408,7 @@ pub fn run_all_probes() -> Vec<ProbeRecord> {
             "cpuinfo",
             cpuinfo.map(|v| classify::classify_cpuinfo(Some(&v))),
         ),
-    ]
+    ];
+    records.extend(crate::lockdown::run());
+    records
 }

@@ -141,6 +141,13 @@ struct Fake {
     killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Runner for Fake {
+    fn tsc_khz(&self) -> Result<u64> {
+        if self.fail.as_deref() == Some("tsc") {
+            Err(Error::Validation("frequency unavailable"))
+        } else {
+            Ok(2_000_000)
+        }
+    }
     fn spawn(
         &mut self,
         _: &ValidatedSpec,
@@ -774,4 +781,17 @@ fn wait_exit_rejects_an_exit_reported_after_the_deadline() {
     assert_eq!(vm.state(), State::Failed);
     assert!(vm.runner().killed.load(std::sync::atomic::Ordering::SeqCst));
     assert!(!f.root().exists());
+}
+
+#[test]
+fn unavailable_tsc_is_rejected_before_jail_creation_or_spawn() {
+    let f = Fixture::new();
+    let runner = Fake {
+        fail: Some("tsc".into()),
+        ..Fake::default()
+    };
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+    assert!(vm.prepare(TIMEOUT).is_err());
+    assert!(!f.temp.path().join("firecracker").exists());
+    assert!(vm.runner().events.is_empty());
 }

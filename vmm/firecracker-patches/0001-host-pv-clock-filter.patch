@@ -1,0 +1,486 @@
+--- a/resources/seccomp/x86_64-unknown-linux-musl.json
++++ b/resources/seccomp/x86_64-unknown-linux-musl.json
+@@ -885,6 +885,42 @@
+                         "op": {"masked_eq": 4},
+                         "val": 0,
+                         "comment": "Ensure PROT_EXEC is not set"
++                    }
++                ]
++            },
++            {
++                "syscall": "ioctl",
++                "args": [
++                    {
++                        "index": 1,
++                        "type": "dword",
++                        "op": "eq",
++                        "val": 1099476678,
++                        "comment": "KVM_X86_SET_MSR_FILTER"
++                    }
++                ]
++            },
++            {
++                "syscall": "ioctl",
++                "args": [
++                    {
++                        "index": 1,
++                        "type": "dword",
++                        "op": "eq",
++                        "val": 1077456506,
++                        "comment": "KVM_XEN_HVM_CONFIG"
++                    }
++                ]
++            },
++            {
++                "syscall": "ioctl",
++                "args": [
++                    {
++                        "index": 1,
++                        "type": "dword",
++                        "op": "eq",
++                        "val": 1080602275,
++                        "comment": "KVM_ENABLE_CAP"
+                     }
+                 ]
+             }
+--- /dev/null
++++ b/src/vmm/src/arch/x86_64/clock_filter.rs
+@@ -0,0 +1,230 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Host enforcement for guests that can execute arbitrary kernel instructions.
++use kvm_bindings::{
++    KVM_CAP_ENFORCE_PV_FEATURE_CPUID, KVM_EXIT_XEN, KVM_EXIT_XEN_HCALL,
++    KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL, KVMIO, kvm_enable_cap, kvm_run, kvm_xen_hvm_config,
++};
++use kvm_ioctls::{Cap, MsrFilterDefaultAction, MsrFilterRange, MsrFilterRangeFlags, VcpuFd, VmFd};
++use vmm_sys_util::{errno, ioctl::ioctl_with_ref, ioctl_iow_nr};
++
++// kvm-ioctls 0.25 has no Xen configuration wrapper.
++#[allow(missing_docs)]
++mod ioctls {
++    use super::*;
++    ioctl_iow_nr!(KVM_XEN_HVM_CONFIG, KVMIO, 0x7a, kvm_xen_hvm_config);
++}
++
++/// Fixed guest identity and virtual counter policy.
++#[path = "cpu_baseline.rs"]
++pub mod baseline;
++
++/// Construct a fresh bounded CPUID set without any host-derived entries.
++pub fn sealed_cpuid(index: u8, count: u8) -> Result<kvm_bindings::CpuId, errno::Error> {
++    let mut entries = Vec::with_capacity(baseline::MAX_CPUID_ENTRIES);
++    for (leaf, subleaf) in baseline::queries() {
++        let [eax, ebx, ecx, edx] = baseline::registers(leaf, subleaf, index, count)
++            .ok_or_else(|| errno::Error::new(libc::EINVAL))?;
++        if entries.len() >= baseline::MAX_CPUID_ENTRIES {
++            return Err(errno::Error::new(libc::E2BIG));
++        }
++        entries.push(kvm_bindings::kvm_cpuid_entry2 {
++            function: leaf, index: subleaf,
++            flags: if matches!(leaf, 4 | 7 | 0xb | 0xd) { 1 } else { 0 },
++            eax, ebx, ecx, edx, ..Default::default()
++        });
++    }
++    kvm_bindings::CpuId::from_entries(&entries).map_err(|_| errno::Error::new(libc::EINVAL))
++}
++
++/// Refuse unsupported vendors/features instead of advertising unavailable instructions.
++pub fn host_supported(cpuid: &kvm_bindings::CpuId) -> bool {
++    if cpuid.as_slice().len() > baseline::MAX_CPUID_ENTRIES { return false; }
++    let get = |leaf| cpuid.as_slice().iter().find(|e| e.function == leaf && e.index == 0);
++    get(0).is_some_and(|r| [r.ebx, r.edx, r.ecx] == [0x756e6547, 0x49656e69, 0x6c65746e])
++        && get(1).is_some_and(|r| r.ecx & baseline::FEATURES_ECX == baseline::FEATURES_ECX
++            && r.edx & baseline::FEATURES_EDX == baseline::FEATURES_EDX)
++        && get(0x80000001).is_some_and(|r| r.ecx & 1 == 1
++            && r.edx & 0x20100800 == 0x20100800)
++        && get(0x80000007).is_some_and(|r| r.edx & (1 << 8) != 0)
++        && get(0x80000008).is_some_and(|r| r.eax & 0xff >= 36 && (r.eax >> 8) & 0xff >= 48)
++}
++
++/// Require hardware TSC scaling even when the host happens to run at 2 GHz.
++pub fn fixed_tsc(vcpu: &VcpuFd) -> Result<(), errno::Error> {
++    set_and_verify_tsc(|khz| vcpu.set_tsc_khz(khz), || vcpu.get_tsc_khz())
++}
++
++fn set_and_verify_tsc(set: impl FnOnce(u32) -> Result<(), errno::Error>,
++                      get: impl FnOnce() -> Result<u32, errno::Error>) -> Result<(), errno::Error> {
++    set(baseline::TSC_KHZ)?;
++    if get()? != baseline::TSC_KHZ { return Err(errno::Error::new(libc::ENOTSUP)); }
++    Ok(())
++}
++
++/// Reject a snapshot before applying its state; it may not select another rate/profile.
++pub fn restore_cpuid(input: &kvm_bindings::CpuId, index: u8, khz: Option<u32>)
++    -> Result<kvm_bindings::CpuId, errno::Error> {
++    if khz != Some(baseline::TSC_KHZ) || input.as_slice().len() > baseline::MAX_CPUID_ENTRIES {
++        return Err(errno::Error::new(libc::EINVAL));
++    }
++    let count = input.as_slice().iter().find(|e| e.function == 1 && e.index == 0)
++        .map(|e| ((e.ebx >> 16) & 0xff) as u8).ok_or_else(|| errno::Error::new(libc::EINVAL))?;
++    let expected = sealed_cpuid(index, count)?;
++    // KVM rewrites CPUID.0xD.0:EBX at runtime (kvm_update_cpuid_runtime) to the
++    // save-area size of the guest's XCR0. The profile has no XSAVE, so XCR0 stays
++    // x87-only and a saved readback holds exactly KVM_XSAVE_LEGACY_SIZE. Accept only
++    // that one recomputed field, then install the sealed template unchanged.
++    let mut saved = input.clone();
++    if let Some(e) = saved.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0) {
++        if e.ebx == KVM_XSAVE_LEGACY_SIZE { e.ebx = 0; }
++    }
++    // Serialization order is fixed as well as values, flags, and padding.
++    if saved != expected { return Err(errno::Error::new(libc::EINVAL)); }
++    Ok(expected)
++}
++
++/// KVM's CPUID.0xD.0:EBX for an x87-only XCR0 (legacy area plus header).
++pub const KVM_XSAVE_LEGACY_SIZE: u32 = 0x240;
++
++/// Deny old/new KVM PV MSRs and the Hyper-V/Xen synthetic range, in both directions.
++pub fn ranges() -> [MsrFilterRange<'static>; 3] {
++    let flags = MsrFilterRangeFlags::READ | MsrFilterRangeFlags::WRITE;
++    [
++        MsrFilterRange { flags, base: 0x11, msr_count: 2, bitmap: &[0] },
++        MsrFilterRange { flags, base: 0x4b56_4d00, msr_count: 256, bitmap: &[0; 32] },
++        MsrFilterRange { flags, base: 0x4000_0000, msr_count: 512, bitmap: &[0; 64] },
++    ]
++}
++
++/// Called on every new VM fd, including the snapshot restore path, before vCPUs.
++pub fn install(vm: &VmFd) -> Result<(), errno::Error> {
++    if vm.check_extension_int(Cap::TscControl) != 1
++        || vm.check_extension_int(Cap::X86MsrFilter) != 1
++        || vm.check_extension_int(Cap::XenHvm) & (KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL as i32) == 0
++        || vm.check_extension_raw(u64::from(KVM_CAP_ENFORCE_PV_FEATURE_CPUID)) != 1
++    {
++        return Err(errno::Error::new(libc::ENOTSUP));
++    }
++    // Filtered accesses must inject #GP, never be serviced by userspace.
++    vm.enable_cap(&kvm_enable_cap { cap: kvm_bindings::KVM_CAP_X86_USER_SPACE_MSR,
++        ..Default::default() })?;
++    vm.set_msr_filter(MsrFilterDefaultAction::ALLOW, &ranges())?;
++    let config = kvm_xen_hvm_config {
++        flags: KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL,
++        // A nonzero synthetic MSR activates KVM's Xen static key. Guest access
++        // to this MSR is denied above, preventing hypercall-page installation.
++        msr: 0x4000_0000,
++        ..Default::default()
++    };
++    // SAFETY: vm is a VM fd; config is an initialized fixed-size UAPI object.
++    let ret = unsafe { ioctl_with_ref(vm, ioctls::KVM_XEN_HVM_CONFIG(), &config) };
++    if ret != 0 { return Err(errno::Error::last()); }
++    Ok(())
++}
++
++/// Re-enable after every CPUID installation, including snapshot restoration.
++pub fn enforce_pv(vcpu: &VcpuFd) -> Result<(), errno::Error> {
++    vcpu.enable_cap(&kvm_enable_cap { cap: KVM_CAP_ENFORCE_PV_FEATURE_CPUID,
++        args: [1, 0, 0, 0], ..Default::default() })
++}
++
++/// Complete intercepted calls without reading any host state or guest memory.
++pub fn deny_xen(run: &mut kvm_run) -> bool {
++    if run.exit_reason != KVM_EXIT_XEN { return false; }
++    // SAFETY: KVM_EXIT_XEN selects the xen union arm. The type selects hcall.
++    let xen = unsafe { &mut run.__bindgen_anon_1.xen };
++    if xen.type_ != KVM_EXIT_XEN_HCALL { return false; }
++    // SAFETY: The discriminator above selects hcall. Only result is changed.
++    xen.u.hcall.result = (-libc::ENOSYS as i64) as u64;
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn scaled_tsc_errors_and_mismatched_readback_fail_closed() {
++        assert!(set_and_verify_tsc(|khz| { assert_eq!(khz, 2_000_000); Ok(()) },
++                                  || Ok(2_000_000)).is_ok());
++        for frequency in [0, 1, 2_400_000, u32::MAX] {
++            assert!(set_and_verify_tsc(|khz| { assert_eq!(khz, 2_000_000); Ok(()) },
++                                      || Ok(frequency)).is_err());
++        }
++        assert!(set_and_verify_tsc(|_| Err(errno::Error::new(libc::ENOTSUP)),
++                                  || panic!("readback after failed SET_TSC_KHZ")).is_err());
++        assert!(set_and_verify_tsc(|_| Ok(()), || Err(errno::Error::new(libc::EIO))).is_err());
++    }
++
++    #[test]
++    fn fixed_identity_rejects_incompatible_hosts_and_snapshot_mutations() {
++        let good = sealed_cpuid(0, 1).unwrap();
++        assert!(host_supported(&good));
++        assert!(restore_cpuid(&good, 0, Some(baseline::TSC_KHZ)).is_ok());
++        for khz in [None, Some(0), Some(2_400_000)] {
++            assert!(restore_cpuid(&good, 0, khz).is_err());
++        }
++        for leaf in [0, 1, 0x80000001, 0x80000007, 0x80000008] {
++            let mut bad = good.clone();
++            let entry = bad.as_mut_slice().iter_mut().find(|e| e.function == leaf).unwrap();
++            entry.eax = 0; entry.ebx = 0; entry.ecx = 0; entry.edx = 0;
++            assert!(!host_supported(&bad));
++        }
++        for count in [1, 2, 3, 32] {
++            for index in 0..count {
++                let cpuid = sealed_cpuid(index, count).unwrap();
++                assert!(restore_cpuid(&cpuid, index, Some(baseline::TSC_KHZ)).is_ok());
++                for pos in 0..cpuid.as_slice().len() {
++                    let mut bad = cpuid.clone();
++                    bad.as_mut_slice()[pos].eax ^= 1;
++                    assert!(restore_cpuid(&bad, index, Some(baseline::TSC_KHZ)).is_err());
++                }
++            }
++        }
++        // A snapshot holds KVM's readback, not the template: 0xD.0 EBX is recomputed.
++        for count in [1, 2] {
++            let mut readback = sealed_cpuid(0, count).unwrap();
++            let e = readback.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0).unwrap();
++            e.ebx = KVM_XSAVE_LEGACY_SIZE;
++            let restored = restore_cpuid(&readback, 0, Some(baseline::TSC_KHZ)).unwrap();
++            assert_eq!(restored, sealed_cpuid(0, count).unwrap());
++            for other in [0x200, 0x340, 0x440, 0x988, 1] {
++                let mut bad = readback.clone();
++                bad.as_mut_slice().iter_mut().find(|e| e.function == 0xd && e.index == 0).unwrap().ebx = other;
++                assert!(restore_cpuid(&bad, 0, Some(baseline::TSC_KHZ)).is_err(), "{other:#x}");
++            }
++            for (leaf, sub) in [(4, 0), (1, 0), (0x16, 0)] {
++                let mut bad = readback.clone();
++                bad.as_mut_slice().iter_mut().find(|e| e.function == leaf && e.index == sub).unwrap().ebx ^= KVM_XSAVE_LEGACY_SIZE;
++                assert!(restore_cpuid(&bad, 0, Some(baseline::TSC_KHZ)).is_err());
++            }
++        }
++        assert!(sealed_cpuid(0, 0).is_err());
++        assert!(sealed_cpuid(0, 33).is_err());
++        assert!(sealed_cpuid(32, 32).is_err());
++    }
++
++    #[test]
++    fn denies_every_pv_clock_msr_in_both_directions() {
++        for msr in [0x11, 0x12, 0x4b564d00, 0x4b564d01, 0x4b564d03,
++                    0x40000000, 0x40000020, 0x40000021, 0x40000022] {
++            let ranges = ranges();
++            let range = ranges.iter().find(|r| msr >= r.base && msr - r.base < r.msr_count).unwrap();
++            assert_eq!(range.flags, MsrFilterRangeFlags::READ | MsrFilterRangeFlags::WRITE);
++            assert!(range.bitmap.iter().all(|b| *b == 0));
++        }
++    }
++
++    #[test]
++    fn intercepted_hypercalls_always_return_enosys() {
++        for input in [9, 0, u64::MAX] {
++            let mut run = kvm_run { exit_reason: KVM_EXIT_XEN, ..Default::default() };
++            run.__bindgen_anon_1.xen.type_ = KVM_EXIT_XEN_HCALL;
++            run.__bindgen_anon_1.xen.u.hcall.input = input;
++            assert!(deny_xen(&mut run));
++            // SAFETY: This fixture initialized the Xen hcall union arm.
++            assert_eq!(unsafe { run.__bindgen_anon_1.xen.u.hcall.result }, (-38i64) as u64);
++        }
++        assert!(!deny_xen(&mut kvm_run::default()));
++    }
++}
+--- /dev/null
++++ b/src/vmm/src/arch/x86_64/cpu_baseline.rs
+@@ -0,0 +1,83 @@
++//! Fixed Intel Nehalem-era identity with an x86-64-v2 feature ceiling.
++//! Only vCPU index/count vary, and both come from the bounded machine spec.
++pub const BRAND: &str = "Intel(R) Xeon(R) CPU E5504 @ 2.00GHz";
++pub const TSC_KHZ: u32 = 2_000_000;
++pub const MAX_VCPUS: u8 = 32;
++pub const MAX_CPUID_ENTRIES: usize = 128;
++pub const SIGNATURE: u32 = 0x0001_06a5;
++pub const FEATURES_ECX: u32 = 0x0098_2201;
++pub const FEATURES_EDX: u32 = 0x078b_fbff;
++
++/// A total function, including invalid topology and unadvertised leaf queries.
++pub fn registers(leaf: u32, subleaf: u32, index: u8, count: u8) -> Option<[u32; 4]> {
++    if count == 0 || count > MAX_VCPUS || index >= count {
++        return None;
++    }
++    let id = u32::from(index);
++    let cpus = u32::from(count);
++    let width = cpus.next_power_of_two().trailing_zeros();
++    let r = match (leaf, subleaf) {
++        (0, 0) => [0x16, 0x756e6547, 0x6c65746e, 0x49656e69],
++        (1, 0) => [
++            SIGNATURE,
++            (id << 24) | (cpus << 16) | (8 << 8),
++            FEATURES_ECX,
++            FEATURES_EDX | if count > 1 { 1 << 28 } else { 0 },
++        ],
++        // No legacy cache descriptors: enumerate the fixed geometry in leaf 4.
++        (2, 0) => [1, 0, 0, 0],
++        (4, 0..=2) => {
++            let (kind, level, ways, sets) = match subleaf {
++                0 => (1, 1, 8, 64),
++                1 => (2, 1, 8, 64),
++                _ => (3, 2, 8, 512),
++            };
++            [
++                kind | (level << 5) | (1 << 8) | ((cpus - 1) << 26),
++                ((ways - 1) << 22) | 63,
++                sets - 1,
++                0,
++            ]
++        }
++        (0xb, 0) => [0, 1, 1 << 8, id],
++        (0xb, 1) => [width, cpus, (2 << 8) | 1, id],
++        (0xb, _) => [0, 0, subleaf & 0xff, id],
++        // 25 MHz crystal * 80 = the fixed 2 GHz virtual TSC.
++        (0x15, 0) => [1, 80, 25_000_000, 0],
++        (0x16, 0) => [2000, 2000, 100, 0],
++        (0x8000_0000, 0) => [0x8000_0008, 0, 0, 0],
++        (0x8000_0001, 0) => [0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)],
++        (0x8000_0002..=0x8000_0004, 0) => {
++            let offset = usize::try_from(leaf - 0x8000_0002).ok()?.checked_mul(16)?;
++            let mut words = [0u32; 4];
++            for (word_index, word) in words.iter_mut().enumerate() {
++                for byte_index in 0..4 {
++                    let pos = offset.checked_add(word_index * 4 + byte_index)?;
++                    *word |=
++                        u32::from(*BRAND.as_bytes().get(pos).unwrap_or(&0)) << (byte_index * 8);
++                }
++            }
++            words
++        }
++        (0x8000_0007, 0) => [0, 0, 0, 1 << 8],
++        (0x8000_0008, 0) => [36 | (48 << 8), 0, 0, 0],
++        _ => [0; 4],
++    };
++    Some(r)
++}
++
++/// Exactly the entries installed in KVM; unknown inputs are never copied.
++pub fn queries() -> impl Iterator<Item = (u32, u32)> {
++    (0..=0x16)
++        .flat_map(|leaf| {
++            let subleaves = match leaf {
++                4 => 4,
++                7 => 2,
++                0xb => 3,
++                _ => 1,
++            };
++            (0..subleaves).map(move |subleaf| (leaf, subleaf))
++        })
++        .chain((0x8000_0000..=0x8000_0008).map(|leaf| (leaf, 0)))
++        .chain((0x4000_0000..=0x4000_0010).map(|leaf| (leaf, 0)))
++}
+--- a/src/vmm/src/arch/x86_64/mod.rs
++++ b/src/vmm/src/arch/x86_64/mod.rs
+@@ -9,6 +9,8 @@
+ 
+ /// Logic for handling x86_64 CPU models.
+ pub mod cpu_model;
++/// Host PV clock filtering.
++pub mod clock_filter;
+ mod gdt;
+ /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
+ pub mod interrupts;
+--- a/src/vmm/src/arch/x86_64/vcpu.rs
++++ b/src/vmm/src/arch/x86_64/vcpu.rs
+@@ -49,6 +49,8 @@
+ /// Errors associated with the wrappers over KVM ioctls.
+ #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+ pub enum KvmVcpuError {
++    /// Fixed 2 GHz guest TSC unavailable; host/nested TSC scaling is required: {0}
++    FixedTsc(kvm_ioctls::Error),
+     /// Failed to convert `kvm_bindings::CpuId` to `Cpuid`: {0}
+     ConvertCpuidType(#[from] cpuid::CpuidTryFromKvmCpuid),
+     /// Failed FamStructWrapper operation: {0}
+@@ -120,6 +122,8 @@
+ /// Errors associated with configuring an x86_64 vCPU.
+ #[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
+ pub enum KvmVcpuConfigureError {
++    /// Fixed 2 GHz guest TSC unavailable; host/nested TSC scaling is required: {0}
++    FixedTsc(kvm_ioctls::Error),
+     /// Failed to convert `Cpuid` to `kvm_bindings::CpuId`: {0}
+     ConvertCpuidType(#[from] vmm_sys_util::fam::Error),
+     /// Failed to apply modifications to CPUID: {0}
+@@ -217,9 +221,16 @@
+             u8::from(vcpu_count > 1 && smt),
+         )?;
+ 
+-        let kvm_cpuid = CpuId::try_from(cpuid)?;
++        // Normalization above may restore host brand, vendor and feature bits.
++        // Replace its result completely before KVM or MSR selection sees it.
++        let kvm_cpuid = super::clock_filter::sealed_cpuid(self.index, vcpu_count)
++            .map_err(KvmVcpuConfigureError::SetCpuid)?;
++        super::clock_filter::fixed_tsc(&self.fd)
++            .map_err(KvmVcpuConfigureError::FixedTsc)?;
+         self.fd
+             .set_cpuid2(&kvm_cpuid)
++            .map_err(KvmVcpuConfigureError::SetCpuid)?;
++        super::clock_filter::enforce_pv(&self.fd)
+             .map_err(KvmVcpuConfigureError::SetCpuid)?;
+ 
+         Ok(kvm_cpuid)
+@@ -677,11 +688,17 @@
+ 
+     /// Scale the TSC frequency of this vCPU to the one provided as a parameter.
+     pub fn set_tsc_khz(&self, tsc_freq: u32) -> Result<(), SetTscError> {
+-        self.fd.set_tsc_khz(tsc_freq).map_err(SetTscError)
++        if tsc_freq != super::clock_filter::baseline::TSC_KHZ {
++            return Err(SetTscError(kvm_ioctls::Error::new(libc::EINVAL)));
++        }
++        super::clock_filter::fixed_tsc(&self.fd).map_err(SetTscError)
+     }
+ 
+     /// Use provided state to populate KVM internal state.
+     pub fn restore_state(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
++        let sealed = super::clock_filter::restore_cpuid(&state.cpuid, self.index, state.tsc_khz)
++            .map_err(KvmVcpuError::VcpuSetCpuid)?;
++        super::clock_filter::fixed_tsc(&self.fd).map_err(KvmVcpuError::FixedTsc)?;
+         // Ordering requirements:
+         //
+         // KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
+@@ -704,7 +721,9 @@
+         // only restores successfully, when the LAPIC is correctly configured.
+ 
+         self.fd
+-            .set_cpuid2(&state.cpuid)
++            .set_cpuid2(&sealed)
++            .map_err(KvmVcpuError::VcpuSetCpuid)?;
++        super::clock_filter::enforce_pv(&self.fd)
+             .map_err(KvmVcpuError::VcpuSetCpuid)?;
+         self.fd
+             .set_mp_state(state.mp_state)
+--- a/src/vmm/src/arch/x86_64/vm.rs
++++ b/src/vmm/src/arch/x86_64/vm.rs
+@@ -27,6 +27,8 @@
+ pub enum KvmVmError {
+     /// Failed to check KVM capability (0): {1}
+     CheckCapability(Cap, kvm_ioctls::Error),
++    /// Fixed CPU profile/TSC scaling or host clock filter unavailable: {0}
++    ClockFilter(kvm_ioctls::Error),
+     /// Set PIT2 error: {0}
+     SetPit2(kvm_ioctls::Error),
+     /// Set clock error: {0}
+@@ -72,7 +74,13 @@
+ impl KvmVm {
+     /// Create a new `KvmVm` struct.
+     pub fn new(kvm: Kvm) -> Result<KvmVm, VmError> {
+-        let common = Self::create_common(kvm)?;
++        let mut common = Self::create_common(kvm)?;
++        if !super::clock_filter::host_supported(&common.kvm.supported_cpuid) {
++            return Err(KvmVmError::ClockFilter(kvm_ioctls::Error::new(libc::ENOTSUP)).into());
++        }
++        common.kvm.supported_cpuid = super::clock_filter::sealed_cpuid(0, 1)
++            .map_err(KvmVmError::ClockFilter)?;
++        super::clock_filter::install(&common.fd).map_err(KvmVmError::ClockFilter)?;
+         let msrs_to_save = common
+             .kvm
+             .msrs_to_save()
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -426,6 +426,14 @@
+                 }
+ 
+                 Ok(VcpuEmulation::Paused)
++            }
++            #[cfg(target_arch = "x86_64")]
++            Ok(VcpuExit::Unsupported(kvm_bindings::KVM_EXIT_XEN)) => {
++                if crate::arch::x86_64::clock_filter::deny_xen(self.kvm_vcpu.fd.get_kvm_run()) {
++                    Ok(VcpuEmulation::Handled)
++                } else {
++                    Err(VcpuError::FaultyKvmExit("Unexpected Xen exit".to_string()))
++                }
+             }
+             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
+         }

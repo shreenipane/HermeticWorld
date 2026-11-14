@@ -251,7 +251,10 @@ host. The host records `unclean_shutdown` unless it receives `frozen`.
 Shutdown executes TERM-all, bounded wait, KILL-all, bounded wait, verifies no
 other userspace processes remain (kernel threads are identified by the bounded
 `/proc/PID/stat` flags field), sync, FIFREEZE on the descriptor retained at boot,
-write/flush `frozen`, then poweroff. A freeze/wait failure produces an error,
+write/flush the complete `frozen` frame, then wait for the host to disconnect
+after reading it or for `REPLY_LINGER_MS` to expire before poweroff. Socket
+readiness is advisory: nonblocking reads/writes retry `WouldBlock` and signals
+under the original absolute frame deadline. A freeze/wait failure produces an error,
 never `frozen`. A broken reply connection still leads to poweroff. There is no
 path lookup to reacquire the upper disk and no thaw operation.
 
@@ -325,6 +328,7 @@ Caps are named constants in `src/lib.rs`, `src/boot.rs`, `src/spec.rs` and
 | `MAX_COMMAND_OUTPUT`, `MAX_RUN_OUTPUT` | 1 MiB/command, 16 MiB/run |
 | `MAX_TIMEOUT_MS` | 300000 ms, positive |
 | `FRAME_TIMEOUT_MS` | 5000 ms each for request and reply |
+| `REPLY_LINGER_MS` | 1000 ms maximum drain before poweroff |
 | `MAX_CONNECTIONS`, `MAX_COMMANDS` | 1 active connection; 2 direct commands including initial child |
 | `MAX_DEV_NODES`, `MAX_DEV_DEPTH` | 16384 nodes; 32 levels |
 | `MAX_CHILDREN_BYTES`, `MAX_REAP_BATCH` | 64 KiB child listing; 4096 children/proc entries per sweep |

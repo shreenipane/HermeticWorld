@@ -326,6 +326,10 @@ impl RunRecord {
 
     /// Full validation of all statement constraints.
     pub fn validate(&self) -> Result<(), RunValidationError> {
+        // D12: an observed (or unscanned) date leak lowers the clock below `hidden`.
+        if self.clock == ClockLevel::Hidden && self.date_leak_observed {
+            return Err(RunValidationError::InvalidField("clock"));
+        }
         for (field, text) in [
             ("spec_version", self.version_tuple.spec_version.as_str()),
             (

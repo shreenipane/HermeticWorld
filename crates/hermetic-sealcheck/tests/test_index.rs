@@ -1456,7 +1456,7 @@ fn cli_index_and_query_match_scan() {
     assert_eq!(qv["mode"], "query");
     assert_eq!(
         qv["not_covered"],
-        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"])
+        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external"])
     );
 
     // --root-visibility must give one value per index.
@@ -1635,7 +1635,7 @@ fn cli_sarif_query_and_scan_properties() {
     assert_eq!(props["mode"], "query");
     assert_eq!(
         props["not_covered"],
-        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external", "T2"])
+        serde_json::json!(["D1", "D3", "D6", "D9:instance_id", "D9:external"])
     );
 }
 
@@ -1896,6 +1896,16 @@ fn query_older_version_index_reports_not_covered() {
             .any(|v| v == "D3b:pyc_code_objects"),
         "version 4 index query must report D3b:pyc_code_objects in not_covered: {not_covered_v4:#?}"
     );
+    for (v, list) in [
+        (2, not_covered_v2),
+        (3, not_covered_v3),
+        (4, not_covered_v4),
+    ] {
+        assert!(
+            list.iter().any(|x| x == "T2"),
+            "version {v} index has no tier-2 context and must report T2 in not_covered: {list:#?}"
+        );
+    }
 }
 
 // T1.12 final review, finding 1: indexing a hostile dotted-name text unit is bounded and

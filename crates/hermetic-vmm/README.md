@@ -32,7 +32,14 @@ be a signed `hermetic-run/v1` record.
 Host-side Firecracker orchestration for Linux x86_64. The library never mounts a
 guest disk. It forbids unsafe Rust and uses only the workspace's existing Rust
 dependencies. `hermetic-vmm plan SPEC.json` (absolute path), or `plan -` for stdin,
-prints a deterministic JSON object containing `api_requests` and `jail_plan`.
+prints a JSON object containing calibrated `api_requests` and `jail_plan`.
+The VMM supplies the fixed scaled guest rate `tsc_early_khz=2000000`.
+The optional legacy `HERMETIC_TSC_KHZ` setting may only equal `2000000`.
+Ordering and serialization are stable for the same spec.
+`boot-args BASE_ARGS` exposes the same resolution for direct launch builders;
+`api_requests` alone is a declarative spec plan and must be calibrated before
+transport. The active embedded CPU profile is `vmm/clock-3b.cpu-template.json`;
+see [its source checks and open limits](../../docs/clock-3b-analysis.md).
 The planner does not open image paths. Exit codes: 0 planned, 2 invalid/refused,
 1 I/O error. Errors contain fixed reasons, never input text, API fault bodies,
 host dates, process output or operating-system error strings.
@@ -285,3 +292,9 @@ host settings. No privileged test is run by the default gate.
 | 7. Development | `default_configuration_cannot_select_development_runner`, feature-only `dev_path_rewriting_uses_only_pinned_directory`, `guest_status_frame_known_answer_and_cap`; owner-only `boots_guest_and_reads_guest_clock` |
 | 8. CLI | `plan_json_is_deterministic_and_never_opens_spec_image_paths`, `validation_and_io_have_distinct_exit_codes_and_no_input_echo`, `non_utf8_arguments_are_refused_without_a_panic`, `spec_json_is_strict_and_bounded_without_echoing_input` |
 | 9. Documentation and release | This README, owner-run instructions above, and `release_lock_matches_owner_supplied_archive_pin` |
+
+Production and development runners now require `HERMETIC_FIRECRACKER_LOCK`
+pointing to a measured patched build lock and verify held executable hashes
+before launch. The stock release pins above are historical inputs. See
+[host filter build and canary](../../docs/clock-3b-host-filter.md) for the pinned
+patch, offline double-build workflow and remaining owner validation.

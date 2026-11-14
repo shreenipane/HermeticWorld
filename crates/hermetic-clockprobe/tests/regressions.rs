@@ -123,7 +123,7 @@ fn small_rtc_divergence_and_hidden_cpu_brand_are_detected() {
     let leaf = CpuidLeafDump {
         leaf: 1,
         subleaf: 0,
-        eax: 0x0004_06f1,
+        eax: 0x0001_06a5,
         ebx: 0,
         ecx: 0,
         edx: 0,
@@ -252,7 +252,7 @@ fn rtc_sources_cannot_hide_a_divergent_clock() {
 }
 
 #[test]
-fn unsupported_frequency_leaf_alias_is_dumped_but_not_interpreted() {
+fn unsupported_frequency_leaf_alias_is_redacted_and_not_interpreted() {
     let max = CpuidLeafDump {
         leaf: 0,
         subleaf: 0,
@@ -271,10 +271,7 @@ fn unsupported_frequency_leaf_alias_is_dumped_but_not_interpreted() {
     };
     let record = classify_cpuid(&[max, aliased], Some(BASELINE_BRAND));
     assert_eq!(record.result, ProbeResult::Blocked);
-    assert!(record
-        .value
-        .unwrap()
-        .contains("0x00000015:0x0=0x00004000:0x00000001:0x00000001:0x00000000"));
+    assert!(record.value.is_none());
 }
 
 #[test]
@@ -291,26 +288,42 @@ fn nominal_frequency_parser_rejects_saturation_and_fractional_zero() {
 }
 
 #[test]
-fn cpuinfo_checks_every_processor_and_rejects_incomplete_later_records() {
-    let baseline = format!("processor: 0\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc\n\n");
-    for later in [
-        "processor: 1\nmodel name: Newer CPU\nflags: fpu tsc\n",
-        &format!("processor: 1\nmodel name: {BASELINE_BRAND}\nflags: fpu avx512_fp16\n"),
+fn unknown_clocksource_and_hypervisor_advertisements_cannot_pass_profile() {
+    assert_eq!(
+        classify_clocksource_sysfs(Some("tsc"), Some("tsc new_host_clock")).result,
+        ProbeResult::Leak
+    );
+    for (leaf, eax, ecx) in [
+        (1, 0x000406f1, 1 << 31),
+        (0x40000000, 0x40000001, 0),
+        (0x40000001, 1 << 24, 0),
+        (0x40000010, 1, 0),
     ] {
-        for text in [format!("{baseline}{later}"), format!("{later}\n{baseline}")] {
-            assert_eq!(classify_cpuinfo(Some(&text)).result, ProbeResult::Leak);
-        }
+        let rec = classify_cpuid(
+            &[CpuidLeafDump {
+                leaf,
+                subleaf: 0,
+                eax,
+                ebx: 0,
+                ecx,
+                edx: 0,
+            }],
+            Some(BASELINE_BRAND),
+        );
+        assert_eq!(rec.result, ProbeResult::Leak, "{leaf:x}");
     }
-    assert_eq!(
-        classify_cpuinfo(Some(&format!("{baseline}processor: 1\nflags: fpu\n"))).result,
-        ProbeResult::Error
-    );
-    assert_eq!(
-        classify_cpuinfo(Some(&baseline.repeat(2))).result,
-        ProbeResult::Blocked
-    );
-    assert_eq!(
-        classify_cpuinfo(Some(&baseline.repeat(MAX_ITEMS + 1))).result,
-        ProbeResult::Error
-    );
+}
+
+#[test]
+fn later_cpu_identity_and_flags_cannot_hide_behind_cpu_zero() {
+    let first = format!("processor: 0\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc\n\n");
+    for second in [
+        "processor: 1\nmodel name: host-secret-sku\nflags: fpu tsc\n".to_string(),
+        format!("processor: 1\nmodel name: {BASELINE_BRAND}\nflags: fpu tsc amx_tile\n"),
+    ] {
+        assert_eq!(
+            classify_cpuinfo(Some(&(first.clone() + &second))).result,
+            ProbeResult::Leak
+        );
+    }
 }

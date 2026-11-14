@@ -315,7 +315,7 @@ impl PreparedJail {
                 != crate::plan::cpu_template()
         {
             return Err(Error::Validation(
-                "CPU template must clear only kvmclock bits",
+                "CPU template must match the sealed clock-3b profile",
             ));
         }
         template.rewind()?;

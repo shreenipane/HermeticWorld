@@ -31,6 +31,7 @@ def test_tree_layout_modes_and_config(tmp_path: Path) -> None:
     assert files == [
         "etc/hermetic/dns.json",
         "etc/hermetic/netvm.json",
+        "etc/hermetic/substrate-bound",
         "sbin/hermetic-busybox",
         "sbin/hermetic-netvm",
     ]

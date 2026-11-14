@@ -514,6 +514,7 @@ name = "hermetic-attest"
 version = "0.1.0"
 dependencies = [
  "hermetic-common",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -534,8 +535,13 @@ dependencies = [
 name = "hermetic-cli"
 version = "0.1.0"
 dependencies = [
+ "hermetic-attest",
+ "hermetic-bundle",
+ "hermetic-clockprobe",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -565,6 +571,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "hermetic-escapeprobe"
+version = "0.1.0"
+dependencies = [
+ "hermetic-netvm-dns",
+ "libc",
 ]
 
 [[package]]
@@ -621,6 +635,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "hermetic-common",
+ "hermetic-sealcheck",
  "hex",
  "serde",
  "serde_json",
@@ -712,6 +727,7 @@ dependencies = [
  "bzip2",
  "clap",
  "flate2",
+ "hermetic-clockprobe",
  "hermetic-common",
  "hex",
  "rusqlite",

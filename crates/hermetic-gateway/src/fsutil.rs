@@ -164,3 +164,94 @@ pub fn open_log_file(dir: &File, name: &str) -> io::Result<File> {
     }
     Ok(file)
 }
+
+/// Atomically replace a regular state file using an exclusive 0600 temporary
+/// file in the held directory. Existing links and special files are refused.
+pub fn write_state_file(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    const MAX_STATE_BYTES: usize = 64 * 1024;
+    const MAX_TEMP_ATTEMPTS: usize = 64;
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || bytes.len() > MAX_STATE_BYTES
+    {
+        return Err(invalid("invalid state file input".into()));
+    }
+    let destination = fd_path(dir, std::ffi::OsStr::new(name));
+    match std::fs::symlink_metadata(&destination) {
+        Ok(meta) if meta.is_file() => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        _ => return Err(invalid("state destination is not a regular file".into())),
+    }
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temporary = fd_path(dir, std::ffi::OsStr::new(&format!(".tmp.state.{attempt}")));
+        if temporary == destination {
+            continue;
+        }
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(flags::O_NOFOLLOW | O_NONBLOCK)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &destination)?;
+            dir.sync_all()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return result;
+    }
+    Err(invalid("state temporary attempts exhausted".into()))
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    #[test]
+    fn state_replace_is_atomic_for_held_readers_and_preserves_external_hardlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = File::open(temp.path()).unwrap();
+        let state = temp.path().join("state.json");
+        std::fs::write(&state, b"old complete record").unwrap();
+        let held = File::open(&state).unwrap();
+        let external = temp.path().join("external");
+        std::fs::hard_link(&state, &external).unwrap();
+        write_state_file(&dir, "state.json", b"new complete record").unwrap();
+        let mut old = Vec::new();
+        held.take(1024).read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old complete record");
+        assert_eq!(std::fs::read(&external).unwrap(), old);
+        assert_eq!(std::fs::read(&state).unwrap(), b"new complete record");
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn state_refuses_escape_names_and_symlinks_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = File::open(temp.path()).unwrap();
+        std::fs::write(temp.path().join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink("secret", temp.path().join("state")).unwrap();
+        for name in ["state", "../outside", "/tmp/outside", "", ".", ".."] {
+            assert!(write_state_file(&dir, name, b"new").is_err());
+        }
+        assert_eq!(
+            std::fs::read(temp.path().join("secret")).unwrap(),
+            b"secret"
+        );
+    }
+}

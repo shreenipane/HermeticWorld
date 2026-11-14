@@ -29,6 +29,30 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-14: 3b full probe passes in the nested VM; Mode H first real run (Phases 3, 3b, 4)
+
+- **Phase:** 3, 3b, 4
+- **Type:** build | measurement | decision
+- **Requirements:** TR-VMM-1, TR-VMM-4, TR-VMM-5, TR-SEC-5
+
+### Done
+- Patched Firecracker 1.18 (host clock filter) built reproducibly with pinned hashes; firecracker `9826f474…`, jailer `276e5bc2…`.
+- Nested ring-0 canary passes on patched Firecracker: all four KVM clock MSRs fault on reads and writes, hypercall 9 returns ENOSYS, pages unchanged. Stock control: all accepted, page changed.
+- Full clock probe in the nested lockdown guest: exit 0, every record blocked except the hypercall record the probe never issues (covered by the canary). Four leaks the probe found were fixed: TSC frequency now only via pinned CPUID 0x15 (no `tsc_early_khz`), KVM-determined CPUID/flag values in the expected profile, jiffies clocksources allowed, kernel-log dates exempt only when listed exactly in a sealed list extracted from the kernel image.
+- Reboot flake fixed in execd (WouldBlock mid-frame, shutdown reply before poweroff): 9/9 reboot smokes since.
+- CodeRabbit reviewed the whole 3b branch: four findings, all fixed with regression tests (exact substrate dates, snapshot-restore CPUID, kernel builder pinned by image ID and never rebuilt, host-filter docs).
+- Mode H: first real agent run on pytest-6202 (free NVIDIA model) inside the sealed VM through the gateway; 60 steps, step limit reached without a patch (unresolved). The gateway stripped the provider's real-date header.
+- Phase 4: preparation work committed (cutoff filters, mirror build, archive replay and search formats, client configs, snapshot formats); npm `dist-tags` reduced to a recomputed `latest`; gateway request deadlines installed before the first accept.
+
+### Measured
+- Nested VM gates: boot, reboot ×3, grader-VM, net and boot+lockdown+full-probe smokes pass on patched Firecracker; Rust and Python gates pass (Python 1809).
+
+### Decisions
+- Owner: V1 includes all of 3b. Mode G uses the owner's subscription. Phase 4: drop post-cutoff npm tags; archived pages stay local-only. 2026-11-15 is reserved for integration.
+
+### Next
+- Integrate guest-lockdown into agent-h and int-day; rerun smokes; push after scans. Phase 4 continues (smart git in NetVM, acquisition, state grading, web archive).
+
 ## 2026-11-13: review-and-fix of every written branch; first real guest kernel build (Phases 1, 2, 3)
 
 - **Phase:** 1, 2, 3

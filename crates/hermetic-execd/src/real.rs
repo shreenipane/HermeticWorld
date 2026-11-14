@@ -2,7 +2,7 @@
 use crate::{
     boot::{Effect, Sys},
     fs::Root,
-    rpc::{ExecReply, Listener},
+    rpc::{Connection, ExecReply, Listener},
     spec::RunSpec,
     sys, *,
 };
@@ -49,54 +49,155 @@ impl Listener for VsockListener {
 }
 
 /// Absolute frame deadlines also bound a peer sending one byte at a time.
-pub struct DeadlineStream {
-    file: File,
+pub struct DeadlineStream(DeadlineSocket<File>);
+
+struct DeadlineSocket<S> {
+    socket: S,
     read_end: Instant,
     write_end: Option<Instant>,
     duration: Duration,
 }
+
+trait Socket {
+    fn ready(&self, end: Instant, events: rustix::event::PollFlags) -> std::io::Result<()>;
+    fn recv(&self, data: &mut [u8]) -> std::io::Result<usize>;
+    fn send(&self, data: &[u8]) -> std::io::Result<usize>;
+}
+
+// Readiness is advisory: the subsequent nonblocking syscall may still report
+// WouldBlock. Neither spurious readiness nor signals may reset the deadline.
+fn deadline_io<T>(
+    end: Instant,
+    mut ready: impl FnMut(Instant) -> std::io::Result<()>,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        if Instant::now() >= end {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let result = ready(end).and_then(|()| {
+            if Instant::now() >= end {
+                Err(std::io::ErrorKind::TimedOut.into())
+            } else {
+                operation()
+            }
+        });
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            other => return other,
+        }
+    }
+}
 impl DeadlineStream {
     pub fn new(file: File, duration: Duration) -> Self {
+        Self(DeadlineSocket::new(file, duration))
+    }
+}
+impl<S> DeadlineSocket<S> {
+    fn new(socket: S, duration: Duration) -> Self {
         Self {
-            file,
+            socket,
             read_end: Instant::now() + duration,
             write_end: None,
             duration,
         }
     }
+}
+impl Socket for File {
     fn ready(&self, end: Instant, events: rustix::event::PollFlags) -> std::io::Result<()> {
         let remaining = end
             .checked_duration_since(Instant::now())
             .ok_or(std::io::ErrorKind::TimedOut)?;
         let timeout = rustix::time::Timespec::try_from(remaining)
             .map_err(|_| std::io::ErrorKind::InvalidInput)?;
-        let mut poll = [rustix::event::PollFd::new(&self.file, events)];
+        let mut poll = [rustix::event::PollFd::new(self, events)];
         if rustix::event::poll(&mut poll, Some(&timeout))? == 0 {
             return Err(std::io::ErrorKind::TimedOut.into());
         }
+        if poll
+            .first()
+            .ok_or(std::io::ErrorKind::InvalidInput)?
+            .revents()
+            .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL)
+        {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
         Ok(())
     }
-}
-impl Read for DeadlineStream {
-    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.ready(self.read_end, rustix::event::PollFlags::IN)?;
-        Ok(rustix::net::recv(&self.file, data, rustix::net::RecvFlags::DONTWAIT)?.0)
+    fn recv(&self, data: &mut [u8]) -> std::io::Result<usize> {
+        Ok(rustix::net::recv(self, data, rustix::net::RecvFlags::DONTWAIT)?.0)
     }
-}
-impl Write for DeadlineStream {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        let end = *self
-            .write_end
-            .get_or_insert_with(|| Instant::now() + self.duration);
-        self.ready(end, rustix::event::PollFlags::OUT)?;
+    fn send(&self, data: &[u8]) -> std::io::Result<usize> {
         Ok(rustix::net::send(
-            &self.file,
+            self,
             data,
             rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
         )?)
     }
+}
+impl<S: Socket> Read for DeadlineSocket<S> {
+    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        deadline_io(
+            self.read_end,
+            |end| self.socket.ready(end, rustix::event::PollFlags::IN),
+            || self.socket.recv(data),
+        )
+    }
+}
+impl<S: Socket> Write for DeadlineSocket<S> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let end = *self
+            .write_end
+            .get_or_insert_with(|| Instant::now() + self.duration);
+        deadline_io(
+            end,
+            |end| self.socket.ready(end, rustix::event::PollFlags::OUT),
+            || self.socket.send(data),
+        )
+    }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl<S: Socket> Connection for DeadlineSocket<S> {
+    fn drain_reply(&mut self) -> std::io::Result<()> {
+        // The host closes its one-request connection after reading the frame.
+        // POLLOUT only promises buffer space, not delivery. Wait for a full
+        // disconnect, or leave the VM alive for the complete bounded linger.
+        // No reads here: pipelined input must not extend the wait or allocate.
+        let end = Instant::now() + Duration::from_millis(REPLY_LINGER_MS);
+        match deadline_io(
+            end,
+            |end| self.socket.ready(end, rustix::event::PollFlags::empty()),
+            || Ok(()),
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(data)
+    }
+}
+impl Write for DeadlineStream {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.write(data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+impl Connection for DeadlineStream {
+    fn drain_reply(&mut self) -> std::io::Result<()> {
+        self.0.drain_reply()
     }
 }
 
@@ -973,7 +1074,7 @@ struct ChildSpec {
 // only when the requested program starts. Every returning path sends failure.
 fn await_startup(file: File, deadline: Instant) -> Result<()> {
     let mut stream = DeadlineStream::new(file, Duration::from_millis(CHILD_START_TIMEOUT_MS));
-    stream.read_end = stream.read_end.min(deadline);
+    stream.0.read_end = stream.0.read_end.min(deadline);
     let failure = |error: std::io::Error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
             Error::Timeout
@@ -1058,6 +1159,185 @@ pub(crate) fn ensure_mountpoint(parent: &OwnedFd, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    struct BackpressuredSocket {
+        sent: RefCell<Vec<u8>>,
+        input: RefCell<std::io::Cursor<Vec<u8>>>,
+        steps: RefCell<std::collections::VecDeque<std::io::Result<usize>>>,
+        end: Cell<Option<Instant>>,
+        polls: Cell<usize>,
+        events: rustix::event::PollFlags,
+    }
+    impl Socket for BackpressuredSocket {
+        fn ready(&self, end: Instant, events: rustix::event::PollFlags) -> std::io::Result<()> {
+            assert_eq!(events, self.events);
+            if let Some(original) = self.end.replace(Some(end)) {
+                assert_eq!(end, original);
+            }
+            self.polls.set(self.polls.get() + 1);
+            Ok(())
+        }
+        fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = self
+                .steps
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(bytes.len()))?;
+            let length = n.min(bytes.len());
+            self.input
+                .borrow_mut()
+                .read(bytes.get_mut(..length).unwrap())
+        }
+        fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
+            let n = self
+                .steps
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(bytes.len()))?;
+            let bytes = bytes.get(..n.min(bytes.len())).unwrap();
+            self.sent.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn reboot_smoke_frame_write_repolls_after_mid_frame_would_block_without_losing_bytes() {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        let socket = BackpressuredSocket {
+            sent: RefCell::default(),
+            input: RefCell::default(),
+            steps: [
+                Ok(2),
+                Err(WouldBlock.into()),
+                Ok(2),
+                Ok(3),
+                Err(WouldBlock.into()),
+                Err(Interrupted.into()),
+                Ok(1),
+            ]
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>()
+            .into(),
+            end: Cell::new(None),
+            polls: Cell::new(0),
+            events: rustix::event::PollFlags::OUT,
+        };
+        let mut stream = DeadlineSocket::new(socket, Duration::from_secs(5));
+        crate::rpc::write_frame(&crate::rpc::Reply::Frozen, &mut stream).unwrap();
+        assert_eq!(
+            *stream.socket.sent.borrow(),
+            b"\x11\0\0\0{\"type\":\"frozen\"}"
+        );
+        assert_eq!(stream.socket.polls.get(), 8);
+        assert!(stream.socket.steps.borrow().is_empty());
+    }
+
+    #[test]
+    fn reboot_smoke_frame_read_repolls_after_mid_frame_would_block_without_losing_bytes() {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        let socket = BackpressuredSocket {
+            sent: RefCell::default(),
+            input: RefCell::new(std::io::Cursor::new(
+                b"\x11\0\0\0{\"type\":\"status\"}".to_vec(),
+            )),
+            steps: [
+                Ok(2),
+                Err(WouldBlock.into()),
+                Ok(2),
+                Ok(3),
+                Err(WouldBlock.into()),
+                Err(Interrupted.into()),
+                Ok(1),
+            ]
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>()
+            .into(),
+            end: Cell::new(None),
+            polls: Cell::new(0),
+            events: rustix::event::PollFlags::IN,
+        };
+        let mut stream = DeadlineSocket::new(socket, Duration::from_secs(5));
+        let request = crate::rpc::read_frame::<crate::rpc::Request>(&mut stream).unwrap();
+        assert_eq!(request, crate::rpc::Request::Status {});
+        assert_eq!(stream.socket.polls.get(), 8);
+        assert!(stream.socket.steps.borrow().is_empty());
+    }
+
+    #[test]
+    fn reboot_smoke_advisory_readiness_and_signals_cannot_extend_io_deadlines() {
+        use std::io::ErrorKind;
+        for transient in [ErrorKind::WouldBlock, ErrorKind::Interrupted] {
+            let polls = Cell::new(0);
+            let end = Instant::now() + Duration::from_secs(5);
+            let error = deadline_io::<usize>(
+                end,
+                |deadline| {
+                    assert_eq!(deadline, end);
+                    polls.set(polls.get() + 1);
+                    if polls.get() == 3 {
+                        Err(ErrorKind::TimedOut.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Err(transient.into()),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert_eq!(polls.get(), 3);
+        }
+        let expired = Instant::now();
+        assert_eq!(
+            deadline_io::<usize>(
+                expired,
+                |_| panic!("poll after deadline"),
+                || panic!("I/O after deadline")
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::TimedOut
+        );
+        let polls = Cell::new(0);
+        let value = deadline_io(
+            Instant::now() + Duration::from_secs(5),
+            |_| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 1 {
+                    Err(ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(7),
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn reboot_smoke_shutdown_linger_requires_full_disconnect_or_waits_its_bounded_cap() {
+        let (local, peer) = startup_pair();
+        let mut stream = DeadlineStream::new(local, Duration::from_millis(FRAME_TIMEOUT_MS));
+        crate::rpc::write_frame(&crate::rpc::Reply::Frozen, &mut stream).unwrap();
+        // Pipelined input and a write-half-close do not acknowledge reading.
+        rustix::net::send(&peer, b"x", rustix::net::SendFlags::NOSIGNAL).unwrap();
+        rustix::net::shutdown(&peer, rustix::net::Shutdown::Write).unwrap();
+        let start = Instant::now();
+        stream.drain_reply().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(REPLY_LINGER_MS));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let mut peer = peer;
+        assert_eq!(
+            crate::rpc::read_frame::<crate::rpc::Reply>(&mut peer).unwrap(),
+            crate::rpc::Reply::Frozen
+        );
+        drop(peer);
+        // A completed one-request peer may disconnect without consuming the
+        // whole linger; there is no second request/read deadline to wait for.
+        stream.drain_reply().unwrap();
+    }
 
     #[test]
     fn devtmpfs_mountpoints_are_created_without_following_links() {

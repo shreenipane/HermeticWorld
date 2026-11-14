@@ -50,7 +50,13 @@ impl Outcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
-    NotWired { operation: &'static str },
+    NotWired {
+        operation: &'static str,
+    },
+    /// Backend not available on this build; fixed fail-closed message (exit 70).
+    Unavailable(&'static str),
+    /// Input data refused (exit 65).
+    Data(String),
     ProblemFound(String),
     Io(String),
     Internal(String),
@@ -60,7 +66,10 @@ impl BackendError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::ProblemFound(_) => EXIT_PROBLEM_FOUND,
-            Self::NotWired { .. } | Self::Internal(_) => EXIT_INTERNAL_OR_NOT_IMPLEMENTED,
+            Self::NotWired { .. } | Self::Unavailable(_) | Self::Internal(_) => {
+                EXIT_INTERNAL_OR_NOT_IMPLEMENTED
+            }
+            Self::Data(_) => EXIT_DATA_ERROR,
             Self::Io(_) => EXIT_IO_ERROR,
         }
     }
@@ -72,6 +81,8 @@ impl fmt::Display for BackendError {
             Self::NotWired { operation } => {
                 write!(f, "backend operation '{operation}' is not yet wired")
             }
+            Self::Unavailable(msg) => write!(f, "not available: {msg}"),
+            Self::Data(msg) => write!(f, "invalid input: {msg}"),
             Self::ProblemFound(msg) => f.write_str(msg),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),

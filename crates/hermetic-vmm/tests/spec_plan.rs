@@ -163,7 +163,8 @@ fn all_roles_attach_entropy_and_template_without_metadata_or_balloon() {
 }
 #[test]
 fn template_changes_exactly_leaf_eax_bits_zero_and_three() {
-    let file: Value = serde_json::from_str(plan::CPU_TEMPLATE).unwrap();
+    let file: Value =
+        serde_json::from_str(include_str!("../../../vmm/hide-kvmclock.cpu-template.json")).unwrap();
     assert_eq!(
         file,
         json!({
@@ -476,4 +477,63 @@ fn grader_drive_layout_requires_writable_result_first_and_read_only_others() {
     assert!(requests
         .iter()
         .all(|r| r.path != "/vsock" && !r.path.starts_with("/network")));
+}
+
+// The lockdown guest has no PV clock or legacy timers; without the VMM-owned
+// tsc_early_khz it stalls in TSC calibration (nested-VM boot, 2026-11-14).
+#[test]
+fn tsc_early_khz_is_vmm_owned_and_bounded() {
+    use hermetic_vmm::plan::{tsc_khz_from_leaf15, with_tsc_khz};
+    assert_eq!(tsc_khz_from_leaf15(2, 140, 38_400_000), Some(2_688_000));
+    for (a, b, c) in [
+        (0, 140, 38_400_000),
+        (2, 0, 38_400_000),
+        (2, 140, 0),
+        (1, 1, 1000),
+    ] {
+        assert_eq!(tsc_khz_from_leaf15(a, b, c), None);
+    }
+    let base = "clocksource=tsc tsc=reliable hermetic.t=1700000000 ro";
+    validate_boot_args(&format!("{base} tsc_early_khz=2688000")).unwrap();
+    for bad in ["0", "02688000", "99999", "10000001", "", "2688000x", "-1"] {
+        assert!(
+            validate_boot_args(&format!("{base} tsc_early_khz={bad}")).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(validate_boot_args(&format!(
+        "{base} tsc_early_khz=2688000 tsc_early_khz=2688000"
+    ))
+    .is_err());
+    let mut s = spec(Role::Agent);
+    s.boot_args.push_str(" tsc_early_khz=2688000");
+    assert!(s.validate().is_err(), "specs must not set tsc_early_khz");
+    let reqs: Vec<_> = api_requests(&spec(Role::Agent).validate().unwrap())
+        .into_iter()
+        .map(|r| with_tsc_khz(r, 2_000_000).unwrap())
+        .collect();
+    let boot = reqs.iter().find(|r| r.path == "/boot-source").unwrap();
+    let args = boot.body["boot_args"].as_str().unwrap();
+    validate_boot_args(args).unwrap();
+    assert!(reqs
+        .iter()
+        .all(|r| !r.body.to_string().contains("tsc_early_khz")));
+}
+
+#[test]
+fn tsc_khz_resolution_prefers_cpuid_and_fails_closed() {
+    use hermetic_vmm::plan::resolve_tsc_khz;
+    assert_eq!(resolve_tsc_khz(Some(2_688_000), None).unwrap(), 2_688_000);
+    assert_eq!(
+        resolve_tsc_khz(Some(2_688_000), Some("3000000")).unwrap(),
+        2_688_000
+    );
+    assert_eq!(resolve_tsc_khz(None, Some("2688000")).unwrap(), 2_688_000);
+    assert!(resolve_tsc_khz(None, None).is_err());
+    for bad in ["", "0", "2.688", "99999", "abc"] {
+        assert!(
+            resolve_tsc_khz(Some(2_688_000), Some(bad)).is_err(),
+            "{bad}"
+        );
+    }
 }

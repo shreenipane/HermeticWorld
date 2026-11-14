@@ -13,7 +13,8 @@ use std::path::{Component, Path, PathBuf};
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_COMPONENTS: usize = 64;
 pub const MAX_SYMLINKS: usize = 32;
-pub const MAX_DIR_ENTRIES: usize = 512;
+/// Bounded, but above a lockdown guest's /dev: 256 legacy PTY pairs alone are 512 nodes.
+pub const MAX_DIR_ENTRIES: usize = 4096;
 // Linux x86_64 UAPI asm-generic/fcntl.h. No arbitrary devices are opened.
 const O_NOFOLLOW: i32 = 0o400000;
 const O_DIRECTORY: i32 = 0o200000;
