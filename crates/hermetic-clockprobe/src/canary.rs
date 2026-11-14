@@ -29,8 +29,12 @@ pub fn inspect(serial: &[u8]) -> ProbeRecord {
         return error();
     };
     let mut found = BTreeSet::new();
-    for line in text.lines() {
-        if let Some((_, payload)) = line.split_once("hermetic-canary/v1 ") {
+    for line in text.split_inclusive('\n') {
+        if let Some((_, payload)) = line.split_once("hermetic-canary/v1") {
+            let Some(payload) = payload.strip_prefix(' ').and_then(|p| p.strip_suffix('\n')) else {
+                return error();
+            };
+            let payload = payload.strip_suffix('\r').unwrap_or(payload);
             if !EXPECTED.contains(&payload) {
                 return ProbeRecord::new(
                     "kernel_canary",

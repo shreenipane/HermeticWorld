@@ -97,3 +97,18 @@ fn cpuinfo_rejects_features_above_the_fixed_v2_ceiling() {
         ProbeResult::Blocked
     );
 }
+
+#[test]
+fn documented_cpu_register_baseline_matches_guest_checker() {
+    let guide = include_str!("../../../docs/clock-3b-analysis.md");
+    for row in [
+        format!("| CPUID.1 EAX | `0x{:08x}` |", baseline::SIGNATURE),
+        format!("| CPUID.1 ECX | `0x{:08x}` |", baseline::FEATURES_ECX),
+        format!(
+            "| CPUID.1 EDX (one vCPU) | `0x{:08x}` |",
+            baseline::FEATURES_EDX
+        ),
+    ] {
+        assert!(guide.contains(&row), "documented baseline differs: {row}");
+    }
+}

@@ -13,7 +13,7 @@ Tick items off here as they land, and log each one in [BUILD_LOG.md](BUILD_LOG.m
 | 1 | sealcheck | Laptop (no KVM) | E3 targets met; leak report on one public benchmark, disclosed privately | In progress |
 | 2 | World | Any Linux box | E4 ≥ 99%; E2 Track A on the paired subset; E10 | Not started |
 | 3 | VMs | Linux x86 + KVM | E1, E8, E9 | Not started |
-| 3b | Clock hiding (host filter required in v1) | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Host patch and offline checks prepared; owner build/VM validation pending |
+| 3b | Clock hiding (host filter required in v1) | Linux x86 + KVM | Probe passes → `clock: hidden` (else ship `faked`) | Reproducible build and nested ring-0 canary/control verified; remaining runtime validation pending |
 | 4 | Extensions | Linux x86 + KVM | E2 Track B; E5 | Not started |
 
 ```
@@ -232,8 +232,9 @@ until deployment validation passes.
 - [x] Host filtering is v1: pinned Firecracker 1.18 patch denies both directions of all clock MSRs, enables PV CPUID enforcement on boot/restore and intercepts pairing through Xen; unsupported hosts fail closed. Source research: docs/clock-3b-host-filter.md.
 - [x] Offline double-build wrapper, measured build-lock and real-runner executable verification; source/patch pins and failure regressions.
 - [x] Opt-in built-in ring-0 canary patch/config and bounded serial validator; no VM run during review.
-- [ ] Owner: prepare the immutable Rust 1.97.0/vendor builder, compile full Firecracker and canary, measure patched hashes, verify CONFIG_KVM_XEN and interception capability on host 7.0.
-- [ ] Owner: nested-VM negative controls and ring-0 canary on cold boot, multiple vCPUs and snapshot restore; stock smokes cannot certify v1.
+- [x] Owner: immutable Rust 1.97.0/vendor builder, full Firecracker and canary compilation, reproducible patched hashes, and nested Xen interception verified on 2026-11-14; base recipe and measurements in docs/clock-3b-host-filter.md.
+- [x] Owner: nested ring-0 canary faults on all four MSRs on reads/writes, hypercall 9 returns ENOSYS, pages unchanged, result=pass; stock control accepts all four MSRs, changes page, result=fail.
+- [ ] Owner: multiple vCPUs, pause/resume, snapshot restore and deployment-host configuration audit; the completed nested test does not certify these paths.
 - [ ] Check TSC stability without kvmclock
 - [ ] Add the eighth check to `clock-leak-probe.md`: the hypercall from a guest kernel module
 - [ ] Run the probe, plus a control run on unpatched Firecracker

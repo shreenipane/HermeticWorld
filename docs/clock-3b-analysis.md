@@ -22,6 +22,20 @@ RDSEED, PMU and all structured feature extensions are absent. Virtio entropy
 remains available. Very early cutoffs still require the substrate exemption in
 the architecture; CPUID cannot suppress instruction or cache timing attacks.
 
+The guest identity check requires these register values exactly:
+
+| Register | Pinned value |
+| --- | --- |
+| CPUID.1 EAX | `0x000106a5` |
+| CPUID.1 ECX | `0x00982201` |
+| CPUID.1 EDX (one vCPU) | `0x078bfbff` |
+
+For multiple vCPUs, only EDX bit 28 (HTT) is added to the feature registers;
+the topology fields also reflect the bounded guest count and index. Vendor
+bytes must spell `GenuineIntel`. Every other register, including extended
+feature flags, must match `vmm/cpu-baseline.rs`; an allowlist subset is
+insufficient for the `cpuid` result.
+
 Basic/extended maximum leaves, 36-bit physical and 48-bit virtual addresses,
 32 KiB L1 instruction/data caches, 256 KiB L2, no L3, and feature flags are fixed.
 Topology describes one thread per core in one package; only the bounded vCPU
@@ -93,5 +107,7 @@ channels. This patch does not claim to eliminate them.
 Offline tests cover fixed-register known answers, all vCPU positions,
 per-register mutations, invalid topology, host feature rejection, snapshot
 mutation rejection, immutable builder/source/patch pins and launch paths. The
-full pinned-container build, ring-0 canary and negative controls on the owner's
-actual host remain required before changing the advertised clock level.
+manager verified the full reproducible pinned-container build, nested ring-0
+canary and stock negative control on 2026-11-14; measurements and results are in
+the host filtering guide. Multiple vCPUs, pause/resume, snapshot restore and TSC
+stability remain required before changing the advertised clock level.

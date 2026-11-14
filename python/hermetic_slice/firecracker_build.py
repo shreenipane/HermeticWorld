@@ -89,8 +89,9 @@ def source_files(archive: bytes) -> dict[str, bytes]:
                     files[str(PurePosixPath(*path.parts[1:]))] = data
         if 'Cargo.lock' not in files or 'rust-toolchain.toml' not in files:
             raise k.KernelError('missing source build inputs')
-        for name in files:
-            if any(str(parent) in files for parent in PurePosixPath(name).parents):
+        for name in seen:
+            relative = PurePosixPath(*PurePosixPath(name).parts[1:])
+            if any(str(parent) in files for parent in relative.parents):
                 raise k.KernelError('source file used as a directory')
     except (tarfile.TarError, EOFError, OSError):
         raise k.KernelError('invalid source archive') from None
@@ -152,31 +153,41 @@ def docker_arguments(image: str, work: Path) -> list[str]:
             '--entrypoint=/bin/sh', image, '-c', BUILD_COMMAND]
 
 
+def _run_process(argv: list[str], timeout: int) -> int:
+    # Popen.__exit__ and subprocess.run's timeout cleanup wait without a
+    # deadline. Keep both the initial wait and forced reaping bounded.
+    process = subprocess.Popen(argv, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=BUILD_CLEANUP_TIMEOUT_SECONDS)
+        raise
+
+
 def run(argv: list[str]) -> None:
     try:
-        with subprocess.Popen(argv, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
-                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, start_new_session=True) as process:
-            try:
-                status = process.wait(timeout=BUILD_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=BUILD_CLEANUP_TIMEOUT_SECONDS)
-                # The daemon owns the container; killing its client alone does
-                # not stop a build or release its mounts.
-                name = argv[argv.index('--name') + 1]
-                subprocess.run(argv[:3] + ['rm', '--force', name],
-                               env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=BUILD_CLEANUP_TIMEOUT_SECONDS, check=True)
+        try:
+            status = _run_process(argv, BUILD_TIMEOUT_SECONDS)
+            if status:
+                raise k.KernelError('Firecracker build failed')
+        except BaseException as error:
+            # The daemon owns the container; killing its client alone does
+            # not stop a build or release its mounts. Remove it even when
+            # the client cannot be reaped within the cleanup deadline.
+            name = argv[argv.index('--name') + 1]
+            if _run_process(argv[:3] + ['rm', '--force', name], BUILD_CLEANUP_TIMEOUT_SECONDS):
+                raise k.KernelError('Firecracker build cleanup failed') from None
+            if isinstance(error, subprocess.TimeoutExpired):
                 raise k.KernelError('Firecracker build timed out') from None
+            raise
     except OSError:
         raise k.KernelError('Firecracker build unavailable') from None
-    if status:
-        raise k.KernelError('Firecracker build failed')
 
 
 def held_directory_path(fd: int) -> Path:
@@ -201,7 +212,7 @@ def build(tarball: Path, image: str, output: Path, *, runner=run) -> None:
         raise k.KernelError('absolute fresh output path required')
     # Hold the parent throughout staging and publication. The private directory
     # prevents pathname replacement by another guest or local user.
-    with k.directory(output.parent) as parent:
+    with k.directory(output.parent, trusted=True) as parent:
         if os.stat(parent).st_mode & 0o022:
             raise k.KernelError('output parent must be private')
         try:

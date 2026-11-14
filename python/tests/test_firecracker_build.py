@@ -199,9 +199,16 @@ def test_build_timeout_removes_daemon_container_before_return(monkeypatch):
                 calls.append('timed out')
                 raise subprocess.TimeoutExpired('docker', timeout)
             return -9
-    monkeypatch.setattr(f.subprocess, 'Popen', lambda *a, **kw: Process())
+    def launch(argv, **kwargs):
+        if argv[3] != 'rm':
+            return Process()
+        class Cleanup:
+            def wait(self, timeout):
+                calls.append(('remove', argv, {**kwargs, 'timeout': timeout}))
+                return 0
+        return Cleanup()
+    monkeypatch.setattr(f.subprocess, 'Popen', launch)
     monkeypatch.setattr(f.os, 'killpg', lambda pid, sig: calls.append(('kill', pid)))
-    monkeypatch.setattr(f.subprocess, 'run', lambda argv, **kw: calls.append(('remove', argv, kw)))
     argv = f.docker_arguments('sha256:' + 'a' * 64, Path('/work/build/0'))
     with pytest.raises(k.KernelError, match='timed out'):
         f.run(argv)
@@ -209,6 +216,56 @@ def test_build_timeout_removes_daemon_container_before_return(monkeypatch):
     assert calls[-1][1] == argv[:3] + ['rm', '--force', argv[argv.index('--name') + 1]]
     assert calls[-1][2]['timeout'] <= 30
     assert calls[-1][2]['env'] == {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+
+
+@pytest.mark.parametrize('removal_stalls', [False, True])
+def test_reap_timeout_still_removes_container_without_unbounded_context_wait(monkeypatch, removal_stalls):
+    import subprocess
+    calls = []
+    class Process:
+        pid = 1234
+        def __enter__(self): return self
+        def __exit__(self, *args):
+            pytest.fail('Popen context cleanup can wait without a deadline')
+        def wait(self, timeout):
+            calls.append(('wait', timeout))
+            raise subprocess.TimeoutExpired('docker', timeout)
+    def launch(argv, **kwargs):
+        if argv[3] != 'rm':
+            return Process()
+        class Cleanup(Process):
+            def wait(self, timeout):
+                calls.append(('remove', argv, {**kwargs, 'timeout': timeout}))
+                if removal_stalls:
+                    raise subprocess.TimeoutExpired('docker rm', timeout)
+                return 0
+        return Cleanup()
+    monkeypatch.setattr(f.subprocess, 'Popen', launch)
+    monkeypatch.setattr(f.os, 'killpg', lambda pid, sig: calls.append(('kill', pid)))
+    argv = f.docker_arguments('sha256:' + 'a' * 64, Path('/work/build/0'))
+    with pytest.raises((k.KernelError, subprocess.TimeoutExpired)):
+        f.run(argv)
+    removal = next(call for call in calls if call[0] == 'remove')
+    assert removal[1] == argv[:3] + ['rm', '--force', argv[argv.index('--name') + 1]]
+    assert removal[2]['timeout'] == f.BUILD_CLEANUP_TIMEOUT_SECONDS
+    assert [call[1] for call in calls if call[0] == 'wait'] == [
+        f.BUILD_TIMEOUT_SECONDS, f.BUILD_CLEANUP_TIMEOUT_SECONDS]
+    assert sum(call[0] == 'remove' for call in calls) == (2 if removal_stalls else 1)
+
+
+def test_failed_client_removes_daemon_container(monkeypatch):
+    calls = []
+    def client(argv, timeout):
+        calls.append((argv, timeout))
+        return 1 if len(calls) == 1 else 0
+    monkeypatch.setattr(f, '_run_process', client)
+    argv = f.docker_arguments('sha256:' + 'a' * 64, Path('/work/build/0'))
+    with pytest.raises(k.KernelError, match='build failed'):
+        f.run(argv)
+    assert calls == [
+        (argv, f.BUILD_TIMEOUT_SECONDS),
+        (argv[:3] + ['rm', '--force', argv[argv.index('--name') + 1]],
+         f.BUILD_CLEANUP_TIMEOUT_SECONDS)]
 
 
 def test_target_tmpfs_allows_build_scripts_to_execute():
@@ -245,3 +302,38 @@ def test_held_parent_resolves_to_real_path_not_proc_magic_link(tmp_path):
             fb.held_directory_path(fd)
     finally:
         os.close(fd)
+
+
+def test_output_ancestry_must_prevent_untrusted_rename(inputs):
+    tarball, image, output = inputs
+    shared = output.parent / 'shared'
+    shared.mkdir()
+    shared.chmod(0o777)
+    private = shared / 'private'
+    private.mkdir(mode=0o700)
+    with pytest.raises(k.KernelError):
+        f.build(tarball, image, private / 'result', runner=fake_runner)
+    assert list(private.iterdir()) == []
+
+
+def test_archive_rejects_directory_under_regular_file_before_staging():
+    member = tarfile.TarInfo('firecracker-1.18.0/Cargo.lock/child')
+    member.type = tarfile.DIRTYPE
+    with pytest.raises(k.KernelError):
+        f.source_files(tar_bytes(member))
+
+
+def test_verified_base_recipe_pins_toolchain_packages_and_musl_headers():
+    recipe = (Path(__file__).resolve().parents[2] / 'vmm/firecracker-base.Dockerfile').read_text()
+    lines = recipe.replace('\\\n', ' ').splitlines()
+    assert 'FROM rust@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073' in lines
+    install = next(line for line in lines if line.startswith('RUN apt-get'))
+    packages = install.split('apt-get install -y --no-install-recommends', 1)[1].split('&&', 1)[0].split()
+    assert packages == ['musl-tools', 'cmake', 'patch', 'clang', 'libclang-dev', 'linux-libc-dev', 'libseccomp-dev']
+    for name, source in [('linux', '/usr/include/linux'), ('asm', '/usr/include/x86_64-linux-gnu/asm'),
+                         ('asm-generic', '/usr/include/asm-generic')]:
+        assert f'ln -s {source} /usr/include/x86_64-linux-musl/{name}' in install
+    toolchain = next(line for line in lines if line.startswith('RUN rustup'))
+    assert 'rustup toolchain install 1.97.0 --profile minimal --component rustfmt' in toolchain
+    assert '--target x86_64-unknown-linux-musl' in toolchain
+    assert 'rustup default 1.97.0' in toolchain

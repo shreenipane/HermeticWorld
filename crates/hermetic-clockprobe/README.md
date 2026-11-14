@@ -2,8 +2,10 @@
 
 Std-only guest diagnostic for Phase 3b. Run as root in the intended
 x86_64 Linux guest, before handing it to an adversary. Never run the real probes
-on the host: their purpose is to collect potentially sensitive guest-visible
-clock and CPU evidence for the manager. Fixed order and JSON escaping are
+on the host: their purpose is to classify guest-visible clock and CPU evidence
+for the manager. Records contain fixed reasons and availability markers;
+sampled clocks, dates, CPU registers, model strings and filesystem text are
+never echoed. Fixed order and JSON escaping are
 deterministic; hardware/time samples themselves are observations, not reproducible
 constants. The binary writes only JSON lines to stdout; I/O errors use fixed text.
 
@@ -51,11 +53,11 @@ become `error`, never `blocked`. Optional absence and log-access denial are dist
 | clock_pairing_hc | Inspect PTP names; always `unavailable` without a safe successful clock-pairing read. Device presence is not success. No raw hypercall is issued. |
 | rtc_sysfs_dev / proc_driver_rtc | Compare parsed date against hermetic.t + guest uptime (60 s tolerance); absent interfaces are `blocked`; malformed proc dates are `error`. Device-only RTC access is `unavailable` pending a safe RTC_RD_TIME wrapper. |
 | hpet | Legacy timer presence is `unavailable`, not proof of wall time/host uptime. No exposed timers is `blocked` for the inspected interfaces. |
-| dmesg_dates | Scan bounded kernel records for all recognized calendar dates, including build banners; report `leak` outside T_clock ±1 day. Output dates only, never log text. Missing access is `unavailable`. A pinned substrate banner may require manual triage. This is not a general secret/string detector. |
+| dmesg_dates | Scan bounded kernel records for all recognized calendar dates, including build banners; report `leak` outside T_clock ±1 day. Echo neither dates nor log text. Missing access is `unavailable`. A pinned substrate banner may require manual triage. This is not a general secret/string detector. |
 | clocksource_sysfs | Current source other than tsc or unexpected available sources is a profile `leak`; missing/failed reads are `error`. Source names alone do not prove UTC disclosure. |
 | posix_clocks | Read std realtime and proc boottime. Realtime divergence >60 s is `leak`; missing reference is `error`; otherwise `unavailable` because std exposes neither raw CLOCK_TAI nor absolute CLOCK_MONOTONIC. Never invent substitutes. |
 | vmclock | Inspect /dev, PTP and ACPI IDs (AMZNC10C/VMCLOCK). A character interface without an ABI/content read is `unavailable`; absence is `blocked` for those inspected paths. |
-| cpuinfo | Record model and flags; model differing from the fixed baseline or flags outside the explicit baseline allowlist is a profile `leak`; missing/invalid input is `error`. |
+| cpuinfo | Check model and flags without echoing them; model differing from the fixed baseline or flags outside the explicit baseline allowlist is a profile `leak`; missing/invalid input is `error`. |
 
 Exit 2 if any record is `leak`, else 1 if any is `error`, else 0.
 **Exit 0 with `unavailable` is an incomplete diagnostic, not a hidden-clock pass.**

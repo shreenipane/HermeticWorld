@@ -267,7 +267,7 @@ fn probe_posix(proc: &Root, expected: Option<u64>) -> io::Result<ProbeRecord> {
         return Ok(error("posix_clocks"));
     };
     let leaked = (rt - t as f64 - boot).abs() > classify::CLOCK_TOLERANCE_SECONDS;
-    Ok(ProbeRecord::new("posix_clocks",if leaked { ProbeResult::Leak } else { ProbeResult::Unavailable },Some(format!("realtime={rt:.3},boottime={boot:.3}")),"Realtime checked against hermetic.t and guest boottime; CLOCK_MONOTONIC and CLOCK_TAI require an approved safe syscall wrapper"))
+    Ok(ProbeRecord::new("posix_clocks",if leaked { ProbeResult::Leak } else { ProbeResult::Unavailable },None,"Realtime checked against hermetic.t and guest boottime; CLOCK_MONOTONIC and CLOCK_TAI require an approved safe syscall wrapper"))
 }
 fn uptime(proc: &Root) -> io::Result<f64> {
     let text = proc.text("uptime", MAX_SMALL_FILE_BYTES)?;

@@ -10,8 +10,10 @@ on every x86 KVM VM. Unsupported hosts fail startup; there is no stock fallback.
 ## Source findings
 
 These are source checks against upstream Linux **v7.0**, not an attestation of
-the running host. The owner supplied `uname -r = 7.0`; its build configuration,
-downstream patches, capability results and nested execution remain **unverified**.
+the running host. The owner supplied `uname -r = 7.0`; its build configuration
+and downstream patches are not independently attested. The manager has verified
+the patched build and nested ring-0 canary, including a stock negative control,
+as recorded below. Multi-vCPU, pause/resume and restore coverage remain open.
 The inspected `arch/x86/kvm/x86.c` SHA256 was
 `d5dfe2e58060f8ef4c731cb8433617e8d28115d9e559cee1563ec1b9813746c7`.
 Firecracker source is v1.18.0, commit
@@ -78,18 +80,37 @@ patched build inputs; they never masquerade as a measured patched binary hash.
 
 Fetch the source URL in that lock to `source.tar.gz` and verify its SHA256 before
 preparing a builder. Source fetch and builder preparation are the online phase.
-Use `vmm/firecracker-builder.Dockerfile` with an operator-selected **digest-pinned**
-base containing Rust 1.97.0, the x86_64 musl target/toolchain, C/C++ tools, cmake,
-make and patch. The Dockerfile fetches only Cargo.lock-pinned dependencies into
+Build `vmm/firecracker-base.Dockerfile` for the verified base recipe: it starts at
+`rust@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073`,
+installs `musl-tools cmake patch clang libclang-dev linux-libc-dev libseccomp-dev`,
+links the linux/asm/asm-generic headers into the musl include directory, and
+installs Rust 1.97.0 with rustfmt and the x86_64-unknown-linux-musl target.
+Pass the resulting digest-pinned base to `vmm/firecracker-builder.Dockerfile`.
+That Dockerfile fetches only Cargo.lock-pinned dependencies into
 `/vendor`; retain the resulting local immutable `sha256:` image ID. The image
-must support non-root builds. No builder digest or binary hash is invented here.
+must support non-root builds. Package repositories are used only during online
+preparation; rebuilding this recipe later may produce a different image ID.
+Use the measured immutable image ID for the offline build.
+
+**Verified by the manager (2026-11-14):** the full patched build completed with
+this base and toolchain, and the two builds were byte-for-byte reproducible:
+
+| Artifact | Measured SHA256 |
+| --- | --- |
+| Final vendored builder image | `1c040b0c5ada03792b5696a2c8f837e07c86645018a436c3a57af828505a2caf` |
+| Firecracker | `8dae26b13769d055ecf64b0318853335e0e0cda84b7bab3fa0c1324d5252686b` |
+| Jailer | `276e5bc2a17fbb23e5478f6bb245697f99e8c84426cbcf7f2700d8958674518b` |
+
+These measurements document the manager's build. Continue to use its measured
+`firecracker.lock.json` with the runners; a different build must measure its own
+artifacts and pass the same reproducibility and runtime checks.
 
 Then build without network, using a private parent and fresh output directory:
 
 ```sh
 mkdir -m 700 "$PWD/.scratch/fc-builds"
 scripts/integration/build-firecracker.sh \
-  "$PWD/source.tar.gz" sha256:ACTUAL_BUILDER_IMAGE_ID \
+  "$PWD/source.tar.gz" sha256:1c040b0c5ada03792b5696a2c8f837e07c86645018a436c3a57af828505a2caf \
   "$PWD/.scratch/fc-builds/patched"
 export HERMETIC_FIRECRACKER_LOCK="$PWD/.scratch/fc-builds/patched/firecracker.lock.json"
 export HERMETIC_FC_BIN="$PWD/.scratch/fc-builds/patched/firecracker"
@@ -157,7 +178,15 @@ or changed evidence. Run controls on stock Firecracker: at least accepted MSRs
 or a successful pairing/page change must be observed; non-TSC host clocks may
 make pairing unsupported in a control, which is not sufficient evidence of an
 interceptor. Also test multiple vCPUs, pause/resume and snapshot restore on the
-owner's actual host. No VM was run during this review.
+owner's actual host.
+
+**Verified by the manager (2026-11-14):** the nested canary produced all six
+expected payloads above: all four MSRs faulted on both RDMSR and WRMSR,
+hypercall 9 returned ENOSYS, every sentinel page remained unchanged, and
+`result=pass`. The stock Firecracker control accepted all four MSRs on reads
+and writes, changed the sentinel page, and reported `result=fail`.
+This verifies the tested nested enforcement path and its negative control;
+it does not establish coverage of other hosts or restore paths.
 
 ## Validation and open items
 
@@ -173,10 +202,15 @@ the canary option. These simulations perform no privileged instructions.
 No dependencies were added to the project or upstream
 Firecracker manifests. The canary patch is provided for manager builds.
 
-**OPEN:** full patched Firecracker/canary compilation with the pinned builder,
-measured artifact lock, actual host Xen capability/configuration, negative
-controls and nested-VM ring-0/restore tests. These require owner-provided builder
-and host resources. The module-only compilation is not a full VMM build or a
-runtime security proof. CPU identity and TSC scaling are implemented in this patch set; deployment
-capability and runtime validation remain manager checks. AMD hosts fail closed.
+**VERIFIED (manager):** full patched Firecracker and canary compilation, the
+measured reproducible artifacts above, nested ring-0 MSR/hypercall enforcement,
+and the stock Firecracker negative control. The successful nested run exercised
+Xen interception on that tested host configuration.
+
+**OPEN:** independent deployment-host configuration/downstream-interface audit,
+multiple vCPUs, pause/resume, snapshot restore and TSC stability. These require
+manager host resources. The completed build and nested canary do not establish
+the whole runtime security boundary. CPU identity and TSC scaling are implemented
+in this patch set; their remaining deployment validation stays a manager check.
+AMD hosts fail closed.
 See `clock-3b-analysis.md` for the baseline and substrate limits.

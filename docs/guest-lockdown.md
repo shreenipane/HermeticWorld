@@ -58,7 +58,8 @@ Host filtering is now required in v1 (owner decision 2026-11-14). The pinned
 patch, Linux 7.0 source findings, offline builder and manager-only ring-0 canary
 are documented in [host filtering](clock-3b-host-filter.md). Earlier references
 below to host filtering being outside this branch are superseded by that work;
-full builds and owner nested-VM validation remain open.
+the manager has since verified the reproducible full build, nested canary and
+stock negative control. Remaining deployment validation is listed in that guide.
 
 ## Manager build and VM checks
 
@@ -105,6 +106,26 @@ verified final `.config` as `/sbin/hermetic-clockprobe` (0755) and
 build record; the guest diagnostic cannot authenticate an arbitrary supplied
 config or an already compromised kernel. No host probe should be executed.
 
+To check CPU identity in that pristine nested AgentVM, run the diagnostic
+without arguments through execd: argv `["/sbin/hermetic-clockprobe"]`,
+`tty: false`, `timeout_ms: 5000`. Equivalently, from a root shell **inside the
+nested guest only**, run:
+
+```sh
+/sbin/hermetic-clockprobe
+```
+
+Require a complete, untruncated response with exactly one `cpuid` record,
+`result: "blocked"`, and detail
+`"Exact CPU profile and fixed 2 GHz CPUID frequency verified"`. This checks
+vendor, family/model/stepping, flags and all profile registers against the
+[pinned baseline](clock-3b-analysis.md#fixed-cpu-profile), without printing CPU
+identity values. A `leak` or `error` fails the identity check. Other records
+cover separate clock and lockdown checks; inspect them too, since the full
+diagnostic can exit 1 or 2 for those checks even when `cpuid` is blocked.
+An overall exit 0 is still insufficient to certify hidden time. Repeat after
+changing the vCPU count or restoring a snapshot, before adversary handoff.
+
 The module probe submits only an empty image to `init_module` and an invalid
 file descriptor to `finit_module`, and requires raw `-ENOSYS` from both; permission errors or invalid-image errors do not pass. It never loads
 a module. The ring-0 probe requires the supplied config policy, live forced
@@ -122,7 +143,8 @@ separate components, as required by TR-VMM-3.
 
 The pinned patch enforces host MSR/hypercall filtering, a fixed Nehalem/v2 CPUID
 profile and actual TSC scaling on cold boot and restore. Keep `clock: faked`
-until the manager completes the patched build, nested ring-0 canary, negative
-controls and restore tests on the deployment host. Unsupported hosts fail
+until the manager completes multi-vCPU, pause/resume, restore and TSC stability
+tests on the deployment host. The reproducible patched build, nested ring-0
+canary and stock negative control were verified on 2026-11-14. Unsupported hosts fail
 closed. See [the source analysis](clock-3b-analysis.md) for the exact profile,
 frequency and substrate timing limits.

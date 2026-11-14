@@ -252,7 +252,7 @@ fn rtc_sources_cannot_hide_a_divergent_clock() {
 }
 
 #[test]
-fn unsupported_frequency_leaf_alias_is_dumped_but_not_interpreted() {
+fn unsupported_frequency_leaf_alias_is_redacted_and_not_interpreted() {
     let max = CpuidLeafDump {
         leaf: 0,
         subleaf: 0,
@@ -271,10 +271,7 @@ fn unsupported_frequency_leaf_alias_is_dumped_but_not_interpreted() {
     };
     let record = classify_cpuid(&[max, aliased], Some(BASELINE_BRAND));
     assert_eq!(record.result, ProbeResult::Blocked);
-    assert!(record
-        .value
-        .unwrap()
-        .contains("0x00000015:0x0=0x00004000:0x00000001:0x00000001:0x00000000"));
+    assert!(record.value.is_none());
 }
 
 #[test]

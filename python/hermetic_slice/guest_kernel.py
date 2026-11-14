@@ -310,7 +310,7 @@ def release_datetime(lock: dict) -> datetime:
 
 
 @contextmanager
-def directory(path: Path, *, create: bool = False):
+def directory(path: Path, *, create: bool = False, trusted: bool = False):
     """Walk without symlinks, retaining an anchor for subsequent descriptor operations."""
     raw = os.fspath(path)
     if len(os.fsencode(raw)) > MAX_PATH_BYTES or ".." in raw.split("/") or "\0" in raw:
@@ -334,6 +334,11 @@ def directory(path: Path, *, create: bool = False):
             if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
                 os.close(child)
                 raise KernelError("directory changed")
+            if trusted and (opened.st_uid not in (0, os.geteuid())
+                            or (opened.st_mode & 0o022
+                                and not (opened.st_uid == 0 and opened.st_mode & stat.S_ISVTX))):
+                os.close(child)
+                raise KernelError("untrusted output ancestor")
             os.close(fd)
             fd = child
         yield fd
