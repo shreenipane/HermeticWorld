@@ -67,10 +67,23 @@ def open_parent(path: str | os.PathLike[str]) -> tuple[int, str]:
 
 def open_regular(path: str | os.PathLike[str], max_bytes: int) -> int:
     directory, leaf = open_parent(path)
+    try:
+        return open_regular_at(directory, leaf, max_bytes)
+    finally:
+        os.close(directory)
+
+
+def open_regular_at(directory: int, leaf: str, max_bytes: int,
+                    *, expected: os.stat_result | None = None) -> int:
+    """Open an inspected regular inode relative to a caller-retained parent."""
+    if validate_path(leaf)[1] != [leaf]:
+        raise ValueError("Invalid input name")
     pinned = None
     readable = None
     try:
         before = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+        if expected is not None and not _same_object(expected, before):
+            raise UnsafePathError("Input changed since preflight")
         if not stat.S_ISREG(before.st_mode):
             raise UnsafePathError("Input is not a regular file")
         pinned = os.open(leaf, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
@@ -91,7 +104,6 @@ def open_regular(path: str | os.PathLike[str], max_bytes: int) -> int:
             os.close(readable)
         if pinned is not None:
             os.close(pinned)
-        os.close(directory)
 
 
 @contextmanager
@@ -127,6 +139,16 @@ class _DirectoryEntry:
 
 def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
     directory, leaf = open_parent(path)
+    try:
+        atomic_write_at(directory, leaf, data)
+    finally:
+        os.close(directory)
+
+
+def atomic_write_at(directory: int, leaf: str, data: bytes) -> None:
+    """Publish into a caller-pinned parent; the caller retains its descriptor."""
+    if validate_path(leaf)[1] != [leaf]:
+        raise ValueError("Invalid destination name")
     temporary = None
     descriptor = None
     try:
@@ -170,8 +192,5 @@ def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
             if descriptor is not None:
                 os.close(descriptor)
         finally:
-            try:
-                if temporary is not None:
-                    os.unlink(temporary, dir_fd=directory)
-            finally:
-                os.close(directory)
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=directory)

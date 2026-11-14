@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 import re
 import stat
 from typing import Any
 
-from hermetic_safe_io import atomic_write, open_regular
+from hermetic_safe_io import (
+    atomic_write, atomic_write_at, open_parent, open_regular, open_regular_at, validate_path,
+)
 
 DEFAULT_PACKUMENT_CAP_BYTES = 64 * 1024 * 1024
 MAX_VERSIONS = 100_000
@@ -21,6 +25,7 @@ MAX_JSON_TOKENS = 8_000_000
 MAX_OBJECT_KEYS = 250_000
 MAX_STRING_LEN = 256 * 1024
 MAX_VERSION_LEN = 256
+MAX_INTEGER_BITS = 4096
 MAX_OPEN_SIZE_BYTES = 1 << 62
 READ_CHUNK_BYTES = 65_536
 
@@ -291,7 +296,87 @@ def _strict_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _validate_json_tree(value: Any, max_bytes: int, *, snapshot: bool = False) -> Any:
+    """Bound direct library inputs before sorting or copying any nested manifest.
+
+    Iterator frames keep auxiliary memory proportional to MAX_JSON_DEPTH. The
+    byte budget includes every occurrence, including shared nodes.
+    Cycles therefore reach the depth cap instead of reaching deepcopy/encoding.
+    When requested, copy containers during validation so later consumers never
+    revisit caller-owned nodes that could have changed after their checks.
+    """
+    captured: list[Any] = []
+    frames = [(iter(((value, captured, None),)), 0)]
+    tokens = 0
+    size = 0
+    while frames:
+        iterator, depth = frames[-1]
+        try:
+            item, destination, key = next(iterator)
+        except StopIteration:
+            frames.pop()
+            continue
+        except RuntimeError:
+            raise ValidationError("JSON object changed during validation") from None
+        tokens += 1
+        if tokens > MAX_JSON_TOKENS:
+            raise CapExceededError("JSON token count exceeds cap")
+        kind = type(item)
+        retained = item
+        if kind in (dict, list):
+            if depth >= MAX_JSON_DEPTH:
+                raise CapExceededError("JSON nesting depth exceeds cap")
+            retained = ({} if kind is dict else []) if snapshot else item
+            if kind is dict:
+                if len(item) > MAX_OBJECT_KEYS:
+                    raise CapExceededError("JSON object key count exceeds cap")
+                def members(mapping, target):
+                    for key, member in mapping.items():
+                        if type(key) is not str:
+                            raise ValidationError("JSON object keys must be strings")
+                        if "\0" in key:
+                            raise ValidationError("NUL byte not allowed in JSON key")
+                        yield key, None, None
+                        yield member, target, key
+                children = members(item, retained if snapshot else None)
+            else:
+                def elements(sequence, target):
+                    for member in sequence:
+                        yield member, target, None
+                children = elements(item, retained if snapshot else None)
+            size += 2 + max(0, len(item) - 1) + (len(item) if kind is dict else 0)
+            frames.append((children, depth + 1))
+        else:
+            if kind is str:
+                if len(item) > MAX_STRING_LEN:
+                    raise CapExceededError("JSON string length exceeds cap")
+            elif kind is int:
+                if item.bit_length() > MAX_INTEGER_BITS:
+                    raise CapExceededError("JSON integer size exceeds cap")
+            elif kind is float:
+                if not math.isfinite(item):
+                    raise ValidationError("Non-finite JSON number rejected")
+            elif kind not in (bool, type(None)):
+                raise ValidationError("Non-JSON value rejected")
+            try:
+                size += len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            except UnicodeEncodeError:
+                raise ValidationError("JSON contains text that is not valid Unicode") from None
+        if size > max_bytes:
+            raise CapExceededError("JSON tree exceeds byte cap")
+        if destination is not None:
+            if type(destination) is list:
+                destination.append(retained)
+            else:
+                destination[key] = retained
+    return captured[0]
+
+
 def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
+    if type(raw) is not bytes:
+        raise ValidationError("JSON input must be bytes")
+    if type(max_bytes) is not int or not 0 <= max_bytes <= DEFAULT_PACKUMENT_CAP_BYTES:
+        raise ValidationError("JSON byte cap is out of bounds")
     if len(raw) > max_bytes:
         raise CapExceededError("JSON payload exceeds byte cap")
     try:
@@ -300,11 +385,13 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
         raise JsonParseError("Invalid UTF-8 in JSON input") from exc
     _precheck_json_structure(text, max_depth=MAX_JSON_DEPTH, max_tokens=MAX_JSON_TOKENS)
     try:
-        return json.loads(
+        value = json.loads(
             text,
             object_pairs_hook=_strict_pairs_hook,
             parse_constant=_reject_constant,
         )
+        _validate_json_tree(value, max_bytes)
+        return value
     except (CapExceededError, JsonParseError, ValidationError):
         raise
     except RecursionError as exc:
@@ -313,20 +400,25 @@ def parse_json_bytes(raw: bytes, max_bytes: int) -> Any:
         raise JsonParseError("Malformed JSON document") from exc
 
 
-def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> bytes:
+def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int,
+                              *, directory: int | None = None,
+                              expected: os.stat_result | None = None) -> bytes:
     """Read a pinned regular inode without following any symlink or blocking on a FIFO."""
     if type(max_bytes) is not int or max_bytes < 0:
         raise ValidationError("Byte cap must be a non-negative integer")
     try:
         # The cap is enforced below so that an oversized file maps to CapExceededError.
-        fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
-    except (OSError, ValueError, TypeError) as exc:
-        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from exc
+        if directory is None:
+            fd = open_regular(path, MAX_OPEN_SIZE_BYTES)
+        else:
+            fd = open_regular_at(directory, os.fspath(path), MAX_OPEN_SIZE_BYTES, expected=expected)
+    except (OSError, ValueError, TypeError):
+        raise FileSafetyError("Refusing to open file (missing, symlink, non-regular, or OS error)") from None
     try:
         try:
             st = os.fstat(fd)
-        except OSError as exc:
-            raise FileSafetyError("Unable to stat file descriptor") from exc
+        except OSError:
+            raise FileSafetyError("Unable to stat file descriptor") from None
         if not stat.S_ISREG(st.st_mode):
             raise FileSafetyError("Refusing non-regular file")
         if st.st_size > max_bytes:
@@ -338,8 +430,8 @@ def read_regular_file_bounded(path: str | os.PathLike[str], max_bytes: int) -> b
             to_read = min(READ_CHUNK_BYTES, max_bytes - total + 1)
             try:
                 chunk = os.read(fd, to_read)
-            except OSError as exc:
-                raise FileSafetyError("Error reading file") from exc
+            except OSError:
+                raise FileSafetyError("Error reading file") from None
             if not chunk:
                 break
             total += len(chunk)
@@ -359,8 +451,8 @@ def write_file_atomic(target_path: str | os.PathLike[str], content: bytes) -> No
         raise ValidationError("Output content must be bytes")
     try:
         atomic_write(target_path, content)
-    except (OSError, ValueError, TypeError) as exc:
-        raise FileSafetyError("Unable to write destination atomically") from exc
+    except (OSError, ValueError, TypeError):
+        raise FileSafetyError("Unable to write destination atomically") from None
 
 
 def _validate_str(val: Any, field: str, max_len: int = MAX_STRING_LEN) -> str:
@@ -379,6 +471,7 @@ def cut_packument(
 ) -> tuple[dict[str, Any], NpmCutReport]:
     """Filter an npm registry packument at cutoff and recompute time, dist-tags, and metadata."""
     cutoff_nanos = parse_rfc3339_utc_nanos(cutoff)
+    packument = _validate_json_tree(packument, DEFAULT_PACKUMENT_CAP_BYTES, snapshot=True)
 
     if not isinstance(packument, dict):
         raise ValidationError("Packument root must be a JSON object")
@@ -416,7 +509,7 @@ def cut_packument(
         _validate_str(ver, "versions.key", max_len=MAX_VERSION_LEN)
         manifest = raw_versions[ver]
         if not isinstance(manifest, dict):
-            raise ValidationError(f"Manifest for version '{ver}' must be a JSON object")
+            raise ValidationError("Version manifest must be a JSON object")
 
         if ver in _RESERVED_TIME_KEYS or ver not in raw_time or raw_time[ver] is None:
             # A reserved "time" key is package-level, not this version's publish time.
@@ -523,13 +616,60 @@ def cut_packument_files(
     report_path: str | os.PathLike[str],
     packument_cap_bytes: int = DEFAULT_PACKUMENT_CAP_BYTES,
 ) -> NpmCutReport:
-    raw = read_regular_file_bounded(packument_path, max_bytes=packument_cap_bytes)
-    data = parse_json_bytes(raw, max_bytes=packument_cap_bytes)
-    cut_data, report = cut_packument(data, cutoff=cutoff)
+    parse_rfc3339_utc_nanos(cutoff)
+    if (type(packument_cap_bytes) is not int
+            or not 0 <= packument_cap_bytes <= DEFAULT_PACKUMENT_CAP_BYTES):
+        raise ValidationError("Packument byte cap is out of bounds")
+    try:
+        paths = [validate_path(path)[0] for path in (packument_path, out_path, report_path)]
+    except (OSError, ValueError, TypeError):
+        raise ValidationError("Invalid packument or publication path") from None
+    if len({os.path.abspath(path) for path in paths}) != len(paths):
+        raise ValidationError("Input, output and report paths must be distinct")
+    with ExitStack() as handles:
+        try:
+            destinations = []
+            inspected = []
+            names = set()
+            inodes = set()
+            # Inspect every destination before publication, and retain its parent
+            # handle so later directory renames cannot redirect either write.
+            for path in paths:
+                directory, leaf = open_parent(path)
+                handles.callback(os.close, directory)
+                parent = os.fstat(directory)
+                identity = (parent.st_dev, parent.st_ino, leaf)
+                if identity in names:
+                    raise ValidationError("Input, output and report paths must be distinct")
+                names.add(identity)
+                try:
+                    existing = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None:
+                    if not stat.S_ISREG(existing.st_mode):
+                        raise FileSafetyError("Publication requires regular files")
+                    inode = (existing.st_dev, existing.st_ino)
+                    if inode in inodes:
+                        raise ValidationError("Input, output and report paths must be distinct")
+                    inodes.add(inode)
+                destinations.append((directory, leaf))
+                inspected.append(existing)
+        except (OSError, ValueError, TypeError):
+            raise FileSafetyError("Unable to prepare publication safely") from None
 
-    out_bytes = canonical_json_bytes(cut_data)
-    rep_bytes = canonical_json_bytes(report.to_dict())
-
-    write_file_atomic(out_path, out_bytes)
-    write_file_atomic(report_path, rep_bytes)
-    return report
+        if inspected[0] is None:
+            raise FileSafetyError("Input must exist during preflight")
+        input_directory, input_leaf = destinations[0]
+        raw = read_regular_file_bounded(input_leaf, max_bytes=packument_cap_bytes,
+                                        directory=input_directory, expected=inspected[0])
+        data = parse_json_bytes(raw, max_bytes=packument_cap_bytes)
+        cut_data, report = cut_packument(data, cutoff=cutoff)
+        out_bytes = canonical_json_bytes(cut_data)
+        rep_bytes = canonical_json_bytes(report.to_dict())
+        try:
+            for (directory, leaf), content in zip(destinations[1:], (out_bytes, rep_bytes)):
+                atomic_write_at(directory, leaf, content)
+        except (OSError, ValueError, TypeError):
+            raise FileSafetyError("Unable to write destination atomically") from None
+        return report

@@ -17,3 +17,5 @@ out/
 # local gate logs and temp dirs left by worktree runs
 .*-gate-*.log
 .*-gate-tmp/
+.g-tmp/
+*.log
