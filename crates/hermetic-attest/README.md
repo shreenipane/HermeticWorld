@@ -54,7 +54,7 @@ The run record contains only deterministic or digest values. There is no field f
 | `r3_result` | Option<GradingRunResult> | Outcome of fix-removal test execution (R3). |
 | `r1_coverage` | Option<u32> | Share of eligible hidden tests covered by R1 mutants (per-mille: 0..=1000). |
 | `run_status` | Enum (`RunStatus`) | Final run status verdict (§12.3). |
-| `date_leak_observed` | bool | Whether real host date was observed in guest egress or probe. |
+| `date_leak_observed` | bool | Whether real host date was observed in guest egress or probe: `SentinelSummary::merge` (`hermetic_sealcheck::d12_runtime`) over the gateway `date_sentinel.json`, the harness summary and the probe; an incomplete scan counts as observed. |
 | `unclean_shutdown` | bool | Whether AgentVM failed to flush and freeze disk cleanly. |
 | `tee_quote` | Option<TeeQuote> | Optional hardware attestation quote (AMD SEV-SNP, Intel TDX, or AWS Nitro). |
 
