@@ -1,5 +1,7 @@
 #![cfg(feature = "dev-unjailed")]
 //! Owner-run offline harness smoke. The ordinary gate never starts a VM.
+#[path = "support/agent_h.rs"]
+mod diagnostics;
 mod support;
 use hermetic_vmm::{api, deadline, Vmm};
 use std::io::{Read, Write};
@@ -80,26 +82,8 @@ fn boots_agent_runs_harness_and_collects_untrusted_extraction() {
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
-    let mut mkfs = Command::new("/usr/sbin/mke2fs")
-        .args([
-            "-q",
-            "-t",
-            "ext4",
-            "-F",
-            "-U",
-            "00000000-0000-0000-0000-000000000001",
-            "-E",
-            "hash_seed=00000000-0000-0000-0000-000000000002,lazy_itable_init=0,lazy_journal_init=0",
-        ])
+    let mut mkfs = diagnostics::overlay_command(clock)
         .arg(&fixture.spec.drives[0].path)
-        .env_clear()
-        .env("SOURCE_DATE_EPOCH", clock.to_string())
-        .env("E2FSPROGS_FAKE_TIME", clock.to_string())
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     finish(&mut mkfs, Duration::from_secs(30));
@@ -112,41 +96,44 @@ fn boots_agent_runs_harness_and_collects_untrusted_extraction() {
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o500)).unwrap();
     let runner = hermetic_vmm::runner::DevUnjailed::new(launcher.to_str().unwrap()).unwrap();
     let mut vm = Vmm::new(fixture.spec.clone().validate().unwrap(), runner);
-    vm.prepare(Duration::from_secs(120)).unwrap();
-    vm.start(Duration::from_secs(10)).unwrap();
-    vm.wait_ready(Duration::from_secs(30)).unwrap();
-    let socket = vm.jail().unwrap().root.descriptor_path("vsock");
-    let end = deadline(Duration::from_secs(30)).unwrap();
-    loop {
-        if let Ok(reply) = call(&socket, br#"{"type":"status"}"#, end) {
-            assert_eq!(reply["type"], "status");
-            assert!(reply["guest_time_unix"].as_i64().unwrap().abs_diff(clock) < 20);
-            break;
+    diagnostics::run(&mut vm, |vm| -> hermetic_vmm::Result<()> {
+        vm.prepare(Duration::from_secs(120)).unwrap();
+        vm.start(Duration::from_secs(10)).unwrap();
+        vm.wait_ready(Duration::from_secs(30)).unwrap();
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        loop {
+            if let Ok(reply) = call(&socket, br#"{"type":"status"}"#, end) {
+                diagnostics::status(&reply, clock)?;
+                break;
+            }
+            assert!(Instant::now() < end, "execd readiness deadline");
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(Instant::now() < end, "execd readiness deadline");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // /proc/self/fd paths are meaningful only in the Vmm process. Keep its pinned directory
-    // descriptor open and address it from the child through the parent's pid.
-    let socket = socket.replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1);
-    let mut harness = Command::new(&python)
-        .arg(format!("{top}/scripts/integration/agent_h_smoke.py"))
-        .args(["--vsock", &socket, "--manifest", &manifest, "--work", &work])
-        .env_clear()
-        .env("PYTHONPATH", format!("{top}/python"))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    finish(&mut harness, Duration::from_secs(240));
-    let end = deadline(Duration::from_secs(10)).unwrap();
-    // Graceful shutdown freezes the upper before power-off. Validation runs after teardown.
-    let frozen = call(&socket, br#"{"type":"shutdown"}"#, end).unwrap();
-    assert_eq!(frozen["type"], "frozen");
-    vm.stop(Duration::from_secs(10)).unwrap();
-    vm.destroy(Duration::from_secs(10)).unwrap();
+        // /proc/self/fd paths are meaningful only in the Vmm process. Keep its pinned directory
+        // descriptor open and address it from the child through the parent's pid.
+        let socket = socket.replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1);
+        let mut harness = Command::new(&python)
+            .arg(format!("{top}/scripts/integration/agent_h_smoke.py"))
+            .args(["--vsock", &socket, "--manifest", &manifest, "--work", &work])
+            .env_clear()
+            .env("PYTHONPATH", format!("{top}/python"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        finish(&mut harness, Duration::from_secs(240));
+        let end = deadline(Duration::from_secs(10)).unwrap();
+        // Graceful shutdown freezes the upper before power-off. Validation runs after teardown.
+        let frozen = call(&socket, br#"{"type":"shutdown"}"#, end).unwrap();
+        assert_eq!(frozen["type"], "frozen");
+        vm.stop(Duration::from_secs(10)).unwrap();
+        vm.destroy(Duration::from_secs(10)).unwrap();
+        Ok(())
+    })
+    .unwrap();
     let mut stream = std::fs::File::open(format!("{work}/changes.hext"))
         .unwrap()
         .take(1024 * 1024 + 1);

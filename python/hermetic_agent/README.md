@@ -69,7 +69,7 @@ smoke for empty and submitted trees. It performs no provider call. It requires:
   `/sbin/hermetic-extract-agent`. `/testbed` and `/smoke/base` must both contain
   exactly `scripts/integration/fixtures/grader-task/repo`. Its run spec uses
   `/testbed` and a PATH containing the supplied shell utilities. This image is
-  an input, like the other owner-run VM tests; the script never downloads one.
+  built by `build-agent-h-fixture.sh` below; the smoke never downloads one.
 - `HERMETIC_AGENT_MANIFEST`: that fixture's world manifest. The existing grader
   fixture uses `2023-11-14T22:13:20Z`; the agent clock is read from the manifest.
 - The same local Docker image, grader runtime, pytest packages and e2fsprogs as
@@ -77,6 +77,100 @@ smoke for empty and submitted trees. It performs no provider call. It requires:
 
 The KVM smoke is an explicit ignored test and must be run by the manager on the
 prepared VM host. A missing input fails; it cannot produce a successful skip.
+
+## Build the fixture and run the first smoke
+
+Run these commands from the worktree root on the prepared manager host. All
+destination directories must be new, with an existing private, physical parent
+(no symlink components). The builders retain their artifacts on success and
+failure. They need cached Cargo dependencies and pinned e2fsprogs 1.47.2. No
+download, Docker daemon, root privilege or KVM is needed to build the fixture.
+
+```sh
+mkdir -m 0700 "$PWD/.review/agent-h-inputs"
+bash scripts/integration/build-agent-h-fixture.sh "$PWD/.review/agent-h-inputs/fixture"
+export HERMETIC_ROOTFS="$PWD/.review/agent-h-inputs/fixture/rootfs.img"
+export HERMETIC_AGENT_MANIFEST="$PWD/.review/agent-h-inputs/fixture/world.json"
+export HERMETIC_FC_BIN=/physical/path/to/pinned/firecracker
+export HERMETIC_KERNEL=/physical/path/to/pinned/vmlinux
+export HERMETIC_AGENT_PYTHON=/physical/path/to/harness-venv/bin/python
+bash scripts/integration/agent-h-smoke.sh "$PWD/.review/agent-h-inputs/smoke"
+```
+
+The builder compiles static execd, init, extract-agent and sealcheck offline,
+with source and build paths remapped. It copies the staging OS's bash, cat and
+sed and their ELF interpreter/library closure as data, without running a loader
+on image contents. This development fixture deliberately uses that local
+runtime; its hashes are recorded, so identical inputs are reproducible. It
+copies exactly the fixture repository into `/testbed` and `/smoke/base`, installs
+the networkless execd run spec, normalizes identity, ownership and timestamps,
+and calls `hermetic_slice.rootfs.build_rootfs`, including D4. The output manifest
+is published atomically only after D4 passes. The smoke's clean GraderVM stage
+also requires the Docker image and Python packages listed above.
+
+## Convert a sealed task and run Mode H
+
+1. Create the private `agent-h-inputs` parent as above if it does not exist.
+   Use an existing sealing run and its local `hermetic/INSTANCE:sealed` image.
+   The converter reads only `tasks/INSTANCE/task.json` and
+   `tasks/INSTANCE/agent/problem_statement.md` from that run. It never copies
+   oracle inputs, patches, test lists, future dates or sealing reports into the
+   guest. The example uses the already sealed pytest task:
+
+   ```sh
+   bash scripts/integration/convert-agent-h-task.sh \
+     "$HOME/hw-e2e-run3" pytest-dev__pytest-6202 "$PWD/.review/agent-h-inputs/pytest"
+   ```
+
+2. The converter pins the local sealed image ID before creating an unstarted,
+   networkless container, exports it, removes the container, validates the entire
+   bounded tar before unpacking, and installs the same static trusted binaries.
+   It uses the sealed image's bash/runtime, cat and sed; missing or unsafe runtime
+   files fail the conversion. Image entrypoints and environment are ignored. The
+   fixed execd PATH includes the common testbed environment locations. It uses
+   the task's exact world/clock cutoffs, normalizes container identity files and
+   staging ownership, and builds a new D4-checked image. No task code executes on
+   the host. Every directory is resolved relative to a held root descriptor;
+   absolute guest links remain inside that root. Fresh outputs are `rootfs.img`,
+   `world.json` and `issue.txt`; source export and staging files stay host-only.
+
+3. Start a policy gateway separately using the configuration in
+   `crates/hermetic-gateway/README.md`, with the same manifest clock, a pinned
+   provider identifier, quotas and a private 0600 key file. Use its explicit
+   numeric loopback HTTP address below. The guest and harness receive no key.
+   Set the staged Firecracker, kernel and harness interpreter as in the fixture
+   instructions, then run:
+
+   ```sh
+   export HERMETIC_ROOTFS="$PWD/.review/agent-h-inputs/pytest/rootfs.img"
+   export HERMETIC_AGENT_MANIFEST="$PWD/.review/agent-h-inputs/pytest/world.json"
+   export HERMETIC_AGENT_TASK="$PWD/.review/agent-h-inputs/pytest/issue.txt"
+   export HERMETIC_AGENT_GATEWAY=http://127.0.0.1:8080
+   export HERMETIC_AGENT_MODEL=PINNED
+   bash scripts/integration/run-agent-h-task.sh "$PWD/.review/agent-h-inputs/pytest-run"
+   ```
+
+4. This explicit ignored VM test boots a read-only base with a fresh 1 GiB CoW
+   drive, 2 GiB RAM, one vCPU, the manifest clock, and no network interface. The
+   host harness sends shell commands through vsock 5000 and requests through the
+   loopback gateway. The session has a 5700-second outer deadline; the harness
+   retains its shorter step, command and run caps. The new private run directory
+   retains `trajectory.json` and `commands.jsonl`. A successful exit means the
+   harness submitted; it is not a grader verdict. Clean extraction and GraderVM
+   validation of a real task remain a separate integration step.
+
+Both `world.json` files use `hermetic-agent-input/v1`: a harness world manifest
+containing cutoffs, rootfs digest, run spec and D4 result. They explicitly set
+`certified_world_bundle: false`. Full WorldManifest certification still needs the
+package-world, substrate, trust and detector evidence described in E2E_SEAL.md;
+the converter cannot manufacture that evidence. These manager runs use the
+development VMM launcher without a jailer. They exercise the first Mode H path,
+and do not establish the production confinement or clock-leak claims.
+
+Offline checks live in `python/tests/test_agent_h_image.py` and the existing
+harness tests. The manager must run the actual fixture build, Docker conversion,
+fixture KVM/grader smoke and ignored real-task KVM test above. None of these
+external requirements is treated as a passing skip.
 
 ## Open protocol decision: requests/httpbin
 

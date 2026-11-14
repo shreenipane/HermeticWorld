@@ -368,3 +368,57 @@ def test_cli_refuses_trajectory_overwriting_command_evidence(tmp_path, monkeypat
         "--trajectory", trajectory, "--command-log", str(journal)])
     assert cli.main() == 2
     assert not journal.exists()
+
+
+def test_runner_refuses_preimported_global_configuration_before_writes(tmp_path, monkeypatch):
+    from hermetic_agent.runner import _upstream
+    # A caller may have imported the optional dependency before choosing a run directory.
+    # Its import-time dotenv settings cannot be undone by changing the environment later.
+    monkeypatch.setitem(sys.modules, "minisweagent", object())
+    with pytest.raises(ProtocolError, match="fresh process"):
+        with _upstream(str(tmp_path)):
+            pytest.fail("preloaded dependency accepted")
+    assert not (tmp_path / ".env").exists()
+
+
+def test_runner_pins_both_config_paths_for_entire_run_and_restores_env(tmp_path, monkeypatch):
+    import builtins
+    import types
+    from hermetic_agent.runner import _upstream
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    global_dir = tmp_path / "global" / "mini-swe-agent"
+    global_dir.mkdir(parents=True)
+    sentinel = global_dir / ".env"
+    sentinel.write_text("HOST_IDENTITY=must-not-load\n")
+    settings = {"MSWEA_GLOBAL_CONFIG_DIR": str(global_dir),
+                "MSWEA_CONFIG_DIR": str(global_dir), "MSWEA_SILENT_STARTUP": "host-value"}
+    for key, value in settings.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delitem(sys.modules, "minisweagent", raising=False)
+    original = builtins.__import__
+    seen = []
+    def isolated():
+        path = Path(os.environ["MSWEA_GLOBAL_CONFIG_DIR"])
+        assert os.environ["MSWEA_CONFIG_DIR"] == str(path)
+        assert os.environ["MSWEA_SILENT_STARTUP"] == "1"
+        assert path.samefile(private)
+        assert (path / ".env").read_bytes() == b""
+        assert (path / ".env").stat().st_mode & 0o777 == 0o600
+        seen.append(True)
+    def importing(name, *args, **kwargs):
+        if name == "minisweagent":
+            isolated()
+            return types.SimpleNamespace(__version__="1.17.4")
+        if name == "minisweagent.agents.default":
+            isolated()
+            return types.SimpleNamespace(DefaultAgent=object, LimitsExceeded=Exception)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", importing)
+    with pytest.raises(RuntimeError, match="run failed"):
+        with _upstream(str(private)):
+            isolated()
+            raise RuntimeError("run failed")
+    assert len(seen) == 3
+    assert {key: os.environ.get(key) for key in settings} == settings
+    assert sentinel.read_text() == "HOST_IDENTITY=must-not-load\n"

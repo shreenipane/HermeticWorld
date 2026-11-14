@@ -23,6 +23,17 @@ INSTANCE = "psf__requests-2317"
 FIXTURE = ROOT / "scripts/integration/fixtures/swebench" / (INSTANCE + ".json")
 
 
+def test_hyphenated_owner_reaches_record_validation(monkeypatch):
+    seen = []
+    def record(path, instance, source):
+        seen.append((path.name, instance))
+        raise e2e.SealError("record_probe")
+    monkeypatch.setattr(e2e, "load_record", record)
+    with pytest.raises(e2e.SealError, match="record_probe"):
+        e2e.run(["pytest-dev__pytest-6202"])
+    assert seen == [("pytest-dev__pytest-6202.json", "pytest-dev__pytest-6202")]
+
+
 def test_offline_record_known_answer_and_provenance():
     raw, row, digest = e2e.load_record(FIXTURE, INSTANCE, FIXTURE.with_suffix(".source.json"))
     assert digest == "4069e71d0cb3d5927ca1ed005a9ee2f6f73fef9ea7136e6115436089980b368e"
