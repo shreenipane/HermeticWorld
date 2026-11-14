@@ -12,7 +12,7 @@ constants. The binary writes only JSON lines to stdout; I/O errors use fixed tex
 From the worktree root, test offline with:
 
 ```sh
-CARGO_NET_OFFLINE=true /home/flingboot/.hermetic/bin/rust-gate
+CARGO_NET_OFFLINE=true "$HOME"/.hermetic/bin/rust-gate
 ```
 
 Build a static GNU executable using the installed target, without a new musl toolchain:
