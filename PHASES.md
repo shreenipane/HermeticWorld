@@ -216,6 +216,9 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: `hermetic_mutants`: variant pool, base-failing assertion finder, validation (TR-GR-8, TR-GR-9)
 - [ ] remaining: Differential runs R0, R1 and R2 in parallel; R3 advisory (cut list: R3, then R2)
 - [ ] remaining: Escape probe (TR-SEC-6)
+  - [x] Guest probe `hermetic-escapeprobe` (DNS real names + delegation, raw IP, ICMP, IPv6, QUIC, vsock CID 0/2 scans, device nodes, host-share mounts, module loading, getrandom positive check) and fail-closed host aggregator; offline classification and hostile-report tests. Proof: `attempt_reached_is_leak_timeout_and_refusals_blocked_other_error`, `mountinfo_host_shares_leak_clean_blocks_hostile_errors`, `netvm_table_resolver_blocks_every_real_name_and_delegation`, `hostile_reports_fail_closed` (`crates/hermetic-escapeprobe/tests/`).
+  - [ ] remaining: Open: run in a nested-VM AgentVM: `HERMETIC_ESCAPE_PROBE_IN_GUEST=1 cargo test -p hermetic-escapeprobe --test vm -- --ignored` (or the binary, then `--aggregate` on the host); no /dev/kvm here.
+  - [ ] remaining: Open: gateway abuse probes, real model-call date scan, pip/git/curl install positive checks (report `unavailable`, verdict `incomplete`); attestation wiring of the verdict.
 - [ ] remaining: Real-date sentinel D12 (TR-SEC-5): scanner exists; runtime/probe/gateway wiring and `date_leak_observed` aggregation remain open (see detector audit above).
 - [ ] remaining: Classifier (TR-CLS-*)
 - [ ] remaining: Attestations: `hermetic-run/v1`, `hermetic-transcript-audit/v1`, score card (TR-ATT-*)
