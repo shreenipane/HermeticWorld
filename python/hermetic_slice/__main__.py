@@ -46,6 +46,12 @@ def main(argv: list[str] | None = None) -> int:
     build_index_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     build_index_parser.add_argument("--cache", type=Path, required=True, help="Cache directory for HTTP downloads")
     build_index_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
+    collect_fixes_parser = subparsers.add_parser(
+        "collect-fixes", help="Collect known passing fixes into each task's staging/fixes (TR-SC-1)")
+    collect_fixes_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
+    collect_fixes_parser.add_argument("--experiments", type=Path, required=True,
+                                      help="SWE-bench experiments checkout (evaluation/<split>/<run>/logs/...)")
+    collect_fixes_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
     build_index_parser.add_argument("--yank-table", type=Path, default=None,
                                     help="Historical yank table (filename -> RFC 3339 yank time, hermetic_yank format)")
 
@@ -366,6 +372,29 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Error sealing {instance_id}: {exc}", file=sys.stderr)
 
         return 1 if has_failure else 0
+
+    if args.subcommand == "collect-fixes":
+        from hermetic_slice.passing_fixes import FixCollectionError, collect
+        if not args.tasks_dir.is_dir() or args.tasks_dir.is_symlink():
+            print(f"Error: Tasks directory {args.tasks_dir} is not a directory", file=sys.stderr)
+            return 1
+        tasks = sorted(d.name for d in args.tasks_dir.iterdir()
+                       if d.is_dir() and not d.is_symlink() and (d / "task.json").is_file())
+        if args.only is not None:
+            unknown = sorted(set(args.only) - set(tasks))
+            if unknown:
+                print(f"Error: Unknown instance_id: {unknown[0]}", file=sys.stderr)
+                return 1
+            tasks = [t for t in tasks if t in args.only]
+        failed = False
+        for instance_id in tasks:
+            try:
+                names = collect(args.experiments, args.tasks_dir / instance_id, instance_id)
+                print(f"{instance_id}  {len(names)}")
+            except (FixCollectionError, OSError) as exc:
+                print(f"Error collecting fixes for {instance_id}: {exc}", file=sys.stderr)
+                failed = True
+        return 1 if failed else 0
 
     if args.subcommand == "build-index":
         tasks_dir = args.tasks_dir

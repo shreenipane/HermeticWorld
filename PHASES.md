@@ -12,7 +12,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | Phase | Verified checklist |
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
-| 1: sealcheck | done 41 of 48 |
+| 1: sealcheck | done 42 of 48 |
 | 2: World | done 25 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
@@ -78,7 +78,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [x] `hermetic-common`: manifest types, cutoff logic (TR-CUT-*), hash chain (T1.1). Proof: `test_earliest_candidate_wins`, `test_hash_chain_vectors_and_tamper` (`crates/hermetic-common/tests/`).
 - [x] Both modes: dated and undated (TR-SC-9). Proof: `test_scan_and_query_undated_equivalence`, `test_dated_scan_json_unchanged_no_mode` (`crates/hermetic-sealcheck/tests/test_undated.rs`).
 - [x] Fingerprints with baseline subtraction (TR-SC-1): gold patch, test-patch added lines, and up to 20 deduplicated passing fixes (`staging/fixes/*.patch`), base-commit fingerprints subtracted. Proof: `test_passing_fix_is_fingerprinted_and_base_subtracted`, `test_passing_fixes_deduplicated_and_capped_at_20` (`crates/hermetic-sealcheck/tests/test_fingerprint_and_scan.rs`), `test_cli_scan_gates_on_a_passing_fix_from_staging_fixes` (`tests/test_cli.rs`), `test_task_input_passing_fixes_sorted_regular_patch_files_only`, `test_task_input_passing_fixes_symlinked_dir_is_not_followed` (`crates/hermetic-common/tests/test_manifest.rs`).
-  - [ ] remaining: collecting the SWE-bench/experiments passing fixes into `staging/fixes/` belongs to slice packaging and is not built
+  - [x] Collecting passing fixes (2026-11-15): `python -m hermetic_slice collect-fixes --tasks-dir DIR --experiments DIR` reads the SWE-bench experiments layout (`evaluation/<split>/<run>/logs/<instance>/patch.diff` with `report.json` `resolved: true`), deduplicates by normalised text, caps at 20, writes `staging/fixes/NNN-<sha12>.patch` deterministically and replaces the old set as a whole; no symlink is followed. Proof: `python/tests/test_passing_fixes.py` (10 tests)
   - [x] Tier 1: lines, windows, diff shape, diff-like text (TR-SC-2) (T1.1). Proof: `test_no_false_positive_at_base_and_planted_findings` (`crates/hermetic-sealcheck/tests/test_fingerprint_and_scan.rs`).
   - [x] Tier 2: tree-sitter IDF symbols, as review (TR-SC-3). Proof: `test_tier2_multi_hunk_results_unchanged_with_precomputed_context` (`crates/hermetic-sealcheck/tests/test_tier2.rs`).
   - [x] Tier 3: winnowing, k=8, w=8 (TR-SC-4) (T1.2). Proof: `test_winnow_baseline_subtraction_gives_zero_gates`, `test_winnow_planted_reformatted_copy_gives_tier3_gate` (`crates/hermetic-sealcheck/tests/test_winnow.rs`).
