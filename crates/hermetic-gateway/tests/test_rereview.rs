@@ -1327,12 +1327,20 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
     common::join_within(h);
     assert!(out.contains("overloaded_error"), "{out}");
     assert!(!out.contains("UPSTREAM_PRIVATE_DETAIL"), "{out}");
-    let logs = env.read_host_logs();
-    let stream = logs
-        .iter()
-        .rev()
-        .find(|l| l["stream"] == true)
-        .expect("stream logged");
+    // The stream entry is written after the response ends; wait for it (bounded).
+    let deadline = Instant::now() + common::TEST_WAIT;
+    let stream = loop {
+        if let Some(entry) = env
+            .read_host_logs()
+            .into_iter()
+            .rev()
+            .find(|l| l["stream"] == true)
+        {
+            break entry;
+        }
+        assert!(Instant::now() < deadline, "stream entry never logged");
+        thread::sleep(Duration::from_millis(10));
+    };
     let logged = stream["original_error_body"].as_str().unwrap();
     assert!(logged.contains("UPSTREAM_PRIVATE_DETAIL"), "{logged}");
 }

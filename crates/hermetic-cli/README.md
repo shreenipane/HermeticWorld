@@ -40,5 +40,7 @@ hermetic help [SUBCOMMAND]
 32-byte Ed25519 public key. With `--bundle`, the bundle must pass integrity
 verification and its root must equal the record's `world_root`. With
 `--classification`, the record must agree with the run classifier on clock level,
-`date_leak_observed`, run status and run digest. Any failure exits 2; refused or
-malformed input files exit 65.
+`date_leak_observed`, run status and run digest. Exit codes: 2 for any verification
+failure, including a record or classification whose contents are malformed (bad JSON or
+UTF-8); 65 for refused input files (symlinks, FIFOs, oversized) and invalid key data;
+74 for missing files.

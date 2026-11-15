@@ -156,3 +156,12 @@ def test_cli_reports_errors_without_output(host: dict[str, Path], tmp_path: Path
     assert main(argv) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and "error" in captured.err
+
+
+@pytest.mark.parametrize("key", ["host", "clockprobe", "date_leak_observed", "schema", "world_sealed"])
+def test_absent_derived_facts_cannot_be_asserted_through_extra(key: str) -> None:
+    asserted = {"host": {"patched_firecracker": True, "hypercall_block": True},
+                "clockprobe": [], "date_leak_observed": False, "schema": "x", "world_sealed": True}
+    with pytest.raises(RunEvidenceError):
+        build_run_evidence(run_digest=DIGEST, world_sealed=True, host=None, clockprobe=None,
+                           date_leak_observed=None, extra={key: asserted[key]})

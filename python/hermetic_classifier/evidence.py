@@ -45,6 +45,8 @@ MAX_PROBE_OUTPUT_BYTES = 1024 * 1024
 MAX_FIRECRACKER_BYTES = 256 * 1024 * 1024
 READ_CHUNK = 1024 * 1024
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+RESERVED_KEYS = frozenset({"schema", "run_digest", "substrate", "world_sealed", "host",
+                           "clockprobe", "date_leak_observed"})
 
 
 def _open(path: str | os.PathLike[str], cap: int) -> int:
@@ -194,8 +196,9 @@ def build_run_evidence(
     if date_leak_observed is not None:
         evidence["date_leak_observed"] = date_leak_observed
     for key, value in (extra or {}).items():
-        if key in evidence:
-            raise RunEvidenceError("extra evidence cannot replace derived facts")
+        # Derived facts are reserved even when absent: they come only from files.
+        if key in RESERVED_KEYS:
+            raise RunEvidenceError("extra evidence cannot supply derived facts")
         evidence[key] = value
     classify_run(evidence)
     return evidence
