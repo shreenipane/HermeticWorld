@@ -84,3 +84,34 @@ fn deadlines_given_at_construction_bound_the_first_connection() {
     assert!(start.elapsed() < Duration::from_secs(3), "head deadline was not in force");
     assert!(server.try_recv().unwrap().is_none());
 }
+
+/// Deadlines installed after a connection began waiting for its request head
+/// must still bound that request's body (the gateway installs them in its loop).
+#[test]
+fn body_deadline_installed_while_head_is_pending_still_applies() {
+    use tiny_http::RequestDeadlines;
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+    client.write_all(b"POST / HTTP/1.1\r\n").unwrap();
+    // Give the connection thread time to start reading the head with no deadlines.
+    std::thread::sleep(Duration::from_millis(300));
+    server.set_request_deadlines(RequestDeadlines {
+        head: None,
+        body: Some(Duration::from_millis(200)),
+    });
+    client
+        .write_all(b"Host: x\r\nContent-Length: 5000\r\n\r\n{")
+        .unwrap();
+    let mut request = server.recv_timeout(WAIT).unwrap().expect("request");
+    // Read on a helper thread so a missing deadline fails the test, not hangs it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut body = Vec::new();
+        let _ = tx.send(request.as_reader().read_to_end(&mut body).is_err());
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(failed) => assert!(failed, "stalled body read did not fail"),
+        Err(_) => panic!("body read outlived its deadline"),
+    }
+    drop(client);
+}

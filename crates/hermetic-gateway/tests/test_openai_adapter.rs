@@ -40,7 +40,9 @@ impl Fixture {
         let config = GatewayConfig::load_from_file(config_path).unwrap();
         let clock = time::OffsetDateTime::from_unix_timestamp(1_000_000_000).unwrap();
         let gateway = Arc::new(GatewayServer::new(config, clock).unwrap());
-        let http = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let http =
+            tiny_http::Server::http_with_deadlines("127.0.0.1:0", gateway.client_deadlines())
+                .unwrap();
         let url = format!("http://{}", http.server_addr());
         let g = gateway.clone();
         let worker = Some(std::thread::spawn(move || g.run_loop(http)));

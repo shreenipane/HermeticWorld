@@ -214,7 +214,9 @@ impl ClientConnection {
         };
 
         // HERMETIC PATCH: the body (and any discarding of an unread body) within `body`.
-        self.set_read_deadline(deadlines.body);
+        // Re-read the configuration: deadlines installed while this connection was
+        // already waiting for its request head must still bound the body.
+        self.set_read_deadline(self.current_deadlines().body);
 
         // building the writer for the request
         let writer = self.sink.next().unwrap();

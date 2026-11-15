@@ -144,21 +144,19 @@ impl<R: Read + Send> Read for SequentialReader<R> {
 
 impl<W: Write + Send> Write for SequentialWriter<W> {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        if let Some(v) = self.trigger.as_mut() {
-            v.recv().unwrap()
-        }
-        self.trigger = None;
-
-        self.writer.lock().unwrap().write(buf)
+        self.wait_turn()?;
+        self.writer
+            .lock()
+            .map_err(|_| aborted("writer poisoned"))?
+            .write(buf)
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        if let Some(v) = self.trigger.as_mut() {
-            v.recv().unwrap()
-        }
-        self.trigger = None;
-
-        self.writer.lock().unwrap().flush()
+        self.wait_turn()?;
+        self.writer
+            .lock()
+            .map_err(|_| aborted("writer poisoned"))?
+            .flush()
     }
 }
 
@@ -173,9 +171,12 @@ where
             SequentialReaderInner::MyTurn(reader) => {
                 self.next.send(reader).ok();
             }
+            // HERMETIC PATCH: a predecessor that went away without handing the
+            // stream on leaves nothing to forward; never panic while dropping.
             SequentialReaderInner::Waiting(recv) => {
-                let reader = recv.recv().unwrap();
-                self.next.send(reader).ok();
+                if let Ok(reader) = recv.recv() {
+                    self.next.send(reader).ok();
+                }
             }
             SequentialReaderInner::Empty => (),
         }
@@ -188,5 +189,76 @@ where
 {
     fn drop(&mut self) {
         self.on_finish.send(()).ok();
+    }
+}
+
+fn aborted(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message)
+}
+
+impl<W: Write + Send> SequentialWriter<W> {
+    /// HERMETIC PATCH: wait for the previous response to finish; a predecessor
+    /// that disappeared without signalling is an I/O error, not a panic.
+    fn wait_turn(&mut self) -> IoResult<()> {
+        // On failure the trigger is kept, so every later write fails too.
+        if let Some(v) = self.trigger.as_mut() {
+            v.recv()
+                .map_err(|_| aborted("previous writer disconnected"))?;
+        }
+        self.trigger = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn writer_whose_predecessor_vanished_fails_without_panicking_and_stays_failed() {
+        let (trigger_tx, trigger_rx) = channel();
+        let (finish_tx, _finish_rx) = channel();
+        let mut writer = SequentialWriter {
+            trigger: Some(trigger_rx),
+            writer: Arc::new(Mutex::new(Vec::<u8>::new())),
+            on_finish: finish_tx,
+        };
+        drop(trigger_tx);
+        for _ in 0..2 {
+            let err = writer.write(b"late").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+            assert_eq!(writer.flush().unwrap_err().kind(), std::io::ErrorKind::ConnectionAborted);
+        }
+        assert!(writer.writer.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dropping_a_waiting_reader_whose_predecessor_vanished_does_not_panic() {
+        let (prev_tx, prev_rx) = channel::<Cursor<Vec<u8>>>();
+        let (next_tx, next_rx) = channel();
+        let reader = SequentialReader {
+            inner: SequentialReaderInner::Waiting(prev_rx),
+            next: next_tx,
+            on_start: None,
+        };
+        drop(prev_tx);
+        drop(reader);
+        assert!(next_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_a_waiting_reader_forwards_the_stream_once_it_arrives() {
+        let (prev_tx, prev_rx) = channel();
+        let (next_tx, next_rx) = channel();
+        let reader = SequentialReader {
+            inner: SequentialReaderInner::Waiting(prev_rx),
+            next: next_tx,
+            on_start: None,
+        };
+        prev_tx.send(Cursor::new(b"stream".to_vec())).unwrap();
+        drop(reader);
+        assert_eq!(next_rx.try_recv().unwrap().into_inner(), b"stream");
     }
 }

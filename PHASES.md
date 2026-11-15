@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 4 of 43 |
+| 2: World | done 6 of 43 |
 | 3: VMs | done 22 of 47 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -142,8 +142,8 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] remaining: Deferred (T2.4): `_make_output_dirs` still creates missing output directories by path (the directory is then opened anchored and checked before any write)
   - [ ] remaining: Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
   - [ ] remaining: Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
-- [ ] remaining: Open, postponed by the owner on 2026-11-12 (T2.2): gateway deadline handling. `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` failed once in a full workspace run; investigation found no slot leak (load timing, inferred, not reproduced) but a real defect: the next request's head deadline is armed at hand-off and overwrites the current request's body deadline (body deadline cut to the head deadline; kept-alive connections closed after any request longer than the head deadline). A first fix is on branch `t2.2` (`b0c7867`, not merged) and was rejected in review: its wait for request completion is unbounded (a retained writer plus a client disconnect parks the connection thread forever), two loosened timing tests no longer prove their deadline, and the two new regressions are not deterministic. Review: `t2.2-codex-deadline-rearm-20261112`
-  - [ ] remaining: Also found by CodeRabbit on main (2026-11-12): keep the body deadline active until the body reader finishes (`crates/vendor/tiny_http/src/client.rs:162`); do not release a successor before its predecessor finishes (`util/sequential.rs:172`); do not block while dropping a waiting reader (`util/sequential.rs:159`). Details: `cr-main-crates-20261112.log`
+- [x] Gateway deadline handling (T2.2). Each request has its own read-deadline cell, armed for the next head only when the stream is handed on, so a successor never cuts a body deadline (`ae2e6ef`). Two further causes of the `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` flake fixed 2026-11-15: the body deadline is re-read from the server configuration after the head (deadlines installed while a head was pending were ignored), and the test harnesses create the server with its deadlines before the first accept, as the gateway binary does. test_8 passed 50 of 50 runs after the fix (5 of 15 failed before). Proof: `body_deadline_installed_while_head_is_pending_still_applies` (fails before the fix).
+  - [x] CodeRabbit (2026-11-12): body deadline kept until the body reader finishes (`ae2e6ef`); the sequential hand-off no longer panics when a predecessor writer or reader disappears without handing on, and a failed writer stays failed. Proof: `writer_whose_predecessor_vanished_fails_without_panicking_and_stays_failed`, `dropping_a_waiting_reader_whose_predecessor_vanished_does_not_panic`, `dropping_a_waiting_reader_forwards_the_stream_once_it_arrives`.
 - [ ] remaining: Package world (TR-PKG-*)
   - [ ] remaining: Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [ ] remaining: Yanked-release handling (simple-index yank rewriting in `python/hermetic_yank`, merged 2026-11-13; wiring into the package mirror still open)

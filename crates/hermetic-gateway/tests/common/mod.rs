@@ -155,8 +155,11 @@ impl TestEnv {
         let gateway = Arc::new(gateway_inner);
 
         // Gateway HTTP front end
+        // Deadlines are installed before the first accept, as in the gateway binary;
+        // installing them later in run_loop left early connections unbounded.
         let gateway_http =
-            tiny_http::Server::http("127.0.0.1:0").expect("Failed to bind gateway HTTP");
+            tiny_http::Server::http_with_deadlines("127.0.0.1:0", gateway.client_deadlines())
+                .expect("Failed to bind gateway HTTP");
         let gw_addr = gateway_http.server_addr().to_ip().expect("gw ip");
         let gateway_url = format!("http://{gw_addr}");
 
