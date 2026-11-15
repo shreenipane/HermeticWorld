@@ -32,7 +32,12 @@ impl BoundedChild {
     /// Wait for exit within `WAIT_TIMEOUT`; on timeout the child is killed and
     /// the test fails.
     pub fn wait_status(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        self.wait_status_within(WAIT_TIMEOUT)
+    }
+
+    /// As `wait_status` with an explicit bound (used to prove the bound holds).
+    pub fn wait_status_within(&mut self, limit: Duration) -> ExitStatus {
+        let deadline = Instant::now() + limit;
         loop {
             if let Some(status) = self.0.try_wait().expect("try_wait") {
                 return status;
@@ -40,7 +45,7 @@ impl BoundedChild {
             if Instant::now() >= deadline {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
-                panic!("child did not exit within {WAIT_TIMEOUT:?}");
+                panic!("child did not exit within {limit:?}");
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -114,7 +119,12 @@ impl<T> BoundedThread<T> {
     /// `JoinHandle::join`; a thread that is still running fails the test (it
     /// is abandoned and ends with the test process).
     pub fn join(self) -> thread::Result<T> {
-        match self.receiver.recv_timeout(WAIT_TIMEOUT) {
+        self.join_within(WAIT_TIMEOUT)
+    }
+
+    /// As `join` with an explicit bound (used to prove the bound holds).
+    pub fn join_within(self, limit: Duration) -> thread::Result<T> {
+        match self.receiver.recv_timeout(limit) {
             Ok(value) => {
                 let _ = self.handle.join();
                 Ok(value)
@@ -124,7 +134,7 @@ impl<T> BoundedThread<T> {
                 Ok(()) => panic!("bounded thread ended without a result"),
             },
             Err(RecvTimeoutError::Timeout) => {
-                panic!("thread did not finish within {WAIT_TIMEOUT:?}")
+                panic!("thread did not finish within {limit:?}")
             }
         }
     }
@@ -132,11 +142,16 @@ impl<T> BoundedThread<T> {
 
 /// Apply read and write timeouts so every blocking socket call is bounded.
 pub fn bound_stream(stream: &UnixStream) {
+    bound_stream_for(stream, WAIT_TIMEOUT);
+}
+
+/// As `bound_stream` with an explicit bound (used to prove the bound holds).
+pub fn bound_stream_for(stream: &UnixStream, limit: Duration) {
     stream
-        .set_read_timeout(Some(WAIT_TIMEOUT))
+        .set_read_timeout(Some(limit))
         .expect("set read timeout");
     stream
-        .set_write_timeout(Some(WAIT_TIMEOUT))
+        .set_write_timeout(Some(limit))
         .expect("set write timeout");
 }
 

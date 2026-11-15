@@ -573,10 +573,13 @@ fn defect5_crash_recovery_endpoint_reuse() {
             .arg("--socket")
             .arg(&socket_path)
             .arg("--log")
-            .arg(temp.path().join("other_log"))
+            .arg(&log_dir)
             .arg("--t-clock")
             .arg("2024-03-01T12:00:00Z")
             .arg("--no-sandbox")
+            // Valid recovery inputs, so the refusal comes from the endpoint ownership
+            // check and not from argument validation (T2.1 review).
+            .arg("--resume-log")
             .arg("--recover"),
     );
     assert_eq!(
@@ -584,6 +587,21 @@ fn defect5_crash_recovery_endpoint_reuse() {
         Some(1),
         "Live endpoint must be protected"
     );
+    // The original listener still owns the endpoint and still serves.
+    {
+        let mut s = support::connect(&socket_path).expect("original listener still accepts");
+        let req = RequestFrame {
+            method: Method::Get,
+            request_id: 7,
+            authority: "example.org".into(),
+            path_and_query: "/test.txt".into(),
+            range: None,
+        };
+        s.write_all(&req.encode().unwrap()).unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let resp = ResponseFrame::read_from(&mut s, 1024 * 1024).unwrap();
+        assert_eq!(resp.status, 200, "original listener stopped serving");
+    }
 
     child.kill();
 
@@ -1012,8 +1030,31 @@ fn defect10_retained_header_presence_and_deterministic_order() {
     );
 }
 
+/// The Landlock failure injection is process-global; it runs only in a child
+/// process so other tests in this binary never start a server with it set.
 #[test]
 fn defect11_unavailable_landlock_startup_regression() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "defect11_unavailable_landlock_startup_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("HERMETIC_DEFECT11_CHILD", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success(), "{stdout}");
+    // The child really ran its body (not just the early return).
+    assert!(stdout.contains("defect11 child completed"), "{stdout}");
+}
+
+#[test]
+fn defect11_unavailable_landlock_startup_child() {
+    if std::env::var_os("HERMETIC_DEFECT11_CHILD").is_none() {
+        return;
+    }
     hermetic_world_server::sandbox::set_inject_landlock_unavailable(true);
 
     let temp = tempdir().unwrap();
@@ -1063,6 +1104,7 @@ fn defect11_unavailable_landlock_startup_regression() {
 
     let count = verify_log_recover(&log_path, false, false).unwrap();
     assert_eq!(count, 2);
+    println!("defect11 child completed");
 }
 
 #[test]
