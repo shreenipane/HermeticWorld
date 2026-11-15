@@ -299,7 +299,10 @@ fn happy_path_run_human_and_json() {
 #[test]
 fn happy_path_verify_with_and_without_bundle() {
     let backend = RecordingBackend::new();
-    let (code, out, err) = exec(&backend, &["verify", "--record", "/runs/rec.json"]);
+    let (code, out, err) = exec(
+        &backend,
+        &["verify", "--record", "/runs/rec.json", "--key", "/k"],
+    );
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(out, "verify: record verified\n");
     assert!(err.is_empty());
@@ -307,7 +310,9 @@ fn happy_path_verify_with_and_without_bundle() {
         backend.calls(),
         vec![RecordedCall::Verify(VerifyRequest {
             record: PathBuf::from("/runs/rec.json"),
+            key: PathBuf::from("/k"),
             bundle: None,
+            classification: None,
         })]
     );
 
@@ -318,6 +323,8 @@ fn happy_path_verify_with_and_without_bundle() {
             "verify",
             "--record",
             "/runs/rec.json",
+            "--key",
+            "/k",
             "--bundle",
             "/worlds/w1",
         ],
@@ -328,7 +335,9 @@ fn happy_path_verify_with_and_without_bundle() {
         backend2.calls(),
         vec![RecordedCall::Verify(VerifyRequest {
             record: PathBuf::from("/runs/rec.json"),
+            key: PathBuf::from("/k"),
             bundle: Some(PathBuf::from("/worlds/w1")),
+            classification: None,
         })]
     );
 }
@@ -421,7 +430,7 @@ fn usage_error_classes_all_exit_64_with_usage_on_stderr() {
             "H",
             "--bogus",
         ][..],
-        &["verify", "--record", "/r", "--json"][..],
+        &["verify", "--record", "/r", "--key", "/k", "--json"][..],
     ] {
         let (code, out, err) = exec(&backend, cmd_args);
         assert_eq!(code, ExitCode::USAGE_ERROR, "failed for {cmd_args:?}");
@@ -521,7 +530,7 @@ fn usage_error_classes_all_exit_64_with_usage_on_stderr() {
             "H",
             "extra",
         ][..],
-        &["verify", "--record", "/r", "extra"][..],
+        &["verify", "--record", "/r", "--key", "/k", "extra"][..],
         &["--version", "extra"][..],
         &["help", "seal", "extra"][..],
     ] {
@@ -738,9 +747,11 @@ fn validation_rejects_invalid_inputs_before_dispatch() {
         ),
         (&["verify-bundle", ""][..], "DIR"),
         (&["probe", "--world", "w\0x"][..], "--world"),
-        (&["verify", "--record", ""][..], "--record"),
+        (&["verify", "--record", "", "--key", "/k"][..], "--record"),
         (
-            &["verify", "--record", "/r", "--bundle", "b\0c"][..],
+            &[
+                "verify", "--record", "/r", "--key", "/k", "--bundle", "b\0c",
+            ][..],
             "--bundle",
         ),
     ] {
@@ -783,13 +794,16 @@ fn hidden_clock_parsed_but_refused_by_dispatch_with_exit_70() {
 fn exit_code_table_and_not_implemented_backend() {
     // 0: success
     let ok_backend = RecordingBackend::with_result(Ok(Outcome::success("all good")));
-    let (c0, _, _) = exec(&ok_backend, &["verify", "--record", "/r"]);
+    let (c0, _, _) = exec(&ok_backend, &["verify", "--record", "/r", "--key", "/k"]);
     assert_eq!(c0, ExitCode(0));
 
     // 2: operation ran and found a problem (via Outcome.ok == false)
     let fail_outcome_backend =
         RecordingBackend::with_result(Ok(Outcome::problem("digest mismatch")));
-    let (c2a, out2a, err2a) = exec(&fail_outcome_backend, &["verify", "--record", "/r"]);
+    let (c2a, out2a, err2a) = exec(
+        &fail_outcome_backend,
+        &["verify", "--record", "/r", "--key", "/k"],
+    );
     assert_eq!(c2a, ExitCode(2));
     assert_eq!(out2a, "verify: digest mismatch\n");
     assert!(err2a.is_empty());
@@ -798,7 +812,10 @@ fn exit_code_table_and_not_implemented_backend() {
     let fail_err_backend = RecordingBackend::with_result(Err(BackendError::ProblemFound(
         "signature invalid".to_string(),
     )));
-    let (c2b, out2b, err2b) = exec(&fail_err_backend, &["verify", "--record", "/r"]);
+    let (c2b, out2b, err2b) = exec(
+        &fail_err_backend,
+        &["verify", "--record", "/r", "--key", "/k"],
+    );
     assert_eq!(c2b, ExitCode(2));
     assert!(out2b.is_empty());
     assert_eq!(err2b, "error: signature invalid\n");
@@ -828,7 +845,7 @@ fn exit_code_table_and_not_implemented_backend() {
         &["verify-bundle", "/b"][..],
         &["probe", "--world", "/w"][..],
         &["run", "--world", "/w", "--task", "t", "--agent-mode", "H"][..],
-        &["verify", "--record", "/r"][..],
+        &["verify", "--record", "/r", "--key", "/k"][..],
     ] {
         let (c70, out70, err70) = exec(&not_impl, cmd);
         assert_eq!(
@@ -871,7 +888,7 @@ USAGE:
   hermetic verify-bundle DIR [--root sha256:HEX]
   hermetic probe --world DIR [--clockprobe-output FILE] [--kernel-canary-serial FILE] [--json]
   hermetic run --world DIR --task ID --agent-mode H|G [--clock faked|hidden] [--json]
-  hermetic verify --record FILE [--bundle DIR]
+  hermetic verify --record FILE --key FILE [--bundle DIR] [--classification FILE]
   hermetic --version
   hermetic help [SUBCOMMAND]
 
@@ -986,4 +1003,36 @@ fn regression_timestamp_fraction_and_leap_years() {
     // Multi-byte UTF-8 at a separator position must be refused, never panic.
     assert!(validate_rfc3339_utc("2024\u{e9}01-01T00:00:00Z").is_err());
     assert!(validate_rfc3339_utc("2024-01-01T00:00:00\u{e9}Z").is_err());
+}
+
+#[test]
+fn verify_requires_a_trusted_key_and_parses_classification() {
+    let backend = RecordingBackend::new();
+    let (code, _, _) = exec(&backend, &["verify", "--record", "/r"]);
+    assert_eq!(code, ExitCode::USAGE_ERROR);
+    assert!(backend.calls().is_empty());
+    let (code, _, err) = exec(
+        &backend,
+        &[
+            "verify",
+            "--record",
+            "/r",
+            "--key",
+            "/k",
+            "--classification",
+            "/c",
+        ],
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(
+        backend.calls(),
+        vec![RecordedCall::Verify(VerifyRequest {
+            record: PathBuf::from("/r"),
+            key: PathBuf::from("/k"),
+            bundle: None,
+            classification: Some(PathBuf::from("/c")),
+        })]
+    );
+    let (code, _, _) = exec(&backend, &["verify", "--record", "/r", "--key", ""]);
+    assert_eq!(code, ExitCode::DATA_ERROR);
 }

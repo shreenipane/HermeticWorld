@@ -77,7 +77,7 @@ USAGE:
   hermetic verify-bundle DIR [--root sha256:HEX]
   hermetic probe --world DIR [--clockprobe-output FILE] [--kernel-canary-serial FILE] [--json]
   hermetic run --world DIR --task ID --agent-mode H|G [--clock faked|hidden] [--json]
-  hermetic verify --record FILE [--bundle DIR]
+  hermetic verify --record FILE --key FILE [--bundle DIR] [--classification FILE]
   hermetic --version
   hermetic help [SUBCOMMAND]
 
@@ -147,11 +147,13 @@ OPTIONS:
 
 pub const VERIFY_HELP: &str = "\
 USAGE:
-  hermetic verify --record FILE [--bundle DIR]
+  hermetic verify --record FILE --key FILE [--bundle DIR] [--classification FILE]
 
 OPTIONS:
-  --record FILE   Execution record file path (non-empty, no NUL bytes)
-  --bundle DIR    Optional sealed bundle directory path (non-empty, no NUL bytes)";
+  --record FILE          Signed run attestation (DSSE envelope JSON)
+  --key FILE             Trusted raw 32-byte Ed25519 public key
+  --bundle DIR           Optional sealed bundle; its root must equal the record's world_root
+  --classification FILE  Optional hermetic-run-classification/v1 to cross-check";
 
 pub const HELP_COMMAND_HELP: &str = "\
 USAGE:

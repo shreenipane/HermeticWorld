@@ -14,7 +14,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
 | 2: World | done 4 of 43 |
-| 3: VMs | done 21 of 47 |
+| 3: VMs | done 22 of 47 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
 
@@ -236,7 +236,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] Strict argument parser and exit-code contract (0/2/64/65/70/74) for all five subcommands. Proof: `usage_error_classes_all_exit_64_with_usage_on_stderr`, `validation_rejects_invalid_inputs_before_dispatch`, `exit_code_table_and_not_implemented_backend` (`crates/hermetic-cli/tests/cli.rs`).
   - [x] `verify-bundle` over `hermetic-bundle::verify`: ok/mismatch/expected-root, symlinked or non-directory root refused (65), inner symlink rejected (2). Proof: `verify_bundle_ok_mismatch_and_expected_root`, `verify_bundle_refuses_symlinked_root_and_nondirectory`, `verify_bundle_with_symlink_inside_is_problem_found` (`crates/hermetic-cli/tests/backend.rs`).
   - [x] `probe` classifies supplied `--clockprobe-output` JSON lines and/or `--kernel-canary-serial` transcripts (never probes the host; no input fails closed, 70); symlink, FIFO and oversized inputs refused. Proof: `probe_classifies_clockprobe_output_blocked_leak_error`, `probe_kernel_canary_serial_pass_leak_and_malformed`, `probe_inputs_refuse_symlink_fifo_oversized_and_missing`, `probe_without_input_fails_closed_and_never_probes_host`.
-  - [ ] remaining: `verify`: run-record schema validation is wired (invalid record exits 2), but DSSE signature check and bundle cross-check are not, so a valid record fails closed with exit 70. Proof of fail-closed: `verify_valid_record_fails_closed_on_signature_check`, `verify_invalid_record_is_problem_found`, `verify_refuses_hostile_record_and_bundle_paths`.
+  - [x] `verify`: Ed25519 DSSE signature check against a trusted key, bundle root binding to `world_root`, and classifier cross-check (clock, `date_leak_observed`, status, run digest). Proof: `verify_accepts_a_signed_record_from_the_trusted_key`, `verify_rejects_tampering_wrong_key_and_unsigned_records`, `verify_binds_the_record_to_the_bundle_root`, `verify_cross_checks_the_classifier`, `verify_refuses_hostile_record_key_classification_and_bundle_paths`, `verify_requires_a_trusted_key_and_parses_classification`.
   - [ ] remaining: `seal` (cutoff computation, world build, sealcheck gate) and `run` (microVM orchestration) fail closed with fixed messages, exit 70. Proof: `seal_fails_closed_with_fixed_message_and_exit_70`, `run_fails_closed_with_fixed_message_and_exit_70`.
 - [x] `clock: faked`: microVM runs are `faked` unless patched Firecracker, host hypercall block, a complete probe (every required record exactly once) with every record blocked (clock pairing `unavailable` only with a blocked ring-0 canary) and no D12 hit all hold; container runs are `real`. Proof: `test_full_blocked_probe_with_host_filter_is_hidden`, `test_missing_host_filter_gives_faked`, `test_missing_probe_gives_faked`, `test_incomplete_probe_gives_faked`, `test_any_record_not_blocked_gives_faked`, `test_clock_pairing_unavailable_needs_blocked_canary`, `test_duplicate_probe_record_gives_faked_even_if_both_blocked`, `test_date_leak_observed_gives_faked_and_review`, `test_container_substrate_is_real` (`python/tests/test_run_classifier.py`).
 

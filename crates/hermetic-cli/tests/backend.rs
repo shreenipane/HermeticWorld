@@ -10,9 +10,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
 
-use hermetic_cli::backend::{
-    PROBE_NEEDS_INPUT, RUN_NOT_WIRED, SEAL_NOT_WIRED, VERIFY_SIGNATURE_NOT_WIRED,
-};
+use hermetic_cli::backend::{PROBE_NEEDS_INPUT, RUN_NOT_WIRED, SEAL_NOT_WIRED};
 use hermetic_cli::{run_with_args, ExitCode, RealBackend};
 
 fn exec(args: &[&str]) -> (ExitCode, String, String) {
@@ -456,66 +454,244 @@ fn probe_new_flags_parse_strictly() {
 
 // ---- verify ----
 
-fn valid_record_json() -> String {
-    serde_json::to_string(&attest_common::sample_run_record()).unwrap()
+use hermetic_attest::canonical::compute_run_digest;
+use hermetic_attest::dsse::{DsseEnvelope, Statement};
+use hermetic_attest::offline_key::Ed25519Signer;
+use hermetic_attest::{Digest, RunRecord};
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
+
+/// Throwaway signer generated in memory for one test.
+fn signer() -> Ed25519Signer {
+    let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    Ed25519Signer::from_pkcs8(der.as_ref()).unwrap()
+}
+
+fn sign(record: RunRecord, signer: &Ed25519Signer) -> String {
+    let st = Statement::new_run_statement(record).unwrap();
+    serde_json::to_string(&DsseEnvelope::sign_statement(&st, signer).unwrap()).unwrap()
+}
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    record: std::path::PathBuf,
+    key: std::path::PathBuf,
+    signer: Ed25519Signer,
+}
+
+fn fixture(record: RunRecord) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let signer = signer();
+    let r = dir.path().join("record.json");
+    fs::write(&r, sign(record, &signer)).unwrap();
+    let k = dir.path().join("key.pub");
+    fs::write(&k, signer.public_key()).unwrap();
+    Fixture {
+        record: r,
+        key: k,
+        dir,
+        signer,
+    }
+}
+
+fn classification(record: &RunRecord, flags: &[&str]) -> String {
+    serde_json::json!({
+        "schema": "hermetic-run-classification/v1",
+        "run_digest": compute_run_digest(record).unwrap().to_string(),
+        "clock": "hidden", "clock_reasons": [], "label": null, "confidence": null,
+        "status": "resolved", "flags": flags,
+    })
+    .to_string()
 }
 
 #[test]
-fn verify_valid_record_fails_closed_on_signature_check() {
-    let dir = tempfile::tempdir().unwrap();
-    let r = dir.path().join("record.json");
-    fs::write(&r, valid_record_json()).unwrap();
-    let (code, out, err) = exec(&["verify", "--record", p(&r)]);
-    assert_eq!(code, ExitCode::INTERNAL_OR_NOT_IMPLEMENTED, "{err}");
-    assert!(out.is_empty());
-    assert_eq!(
-        err,
-        format!("error: not available: {VERIFY_SIGNATURE_NOT_WIRED}\n")
-    );
-
-    let (code, _, _) = exec(&["verify", "--record", p(&r), "--bundle", p(dir.path())]);
-    assert_eq!(code, ExitCode::INTERNAL_OR_NOT_IMPLEMENTED);
+fn verify_accepts_a_signed_record_from_the_trusted_key() {
+    let f = fixture(attest_common::sample_run_record());
+    let (code, out, err) = exec(&["verify", "--record", p(&f.record), "--key", p(&f.key)]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let digest = compute_run_digest(&attest_common::sample_run_record()).unwrap();
+    assert_eq!(out, format!("verify: verified run {digest}\n"));
 }
 
 #[test]
-fn verify_invalid_record_is_problem_found() {
-    let dir = tempfile::tempdir().unwrap();
-    let r = dir.path().join("record.json");
-    for bad in [
-        "{}".to_string(),
-        "nope".to_string(),
-        valid_record_json().replace("\"task_id\"", "\"task_idx\""),
-    ] {
-        fs::write(&r, &bad).unwrap();
-        let (code, out, err) = exec(&["verify", "--record", p(&r)]);
-        assert_eq!(code, ExitCode::PROBLEM_FOUND, "{bad}");
+fn verify_rejects_tampering_wrong_key_and_unsigned_records() {
+    let f = fixture(attest_common::sample_run_record());
+    // A signature from another key, under the trusted key id or not, fails.
+    let other = signer();
+    let wrong_key = f.dir.path().join("other.pub");
+    fs::write(&wrong_key, other.public_key()).unwrap();
+    let (code, _, err) = exec(&["verify", "--record", p(&f.record), "--key", p(&wrong_key)]);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.starts_with("error: record invalid"), "{err}");
+    // Flip one payload byte of a valid envelope.
+    let mut env: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&f.record).unwrap()).unwrap();
+    let payload = env["payload"].as_str().unwrap().to_string();
+    let flipped = if payload.starts_with('e') { "f" } else { "e" };
+    env["payload"] = serde_json::Value::from(format!("{flipped}{}", &payload[1..]));
+    let tampered = f.dir.path().join("tampered.json");
+    fs::write(&tampered, env.to_string()).unwrap();
+    // The old unsigned record format is not accepted either.
+    let unsigned = f.dir.path().join("unsigned.json");
+    fs::write(&unsigned, valid_record_json()).unwrap();
+    for bad in [&tampered, &unsigned] {
+        let (code, out, err) = exec(&["verify", "--record", p(bad), "--key", p(&f.key)]);
+        assert_eq!(code, ExitCode::PROBLEM_FOUND, "{bad:?}");
         assert!(out.is_empty());
         assert!(err.starts_with("error: record invalid"), "{err}");
     }
-    fs::write(&r, [0xffu8]).unwrap();
-    let (code, _, _) = exec(&["verify", "--record", p(&r)]);
+    for bad in ["{}", "nope"] {
+        fs::write(&tampered, bad).unwrap();
+        let (code, _, _) = exec(&["verify", "--record", p(&tampered), "--key", p(&f.key)]);
+        assert_eq!(code, ExitCode::PROBLEM_FOUND, "{bad}");
+    }
+    fs::write(&tampered, [0xffu8]).unwrap();
+    let (code, _, _) = exec(&["verify", "--record", p(&tampered), "--key", p(&f.key)]);
     assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    drop(f.signer);
 }
 
 #[test]
-fn verify_refuses_hostile_record_and_bundle_paths() {
+fn verify_binds_the_record_to_the_bundle_root() {
     let dir = tempfile::tempdir().unwrap();
-    let r = dir.path().join("record.json");
-    fs::write(&r, valid_record_json()).unwrap();
-    let link = dir.path().join("link");
-    symlink(&r, &link).unwrap();
-    let fifo = dir.path().join("fifo");
+    let b = dir.path().join("b");
+    fs::create_dir(&b).unwrap();
+    fs::write(b.join("a.txt"), b"hello").unwrap();
+    let manifest = hermetic_bundle::seal(&b).unwrap();
+    let root = Digest::parse(&manifest.root).unwrap();
+    let mut matching = attest_common::sample_run_record();
+    matching.world_root = root.clone();
+    matching.version_tuple.world_version = root;
+    let good = fixture(matching);
+    let (code, _, err) = exec(&[
+        "verify",
+        "--record",
+        p(&good.record),
+        "--key",
+        p(&good.key),
+        "--bundle",
+        p(&b),
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    // The sample record names a different world root.
+    let other = fixture(attest_common::sample_run_record());
+    let (code, _, err) = exec(&[
+        "verify",
+        "--record",
+        p(&other.record),
+        "--key",
+        p(&other.key),
+        "--bundle",
+        p(&b),
+    ]);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.contains("world_root"), "{err}");
+    // A modified bundle no longer matches its manifest.
+    fs::write(b.join("a.txt"), b"changed").unwrap();
+    let (code, _, err) = exec(&[
+        "verify",
+        "--record",
+        p(&good.record),
+        "--key",
+        p(&good.key),
+        "--bundle",
+        p(&b),
+    ]);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.contains("bundle rejected"), "{err}");
+}
+
+#[test]
+fn verify_cross_checks_the_classifier() {
+    let record = attest_common::sample_run_record();
+    let f = fixture(record.clone());
+    let c = f.dir.path().join("class.json");
+    fs::write(&c, classification(&record, &[])).unwrap();
+    let args = |c: &Path| {
+        exec(&[
+            "verify",
+            "--record",
+            p(&f.record),
+            "--key",
+            p(&f.key),
+            "--classification",
+            p(c),
+        ])
+    };
+    let (code, _, err) = args(&c);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    // The classifier saw a date leak the record does not report.
+    fs::write(&c, classification(&record, &["date_leak_observed"])).unwrap();
+    let (code, _, err) = args(&c);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.contains("date_leak_observed"), "{err}");
+    // Classification of another run.
+    let mut other = record.clone();
+    other.task_id = "other-task".into();
+    fs::write(&c, classification(&other, &[])).unwrap();
+    let (code, _, err) = args(&c);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.contains("run_digest"), "{err}");
+    fs::write(&c, "{\"schema\":\"x\"}").unwrap();
+    let (code, _, err) = args(&c);
+    assert_eq!(code, ExitCode::PROBLEM_FOUND);
+    assert!(err.starts_with("error: classification invalid"), "{err}");
+}
+
+#[test]
+fn verify_refuses_hostile_record_key_classification_and_bundle_paths() {
+    let f = fixture(attest_common::sample_run_record());
+    let dir = f.dir.path();
+    let link = dir.join("link");
+    symlink(&f.record, &link).unwrap();
+    let klink = dir.join("klink");
+    symlink(&f.key, &klink).unwrap();
+    let fifo = dir.join("fifo");
     mkfifo(&fifo);
-    let big = dir.path().join("big");
+    let big = dir.join("big");
     fs::write(&big, vec![b' '; 1024 * 1024 + 1]).unwrap();
     for hostile in [&link, &fifo, &big] {
-        let (code, _, _) = exec(&["verify", "--record", p(hostile)]);
+        let (code, _, _) = exec(&["verify", "--record", p(hostile), "--key", p(&f.key)]);
         assert_eq!(code, ExitCode::DATA_ERROR, "{hostile:?}");
+        let (code, _, _) = exec(&[
+            "verify",
+            "--record",
+            p(&f.record),
+            "--key",
+            p(&f.key),
+            "--classification",
+            p(hostile),
+        ]);
+        assert_eq!(code, ExitCode::DATA_ERROR, "classification {hostile:?}");
     }
-    let dlink = dir.path().join("dlink");
-    symlink(dir.path(), &dlink).unwrap();
-    let (code, _, _) = exec(&["verify", "--record", p(&r), "--bundle", p(&dlink)]);
+    let short = dir.join("short.pub");
+    fs::write(&short, [0u8; 31]).unwrap();
+    for bad_key in [&klink, &fifo, &big, &short] {
+        let (code, _, _) = exec(&["verify", "--record", p(&f.record), "--key", p(bad_key)]);
+        assert_eq!(code, ExitCode::DATA_ERROR, "key {bad_key:?}");
+    }
+    let dlink = dir.join("dlink");
+    symlink(dir, &dlink).unwrap();
+    let (code, _, _) = exec(&[
+        "verify",
+        "--record",
+        p(&f.record),
+        "--key",
+        p(&f.key),
+        "--bundle",
+        p(&dlink),
+    ]);
     assert_eq!(code, ExitCode::DATA_ERROR);
-    let (code, _, _) = exec(&["verify", "--record", p(&dir.path().join("absent"))]);
+    let (code, _, _) = exec(&[
+        "verify",
+        "--record",
+        p(&dir.join("absent")),
+        "--key",
+        p(&f.key),
+    ]);
     assert_eq!(code, ExitCode::IO_ERROR);
+}
+
+fn valid_record_json() -> String {
+    serde_json::to_string(&attest_common::sample_run_record()).unwrap()
 }

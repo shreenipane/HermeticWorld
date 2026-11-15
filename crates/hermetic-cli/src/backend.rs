@@ -10,7 +10,12 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
-use hermetic_attest::{safe_read_file, FsError, RunRecord};
+use hermetic_attest::offline_key::Ed25519Verifier;
+use hermetic_attest::verify::{
+    check_against_classification, verify_run_attestation, ReplayGuard, RunBinding,
+    RunClassification,
+};
+use hermetic_attest::{safe_read_file, Digest, FsError};
 use hermetic_bundle::{BundleError, Verdict};
 use hermetic_clockprobe::canary;
 use hermetic_clockprobe::classify::{determine_exit_code, ProbeRecord, ProbeResult, MAX_ITEMS};
@@ -23,13 +28,14 @@ pub const SEAL_NOT_WIRED: &str =
     "seal backend (cutoff computation, world build, sealcheck gate) is not available in this build";
 pub const RUN_NOT_WIRED: &str =
     "run backend (microVM orchestration) is not available in this build";
-pub const VERIFY_SIGNATURE_NOT_WIRED: &str = "record schema is valid, but signature and bundle cross-check verification is not available in this build";
 pub const PROBE_NEEDS_INPUT: &str = "probe never runs guest probes on the host; supply --clockprobe-output or --kernel-canary-serial";
 
 /// Cap for captured clockprobe JSON-lines output.
 pub const MAX_CLOCKPROBE_OUTPUT_BYTES: usize = 1024 * 1024;
-/// Cap for a run record file.
+/// Cap for a signed run attestation (DSSE envelope) file.
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Cap for a run classification file.
+pub const MAX_CLASSIFICATION_FILE_BYTES: usize = hermetic_attest::verify::MAX_CLASSIFICATION_BYTES;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealBackend;
@@ -209,14 +215,56 @@ impl Backend for RealBackend {
     }
 
     fn verify(&self, req: VerifyRequest) -> Result<Outcome, BackendError> {
-        if let Some(bundle) = &req.bundle {
-            require_real_dir(bundle)?;
-        }
+        // Read and validate every input before any verdict.
+        let verifier = Ed25519Verifier::from_public_key_path(&req.key)
+            .map_err(|e| BackendError::Data(format!("refused key file: {e}")))?;
         let bytes = read_input(&req.record, MAX_RECORD_BYTES)?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| BackendError::ProblemFound("record invalid: not UTF-8".to_string()))?;
-        RunRecord::from_json_str(text)
+        let classification = match &req.classification {
+            Some(path) => {
+                let raw = read_input(path, MAX_CLASSIFICATION_FILE_BYTES)?;
+                let raw = std::str::from_utf8(&raw).map_err(|_| {
+                    BackendError::ProblemFound("classification invalid: not UTF-8".to_string())
+                })?;
+                Some(RunClassification::from_json_str(raw).map_err(|e| {
+                    BackendError::ProblemFound(format!("classification invalid: {e}"))
+                })?)
+            }
+            None => None,
+        };
+        let mut binding = RunBinding::default();
+        if let Some(bundle) = &req.bundle {
+            require_real_dir(bundle)?;
+            let report = hermetic_bundle::verify(bundle, None).map_err(bundle_error)?;
+            if report.verdict != Verdict::Ok {
+                return Err(BackendError::ProblemFound(
+                    "bundle rejected: integrity mismatch".to_string(),
+                ));
+            }
+            binding.world_root = Some(
+                Digest::parse(&report.recomputed_root)
+                    .map_err(|_| BackendError::Data("bundle root is not a digest".to_string()))?,
+            );
+        }
+        // A single invocation has a fresh guard; replay across runs is the
+        // caller's responsibility (the guard is exposed by hermetic-attest).
+        let mut guard = ReplayGuard::new();
+        let (statement, digest) = verify_run_attestation(text, &verifier, &binding, &mut guard)
             .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?;
-        Err(BackendError::Unavailable(VERIFY_SIGNATURE_NOT_WIRED))
+        if let Some(c) = &classification {
+            check_against_classification(&statement.predicate, c)
+                .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?;
+        }
+        let mut outcome = Outcome::success(format!("verified run {digest}"))
+            .with_detail("run_digest", Value::from(digest.to_string()))
+            .with_detail("task_id", Value::from(statement.predicate.task_id.clone()));
+        if req.bundle.is_some() {
+            outcome = outcome.with_detail("bundle", Value::from("matches world_root"));
+        }
+        if classification.is_some() {
+            outcome = outcome.with_detail("classification", Value::from("consistent"));
+        }
+        Ok(outcome)
     }
 }

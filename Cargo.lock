@@ -538,6 +538,7 @@ dependencies = [
  "hermetic-attest",
  "hermetic-bundle",
  "hermetic-clockprobe",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

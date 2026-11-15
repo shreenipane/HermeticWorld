@@ -176,7 +176,9 @@ pub struct RawRunArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawVerifyArgs {
     pub record: String,
+    pub key: String,
     pub bundle: Option<String>,
+    pub classification: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +231,9 @@ pub struct RunRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyRequest {
     pub record: PathBuf,
+    pub key: PathBuf,
     pub bundle: Option<PathBuf>,
+    pub classification: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,12 +797,24 @@ where
             let parsed = scan_tokens(
                 SubcommandKind::Verify,
                 rest,
-                &[("--record", FlagSpec::Value), ("--bundle", FlagSpec::Value)],
+                &[
+                    ("--record", FlagSpec::Value),
+                    ("--key", FlagSpec::Value),
+                    ("--bundle", FlagSpec::Value),
+                    ("--classification", FlagSpec::Value),
+                ],
             )?;
             reject_any_positionals(SubcommandKind::Verify, &parsed)?;
             let record = require_value_flag(SubcommandKind::Verify, &parsed, "--record")?;
+            let key = require_value_flag(SubcommandKind::Verify, &parsed, "--key")?;
             let bundle = take_value_flag(&parsed, "--bundle");
-            Ok(RawCommand::Verify(RawVerifyArgs { record, bundle }))
+            let classification = take_value_flag(&parsed, "--classification");
+            Ok(RawCommand::Verify(RawVerifyArgs {
+                record,
+                key,
+                bundle,
+                classification,
+            }))
         }
     }
 }
@@ -862,11 +878,22 @@ pub fn validate_command(raw: RawCommand) -> Result<ValidatedCommand, ValidationE
         }
         RawCommand::Verify(args) => {
             let record = validate_path("--record", &args.record)?;
+            let key = validate_path("--key", &args.key)?;
             let bundle = match args.bundle {
                 Some(ref b) => Some(validate_path("--bundle", b)?),
                 None => None,
             };
-            Ok(ValidatedCommand::Verify(VerifyRequest { record, bundle }))
+            let classification = args
+                .classification
+                .as_deref()
+                .map(|v| validate_path("--classification", v))
+                .transpose()?;
+            Ok(ValidatedCommand::Verify(VerifyRequest {
+                record,
+                key,
+                bundle,
+                classification,
+            }))
         }
     }
 }

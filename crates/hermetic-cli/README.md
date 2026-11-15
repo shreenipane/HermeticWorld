@@ -17,7 +17,7 @@ hermetic seal --src DIR --out DIR --t-clock RFC3339 --world-id ID [--seal-level 
 hermetic verify-bundle DIR [--root sha256:HEX]
 hermetic probe --world DIR [--clockprobe-output FILE] [--kernel-canary-serial FILE] [--json]
 hermetic run --world DIR --task ID --agent-mode H|G [--clock faked|hidden] [--json]
-hermetic verify --record FILE [--bundle DIR]
+hermetic verify --record FILE --key FILE [--bundle DIR] [--classification FILE]
 hermetic --version
 hermetic help [SUBCOMMAND]
 
@@ -33,3 +33,12 @@ hermetic help [SUBCOMMAND]
 | `70` | Internal error or feature not implemented (including `--clock hidden` and unwired backend calls) |
 | `74` | I/O error |
 
+
+## verify
+
+`--record` is a signed run attestation (DSSE envelope). `--key` is the trusted raw
+32-byte Ed25519 public key. With `--bundle`, the bundle must pass integrity
+verification and its root must equal the record's `world_root`. With
+`--classification`, the record must agree with the run classifier on clock level,
+`date_leak_observed`, run status and run digest. Any failure exits 2; refused or
+malformed input files exit 65.
