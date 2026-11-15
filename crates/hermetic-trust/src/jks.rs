@@ -322,10 +322,9 @@ pub fn inject_ca_into_jks(
     for entry in &entries {
         let alias_norm = entry.alias().to_lowercase();
         if !seen_aliases.insert(alias_norm) {
-            return Err(TrustError::Jks(format!(
-                "duplicate alias '{}' in keystore",
-                entry.alias()
-            )));
+            // A fixed code: keystore alias text (possibly with control
+            // characters) never reaches reports or skipped-path reasons.
+            return Err(TrustError::Jks("duplicate_alias".to_string()));
         }
     }
 

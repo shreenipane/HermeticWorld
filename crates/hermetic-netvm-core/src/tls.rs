@@ -251,13 +251,14 @@ impl Resolver {
             return None;
         }
         state.issuances += 1;
-        let leaf = mint_leaf(&state.ca, &[name], state.clock).ok()?;
+        let mut leaf = mint_leaf(&state.ca, &[name], state.clock).ok()?;
+        // Take the buffers (no copy of the key); the leaf's PEM is wiped on drop.
         let key = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
-            PrivatePkcs8KeyDer::from(leaf.key_der),
+            PrivatePkcs8KeyDer::from(std::mem::take(&mut leaf.key_der)),
         ))
         .ok()?;
         let certified = Arc::new(CertifiedKey::new(
-            vec![CertificateDer::from(leaf.cert_der)],
+            vec![CertificateDer::from(std::mem::take(&mut leaf.cert_der))],
             key,
         ));
         if state.cache.len() >= MAX_TLS_CACHE_ENTRIES {

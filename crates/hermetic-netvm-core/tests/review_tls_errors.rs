@@ -48,7 +48,9 @@ fn upstream_errors_and_invalid_status_finish_https_without_truncation() {
     let server = tls::server_config(ca.clone(), &table, EPOCH).unwrap();
     let filter = Arc::new(WorldFilter::new(&table));
     let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(ca.cert_der)).unwrap();
+    roots
+        .add(CertificateDer::from(ca.cert_der.clone()))
+        .unwrap();
     let client = Arc::new(
         ClientConfig::builder_with_details(
             Arc::new(rustls::crypto::ring::default_provider()),

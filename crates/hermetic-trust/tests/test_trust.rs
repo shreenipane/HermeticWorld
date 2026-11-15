@@ -2630,6 +2630,33 @@ fn test_regression_jks_duplicate_alias_and_private_key_collision_both_orders() {
         jks_order3,
         "Keystore bytes must remain unchanged on duplicate alias"
     );
+
+    // Order 4 (T2.5 review): a duplicate alias with control characters is reported
+    // with a fixed code; no keystore alias text reaches the report.
+    let hostile = "evil\u{1b}[31malias\n";
+    let entries_order4: [(&str, bool, &[u8]); 2] = [
+        (hostile, false, &ca.cert_der),
+        (hostile, false, &ca.cert_der),
+    ];
+    let jks_order4 = create_multi_entry_jks(&entries_order4, "changeit");
+    fs::write(&jks_path, &jks_order4).expect("write order4");
+    let report4 = install_ca(&rootfs, &ca.cert_pem).expect("install_ca order4");
+    let skipped4 = report4
+        .skipped_paths
+        .iter()
+        .find(|s| s.path.ends_with("cacerts"))
+        .expect("duplicate hostile alias skipped");
+    assert!(
+        skipped4.reason.contains("duplicate_alias"),
+        "{:?}",
+        skipped4.reason
+    );
+    assert!(!skipped4.reason.contains("evil"), "{:?}", skipped4.reason);
+    assert!(
+        !skipped4.reason.chars().any(char::is_control),
+        "{:?}",
+        skipped4.reason
+    );
 }
 
 /// Wait for a child process with a deadline; kill it and panic on timeout.
@@ -3616,5 +3643,361 @@ fn test_created_entries_owned_by_guest_owner_in_user_namespace() {
         let is_dir = !parts[3].ends_with(".crt") && !parts[3].ends_with(".pem");
         let expected = if is_dir { "755" } else { "644" };
         assert_eq!(parts[2], expected, "mode under umask 077: {}", line);
+    }
+}
+
+/// T2.5 review: test injection is per-thread only. A hook installed on one
+/// thread never fires for an installer running on another thread.
+#[test]
+fn test_injection_hooks_never_cross_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("etc/ssl/certs")).expect("create certs");
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = fired.clone();
+    let _hook = hermetic_trust::set_before_use_hook_guard(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let _chown = hermetic_trust::set_chown_failure_guard();
+    let other = rootfs.clone();
+    let result = std::thread::spawn(move || {
+        let root = open_dir_handle(&other).expect("open rootfs");
+        atomic_write_in_root(
+            &root,
+            std::path::Path::new("etc/ssl/certs/other-thread.crt"),
+            b"DATA",
+            NEW_FILE_MODE,
+            current_owner(),
+        )
+    })
+    .join()
+    .expect("join");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        0,
+        "hook fired on another thread"
+    );
+    // On the installing thread itself the hook does fire.
+    let root = open_dir_handle(&rootfs).expect("open rootfs");
+    let _ = atomic_write_in_root(
+        &root,
+        std::path::Path::new("etc/ssl/certs/same-thread.crt"),
+        b"DATA",
+        NEW_FILE_MODE,
+        current_owner(),
+    );
+    assert!(
+        fired.load(Ordering::SeqCst) > 0,
+        "hook did not fire on its own thread"
+    );
+}
+
+/// T2.5 review: the CA and leaf types own an explicit `Drop` that wipes the seed
+/// and private-key buffers (a `Drop` bound only holds for an explicit impl).
+#[test]
+fn test_secret_holders_wipe_on_drop() {
+    #[allow(drop_bounds)]
+    fn explicit_drop<T: Drop>() {}
+    explicit_drop::<hermetic_trust::Ca>();
+    explicit_drop::<hermetic_trust::LeafCert>();
+}
+
+/// T2.5 review: strict DER for BOOLEANs, unique identifiers, pathLenConstraint
+/// and the SAN/SKI/AKI payloads. Each bad certificate is otherwise a valid,
+/// correctly self-signed CA; the baseline must still install.
+#[test]
+fn test_regression_strict_der_certificate_fields() {
+    use hermetic_trust::asn1::*;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("etc/ssl/certs")).expect("create certs");
+    let seed: [u8; 32] = [7u8; 32];
+    let ca = mint_ca("der-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+    let (not_before, not_after) =
+        compute_ca_validity(datetime!(2024-01-01 00:00:00 UTC)).expect("validity");
+    let validity = encode_sequence(&[&encode_der_time(not_before), &encode_der_time(not_after)]);
+
+    let ext = |oid: &[u8], critical: Option<Vec<u8>>, value: Vec<u8>| -> Vec<u8> {
+        match critical {
+            Some(c) => encode_sequence(&[&encode_oid(oid), &c, &encode_octet_string(&value)]),
+            None => encode_sequence(&[&encode_oid(oid), &encode_octet_string(&value)]),
+        }
+    };
+    let ku = ext(
+        OID_KEY_USAGE,
+        Some(encode_boolean(true)),
+        encode_bit_string(1, &[0x06]),
+    );
+    let bc = |inner: &[&[u8]]| {
+        ext(
+            OID_BASIC_CONSTRAINTS,
+            Some(encode_boolean(true)),
+            encode_sequence(inner),
+        )
+    };
+    let good_bc = bc(&[&encode_boolean(true)]);
+
+    let build = |unique: &[Vec<u8>], exts: &[Vec<u8>]| -> String {
+        let ext_refs: Vec<&[u8]> = exts.iter().map(|e| e.as_slice()).collect();
+        let exts_der = encode_explicit(3, &encode_sequence(&ext_refs));
+        let version = encode_explicit(0, &encode_integer(&[2]));
+        let serial = encode_integer(&[3u8; 16]);
+        let alg = encode_sha256_with_rsa_algorithm();
+        let mut items: Vec<&[u8]> = vec![
+            &version,
+            &serial,
+            &alg,
+            &ca.subject_dn_der,
+            &validity,
+            &ca.subject_dn_der,
+            &ca.spki_der,
+        ];
+        for u in unique {
+            items.push(u);
+        }
+        items.push(&exts_der);
+        sign_custom_tbs(&encode_sequence(&items), &ca.key)
+    };
+    let installs = |pem: &str| install_ca(&rootfs, pem).is_ok();
+
+    // Baseline and well-formed optional fields install.
+    assert!(
+        installs(&build(&[], &[good_bc.clone(), ku.clone()])),
+        "baseline must install"
+    );
+    let good_san = ext(
+        OID_SUBJECT_ALT_NAME,
+        None,
+        encode_sequence(&[&encode_tlv(0x82, b"ca.example")]),
+    );
+    let good_ski = ext(
+        OID_SUBJECT_KEY_IDENTIFIER,
+        None,
+        encode_octet_string(&[1u8; 20]),
+    );
+    let good_aki = ext(
+        OID_AUTHORITY_KEY_IDENTIFIER,
+        None,
+        encode_sequence(&[&encode_tlv(0x80, &[1u8; 20])]),
+    );
+    let good_path = bc(&[&encode_boolean(true), &encode_integer(&[0])]);
+    assert!(
+        installs(&build(
+            &[encode_tlv(0x81, &[0, 0xAA])],
+            &[good_path, ku.clone(), good_san, good_ski, good_aki]
+        )),
+        "well-formed optional fields must install"
+    );
+
+    let bad: Vec<(&str, String)> = vec![
+        (
+            "critical BOOLEAN 0x01",
+            build(
+                &[],
+                &[
+                    ext(
+                        OID_BASIC_CONSTRAINTS,
+                        Some(encode_tlv(0x01, &[0x01])),
+                        encode_sequence(&[&encode_boolean(true)]),
+                    ),
+                    ku.clone(),
+                ],
+            ),
+        ),
+        (
+            "explicit critical FALSE",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_SUBJECT_KEY_IDENTIFIER,
+                        Some(encode_tlv(0x01, &[0x00])),
+                        encode_octet_string(&[1u8; 20]),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "two-byte BOOLEAN",
+            build(&[], &[bc(&[&encode_tlv(0x01, &[0xFF, 0xFF])]), ku.clone()]),
+        ),
+        (
+            "cA BOOLEAN 0x01",
+            build(&[], &[bc(&[&encode_tlv(0x01, &[0x01])]), ku.clone()]),
+        ),
+        (
+            "negative pathLen",
+            build(
+                &[],
+                &[
+                    bc(&[&encode_boolean(true), &encode_tlv(0x02, &[0xFF])]),
+                    ku.clone(),
+                ],
+            ),
+        ),
+        (
+            "non-minimal pathLen",
+            build(
+                &[],
+                &[
+                    bc(&[&encode_boolean(true), &encode_tlv(0x02, &[0x00, 0x01])]),
+                    ku.clone(),
+                ],
+            ),
+        ),
+        (
+            "empty pathLen",
+            build(
+                &[],
+                &[
+                    bc(&[&encode_boolean(true), &encode_tlv(0x02, &[])]),
+                    ku.clone(),
+                ],
+            ),
+        ),
+        (
+            "constructed unique id",
+            build(
+                &[encode_tlv(0xA1, &[0x03, 0x01, 0x00])],
+                &[good_bc.clone(), ku.clone()],
+            ),
+        ),
+        (
+            "unique id bad unused bits",
+            build(
+                &[encode_tlv(0x81, &[9, 0xAA])],
+                &[good_bc.clone(), ku.clone()],
+            ),
+        ),
+        (
+            "unique id non-zero padding",
+            build(
+                &[encode_tlv(0x81, &[1, 0x01])],
+                &[good_bc.clone(), ku.clone()],
+            ),
+        ),
+        (
+            "unique ids out of order",
+            build(
+                &[encode_tlv(0x82, &[0]), encode_tlv(0x81, &[0])],
+                &[good_bc.clone(), ku.clone()],
+            ),
+        ),
+        (
+            "empty SKI",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(OID_SUBJECT_KEY_IDENTIFIER, None, encode_octet_string(&[])),
+                ],
+            ),
+        ),
+        (
+            "SKI not OCTET STRING",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(OID_SUBJECT_KEY_IDENTIFIER, None, encode_integer(&[1])),
+                ],
+            ),
+        ),
+        (
+            "AKI unknown field",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_AUTHORITY_KEY_IDENTIFIER,
+                        None,
+                        encode_sequence(&[&encode_tlv(0x83, &[1])]),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "AKI out of order",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_AUTHORITY_KEY_IDENTIFIER,
+                        None,
+                        encode_sequence(&[&encode_tlv(0x82, &[1]), &encode_tlv(0x80, &[1])]),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "empty SAN",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(OID_SUBJECT_ALT_NAME, None, encode_sequence(&[])),
+                ],
+            ),
+        ),
+        (
+            "SAN bad dNSName",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_SUBJECT_ALT_NAME,
+                        None,
+                        encode_sequence(&[&encode_tlv(0x82, b"bad name\n")]),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "SAN bad iPAddress",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_SUBJECT_ALT_NAME,
+                        None,
+                        encode_sequence(&[&encode_tlv(0x87, &[1, 2, 3])]),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "SAN unknown tag",
+            build(
+                &[],
+                &[
+                    good_bc.clone(),
+                    ku.clone(),
+                    ext(
+                        OID_SUBJECT_ALT_NAME,
+                        None,
+                        encode_sequence(&[&encode_tlv(0x89, &[1])]),
+                    ),
+                ],
+            ),
+        ),
+    ];
+    for (what, pem) in bad {
+        assert!(!installs(&pem), "{what} must be rejected");
     }
 }

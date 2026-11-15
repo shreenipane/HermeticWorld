@@ -47,6 +47,23 @@ pub struct LeafCert {
     pub key_der: Vec<u8>,
 }
 
+// Secret material is wiped when it is dropped (the RSA key wipes itself).
+impl Drop for Ca {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.seed.zeroize();
+        self.key_pem.zeroize();
+    }
+}
+
+impl Drop for LeafCert {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key_pem.zeroize();
+        self.key_der.zeroize();
+    }
+}
+
 impl std::fmt::Debug for LeafCert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeafCert")

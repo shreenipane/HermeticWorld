@@ -560,15 +560,28 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         .checked_add(1)
         .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
 
-    // Skip optional [1] issuerUniqueID, [2] subjectUniqueID
+    // Optional [1] issuerUniqueID, [2] subjectUniqueID: IMPLICIT BIT STRINGs
+    // (primitive in DER), each at most once and in order.
+    let mut last_unique_tag = 0u8;
     while let Some(item) = tbs_items.get(idx) {
-        if item.tag == 0x81 || item.tag == 0x82 || item.tag == 0xA1 || item.tag == 0xA2 {
-            idx = idx
-                .checked_add(1)
-                .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
-        } else {
+        if item.tag == 0xA1 || item.tag == 0xA2 {
+            return Err(TrustError::Cert(
+                "unique identifier must be a primitive BIT STRING".to_string(),
+            ));
+        }
+        if item.tag != 0x81 && item.tag != 0x82 {
             break;
         }
+        if item.tag <= last_unique_tag {
+            return Err(TrustError::Cert(
+                "unique identifiers repeated or out of order".to_string(),
+            ));
+        }
+        last_unique_tag = item.tag;
+        validate_bit_string_value(item.value, "unique identifier")?;
+        idx = idx
+            .checked_add(1)
+            .ok_or_else(|| TrustError::Cert("idx overflow".to_string()))?;
     }
 
     // Find extensions ([3] EXPLICIT tag 0xA3)
@@ -647,8 +660,13 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
                         "invalid extension value tag: expected OCTET STRING".to_string(),
                     ));
                 }
-                let crit = p1.value.iter().any(|&b| b != 0);
-                (p0.value, crit, p2.value)
+                // DER: critical is DEFAULT FALSE, so an explicit value must be TRUE.
+                if !der_boolean(p1.value, "extension critical")? {
+                    return Err(TrustError::Cert(
+                        "explicit critical FALSE is not DER".to_string(),
+                    ));
+                }
+                (p0.value, true, p2.value)
             }
             _ => {
                 return Err(TrustError::Cert(
@@ -696,9 +714,13 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
                         "invalid basicConstraints cA: expected BOOLEAN".to_string(),
                     ));
                 }
-                if ca_bool.value.iter().any(|&b| b != 0) {
-                    found_ca_true = true;
+                // DER: cA is DEFAULT FALSE, so an explicit value must be TRUE.
+                if !der_boolean(ca_bool.value, "basicConstraints cA")? {
+                    return Err(TrustError::Cert(
+                        "explicit basicConstraints cA FALSE is not DER".to_string(),
+                    ));
                 }
+                found_ca_true = true;
                 if bc_items.len() > 2 {
                     return Err(TrustError::Cert(
                         "invalid basicConstraints: too many elements".to_string(),
@@ -714,8 +736,15 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
                                 .to_string(),
                         ));
                     }
+                    validate_path_len(path_len.value)?;
                 }
             }
+        } else if oid == OID_SUBJECT_KEY_IDENTIFIER {
+            validate_ski(extn_value)?;
+        } else if oid == OID_AUTHORITY_KEY_IDENTIFIER {
+            validate_aki(extn_value)?;
+        } else if oid == OID_SUBJECT_ALT_NAME {
+            validate_san(extn_value)?;
         } else if oid == OID_KEY_USAGE {
             let (ku_tlv, rem) = parse_tlv(extn_value)?;
             if !rem.is_empty() || ku_tlv.tag != 0x03 {
@@ -823,5 +852,141 @@ pub fn validate_ca_certificate(der: &[u8]) -> Result<(), TrustError> {
         .verify(tbs_tlv.raw, &signature)
         .map_err(|e| TrustError::Cert(format!("CA self-signature verification failed: {}", e)))?;
 
+    Ok(())
+}
+
+/// DER BOOLEAN contents: exactly one byte, 0x00 (FALSE) or 0xFF (TRUE).
+fn der_boolean(value: &[u8], what: &str) -> Result<bool, TrustError> {
+    match value {
+        [0x00] => Ok(false),
+        [0xFF] => Ok(true),
+        _ => Err(TrustError::Cert(format!("invalid DER BOOLEAN in {what}"))),
+    }
+}
+
+/// BIT STRING contents: an unused-bits byte (0..=7, and 0 when empty) and, in
+/// DER, zero padding bits.
+fn validate_bit_string_value(value: &[u8], what: &str) -> Result<(), TrustError> {
+    let (&unused, data) = value
+        .split_first()
+        .ok_or_else(|| TrustError::Cert(format!("empty BIT STRING in {what}")))?;
+    if unused > 7 || (data.is_empty() && unused != 0) {
+        return Err(TrustError::Cert(format!("invalid BIT STRING in {what}")));
+    }
+    if let Some(&last) = data.last() {
+        if last & ((1u8 << unused) - 1) != 0 {
+            return Err(TrustError::Cert(format!(
+                "non-zero BIT STRING padding in {what}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// pathLenConstraint: a minimally encoded, non-negative INTEGER that fits u32.
+fn validate_path_len(value: &[u8]) -> Result<(), TrustError> {
+    let invalid = || TrustError::Cert("invalid basicConstraints pathLenConstraint".to_string());
+    let (&first, rest) = value.split_first().ok_or_else(invalid)?;
+    if first & 0x80 != 0 {
+        return Err(invalid()); // negative
+    }
+    if first == 0 && rest.first().is_some_and(|b| b & 0x80 == 0) {
+        return Err(invalid()); // non-minimal
+    }
+    let magnitude = if first == 0 { rest } else { value };
+    if magnitude.len() > 4 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn single_tlv<'a>(value: &'a [u8], tag: u8, what: &str) -> Result<Tlv<'a>, TrustError> {
+    let (tlv, rem) = parse_tlv(value)?;
+    if !rem.is_empty() || tlv.tag != tag {
+        return Err(TrustError::Cert(format!("invalid {what} encoding")));
+    }
+    Ok(tlv)
+}
+
+/// subjectKeyIdentifier: a non-empty OCTET STRING.
+fn validate_ski(value: &[u8]) -> Result<(), TrustError> {
+    let ski = single_tlv(value, 0x04, "subjectKeyIdentifier")?;
+    if ski.value.is_empty() {
+        return Err(TrustError::Cert("empty subjectKeyIdentifier".to_string()));
+    }
+    Ok(())
+}
+
+/// authorityKeyIdentifier: SEQUENCE of optional [0] keyIdentifier (primitive),
+/// [1] authorityCertIssuer (constructed) and [2] serial (primitive), in order.
+fn validate_aki(value: &[u8]) -> Result<(), TrustError> {
+    let aki = single_tlv(value, 0x30, "authorityKeyIdentifier")?;
+    let mut last = None;
+    for item in parse_sequence_items(aki.value)? {
+        let rank = match item.tag {
+            0x80 => 0,
+            0xA1 => 1,
+            0x82 => 2,
+            _ => {
+                return Err(TrustError::Cert(
+                    "unexpected field in authorityKeyIdentifier".to_string(),
+                ))
+            }
+        };
+        if last.is_some_and(|l| rank <= l) {
+            return Err(TrustError::Cert(
+                "authorityKeyIdentifier fields repeated or out of order".to_string(),
+            ));
+        }
+        if item.value.is_empty() {
+            return Err(TrustError::Cert(
+                "empty authorityKeyIdentifier field".to_string(),
+            ));
+        }
+        if item.tag == 0xA1 {
+            parse_sequence_items(item.value)?;
+        }
+        last = Some(rank);
+    }
+    if last.is_none() {
+        return Err(TrustError::Cert("empty authorityKeyIdentifier".to_string()));
+    }
+    Ok(())
+}
+
+/// subjectAltName: a non-empty SEQUENCE of GeneralName. Every name is a context
+/// tag 0..=8 with the DER form (constructed for otherName, x400Address,
+/// directoryName and ediPartyName); dNSName, rfc822Name and URI are printable
+/// ASCII, and iPAddress is 4 or 16 bytes.
+fn validate_san(value: &[u8]) -> Result<(), TrustError> {
+    let san = single_tlv(value, 0x30, "subjectAltName")?;
+    let names = parse_sequence_items(san.value)?;
+    if names.is_empty() {
+        return Err(TrustError::Cert("empty subjectAltName".to_string()));
+    }
+    for name in names {
+        let invalid = || TrustError::Cert("invalid subjectAltName GeneralName".to_string());
+        match name.tag {
+            0xA0 | 0xA3 | 0xA4 | 0xA5 => {
+                parse_sequence_items(name.value)?;
+            }
+            0x81 | 0x82 | 0x86 => {
+                if name.value.is_empty() || !name.value.iter().all(|b| (0x21..=0x7e).contains(b)) {
+                    return Err(invalid());
+                }
+            }
+            0x87 => {
+                if name.value.len() != 4 && name.value.len() != 16 {
+                    return Err(invalid());
+                }
+            }
+            0x88 => {
+                if name.value.is_empty() {
+                    return Err(invalid());
+                }
+            }
+            _ => return Err(invalid()),
+        }
+    }
     Ok(())
 }

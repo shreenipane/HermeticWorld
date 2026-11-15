@@ -275,12 +275,8 @@ const O_CLOEXEC: i32 = 0o2000000;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ELOOP: i32 = 40;
 
-pub static FORCE_CHOWN_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub static BEFORE_USE_HOOK: std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>> =
-    std::sync::RwLock::new(None);
-
+// Test injection is per-thread only (no process-global hooks): it can affect
+// only the thread that installed it, and is off unless a guard is held.
 thread_local! {
     static THREAD_CHOWN_FAILURE: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
     static THREAD_BEFORE_USE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
@@ -548,7 +544,6 @@ pub fn open_parent_dir_handle(
 
 fn chown_failure_injected() -> bool {
     THREAD_CHOWN_FAILURE.with(|c| *c.borrow())
-        || FORCE_CHOWN_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Set ownership through an open descriptor (never through a path).
@@ -699,11 +694,6 @@ pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
             hook();
         }
     });
-    if let Ok(guard) = BEFORE_USE_HOOK.read() {
-        if let Some(ref hook) = *guard {
-            hook();
-        }
-    }
 
     let file = options.open(&proc_path).map_err(|e| {
         #[cfg(unix)]
@@ -799,11 +789,6 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
             hook();
         }
     });
-    if let Ok(guard) = BEFORE_USE_HOOK.read() {
-        if let Some(ref hook) = *guard {
-            hook();
-        }
-    }
 
     // Create unique temp file in parent dir through handle
     let mut attempt: u32 = 0;

@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 19 of 43 |
+| 2: World | done 23 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -159,10 +159,10 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] The bounded test helpers take explicit bounds, and tests stall a child, a thread and a socket to prove each times out (and the child is killed) (2026-11-15). Proof: `stalled_child_fails_within_its_bound_and_is_killed`, `stalled_thread_fails_within_its_bound`, `stalled_socket_read_times_out_within_its_bound`
   - [ ] remaining: Deferred (T2.1): publication and endpoint reclaim trust same-uid processes and root (directories must be owned by the server uid and not group/other writable). Note 2026-11-15: a safe `renameat2` is available through rustix, but `atomic_write` deliberately replaces an existing destination, so `RENAME_NOREPLACE` does not apply; closing the same-uid window needs an owner decision on that trust model
 - [x] Trust injection: per-world CA, every trust store, environment defaults (TR-SEAL-10) (T2.5). Proof: `test_fake_rootfs_install`, `test_seed_file_validation_and_private_key_permissions` (`crates/hermetic-trust/tests/test_trust.rs`).
-  - [ ] remaining: Deferred (T2.5 review, non-blocking): a duplicate-alias error copies keystore alias text (incl. control characters) into `skipped_paths.reason` and reports; return a fixed code
-  - [ ] remaining: Deferred (T2.5 review): certificate validation gaps: unique-ID fields skipped unvalidated, BOOLEAN accepts any non-zero byte, `pathLenConstraint` checked by tag only, critical SAN/SKI/AKI payloads not validated
-  - [ ] remaining: Deferred (T2.5 review): the process-global test hooks `FORCE_CHOWN_FAILURE` and `BEFORE_USE_HOOK` are public and consulted in production paths; move injection to test-only, per-thread code
-  - [ ] remaining: Deferred (T2.5 review): CA seed and plaintext key PEM buffers are not zeroised; two guarded `unwrap()` calls remain; no compile-failure check for unsupported targets
+  - [x] A duplicate keystore alias is reported with the fixed code `duplicate_alias`; no alias text (or control characters) reaches reports (2026-11-15). Proof: `test_regression_jks_duplicate_alias_and_private_key_collision_both_orders` (order 4)
+  - [x] Strict DER certificate checks (2026-11-15): BOOLEANs must be 0x00/0xFF and DEFAULT FALSE may not be explicit; unique identifiers must be primitive, in order, with valid unused bits and zero padding; `pathLenConstraint` must be a minimal non-negative INTEGER; SAN, SKI and AKI payloads are parsed and validated whether critical or not. Proof: `test_regression_strict_der_certificate_fields` (19 malformed cases, valid baseline installs)
+  - [x] The process-global hooks `FORCE_CHOWN_FAILURE` and `BEFORE_USE_HOOK` are removed; injection is per-thread only and off unless a guard is held (2026-11-15). Proof: `test_injection_hooks_never_cross_threads`
+  - [x] CA seed and key PEM, and leaf key PEM/DER, are wiped on drop (`zeroize`, already in the lock; the RSA key wipes itself); no `unwrap()` remains in the crate's production code; unsupported targets fail at compile time (`compile_error!` in `install.rs`) (2026-11-15). Proof: `test_secret_holders_wipe_on_drop`
   - [ ] remaining: Deferred (T2.5): on-disk ownership with a guest owner different from the sealing user is tested only by recording the ownership step, because this host cannot create user namespaces; run `test_created_entries_owned_by_guest_owner_in_user_namespace` where `unshare -Ur` works
   - [ ] remaining: Deferred (T2.5, owner decision): the installer's check-then-use protection assumes exclusive access to the rootfs; the full fix needs `openat2`/`cap-std` (new dependency)
 - [ ] remaining: Gateway with the Anthropic adapter (TR-GW-*)
