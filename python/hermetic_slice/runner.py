@@ -50,8 +50,13 @@ def run_task(
     limits: Limits | None = None,
     sentinel: DateSentinel | None = None,
     extra_sentinel_summaries: list[dict[str, Any]] | None = None,
+    runspec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one task inside sealed world, extract patch, grade, and record results.
+
+    ``runspec`` (a derived ``hermetic_runspec`` spec) is applied to the agent
+    container: user, groups, working directory, environment, limits, dropped
+    capabilities.
 
     ``date_leak_observed`` is the D12 result: the harness sentinel (prompts and
     observations; default real date = today UTC, host name and home directory) merged with
@@ -150,7 +155,8 @@ def run_task(
     world = None
     try:
         # 3. start_world
-        world = start_world(task_json, sealed_image, task_dir / "index", name=world_name)
+        world = start_world(task_json, sealed_image, task_dir / "index", name=world_name,
+                            runspec=runspec)
 
         # 4. exec_fn = lambda cmd, timeout: world_exec(world, AGENT_PRELUDE + cmd, timeout=timeout)
         def exec_fn(cmd: str, timeout: int) -> tuple[int, str]:

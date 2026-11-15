@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     run_agent_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
     run_agent_parser.add_argument("--max-steps", type=int, default=60, help="Maximum agent steps")
     run_agent_parser.add_argument("--image-tag-format", default="hermetic/{id}:sealed", help="Format for sealed image tag")
+    run_agent_parser.add_argument("--run-spec", type=Path, default=None,
+                                  help="Derived run spec (hermetic_runspec output) applied to the agent container")
 
     fetch_parser = subparsers.add_parser("fetch-eval-specs", help="Fetch official eval specs and write to staging")
     fetch_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
@@ -558,6 +560,16 @@ def main(argv: list[str] | None = None) -> int:
         limits = Limits(max_steps=args.max_steps)
 
         runs_dir = args.runs_dir
+        runspec = None
+        if args.run_spec is not None:
+            from hermetic_runspec.derive import parse_json_bytes, read_regular_file_bounded
+            from hermetic_slice.world import runspec_docker_args
+            try:
+                runspec = parse_json_bytes(read_regular_file_bounded(args.run_spec, 1024 * 1024), 1024 * 1024)
+                runspec_docker_args(runspec)  # validate before any container starts
+            except Exception as exc:
+                print(f"Refused run spec: {type(exc).__name__}", file=sys.stderr)
+                return 1
         runs_dir.mkdir(parents=True, exist_ok=True)
 
         has_failure = False
@@ -575,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
                     run_dir=task_run_dir,
                     image_tag_format=args.image_tag_format,
                     limits=limits,
+                    runspec=runspec,
                 )
 
                 agent_info = record.get("agent", {})

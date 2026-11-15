@@ -13,8 +13,8 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 42 of 48 |
-| 2: World | done 25 of 43 |
-| 3: VMs | done 23 of 48 |
+| 2: World | done 26 of 43 |
+| 3: VMs | done 24 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
 
@@ -175,7 +175,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] The first original upstream SSE `error` event (bounded to 64 KiB) is kept for the host log; the agent still receives only the sanitised event (2026-11-15). Proof: `upstream_sse_error_body_is_logged_but_never_forwarded`
   - [x] An explicit unrecognised upstream error type becomes `api_error`; only a body without a type maps from the status (2026-11-15). Proof: `unrecognised_upstream_error_type_becomes_api_error`
   - [ ] remaining: Note (T2.2): `tiny_http` 0.12.0 is vendored with local patches at `crates/vendor/tiny_http` (see `VENDORED.md`); a half-closed client never frees its slot before the upstream ends, and a waiting request gets a bounded 529
-- [ ] remaining: Container isolation of the agent, with the run spec applied
+- [x] Container isolation of the agent, with the run spec applied (2026-11-15): `start_world(runspec=...)` / `run-agent --run-spec FILE` run the agent container as the spec's user and groups, in its working directory, with its environment, hostname, nameserver and CPU/memory limits, `--cap-drop ALL` and `no-new-privileges`, on the internal world network; the spec is re-validated (ids, limits, env names; no override of the package-index variables) before any container starts. Proof: `test_run_spec_maps_to_hardened_docker_flags`, `test_invalid_run_specs_are_refused`, `test_start_world_applies_the_run_spec_to_the_agent_only`, `test_cli_run_agent_applies_or_refuses_a_run_spec`
 - [x] Manifest with `world_root`. Proof: `test_known_answer_root`, `test_inclusion_proofs_for_every_leaf` (`crates/hermetic-common/tests/test_world_manifest.rs`).
 - [ ] remaining: Reproducibility check (E7)
 - [ ] remaining: E4 oracle harness: gold passes, `FAIL_TO_PASS` fails on base, per-test parity with the official harness, flaky-test detection (3×), pytest plugin list (oracle result analysis in `python/hermetic_oracle`, merged 2026-11-13; harness run still open)
@@ -210,7 +210,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] First-cut runtime: PID 1 clock setup, fixed eth0 addresses, table DNS, HTTP filter to persistent serialized WorldServer frames (CID 2 port 5001), ingress/egress service-port filter, forwarding and IPv6 off; offline transport/policy tests. Proof: `test_dns_round_trip_via_fake`, `test_http_get_forwarded_with_header_filtering` (`crates/hermetic-netvm-core/tests/netvm.rs`).
   - [x] NetVM tree/image builder through existing D4-checked rootfs tooling; AgentVM resolver and network in run spec Proof: `test_netvm_image` suite (`python/tests/test_netvm_image.py`).
   - [x] Automatic eth0 initialization from the AgentVM run spec: validated IPv4 address/prefix, on-link NetVM gateway and MTU; fixed, bounded trusted busybox commands after clock/root setup and before entrypoint/vsock; fail closed; offline validation/order/failure tests. Network smoke inspects setup instead of supplying harness commands; VM verification remains below. Proof: `network_validates_before_commands_and_rejects_failure_signal_and_timeout`, `network_argv_uses_declared_address_prefix_gateway_and_mtu` (`crates/hermetic-execd/tests/contract.rs`).
-  - [ ] remaining: Open: TLS termination, world-CA private-key delivery at boot and leaf minting (TR-NET-1/3/4); 443 currently dropped
+  - [x] TLS termination on 443, world-CA private-key delivery at boot (bounded transfer bound to the sealed world) and deterministic leaf minting (TR-NET-1/3/4). Nested-VM net smoke passed 2026-11-15 on `finish-code`: certificate-verified HTTPS GET/HEAD with world trust succeeds, unrelated trust fails, everything else dropped. Proof: `ca_boot_transfer_is_exact_bounded_and_bound_to_sealed_world`, `verified_https_get_head_and_policy_rejections_never_reach_unsealed_upstream`, `leaves_restore_deterministically_with_sealed_validity`, `tls_host_mismatch_resets_the_connection` (`crates/hermetic-netvm-core/tests/tls_world.rs`), `netvm_serves_world_to_agent_and_drops_everything_else` (`scripts/integration/net-smoke.sh`)
   - [ ] remaining: Open: TPROXY (TR-NET-3); first cut owns manifest world addresses as /32s and listens directly on port 80
   - [ ] remaining: Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image
   - [x] Manager nested two-VM boot/network smoke passed on 2026-11-14 using the policy-checked kernel and patched Firecracker. Proof: `scripts/integration/net-smoke.sh`, `crates/hermetic-vmm/tests/net_guest.rs`; historical manager smoke, not rerun in this review.
