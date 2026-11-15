@@ -514,8 +514,10 @@ impl GatewayServer {
         message: &str,
         endpoint: &str,
     ) {
-        let (resp_msg, log_msg) = if err_type == API_ERROR {
-            (standard_message_for_type(API_ERROR), message)
+        // Internal failures and quota breaches never show the agent their reason
+        // or the configured limits: it gets the standard message, the host log the detail.
+        let (resp_msg, log_msg) = if err_type == API_ERROR || err_type == RATE_LIMIT_ERROR {
+            (standard_message_for_type(err_type), message)
         } else {
             (message, message)
         };
@@ -1039,12 +1041,14 @@ impl GatewayServer {
 
                 // The stream reader records the streamed usage into `slot` and stops at its next
                 // read once the disconnect watcher has cancelled `slot`.
+                let error_capture = Arc::new(std::sync::Mutex::new(None));
                 let sse_reader = SanitizingSseReader::with_slot_guard(
                     reader,
                     self.clock.clone(),
                     slot.usage_handle(),
                     slot.clone(),
-                );
+                )
+                .with_error_capture(error_capture.clone());
 
                 let sse_reader = SentinelReader {
                     inner: sse_reader,
@@ -1091,7 +1095,10 @@ impl GatewayServer {
                     client_status: status,
                     upstream_status: Some(status),
                     dropped_headers: filtered.dropped_headers,
-                    original_error_body: None,
+                    original_error_body: match error_capture.lock() {
+                        Ok(mut g) => g.take(),
+                        Err(p) => p.into_inner().take(),
+                    },
                     history_rewrite: is_rewrite,
                     history_rewrites_total: total_rewrites,
                     quotas: self.quota.snapshot(),

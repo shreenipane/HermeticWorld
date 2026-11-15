@@ -191,8 +191,8 @@ impl UpstreamClient {
                     // Read at most cap + 1 bytes: more than the cap is refused, never cut.
                     let mut reader = resp.into_reader().take(cap as u64 + 1);
                     let mut raw = Vec::new();
-                    if reader.read_to_end(&mut raw).is_err() {
-                        return Err(GatewayError::UpstreamTimeout("Upstream read failed".into()));
+                    if let Err(error) = reader.read_to_end(&mut raw) {
+                        return Err(classify_read_error(&error));
                     }
                     if raw.len() > cap {
                         if (200..300).contains(&status) {
@@ -284,5 +284,16 @@ impl UpstreamClient {
                 ))
             }
         }
+    }
+}
+
+/// Only a real timeout is reported as one; any other read failure (for example
+/// invalid data or a reset) is an upstream error.
+pub fn classify_read_error(error: &std::io::Error) -> GatewayError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            GatewayError::UpstreamTimeout("Upstream read timed out".into())
+        }
+        _ => GatewayError::UpstreamError("Upstream read failed".into()),
     }
 }

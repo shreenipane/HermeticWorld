@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 6 of 43 |
+| 2: World | done 12 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -168,12 +168,12 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: Gateway with the Anthropic adapter (TR-GW-*)
   - [ ] remaining: Policy core: default-deny adapter, request and response rewriting, quotas, history, streaming (TR-GW-2 to TR-GW-8) (T2.2). Proof: `test_sse_streaming_timestamp_rewrite_and_token_counting` plus request/response/quota suites (`crates/hermetic-gateway/tests/`). Current full Rust gate exposed a test synchronization race: `test_sse_streaming_timestamp_rewrite_and_token_counting` reads finalized quota totals immediately after response EOF, before `record_and_release` runs (`server.rs:973-974`); observed 0 instead of 25 input tokens. Requires gateway-component test synchronization; existing assertions retained.
   - [ ] remaining: Gateway isolation (TR-GW-1)
-  - [ ] remaining: Deferred (T2.2 review): operator config and API-key paths are opened without refusing symlinked ancestor directories
-  - [ ] remaining: Deferred (T2.2 review): quota errors expose internal reasons and configured limits instead of standard messages
-  - [ ] remaining: Deferred (T2.2 review): source validation traverses arbitrary tool inputs and schemas, so a legitimate tool argument shaped like a URL image source is refused
-  - [ ] remaining: Deferred (T2.2 review): every read failure on a successful upstream response is classified as a timeout (e.g. invalid UTF-8)
-  - [ ] remaining: Deferred (T2.2 review): original SSE error bodies are never logged (`original_error_body` is always `None` for streams)
-  - [ ] remaining: Deferred (T2.2 review): an unrecognised upstream error type falls back to the HTTP-status-derived type instead of `api_error`
+  - [x] Operator config and API-key paths: every component is opened with `O_NOFOLLOW` through pinned directory descriptors, so symlinked ancestors are refused (fixed earlier; recorded 2026-11-15). Proof: `secret_file_permissions_and_all_symlink_components_are_refused`
+  - [x] Quota errors reply with the standard `rate_limit_error` message; the reason and limits go only to the host log (2026-11-15). Proof: `quota_breach_replies_with_the_standard_message_and_logs_the_reason`
+  - [x] Source validation checks only protocol content-block locations, so a tool argument or schema shaped like a URL image source is accepted (fixed in `a4dbcd2`; recorded 2026-11-15). Proof: `test_tool_use_and_schema_with_image_like_source_not_rejected`
+  - [x] Only a real timeout on an upstream body read is reported as a timeout; other read failures are upstream errors (2026-11-15). Proof: `only_real_timeouts_are_reported_as_timeouts`
+  - [x] The first original upstream SSE `error` event (bounded to 64 KiB) is kept for the host log; the agent still receives only the sanitised event (2026-11-15). Proof: `upstream_sse_error_body_is_logged_but_never_forwarded`
+  - [x] An explicit unrecognised upstream error type becomes `api_error`; only a body without a type maps from the status (2026-11-15). Proof: `unrecognised_upstream_error_type_becomes_api_error`
   - [ ] remaining: Note (T2.2): `tiny_http` 0.12.0 is vendored with local patches at `crates/vendor/tiny_http` (see `VENDORED.md`); a half-closed client never frees its slot before the upstream ends, and a waiting request gets a bounded 529
 - [ ] remaining: Container isolation of the agent, with the run spec applied
 - [x] Manifest with `world_root`. Proof: `test_known_answer_root`, `test_inclusion_proofs_for_every_leaf` (`crates/hermetic-common/tests/test_world_manifest.rs`).

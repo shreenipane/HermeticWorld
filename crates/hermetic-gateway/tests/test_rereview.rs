@@ -1272,3 +1272,107 @@ fn test_8c_slow_continuing_readers_are_released_at_the_overall_stream_bound() {
     }
     common::join_within(h);
 }
+
+// ---------- deferred T2.2 review items (2026-11-15) ----------
+
+#[test]
+fn quota_breach_replies_with_the_standard_message_and_logs_the_reason() {
+    let env = env_2019(QuotasConfig {
+        max_output_tokens: Some(10),
+        ..Default::default()
+    });
+    let mock = env.mock_server.clone();
+    let h = thread::spawn(move || {
+        let req = common::recv_upstream(&mock);
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":50}}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            .to_string();
+        req.respond(sse_response(sse)).unwrap();
+    });
+    let _ = post(&env, &simple_body(true)).map(|r| r.into_string());
+    common::join_within(h);
+    assert!(env.gateway_server.quota().snapshot().limit_exceeded);
+    let err = post(&env, &simple_body(false)).unwrap_err();
+    let ureq::Error::Status(429, resp) = err else {
+        panic!("expected 429")
+    };
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "Rate limit exceeded");
+    let logs = env.read_host_logs();
+    let refused = logs
+        .iter()
+        .rev()
+        .find(|l| l["client_status"] == 429)
+        .expect("429 logged");
+    let logged = refused["original_error_body"].as_str().unwrap();
+    assert!(logged.starts_with("Limit exceeded:"), "{logged}");
+}
+
+#[test]
+fn upstream_sse_error_body_is_logged_but_never_forwarded() {
+    let env = env_2019(QuotasConfig::default());
+    let mock = env.mock_server.clone();
+    let h = thread::spawn(move || {
+        let req = common::recv_upstream(&mock);
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"UPSTREAM_PRIVATE_DETAIL\"}}\n\n"
+            .to_string();
+        req.respond(sse_response(sse)).unwrap();
+    });
+    let out = post(&env, &simple_body(true))
+        .expect("stream")
+        .into_string()
+        .unwrap();
+    common::join_within(h);
+    assert!(out.contains("overloaded_error"), "{out}");
+    assert!(!out.contains("UPSTREAM_PRIVATE_DETAIL"), "{out}");
+    let logs = env.read_host_logs();
+    let stream = logs
+        .iter()
+        .rev()
+        .find(|l| l["stream"] == true)
+        .expect("stream logged");
+    let logged = stream["original_error_body"].as_str().unwrap();
+    assert!(logged.contains("UPSTREAM_PRIVATE_DETAIL"), "{logged}");
+}
+
+#[test]
+fn unrecognised_upstream_error_type_becomes_api_error() {
+    use hermetic_gateway::response::sanitize_error_body;
+    for status in [400, 429, 500, 529] {
+        let (body, kind) = sanitize_error_body(
+            status,
+            r#"{"type":"error","error":{"type":"novel_error","message":"x"}}"#,
+        );
+        assert_eq!(kind, "api_error", "{status}");
+        assert!(!body.contains("novel_error"));
+    }
+    assert_eq!(sanitize_error_body(429, "not json").1, "rate_limit_error");
+    assert_eq!(
+        sanitize_error_body(500, r#"{"error":{"type":"rate_limit_error"}}"#).1,
+        "rate_limit_error"
+    );
+}
+
+#[test]
+fn only_real_timeouts_are_reported_as_timeouts() {
+    use hermetic_gateway::upstream::classify_read_error;
+    use hermetic_gateway::GatewayError;
+    for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+        assert!(matches!(
+            classify_read_error(&std::io::Error::from(kind)),
+            GatewayError::UpstreamTimeout(_)
+        ));
+    }
+    for kind in [
+        ErrorKind::InvalidData,
+        ErrorKind::ConnectionReset,
+        ErrorKind::UnexpectedEof,
+    ] {
+        assert!(matches!(
+            classify_read_error(&std::io::Error::from(kind)),
+            GatewayError::UpstreamError(_)
+        ));
+    }
+}

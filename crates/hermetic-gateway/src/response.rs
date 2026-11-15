@@ -396,14 +396,19 @@ pub fn status_code_to_recognised_type(code: u16) -> &'static str {
 
 /// Sanitise upstream non-2xx error body.
 /// Keeps recognised type, but replaces message with standard message.
-/// If unrecognised or not JSON, maps to status code or api_error.
+/// An explicit unrecognised type becomes `api_error`; a body without a type
+/// (or not JSON) maps from the status code.
 pub fn sanitize_error_body(status: u16, original_body: &str) -> (String, String) {
     let mut recognised_type = status_code_to_recognised_type(status);
 
     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(original_body) {
         if let Some(err_obj) = json_val.get("error").and_then(|e| e.as_object()) {
             if let Some(err_type) = err_obj.get("type").and_then(|t| t.as_str()) {
-                if is_recognised_error_type(err_type) {
+                // An explicit but unrecognised upstream type is not trusted to
+                // match the status; it becomes api_error.
+                if !is_recognised_error_type(err_type) {
+                    recognised_type = API_ERROR;
+                } else {
                     recognised_type = match err_type {
                         INVALID_REQUEST_ERROR => INVALID_REQUEST_ERROR,
                         AUTHENTICATION_ERROR => AUTHENTICATION_ERROR,
@@ -700,7 +705,11 @@ pub struct SanitizingSseReader<R: Read> {
     usage: Arc<Mutex<StreamUsage>>,
     slot_guard: Option<Arc<StreamSlotGuard>>,
     eof: bool,
+    error_capture: Option<Arc<Mutex<Option<String>>>>,
 }
+
+/// Largest original upstream SSE error event kept for the host log.
+pub const MAX_CAPTURED_SSE_ERROR_BYTES: usize = 64 * 1024;
 
 impl<R: Read> SanitizingSseReader<R> {
     pub const MAX_LINE_BYTES: usize = 1024 * 1024; // 1 MiB per line limit
@@ -714,6 +723,7 @@ impl<R: Read> SanitizingSseReader<R> {
             usage: Arc::new(Mutex::new(StreamUsage::default())),
             slot_guard: None,
             eof: false,
+            error_capture: None,
         }
     }
 
@@ -730,6 +740,31 @@ impl<R: Read> SanitizingSseReader<R> {
             usage,
             slot_guard: Some(slot_guard),
             eof: false,
+            error_capture: None,
+        }
+    }
+
+    /// Keep the first original upstream `error` event (bounded) in `cell` for the
+    /// host log; the agent still only receives the sanitised event.
+    pub fn with_error_capture(mut self, cell: Arc<Mutex<Option<String>>>) -> Self {
+        self.error_capture = Some(cell);
+        self
+    }
+
+    fn capture_error(&self, block: &str) {
+        let Some(cell) = self.error_capture.as_ref() else {
+            return;
+        };
+        let mut end = block.len().min(MAX_CAPTURED_SSE_ERROR_BYTES);
+        while !block.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut guard = match cell.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if guard.is_none() {
+            *guard = Some(block[..end].to_string());
         }
     }
 
@@ -799,6 +834,9 @@ impl<R: Read> SanitizingSseReader<R> {
         match self.fetch_next_event() {
             Ok(Some(block)) => match sanitize_sse_event(&block, &self.clock) {
                 SseOutcome::Forward(text, ev_usage) => {
+                    if text.starts_with("event: error\n") {
+                        self.capture_error(&block);
+                    }
                     if let Ok(mut u) = self.usage.lock() {
                         u.input_tokens = u.input_tokens.max(ev_usage.input_tokens);
                         u.output_tokens = u.output_tokens.max(ev_usage.output_tokens);
