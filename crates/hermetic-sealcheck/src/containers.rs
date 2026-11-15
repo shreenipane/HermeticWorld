@@ -530,6 +530,11 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
                 }
             }
         } else {
+            // Archived pages: content-encoded HTTP payloads inside WARC records are
+            // decoded and scanned as nested units; the raw file is still scanned below.
+            if bytes.starts_with(b"WARC/") {
+                self.scan_warc_payloads(path, bytes, depth);
+            }
             // Plain file unit
             // Part B: Recognised binaries (ELF, Java .class, wasm) are scanned for D3b
             if let Some((channel, res)) = crate::binary::recognize_binary(bytes) {
@@ -1082,6 +1087,136 @@ impl<'a, S: UnitSink> ContainerScanner<'a, S> {
         }
     }
 
+    fn warc_gap(&mut self, path: &str, reason: String) {
+        self.push(Finding {
+            detector: "D2".into(),
+            channel: "warc_payload_unscanned".into(),
+            path: path.to_string(),
+            visibility: self.opts.visibility,
+            severity: Severity::Review,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec![reason],
+        });
+    }
+
+    /// Decode and scan every content-encoded (gzip/deflate) or chunked HTTP
+    /// response payload in a WARC file. Plain payloads are already covered by
+    /// the raw text scan of the file. A record that cannot be parsed or a payload
+    /// in an unsupported encoding is a review finding, never silently skipped.
+    fn scan_warc_payloads(&mut self, path: &str, bytes: &[u8], depth: usize) {
+        let mut rest = bytes;
+        let mut index = 0usize;
+        while !rest.is_empty() {
+            if index >= MAX_WARC_RECORDS {
+                self.warc_gap(path, format!("more than {MAX_WARC_RECORDS} WARC records"));
+                return;
+            }
+            let Some(head_end) = find_subslice(rest, b"\r\n\r\n") else {
+                self.warc_gap(path, format!("WARC record {} has no header end", index + 1));
+                return;
+            };
+            let head = &rest[..head_end];
+            if !head.starts_with(b"WARC/") {
+                self.warc_gap(
+                    path,
+                    format!("WARC record {} is not a WARC header", index + 1),
+                );
+                return;
+            }
+            let Some(length) = header_value(head, b"content-length")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            else {
+                self.warc_gap(
+                    path,
+                    format!("WARC record {} has no Content-Length", index + 1),
+                );
+                return;
+            };
+            let start = head_end + 4;
+            let Some(block) = start
+                .checked_add(length)
+                .and_then(|end| rest.get(start..end))
+            else {
+                self.warc_gap(path, format!("WARC record {} is truncated", index + 1));
+                return;
+            };
+            index += 1;
+            let is_response = header_value(head, b"warc-type")
+                .is_some_and(|v| v.trim_ascii().eq_ignore_ascii_case(b"response"));
+            if is_response {
+                match self.decode_http_payload(block) {
+                    Ok(Some(decoded)) => {
+                        let member = format!("{path}!<warc:{index}>");
+                        self.scan(&member, &decoded, depth + 1);
+                    }
+                    Ok(None) => {}
+                    Err(reason) => self.warc_gap(path, format!("WARC record {index}: {reason}")),
+                }
+            }
+            rest = &rest[start + length..];
+            for _ in 0..2 {
+                rest = rest.strip_prefix(b"\r\n").unwrap_or(rest);
+            }
+        }
+    }
+
+    /// The decoded body of an HTTP response block, or `None` when the body is
+    /// neither chunked nor content-encoded (the raw scan already covers it).
+    fn decode_http_payload(&mut self, block: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let Some(head_end) = find_subslice(block, b"\r\n\r\n") else {
+            return Err("HTTP response has no header end".into());
+        };
+        let head = &block[..head_end];
+        let mut body: std::borrow::Cow<'_, [u8]> = block[head_end + 4..].into();
+        let chunked = header_value(head, b"transfer-encoding")
+            .is_some_and(|v| v.trim_ascii().eq_ignore_ascii_case(b"chunked"));
+        if chunked {
+            body = dechunk(&body)
+                .ok_or("malformed chunked transfer encoding")?
+                .into();
+        }
+        let encoding = header_value(head, b"content-encoding")
+            .map(|v| v.trim_ascii().to_ascii_lowercase())
+            .unwrap_or_default();
+        let comp_len = body.len() as u64;
+        let mut out = Vec::new();
+        let result = match encoding.as_slice() {
+            b"" | b"identity" => {
+                return Ok(chunked.then(|| body.into_owned()));
+            }
+            b"gzip" | b"x-gzip" => {
+                let decoder = flate2::read::MultiGzDecoder::new(Cursor::new(&body[..]));
+                CountingReader::new(decoder, &mut self.total_expanded, comp_len, self.opts)
+                    .read_to_end(&mut out)
+            }
+            b"deflate" => {
+                // RFC 9110 deflate is zlib-wrapped; some servers send raw deflate.
+                let zlib = flate2::read::ZlibDecoder::new(Cursor::new(&body[..]));
+                let first =
+                    CountingReader::new(zlib, &mut self.total_expanded, comp_len, self.opts)
+                        .read_to_end(&mut out);
+                if first.is_err() {
+                    out.clear();
+                    let raw = flate2::read::DeflateDecoder::new(Cursor::new(&body[..]));
+                    CountingReader::new(raw, &mut self.total_expanded, comp_len, self.opts)
+                        .read_to_end(&mut out)
+                } else {
+                    first
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unsupported Content-Encoding {:?}",
+                    String::from_utf8_lossy(other)
+                ))
+            }
+        };
+        result.map_err(|e| format!("payload decoding failed: {e}"))?;
+        Ok(Some(out))
+    }
+
     fn decompress_and_scan(
         &mut self,
         path: &str,
@@ -1195,4 +1330,41 @@ pub fn scan_container_or_unit_with_root_prefix(
         ContainerScanner::new(opts, MatchSink::new(fp, signatures, opts), root_prefix_len);
     scanner.scan(path, bytes, 0);
     scanner.sink.findings
+}
+
+/// Largest number of WARC records decoded from one file.
+pub const MAX_WARC_RECORDS: usize = 100_000;
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The value of the first header named `name` (ASCII case-insensitive) in a
+/// CRLF-separated header block.
+fn header_value<'b>(head: &'b [u8], name: &[u8]) -> Option<&'b [u8]> {
+    head.split(|&b| b == b'\n').skip(1).find_map(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let colon = line.iter().position(|&b| b == b':')?;
+        line[..colon]
+            .trim_ascii()
+            .eq_ignore_ascii_case(name)
+            .then(|| &line[colon + 1..])
+    })
+}
+
+/// Decode an HTTP/1.1 chunked body (bounded by its input); `None` if malformed.
+fn dechunk(mut input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    loop {
+        let line_end = find_subslice(input, b"\r\n")?;
+        let size_text = std::str::from_utf8(&input[..line_end]).ok()?;
+        let size_text = size_text.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        input = &input[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(input.get(..size)?);
+        input = input.get(size..)?.strip_prefix(b"\r\n")?;
+    }
 }
