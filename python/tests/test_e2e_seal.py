@@ -377,7 +377,12 @@ def test_orchestration_is_ordered_and_stops_without_false_world(tmp_path, monkey
         if "d8" in argv:
             return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
         if "--root" in argv:
-            return b'{"detector":"D10","findings":[],"verdict":"pass","complete":true}'
+            # The sealer writes its provenance manifest and hands it to D10.
+            manifest = argv[argv.index("--provenance") + 1]
+            assert json.loads(Path(manifest).read_bytes()) == {
+                "records": [], "schema": "hermetic.d10.provenance/1", "scrubbed_payloads": []}
+            return (b'{"detector":"D10","findings":[],"verdict":"pass","complete":true,'
+                    b'"provenance":{"verdict":"verified","issues":[]}}')
         return b""
     monkeypatch.setattr(e2e, "command", fake_command)
     original_umask = os.umask(0o077)

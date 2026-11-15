@@ -13,7 +13,8 @@ from test_e2e_seal import e2e, INSTANCE
 
 def clean_report(step):
     if step == "D10":
-        return {"detector": "D10", "verdict": "pass", "complete": True, "findings": []}
+        return {"detector": "D10", "verdict": "pass", "complete": True, "findings": [],
+                "provenance": {"verdict": "verified", "issues": []}}
     return {"schema": "hermetic-sealcheck/v0", "gate": False,
             "not_covered": [], "findings": []}
 
@@ -196,3 +197,20 @@ def test_artifact_hash_known_answer_and_growth_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(e2e, "open_regular", growing)
     with pytest.raises(e2e.SealError, match="artifact_byte_cap"):
         e2e.file_evidence(path, 3)
+
+
+@pytest.mark.parametrize("provenance", [None, {}, {"verdict": "error"}, {"verdict": "pass"}, "verified"])
+def test_d10_report_without_verified_provenance_is_refused(provenance):
+    report = clean_report("D10")
+    if provenance is None:
+        del report["provenance"]
+    else:
+        report["provenance"] = provenance
+    with pytest.raises(e2e.SealError, match="d10_provenance_unverified"):
+        e2e.validate_scan_report("D10", report)
+
+
+def test_d10_provenance_gate_gates_the_seal():
+    report = dict(clean_report("D10"), provenance={"verdict": "gate", "issues": [{"issue": "x"}]})
+    with pytest.raises(e2e.SealError, match="detector_gate"):
+        e2e.validate_scan_report("D10", report)

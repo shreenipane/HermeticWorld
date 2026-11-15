@@ -13,6 +13,7 @@ from hermetic_d10 import scan_tree
 from hermetic_d10.provenance import (
     PROVENANCE_SCHEMA,
     ProvenanceError,
+    build_provenance,
     parse_provenance,
     verify_provenance,
 )
@@ -144,3 +145,53 @@ def test_duplicate_provenance_keys_cannot_hide_records() -> None:
     data = manifest([]).replace(b'"records": []', b'"records": [], "records": []')
     with pytest.raises(ProvenanceError, match="duplicate"):
         parse_provenance(data)
+
+
+def run_cli(argv: list[str], capsys) -> tuple[int, dict]:
+    from hermetic_d10.__main__ import main
+    code = main(argv)
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_cli_provenance_gates_unlisted_records_and_verifies_listed_ones(tmp_path: Path, capsys) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.warc").write_bytes(warc(b"one"))
+    empty = tmp_path / "empty.json"
+    empty.write_bytes(build_provenance([], []))
+    code, out = run_cli(["--root", str(root), "--t-clock", CLOCK, "--provenance", str(empty)], capsys)
+    assert code == 2
+    assert out["provenance"]["verdict"] == "gate"
+    assert [i["issue"] for i in out["provenance"]["issues"]] == ["record_without_provenance"]
+    listed = tmp_path / "listed.json"
+    listed.write_bytes(build_provenance([rec("a.warc", 1, b"one")], []))
+    code, out = run_cli(["--root", str(root), "--t-clock", CLOCK, "--provenance", str(listed)], capsys)
+    assert code == 0, out
+    assert out["provenance"]["verdict"] == "verified"
+
+
+def test_cli_refuses_hostile_provenance_files(tmp_path: Path, capsys) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    good = tmp_path / "good.json"
+    good.write_bytes(build_provenance([], []))
+    link = tmp_path / "link.json"
+    link.symlink_to(good)
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b"{")
+    for path in (link, bad, tmp_path / "absent.json", tmp_path):
+        code, out = run_cli(["--root", str(root), "--t-clock", CLOCK, "--provenance", str(path)], capsys)
+        assert code == 1, path
+        assert out["verdict"] == "error" or out.get("provenance", {}).get("verdict") == "error", out
+
+
+def test_build_provenance_is_canonical_and_refuses_invalid_records() -> None:
+    a = build_provenance([rec("b.warc", 1, b"x"), rec("a.warc", 2, b"y")], [sha(b"z"), sha(b"z")])
+    b = build_provenance([rec("a.warc", 2, b"y"), rec("b.warc", 1, b"x")], [sha(b"z")])
+    assert a == b
+    entries, scrubbed = parse_provenance(a)
+    assert set(entries) == {("a.warc", 2), ("b.warc", 1)} and scrubbed == {sha(b"z")}
+    for records, scrubbed in [([rec("/abs", 1, b"x")], []), ([rec("a", 1, b"x", scrub="maybe")], []),
+                              ([{"path": "a"}], []), ([], ["nothex"]), ("x", []), ([], "x")]:
+        with pytest.raises(ProvenanceError):
+            build_provenance(records, scrubbed)  # type: ignore[arg-type]

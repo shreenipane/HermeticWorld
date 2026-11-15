@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from hermetic_d10.carriers import (
@@ -80,7 +81,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_NESTING_DEPTH,
         help=f"Maximum archive nesting depth (default: {MAX_NESTING_DEPTH}).",
     )
+    parser.add_argument(
+        "--provenance",
+        default=None,
+        help="Sealer provenance manifest (hermetic.d10.provenance/1); every WARC record must match it.",
+    )
     return parser
+
+
+def _read_provenance(path: str) -> bytes:
+    """Read the manifest without following symlinks, within its byte cap."""
+    from hermetic_safe_io import open_regular
+
+    from hermetic_d10.provenance import MAX_PROVENANCE_BYTES, ProvenanceError
+
+    try:
+        fd = open_regular(path, MAX_PROVENANCE_BYTES)
+    except (OSError, ValueError, TypeError):
+        raise ProvenanceError("provenance manifest refused (missing, symlink or not a regular file)") from None
+    try:
+        data = b""
+        while len(data) <= MAX_PROVENANCE_BYTES:
+            chunk = os.read(fd, MAX_PROVENANCE_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > MAX_PROVENANCE_BYTES:
+        raise ProvenanceError("provenance manifest exceeds byte cap")
+    return data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
             max_nesting_depth=args.max_depth,
         )
         result = scan_tree(args.root, clock_dt, caps=caps)
+        provenance = None
+        if args.provenance is not None:
+            from hermetic_d10.provenance import verify_provenance
+
+            provenance = verify_provenance(result, _read_provenance(args.provenance), clock_dt)
     except HermeticD10Error as exc:
         err_payload = {
             "detector": "D10",
@@ -109,7 +144,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(err_payload, indent=2))
         return 1
 
-    print(result.to_json())
+    if provenance is None:
+        print(result.to_json())
+    else:
+        combined = json.loads(result.to_json())
+        combined["provenance"] = provenance
+        print(json.dumps(combined, indent=2, sort_keys=True))
+        if provenance["verdict"] == "error":
+            return 1
+        if provenance["verdict"] == "gate":
+            return 2
     if result.has_cap_error():
         return 1
     if result.verdict == "gate":

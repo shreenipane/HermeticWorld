@@ -163,3 +163,23 @@ def verify_provenance(scan: ScanResult, manifest: bytes, t_clock: datetime) -> d
     report["truncated"] = len(issues) >= MAX_ISSUES
     report["verdict"] = "gate" if issues else "verified"
     return report
+
+
+def build_provenance(records: list[dict[str, Any]], scrubbed_payloads: list[str]) -> bytes:
+    """Sealer side: canonical manifest bytes for the archived records it ships.
+
+    The output is validated by `parse_provenance` before it is returned, so the
+    sealer can never write a manifest the detector would refuse.
+    """
+    if not isinstance(records, list) or not isinstance(scrubbed_payloads, list):
+        raise ProvenanceError("provenance records and scrubbed payloads must be lists")
+    doc = {
+        "schema": PROVENANCE_SCHEMA,
+        "records": sorted(records, key=lambda r: (str(r.get("path")), str(r.get("record")))
+                          if isinstance(r, dict) else ("", "")),
+        "scrubbed_payloads": sorted(set(scrubbed_payloads)) if all(
+            isinstance(v, str) for v in scrubbed_payloads) else scrubbed_payloads,
+    }
+    data = (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    parse_provenance(data)
+    return data

@@ -402,6 +402,12 @@ def normalise_tree(root, epoch):
         os.close(parent)
 
 
+def sealed_provenance():
+    """D10 provenance manifest for the archived records this seal ships (none)."""
+    from hermetic_d10.provenance import build_provenance
+    return build_provenance([], [])
+
+
 def validate_scan_report(step, value):
     """Exit zero alone cannot certify coverage of every stored payload."""
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
@@ -416,7 +422,10 @@ def validate_scan_report(step, value):
             raise SealError("invalid_scan_report")
         if value.get("complete") is not True:
             raise SealError("detector_incomplete")
-        gated = value["verdict"] == "gate"
+        provenance = value.get("provenance")
+        if not isinstance(provenance, dict) or provenance.get("verdict") not in ("verified", "gate"):
+            raise SealError("d10_provenance_unverified")
+        gated = value["verdict"] == "gate" or provenance["verdict"] == "gate"
     else:
         if value.get("schema") != "hermetic-sealcheck/v0" or type(value.get("gate")) is not bool:
             raise SealError("invalid_scan_report")
@@ -642,6 +651,9 @@ def run(argv=None):
         task_dir = work / "tasks" / args.instance
         task = read_json(task_dir / "task.json")
         clock = task["cutoffs"]["t_clock"]
+        # A repo_only seal ships no sealer-built web archive, so its provenance
+        # manifest is empty: any WARC record found in the tree gates the seal.
+        atomic_write(work / "d10-provenance.json", sealed_provenance())
         scans = [
             ("sealcheck_tiers", [str(work / "sealcheck"), "scan", "--task", str(task_dir),
                                  "--base-tree", str(work / "base-tree"), "--root", str(work / "source-tree"),
@@ -649,7 +661,8 @@ def run(argv=None):
             ("D8", [str(work / "sealcheck"), "d8", "--root", str(work / "source-tree"), "--t-clock", clock]),
             ("D10", [sys.executable, "-I", "-B", "-c",
                       "import sys; sys.path.insert(0, sys.argv.pop(1)); from hermetic_d10.__main__ import main; raise SystemExit(main())",
-                      str(TOP / "python"), "--root", str(work / "source-tree"), "--t-clock", clock]),
+                      str(TOP / "python"), "--root", str(work / "source-tree"), "--t-clock", clock,
+                      "--provenance", str(work / "d10-provenance.json")]),
         ]
         for step, argv in scans:
             report = command(argv, env=env)
