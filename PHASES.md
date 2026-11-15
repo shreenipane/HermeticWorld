@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 24 of 43 |
+| 2: World | done 25 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -146,7 +146,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [x] CodeRabbit (2026-11-12): body deadline kept until the body reader finishes (`ae2e6ef`); the sequential hand-off no longer panics when a predecessor writer or reader disappears without handing on, and a failed writer stays failed. Proof: `writer_whose_predecessor_vanished_fails_without_panicking_and_stays_failed`, `dropping_a_waiting_reader_whose_predecessor_vanished_does_not_panic`, `dropping_a_waiting_reader_forwards_the_stream_once_it_arrives`.
 - [ ] remaining: Package world (TR-PKG-*)
   - [ ] remaining: Layer 1: recording index for the task closure (pip, uv, conda via pixi)
-  - [ ] remaining: Yanked-release handling (simple-index yank rewriting in `python/hermetic_yank`, merged 2026-11-13; wiring into the package mirror still open)
+  - [x] Yanked-release handling: `python/hermetic_yank` rewrites PEP 691 pages, and the frozen package index now takes the historical yank table (`build_index(yank_times=...)`, `build-index --yank-table`): a file yanked at or before the cutoff is served with PEP 592 `data-yanked` (no reason text), one yanked later is served unmarked, and a file yanked today without history is reported as `yank_unknown`, never guessed (2026-11-15). Proof: `test_historical_yanks_are_served_as_of_the_cutoff`, `test_without_a_yank_table_nothing_is_marked_and_current_yanks_are_unknown`, `test_invalid_yank_tables_are_refused`, `test_build_index_cli_refuses_a_hostile_yank_table`. Remaining for the package world: a source for the historical yank table (PyPI exposes only current yank state)
   - [ ] remaining: Layer 2: ecosystem baseline per cutoff month; measure its storage
   - [ ] remaining: apt snapshots where available
 - [ ] remaining: Ecosystems: PyPI, conda, Debian/Ubuntu, git dependencies (static mirrors)

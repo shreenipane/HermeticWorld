@@ -184,8 +184,18 @@ def build_index(
     index_dir: Path,
     *,
     versions_per_package: int = 5,
+    yank_times: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Build PEP 503 frozen package index and return index report."""
+    """Build PEP 503 frozen package index and return index report.
+
+    ``yank_times`` is the historical yank table (filename -> RFC 3339 yank time,
+    the ``hermetic_yank`` input format). A served file yanked at or before the
+    cutoff is marked ``data-yanked`` (PEP 592), so the agent sees the yank state
+    as it was then; one yanked later is served unmarked. A file yanked today but
+    missing from the table is reported as ``yank_unknown``, never guessed. Without
+    a table no file is marked and every currently yanked file is unknown.
+    """
+    from hermetic_yank.simple_index import YankError, parse_rfc3339_ns
     index_dir = Path(index_dir)
     files_dir = index_dir / "files"
     simple_dir = index_dir / "simple"
@@ -194,6 +204,16 @@ def build_index(
 
     cutoff_str = task["cutoffs"]["t_world"]
     cutoff_dt = parse_iso(cutoff_str)
+    if yank_times is not None and not isinstance(yank_times, dict):
+        raise IndexBuildError("yank table must be a mapping")
+    try:
+        cutoff_ns = parse_rfc3339_ns(cutoff_str)
+        yanked_ns = {name: parse_rfc3339_ns(when) for name, when in (yank_times or {}).items()
+                     if isinstance(name, str) and name}
+    except (YankError, TypeError, ValueError):
+        raise IndexBuildError("invalid yank table or cutoff") from None
+    if yank_times is not None and len(yanked_ns) != len(yank_times):
+        raise IndexBuildError("invalid filename in yank table")
 
     # Determine target project names to exclude
     excluded_names: set[str] = set()
@@ -235,6 +255,8 @@ def build_index(
                 "served_versions": [],
                 "served_files": [],
                 "yanked_served": [],
+                "yanked_at_cutoff": [],
+                "yank_unknown": [],
             })
             continue
         pypi_data = json.loads(body.decode("utf-8"))
@@ -288,6 +310,8 @@ def build_index(
         served_versions: list[str] = []
         served_files: list[str] = []
         yanked_served: list[str] = []
+        yanked_at_cutoff: list[str] = []
+        yank_unknown: list[str] = []
         files_for_html: list[dict[str, Any]] = []
 
         for ver_str, _, kept_files in selected_versions:
@@ -310,10 +334,17 @@ def build_index(
                 served_files.append(fname)
                 if f.get("yanked"):
                     yanked_served.append(fname)
+                when = yanked_ns.get(fname)
+                yanked_then = when is not None and when <= cutoff_ns
+                if yanked_then:
+                    yanked_at_cutoff.append(fname)
+                elif f.get("yanked") and when is None:
+                    yank_unknown.append(fname)
                 files_for_html.append({
                     "filename": fname,
                     "sha256": actual_sha256,
                     "requires_python": f.get("requires_python"),
+                    "yanked": yanked_then,
                 })
 
         if files_for_html:
@@ -327,8 +358,10 @@ def build_index(
                 sha = finfo["sha256"]
                 req_py = finfo["requires_python"]
                 req_attr = f' data-requires-python="{html.escape(req_py, quote=True)}"' if req_py else ""
+                # No reason text: only the historical fact of the yank is served.
+                yank_attr = ' data-yanked=""' if finfo["yanked"] else ""
                 href = f"../../files/{fname}#sha256={sha}"
-                links.append(f'    <a href="{href}"{req_attr}>{html.escape(fname)}</a>')
+                links.append(f'    <a href="{href}"{req_attr}{yank_attr}>{html.escape(fname)}</a>')
 
             pkg_html = (
                 "<!DOCTYPE html>\n"
@@ -354,6 +387,8 @@ def build_index(
             "served_versions": served_versions,
             "served_files": served_files,
             "yanked_served": yanked_served,
+            "yanked_at_cutoff": yanked_at_cutoff,
+            "yank_unknown": yank_unknown,
         })
 
     # Write root simple/index.html
@@ -385,6 +420,8 @@ def build_index(
             "served_versions": sum(len(p["served_versions"]) for p in package_reports),
             "served_files": sum(len(p["served_files"]) for p in package_reports),
             "yanked_served": sum(len(p["yanked_served"]) for p in package_reports),
+            "yanked_at_cutoff": sum(len(p["yanked_at_cutoff"]) for p in package_reports),
+            "yank_unknown": sum(len(p["yank_unknown"]) for p in package_reports),
             "newer_than_t_world": sum(1 for p in package_reports if p["installed_newer_than_t_world"]),
             "not_on_pypi": sum(1 for p in package_reports if not p["on_pypi"]),
         },

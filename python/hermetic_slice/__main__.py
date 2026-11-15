@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     build_index_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
     build_index_parser.add_argument("--cache", type=Path, required=True, help="Cache directory for HTTP downloads")
     build_index_parser.add_argument("--only", action="append", default=None, help="Optional instance IDs to process")
+    build_index_parser.add_argument("--yank-table", type=Path, default=None,
+                                    help="Historical yank table (filename -> RFC 3339 yank time, hermetic_yank format)")
 
     world_probe_parser = subparsers.add_parser("world-probe", help="Probe world isolation and package index for tasks")
     world_probe_parser.add_argument("--tasks-dir", type=Path, required=True, help="Directory containing task directories")
@@ -389,6 +391,16 @@ def main(argv: list[str] | None = None) -> int:
 
         http_get = make_http_get(args.cache)
         has_failure = False
+        yank_times = None
+        if args.yank_table is not None:
+            from hermetic_yank.simple_index import (MAX_YANKS_BYTES, YankError, load_json_bounded,
+                                                    safe_read_bytes)
+            try:
+                yank_times = load_json_bounded(safe_read_bytes(str(args.yank_table), MAX_YANKS_BYTES),
+                                               MAX_YANKS_BYTES)
+            except (YankError, OSError) as exc:
+                print(f"Refused yank table: {exc}", file=sys.stderr)
+                return 1
 
         for tdir in task_dirs:
             instance_id = tdir.name
@@ -397,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                 image = task["image"]
                 env = env_info(image)
                 index_dir = tdir / "index"
-                report = build_index(task, env, http_get, index_dir)
+                report = build_index(task, env, http_get, index_dir, yank_times=yank_times)
                 totals = report.get("totals", {})
                 served_packages = totals.get("served_packages", 0)
                 served_files = totals.get("served_files", 0)
