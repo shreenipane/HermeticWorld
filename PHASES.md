@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 15 of 43 |
+| 2: World | done 16 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -154,7 +154,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [x] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*) (T2.1). Proof: `test_store_and_responses`, `test_sandbox`, `test_limits`, `test_log_and_dedupe` suites (`crates/hermetic-world-server/tests/`).
   - [ ] remaining: Deferred (T2.1 review, non-blocking): endpoint probes use a blocking `UnixStream::connect` against a lock listener that never accepts; repeated recovery attempts on one endpoint can fill the backlog and block startup; use non-blocking exclusive ownership
   - [ ] remaining: Deferred (T2.1 review): the live-endpoint test passes `--recover` without `--resume-log`, so it is rejected before endpoint ownership is checked; give it valid recovery inputs and assert the original listener still serves
-  - [ ] remaining: Deferred (T2.1 review): the seccomp allow-list still permits arbitrary Unix-socket connects, signalling other same-uid processes, credential-changing syscalls and `clock_settime`; remove them and test denial
+  - [x] Seccomp allow-list tightened (2026-11-15): `connect` removed (the server connects only before the sandbox), every credential-changing call (`set*id`, `setgroups`, `setfs*id`, `capset`) and `clock_settime` removed, and `kill`/`tgkill`/`rt_sigqueueinfo` allowed only for the server's own pid (`tkill` removed). Denial is tested in child processes (killed by SIGSYS) and self-signalling still works. Proof: `seccomp_denies_connect_foreign_signals_credentials_and_clock_setting`
   - [ ] remaining: Deferred (T2.1 review): the Landlock failure-injection test sets a process-global flag while other tests start sandboxed servers; isolate it in a child process
   - [ ] remaining: Deferred (T2.1 review): no test stalls a child, thread or socket to prove the bounded test helpers actually time out
   - [ ] remaining: Deferred (T2.1): publication and endpoint reclaim trust same-uid processes and root (directories must be owned by the server uid and not group/other writable); `renameat2(RENAME_NOREPLACE)` is not used because the crate forbids unsafe code

@@ -114,7 +114,9 @@ pub fn apply_landlock_for_endpoint(
 
 /// Apply seccomp allow-list filter.
 ///
-/// Denies `execve`/`execveat`, `ptrace`, `mount`/`umount2`, and `socket` for any family other than `AF_UNIX`.
+/// Denies `execve`/`execveat`, `ptrace`, `mount`/`umount2`, `socket` for any family other than
+/// `AF_UNIX`, `connect` (the server only accepts once sandboxed), every credential-changing call
+/// (`set*id`, `setgroups`, `capset`), `clock_settime`, and signals to any other process.
 /// Violations kill the process.
 pub fn apply_seccomp() -> Result<(), SandboxError> {
     let target_arch = TargetArch::try_from(std::env::consts::ARCH)?;
@@ -128,6 +130,19 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::AF_UNIX as u64,
     )?])?;
     rules.insert(libc::SYS_socket, vec![socket_rule]);
+
+    // Signals only to this process (its own threads included): never to other
+    // same-uid processes. The pid is fixed when the filter is built.
+    let own_pid = u64::from(std::process::id());
+    for sys in [libc::SYS_kill, libc::SYS_tgkill, libc::SYS_rt_sigqueueinfo] {
+        let own = SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            own_pid,
+        )?])?;
+        rules.insert(sys, vec![own]);
+    }
 
     // System calls allowed unconditionally for server operation
     let allowed_syscalls = [
@@ -163,7 +178,6 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_getitimer,
         libc::SYS_setitimer,
         libc::SYS_getpid,
-        libc::SYS_connect,
         libc::SYS_accept,
         libc::SYS_sendto,
         libc::SYS_recvfrom,
@@ -180,7 +194,6 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_clone,
         libc::SYS_exit,
         libc::SYS_wait4,
-        libc::SYS_kill,
         libc::SYS_uname,
         libc::SYS_fcntl,
         libc::SYS_flock,
@@ -205,30 +218,19 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_times,
         libc::SYS_getuid,
         libc::SYS_getgid,
-        libc::SYS_setuid,
-        libc::SYS_setgid,
         libc::SYS_geteuid,
         libc::SYS_getegid,
         libc::SYS_setpgid,
         libc::SYS_getpgrp,
         libc::SYS_setsid,
-        libc::SYS_setreuid,
-        libc::SYS_setregid,
         libc::SYS_getgroups,
-        libc::SYS_setgroups,
-        libc::SYS_setresuid,
         libc::SYS_getresuid,
-        libc::SYS_setresgid,
         libc::SYS_getresgid,
         libc::SYS_getpgid,
-        libc::SYS_setfsuid,
-        libc::SYS_setfsgid,
         libc::SYS_getsid,
         libc::SYS_capget,
-        libc::SYS_capset,
         libc::SYS_rt_sigpending,
         libc::SYS_rt_sigtimedwait,
-        libc::SYS_rt_sigqueueinfo,
         libc::SYS_rt_sigsuspend,
         libc::SYS_sigaltstack,
         libc::SYS_statfs,
@@ -242,18 +244,15 @@ pub fn apply_seccomp() -> Result<(), SandboxError> {
         libc::SYS_sched_getaffinity,
         libc::SYS_gettid,
         libc::SYS_restart_syscall,
-        libc::SYS_tkill,
         libc::SYS_time,
         libc::SYS_epoll_create,
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_wait,
         libc::SYS_set_tid_address,
-        libc::SYS_clock_settime,
         libc::SYS_clock_gettime,
         libc::SYS_clock_getres,
         libc::SYS_clock_nanosleep,
         libc::SYS_exit_group,
-        libc::SYS_tgkill,
         libc::SYS_mkdirat,
         libc::SYS_mknodat,
         libc::SYS_newfstatat,
@@ -384,5 +383,80 @@ mod review_tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         std::process::exit(0);
+    }
+
+    fn seccomp_child_status(op: &str) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::review_tests::seccomp_child",
+                "--nocapture",
+            ])
+            .env("HERMETIC_SECCOMP_OP", op)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn seccomp_denies_connect_foreign_signals_credentials_and_clock_setting() {
+        for op in [
+            "connect",
+            "kill_other",
+            "setuid",
+            "setresgid",
+            "setgroups",
+            "capset",
+            "clock_settime",
+        ] {
+            let status = seccomp_child_status(op);
+            assert_eq!(status.signal(), Some(libc::SIGSYS), "{op}: {status}");
+        }
+        // Signals to the process itself stay allowed.
+        let status = seccomp_child_status("kill_self");
+        assert!(status.success(), "kill_self: {status}");
+    }
+
+    #[test]
+    fn seccomp_child() {
+        let Ok(op) = std::env::var("HERMETIC_SECCOMP_OP") else {
+            return;
+        };
+        // A process to signal and a listener to connect to, created before the filter.
+        let mut other = Command::new("sleep").arg("5").spawn().unwrap();
+        let other_pid = i32::try_from(other.id()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        apply_seccomp().unwrap();
+        // Each call below is denied by killing the process; reaching the exit is a failure.
+        let other_pid = rustix::process::Pid::from_raw(other_pid).unwrap();
+        let rc = match op.as_str() {
+            "connect" => i32::from(std::os::unix::net::UnixStream::connect(&path).is_err()),
+            "kill_other" => i32::from(rustix::process::test_kill_process(other_pid).is_err()),
+            "setuid" => {
+                i32::from(rustix::thread::set_thread_uid(rustix::process::getuid()).is_err())
+            }
+            "setresgid" => i32::from(rustix::thread::set_thread_res_gid(None, None, None).is_err()),
+            "setgroups" => i32::from(rustix::thread::set_thread_groups(&[]).is_err()),
+            "capset" => {
+                let sets = rustix::thread::capabilities(None).unwrap();
+                i32::from(rustix::thread::set_capabilities(None, sets).is_err())
+            }
+            "clock_settime" => {
+                let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+                i32::from(
+                    rustix::time::clock_settime(rustix::time::ClockId::Realtime, now).is_err(),
+                )
+            }
+            "kill_self" => {
+                let me = rustix::process::getpid();
+                let rc = i32::from(rustix::process::test_kill_process(me).is_err());
+                // The helper is not signalled here: that would be a denied foreign signal.
+                std::process::exit(if rc == 0 { 0 } else { 3 });
+            }
+            _ => 2,
+        };
+        let _ = other.kill();
+        std::process::exit(10 + rc);
     }
 }

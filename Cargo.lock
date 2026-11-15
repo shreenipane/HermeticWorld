@@ -790,6 +790,7 @@ dependencies = [
  "hermetic-common",
  "landlock",
  "libc",
+ "rustix",
  "seccompiler",
  "serde",
  "serde_json",
