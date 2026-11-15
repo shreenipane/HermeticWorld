@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 12 of 43 |
+| 2: World | done 15 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -139,9 +139,9 @@ The oracle passes on every slice task, and one agent run is graded.
 ### Deliverables
 - [x] Rootfs build with `SOURCE_DATE_EPOCH` mke2fs (e2fsprogs ≥ 1.47.1) and a D4 guard (TR-SEAL-7, TR-SEAL-8) (T2.4; tar stream into `mke2fs -d`, pinned e2fsprogs 1.47.2 and `data/mke2fs-hermetic.conf`). Proof: `test_synthetic_tree_mtimes_clamped_passes_d4`, `test_reproducibility_tr_seal_12` (`python/tests/test_rootfs.py`).
   - [ ] remaining: Decision to confirm (T2.4): the image keeps no extended attributes; mtimes are clamped to min(source, T_clock); source paths with symlinked ancestors are refused
-  - [ ] remaining: Deferred (T2.4): `_make_output_dirs` still creates missing output directories by path (the directory is then opened anchored and checked before any write)
-  - [ ] remaining: Deferred (T2.4): `_make_writable_and_retry` in `repo_sealer.py` is no longer used by production code; remove it together with the tests that call it directly
-  - [ ] remaining: Deferred (T2.4): the simulated-other-uid test stubs the storage ownership checks
+  - [x] `_make_output_dirs` creates missing output directories relative to held descriptors with `O_NOFOLLOW`; a symlinked or file component is refused (2026-11-15). Proof: `test_output_dirs_are_created_without_following_symlinks`
+  - [x] The unused `_make_writable_and_retry` rmtree handler (and `_remove_at`) removed with the test that called it directly; the swapped-ancestor chmod coverage stays (2026-11-15). Proof: `test_unused_rmtree_retry_handler_is_removed`, `test_ancestor_swapped_for_symlink_is_never_followed`
+  - [x] The simulated-other-uid image test no longer stubs the storage ownership checks: they run on every held descriptor against the real owning identity, and the test asserts they ran (2026-11-15). Proof: `test_finding1_image_independent_of_builder_identity`
 - [x] Gateway deadline handling (T2.2). Each request has its own read-deadline cell, armed for the next head only when the stream is handed on, so a successor never cuts a body deadline (`ae2e6ef`). Two further causes of the `test_8_stalled_clients_are_dropped_at_the_deadline_and_service_recovers` flake fixed 2026-11-15: the body deadline is re-read from the server configuration after the head (deadlines installed while a head was pending were ignored), and the test harnesses create the server with its deadlines before the first accept, as the gateway binary does. test_8 passed 50 of 50 runs after the fix (5 of 15 failed before). Proof: `body_deadline_installed_while_head_is_pending_still_applies` (fails before the fix).
   - [x] CodeRabbit (2026-11-12): body deadline kept until the body reader finishes (`ae2e6ef`); the sequential hand-off no longer panics when a predecessor writer or reader disappears without handing on, and a failed writer stays failed. Proof: `writer_whose_predecessor_vanished_fails_without_panicking_and_stays_failed`, `dropping_a_waiting_reader_whose_predecessor_vanished_does_not_panic`, `dropping_a_waiting_reader_forwards_the_stream_once_it_arrives`.
 - [ ] remaining: Package world (TR-PKG-*)

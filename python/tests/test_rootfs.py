@@ -1132,10 +1132,28 @@ def test_finding1_image_independent_of_builder_identity(tmp_path: Path, monkeypa
     res1 = build_rootfs(src=src, out_image=tmp_path / "a" / "r.ext4", t_clock=t_clock, world_id="w", size_mib=64)
     sealcheck = find_sealcheck_bin()
     monkeypatch.setattr("hermetic_slice.rootfs.find_sealcheck_bin", lambda _bin=None: sealcheck)
-    # The simulated builder does not own the real test directories; the ownership checks on
-    # storage directories are covered by the B4 tests, this test is about the image bytes.
-    monkeypatch.setattr("hermetic_slice.rootfs.check_safe_dir_fd", lambda *_args: None)
-    monkeypatch.setattr("hermetic_slice.rootfs.check_private_dir_fd", lambda *_args: None)
+    # The storage ownership checks still run on every held descriptor, against the real
+    # identity that owns the test directories (T2.4: no longer stubbed out). Everything
+    # else in the build sees the simulated identity.
+    import hermetic_slice.rootfs as rootfs_mod
+    real_ids = {fn: getattr(os, fn) for fn in ("geteuid", "getuid", "getegid", "getgid")}
+    checked = []
+
+    def with_real_identity(check):
+        def run(*args):
+            simulated = {fn: getattr(os, fn) for fn in real_ids}
+            for fn, real in real_ids.items():
+                setattr(os, fn, real)
+            try:
+                checked.append(check.__name__)
+                return check(*args)
+            finally:
+                for fn, value in simulated.items():
+                    setattr(os, fn, value)
+        return run
+
+    monkeypatch.setattr(rootfs_mod, "check_safe_dir_fd", with_real_identity(rootfs_mod.check_safe_dir_fd))
+    monkeypatch.setattr(rootfs_mod, "check_private_dir_fd", with_real_identity(rootfs_mod.check_private_dir_fd))
     for fn, value in (("geteuid", 4242), ("getuid", 4242), ("getegid", 4343), ("getgid", 4343)):
         monkeypatch.setattr(os, fn, lambda value=value: value)
     res2 = build_rootfs(
@@ -1144,6 +1162,7 @@ def test_finding1_image_independent_of_builder_identity(tmp_path: Path, monkeypa
     )
     monkeypatch.undo()
     assert res1["sha256"] == res2["sha256"]
+    assert {"check_safe_dir_fd", "check_private_dir_fd"} <= set(checked), checked
 
     if DEBUGFS is not None:
         out = _debugfs(tmp_path / "a" / "r.ext4", "stat /usr/bin/tool")

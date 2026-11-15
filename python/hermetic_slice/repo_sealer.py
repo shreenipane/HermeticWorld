@@ -117,43 +117,6 @@ def chmod_nofollow(path, mode: int) -> bool:
         os.close(parent_fd)
 
 
-def _remove_at(func, parent_fd: int, name: str) -> None:
-    if func is os.rmdir:
-        os.rmdir(name, dir_fd=parent_fd)
-    elif func in (os.unlink, os.remove):
-        os.unlink(name, dir_fd=parent_fd)
-    # Other failing calls (open, scandir, lstat) need no retry here: making the entry
-    # writable/searchable is the fix, and rmtree's own removal then proceeds or reports.
-
-
-def _make_writable_and_retry(func, path, _exc):
-    """shutil.rmtree error handler: every chmod, unlink and rmdir is relative to the parent's
-    descriptor, reached without following any symlink (a swapped ancestor is refused)."""
-    try:
-        parent_fd, name = _open_parent_anchored(path)
-    except OSError:
-        return
-    try:
-        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if stat.S_ISLNK(st.st_mode):
-            _add_owner_rwx(parent_fd)
-            os.unlink(name, dir_fd=parent_fd)
-            return
-        # S_IWRITE alone would strip r/x from directories on POSIX.
-        if not _chmod_at(parent_fd, name, stat.S_IRWXU):
-            os.unlink(name, dir_fd=parent_fd)  # swapped for a symlink: remove the link only
-            return
-        try:
-            _remove_at(func, parent_fd, name)
-        except OSError:
-            _add_owner_rwx(parent_fd)
-            _remove_at(func, parent_fd, name)
-    except OSError:
-        pass
-    finally:
-        os.close(parent_fd)
-
-
 def _open_subdir_for_removal(parent_fd: int, name: str) -> int | None:
     """Open name inside parent_fd as a directory without following symlinks; None if it is
     not a directory (anymore). Grants owner rwx (on the opened inode) when needed."""

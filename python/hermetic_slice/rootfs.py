@@ -1006,17 +1006,25 @@ def _is_inside(path: Path, anchor: os.stat_result) -> bool:
 
 
 def _make_output_dirs(directory: Path) -> None:
-    """mkdir -p with mode 0755 for every created level (Path.mkdir(parents=True) ignores mode for parents)."""
-    missing: list[Path] = []
-    current = Path(os.path.abspath(directory))
-    while not current.exists():
-        missing.append(current)
-        current = current.parent
-    for level in reversed(missing):
-        try:
-            os.mkdir(level, 0o755)
-        except FileExistsError:
-            pass
+    """mkdir -p with mode 0755 for every created level, walked component by component
+    relative to the parent's descriptor: no component is ever followed through a symlink,
+    and a component swapped for a symlink or a file is refused (ELOOP/ENOTDIR)."""
+    parts = Path(os.path.abspath(directory)).parts
+    fd = os.open("/", _DIR_OPEN_FLAGS)
+    try:
+        for name in parts[1:]:
+            try:
+                child = os.open(name, _DIR_OPEN_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(name, _DIR_OPEN_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
 
 
 def check_safe_dir_fd(fd: int, what: str, where: Path | str) -> None:

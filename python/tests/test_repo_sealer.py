@@ -555,39 +555,6 @@ def test_chmod_nofollow_never_changes_symlink_target(tmp_path: Path) -> None:
     assert stat.S_IMODE(os.lstat(regular).st_mode) == 0o700
 
 
-def test_make_writable_and_retry_symlink_swapped_after_lstat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Review finding 9: an entry that lstat saw as a regular file but that has been replaced
-    by a symlink to a host file before the chmod: the host file's mode is unchanged."""
-    from hermetic_slice import repo_sealer
-
-    host_file = tmp_path / "host_secret"
-    host_file.write_text("secret\n")
-    os.chmod(host_file, 0o600)
-
-    tree = tmp_path / "tree"
-    tree.mkdir()
-    victim = tree / "victim"
-    victim.symlink_to(host_file)
-
-    real_lstat = os.lstat
-    fake_regular = real_lstat(host_file)
-
-    def lying_lstat(path, *args, **kwargs):
-        # Simulates the race: the lstat happened while 'victim' was still a regular file.
-        if Path(path) == victim:
-            return fake_regular
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(repo_sealer.os, "lstat", lying_lstat)
-    repo_sealer._make_writable_and_retry(os.unlink, str(victim), PermissionError("simulated"))
-    monkeypatch.setattr(repo_sealer.os, "lstat", real_lstat)
-
-    assert stat.S_IMODE(os.lstat(host_file).st_mode) == 0o600, "chmod followed a swapped-in symlink"
-    assert host_file.read_text() == "secret\n"
-
-
 def test_clean_directory_symlink_swapped_after_lstat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Review finding 9 (_clean_directory sites): a symlink swapped in after the lstat is not chmod'ed."""
     from hermetic_slice import repo_sealer
@@ -625,8 +592,8 @@ def test_clean_directory_symlink_swapped_after_lstat(tmp_path: Path, monkeypatch
 
 
 def test_ancestor_swapped_for_symlink_is_never_followed(tmp_path: Path) -> None:
-    """Prior-check item 9: an ancestor directory replaced by a symlink after rmtree saw it must
-    not redirect the chmod or the unlink to a file outside the tree."""
+    """Prior-check item 9: an ancestor directory replaced by a symlink must not redirect a
+    chmod to a file outside the tree."""
     from hermetic_slice import repo_sealer
 
     outside = tmp_path / "outside"
@@ -640,10 +607,6 @@ def test_ancestor_swapped_for_symlink_is_never_followed(tmp_path: Path) -> None:
     (tree / "sub" / "file").write_text("x")
     shutil.rmtree(tree / "sub")
     (tree / "sub").symlink_to(outside)
-
-    repo_sealer._make_writable_and_retry(os.unlink, str(tree / "sub" / "file"), PermissionError("simulated"))
-    assert target.read_text() == "keep\n", "the outside file was removed through a swapped ancestor"
-    assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
 
     assert repo_sealer.chmod_nofollow(tree / "sub" / "file", 0o777) is False
     assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
@@ -687,3 +650,11 @@ def test_clean_directory_ancestor_swapped_during_cleanup_stays_inside(
     assert victim.read_text() == "outside data\n", "removal followed the swapped ancestor"
     assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o644
     assert list((tmp_path / "a-real" / "dest").iterdir()) == [], "the real directory was not cleaned"
+
+
+def test_unused_rmtree_retry_handler_is_removed() -> None:
+    """T2.4: the old shutil.rmtree error handler is gone; cleanup uses descriptor-relative removal only."""
+    from hermetic_slice import repo_sealer
+
+    assert not hasattr(repo_sealer, "_make_writable_and_retry")
+    assert not hasattr(repo_sealer, "_remove_at")
