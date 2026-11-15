@@ -607,6 +607,7 @@ fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::
     if !matches!(socket_identity(&entry), Some((current, _)) if current == id) {
         return Err(not_owned());
     }
+
     #[cfg(test)]
     review_tests::endpoint_verified();
     let private = directory.path(Path::new(&format!(
@@ -750,11 +751,9 @@ impl WorldServer {
                     Some((id, uid)) if uid == parent_meta.uid() => id,
                     _ => return Err(ServerExit::StartupFailed),
                 };
-                match UnixStream::connect(&lock_entry) {
-                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                        Some((lock_id, (meta.dev(), meta.ino())))
-                    }
-                    _ => return Err(ServerExit::StartupFailed),
+                match probe_lock(&lock_entry) {
+                    LockProbe::Stale => Some((lock_id, (meta.dev(), meta.ino()))),
+                    LockProbe::Live | LockProbe::Unknown => return Err(ServerExit::StartupFailed),
                 }
             }
             _ => return Err(ServerExit::StartupFailed),
@@ -901,8 +900,8 @@ impl WorldServer {
                     Some((id, uid)) if uid == parent_uid => id,
                     _ => return Err(ServerExit::StartupFailed),
                 };
-                match UnixStream::connect(&lock_entry) {
-                    Err(ce) if ce.kind() == ErrorKind::ConnectionRefused => {
+                match probe_lock(&lock_entry) {
+                    LockProbe::Stale => {
                         if let Err(e) = self.socket_directory.check_exclusive() {
                             eprintln!(
                                 "stale endpoint lock {} not removed: endpoint directory \
@@ -1450,6 +1449,44 @@ impl WorldServer {
             #[cfg(test)]
             review_tests::crash_at("after_completion");
         }
+    }
+}
+
+/// Result of probing an endpoint lock socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockProbe {
+    /// Nothing listens: the lock (and its endpoint) is stale.
+    Stale,
+    /// A listener holds the lock (connected, or its backlog is full).
+    Live,
+    /// Any other failure: treated as not provably stale.
+    Unknown,
+}
+
+/// Probe a lock socket without ever blocking. A live server's lock listener
+/// never accepts, so a blocking connect could wait forever once repeated
+/// probes fill its backlog; a non-blocking connect returns at once, and
+/// `EAGAIN` (backlog full) proves a listener exists just as success does.
+pub(crate) fn probe_lock(path: &Path) -> LockProbe {
+    use rustix::io::Errno;
+    use rustix::net::{
+        connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
+    };
+    let Ok(addr) = SocketAddrUnix::new(path) else {
+        return LockProbe::Unknown;
+    };
+    let Ok(fd) = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    ) else {
+        return LockProbe::Unknown;
+    };
+    match connect(&fd, &addr) {
+        Ok(()) | Err(Errno::AGAIN) | Err(Errno::INPROGRESS) => LockProbe::Live,
+        Err(Errno::CONNREFUSED) => LockProbe::Stale,
+        Err(_) => LockProbe::Unknown,
     }
 }
 
@@ -2104,5 +2141,32 @@ mod review_tests {
             assert_eq!(names, [std::ffi::OsString::from("socket")], "live={live}");
             drop(owned);
         }
+    }
+
+    #[test]
+    fn lock_probe_never_blocks_and_distinguishes_live_stale_and_missing() {
+        use super::{probe_lock, LockProbe};
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live.lock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        // The listener never accepts: past its backlog a blocking connect would
+        // wait forever. Every probe must return at once and report it live.
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(probe_lock(&live), LockProbe::Live);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+
+        let stale = temp.path().join("stale.lock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        assert!(stale.exists());
+        assert_eq!(probe_lock(&stale), LockProbe::Stale);
+
+        assert_eq!(
+            probe_lock(&temp.path().join("missing.lock")),
+            LockProbe::Unknown
+        );
+        // A non-socket entry never reaches the probe: both callers first require
+        // the lock to be a socket owned by the directory owner (`socket_identity`).
     }
 }

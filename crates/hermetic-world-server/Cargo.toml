@@ -9,6 +9,7 @@ name = "hermetic-world-server"
 path = "src/main.rs"
 
 [dependencies]
+rustix = { version = "=1.1.6", features = ["net"] }
 hermetic-common = { workspace = true }
 blake3 = { workspace = true }
 landlock = { workspace = true }
@@ -22,4 +23,4 @@ time = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rustix = { version = "=1.1.6", features = ["process", "thread", "time"] }
+rustix = { version = "=1.1.6", features = ["process", "thread", "time", "net"] }

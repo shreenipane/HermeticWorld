@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 40 of 48 |
-| 2: World | done 23 of 43 |
+| 2: World | done 24 of 43 |
 | 3: VMs | done 23 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 27 of 39 |
@@ -152,7 +152,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: Ecosystems: PyPI, conda, Debian/Ubuntu, git dependencies (static mirrors)
 - [ ] remaining: `strict` class B rebuild, with `repo_only` fallback and labelling
 - [x] WorldServer: read-only store, Landlock, seccomp, frames, limits, hash log, dedupe index (TR-WS-*) (T2.1). Proof: `test_store_and_responses`, `test_sandbox`, `test_limits`, `test_log_and_dedupe` suites (`crates/hermetic-world-server/tests/`).
-  - [ ] remaining: Deferred (T2.1 review, non-blocking): endpoint probes use a blocking `UnixStream::connect` against a lock listener that never accepts; repeated recovery attempts on one endpoint can fill the backlog and block startup; use non-blocking exclusive ownership
+  - [x] Endpoint lock probes use a non-blocking connect (`probe_lock`): connected or backlog-full (`EAGAIN`) means live, refused means stale, anything else is not provably stale; repeated probes can no longer block startup (2026-11-15). Proof: `lock_probe_never_blocks_and_distinguishes_live_stale_and_missing` (1000 probes past the backlog), `defect5_crash_recovery_endpoint_reuse`
   - [x] The live-endpoint recovery test now passes valid recovery inputs (`--resume-log --recover` on the same log), so the refusal comes from the ownership check, and it asserts the original listener still serves (2026-11-15). Proof: `defect5_crash_recovery_endpoint_reuse`
   - [x] Seccomp allow-list tightened (2026-11-15): `connect` removed (the server connects only before the sandbox), every credential-changing call (`set*id`, `setgroups`, `setfs*id`, `capset`) and `clock_settime` removed, and `kill`/`tgkill`/`rt_sigqueueinfo` allowed only for the server's own pid (`tkill` removed). Denial is tested in child processes (killed by SIGSYS) and self-signalling still works. Proof: `seccomp_denies_connect_foreign_signals_credentials_and_clock_setting`
   - [x] The Landlock failure-injection test runs in a child process, so its process-global flag never reaches other tests; the parent requires the child's completion marker (2026-11-15). Proof: `defect11_unavailable_landlock_startup_regression`
