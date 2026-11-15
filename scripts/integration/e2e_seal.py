@@ -538,8 +538,12 @@ def worker(action, work, instance):
             "resolv.conf": RESOLV_CONF.encode("ascii"),
         }.items():
             atomic_write(tree / "etc" / name, data)
-        # Remove target bytecode and the same caches omitted by build_rootfs, so
+        # Remove bytecode caches and the same caches omitted by build_rootfs, so
         # sealcheck scans the tree that is actually made reachable in the image.
+        # TR-SEAL-3 removes __pycache__ from the repository; outside it, clamping
+        # mtimes to T_clock (normalise_tree) leaves every timestamp-based cache
+        # stale (D3), and Python would only recompile it, so caches are removed
+        # everywhere and rebuilt in the agent's overlay.
         from hermetic_slice.rootfs import is_cleanup_target
         remaining = [MAX_MEMBERS]
         def cleanup(directory, parts=()):
@@ -551,7 +555,7 @@ def worker(action, work, instance):
                     if remaining[0] < 0:
                         raise SealError("tree_entry_cap")
                     path = parts + (entry.name,)
-                    if is_cleanup_target(path) or (path[:1] == ("testbed",) and entry.name == "__pycache__"):
+                    if is_cleanup_target(path) or (entry.name == "__pycache__" and entry.is_dir(follow_symlinks=False)):
                         remove_tree_at(directory, entry.name)
                     elif entry.is_dir(follow_symlinks=False):
                         child = open_child(directory, entry.name)

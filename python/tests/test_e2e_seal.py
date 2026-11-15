@@ -241,6 +241,15 @@ def test_repository_worker_seals_real_objects_and_preserves_source_edits(tmp_pat
     (repo / "source.py").write_bytes(b"image environment setup edit\n")
     (repo / "__pycache__").mkdir()
     (repo / "__pycache__/stale.pyc").write_bytes(b"stale")
+    # Environment caches outside the repository are removed too (stale after
+    # the mtime clamp); a symlink named __pycache__ is never followed.
+    env_cache = work / "source-tree/opt/env/lib/python3.9/__pycache__"
+    env_cache.mkdir(parents=True)
+    (env_cache / "os.cpython-39.pyc").write_bytes(b"cache")
+    kept_dir = work / "kept"
+    kept_dir.mkdir()
+    (kept_dir / "keep.pyc").write_bytes(b"keep")
+    (work / "source-tree/opt/env/__pycache__").symlink_to(kept_dir)
     log = work / "source-tree/var/log"
     log.mkdir(parents=True)
     (log / "dated.log").write_text("host date")
@@ -268,6 +277,8 @@ def test_repository_worker_seals_real_objects_and_preserves_source_edits(tmp_pat
     assert (work / "base-tree/source.py").read_bytes() == b"base source\n"
     assert (repo / "source.py").read_bytes() == b"image environment setup edit\n"
     assert not (repo / "__pycache__").exists()
+    assert not env_cache.exists()
+    assert (kept_dir / "keep.pyc").read_bytes() == b"keep"
     assert not (log / "dated.log").exists()
     assert outside.read_bytes() == b"untouched"
     assert outside.stat().st_mtime_ns == original_mtime

@@ -13,8 +13,8 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 42 of 48 |
-| 2: World | done 26 of 43 |
-| 3: VMs | done 25 of 48 |
+| 2: World | done 27 of 44 |
+| 3: VMs | done 26 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 28 of 39 |
 
@@ -177,7 +177,8 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] remaining: Note (T2.2): `tiny_http` 0.12.0 is vendored with local patches at `crates/vendor/tiny_http` (see `VENDORED.md`); a half-closed client never frees its slot before the upstream ends, and a waiting request gets a bounded 529
 - [x] Container isolation of the agent, with the run spec applied (2026-11-15): `start_world(runspec=...)` / `run-agent --run-spec FILE` run the agent container as the spec's user and groups, in its working directory, with its environment, hostname, nameserver and CPU/memory limits, `--cap-drop ALL` and `no-new-privileges`, on the internal world network; the spec is re-validated (ids, limits, env names; no override of the package-index variables) before any container starts. Proof: `test_run_spec_maps_to_hardened_docker_flags`, `test_invalid_run_specs_are_refused`, `test_start_world_applies_the_run_spec_to_the_agent_only`, `test_cli_run_agent_applies_or_refuses_a_run_spec`
 - [x] Manifest with `world_root`. Proof: `test_known_answer_root`, `test_inclusion_proofs_for_every_leaf` (`crates/hermetic-common/tests/test_world_manifest.rs`).
-- [ ] remaining: Reproducibility check (E7)
+- [x] Reproducibility check (E7), measured 2026-11-15 on psf__requests-2317: two independent seals give a byte-identical rootfs image (1.6 GB, `cbfdf3bd…`) and sealed repository (`hermetic_e7 compare`: reproducible). The first run found two sources of difference, both fixed: multi-threaded `git repack` (now `pack.threads=1`, no bitmaps) and per-checkout stat data in `.git/index` (rebuilt with `read-tree`). It also found that clamping mtimes made every environment `.pyc` stale (6,080 D3 gates); bytecode caches are now removed everywhere, not only in the repository. Proof: `test_sealing_twice_gives_identical_trees_e7`, `test_repository_worker_seals_real_objects_and_preserves_source_edits` (environment caches)
+  - [ ] remaining: E7 on the full `world_root`: the seal still stops at D4/D6 gates on the post-cutoff task environment (pip 23 wheel members, image creation date); a `repo_only` seal needs the substrate inventory and exemption design (owner decision) before the world manifest is built
 - [ ] remaining: E4 oracle harness: gold passes, `FAIL_TO_PASS` fails on base, per-test parity with the official harness, flaky-test detection (3×), pytest plugin list (oracle result analysis in `python/hermetic_oracle`, merged 2026-11-13; harness run still open)
 - [ ] remaining: E2 design: a paired subset of 50–100 tasks stratified by repo and year, ≥ 2 seeds, bootstrap intervals, McNemar, drift control
 
@@ -214,7 +215,7 @@ The oracle passes on every slice task, and one agent run is graded.
   - [ ] remaining: Open: TPROXY (TR-NET-3); first cut owns manifest world addresses as /32s and listens directly on port 80
   - [ ] remaining: Open: dm-verity for NetVM (TR-NET-1); first cut uses a D4-checked read-only ext4 image
   - [x] Manager nested two-VM boot/network smoke passed on 2026-11-14 using the policy-checked kernel and patched Firecracker. Proof: `scripts/integration/net-smoke.sh`, `crates/hermetic-vmm/tests/net_guest.rs`; historical manager smoke, not rerun in this review.
-- [ ] remaining: AgentVM on a CoW world; Mode H through vsock 5000
+- [x] AgentVM on a CoW world; Mode H through vsock 5000 (recorded 2026-11-15): execd mounts the sealed base read-only and the per-run overlay disk over it (`MountBaseReadOnly`, `MountDisk`), and serves exec on vsock 5000 (`VSOCK_PORT`); Mode H ran a real task this way on 2026-11-14 (pytest-6202, 60 steps, real-date header stripped). Proof: `boots_guest_and_reads_guest_clock`, `agent_h_overlay_uses_pinned_config_instead_of_host_defaults` (`crates/hermetic-vmm/tests/guest.rs`), `runs_sealed_task_through_host_harness` (`crates/hermetic-vmm/tests/agent_h_task.rs`, manager-run)
 - [ ] remaining: Mode G: `/opt/agent` volume, model path NetVM → gateway (cut list: optional)
 - [ ] remaining: ExtractorVM plus host validator (TR-EXT-*)
 - [ ] remaining: GraderVM supervisor and isolation (TR-GR-1 to TR-GR-5)

@@ -402,10 +402,20 @@ def seal_repo(
                     shutil.rmtree(Path(root) / d, ignore_errors=True)
                     dirs.remove(d)
 
-        # Step 8: Repack and prune
-        run_git(["repack", "-a", "-d", "-f"], cwd=dest)
+        # Step 8: Repack and prune, reproducibly (E7, TR-SEAL-12): one packing
+        # thread makes delta selection, and so the pack bytes and name,
+        # deterministic; no bitmaps.
+        run_git(["-c", "pack.threads=1", "-c", "repack.writeBitmaps=false",
+                 "repack", "-a", "-d", "-f"], cwd=dest)
         run_git(["prune", "--expire=now"], cwd=dest)
         run_git(["commit-graph", "write", "--reachable"], cwd=dest)
+        # The checkout's index records each file's inode, device and ctimes.
+        # Rebuilt from the tree with read-tree, every entry carries zeroed stat
+        # data: identical across seals; git refreshes it on first use.
+        index = dest / ".git" / "index"
+        if index.exists() and not index.is_symlink():
+            index.unlink()
+        run_git(["read-tree", "sealed"], cwd=dest)
 
         # Step 9: Verify sealed repo
         problems = verify_sealed_repo(dest, base_sha, kept_tags)

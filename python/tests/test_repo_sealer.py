@@ -658,3 +658,21 @@ def test_unused_rmtree_retry_handler_is_removed() -> None:
 
     assert not hasattr(repo_sealer, "_make_writable_and_retry")
     assert not hasattr(repo_sealer, "_remove_at")
+
+
+def test_sealing_twice_gives_identical_trees_e7(synthetic_repo: SyntheticRepo, tmp_path: Path) -> None:
+    """E7 / TR-SEAL-12: two seals of the same repo are byte-identical, .git included
+    (deterministic pack, no per-checkout stat data in the index)."""
+    from hermetic_e7.compare import compare_worlds
+
+    trees = []
+    for name in ("a", "b"):
+        dest = tmp_path / name
+        seal_repo(src=synthetic_repo.path, base_commit=synthetic_repo.c3_base, dest=dest,
+                  t_clock=synthetic_repo.t_clock)
+        trees.append(dest)
+    report = compare_worlds(*trees)
+    assert report.root_a == report.root_b, report
+    # The index still lists every tracked file, and git sees a clean tree.
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=trees[0], capture_output=True, check=True)
+    assert status.stdout == b""
