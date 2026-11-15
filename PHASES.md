@@ -14,9 +14,9 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 42 of 48 |
 | 2: World | done 26 of 43 |
-| 3: VMs | done 24 of 48 |
+| 3: VMs | done 25 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
-| 4: Extensions | done 27 of 39 |
+| 4: Extensions | done 28 of 39 |
 
 ## Overview
 
@@ -250,7 +250,7 @@ The oracle passes on every slice task, and one agent run is graded.
 
 ### Integration findings, 2026-11-13 (grader path)
 - [x] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2). Proof: `clock_is_set_before_anything_writable_then_supervisor_then_poweroff` (`crates/hermetic-execd/src/grader.rs`); `grader_drive_layout_requires_writable_result_first_and_read_only_others` (`crates/hermetic-vmm/tests/spec_plan.rs`).
-- [ ] remaining: Supervisor isolation: apply the `hermetic-grader-sandbox` plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill.
+- [x] Supervisor isolation: the `hermetic-grader-sandbox` plan is applied (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill. Done in `f9bf272` (2026-11-13; recorded 2026-11-15). Proof: `applied_plan_covers_every_isolation_property_and_fails_closed`, `hostile_configuration_is_refused_before_spawn_or_result_write`, `deterministic_plan_and_device_program_known_answer`, `unprivileged_launch_fails_closed_without_running_repository` (`crates/hermetic-grader-supervisor/tests/isolation.rs`); the real-kernel case `privileged_kernel_isolation_and_tree_teardown` needs root and runs in the grader VM, whose nested smoke passes.
 - [x] Extraction format: the validator's HEXT v1 format is canonical; `hermetic-extract-agent` emits it byte for byte. Tree root is `patch:` / `repo_dir: ""` on both sides; `.` is refused. Cross-crate test `crates/hermetic-extract-agent/tests/validator_compat.rs`; grader smoke now runs agent then validator (done 2026-11-13). Proof: `validator_compat` suite (`crates/hermetic-extract-agent/tests/validator_compat.rs`).
 
 ---
@@ -428,5 +428,5 @@ No deliverable above is removed or reduced:
 
 ### Integration findings, 2026-11-13 (grader path)
 - [x] Grader PID 1: static unsafe-free binary; read-only proc, /tmp, devpts; clock from `hermetic.t` first (reuse execd clock code); run the supervisor with fixed config and result drive; sync and power off; no vsock or network. Plus the vmm grader drive layout (1 MiB result drive) and VM-exit detection. Unblocks the grader VM boot and its clock check (TR-GR-1/2).
-- [ ] Supervisor isolation: apply the `hermetic-grader-sandbox` plan (pid/mount/ipc/uts/net namespaces, capability drop, no_new_privs, device list, cgroup v2 block-device deny); record pipe on fd 3 or higher; process-group kill.
+- [x] Supervisor isolation: the `hermetic-grader-sandbox` plan is applied (namespaces, capabilities, no_new_privs, devices, cgroup deny, record pipe on fd 3+, process-group kill). Done in `f9bf272` (2026-11-13; recorded 2026-11-15). Proof: `applied_plan_covers_every_isolation_property_and_fails_closed`, `hostile_configuration_is_refused_before_spawn_or_result_write`, `deterministic_plan_and_device_program_known_answer`, `unprivileged_launch_fails_closed_without_running_repository` (`crates/hermetic-grader-supervisor/tests/isolation.rs`); the real-kernel case `privileged_kernel_isolation_and_tree_teardown` needs root and runs in the grader VM, whose nested smoke passes.
 - [x] Extraction format: the validator's HEXT v1 format is canonical; `hermetic-extract-agent` emits it byte for byte. Tree root is `patch:` / `repo_dir: ""` on both sides; `.` is refused. Cross-crate test `crates/hermetic-extract-agent/tests/validator_compat.rs`; grader smoke now runs agent then validator (done 2026-11-13).
