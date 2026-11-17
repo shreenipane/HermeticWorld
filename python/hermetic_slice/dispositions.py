@@ -388,11 +388,14 @@ def find_binary(bin_name: str, custom_path: str | Path | None = None, env_var: s
     if which:
         return which
 
-    candidates = [
-        Path(f"target/debug/{bin_name}"),
-        Path(f"target/release/{bin_name}"),
-        Path(f"/home/flingboot/hermetic/cargo-target/t1.14/debug/{bin_name}"),
-    ]
+    # The repository's own target directory, an explicit CARGO_TARGET_DIR, and
+    # the gates' per-worktree target directory (~/hermetic/cargo-target/<worktree>).
+    repo = Path(__file__).resolve().parents[2]
+    roots = [Path("target"), repo / "target"]
+    if os.environ.get("CARGO_TARGET_DIR"):
+        roots.append(Path(os.environ["CARGO_TARGET_DIR"]))
+    roots.append(Path.home() / "hermetic" / "cargo-target" / repo.name)
+    candidates = [root / profile / bin_name for root in roots for profile in ("debug", "release")]
     for c in candidates:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c.resolve())
