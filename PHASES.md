@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 42 of 48 |
-| 2: World | done 28 of 44 |
+| 2: World | done 30 of 44 |
 | 3: VMs | done 26 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 28 of 39 |
