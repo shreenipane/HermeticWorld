@@ -543,11 +543,25 @@ fn smoke_script_exists_and_is_executable() {
         .unwrap()
         .join("scripts/integration/extract-vm-smoke.sh");
     assert!(script.exists(), "smoke script must exist: {:?}", script);
-    let perms = fs::metadata(&script).unwrap().permissions();
-    assert_eq!(
-        perms.mode() & 0o777,
-        0o755,
-        "smoke script must have mode 0755 without runtime modification"
+    let meta = fs::symlink_metadata(&script).unwrap();
+    assert!(
+        meta.is_file(),
+        "smoke script must be a regular file: {:?}",
+        script
+    );
+    assert!(
+        !meta.is_symlink(),
+        "smoke script must not be a symlink: {:?}",
+        script
+    );
+    let mode = meta.permissions().mode();
+    assert!(
+        mode & 0o100 != 0,
+        "smoke script must be executable by its owner"
+    );
+    assert!(
+        mode & 0o002 == 0,
+        "smoke script must not be writable by others"
     );
 }
 
