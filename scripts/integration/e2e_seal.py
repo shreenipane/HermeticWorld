@@ -25,6 +25,8 @@ sys.path.insert(0, str(TOP / "scripts/integration"))
 
 from hermetic_safe_io import atomic_write, open_parent, open_regular, validate_path
 from hermetic_runspec.derive import parse_json_bytes, read_regular_file_bounded
+from hermetic_d7.normalise import HermeticD7Error
+from hermetic_d7.recipe import RecipeError, RecipeSecurityError
 from smoke_work import create_work, open_child
 
 MAX_RECORD_BYTES = 8 * 1024**2
@@ -408,6 +410,16 @@ def sealed_provenance():
     return build_provenance([], [])
 
 
+def sealed_recipe(tree=None, build_record=None):
+    """D7 build recipe for artifacts built from source in the world."""
+    from hermetic_d7.recipe import build_recipe
+    if tree is not None and os.path.isdir(tree):
+        return build_recipe(tree, build_manifest=build_record)
+    if build_record is not None:
+        return build_recipe(None, build_manifest=build_record)
+    return None
+
+
 def validate_scan_report(step, value):
     """Exit zero alone cannot certify coverage of every stored payload."""
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
@@ -658,6 +670,25 @@ def run(argv=None):
         # A repo_only seal ships no sealer-built web archive, so its provenance
         # manifest is empty: any WARC record found in the tree gates the seal.
         atomic_write(work / "d10-provenance.json", sealed_provenance())
+        # Emit d7-recipe.json for the sealed world root (outside the world tree).
+        step = "d7_recipe"
+        build_rec_path = work / "build-record.json"
+        try:
+            build_rec = None
+            try:
+                st = os.lstat(build_rec_path)
+                if stat.S_ISLNK(st.st_mode):
+                    raise RecipeSecurityError(f"build manifest {build_rec_path!r} is a symlink")
+                if not stat.S_ISREG(st.st_mode):
+                    raise RecipeSecurityError(f"build manifest {build_rec_path!r} is not a regular file")
+                build_rec = build_rec_path
+            except FileNotFoundError:
+                build_rec = None
+            recipe_data = sealed_recipe(work / "source-tree", build_record=build_rec)
+        except (RecipeError, HermeticD7Error) as exc:
+            raise SealError(f"d7_recipe_{type(exc).__name__}") from exc
+        if recipe_data is not None:
+            atomic_write(work / "d7-recipe.json", recipe_data)
         scans = [
             ("sealcheck_tiers", [str(work / "sealcheck"), "scan", "--task", str(task_dir),
                                  "--base-tree", str(work / "base-tree"), "--root", str(work / "source-tree"),

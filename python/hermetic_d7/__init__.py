@@ -9,6 +9,22 @@ from hermetic_d7.compare import (
     compare_artifacts,
     format_report_json,
 )
+from hermetic_d7.deep_audit import (
+    RECIPE_SCHEMA,
+    RecipeEntry,
+    parse_recipe,
+    run_deep_audit,
+)
+from hermetic_d7.recipe import (
+    MAX_UNATTRIBUTED_ENTRIES,
+    RecipeError,
+    RecipeFormatError,
+    RecipeResourceLimitError,
+    RecipeSecurityError,
+    build_recipe,
+    emit_recipe,
+    scan_built_artifacts,
+)
 from hermetic_d7.normalise import (
     MAX_ARCHIVE_MEMBERS,
     MAX_DIFF_INPUT_LINES,
@@ -54,16 +70,25 @@ __all__ = [
     "MAX_RECORD_LINES",
     "MAX_TEXT_DIFF_BYTES",
     "MAX_TOTAL_DECOMPRESSED_BYTES",
+    "MAX_UNATTRIBUTED_ENTRIES",
     "NormalisedMember",
     "PYC_HEADER_SIZE",
     "READ_CHUNK_SIZE",
+    "RECIPE_SCHEMA",
+    "RecipeEntry",
+    "RecipeError",
+    "RecipeFormatError",
+    "RecipeResourceLimitError",
+    "RecipeSecurityError",
     "ResourceLimitError",
     "ResourceLimits",
     "SecurityViolationError",
     "__version__",
     "build_error_report",
+    "build_recipe",
     "build_unified_diff",
     "compare_artifacts",
+    "emit_recipe",
     "format_report_json",
     "load_artifact",
     "normalise_executable",
@@ -71,6 +96,9 @@ __all__ = [
     "normalise_metadata",
     "normalise_pyc",
     "normalise_record",
+    "parse_recipe",
+    "run_deep_audit",
+    "scan_built_artifacts",
     "validate_member_path",
 ]
 

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import hermetic_safe_io
 from hermetic_d7.compare import AUDIT_POLICY_STATEMENT, compare_artifacts
 from hermetic_d7.normalise import (
     HermeticD7Error,
@@ -44,8 +45,8 @@ from hermetic_d7.normalise import (
 )
 
 RECIPE_SCHEMA = "hermetic.d7.recipe/1"
-MAX_RECIPE_BYTES = 1024 * 1024
-MAX_RECIPE_ENTRIES = 256
+MAX_RECIPE_BYTES = 4 * 1024 * 1024
+MAX_RECIPE_ENTRIES = 4096
 MAX_ARGS = 64
 MAX_ARG_BYTES = 1024
 MAX_BUILDER_OUTPUT_ENTRIES = 2
@@ -63,6 +64,12 @@ class RecipeEntry:
     source: str
     builder: str
     args: tuple[str, ...]
+
+
+class RecipeEntries(list[RecipeEntry]):
+    """Recipe entries with optional unattributed artifacts attached."""
+
+    unattributed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,7 +105,10 @@ class RefusingBuilder:
 
 
 def _read_no_follow(root_fd: int, rel: str, cap: int) -> bytes:
-    fd = _open_no_follow(root_fd, rel, directory=False)
+    try:
+        fd = _open_no_follow(root_fd, rel, directory=False)
+    except FileNotFoundError:
+        raise SecurityViolationError("recipe input does not exist")
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -147,6 +157,9 @@ def _open_no_follow(root_fd: int, rel: str, *, directory: bool) -> int:
             os.close(current)
             current = nxt
         return current
+    except FileNotFoundError:
+        os.close(current)
+        raise
     except OSError:
         os.close(current)
         raise SecurityViolationError("cannot open recipe input safely") from None
@@ -245,7 +258,7 @@ def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def parse_recipe(data: bytes) -> list[RecipeEntry]:
+def parse_recipe(data: bytes) -> RecipeEntries:
     """Validate a recipe mapping strictly; any defect refuses the whole recipe."""
     if len(data) > MAX_RECIPE_BYTES:
         raise ResourceLimitError("recipe exceeds byte cap")
@@ -253,21 +266,48 @@ def parse_recipe(data: bytes) -> list[RecipeEntry]:
         doc = json.loads(data.decode("utf-8"), object_pairs_hook=_strict_pairs)
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise InvalidArtifactError("recipe is not valid UTF-8 JSON") from None
-    if not isinstance(doc, dict) or set(doc) != {"schema", "entries"}:
-        raise InvalidArtifactError("recipe must have exactly 'schema' and 'entries'")
+    if not isinstance(doc, dict) or set(doc) not in (
+        {"schema", "entries"},
+        {"schema", "entries", "unattributed"},
+    ):
+        raise InvalidArtifactError("recipe must have exactly 'schema' and 'entries' (and optional 'unattributed')")
     if doc["schema"] != RECIPE_SCHEMA:
         raise InvalidArtifactError("unsupported recipe schema")
     raw_entries = doc["entries"]
-    if not isinstance(raw_entries, list) or not raw_entries:
-        raise InvalidArtifactError("recipe entries must be a non-empty list")
+    raw_unattributed = doc.get("unattributed")
+    if not isinstance(raw_entries, list):
+        raise InvalidArtifactError("recipe entries must be a list")
     if len(raw_entries) > MAX_RECIPE_ENTRIES:
         raise ResourceLimitError("recipe entry cap exceeded")
+    unattributed_paths: list[str] = []
+    if raw_unattributed is not None:
+        if not isinstance(raw_unattributed, list):
+            raise InvalidArtifactError("recipe unattributed must be a list")
+        if len(raw_unattributed) > MAX_RECIPE_ENTRIES:
+            raise ResourceLimitError("recipe unattributed cap exceeded")
+        for idx, item in enumerate(raw_unattributed):
+            if not isinstance(item, str) or any(0xD800 <= ord(c) <= 0xDFFF for c in item):
+                raise InvalidArtifactError(f"unattributed entry {idx} must be a valid string")
+            try:
+                unattributed_paths.append(validate_member_path(item, is_dir=False))
+            except HermeticD7Error:
+                raise SecurityViolationError(f"unattributed entry {idx} is not a safe relative path") from None
+        if len(set(unattributed_paths)) != len(unattributed_paths):
+            raise InvalidArtifactError("duplicate unattributed artifact")
+    if not raw_entries and not unattributed_paths:
+        raise InvalidArtifactError("recipe entries must be a non-empty list")
     entries = [_entry(raw, i) for i, raw in enumerate(raw_entries)]
     for key in ("id", "artifact"):
         values = [getattr(e, key) for e in entries]
         if len(set(values)) != len(values):
             raise InvalidArtifactError(f"duplicate recipe {key}")
-    return entries
+    if raw_unattributed is not None:
+        entry_artifacts = {e.artifact for e in entries}
+        if entry_artifacts.intersection(unattributed_paths):
+            raise InvalidArtifactError("artifact cannot be both attributed and unattributed")
+    result = RecipeEntries(entries)
+    result.unattributed = tuple(unattributed_paths)
+    return result
 
 
 def _audit_entry(
@@ -306,7 +346,7 @@ def _audit_entry(
                     raise BuildFailedError("builder must produce exactly the named artifact")
                 if stat.S_ISLNK(os.lstat(os.path.join(out, name)).st_mode):
                     raise SecurityViolationError("builder output is a symlink")
-                report = compare_artifacts(shipped, Path(out) / name, limits)
+                report = compare_artifacts(shipped, Path(out) / name, limits, generated_files=[entry.artifact, name])
         finally:
             os.close(source_fd)
             os.close(artifact_fd)
@@ -348,16 +388,37 @@ def run_deep_audit(
         "mode": "deep_audit",
         "policy": AUDIT_POLICY_STATEMENT,
         "recipe": "",
+        "unattributed": [],
     }
     try:
-        recipe = validate_member_path(recipe_rel, is_dir=False)
-        report["recipe"] = recipe
+        recipe_str = str(recipe_rel)
+        report["recipe"] = recipe_str
         try:
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
             raise SecurityViolationError("shipped root is not a directory (links refused)") from None
         try:
-            entries = parse_recipe(_read_no_follow(root_fd, recipe, MAX_RECIPE_BYTES))
+            recipe_path = Path(recipe_rel)
+            if recipe_path.is_file() and (recipe_path.is_absolute() or "/" in recipe_str):
+                try:
+                    rec_fd = hermetic_safe_io.open_regular(recipe_path, MAX_RECIPE_BYTES)
+                except (hermetic_safe_io.UnsafePathError, ValueError) as exc:
+                    raise SecurityViolationError(f"recipe {recipe_str!r} is unsafe") from exc
+                try:
+                    recipe_bytes = os.read(rec_fd, MAX_RECIPE_BYTES + 1)
+                finally:
+                    os.close(rec_fd)
+            else:
+                recipe = validate_member_path(recipe_str, is_dir=False)
+                recipe_bytes = _read_no_follow(root_fd, recipe, MAX_RECIPE_BYTES)
+            entries = parse_recipe(recipe_bytes)
+            report["unattributed"] = list(getattr(entries, "unattributed", ()))
+            for unattr in getattr(entries, "unattributed", ()):
+                try:
+                    fd = _open_no_follow(root_fd, unattr, directory=False)
+                    os.close(fd)
+                except FileNotFoundError:
+                    raise SecurityViolationError(f"unattributed artifact {unattr!r} does not exist") from None
             report["entries"] = [
                 _audit_entry(root_fd, e, active_builder, active_limits) for e in entries
             ]
@@ -368,9 +429,14 @@ def run_deep_audit(
         report["verdict"] = "error"
         return report
     verdicts = {e["verdict"] for e in report["entries"]}
-    report["verdict"] = (
-        "error" if "error" in verdicts else "differs" if "differs" in verdicts else "identical"
-    )
+    if "error" in verdicts:
+        report["verdict"] = "error"
+    elif "differs" in verdicts:
+        report["verdict"] = "differs"
+    elif report["unattributed"]:
+        report["verdict"] = "incomplete"
+    else:
+        report["verdict"] = "identical"
     return report
 
 

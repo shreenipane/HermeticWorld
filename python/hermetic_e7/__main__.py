@@ -9,7 +9,7 @@ import sys
 from typing import Sequence
 
 from hermetic_e7.compare import compare_worlds, format_report
-from hermetic_e7.tree import HermeticError, build_manifest
+from hermetic_e7.tree import HermeticError, build_manifest, seal_world
 
 MAX_CLI_ARGS: int = 32
 
@@ -27,6 +27,8 @@ def _build_parser() -> _SafeArgumentParser:
 
     manifest_parser = subparsers.add_parser("manifest", help="Seal a directory into a manifest JSON")
     manifest_parser.add_argument("dir", help="World directory to hash")
+    manifest_parser.add_argument("--output", "-o", help="Optional output directory to write manifest.json and d7-recipe.json")
+    manifest_parser.add_argument("--build-record", help="Optional path to build record")
 
     compare_parser = subparsers.add_parser("compare", help="Compare two world directories")
     compare_parser.add_argument("dir_a", help="First world directory")
@@ -53,7 +55,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "manifest":
-            manifest = build_manifest(args.dir)
+            if getattr(args, "output", None):
+                manifest = seal_world(args.dir, args.output, build_record=getattr(args, "build_record", None))
+            else:
+                manifest = build_manifest(args.dir)
             print(json.dumps(manifest, sort_keys=True, indent=2))
             return 0
         if args.command == "compare":

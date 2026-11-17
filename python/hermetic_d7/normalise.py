@@ -43,6 +43,8 @@ MAX_DIFF_INPUT_LINES: int = 50_000
 MAX_TAR_EXTENDED_HEADER_BYTES: int = 1024 * 1024
 MAX_ARTIFACT_BYTES: int = 256 * 1024 * 1024
 
+COMPILED_EXTENSION_SUFFIXES: tuple[str, ...] = (".so", ".dylib", ".pyd")
+
 
 class HermeticD7Error(Exception):
     """Base typed error for all Detector D7 failures."""
@@ -640,11 +642,42 @@ def _archive_stream(path: Path) -> io.BytesIO:
         raise SecurityViolationError(f"Unsafe archive input: {type(exc).__name__}") from exc
 
 
+def _read_regular_file(
+    file_path: Path,
+    limits: ResourceLimits,
+) -> dict[str, NormalisedMember]:
+    """Load a single regular file artifact (such as a compiled extension module or generated file)."""
+    norm_name = validate_member_path(file_path.name, is_dir=False, max_depth=limits.max_nesting_depth)
+    try:
+        fd = hermetic_safe_io.open_regular(file_path, limits.max_member_bytes)
+    except (OSError, ValueError) as exc:
+        raise SecurityViolationError(
+            f"Failed to open {norm_name!r} safely: {type(exc).__name__}"
+        ) from exc
+    with os.fdopen(fd, "rb") as fobj:
+        opened = os.fstat(fobj.fileno())
+        if opened.st_nlink > 1:
+            raise SecurityViolationError("Hardlinked file refused")
+        raw_bytes, _ = _read_bounded_stream(
+            fobj, norm_name, limits, 0
+        )
+    return {
+        norm_name: _build_member(
+            norm_name,
+            raw_bytes,
+            normalise_executable(opened.st_mode),
+            limits,
+        )
+    }
+
+
 def load_artifact(
     artifact_path: str | Path,
     limits: ResourceLimits | None = None,
+    *,
+    generated_files: Sequence[str | Path] | set[str] | None = None,
 ) -> dict[str, NormalisedMember]:
-    """Load and normalise an artifact (directory tree, .whl/.zip, or .tar/.tar.gz)."""
+    """Load and normalise an artifact (directory tree, .whl/.zip, .tar/.tar.gz, compiled extension, or generated file)."""
     active_limits = limits or ResourceLimits()
     path = Path(artifact_path)
 
@@ -674,8 +707,18 @@ def load_artifact(
     if lower_name.endswith(".tar"):
         return _read_tar(path, "r:", active_limits)
 
+    is_compiled = any(lower_name.endswith(sfx) for sfx in COMPILED_EXTENSION_SUFFIXES)
+    is_generated = False
+    if generated_files is not None:
+        raw_str = str(artifact_path)
+        gen_strs = {str(g) for g in generated_files} | {Path(g).name for g in generated_files}
+        is_generated = raw_str in gen_strs or path.name in gen_strs or str(path) in gen_strs
+
+    if is_compiled or is_generated:
+        return _read_regular_file(path, active_limits)
+
     raise InvalidArtifactError(
-        f"Unsupported artifact format for {path.name!r}; expected directory, .whl, .zip, .tar, or .tar.gz"
+        f"Unsupported artifact format for {path.name!r}; expected directory, .whl, .zip, .tar, .tar.gz, compiled extension, or listed generated file"
     )
 
 

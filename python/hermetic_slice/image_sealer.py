@@ -5,13 +5,18 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 
 from hermetic_slice.cutoffs import ensure_utc
 from hermetic_slice.dockerutil import run_docker
 from hermetic_slice.gitutil import run_git
 from hermetic_slice.repo_sealer import SealReport, rmtree_force, seal_repo
+
+
+RECIPE_PROBLEM_MESSAGE: str = "d7-recipe generation failed"
 
 
 class ImageSealError(Exception):
@@ -644,7 +649,13 @@ def verification_problems(after: dict, before: dict | None = None) -> list[str]:
     return problems
 
 
-def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dict:
+def seal_image(
+    task_dir: Path,
+    work_dir: Path,
+    *,
+    tag: str | None = None,
+    build_record: str | Path | dict | None = None,
+) -> dict:
     """Measure, seal, and verify a SWE-bench task image."""
     task_json_path = task_dir / "task.json"
     if not task_json_path.exists():
@@ -669,6 +680,7 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
         rmtree_force(context_dir)
     # A report left by an earlier run must not be read as this run's result.
     (task_dir / "seal" / "report.json").unlink(missing_ok=True)
+    (task_dir / "seal" / "d7-recipe.json").unlink(missing_ok=True)
 
     orig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -700,7 +712,67 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
     after = measure(sealed_tag, task, lines)
     problems = verification_problems(after, before)
 
-    # Step 7: Write report.json (always written before potential raise)
+    # Step 7: Emit d7-recipe.json (outside the sealed tree)
+    seal_out_dir = task_dir / "seal"
+    seal_out_dir.mkdir(parents=True, exist_ok=True)
+
+    recipe_tree = sealed_dir if sealed_dir.is_dir() else (orig_dir if orig_dir.is_dir() else None)
+    if recipe_tree is not None:
+        try:
+            from hermetic_d7.normalise import HermeticD7Error
+            from hermetic_d7.recipe import (
+                RecipeError,
+                RecipeFormatError,
+                RecipeSecurityError,
+                emit_recipe,
+                scan_built_artifacts,
+            )
+
+            recipe_record = build_record
+            if recipe_record is None:
+                cand = task_dir / "build-record.json"
+                try:
+                    st = os.lstat(cand)
+                    if stat.S_ISLNK(st.st_mode):
+                        raise RecipeSecurityError(f"build manifest {cand!r} is a symlink")
+                    if not stat.S_ISREG(st.st_mode):
+                        raise RecipeSecurityError(f"build manifest {cand!r} is not a regular file")
+                    recipe_record = cand
+                except FileNotFoundError:
+                    recipe_record = None
+            elif isinstance(recipe_record, (str, Path)):
+                cand = Path(recipe_record)
+                try:
+                    st = os.lstat(cand)
+                    if stat.S_ISLNK(st.st_mode):
+                        raise RecipeSecurityError(f"build manifest {cand!r} is a symlink")
+                    if not stat.S_ISREG(st.st_mode):
+                        raise RecipeSecurityError(f"build manifest {cand!r} is not a regular file")
+                except FileNotFoundError as exc:
+                    raise RecipeFormatError(f"build manifest {cand!r} not found") from exc
+
+            has_work = True
+            if recipe_record is None:
+                root_fd = os.open(recipe_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    scanned = scan_built_artifacts(root_fd)
+                finally:
+                    os.close(root_fd)
+                if not scanned:
+                    has_work = False
+
+            if has_work:
+                emit_recipe(
+                    recipe_tree,
+                    output_path=seal_out_dir / "d7-recipe.json",
+                    build_manifest=recipe_record,
+                )
+        except (RecipeError, HermeticD7Error, Exception):
+            problems.append(RECIPE_PROBLEM_MESSAGE)
+    else:
+        problems.append(RECIPE_PROBLEM_MESSAGE)
+
+    # Step 8: Write report.json (always written before potential raise)
     try:
         inspect_out = run_docker(["image", "inspect", sealed_tag])
         inspect_data = json.loads(inspect_out.decode("utf-8"))
@@ -737,8 +809,6 @@ def seal_image(task_dir: Path, work_dir: Path, *, tag: str | None = None) -> dic
         "status": status,
     }
 
-    seal_out_dir = task_dir / "seal"
-    seal_out_dir.mkdir(parents=True, exist_ok=True)
     (seal_out_dir / "report.json").write_text(
         json.dumps(report_data, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

@@ -16,6 +16,7 @@ from hermetic_slice.__main__ import main
 from hermetic_slice.dockerutil import is_docker_available, run_docker
 from hermetic_slice.gitutil import run_git
 from hermetic_slice.image_sealer import (
+    RECIPE_PROBLEM_MESSAGE,
     RESTORE_MODES_SH,
     ImageSealError,
     gold_lines,
@@ -1094,4 +1095,153 @@ def test_regression_defect7_ls_tree_lowered_caps_bounded_failure_and_child_clean
     )
     assert proc_entries.returncode != 0
     assert "entry count cap exceeded" in proc_entries.stderr
+
+
+def _setup_mock_seal_image(tmp_path: Path, monkeypatch):
+    """Set up mock environment for offline seal_image tests."""
+    from hermetic_slice.repo_sealer import SealReport
+
+    instance_id = "test-recipe-task-1"
+    task_dir = tmp_path / "tasks" / instance_id
+    task_dir.mkdir(parents=True)
+    task_json = {
+        "base_commit": "abc1234567890",
+        "cutoffs": {"t_clock": "2024-01-01T00:00:00Z"},
+        "image": "fake-image:latest",
+        "instance_id": instance_id,
+    }
+    (task_dir / "task.json").write_text(json.dumps(task_json), encoding="utf-8")
+    work_dir = tmp_path / "work" / instance_id
+    work_dir.mkdir(parents=True)
+
+    def fake_run_docker(args, **kwargs):
+        if args[:2] == ["create", "fake-image:latest"]:
+            return b"container-id-123\n"
+        if args[:2] == ["image", "inspect"]:
+            return b'[{"Id": "sha256:fakeimageid123"}]'
+        return b""
+
+    def fake_seal_repo(src, base_commit, dest, t_clock):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / ".git").mkdir(parents=True, exist_ok=True)
+        return SealReport("abc1234567890", 0, {}, {})
+
+    monkeypatch.setattr("hermetic_slice.image_sealer.run_docker", fake_run_docker)
+    monkeypatch.setattr("hermetic_slice.image_sealer.seal_repo", fake_seal_repo)
+    monkeypatch.setattr("hermetic_slice.image_sealer.gold_lines", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "hermetic_slice.image_sealer.measure",
+        lambda *a, **kw: {
+            "head_is_base": True,
+            "extra_commits": [],
+            "gold_lines_found_in_unreachable": 0,
+            "tracked_content_modified_vs_base": [],
+        },
+    )
+    monkeypatch.setattr("hermetic_slice.image_sealer.verification_problems", lambda *a, **kw: [])
+
+    return task_dir, work_dir
+
+
+def test_regression_symlinked_build_record_fails_seal_with_fixed_message(tmp_path: Path, monkeypatch) -> None:
+    """A symlinked build record makes seal_image fail closed with the fixed problem message."""
+    task_dir, work_dir = _setup_mock_seal_image(tmp_path, monkeypatch)
+    outside = tmp_path / "outside-record.json"
+    outside.write_text('{"entries": []}', encoding="utf-8")
+    (task_dir / "build-record.json").symlink_to(outside)
+
+    with pytest.raises(ImageSealError) as exc_info:
+        seal_image(task_dir, work_dir)
+    assert RECIPE_PROBLEM_MESSAGE in str(exc_info.value)
+
+    report_file = task_dir / "seal" / "report.json"
+    assert report_file.exists()
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert RECIPE_PROBLEM_MESSAGE in report["problems"]
+    assert not (task_dir / "seal" / "d7-recipe.json").exists()
+
+
+def test_regression_broken_symlinked_build_record_fails_seal_with_fixed_message(tmp_path: Path, monkeypatch) -> None:
+    """A broken symlinked build record makes seal_image fail closed with the fixed problem message."""
+    task_dir, work_dir = _setup_mock_seal_image(tmp_path, monkeypatch)
+    (task_dir / "build-record.json").symlink_to(tmp_path / "nonexistent-target.json")
+
+    with pytest.raises(ImageSealError) as exc_info:
+        seal_image(task_dir, work_dir)
+    assert RECIPE_PROBLEM_MESSAGE in str(exc_info.value)
+
+    report_file = task_dir / "seal" / "report.json"
+    assert report_file.exists()
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert RECIPE_PROBLEM_MESSAGE in report["problems"]
+    assert not (task_dir / "seal" / "d7-recipe.json").exists()
+
+
+def test_regression_recipe_error_fails_seal_with_fixed_message(tmp_path: Path, monkeypatch) -> None:
+    """A recipe error (malformed JSON or invalid recipe) makes seal_image fail closed with the fixed message."""
+    task_dir, work_dir = _setup_mock_seal_image(tmp_path, monkeypatch)
+    (task_dir / "build-record.json").write_text("{this is not valid json", encoding="utf-8")
+
+    with pytest.raises(ImageSealError) as exc_info:
+        seal_image(task_dir, work_dir)
+    assert RECIPE_PROBLEM_MESSAGE in str(exc_info.value)
+
+    report_file = task_dir / "seal" / "report.json"
+    assert report_file.exists()
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert RECIPE_PROBLEM_MESSAGE in report["problems"]
+    assert not (task_dir / "seal" / "d7-recipe.json").exists()
+
+
+def test_regression_valid_seal_writes_d7_recipe_outside_tree(tmp_path: Path, monkeypatch) -> None:
+    """A valid seal writes d7-recipe.json outside the sealed tree."""
+    from hermetic_slice.repo_sealer import SealReport
+
+    task_dir, work_dir = _setup_mock_seal_image(tmp_path, monkeypatch)
+
+    def fake_seal_repo(src, base_commit, dest, t_clock):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / ".git").mkdir(parents=True, exist_ok=True)
+        src_dir = dest / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "hello.c").write_text("int main() { return 0; }\n", encoding="utf-8")
+        out_dir = dest / "lib"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "hello.so").write_bytes(b"\x7fELFfake")
+        return SealReport("abc1234567890", 0, {}, {})
+
+    monkeypatch.setattr("hermetic_slice.image_sealer.seal_repo", fake_seal_repo)
+
+    valid_record = {
+        "entries": [
+            {
+                "id": "hello-so",
+                "artifact": "lib/hello.so",
+                "source": "src",
+                "builder": "gcc",
+                "args": ["-shared"],
+            }
+        ]
+    }
+    (task_dir / "build-record.json").write_text(json.dumps(valid_record, indent=2), encoding="utf-8")
+
+    report = seal_image(task_dir, work_dir)
+    assert report["status"] == "sealed"
+    assert report["problems"] == []
+
+    # d7-recipe.json is written outside the sealed tree in task_dir/seal
+    recipe_path = task_dir / "seal" / "d7-recipe.json"
+    assert recipe_path.is_file()
+    assert not recipe_path.is_symlink()
+    recipe_doc = json.loads(recipe_path.read_text(encoding="utf-8"))
+    assert recipe_doc["schema"] == "hermetic.d7.recipe/1"
+    assert recipe_doc["entries"][0]["id"] == "hello-so"
+    assert recipe_doc["entries"][0]["artifact"] == "lib/hello.so"
+
+    # d7-recipe.json is NOT in the sealed tree or orig tree
+    assert not (work_dir / "sealed" / "d7-recipe.json").exists()
+    assert not (work_dir / "orig" / "d7-recipe.json").exists()
 

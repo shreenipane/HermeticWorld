@@ -247,3 +247,53 @@ def build_manifest(root_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def seal_world(
+    world_root: str | Path,
+    output_dir: str | Path,
+    *,
+    build_record: str | Path | dict[str, Any] | Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Seal a world tree: write manifest.json and d7-recipe.json next to each other in output_dir.
+
+    Both output files are written outside the world tree so the agent never sees them.
+    Returns the computed manifest dictionary.
+    """
+    manifest = build_manifest(world_root)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = canonical_manifest_bytes(manifest)
+    hermetic_safe_io.atomic_write(out / "manifest.json", manifest_bytes)
+
+    from hermetic_d7.recipe import RecipeFormatError, RecipeSecurityError, emit_recipe
+
+    recipe_record = build_record
+    if recipe_record is None:
+        cand = out / "build-record.json"
+        try:
+            st = os.lstat(cand)
+            if stat.S_ISLNK(st.st_mode):
+                raise RecipeSecurityError(f"build manifest {cand!r} is a symlink")
+            if not stat.S_ISREG(st.st_mode):
+                raise RecipeSecurityError(f"build manifest {cand!r} is not a regular file")
+            recipe_record = cand
+        except FileNotFoundError:
+            recipe_record = None
+    elif isinstance(recipe_record, (str, Path)):
+        cand = Path(recipe_record)
+        try:
+            st = os.lstat(cand)
+            if stat.S_ISLNK(st.st_mode):
+                raise RecipeSecurityError(f"build manifest {cand!r} is a symlink")
+            if not stat.S_ISREG(st.st_mode):
+                raise RecipeSecurityError(f"build manifest {cand!r} is not a regular file")
+        except FileNotFoundError as exc:
+            raise RecipeFormatError(f"build manifest {cand!r} not found") from exc
+
+    emit_recipe(
+        world_root,
+        output_path=out / "d7-recipe.json",
+        build_manifest=recipe_record,
+    )
+    return manifest
+
+

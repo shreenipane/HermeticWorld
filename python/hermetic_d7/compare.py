@@ -192,6 +192,8 @@ def compare_artifacts(
     shipped_path: str | Path,
     rebuilt_path: str | Path,
     limits: ResourceLimits | None = None,
+    *,
+    generated_files: Sequence[str | Path] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Compare a shipped artifact (A) against a rebuilt artifact (B).
 
@@ -201,8 +203,8 @@ def compare_artifacts(
     active_limits = limits or ResourceLimits()
 
     try:
-        members_shipped = load_artifact(shipped_path, limits=active_limits)
-        members_rebuilt = load_artifact(rebuilt_path, limits=active_limits)
+        members_shipped = load_artifact(shipped_path, limits=active_limits, generated_files=generated_files)
+        members_rebuilt = load_artifact(rebuilt_path, limits=active_limits, generated_files=generated_files)
 
         keys_shipped = set(members_shipped.keys())
         keys_rebuilt = set(members_rebuilt.keys())

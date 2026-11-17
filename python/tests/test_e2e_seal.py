@@ -416,3 +416,74 @@ def test_orchestration_is_ordered_and_stops_without_false_world(tmp_path, monkey
         assert "D5b_inventory_and_release_metadata" in events[-1]["missing"]
         assert events[-1]["detectors"]["D11"] == "post_run_only"
     assert "private reason" not in json.dumps(events)
+
+
+def test_cr_finding2_recipe_generation_failure_labels_own_step(tmp_path, monkeypatch, capsys):
+    """CR finding 2: D7 recipe generation failures are emitted under step 'd7_recipe' with typed SealError."""
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                (task / "task.json").write_text('{"cutoffs":{"t_clock":"2014-01-01T00:00:00Z"}}')
+            elif action == "rootfs":
+                src_tree = work / "source-tree"
+                src_tree.mkdir(parents=True, exist_ok=True)
+                outside = tmp_path / "outside.txt"
+                outside.write_bytes(b"outside")
+                (src_tree / "bad.so").symlink_to(outside)
+        return b""
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([INSTANCE, str(work), "--sealcheck", str(tool)]) == 1
+    finally:
+        os.umask(original_umask)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["step"] == "d7_recipe"
+    assert events[-1]["verdict"] == "fail"
+    assert events[-1]["reason"] == "d7_recipe_RecipeSecurityError"
+
+
+def test_e2e_seal_symlinked_build_record_fails_d7_recipe(tmp_path, monkeypatch, capsys):
+    """A symlinked build-record.json fails e2e seal closed under step 'd7_recipe' with RecipeSecurityError."""
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                (task / "task.json").write_text('{"cutoffs":{"t_clock":"2014-01-01T00:00:00Z"}}')
+            elif action == "rootfs":
+                src_tree = work / "source-tree"
+                src_tree.mkdir(parents=True, exist_ok=True)
+                # Create symlinked build-record.json in work dir
+                outside = tmp_path / "outside-record.json"
+                outside.write_bytes(b'{"entries": []}')
+                (work / "build-record.json").symlink_to(outside)
+        return b""
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([INSTANCE, str(work), "--sealcheck", str(tool)]) == 1
+    finally:
+        os.umask(original_umask)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["step"] == "d7_recipe"
+    assert events[-1]["verdict"] == "fail"
+    assert events[-1]["reason"] == "d7_recipe_RecipeSecurityError"

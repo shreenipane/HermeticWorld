@@ -20,6 +20,7 @@ from hermetic_e7.tree import (
     WorldPathError,
     build_manifest,
     canonical_manifest_bytes,
+    seal_world,
 )
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "classify_file",
     "compare_worlds",
     "format_report",
+    "seal_world",
 ]
 
 
