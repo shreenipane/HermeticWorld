@@ -308,7 +308,6 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         None
     };
     runtime::world_addresses(&table).map_err(str::to_owned)?;
-    let filter = WorldFilter::new(&table);
     let upstream = if pid1 {
         VsockUpstream::guest()
     } else {
@@ -326,24 +325,36 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
     };
     let dns_addr: SocketAddr = dns_addr.parse().map_err(|_| "invalid_arguments")?;
     let http_addr: SocketAddr = http_addr.parse().map_err(|_| "invalid_arguments")?;
-    if pid1 {
+    let path = if pid1 {
         let epoch = format!("@{}", config.t_clock);
         run_command("/sbin/hermetic-busybox", &["date", "-u", "-s", &epoch])?;
-        hermetic_netvm_core::firewall::install().map_err(|_| "boot_failed")?;
-        runtime::configure(&table, |command| {
+        let active_path = hermetic_netvm_core::firewall::install(config.redirect_fallback)
+            .map_err(|_| "boot_failed")?;
+        runtime::configure(&table, active_path, |command| {
             let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
             run_command(command.program, &args).map_err(|_| "boot_failed")
         })
         .map_err(str::to_owned)?;
-    }
+        let _ = runtime::write_boot_log(std::io::stderr(), active_path);
+        active_path
+    } else {
+        hermetic_netvm_core::firewall::InterceptionPath::Redirect
+    };
     let https = if pid1 {
-        Some(TcpListener::bind("0.0.0.0:443").map_err(|_| "bind_failed")?)
+        let listener = TcpListener::bind("0.0.0.0:443").map_err(|_| "bind_failed")?;
+        if path == hermetic_netvm_core::firewall::InterceptionPath::Tproxy {
+            hermetic_netvm_core::sys::set_transparent(&listener).map_err(|_| "bind_failed")?;
+        }
+        Some(listener)
     } else {
         None
     };
     let dns = UdpSocket::bind(dns_addr).map_err(|_| "bind_failed")?;
     let http = TcpListener::bind(http_addr).map_err(|_| "bind_failed")?;
-    let filter = Arc::new(filter);
+    if pid1 && path == hermetic_netvm_core::firewall::InterceptionPath::Tproxy {
+        hermetic_netvm_core::sys::set_transparent(&http).map_err(|_| "bind_failed")?;
+    }
+    let filter = Arc::new(WorldFilter::with_path(&table, path));
     let upstream = Arc::new(upstream);
     let server = RunningNetvm::start(
         dns,
@@ -390,7 +401,7 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         None
     };
     if pid1 {
-        runtime::write_ready_status(std::io::stderr()).map_err(|_| "status_failed")?;
+        runtime::write_ready_status(std::io::stderr(), path).map_err(|_| "status_failed")?;
     }
     let shutdown = server.shutdown_flag();
     while !shutdown.load(Ordering::Acquire) {

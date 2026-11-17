@@ -103,10 +103,10 @@ fn fetches_from_world_server_over_wire_frames() {
 fn http_through_filter_reaches_world_and_post_is_405() {
     let temp = tempfile::tempdir().unwrap();
     let socket = world(temp.path());
-    let table = DnsTable::from_json_str(
-        r#"{"records":[{"name":"files.example","a":["10.9.0.1"],"aaaa":[]}]}"#,
-    )
-    .unwrap();
+    let table = DnsTable::test_fixture([(
+        "files.example",
+        vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()],
+    )]);
     let server = RunningNetvm::start(
         UdpSocket::bind("127.0.0.1:0").unwrap(),
         TcpListener::bind("127.0.0.1:0").unwrap(),
@@ -291,4 +291,85 @@ fn requests_share_one_connection_with_increasing_ids() {
     }
     drop(up);
     assert_eq!(server.join().unwrap(), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn non_pid1_serve_preserves_direct_http_for_allowed_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = world(temp.path());
+
+    let config_path = temp.path().join("netvm.json");
+    std::fs::write(&config_path, b"{\"t_clock\":1700000000}").unwrap();
+
+    let dns_path = temp.path().join("dns.json");
+    std::fs::write(
+        &dns_path,
+        b"{\"records\":[{\"name\":\"files.example\",\"a\":[\"10.9.0.1\"],\"aaaa\":[]}]}",
+    )
+    .unwrap();
+
+    let dns_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dns_addr = dns_socket.local_addr().unwrap();
+    drop(dns_socket);
+
+    let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_hermetic-netvm"))
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--dns-table",
+            dns_path.to_str().unwrap(),
+            "--world-socket",
+            socket.to_str().unwrap(),
+            "--dns",
+            &dns_addr.to_string(),
+            "--http",
+            &http_addr.to_string(),
+        ])
+        .spawn()
+        .unwrap();
+    let _guard = ChildGuard(child);
+
+    let start = Instant::now();
+    let mut stream = loop {
+        match TcpStream::connect(http_addr) {
+            Ok(s) => break s,
+            Err(_) if start.elapsed() < Duration::from_secs(3) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("failed to connect to netvm serve http port: {e}"),
+        }
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .write_all(b"GET /hello.txt HTTP/1.1\r\nHost: files.example\r\nConnection: close\r\n\r\n")
+        .unwrap();
+
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "expected 200 response, got: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(response.ends_with(BODY));
 }

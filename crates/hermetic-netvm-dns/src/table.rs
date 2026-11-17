@@ -264,6 +264,21 @@ impl DnsTable {
         Ok(Self { records })
     }
 
+    /// Test-only fixture constructor allowing arbitrary addresses (such as 127.0.0.1)
+    /// to declare test listener addresses without production world-range restrictions.
+    pub fn test_fixture<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, Vec<Ipv4Addr>)>,
+        S: Into<String>,
+    {
+        let mut records = BTreeMap::new();
+        for (name, mut ips) in entries {
+            ips.sort();
+            records.insert(name.into(), ips);
+        }
+        Self { records }
+    }
+
     /// Loads and validates a [`DnsTable`] from a JSON string.
     pub fn from_json_str(json: &str) -> Result<Self, TableError> {
         Self::from_json_bytes(json.as_bytes())

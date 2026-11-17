@@ -1,22 +1,84 @@
 #![forbid(unsafe_code)]
-//! Fixed x86-64 Linux legacy IPv4 filter and NAT tables. No packet bytes enter this encoder.
-//! UAPI: linux/netfilter_ipv4/ip_tables.h and linux/netfilter/xt_tcpudp.h.
+//! Fixed x86-64 Linux legacy IPv4 filter, mangle (TPROXY) and NAT tables. No packet bytes enter this encoder.
+//! UAPI: linux/netfilter_ipv4/ip_tables.h, linux/netfilter/xt_tcpudp.h and linux/netfilter/xt_TPROXY.h.
 use std::io;
 
 pub(crate) const MAX_OLD_RULES: usize = 16;
 pub(crate) const REPLACE_HEADER_BYTES: usize = 96;
+pub const FWMARK: u32 = 1;
+pub const FWMARK_MASK: u32 = !0;
 const ENTRY_BYTES: u16 = 112;
 const TARGET_BYTES: u16 = 40;
 const MATCH_BYTES: u16 = 48;
 const DROP: i32 = -1;
 const ACCEPT: i32 = -2;
 const REDIRECT_TARGET_BYTES: u16 = 56;
+pub const TPROXY_TARGET_BYTES: u16 = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptionPath {
+    Tproxy,
+    Redirect,
+}
+
+impl InterceptionPath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tproxy => "tproxy",
+            Self::Redirect => "redirect",
+        }
+    }
+}
 
 pub(crate) struct Table {
     pub entries: Vec<u8>,
     pub hooks: [u32; 5],
     pub underflows: [u32; 5],
     pub count: u32,
+}
+
+/// Mangle table for TPROXY: redirect ingress TCP on ports 80 and 443 on eth0
+/// to local listeners while preserving the original packet destination and
+/// assigning the fixed fwmark.
+pub(crate) fn mangle_table() -> Table {
+    let mut t = Table {
+        entries: Vec::new(),
+        hooks: [0; 5],
+        underflows: [0; 5],
+        count: 0,
+    };
+    // The legacy mangle table has PREROUTING, INPUT, FORWARD, OUTPUT and POSTROUTING hooks.
+    for hook in [0, 1, 2, 3, 4] {
+        t.hooks[hook] = t.entries.len() as u32;
+        if hook == 0 {
+            for port in [80, 443] {
+                let mut e = entry(6, Some((false, port)), ACCEPT);
+                let target = ENTRY_BYTES + MATCH_BYTES;
+                e.truncate(usize::from(target));
+                e.resize(usize::from(target + TPROXY_TARGET_BYTES), 0);
+                e[16..21].copy_from_slice(b"eth0\0");
+                e[48..53].fill(255);
+                e[90..92].copy_from_slice(&(target + TPROXY_TARGET_BYTES).to_ne_bytes());
+                let start = usize::from(target);
+                e[start..start + 2].copy_from_slice(&TPROXY_TARGET_BYTES.to_ne_bytes());
+                e[start + 2..start + 9].copy_from_slice(b"TPROXY\0");
+                // Revision 0: struct xt_tproxy_target_info
+                e[start + 31] = 0;
+                e[start + 32..start + 36].copy_from_slice(&FWMARK_MASK.to_ne_bytes());
+                e[start + 36..start + 40].copy_from_slice(&FWMARK.to_ne_bytes());
+                // laddr is 0 (keep packet destination)
+                e[start + 44..start + 46].copy_from_slice(&port.to_be_bytes());
+                t.entries.extend(e);
+                t.count += 1;
+            }
+        }
+        t.underflows[hook] = t.entries.len() as u32;
+        t.entries.extend(entry(0, None, ACCEPT));
+        t.count += 1;
+    }
+    t.entries.extend(error_entry());
+    t.count += 1;
+    t
 }
 
 /// REDIRECT is the interception fallback: ingress TCP keeps its destination
@@ -122,14 +184,24 @@ fn error_entry() -> Vec<u8> {
 }
 
 /// Must be called before eth0 is brought up. Failure leaves the VM offline.
-pub fn install() -> io::Result<()> {
-    install_with(crate::sys::install_table)
+pub fn install(allow_fallback: bool) -> io::Result<InterceptionPath> {
+    install_with(allow_fallback, crate::sys::install_table)
 }
 
-fn install_with(mut replace: impl FnMut(&[u8], u32, &Table) -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn install_with(
+    allow_fallback: bool,
+    mut replace: impl FnMut(&[u8], u32, &Table) -> io::Result<()>,
+) -> io::Result<InterceptionPath> {
     // Denial policy first, then interception, always before eth0 comes up.
     replace(b"filter", 14, &table(true))?;
-    replace(b"nat", 27, &nat_table())
+    match replace(b"mangle", 31, &mangle_table()) {
+        Ok(()) => Ok(InterceptionPath::Tproxy),
+        Err(_) if allow_fallback => {
+            replace(b"nat", 27, &nat_table())?;
+            Ok(InterceptionPath::Redirect)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -138,8 +210,69 @@ mod tests {
     fn u16_at(b: &[u8], at: usize) -> u16 {
         u16::from_ne_bytes(b[at..at + 2].try_into().unwrap())
     }
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
+    }
     fn i32_at(b: &[u8], at: usize) -> i32 {
         i32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn mangle_tproxy_intercepts_any_destination_only_tcp_service_ports_with_fwmark() {
+        let t = mangle_table();
+        assert_eq!(t.hooks, [0, 568, 720, 872, 1024]);
+        assert_eq!(t.underflows, [416, 568, 720, 872, 1024]);
+        assert_eq!((t.count, t.entries.len()), (8, 1352));
+
+        let tproxied = |hook: usize, iface: &[u8], proto: u16, port: u16| {
+            let mut offset = t.hooks[hook] as usize;
+            loop {
+                let e = &t.entries[offset..];
+                let target = u16_at(e, 88) as usize;
+                assert_eq!(&e[..16], &[0; 16], "address-dependent rule");
+                if u16_at(e, 80) == 0 {
+                    assert_eq!(i32_at(e, target + 32), ACCEPT);
+                    return false;
+                }
+                assert_eq!(u16_at(e, 112), 48);
+                assert_eq!(&e[114..118], b"tcp\0");
+                assert_eq!(
+                    &e[48..64],
+                    &[255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                );
+                if iface == &e[16..21]
+                    && proto == u16_at(e, 80)
+                    && (u16_at(e, 148)..=u16_at(e, 150)).contains(&port)
+                {
+                    assert_eq!(u16_at(e, target), TPROXY_TARGET_BYTES);
+                    assert_eq!(&e[target + 2..target + 9], b"TPROXY\0");
+                    assert_eq!(e[target + 31], 0, "target revision");
+                    assert_eq!(u32_at(e, target + 32), FWMARK_MASK, "mark mask");
+                    assert_eq!(u32_at(e, target + 36), FWMARK, "mark value");
+                    assert_eq!(u32_at(e, target + 40), 0, "keep destination address");
+                    let expected_be_port = port.to_be();
+                    assert_eq!(u16_at(e, target + 44), expected_be_port, "redirect port");
+                    return true;
+                }
+                offset += u16_at(e, 90) as usize;
+            }
+        };
+
+        for hook in 0..5 {
+            for iface in [&b"eth0\0"[..], &b"eth1\0"[..], &b"lo\0\0\0"[..]] {
+                for proto in [1, 6, 17, 41, 47, 50, 58, 132] {
+                    for port in [0, 22, 53, 80, 123, 443, 853, 5001, 65535] {
+                        assert_eq!(
+                            tproxied(hook, iface, proto, port),
+                            hook == 0
+                                && iface == b"eth0\0"
+                                && proto == 6
+                                && [80, 443].contains(&port)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -235,28 +368,84 @@ mod tests {
 
     #[test]
     fn interception_installation_is_ordered_and_fails_closed() {
-        for failure in [None, Some(0), Some(1)] {
-            let mut seen = Vec::new();
-            let result = install_with(|name, hooks, rules| {
-                let index = seen.len();
-                seen.push((name.to_vec(), hooks, rules.count));
-                if failure == Some(index) {
-                    Err(io::ErrorKind::PermissionDenied.into())
-                } else {
-                    Ok(())
-                }
-            });
-            assert_eq!(result.is_err(), failure.is_some());
-            assert_eq!(seen[0], (b"filter".to_vec(), 14, 10));
-            if failure == Some(0) {
-                assert_eq!(seen.len(), 1);
+        // 1. TPROXY success: filter (14) then mangle (31), returning Tproxy path.
+        let mut seen = Vec::new();
+        let path = install_with(false, |name, hooks, rules| {
+            seen.push((name.to_vec(), hooks, rules.count));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(path, InterceptionPath::Tproxy);
+        assert_eq!(
+            seen,
+            [(b"filter".to_vec(), 14, 10), (b"mangle".to_vec(), 31, 8)]
+        );
+
+        // 2. Filter failure: fails immediately, stops before mangle or nat.
+        let mut seen = Vec::new();
+        let err = install_with(true, |name, hooks, rules| {
+            seen.push((name.to_vec(), hooks, rules.count));
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert!(err.is_err());
+        assert_eq!(seen, [(b"filter".to_vec(), 14, 10)]);
+
+        // 3. Mangle fails without fallback allowed: fails closed, never touches nat.
+        let mut seen = Vec::new();
+        let err = install_with(false, |name, hooks, rules| {
+            seen.push((name.to_vec(), hooks, rules.count));
+            if name == b"mangle" {
+                Err(io::ErrorKind::Unsupported.into())
             } else {
-                assert_eq!(
-                    seen,
-                    [(b"filter".to_vec(), 14, 10), (b"nat".to_vec(), 27, 7)]
-                );
+                Ok(())
             }
-        }
+        });
+        assert!(err.is_err());
+        assert_eq!(
+            seen,
+            [(b"filter".to_vec(), 14, 10), (b"mangle".to_vec(), 31, 8)]
+        );
+
+        // 4. Mangle fails with fallback allowed: falls back to nat, returns Redirect path.
+        let mut seen = Vec::new();
+        let path = install_with(true, |name, hooks, rules| {
+            seen.push((name.to_vec(), hooks, rules.count));
+            if name == b"mangle" {
+                Err(io::ErrorKind::Unsupported.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(path, InterceptionPath::Redirect);
+        assert_eq!(
+            seen,
+            [
+                (b"filter".to_vec(), 14, 10),
+                (b"mangle".to_vec(), 31, 8),
+                (b"nat".to_vec(), 27, 7)
+            ]
+        );
+
+        // 5. Mangle fails with fallback allowed, and nat fails: fails closed.
+        let mut seen = Vec::new();
+        let err = install_with(true, |name, hooks, rules| {
+            seen.push((name.to_vec(), hooks, rules.count));
+            if name == b"mangle" || name == b"nat" {
+                Err(io::ErrorKind::Unsupported.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(err.is_err());
+        assert_eq!(
+            seen,
+            [
+                (b"filter".to_vec(), 14, 10),
+                (b"mangle".to_vec(), 31, 8),
+                (b"nat".to_vec(), 27, 7)
+            ]
+        );
     }
 
     #[test]

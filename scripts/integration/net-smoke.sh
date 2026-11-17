@@ -81,8 +81,9 @@ PY
 chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
 
 # 5. Boot both VMs and run the checks from the agent through execd (owner-run ignored test).
-# Includes known-Host HTTP fetches to non-manifest destinations and an HTTPS
-# certificate-verified HTTPS fetch with world trust and failure with unrelated trust.
+# Verifies TPROXY serves arbitrary destination on 80/443 matching manifest host,
+# refuses non-matching destinations, drops all other ports/protocols, and verifies HTTPS
+# with world CA vs failure with unrelated CA.
 umask 077
 if \
 HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/agent.img" \

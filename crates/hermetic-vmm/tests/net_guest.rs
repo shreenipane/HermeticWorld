@@ -431,15 +431,11 @@ fn run() {
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
         assert!(out.ends_with("hello from the frozen world\n"), "{out}");
 
-        // REDIRECT fallback: destination IP does not select an upstream. These
-        // addresses are absent from the DNS manifest and have no external route.
+        // Under TPROXY (TR-NET-3), requests to destination addresses that do not
+        // match the host's DNS table address are refused (connection reset).
         for address in ["1.1.1.1", "192.168.0.1", "169.254.169.254", "10.0.2.2"] {
             let (_, out) = sh(&socket, &format!("printf 'GET /hello.txt HTTP/1.1\\r\\nHost: files.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
-            assert!(out.starts_with("HTTP/1.1 200"), "{address}: {out}");
-            assert!(
-                out.ends_with("hello from the frozen world\n"),
-                "{address}: {out}"
-            );
+            assert!(!out.contains("HTTP/1.1"), "{address}: {out}");
             let (_, out) = sh(&socket, &format!("printf 'GET / HTTP/1.1\\r\\nHost: unknown.example\\r\\n\\r\\n' | /bin/busybox nc -w 5 {address} 80"));
             assert!(!out.contains("HTTP/1.1"), "{address}: {out}");
         }
@@ -466,22 +462,27 @@ fn run() {
                 "{target}: {out}"
             );
         }
-        // Certificate verification uses only the injected world CA, including
-        // when the destination IP is absent from the manifest.
-        for address in [
-            "10.9.0.1",
-            "1.1.1.1",
-            "192.168.0.1",
-            "169.254.169.254",
-            "10.0.2.2",
-        ] {
+        // Certificate verification uses only the injected world CA on the manifest
+        // destination address (10.9.0.1). Mismatched destination addresses are refused.
+        let address = "10.9.0.1";
+        let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/ca.der {address} files.example /hello.txt GET 1700000000"));
+        assert_eq!(code, Some(0), "{address}: {out}");
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.ends_with("hello from the frozen world\n"), "{out}");
+        let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/unrelated.der {address} files.example /hello.txt GET 1700000000"));
+        assert_ne!(code, Some(0), "unrelated CA accepted: {out}");
+        assert!(!out.contains("hello from the frozen world"), "{out}");
+        for address in ["1.1.1.1", "192.168.0.1", "169.254.169.254", "10.0.2.2"] {
             let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/ca.der {address} files.example /hello.txt GET 1700000000"));
-            assert_eq!(code, Some(0), "{address}: {out}");
-            assert!(out.starts_with("HTTP/1.1 200"), "{out}");
-            assert!(out.ends_with("hello from the frozen world\n"), "{out}");
-            let (code, out) = sh(&socket, &format!("/bin/hermetic-https-fetch /etc/hermetic/unrelated.der {address} files.example /hello.txt GET 1700000000"));
-            assert_ne!(code, Some(0), "unrelated CA accepted: {out}");
-            assert!(!out.contains("hello from the frozen world"), "{out}");
+            assert_ne!(
+                code,
+                Some(0),
+                "mismatched address accepted: {address}: {out}"
+            );
+            assert!(
+                !out.contains("hello from the frozen world"),
+                "{address}: {out}"
+            );
         }
         let (code, out) = sh(&socket, "/bin/hermetic-https-fetch /etc/hermetic/ca.der 10.9.0.1 files.example /hello.txt HEAD 1700000000");
         assert_eq!(code, Some(0), "{out}");

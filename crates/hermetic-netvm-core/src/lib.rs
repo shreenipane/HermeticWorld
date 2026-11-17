@@ -11,7 +11,7 @@ pub mod firewall;
 pub mod headers;
 pub mod http;
 pub mod runtime;
-mod sys;
+pub mod sys;
 pub mod tls;
 pub mod upstream;
 

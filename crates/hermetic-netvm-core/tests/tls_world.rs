@@ -44,6 +44,7 @@ fn material() -> (Vec<u8>, WorldConfig) {
         WorldConfig {
             t_clock: EPOCH,
             tls: Some(m.identity(ca()).unwrap()),
+            redirect_fallback: false,
         },
     )
 }
@@ -143,6 +144,18 @@ fn client_config(trust: bool, sni: bool) -> Arc<ClientConfig> {
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(config)
 }
+fn fixture_table() -> DnsTable {
+    DnsTable::test_fixture([
+        (
+            "files.example",
+            vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()],
+        ),
+        (
+            "other.example",
+            vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()],
+        ),
+    ])
+}
 fn ask(
     server: Arc<rustls::ServerConfig>,
     upstream: Arc<FrozenUpstream>,
@@ -162,13 +175,14 @@ fn ask_with_client(
 ) -> (io::Result<usize>, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let filter = Arc::new(WorldFilter::new(&fixture_table()));
     let worker = std::thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
         tls::handle_connection(
             socket,
             server,
             HttpRuntimeConfig::bounded(1, 500, 500, 2000, EPOCH),
-            &WorldFilter::new(&table()),
+            filter.as_ref(),
             upstream.as_ref(),
             &Metrics::new(Arc::new(VecLogSink::new())),
         );
@@ -362,4 +376,85 @@ fn verified_https_also_supports_tls12() {
     assert!(result.is_ok(), "{result:?}");
     assert!(out.starts_with(b"HTTP/1.1 200 ") && out.ends_with(b"frozen\n"));
     assert_eq!(upstream.0.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn tls_client_hello_for_world_host_dialled_to_mismatched_address_is_reset_before_certificate_minted_or_sent(
+) {
+    // table() defines: files.example -> 10.9.0.1, other.example -> 10.9.0.2.
+    // The test server listens on 127.0.0.1:0.
+    // When the client connects to 127.0.0.1 and sends a ClientHello with SNI=files.example,
+    // the dialled address (127.0.0.1) does NOT match the world host's table address (10.9.0.1).
+    // The server must reset the connection immediately, before any leaf certificate is minted
+    // and before any TLS response (ServerHello / Certificate) is sent.
+    let (server, resolver) =
+        tls::server_config_with_resolver(ca().clone(), &table(), EPOCH).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let filter = Arc::new(WorldFilter::new(&table()));
+    let upstream = Arc::new(FrozenUpstream(AtomicUsize::new(0)));
+    let upstream_clone = upstream.clone();
+    let metrics = Arc::new(Metrics::new(Arc::new(VecLogSink::new())));
+    let metrics_clone = metrics.clone();
+
+    let worker = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        tls::handle_connection(
+            socket,
+            server,
+            HttpRuntimeConfig::bounded(1, 500, 500, 2000, EPOCH),
+            filter.as_ref(),
+            upstream_clone.as_ref(),
+            &metrics_clone,
+        );
+    });
+
+    let mut client_socket = TcpStream::connect(address).unwrap();
+    client_socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client_socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Generate real TLS ClientHello with SNI "files.example"
+    let client_cfg = client_config(true, true);
+    let mut conn = ClientConnection::new(
+        client_cfg,
+        ServerName::try_from("files.example".to_string()).unwrap(),
+    )
+    .unwrap();
+    let mut hello_wire = Vec::new();
+    conn.write_tls(&mut hello_wire).unwrap();
+    assert!(
+        !hello_wire.is_empty(),
+        "client hello wire must not be empty"
+    );
+
+    // Send ClientHello to the server
+    client_socket.write_all(&hello_wire).unwrap();
+    client_socket.flush().unwrap();
+
+    // Read from the socket: verify connection is reset and ZERO bytes were sent by server
+    let mut response_buf = [0u8; 1024];
+    let read_result = client_socket.read(&mut response_buf);
+    match read_result {
+        Ok(0) => {} // Immediate EOF from TCP reset
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+        other => panic!("expected EOF or ConnectionReset, got {other:?}"),
+    }
+
+    worker.join().unwrap();
+
+    // Verify:
+    // 1. Zero leaf certificates were minted
+    assert_eq!(
+        resolver.issuances(),
+        0,
+        "a certificate was minted despite mismatched destination address!"
+    );
+    // 2. HTTP rejection metric incremented
+    assert_eq!(metrics.snapshot().http_rejected, 1);
+    // 3. Upstream was never contacted
+    assert_eq!(upstream.0.load(Ordering::Relaxed), 0);
 }

@@ -42,9 +42,10 @@ fn upstream_errors_and_invalid_status_finish_https_without_truncation() {
         &[7; 32],
     )
     .unwrap();
-    let table =
-        DnsTable::from_json_str(r#"{"records":[{"name":"files.example","a":["10.9.0.1"]}]}"#)
-            .unwrap();
+    let table = DnsTable::test_fixture([(
+        "files.example",
+        vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()],
+    )]);
     let server = tls::server_config(ca.clone(), &table, EPOCH).unwrap();
     let filter = Arc::new(WorldFilter::new(&table));
     let mut roots = RootCertStore::empty();

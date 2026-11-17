@@ -46,6 +46,7 @@ unsafe extern "C" {
         value: *mut c_void,
         length: *mut u32,
     ) -> c_int;
+    fn getsockname(fd: c_int, address: *mut c_void, length: *mut u32) -> c_int;
 }
 
 pub(crate) fn ready(stream: &UnixStream, write: bool, deadline: Instant) -> io::Result<()> {
@@ -267,4 +268,91 @@ pub(crate) fn reset_tcp(stream: &std::net::TcpStream) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Enable IP_TRANSPARENT on a TCP listener so it can intercept packets routed to foreign addresses.
+pub fn set_transparent(listener: &std::net::TcpListener) -> io::Result<()> {
+    let val: c_int = 1;
+    // SAFETY: IP_TRANSPARENT (level SOL_IP = 0, optname = 19) takes an integer flag.
+    // The socket descriptor is valid and borrowed from the live listener.
+    let rc = unsafe {
+        setsockopt(
+            listener.as_raw_fd(),
+            0,
+            19,
+            (&val as *const c_int).cast(),
+            std::mem::size_of_val(&val) as u32,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct SockAddrIn {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [u8; 8],
+}
+
+/// Retrieve the original destination of an accepted TPROXY connection using getsockname.
+pub fn original_destination(stream: &std::net::TcpStream) -> io::Result<std::net::SocketAddr> {
+    let mut addr = SockAddrIn {
+        sin_family: 0,
+        sin_port: 0,
+        sin_addr: 0,
+        sin_zero: [0; 8],
+    };
+    let mut len = std::mem::size_of::<SockAddrIn>() as u32;
+    // SAFETY: getsockname writes the local socket address into the initialized SockAddrIn buffer.
+    // The descriptor is valid and borrowed from the live TcpStream.
+    let rc = unsafe {
+        getsockname(
+            stream.as_raw_fd(),
+            (&mut addr as *mut SockAddrIn).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if addr.sin_family != 2 {
+        // AF_INET
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr));
+    let port = u16::from_be(addr.sin_port);
+    Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        ip, port,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_setsockopt_or_fails_with_permission_denied() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Unprivileged host tests get EPERM (PermissionDenied); netvm gets Ok(()).
+        let result = set_transparent(&listener);
+        if let Err(e) = result {
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn original_destination_returns_local_address_for_connected_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let orig = original_destination(&server).unwrap();
+        assert_eq!(orig.port(), addr.port());
+        assert_eq!(orig.ip(), addr.ip());
+        drop(client);
+    }
 }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 //! NetVM boot policy: static DNS and sealed HTTP/HTTPS host filtering.
+pub use crate::firewall::InterceptionPath;
 use crate::{
     dns::DnsResponder,
     http::{FilterDecision, RequestFilter},
@@ -29,14 +30,39 @@ pub const MAX_CONNTRACK_ENTRIES: u32 = 1024;
 pub const CONNTRACK_IDLE_SECONDS: u32 = 30;
 pub const MAX_FRAGMENT_BYTES: u32 = 262144;
 pub const FRAGMENT_TIMEOUT_SECONDS: u32 = 5;
+pub const TPROXY_ROUTING_TABLE: u32 = 100;
+pub const TPROXY_ROUTING_TABLE_STR: &str = "100";
 
 /// Emitted only after network configuration and both service loops have started.
 /// All fields describe sealed policy; no wall clock or host configuration is read.
-pub fn write_ready_status(mut out: impl std::io::Write) -> std::io::Result<()> {
+pub fn write_ready_status(
+    mut out: impl std::io::Write,
+    path: InterceptionPath,
+) -> std::io::Result<()> {
+    let binding = match path {
+        InterceptionPath::Tproxy => "on",
+        InterceptionPath::Redirect => "off",
+    };
     writeln!(
         out,
-        "netvm_ready interface=eth0 address={NETVM_CIDR} dns={NETVM_ADDRESS}:53 http=0.0.0.0:80"
+        "netvm_ready interface=eth0 address={NETVM_CIDR} dns={NETVM_ADDRESS}:53 http=0.0.0.0:80 path={} destination_binding={binding}",
+        path.as_str()
     )
+}
+
+/// Emitted during early boot to record interception mode and destination binding status.
+pub fn write_boot_log(mut out: impl std::io::Write, path: InterceptionPath) -> std::io::Result<()> {
+    match path {
+        InterceptionPath::Tproxy => {
+            writeln!(out, "netvm_boot: path=tproxy destination_binding=on")
+        }
+        InterceptionPath::Redirect => {
+            writeln!(
+                out,
+                "netvm_boot: warning: path=redirect destination_binding=off (REDIRECT fallback active)"
+            )
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +71,8 @@ pub struct WorldConfig {
     pub t_clock: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<crate::tls::TlsIdentity>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redirect_fallback: bool,
 }
 impl WorldConfig {
     pub fn parse(reader: impl Read) -> Result<Self, &'static str> {
@@ -72,18 +100,37 @@ impl DnsResponder for WorldDns {
         hermetic_netvm_dns::respond(packet, &self.0)
     }
 }
+#[derive(Clone)]
 pub struct WorldFilter {
     hosts: BTreeSet<String>,
+    table: DnsTable,
+    path: InterceptionPath,
 }
 impl WorldFilter {
     pub fn new(table: &DnsTable) -> Self {
+        Self::with_path(table, InterceptionPath::Tproxy)
+    }
+
+    pub fn with_path(table: &DnsTable, path: InterceptionPath) -> Self {
         Self {
             hosts: table.names().map(str::to_owned).collect(),
+            table: table.clone(),
+            path,
         }
     }
 }
 impl RequestFilter for WorldFilter {
     fn check(&self, head: &[u8], tls: bool, sni: Option<&str>) -> FilterDecision {
+        self.check_with_dest(head, tls, sni, None)
+    }
+
+    fn check_with_dest(
+        &self,
+        head: &[u8],
+        tls: bool,
+        sni: Option<&str>,
+        destination: Option<std::net::IpAddr>,
+    ) -> FilterDecision {
         let parsed = match parse_request_head(head) {
             Ok(p) => p,
             Err(_) => return FilterDecision::Reject,
@@ -97,6 +144,9 @@ impl RequestFilter for WorldFilter {
             Decision::MethodNotAllowed => FilterDecision::NotAllowed,
             Decision::Reject(_) => FilterDecision::Reject,
             Decision::Forward(mut req) => {
+                if !self.check_destination(&req.host, destination) {
+                    return FilterDecision::Reject;
+                }
                 if tls && sni.is_none_or(|sni| !sni.eq_ignore_ascii_case(&req.host)) {
                     return FilterDecision::Reject;
                 }
@@ -127,6 +177,23 @@ impl RequestFilter for WorldFilter {
                 }
             }
         }
+    }
+
+    fn check_destination(&self, host: &str, destination: Option<std::net::IpAddr>) -> bool {
+        if self.path == InterceptionPath::Redirect {
+            return true;
+        }
+        let Some(dest) = destination else {
+            return false;
+        };
+        let dest_v4 = match dest {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => return false,
+        };
+        let Some(records) = self.table.lookup(host) else {
+            return false;
+        };
+        records.contains(&dest_v4)
     }
 }
 
@@ -160,9 +227,12 @@ pub fn world_addresses(table: &DnsTable) -> Result<Vec<Ipv4Addr>, &'static str> 
 
 /// NetVM network bring-up. No forwarding and no IPv6: the only reachable
 /// services are the DNS socket on `NETVM_ADDRESS:53` and the HTTP socket on port 80
-/// of any destination address (REDIRECT in PREROUTING). World /32 aliases also
-/// answer ARP for manifest addresses. Every other service is dropped.
-pub fn boot_commands(table: &DnsTable) -> Result<Vec<BootCommand>, &'static str> {
+/// and HTTPS on port 443 of any destination address (TPROXY with fwmark policy routing,
+/// or fallback REDIRECT in PREROUTING). Every other service is dropped.
+pub fn boot_commands(
+    table: &DnsTable,
+    path: InterceptionPath,
+) -> Result<Vec<BootCommand>, &'static str> {
     let mut out = vec![
         busy(&["sysctl", "-w", "net.ipv4.ip_forward=0"]),
         busy(&["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"]),
@@ -191,10 +261,39 @@ pub fn boot_commands(table: &DnsTable) -> Result<Vec<BootCommand>, &'static str>
         out.push(busy(&["sysctl", "-w", &format!("{key}={value}")]));
     }
     out.push(busy(&["ip", "link", "set", "lo", "up"]));
-    out.push(busy(&["ip", "addr", "add", NETVM_CIDR, "dev", "eth0"]));
-    for ip in world_addresses(table)? {
-        let cidr = format!("{ip}/32");
-        out.push(busy(&["ip", "addr", "add", &cidr, "dev", "eth0"]));
+    let addresses = world_addresses(table)?;
+    match path {
+        InterceptionPath::Tproxy => {
+            let fwmark_str = crate::firewall::FWMARK.to_string();
+            out.push(busy(&[
+                "ip",
+                "rule",
+                "add",
+                "fwmark",
+                &fwmark_str,
+                "table",
+                TPROXY_ROUTING_TABLE_STR,
+            ]));
+            out.push(busy(&[
+                "ip",
+                "route",
+                "add",
+                "local",
+                "default",
+                "dev",
+                "lo",
+                "table",
+                TPROXY_ROUTING_TABLE_STR,
+            ]));
+            out.push(busy(&["ip", "addr", "add", NETVM_CIDR, "dev", "eth0"]));
+        }
+        InterceptionPath::Redirect => {
+            out.push(busy(&["ip", "addr", "add", NETVM_CIDR, "dev", "eth0"]));
+            for ip in addresses {
+                let cidr = format!("{ip}/32");
+                out.push(busy(&["ip", "addr", "add", &cidr, "dev", "eth0"]));
+            }
+        }
     }
     out.push(busy(&["ip", "link", "set", "eth0", "up"]));
     out.push(busy(&[
@@ -209,9 +308,10 @@ pub fn boot_commands(table: &DnsTable) -> Result<Vec<BootCommand>, &'static str>
 /// Replayable orchestration, tested without root or host networking effects.
 pub fn configure(
     table: &DnsTable,
+    path: InterceptionPath,
     mut run: impl FnMut(&BootCommand) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
-    for command in boot_commands(table)? {
+    for command in boot_commands(table, path)? {
         run(&command)?;
     }
     Ok(())
@@ -248,23 +348,46 @@ mod tests {
     #[test]
     fn ready_status_has_only_fixed_network_policy() {
         let mut out = Vec::new();
-        write_ready_status(&mut out).unwrap();
+        write_ready_status(&mut out, InterceptionPath::Tproxy).unwrap();
         assert_eq!(
             out,
-            b"netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80\n"
+            b"netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\n"
+        );
+        let mut out = Vec::new();
+        write_ready_status(&mut out, InterceptionPath::Redirect).unwrap();
+        assert_eq!(
+            out,
+            b"netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=redirect destination_binding=off\n"
+        );
+    }
+
+    #[test]
+    fn boot_log_states_destination_binding() {
+        let mut out = Vec::new();
+        write_boot_log(&mut out, InterceptionPath::Tproxy).unwrap();
+        assert_eq!(out, b"netvm_boot: path=tproxy destination_binding=on\n");
+        let mut out = Vec::new();
+        write_boot_log(&mut out, InterceptionPath::Redirect).unwrap();
+        assert_eq!(
+            out,
+            b"netvm_boot: warning: path=redirect destination_binding=off (REDIRECT fallback active)\n"
         );
     }
 
     /// `(name, [a...])` pairs in the manifest table format.
     fn table(records: &[(&str, &[&str])]) -> DnsTable {
-        let records: Vec<_> = records
-            .iter()
-            .map(|(n, a)| serde_json::json!({"name": n, "a": a, "aaaa": []}))
-            .collect();
-        DnsTable::from_json_str(&serde_json::json!({ "records": records }).to_string()).unwrap()
+        DnsTable::test_fixture(records.iter().map(|(n, ips)| {
+            (
+                *n,
+                ips.iter()
+                    .map(|ip| ip.parse::<std::net::Ipv4Addr>().unwrap())
+                    .collect(),
+            )
+        }))
     }
     fn get(filter: &WorldFilter, raw: &str) -> FilterDecision {
-        filter.check(raw.as_bytes(), false, None)
+        let dest = "10.9.0.1".parse().ok();
+        filter.check_with_dest(raw.as_bytes(), false, None, dest)
     }
 
     #[test]
@@ -292,7 +415,7 @@ mod tests {
             ("b.example", &["10.9.0.2", "10.9.0.1"]),
             ("a.example", &["10.9.0.3"]),
         ]);
-        let plan = boot_commands(&t).unwrap();
+        let plan = boot_commands(&t, InterceptionPath::Redirect).unwrap();
         assert!(plan.iter().all(|c| c.program == BUSYBOX));
         let flat: Vec<String> = plan.iter().map(|c| c.args.join(" ")).collect();
         assert_eq!(flat[0], "sysctl -w net.ipv4.ip_forward=0");
@@ -322,10 +445,56 @@ mod tests {
     }
 
     #[test]
+    fn boot_plan_tproxy_configures_policy_routing_and_never_owns_world_addresses() {
+        let t = table(&[
+            ("b.example", &["10.9.0.2", "10.9.0.1"]),
+            ("a.example", &["10.9.0.3"]),
+        ]);
+        let plan = boot_commands(&t, InterceptionPath::Tproxy).unwrap();
+        assert!(plan.iter().all(|c| c.program == BUSYBOX));
+        let flat: Vec<String> = plan.iter().map(|c| c.args.join(" ")).collect();
+        assert_eq!(flat[0], "sysctl -w net.ipv4.ip_forward=0");
+        // Must contain policy rule and local default route
+        assert!(flat.contains(&"ip rule add fwmark 1 table 100".to_owned()));
+        assert!(flat.contains(&"ip route add local default dev lo table 100".to_owned()));
+        assert!(flat.contains(&"ip addr add 10.0.2.3/24 dev eth0".to_owned()));
+        // Never owns any world /32 addresses on eth0
+        assert!(!flat.iter().any(|c| c.contains("/32")));
+        // Ordering: rule, route and addr before eth0 up; /proc remount ro last
+        let up = flat
+            .iter()
+            .position(|c| c == "ip link set eth0 up")
+            .unwrap();
+        let rule_pos = flat
+            .iter()
+            .position(|c| c == "ip rule add fwmark 1 table 100")
+            .unwrap();
+        let route_pos = flat
+            .iter()
+            .position(|c| c == "ip route add local default dev lo table 100")
+            .unwrap();
+        let addr_pos = flat
+            .iter()
+            .position(|c| c == "ip addr add 10.0.2.3/24 dev eth0")
+            .unwrap();
+        assert!(rule_pos < up);
+        assert!(route_pos < up);
+        assert!(addr_pos < up);
+        assert!(flat.last().unwrap().starts_with("mount -o remount,ro"));
+    }
+
+    #[test]
     fn table_address_in_link_subnet_is_refused() {
         for ip in ["10.0.2.15", "10.0.2.3", "10.0.2.200"] {
             let t = table(&[("x.example", &[ip])]);
-            assert_eq!(boot_commands(&t), Err("invalid_dns"));
+            assert_eq!(
+                boot_commands(&t, InterceptionPath::Tproxy),
+                Err("invalid_dns")
+            );
+            assert_eq!(
+                boot_commands(&t, InterceptionPath::Redirect),
+                Err("invalid_dns")
+            );
         }
     }
 
@@ -333,7 +502,7 @@ mod tests {
     fn configure_stops_at_first_failure() {
         let t = table(&[("a.example", &["10.9.0.1"])]);
         let mut seen = 0;
-        let r = configure(&t, |_| {
+        let r = configure(&t, InterceptionPath::Tproxy, |_| {
             seen += 1;
             if seen == 2 {
                 Err("boot_failed")
@@ -348,38 +517,40 @@ mod tests {
     #[test]
     fn interception_state_is_capped_before_network_and_every_failure_stops_boot() {
         let t = table(&[("a.example", &["10.9.0.1"])]);
-        let plan = boot_commands(&t).unwrap();
-        let up = plan
-            .iter()
-            .position(|c| c.args == ["ip", "link", "set", "eth0", "up"])
-            .unwrap();
-        for required in [
-            "net.netfilter.nf_conntrack_max=1024",
-            "net.netfilter.nf_conntrack_tcp_timeout_established=30",
-            "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5",
-            "net.netfilter.nf_conntrack_tcp_timeout_time_wait=5",
-            "net.ipv4.ipfrag_high_thresh=262144",
-            "net.ipv4.ipfrag_time=5",
-        ] {
-            assert!(plan
+        for path in [InterceptionPath::Tproxy, InterceptionPath::Redirect] {
+            let plan = boot_commands(&t, path).unwrap();
+            let up = plan
                 .iter()
-                .take(up)
-                .any(|c| c.args == ["sysctl", "-w", required]));
-        }
-        for fail_at in 0..plan.len() {
-            let mut seen = Vec::new();
-            assert_eq!(
-                configure(&t, |c| {
-                    seen.push(c.clone());
-                    if seen.len() == fail_at + 1 {
-                        Err("boot_failed")
-                    } else {
-                        Ok(())
-                    }
-                }),
-                Err("boot_failed")
-            );
-            assert_eq!(seen, plan[..=fail_at]);
+                .position(|c| c.args == ["ip", "link", "set", "eth0", "up"])
+                .unwrap();
+            for required in [
+                "net.netfilter.nf_conntrack_max=1024",
+                "net.netfilter.nf_conntrack_tcp_timeout_established=30",
+                "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5",
+                "net.netfilter.nf_conntrack_tcp_timeout_time_wait=5",
+                "net.ipv4.ipfrag_high_thresh=262144",
+                "net.ipv4.ipfrag_time=5",
+            ] {
+                assert!(plan
+                    .iter()
+                    .take(up)
+                    .any(|c| c.args == ["sysctl", "-w", required]));
+            }
+            for fail_at in 0..plan.len() {
+                let mut seen = Vec::new();
+                assert_eq!(
+                    configure(&t, path, |c| {
+                        seen.push(c.clone());
+                        if seen.len() == fail_at + 1 {
+                            Err("boot_failed")
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    Err("boot_failed")
+                );
+                assert_eq!(seen, plan[..=fail_at]);
+            }
         }
     }
 
@@ -389,7 +560,7 @@ mod tests {
         // of low_thresh, and low_thresh a maximum of high_thresh.
         let mut low = 3 * 1024 * 1024u32;
         let mut high = 4 * 1024 * 1024u32;
-        configure(&table(&[]), |command| {
+        configure(&table(&[]), InterceptionPath::Tproxy, |command| {
             if command.args.first().map(String::as_str) == Some("sysctl") {
                 let (key, value) = command.args[2].split_once('=').unwrap();
                 let value: u32 = value.parse().unwrap();
@@ -469,6 +640,113 @@ mod tests {
             f.check(b"GET / HTTP/1.1\r\nHost: files.example\r\n\r\n", true, None),
             FilterDecision::Reject
         ));
+    }
+
+    #[test]
+    fn original_destination_mismatch_is_refused() {
+        let t = table(&[
+            ("files.example", &["10.9.0.1"]),
+            ("other.example", &["10.9.0.2"]),
+        ]);
+        let filter = WorldFilter::new(&t);
+
+        let head = b"GET / HTTP/1.1\r\nHost: files.example\r\n\r\n";
+        let post_head = b"POST / HTTP/1.1\r\nHost: files.example\r\nContent-Length: 0\r\n\r\n";
+
+        let ip_matching: std::net::IpAddr = "10.9.0.1".parse().unwrap();
+        let ip_mismatch: std::net::IpAddr = "10.9.0.2".parse().unwrap();
+        let ip_external: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+        let ip_loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Direct check_destination
+        // 1. None rejected
+        assert!(!filter.check_destination("files.example", None));
+        // 2. Loopback not in the table rejected
+        assert!(!filter.check_destination("files.example", Some(ip_loopback)));
+        // 3. Mismatch rejected
+        assert!(!filter.check_destination("files.example", Some(ip_mismatch)));
+        assert!(!filter.check_destination("files.example", Some(ip_external)));
+        assert!(!filter.check_destination("unknown.example", Some(ip_matching)));
+        // 4. Match accepted
+        assert!(filter.check_destination("files.example", Some(ip_matching)));
+
+        // check_with_dest: matching destination forwards
+        assert!(matches!(
+            filter.check_with_dest(head, false, None, Some(ip_matching)),
+            FilterDecision::Forward(_)
+        ));
+
+        // check_with_dest: destination None refuses (reset)
+        assert_eq!(
+            filter.check_with_dest(head, false, None, None),
+            FilterDecision::Reject
+        );
+
+        // check_with_dest: loopback not in table refuses (reset)
+        assert_eq!(
+            filter.check_with_dest(head, false, None, Some(ip_loopback)),
+            FilterDecision::Reject
+        );
+
+        // check_with_dest: mismatched destination refuses (reset)
+        assert_eq!(
+            filter.check_with_dest(head, false, None, Some(ip_mismatch)),
+            FilterDecision::Reject
+        );
+        assert_eq!(
+            filter.check_with_dest(head, false, None, Some(ip_external)),
+            FilterDecision::Reject
+        );
+
+        // check_with_dest: mismatched destination refuses even for POST (never gives 405)
+        assert_eq!(
+            filter.check_with_dest(post_head, false, None, Some(ip_mismatch)),
+            FilterDecision::Reject
+        );
+
+        // check_with_dest: matching destination for POST gives 405
+        assert_eq!(
+            filter.check_with_dest(post_head, false, None, Some(ip_matching)),
+            FilterDecision::NotAllowed
+        );
+
+        // Test fixture declaring loopback listener address in table exercises normal match rule:
+        let t_loopback = table(&[("files.example", &["127.0.0.1"])]);
+        let filter_loopback = WorldFilter::new(&t_loopback);
+        assert!(filter_loopback.check_destination("files.example", Some(ip_loopback)));
+        assert!(matches!(
+            filter_loopback.check_with_dest(head, false, None, Some(ip_loopback)),
+            FilterDecision::Forward(_)
+        ));
+
+        // Fallback path (Redirect) skips destination check:
+        let filter_redirect = WorldFilter::with_path(&t, InterceptionPath::Redirect);
+        assert!(filter_redirect.check_destination("files.example", Some(ip_mismatch)));
+        assert!(matches!(
+            filter_redirect.check_with_dest(head, false, None, Some(ip_mismatch)),
+            FilterDecision::Forward(_)
+        ));
+    }
+
+    #[test]
+    fn default_config_never_selects_redirect_fallback() {
+        let raw = br#"{"t_clock":1700000000}"#;
+        let config = WorldConfig::parse(&raw[..]).unwrap();
+        assert!(!config.redirect_fallback);
+
+        let mut touched = Vec::new();
+        let res =
+            crate::firewall::install_with(config.redirect_fallback, |name, _hooks, _rules| {
+                touched.push(name.to_vec());
+                if name == b"mangle" {
+                    Err(std::io::ErrorKind::Unsupported.into())
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(res.is_err());
+        assert_eq!(touched, [b"filter".to_vec(), b"mangle".to_vec()]);
+        assert!(!touched.contains(&b"nat".to_vec()));
     }
 }
 

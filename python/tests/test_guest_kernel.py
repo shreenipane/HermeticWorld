@@ -1004,6 +1004,20 @@ def test_netvm_redirect_requires_builtin_nat_and_conntrack():
         assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
 
 
+def test_netvm_tproxy_requires_policy_routing_and_mangle():
+    for option in (
+        "CONFIG_IP_ADVANCED_ROUTER",
+        "CONFIG_IP_MULTIPLE_TABLES",
+        "CONFIG_NETFILTER_XT_MARK",
+        "CONFIG_IP_NF_MANGLE",
+        "CONFIG_NETFILTER_XT_TARGET_TPROXY",
+        "CONFIG_NF_TPROXY_IPV4",
+    ):
+        assert k.RULES[option].value == "y"
+        assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
+        assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
+
+
 # Root must not be able to replace or inspect the trusted kernel even when it
 # creates its own device nodes or supplies arbitrary modules and BPF programs.
 LOCKDOWN_REQUIRED = (

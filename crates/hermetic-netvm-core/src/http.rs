@@ -82,7 +82,23 @@ pub enum FilterDecision {
 
 /// Pluggable request filter operating strictly on the parsed HTTP request head.
 pub trait RequestFilter: Send + Sync {
-    fn check(&self, head: &[u8], tls: bool, sni: Option<&str>) -> FilterDecision;
+    fn check(&self, head: &[u8], tls: bool, sni: Option<&str>) -> FilterDecision {
+        self.check_with_dest(head, tls, sni, None)
+    }
+
+    fn check_with_dest(
+        &self,
+        head: &[u8],
+        tls: bool,
+        sni: Option<&str>,
+        _destination: Option<std::net::IpAddr>,
+    ) -> FilterDecision {
+        self.check(head, tls, sni)
+    }
+
+    fn check_destination(&self, _host: &str, _destination: Option<std::net::IpAddr>) -> bool {
+        true
+    }
 }
 
 /// Streaming response returned by [`Upstream::fetch`].
@@ -391,6 +407,12 @@ impl HttpStream {
             }
         }
     }
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            Self::Plain(s) => s.local_addr(),
+            Self::Tls(s) => s.sock.local_addr(),
+        }
+    }
 }
 impl Read for HttpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -603,8 +625,9 @@ pub(crate) fn handle_stream(
     };
 
     let is_head_request = head.starts_with(b"HEAD ");
+    let dialled = stream.local_addr().ok().map(|sa| sa.ip());
 
-    match filter.check(&head, tls, sni) {
+    match filter.check_with_dest(&head, tls, sni, dialled) {
         FilterDecision::Reject => {
             metrics.inc_http_rejected();
             stream.reset();

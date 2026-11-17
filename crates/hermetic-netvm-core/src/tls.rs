@@ -220,7 +220,7 @@ struct Certificates {
     cache: BTreeMap<String, Arc<CertifiedKey>>,
     issuances: usize,
 }
-struct Resolver(Mutex<Certificates>);
+pub struct Resolver(Mutex<Certificates>);
 impl std::fmt::Debug for Resolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WorldCertificates")
@@ -239,6 +239,10 @@ impl ResolvesServerCert for Resolver {
     }
 }
 impl Resolver {
+    pub fn issuances(&self) -> usize {
+        self.0.lock().map(|s| s.issuances).unwrap_or(0)
+    }
+
     fn certificate(&self, name: &str) -> Option<Arc<CertifiedKey>> {
         let mut state = self.0.lock().ok()?;
         if !state.hosts.contains(name) {
@@ -269,26 +273,35 @@ impl Resolver {
         Some(certified)
     }
 }
-pub fn server_config(ca: Ca, table: &DnsTable, epoch: i64) -> io::Result<Arc<ServerConfig>> {
+pub fn server_config_with_resolver(
+    ca: Ca,
+    table: &DnsTable,
+    epoch: i64,
+) -> io::Result<(Arc<ServerConfig>, Arc<Resolver>)> {
     let clock = time::OffsetDateTime::from_unix_timestamp(epoch).map_err(|_| invalid())?;
     let epoch = u64::try_from(epoch).map_err(|_| invalid())?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let resolver = Arc::new(Resolver(Mutex::new(Certificates {
+        ca,
+        clock,
+        hosts: table.names().map(str::to_owned).collect(),
+        cache: BTreeMap::new(),
+        issuances: 0,
+    })));
     let mut config = ServerConfig::builder_with_details(provider, Arc::new(FrozenTime(epoch)))
         .with_safe_default_protocol_versions()
         .map_err(|_| invalid())?
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(Resolver(Mutex::new(Certificates {
-            ca,
-            clock,
-            hosts: table.names().map(str::to_owned).collect(),
-            cache: BTreeMap::new(),
-            issuances: 0,
-        }))));
+        .with_cert_resolver(resolver.clone());
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
     config.max_fragment_size = Some(MAX_TLS_BUFFER_BYTES);
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), resolver))
+}
+
+pub fn server_config(ca: Ca, table: &DnsTable, epoch: i64) -> io::Result<Arc<ServerConfig>> {
+    server_config_with_resolver(ca, table, epoch).map(|(cfg, _)| cfg)
 }
 
 /// Each syscall uses the remaining absolute budget, including rustls internal
@@ -320,6 +333,9 @@ impl DeadlineTcp {
     }
     pub fn shutdown(&self) {
         let _ = self.socket.shutdown(Shutdown::Both);
+    }
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
     }
 }
 impl Read for DeadlineTcp {
@@ -365,7 +381,7 @@ fn vector<'a>(bytes: &mut &'a [u8], width: usize) -> io::Result<&'a [u8]> {
     let n = number(bytes, width)?;
     take(bytes, n)
 }
-fn check_extensions(mut hello: &[u8]) -> io::Result<()> {
+fn parse_client_hello_extensions(mut hello: &[u8]) -> io::Result<Option<String>> {
     take(&mut hello, 34)?; // legacy version and random
     vector(&mut hello, 1)?; // session id
     vector(&mut hello, 2)?; // cipher suites
@@ -374,16 +390,40 @@ fn check_extensions(mut hello: &[u8]) -> io::Result<()> {
     if !hello.is_empty() {
         return Err(invalid());
     }
+    let mut sni = None;
     while !extensions.is_empty() {
         let kind = number(&mut extensions, 2)?;
-        let _ = vector(&mut extensions, 2)?;
+        let mut ext_data = vector(&mut extensions, 2)?;
         if kind == 0xfe0d {
             return Err(invalid());
         }
+        if kind == 0 {
+            // RFC 6066: server_name extension
+            let mut list = vector(&mut ext_data, 2)?;
+            if !ext_data.is_empty() {
+                return Err(invalid());
+            }
+            while !list.is_empty() {
+                let name_type = number(&mut list, 1)?;
+                let host_bytes = vector(&mut list, 2)?;
+                if name_type == 0 && sni.is_none() {
+                    let s = std::str::from_utf8(host_bytes).map_err(|_| invalid())?;
+                    if s.is_empty() || s.len() > 255 {
+                        return Err(invalid());
+                    }
+                    sni = Some(s.to_ascii_lowercase());
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(sni)
 }
-fn client_hello(socket: &mut DeadlineTcp) -> io::Result<Vec<u8>> {
+
+fn check_extensions(hello: &[u8]) -> io::Result<()> {
+    parse_client_hello_extensions(hello).map(|_| ())
+}
+
+fn client_hello(socket: &mut DeadlineTcp) -> io::Result<(Vec<u8>, Option<String>)> {
     let mut wire = Vec::new();
     let mut handshake = Vec::new();
     loop {
@@ -423,11 +463,11 @@ fn client_hello(socket: &mut DeadlineTcp) -> io::Result<Vec<u8>> {
         if fields.len() < len {
             continue;
         }
-        check_extensions(take(&mut fields, len)?)?;
+        let sni = parse_client_hello_extensions(take(&mut fields, len)?)?;
         if !fields.is_empty() {
             return Err(invalid());
         }
-        return Ok(wire);
+        return Ok((wire, sni));
     }
 }
 
@@ -513,7 +553,15 @@ pub fn handle_connection(
 ) {
     let mut socket = DeadlineTcp::new(socket, Instant::now() + HANDSHAKE_TIMEOUT);
     let result = (|| -> io::Result<(ServerConnection, String)> {
-        let hello = client_hello(&mut socket)?;
+        let (hello, sni) = client_hello(&mut socket)?;
+        let name = sni.ok_or_else(invalid)?;
+        let dialled = socket.local_addr().ok().map(|sa| sa.ip());
+        // Verify destination before creating ServerConnection or invoking handshake_io:
+        // ClientHello whose SNI does not match dialled IP must be reset before minting
+        // or sending any certificate.
+        if !filter.check_destination(&name, dialled) {
+            return Err(invalid());
+        }
         let mut conn = ServerConnection::new(config).map_err(|_| invalid())?;
         conn.set_buffer_limit(Some(MAX_TLS_BUFFER_BYTES));
         let mut input = io::Cursor::new(hello);
@@ -524,7 +572,13 @@ pub fn handle_connection(
             conn.process_new_packets().map_err(|_| invalid())?;
         }
         handshake_io(&mut conn, &mut socket)?;
-        let name = conn.server_name().ok_or_else(invalid)?.to_owned();
+        let server_name = conn.server_name().ok_or_else(invalid)?;
+        if !server_name.eq_ignore_ascii_case(&name) {
+            return Err(invalid());
+        }
+        if !filter.check_destination(server_name, dialled) {
+            return Err(invalid());
+        }
         Ok((conn, name))
     })();
     match result {
@@ -621,7 +675,9 @@ mod tests {
             let result = client_hello(&mut receiver);
             assert_eq!(result.is_err(), ech);
             if !ech {
-                assert_eq!(result.unwrap(), wire);
+                let (got_wire, sni) = result.unwrap();
+                assert_eq!(got_wire, wire);
+                assert_eq!(sni, None);
             }
         }
         for bytes in [

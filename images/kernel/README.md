@@ -209,6 +209,8 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_IP6_NF_MANGLE` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IPC_NS` | `y` | TR-VMM-4: namespaces (mount namespaces are part of NAMESPACES) |
 | `CONFIG_IPV6` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
+| `CONFIG_IP_ADVANCED_ROUTER` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
+| `CONFIG_IP_MULTIPLE_TABLES` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP_NF_FILTER` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP_NF_IPTABLES` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_IP_NF_MANGLE` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
@@ -233,6 +235,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_NETFILTER` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NETFILTER_ADVANCED` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NETFILTER_XTABLES` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
+| `CONFIG_NETFILTER_XT_MARK` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NETFILTER_XT_MATCH_CONNTRACK` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NETFILTER_XT_MATCH_SOCKET` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
 | `CONFIG_NETFILTER_XT_TARGET_MASQUERADE` | `y` | TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack |
