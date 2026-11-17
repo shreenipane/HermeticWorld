@@ -383,6 +383,9 @@ impl Server {
                     Err(IoError::from_raw_os_error(inject_code))
                 } else {
                     let mut res = server.accept();
+                    if inside_close_trigger.load(Relaxed) {
+                        break;
+                    }
                     let inject_code = INJECT_ACCEPT_ERROR.swap(0, Ordering::SeqCst);
                     if inject_code != 0 {
                         res = Err(IoError::from_raw_os_error(inject_code));

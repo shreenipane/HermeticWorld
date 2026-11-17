@@ -3,7 +3,11 @@ mod common;
 use common::TestEnv;
 use hermetic_gateway::quota::QuotasConfig;
 use std::io::{BufRead, BufReader, Cursor};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tiny_http::{Header, Response};
 
 #[test]
@@ -80,6 +84,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     let snap = env.gateway_server.quota().snapshot();
     assert_eq!(snap.input_tokens, 25);
     assert_eq!(snap.output_tokens, 15);
+}
+
+#[test]
+fn test_sse_streaming_50_iterations_consecutive_success() {
+    for _ in 0..50 {
+        test_sse_streaming_timestamp_rewrite_and_token_counting();
+    }
 }
 
 #[test]
@@ -567,4 +578,127 @@ fn test_stream_client_disconnect_during_upstream_pause_releases_slot_within_boun
 
     let overlap = common::join_within(mock_handle);
     assert_eq!(overlap, 0, "second upstream request overlapped the first");
+}
+
+#[test]
+fn test_sse_streaming_quota_committed_before_response_eof_barrier() {
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    let (server_at_barrier_tx, server_at_barrier_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (unblock_server_tx, unblock_server_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    let hook_barrier_tx = server_at_barrier_tx;
+    let hook_unblock_rx = std::sync::Mutex::new(unblock_server_rx);
+    let hook = Arc::new(move || {
+        let _ = hook_barrier_tx.send(());
+        let guard = hook_unblock_rx.lock().unwrap();
+        guard
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("server unblocked within test deadline");
+    });
+
+    let t_clock = OffsetDateTime::parse("2026-11-11T12:00:00Z", &Rfc3339).unwrap();
+    let env =
+        common::TestEnv::new_with_setup(QuotasConfig::default(), t_clock, None, move |gateway| {
+            gateway.with_post_stream_respond_hook(hook)
+        });
+
+    let mock = env.mock_server.clone();
+    let mock_handle = thread::spawn(move || {
+        let req = common::recv_upstream(&mock);
+
+        let sse_payload = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"created_at\":1600000000,\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        let resp = Response::new(
+            200.into(),
+            vec![Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).unwrap()],
+            Cursor::new(sse_payload.as_bytes().to_vec()),
+            Some(sse_payload.len()),
+            None,
+        );
+
+        req.respond(resp).unwrap();
+    });
+
+    let client = common::test_client();
+    let body = r#"{
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    }"#;
+
+    let res = client
+        .post(&format!("{}/v1/messages", env.gateway_url))
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_string(body)
+        .expect("send stream ok");
+
+    assert_eq!(res.status(), 200);
+
+    let mut reader = BufReader::new(res.into_reader());
+    let mut all_stream_text = String::new();
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).unwrap() > 0 {
+        all_stream_text.push_str(&line);
+        line.clear();
+    }
+
+    // Client observed response EOF. Wait for the server handler thread to reach
+    // the barrier after request.respond() but before slot.record_and_release().
+    server_at_barrier_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("server reached post-respond barrier");
+
+    // While the server thread is paused at the barrier (having NOT run line 1083 yet),
+    // verify that the quota snapshot already reflects finalized tokens and concurrency.
+    // In the product, SanitizingSseReader commits usage and releases the slot before
+    // the final response EOF bytes are sent to the client, guaranteeing happen-before
+    // semantics. If this recording were deferred until the handler thread resumes,
+    // this assertion would fail with 0 input tokens and concurrent_requests == 1.
+    let snap = env.gateway_server.quota().snapshot();
+    assert_eq!(
+        snap.input_tokens, 25,
+        "Input tokens must be committed before response EOF"
+    );
+    assert_eq!(
+        snap.output_tokens, 15,
+        "Output tokens must be committed before response EOF"
+    );
+    assert_eq!(
+        snap.concurrent_requests, 0,
+        "Concurrency slot must be released before response EOF"
+    );
+
+    // Also verify that an immediate second request can acquire concurrency headroom
+    // while the first request handler thread is still held at the barrier.
+    let snap_concurrency = env.gateway_server.quota().check_and_acquire(0);
+    assert!(
+        snap_concurrency.is_ok(),
+        "Second request must be able to acquire concurrency slot"
+    );
+    env.gateway_server.quota().release_concurrent();
+
+    // Release the server handler thread.
+    unblock_server_tx
+        .send(())
+        .expect("unblock server handler thread");
+
+    common::join_within(mock_handle);
+
+    // Verify deltas and timestamps passed through correctly
+    let guest_unix = env.t_clock.unix_timestamp();
+    assert!(
+        common::contains_guest_unix_created_at(&all_stream_text, guest_unix),
+        "Expected guest timestamp near {guest_unix} in stream: {all_stream_text}"
+    );
+    assert!(all_stream_text.contains("Hello world"));
+    assert!(all_stream_text.contains("event: message_stop"));
 }

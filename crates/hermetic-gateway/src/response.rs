@@ -872,6 +872,9 @@ impl<R: Read> SanitizingSseReader<R> {
 
 impl<R: Read> Read for SanitizingSseReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.is_cancelled() {
             return Err(client_gone());
         }

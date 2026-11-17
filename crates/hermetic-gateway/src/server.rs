@@ -207,6 +207,9 @@ pub struct GatewayServer {
     /// Real-date sentinel (D12) over agent requests and forwarded upstream responses.
     sentinel: Arc<DateSentinel>,
     sentinel_persist: Arc<Mutex<()>>,
+    /// Test seam: invoked after `request.respond` returns on a streaming response,
+    /// before `slot.record_and_release()` runs in the handler thread.
+    post_stream_respond_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GatewayServer {
@@ -303,6 +306,7 @@ impl GatewayServer {
             stream_total_deadline: STREAM_TOTAL_WRITE_DEADLINE,
             sentinel,
             sentinel_persist: Arc::new(Mutex::new(())),
+            post_stream_respond_hook: None,
         })
     }
 
@@ -397,6 +401,13 @@ impl GatewayServer {
     /// Replaces the sentinel itself (tests use a small byte cap).
     pub fn with_date_sentinel_instance(mut self, sentinel: DateSentinel) -> Self {
         self.sentinel = Arc::new(sentinel);
+        self
+    }
+
+    /// Test seam: runs `hook` immediately after `request.respond` returns on a streaming
+    /// response, before `slot.record_and_release()` runs in the handler thread.
+    pub fn with_post_stream_respond_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.post_stream_respond_hook = Some(hook);
         self
     }
 
@@ -1080,6 +1091,9 @@ impl GatewayServer {
                     h.set(Some(first.min(overall_end)));
                 }
                 let _ = request.respond(tiny_response);
+                if let Some(hook) = &self.post_stream_respond_hook {
+                    hook();
+                }
                 let _ = slot.record_and_release();
 
                 self.log_entry(&HostLogEntry {
