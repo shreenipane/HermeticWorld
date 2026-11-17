@@ -612,6 +612,7 @@ version = "0.1.0"
 dependencies = [
  "hermetic-extract",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -779,7 +780,9 @@ name = "hermetic-vmm"
 version = "0.1.0"
 dependencies = [
  "hermetic-common",
+ "hermetic-extract",
  "hermetic-netvm-core",
+ "hermetic-run",
  "rustix",
  "serde",
  "serde_json",

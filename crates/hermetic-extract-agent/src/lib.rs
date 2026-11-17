@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod init;
 pub mod stream;
 pub mod walk;
 
@@ -142,50 +143,20 @@ pub enum TaskClass {
 /// Parses a CLI `--class` specification (`patch:REPO`, `patch:` for the tree root,
 /// `artifact:P1,P2`, or `state`).
 pub fn parse_task_class(spec: &str) -> Result<TaskClass, ExtractError> {
-    if spec == "state" {
-        return Ok(TaskClass::State);
-    }
-    if let Some(repo) = spec.strip_prefix("patch:") {
-        // The tree root is spelled as the empty string (`patch:`), matching the host
-        // validator's `repo_dir: ""`. Any other spelling of the root is refused.
-        if repo == "." || repo == "./" || repo == "/" {
-            return Err(ExtractError::InvalidTaskClass {
-                reason: "tree root must be spelled `patch:` (empty repo path), not '.' or '/'",
-            });
-        }
-        if !repo.is_empty() {
-            validate_relative_path(repo)?;
-        }
-        return Ok(TaskClass::Patch {
-            repo_dir: repo.to_string(),
+    use hermetic_extract::config::TaskClassSpec;
+    if spec.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ExtractError::InvalidTaskClass {
+            reason: "task class must not contain whitespace or control characters",
         });
     }
-    if let Some(list) = spec.strip_prefix("artifact:") {
-        if list.is_empty() {
-            return Err(ExtractError::InvalidTaskClass {
-                reason: "artifact path list must not be empty",
-            });
-        }
-        let mut paths = Vec::new();
-        for (idx, raw) in list.split(',').enumerate() {
-            if idx >= MAX_DECLARED_PATHS {
-                return Err(ExtractError::InvalidTaskClass {
-                    reason: "too many declared artifact paths",
-                });
-            }
-            if raw.is_empty() {
-                return Err(ExtractError::InvalidTaskClass {
-                    reason: "artifact path entry must not be empty",
-                });
-            }
-            validate_relative_path(raw)?;
-            paths.push(raw.to_string());
-        }
-        return Ok(TaskClass::Artifact { paths });
+    match hermetic_extract::config::parse_task_class_spec(spec) {
+        Ok(TaskClassSpec::Patch { repo_dir }) => Ok(TaskClass::Patch { repo_dir }),
+        Ok(TaskClassSpec::Artifact { paths }) => Ok(TaskClass::Artifact { paths }),
+        Ok(TaskClassSpec::State) => Ok(TaskClass::State),
+        Err(_) => Err(ExtractError::InvalidTaskClass {
+            reason: "expected patch:REPO, artifact:P1,P2, or state",
+        }),
     }
-    Err(ExtractError::InvalidTaskClass {
-        reason: "expected patch:REPO, artifact:P1,P2, or state",
-    })
 }
 
 /// Validates a normalized relative UTF-8 `/`-separated path without `.` or `..` components.
@@ -209,7 +180,10 @@ pub fn validate_relative_path(path: &str) -> Result<(), ExtractError> {
             reason: "path must be relative without leading or trailing slash",
         });
     }
-    if path.contains('\0') || path.contains('\\') {
+    if path.contains('\0')
+        || path.contains('\\')
+        || path.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(ExtractError::InvalidPath {
             path: path.to_string(),
             reason: "path contains forbidden character",

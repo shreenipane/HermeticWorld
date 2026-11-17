@@ -2,6 +2,7 @@
 //! Stream format and host-side validator for hermetic-extract (TR-EXT-5, TR-EXT-6).
 
 pub mod config;
+pub mod disk;
 pub mod error;
 pub mod format;
 pub mod report;

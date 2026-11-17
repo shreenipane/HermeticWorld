@@ -67,7 +67,7 @@ pub struct Limits {
     pub file_size_bytes: u64,
     pub open_files: u32,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JailConfig {
     pub base: String,

@@ -10,6 +10,8 @@ dev-unjailed = []
 
 [dependencies]
 hermetic-common = { workspace = true }
+hermetic-extract = { path = "../hermetic-extract" }
+hermetic-run = { path = "../hermetic-run" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event", "mount", "thread"] }

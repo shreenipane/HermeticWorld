@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Bounded, descriptor-pinned microVM orchestration. No guest filesystem is mounted.
 pub mod api;
+pub mod extractor;
 pub mod fs;
 pub mod lifecycle;
 pub mod pin;
@@ -8,6 +9,11 @@ pub mod plan;
 pub mod runner;
 pub mod spec;
 
+pub use extractor::{
+    create_fresh_output_drive, create_overlay_cow_copy, extractor_spec, fallback_chunked_copy,
+    generate_run_nonce, read_extractor_output, ExtractorError, ExtractorVmConfig,
+    DEFAULT_OUTPUT_DRIVE_BYTES, MAX_OUTPUT_DRIVE_BYTES, MAX_OVERLAY_COPY_BYTES,
+};
 pub use lifecycle::{State, Vmm};
 pub use plan::{api_requests, jail_plan, ApiRequest, JailPlan};
 pub use spec::{ValidatedSpec, VmSpec};

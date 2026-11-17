@@ -662,6 +662,166 @@ fn boots_grader_and_collects_result_drive() {
     }
 }
 
+/// Boots an extractor image with `init=/sbin/hermetic-extract-init` (no vsock, no
+/// network), mounts base read-only and overlay CoW read-write, executes in-guest
+/// walk and stream, and writes the output drive, which the host validates with
+/// `read_extractor_output`.
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and an extractor image; see README"]
+fn boots_extractor_and_collects_output_drive() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        let mut vars = Vec::new();
+        for name in [
+            "HERMETIC_FC_BIN",
+            "HERMETIC_KERNEL",
+            "HERMETIC_EXTRACT_ROOTFS",
+            "HERMETIC_EXTRACT_BASE",
+            "HERMETIC_EXTRACT_OVERLAY_COW",
+            "HERMETIC_EXTRACT_OUTPUT",
+        ] {
+            match std::env::var(name) {
+                Ok(value) => vars.push(value),
+                Err(_) => {
+                    eprintln!("skipped: set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_EXTRACT_ROOTFS, HERMETIC_EXTRACT_BASE, HERMETIC_EXTRACT_OVERLAY_COW and HERMETIC_EXTRACT_OUTPUT");
+                    return;
+                }
+            }
+        }
+        let task_class = std::env::var("HERMETIC_EXTRACT_TASK").unwrap_or_else(|_| "patch:".into());
+
+        let f = support::Fixture::new();
+        let fc_bin = vars[0].clone();
+        let kernel_bin = vars[1].clone();
+        let rootfs = vars[2].clone();
+        let base_drive = vars[3].clone();
+        let overlay_cow = vars[4].clone();
+        let output_out = vars[5].clone();
+
+        let output_drive_path = std::path::PathBuf::from(&output_out);
+        if let Some(parent) = output_drive_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&output_drive_path);
+        hermetic_vmm::extractor::create_fresh_output_drive(&output_drive_path, 16 * 1024 * 1024)
+            .expect("create fresh output drive");
+
+        let run_nonce = hermetic_vmm::extractor::generate_run_nonce().expect("generate run nonce");
+
+        if std::env::var_os("HERMETIC_FIRECRACKER_LOCK").is_none() {
+            let candidate = std::path::PathBuf::from(format!("{fc_bin}.lock.json"));
+            if candidate.is_file() {
+                std::env::set_var("HERMETIC_FIRECRACKER_LOCK", &candidate);
+            } else if let Ok(home) = std::env::var("HOME") {
+                let default_lock = std::path::PathBuf::from(home)
+                    .join(".hermetic/fcbuild/out/patched/firecracker.lock.json");
+                if default_lock.is_file() {
+                    std::env::set_var("HERMETIC_FIRECRACKER_LOCK", &default_lock);
+                }
+            }
+        }
+
+        let mut jail = f.spec.jail.clone();
+        jail.firecracker = fc_bin;
+
+        let config = hermetic_vmm::extractor::ExtractorVmConfig {
+            vm_id: "extractor-vm-guest".into(),
+            index: 0,
+            extractor_image: rootfs,
+            kernel_image: kernel_bin,
+            base_drive,
+            overlay_cow_drive: overlay_cow,
+            output_drive: output_drive_path.to_str().unwrap().to_string(),
+            task_class,
+            run_nonce,
+            t_clock: 1700000000,
+            vcpus: 2,
+            memory_mib: 1024,
+            cpu_template: f.spec.cpu_template.clone(),
+            jail,
+        };
+
+        let spec = hermetic_vmm::extractor::extractor_spec(&config).expect("valid extractor spec");
+        let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+        let mut vm = Vmm::new(spec.validate().unwrap(), runner);
+
+        let print_diagnostics = |runner: &hermetic_vmm::runner::DevUnjailed, step: &str| {
+            let (serial, errors) = runner.console_output();
+            eprintln!("extractor serial: {step} failed; console follows");
+            let serial_str = String::from_utf8_lossy(&serial);
+            for line in serial_str.lines() {
+                eprintln!("extractor serial: {line}");
+            }
+            let error_str = String::from_utf8_lossy(&errors);
+            for line in error_str.lines() {
+                eprintln!("extractor serial: stderr: {line}");
+                eprintln!("extractor stderr: {line}");
+            }
+        };
+
+        if let Err(e) = vm.prepare(Duration::from_secs(120)) {
+            print_diagnostics(vm.runner(), "prepare");
+            panic!("prepare failed: {e:?}");
+        }
+        if let Err(e) = vm.start(Duration::from_secs(10)) {
+            print_diagnostics(vm.runner(), "start");
+            panic!("start failed: {e:?}");
+        }
+        if let Err(e) = vm.wait_ready(Duration::from_secs(30)) {
+            print_diagnostics(vm.runner(), "wait_ready");
+            panic!("wait_ready failed: {e:?}");
+        }
+        let exit = vm.wait_exit(Duration::from_secs(300));
+        if let Err(ref e) = exit {
+            print_diagnostics(vm.runner(), "wait_exit");
+            panic!("wait_exit failed: {e:?}");
+        }
+        exit.expect("extractor VM did not power off");
+
+        let drive = vm.jail().unwrap().root.descriptor_path("drive-output");
+        let base_dir = std::env::var("HERMETIC_EXTRACT_BASE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| f.temp.path().join("base"));
+        let out_dir = f.temp.path().join("published");
+        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        let extract_config = hermetic_extract::config::ExtractConfig::default();
+        let outcome = hermetic_vmm::extractor::read_extractor_output(
+            std::path::Path::new(&drive),
+            &config.run_nonce,
+            &base_dir,
+            &out_dir,
+            hermetic_extract::config::TaskClass::Patch,
+            &extract_config,
+        )
+        .expect("valid extractor output");
+        eprintln!(
+            "extractor outcome: patch_digest={} tamper_evidence={:?}",
+            outcome.patch_digest, outcome.tamper_evidence
+        );
+
+        let drive_bytes = std::fs::read(&drive).unwrap();
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&output_drive_path)
+            .unwrap();
+        out.write_all(&drive_bytes).unwrap();
+
+        if let Err(e) = vm.destroy(Duration::from_secs(10)) {
+            print_diagnostics(vm.runner(), "destroy");
+            panic!("destroy failed: {e:?}");
+        }
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: build with --features dev-unjailed");
+    }
+}
+
 #[test]
 fn grader_exit_timeout_retains_bounded_serial_and_errors_after_cleanup() {
     let mut report = Vec::new();

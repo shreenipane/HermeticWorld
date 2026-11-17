@@ -11,10 +11,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 libc.workspace = true
+rustix = { version = "=1.1.6", features = ["fs", "mount", "process", "system"] }
+hermetic-extract = { path = "../hermetic-extract" }
 
 [dev-dependencies]
 tempfile = "3"
-# Host validator, used only by the cross-crate format compatibility tests.
-hermetic-extract = { path = "../hermetic-extract" }
+
+[[bin]]
+name = "hermetic-extract-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "hermetic-extract-init"
+path = "src/bin/hermetic_extract_init.rs"
 
 

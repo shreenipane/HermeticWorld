@@ -114,6 +114,21 @@ def main(argv: list[str] | None = None) -> int:
         "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
     )
 
+    build_extractor_parser = subparsers.add_parser("build-extractor-image", help="Build ExtractorVM rootfs image with D4 guard")
+    build_extractor_parser.add_argument("--tree", type=Path, required=True, help="Path for extractor rootfs tree")
+    build_extractor_parser.add_argument("--out", type=Path, required=True, help="Output image file")
+    build_extractor_parser.add_argument("--extractor-bin", type=Path, required=True, help="Path to static hermetic-extract-init binary")
+    build_extractor_parser.add_argument("--t-clock", required=True, help="Clock cutoff in RFC 3339 / ISO 8601")
+    build_extractor_parser.add_argument("--world-id", required=True, help="World identifier")
+    build_extractor_parser.add_argument("--agent-bin", type=Path, default=None, help="Optional path to hermetic-extract-agent binary")
+    build_extractor_parser.add_argument("--sealcheck-bin", type=Path, default=None, help="Path to sealcheck binary")
+    build_extractor_parser.add_argument("--kernel-lock", type=Path, default=Path(__file__).absolute().parent.parent.parent / "images/kernel/kernel.lock.json")
+    build_extractor_parser.add_argument("--kernel-image", type=Path, help="Matching kernel image for exact substrate dates")
+    build_extractor_parser.add_argument("--clockprobe-bin", type=Path, help="Offline substrate date extractor")
+    build_extractor_parser.add_argument(
+        "--work-dir", type=Path, default=None, help="Directory for the private work directory (default: system temp)"
+    )
+
     kernel_check = subparsers.add_parser("kernel-check-config", help="Check final guest kernel config")
     kernel_check.add_argument("--config", type=Path, required=True)
     kernel_build = subparsers.add_parser("kernel-build", help="Build pinned guest kernel offline")
@@ -661,6 +676,37 @@ def main(argv: list[str] | None = None) -> int:
                 t_clock=t_clock,
                 world_id=args.world_id,
                 size_mib=args.size_mib,
+                sealcheck_bin=args.sealcheck_bin,
+                work_dir=args.work_dir,
+                kernel_lock=args.kernel_lock,
+                kernel_image=args.kernel_image,
+                clockprobe_bin=args.clockprobe_bin,
+            )
+            print(json.dumps(res, indent=2))
+            return 0
+        except RootfsGateError as exc:
+            print(f"Rootfs gate error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "build-extractor-image":
+        from hermetic_slice.extractor import build_extractor_image
+        from hermetic_slice.rootfs import RootfsGateError
+
+        try:
+            t_clock = datetime.fromisoformat(args.t_clock)
+            if t_clock.tzinfo is None or t_clock.tzinfo.utcoffset(t_clock) is None:
+                raise ValueError(f"--t-clock must be timezone-aware: {args.t_clock}")
+            t_clock = t_clock.astimezone(timezone.utc)
+            res = build_extractor_image(
+                tree=args.tree,
+                out_image=args.out,
+                extractor_bin=args.extractor_bin,
+                t_clock=t_clock,
+                world_id=args.world_id,
+                agent_bin=args.agent_bin,
                 sealcheck_bin=args.sealcheck_bin,
                 work_dir=args.work_dir,
                 kernel_lock=args.kernel_lock,

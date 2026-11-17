@@ -261,6 +261,11 @@ fn run() -> Result<(), CliError> {
 }
 
 fn main() -> ExitCode {
+    if env::args_os().any(|a| a == "--init") {
+        let mut sys = hermetic_extract_agent::init::LinuxExtractorSys::new();
+        let _ = hermetic_extract_agent::init::run_extractor_init(&mut sys, None);
+        return ExitCode::FAILURE;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError::HelpRequested) => {

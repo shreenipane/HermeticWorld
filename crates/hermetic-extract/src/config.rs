@@ -20,6 +20,103 @@ pub enum TaskClass {
     State,
 }
 
+/// Parsed benchmark task class specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskClassSpec {
+    /// Extract changes within a repository directory (`""` denotes the tree root).
+    Patch { repo_dir: String },
+    /// Extract changes only for explicitly declared relative paths.
+    Artifact { paths: Vec<String> },
+    /// Extract nothing (produces a valid header + empty end record).
+    State,
+}
+
+impl TaskClassSpec {
+    pub fn class_kind(&self) -> TaskClass {
+        match self {
+            TaskClassSpec::Patch { .. } => TaskClass::Patch,
+            TaskClassSpec::Artifact { .. } => TaskClass::Artifact,
+            TaskClassSpec::State => TaskClass::State,
+        }
+    }
+}
+
+/// Validates a relative path for task class specifications.
+fn validate_spec_relative_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if path.len() > 4096 {
+        return Err("path exceeds maximum length of 4096 bytes".into());
+    }
+    if path.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("path contains whitespace or control characters".into());
+    }
+    if path.starts_with('/') || path.ends_with('/') {
+        return Err("path must be relative without leading or trailing slash".into());
+    }
+    if path.contains('\0') || path.contains('\\') {
+        return Err("path contains forbidden character".into());
+    }
+    let mut depth: usize = 0;
+    for seg in path.split('/') {
+        depth = depth.saturating_add(1);
+        if depth > 32 {
+            return Err("path depth exceeds limit of 32".into());
+        }
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err("path contains empty, '.', or '..' segment".into());
+        }
+    }
+    Ok(())
+}
+
+/// Parses and validates a task class specification string (`patch:REPO`, `patch:` for the tree root,
+/// `artifact:P1,P2`, or `state`).
+///
+/// Refuses whitespace, control characters, leading/trailing slashes, and traversal sequences.
+pub fn parse_task_class_spec(spec: &str) -> Result<TaskClassSpec, String> {
+    if spec.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("task class must not contain whitespace or control characters".into());
+    }
+    if spec == "state" {
+        return Ok(TaskClassSpec::State);
+    }
+    if let Some(repo) = spec.strip_prefix("patch:") {
+        if repo == "." || repo == "./" || repo == "/" {
+            return Err(
+                "tree root must be spelled `patch:` (empty repo path), not '.' or '/'".into(),
+            );
+        }
+        if !repo.is_empty() {
+            validate_spec_relative_path(repo)?;
+        }
+        return Ok(TaskClassSpec::Patch {
+            repo_dir: repo.to_string(),
+        });
+    }
+    if let Some(list) = spec.strip_prefix("artifact:") {
+        if list.is_empty() {
+            return Err("artifact path list must not be empty".into());
+        }
+        let mut paths = Vec::new();
+        for (idx, raw) in list.split(',').enumerate() {
+            if idx >= 64 {
+                return Err("too many declared artifact paths (limit 64)".into());
+            }
+            if raw.is_empty() {
+                return Err("artifact path entry must not be empty".into());
+            }
+            validate_spec_relative_path(raw)?;
+            paths.push(raw.to_string());
+        }
+        return Ok(TaskClassSpec::Artifact { paths });
+    }
+    Err(format!(
+        "invalid task class specification '{spec}': expected 'patch:REPO', 'artifact:P1,P2', or 'state'"
+    ))
+}
+
 impl FromStr for TaskClass {
     type Err = String;
 
