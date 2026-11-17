@@ -502,16 +502,10 @@ impl LogManager {
             return false;
         }
         let req_bytes = est_line_bytes.saturating_mul(2);
-        if self
-            .log_bytes
+        self.log_bytes
             .saturating_add(req_bytes)
             .saturating_add(TERMINAL_RESERVE_LOG_BYTES)
-            > MAX_LOG_BYTES
-        {
-            return false;
-        }
-
-        true
+            <= MAX_LOG_BYTES
     }
 
     fn directory(&self) -> io::Result<Directory> {

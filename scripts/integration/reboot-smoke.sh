@@ -43,8 +43,10 @@ from hermetic_slice.initramfs import build_initramfs
 print(build_initramfs(sys.argv[2] + '/hermetic-execd', sys.argv[2] + '/hermetic-init', sys.argv[3], 1700000000))
 PY
 )"
-export HERMETIC_FC_BIN="${HERMETIC_FC_BIN:-$HOME/.hermetic/tools/firecracker-1.18.0/firecracker}"
-export HERMETIC_KERNEL="${HERMETIC_KERNEL:-$HOME/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
+# The VMM refuses symlinked path components; resolve the tool directory once.
+hermetic_home="${HERMETIC_HOME:-$(readlink -f "$HOME/.hermetic")}"
+export HERMETIC_FC_BIN="${HERMETIC_FC_BIN:-$hermetic_home/tools/firecracker-1.18.0/firecracker}"
+export HERMETIC_KERNEL="${HERMETIC_KERNEL:-$hermetic_home/cache/kernel-out-20261113-6.6b/vmlinux}"
 export HERMETIC_ROOTFS="$WORK/first/rootfs.img"
 export HERMETIC_INITRD="$WORK/trusted.cpio" HERMETIC_INITRD_SHA256="$PIN"
 export HERMETIC_REBOOT_RECORD_OUT="$WORK/reboot-record.json"

@@ -94,20 +94,9 @@ fn test_token_bucket_delays_requests() {
 }
 
 fn bin_path() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current exe");
-    p.pop(); // deps
-    p.pop(); // debug
-    p.push("hermetic-world-server");
-    if p.exists() {
-        return p;
-    }
-    // Search in cargo target dir
-    let target =
-        PathBuf::from("/home/flingboot/hermetic/cargo-target/t2.1/debug/hermetic-world-server");
-    if target.exists() {
-        return target;
-    }
-    panic!("hermetic-world-server binary not found at {:?}", p);
+    // Cargo builds the package's binaries for its integration tests and names
+    // the exact path; no search through target-directory layouts.
+    PathBuf::from(env!("CARGO_BIN_EXE_hermetic-world-server"))
 }
 
 #[test]

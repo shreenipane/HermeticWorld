@@ -670,7 +670,8 @@ fn run_d4_image(args: D4ImageArgs) -> Result<ExitCode, Box<dyn std::error::Error
                 hunk: None,
                 evidence: vec![error.to_string()],
             };
-            write_report(
+            // The report is written for the record; the scan error decides the exit.
+            let _report_exit = write_report(
                 vec![finding],
                 None,
                 image_name,
