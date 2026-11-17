@@ -13,7 +13,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
 | 1: sealcheck | done 42 of 48 |
-| 2: World | done 27 of 44 |
+| 2: World | done 28 of 44 |
 | 3: VMs | done 26 of 48 |
 | 3b: Clock hiding | done 18 of 20 |
 | 4: Extensions | done 28 of 39 |
@@ -147,7 +147,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [ ] remaining: Package world (TR-PKG-*)
   - [ ] remaining: Layer 1: recording index for the task closure (pip, uv, conda via pixi)
   - [x] Yanked-release handling: `python/hermetic_yank` rewrites PEP 691 pages, and the frozen package index now takes the historical yank table (`build_index(yank_times=...)`, `build-index --yank-table`): a file yanked at or before the cutoff is served with PEP 592 `data-yanked` (no reason text), one yanked later is served unmarked, and a file yanked today without history is reported as `yank_unknown`, never guessed (2026-11-15). Proof: `test_historical_yanks_are_served_as_of_the_cutoff`, `test_without_a_yank_table_nothing_is_marked_and_current_yanks_are_unknown`, `test_invalid_yank_tables_are_refused`, `test_build_index_cli_refuses_a_hostile_yank_table`. Remaining for the package world: a source for the historical yank table (PyPI exposes only current yank state)
-  - [ ] remaining: Layer 2: ecosystem baseline per cutoff month; measure its storage
+  - [x] Layer 2: ecosystem baseline per cutoff month; measure its storage (TR-PKG-4): `python/hermetic_pkgbase` implements validated spec parsing, transitive closure planning at the cutoff with cycle handling and named caps, deterministic canonical JSON plans, storage measurement, and a content-addressed store builder compatible with `hermetic_pkgindex` `FrozenStore` with SHA-256 verification and frozen baseline immutability. Proof: `test_transitive_closure_with_cycle_and_post_cutoff_dependency`, `test_planner_caps`, `test_planner_determinism`, `test_storage_measurement`, `test_builder_hash_mismatch_refused`, `test_frozen_baseline_immutability`, `test_compatibility_with_hermetic_pkgindex_frozen_store` (`python/tests/test_pkgbase.py`).
   - [ ] remaining: apt snapshots where available
 - [ ] remaining: Ecosystems: PyPI, conda, Debian/Ubuntu, git dependencies (static mirrors)
 - [ ] remaining: `strict` class B rebuild, with `repo_only` fallback and labelling
