@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use hermetic_attest::{
-    AgentMode, ClockLevel, Deployment, Digest, GraderIsolation, GradingRunResult, ProbeResult,
-    RunRecord, RunStatus, SealLevel, SignatureError, Signer, SubstrateAtT, TaskClass, Verifier,
-    VersionTuple,
+    AgentMode, ClockLevel, Deployment, Digest, GraderIsolation, GradingRunResult, HostBootRecord,
+    ProbeResult, RunRecord, RunStatus, SealLevel, SignatureError, Signer, SubstrateAtT, TaskClass,
+    Verifier, VersionTuple,
 };
 use sha2::{Digest as Sha2Digest, Sha256};
 
@@ -21,7 +21,7 @@ pub fn sample_run_record() -> RunRecord {
         base_commit: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
         pkg_cutoff: None,
         version_tuple: VersionTuple {
-            spec_version: "v1.0".to_string(),
+            spec_version: "v1.1".to_string(),
             world_version: Digest::parse(
                 "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
@@ -107,7 +107,23 @@ pub fn sample_run_record() -> RunRecord {
         date_leak_observed: false,
         unclean_shutdown: false,
         tee_quote: None,
+        boot_record: Some(HostBootRecord {
+            boot_path: "trusted_initramfs".to_string(),
+            initrd_digest: Some(
+                Digest::parse(
+                    "sha256:f123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+        }),
     }
+}
+
+pub fn sample_v1_0_run_record() -> RunRecord {
+    let mut record = sample_run_record();
+    record.version_tuple.spec_version = "v1.0".to_string();
+    record.boot_record = None;
+    record
 }
 
 pub struct DeterministicTestSigner {

@@ -50,6 +50,9 @@ pub enum RunValidationError {
     },
     InvalidField(&'static str),
     WorldVersionMismatch,
+    MissingBootRecord,
+    BootRecordVersionMismatch,
+    InvalidBootRecord(&'static str),
 }
 
 impl fmt::Display for RunValidationError {
@@ -118,6 +121,13 @@ impl fmt::Display for RunValidationError {
             } => {
                 write!(f, "Mismatch between task_class '{task_class:?}' and grader_isolation '{grader_isolation:?}'")
             }
+            Self::MissingBootRecord => {
+                write!(f, "boot_record is required for spec_version >= v1.1")
+            }
+            Self::BootRecordVersionMismatch => {
+                write!(f, "boot_record must not be present in spec_version v1.0")
+            }
+            Self::InvalidBootRecord(msg) => write!(f, "Invalid boot_record: {msg}"),
         }
     }
 }
@@ -220,6 +230,58 @@ pub struct TeeQuote {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HostBootRecord {
+    pub boot_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initrd_digest: Option<Digest>,
+}
+
+pub type BootRecord = HostBootRecord;
+
+impl HostBootRecord {
+    pub fn sealed_disk() -> Self {
+        Self {
+            boot_path: "sealed_disk".to_string(),
+            initrd_digest: None,
+        }
+    }
+
+    pub fn trusted_initramfs(initrd_digest: Digest) -> Self {
+        Self {
+            boot_path: "trusted_initramfs".to_string(),
+            initrd_digest: Some(initrd_digest),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RunValidationError> {
+        if !valid_record_text(&self.boot_path) {
+            return Err(RunValidationError::InvalidBootRecord("invalid boot_path"));
+        }
+        match self.boot_path.as_str() {
+            "sealed_disk" => {
+                if self.initrd_digest.is_some() {
+                    return Err(RunValidationError::InvalidBootRecord(
+                        "sealed_disk must not carry initrd_digest",
+                    ));
+                }
+            }
+            "trusted_initramfs" => {
+                if self.initrd_digest.is_none() {
+                    return Err(RunValidationError::InvalidBootRecord(
+                        "trusted_initramfs requires initrd_digest",
+                    ));
+                }
+            }
+            _ => {
+                return Err(RunValidationError::InvalidBootRecord("unknown boot_path"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VersionTuple {
     pub spec_version: String,
     pub world_version: Digest,
@@ -307,6 +369,10 @@ pub struct RunRecord {
     // Optional TEE quote
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tee_quote: Option<TeeQuote>,
+
+    // Optional Host Boot Record (versioned field: required for spec_version >= v1.1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_record: Option<HostBootRecord>,
 }
 
 impl RunRecord {
@@ -491,6 +557,21 @@ impl RunRecord {
                         grader_isolation: self.grader_isolation,
                     });
                 }
+            }
+        }
+
+        // 8. Boot record version gate
+        match self.version_tuple.spec_version.as_str() {
+            "v1.0" => {
+                if self.boot_record.is_some() {
+                    return Err(RunValidationError::BootRecordVersionMismatch);
+                }
+            }
+            _ => {
+                let Some(ref boot) = self.boot_record else {
+                    return Err(RunValidationError::MissingBootRecord);
+                };
+                boot.validate()?;
             }
         }
 

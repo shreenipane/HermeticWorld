@@ -1,6 +1,8 @@
 mod common;
-use common::sample_run_record;
-use hermetic_attest::{compute_run_digest, to_canonical_json_bytes, Digest, RunRecord};
+use common::{sample_run_record, sample_v1_0_run_record};
+use hermetic_attest::{
+    compute_run_digest, to_canonical_json_bytes, Digest, HostBootRecord, RunRecord,
+};
 
 #[test]
 fn test_known_answer_run_digest() {
@@ -13,6 +15,22 @@ fn test_known_answer_run_digest() {
     assert_eq!(digest, sha256_expected);
 
     // Hardcoded known-answer digest check to prevent silent format drift
+    assert_eq!(
+        digest.as_str(),
+        "sha256:276890036858a059aa3a9fa90866df7d47345bca5011e77a340227aeb917b9a2"
+    );
+}
+
+#[test]
+fn test_known_answer_v1_0_run_digest() {
+    let record = sample_v1_0_run_record();
+    let digest = compute_run_digest(&record).expect("compute digest");
+
+    let canonical_bytes = to_canonical_json_bytes(&record).expect("canonical bytes");
+    let sha256_expected = Digest::from_sha256(&canonical_bytes);
+    assert_eq!(digest, sha256_expected);
+
+    // Old v1.0 records without boot_record keep their exact known-answer digest
     assert_eq!(
         digest.as_str(),
         "sha256:8f6dbdb819c5ddf82272a6245e128700869f671e2546eb82fbfc8acf6657f998"
@@ -91,5 +109,10 @@ fn test_single_field_changes_alter_digest() {
     // 7. exemption_list changed
     let mut mut_record = base.clone();
     mut_record.exemption_list = vec!["pkg-a".to_string(), "pkg-c".to_string()];
+    assert_ne!(base_digest, compute_run_digest(&mut_record).unwrap());
+
+    // 8. boot_record changed
+    let mut mut_record = base.clone();
+    mut_record.boot_record = Some(HostBootRecord::sealed_disk());
     assert_ne!(base_digest, compute_run_digest(&mut_record).unwrap());
 }

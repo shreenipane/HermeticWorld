@@ -265,6 +265,7 @@ fn mismatched_world_root_bundle_and_other_bindings_are_rejected() {
         world_bundle: Some(rec.version_tuple.world_version.clone()),
         sealcheck_report_digest: Some(rec.sealcheck_report_digest.clone()),
         grader_image_digest: Some(rec.version_tuple.grader_image_digest.clone()),
+        boot_record: rec.boot_record.clone(),
     };
     verify_run_attestation(&env, &verifier, &good, &mut ReplayGuard::new()).unwrap();
 
@@ -303,6 +304,13 @@ fn mismatched_world_root_bundle_and_other_bindings_are_rejected() {
                 ..good.clone()
             },
             "task_id",
+        ),
+        (
+            RunBinding {
+                boot_record: Some(hermetic_attest::HostBootRecord::sealed_disk()),
+                ..good.clone()
+            },
+            "boot_record",
         ),
     ];
     for (binding, name) in cases {
@@ -474,5 +482,68 @@ fn classifier_from_another_run_is_rejected_even_when_verdicts_match() {
     assert_eq!(
         check_against_classification(&rec, &c).unwrap_err(),
         VerifyError::ClassificationMismatch("run_digest")
+    );
+}
+
+#[test]
+fn old_version_v1_0_record_without_boot_record_still_verifies() {
+    let (signer, verifier) = keys();
+    let old_rec = common::sample_v1_0_run_record();
+    let env = signed_run(old_rec.clone(), &signer);
+    let mut guard = ReplayGuard::new();
+    let binding = RunBinding::default();
+    let (statement, digest) =
+        verify_run_attestation(&env, &verifier, &binding, &mut guard).unwrap();
+    assert_eq!(statement.predicate, old_rec);
+    assert_eq!(
+        digest.as_str(),
+        "sha256:8f6dbdb819c5ddf82272a6245e128700869f671e2546eb82fbfc8acf6657f998"
+    );
+}
+
+#[test]
+fn tampered_boot_record_fails_verification() {
+    let (signer, verifier) = keys();
+    let rec = sample_run_record();
+    let env = signed_run(rec.clone(), &signer);
+
+    // 1. In-place tampering with boot_record in payload fails signature verification
+    let mut payload = payload_of(&env);
+    payload["predicate"]["boot_record"]["boot_path"] = Value::from("sealed_disk");
+    let mut v: Value = serde_json::from_str(&env).unwrap();
+    v["payload"] = Value::from(base64_encode(&serde_json::to_vec(&payload).unwrap()));
+    assert!(matches!(
+        verify(&v.to_string(), &verifier),
+        Err(VerifyError::Envelope(DsseError::SignatureVerification(_)))
+    ));
+
+    // 2. Tampered boot_record re-signed raw fails schema validation
+    let mut invalid_payload = payload_of(&env);
+    invalid_payload["predicate"]["boot_record"]["boot_path"] = Value::from("untrusted");
+    assert!(verify(&sign_raw_payload(&invalid_payload, &signer), &verifier).is_err());
+
+    // 3. Sealed disk carrying initrd_digest re-signed raw fails validation
+    let mut invalid_payload2 = payload_of(&env);
+    invalid_payload2["predicate"]["boot_record"]["boot_path"] = Value::from("sealed_disk");
+    // (still carries initrd_digest from sample_run_record)
+    assert!(verify(&sign_raw_payload(&invalid_payload2, &signer), &verifier).is_err());
+
+    // 4. Missing boot_record in v1.1 re-signed raw fails validation
+    let mut missing_boot = payload_of(&env);
+    missing_boot["predicate"]
+        .as_object_mut()
+        .unwrap()
+        .remove("boot_record");
+    assert!(verify(&sign_raw_payload(&missing_boot, &signer), &verifier).is_err());
+
+    // 5. Mismatched boot_record in binding fails verification
+    let binding = RunBinding {
+        boot_record: Some(hermetic_attest::HostBootRecord::sealed_disk()),
+        ..Default::default()
+    };
+    let mut guard = ReplayGuard::new();
+    assert_eq!(
+        verify_run_attestation(&env, &verifier, &binding, &mut guard).unwrap_err(),
+        VerifyError::BindingMismatch("boot_record")
     );
 }

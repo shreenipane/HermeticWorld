@@ -717,8 +717,13 @@ dependencies = [
 name = "hermetic-run"
 version = "0.1.0"
 dependencies = [
+ "hermetic-attest",
+ "hermetic-sealcheck",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

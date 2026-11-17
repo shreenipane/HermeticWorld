@@ -39,9 +39,9 @@ pub use dsse::{
 };
 pub use fs::{safe_atomic_write_file, safe_read_file, FsError};
 pub use run::{
-    AgentMode, ClockLevel, Deployment, GraderIsolation, GradingRunResult, ProbeResult, RunRecord,
-    RunStatus, RunValidationError, SealLevel, SubstrateAtT, TaskClass, TeePlatform, TeeQuote,
-    VersionTuple, MAX_RUN_RECORD_SIZE,
+    AgentMode, BootRecord, ClockLevel, Deployment, GraderIsolation, GradingRunResult,
+    HostBootRecord, ProbeResult, RunRecord, RunStatus, RunValidationError, SealLevel, SubstrateAtT,
+    TaskClass, TeePlatform, TeeQuote, VersionTuple, MAX_RUN_RECORD_SIZE,
 };
 pub use score_card::{
     generate_score_card, ExcludedTask, RepairedTask, ScoreCard, ScoreCardError,

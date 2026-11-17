@@ -284,3 +284,73 @@ fn test_task_id_and_base_commit_validation() {
         Err(RunValidationError::InvalidBaseCommit(_))
     ));
 }
+
+#[test]
+fn test_boot_record_version_gate() {
+    let mut record = sample_run_record();
+    assert_eq!(record.version_tuple.spec_version, "v1.1");
+    assert!(record.boot_record.is_some());
+    assert!(record.validate().is_ok());
+
+    // v1.1 requires boot_record
+    record.boot_record = None;
+    assert_eq!(
+        record.validate(),
+        Err(RunValidationError::MissingBootRecord)
+    );
+
+    // v1.0 without boot_record validates
+    record.version_tuple.spec_version = "v1.0".to_string();
+    assert!(record.validate().is_ok());
+
+    // v1.0 carrying boot_record is rejected
+    record.boot_record = Some(hermetic_attest::HostBootRecord::sealed_disk());
+    assert_eq!(
+        record.validate(),
+        Err(RunValidationError::BootRecordVersionMismatch)
+    );
+}
+
+#[test]
+fn test_boot_record_validation_and_tampering() {
+    let mut record = sample_run_record();
+
+    // Valid sealed_disk
+    record.boot_record = Some(hermetic_attest::HostBootRecord::sealed_disk());
+    assert!(record.validate().is_ok());
+
+    // Tampered: unknown boot_path
+    record.boot_record = Some(hermetic_attest::HostBootRecord {
+        boot_path: "untrusted_network".to_string(),
+        initrd_digest: None,
+    });
+    assert!(matches!(
+        record.validate(),
+        Err(RunValidationError::InvalidBootRecord(_))
+    ));
+
+    // Tampered: sealed_disk carrying an initrd_digest
+    record.boot_record = Some(hermetic_attest::HostBootRecord {
+        boot_path: "sealed_disk".to_string(),
+        initrd_digest: Some(
+            Digest::parse(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        ),
+    });
+    assert!(matches!(
+        record.validate(),
+        Err(RunValidationError::InvalidBootRecord(_))
+    ));
+
+    // Tampered: trusted_initramfs missing initrd_digest
+    record.boot_record = Some(hermetic_attest::HostBootRecord {
+        boot_path: "trusted_initramfs".to_string(),
+        initrd_digest: None,
+    });
+    assert!(matches!(
+        record.validate(),
+        Err(RunValidationError::InvalidBootRecord(_))
+    ));
+}

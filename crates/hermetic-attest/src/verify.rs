@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::audit::TranscriptAuditRecord;
 use crate::digest::Digest;
 use crate::dsse::{verify_audit_envelope, verify_run_envelope, DsseError, Statement, Verifier};
-use crate::run::{ClockLevel, RunRecord, RunStatus};
+use crate::run::{ClockLevel, HostBootRecord, RunRecord, RunStatus};
 
 /// Largest replay guard (distinct run digests remembered).
 pub const MAX_REPLAY_ENTRIES: usize = 100_000;
@@ -62,6 +62,7 @@ pub struct RunBinding {
     pub world_bundle: Option<Digest>,
     pub sealcheck_report_digest: Option<Digest>,
     pub grader_image_digest: Option<Digest>,
+    pub boot_record: Option<HostBootRecord>,
 }
 
 impl RunBinding {
@@ -92,7 +93,17 @@ impl RunBinding {
             &self.grader_image_digest,
             &record.version_tuple.grader_image_digest,
             "grader_image_digest",
-        )
+        )?;
+        if let Some(ref want_boot) = self.boot_record {
+            match &record.boot_record {
+                Some(got_boot) if got_boot != want_boot => {
+                    return Err(VerifyError::BindingMismatch("boot_record"));
+                }
+                None => return Err(VerifyError::BindingMismatch("boot_record")),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 

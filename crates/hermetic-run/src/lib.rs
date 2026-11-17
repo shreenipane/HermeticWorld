@@ -2,6 +2,7 @@
 
 pub mod infra;
 pub mod machine;
+pub mod orchestrator;
 pub mod verdict;
 
 use std::cell::RefCell;
@@ -14,6 +15,13 @@ pub use infra::{
     PreparedWorld, ShutdownKind, Step, VmGuard, VmHandle, VmId, VmKind, WorldSpec,
 };
 pub use machine::{FailureReason, RunState, StateMachine, TransitionError};
+pub use orchestrator::{
+    assemble_and_sign_run_record, assemble_run_record, sign_run_record,
+    sign_run_record_with_key_path, write_signed_run_record, BootRecordArtifact, OrchestratorError,
+    VerdictArtifact, WorldManifestArtifact, MAX_BOOT_RECORD_BYTES, MAX_HARNESS_SUMMARY_BYTES,
+    MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES,
+    MAX_VERDICT_BYTES,
+};
 pub use verdict::{
     resolve_status, verdict, verdict_reasons, GraderResults, MutatedTestResult, PairedTestResult,
     R0Result, R1Result, R2Result, R3Result, RunStatus, TestResult, Verdict,

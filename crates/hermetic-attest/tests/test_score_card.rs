@@ -1,5 +1,5 @@
 mod common;
-use common::sample_run_record;
+use common::{sample_run_record, sample_v1_0_run_record};
 use hermetic_attest::{
     generate_score_card, AgentMode, ClockLevel, Digest, ExcludedTask, RepairedTask, RunStatus,
     ScoreCardError, SealLevel, SubstrateAtT, TaskClass, MAX_SCORE_CARD_RECORDS,
@@ -107,17 +107,17 @@ fn test_score_card_empty_records_and_bounds() {
 
 #[test]
 fn test_score_card_counts_and_sorting() {
-    let mut r1 = sample_run_record();
+    let mut r1 = sample_v1_0_run_record();
     r1.run_status = RunStatus::Resolved;
     r1.task_class = TaskClass::Patch;
     r1.substrate_at_t = SubstrateAtT::Full;
 
-    let mut r2 = sample_run_record();
+    let mut r2 = sample_v1_0_run_record();
     r2.run_status = RunStatus::Unresolved;
     r2.task_class = TaskClass::Patch;
     r2.substrate_at_t = SubstrateAtT::Partial;
 
-    let mut r3 = sample_run_record();
+    let mut r3 = sample_v1_0_run_record();
     r3.run_status = RunStatus::Tampered;
     r3.task_class = TaskClass::Artifact;
     r3.substrate_at_t = SubstrateAtT::None;
@@ -202,5 +202,65 @@ fn test_score_card_counts_and_sorting() {
     assert_eq!(
         card_digest.as_str(),
         "sha256:b2c8fb90aa4443323f365e05ed71255391b71b61c8ab2455481d18ac6b7da7ce"
+    );
+}
+
+#[test]
+fn test_score_card_v1_1_known_answer() {
+    let mut r1 = sample_run_record();
+    r1.run_status = RunStatus::Resolved;
+    r1.task_class = TaskClass::Patch;
+    r1.substrate_at_t = SubstrateAtT::Full;
+
+    let mut r2 = sample_run_record();
+    r2.run_status = RunStatus::Unresolved;
+    r2.task_class = TaskClass::Patch;
+    r2.substrate_at_t = SubstrateAtT::Partial;
+
+    let mut r3 = sample_run_record();
+    r3.run_status = RunStatus::Tampered;
+    r3.task_class = TaskClass::Artifact;
+    r3.substrate_at_t = SubstrateAtT::None;
+
+    let excluded = vec![
+        ExcludedTask {
+            task_id: "task-z".to_string(),
+            detector: "D0".to_string(),
+            reason: Some("Problem leak".to_string()),
+        },
+        ExcludedTask {
+            task_id: "task-a".to_string(),
+            detector: "D1".to_string(),
+            reason: None,
+        },
+    ];
+
+    let repaired = vec![
+        RepairedTask {
+            task_id: "task-r2".to_string(),
+            detector: "D0".to_string(),
+            detail: Some("Redacted".to_string()),
+        },
+        RepairedTask {
+            task_id: "task-r1".to_string(),
+            detector: "D2".to_string(),
+            detail: None,
+        },
+    ];
+
+    let card = generate_score_card(
+        "SWE-bench Verified",
+        "2024.1",
+        &[r1, r2, r3],
+        &excluded,
+        &repaired,
+    )
+    .expect("generate card");
+
+    let canonical_json = card.to_canonical_json().expect("canonical json");
+    let card_digest = Digest::from_sha256(canonical_json.as_bytes());
+    assert_eq!(
+        card_digest.as_str(),
+        "sha256:7088589302823224a45132b81798298eac3e1b45dd1eb84a73ecc029ac2b448a"
     );
 }
