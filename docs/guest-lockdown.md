@@ -167,7 +167,10 @@ separate components, as required by TR-VMM-3.
 The pinned patch enforces host MSR/hypercall filtering, a fixed Nehalem/v2 CPUID
 profile and actual TSC scaling on cold boot and restore. Keep `clock: faked`
 until the manager completes multi-vCPU, pause/resume, restore and TSC stability
-tests on the deployment host. The reproducible patched build, nested ring-0
-canary and stock negative control were verified on 2026-11-14. Unsupported hosts fail
+tests on the deployment host. For TSC stability verification, `/sbin/hermetic-clockprobe --read-tsc`
+(and `/sbin/hermetic-tsc-read`) provides a trusted measurement path invoked by execd
+to read the guest TSC, allowing host-side drift verification within `MAX_PERMISSIBLE_DRIFT_PPM`
+via `scripts/integration/tsc-drift-smoke.sh` even if RDTSC is trapped for unprivileged agents.
+The reproducible patched build, nested ring-0 canary and stock negative control were verified on 2026-11-14. Unsupported hosts fail
 closed. See [the source analysis](clock-3b-analysis.md) for the exact profile,
 frequency and substrate timing limits.

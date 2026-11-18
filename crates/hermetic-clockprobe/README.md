@@ -72,6 +72,7 @@ encoded false security conclusions. No pre-existing repository test was changed.
 
 See [guest lockdown policy and manager commands](../../docs/guest-lockdown.md).
 `--lockdown-only` emits just the two lockdown records for execd integration.
+`--read-tsc` (and the static `hermetic-tsc-read` binary) emits `{"tsc": <u64>}` with the raw guest TSC reading. Under Phase 3b clock hiding, RDTSC may be trapped for unprivileged agents; execd invokes this helper as a trusted supervisor measurement path to qualify virtual TSC drift.
 The manager must supply the verified matching config at
 `/etc/hermetic/guest-kernel.config` and mount securityfs first.
 Lockdown config reads are capped at 2 MiB, with 4096-byte lines; live state

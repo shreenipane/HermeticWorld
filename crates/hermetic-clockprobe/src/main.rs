@@ -9,6 +9,20 @@ fn main() {
     let records = match args.as_slice() {
         [] => probes::run_all_probes(),
         [arg] if arg == "--lockdown-only" => lockdown::run(),
+        // Trusted guest measurement path: read the TSC via RDTSC. Under Phase 3b
+        // clock hiding, RDTSC may be trapped for unprivileged agents; execd runs this
+        // trusted helper to measure guest TSC stability and drift against nominal frequency.
+        [arg] if arg == "--read-tsc" || arg == "--tsc" => {
+            let Some(val) = hermetic_clockprobe::read_tsc() else {
+                std::process::exit(1);
+            };
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            if writeln!(handle, "{{\"tsc\":{val}}}").is_err() || handle.flush().is_err() {
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
         [arg] if arg == "--kernel-canary-serial" => {
             let mut serial = Vec::new();
             if io::stdin()

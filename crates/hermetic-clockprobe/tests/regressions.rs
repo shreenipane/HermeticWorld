@@ -32,6 +32,22 @@ fn rtc_hostile_dates_never_panic_or_pass() {
 }
 
 #[test]
+fn read_tsc_returns_value_or_clean_none_on_x86() {
+    let tsc = hermetic_clockprobe::read_tsc();
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(tsc.is_some());
+        let val1 = tsc.unwrap();
+        let val2 = hermetic_clockprobe::read_tsc().unwrap();
+        assert!(val2 >= val1);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        assert!(tsc.is_none());
+    }
+}
+
+#[test]
 fn missing_references_nan_and_incomplete_inputs_fail_closed() {
     for epoch in [
         "hermetic.t=1 hermetic.t=2",

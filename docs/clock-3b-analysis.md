@@ -139,3 +139,18 @@ no probe arguments, exit 0, all 14 records exactly once and blocked, except
 `clock_pairing_hc` may be unavailable. That userspace exception requires the
 separate ring-0 canary before claiming hidden time. The manager's nested full
 probe passed on 2026-11-14; deployment-host validation remains outstanding.
+
+## Guest TSC drift measurement and trusted measurement path
+
+To confirm guest TSC stability without kvmclock, guest-side TSC readings are sampled
+over at least 30 seconds of host elapsed time and tracked against the 2.0 GHz virtual
+TSC (`GUEST_TSC_KHZ = 2000000`). Under Phase 3b clock-hiding rules, `rdtsc` may be trapped
+or filtered for untrusted agent workloads to prevent covert timing side-channels. For
+authoritative drift tracking, `execd` (the trusted PID 1 supervisor inside the guest)
+executes a static helper (`/sbin/hermetic-clockprobe --read-tsc` or `/sbin/hermetic-tsc-read`)
+over vsock RPC as a documented trusted measurement path. The host orchestrator feeds
+`(host elapsed ns, guest TSC ticks)` pairs into `hermetic_vmm::tsc_drift::TscDriftTracker`
+and asserts that cumulative drift remains within `MAX_PERMISSIBLE_DRIFT_PPM` (500 PPM).
+No synthetic offsets or guest wall-clock values are used.
+Integration test `measures_guest_tsc_drift_without_kvmclock` and smoke script
+`scripts/integration/tsc-drift-smoke.sh` automate this nested VM measurement.

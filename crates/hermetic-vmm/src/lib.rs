@@ -23,7 +23,7 @@ pub use host_audit::{audit_host_live, audit_host_offline, HostAuditError, HostAu
 pub use lifecycle::{State, Vmm};
 pub use plan::{api_requests, jail_plan, ApiRequest, JailPlan};
 pub use spec::{drive_id, valid_drive_id, ValidatedSpec, VmSpec};
-pub use tsc_drift::{TscDriftError, TscDriftReport, TscDriftTracker};
+pub use tsc_drift::{TscDriftError, TscDriftTracker, MAX_PERMISSIBLE_DRIFT_PPM};
 pub use verity::{parse_dm_create, VerityTable};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

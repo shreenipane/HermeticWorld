@@ -259,6 +259,105 @@ fn boots_guest_and_reads_guest_clock() {
     }
 }
 
+/// Measure guest TSC stability and drift without kvmclock over at least 30 seconds.
+///
+/// Under Phase 3b clock-hiding rules, the virtual TSC is fixed at 2.0 GHz via
+/// hardware scaling and CPUID leaf 0x15, while kvmclock MSRs are denied. If RDTSC
+/// is trapped for untrusted agent workloads to eliminate covert timing channels,
+/// execd (the trusted root supervisor) executes this measurement helper over vsock
+/// as a documented trusted measurement path. The host collects (elapsed ns, TSC ticks)
+/// pairs and validates that cumulative drift remains within MAX_PERMISSIBLE_DRIFT_PPM.
+#[test]
+#[ignore = "needs dev-unjailed, KVM, pinned Firecracker, and sealed static probe; run scripts/integration/tsc-drift-smoke.sh"]
+fn measures_guest_tsc_drift_without_kvmclock() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        let Some(f) = environment() else {
+            return;
+        };
+        let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+        let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+        vm.prepare(Duration::from_secs(120)).unwrap();
+        vm.start(Duration::from_secs(10)).unwrap();
+        vm.wait_ready(Duration::from_secs(30)).unwrap();
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        let ready_end = deadline(Duration::from_secs(30)).unwrap();
+        loop {
+            match guest_status(&socket, ready_end) {
+                Ok(status) => {
+                    assert_eq!(status.kind, "status");
+                    break;
+                }
+                Err(Error::Io) => {
+                    assert!(Instant::now() < ready_end, "execd readiness deadline");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("execd readiness: {e}"),
+            }
+        }
+
+        let mut tracker = hermetic_vmm::tsc_drift::TscDriftTracker::for_virtual_tsc();
+        let start_instant = Instant::now();
+        const TOTAL_POINTS: usize = 6;
+        const INTERVAL_SECS: u64 = 6;
+
+        for i in 0..TOTAL_POINTS {
+            if i > 0 {
+                std::thread::sleep(Duration::from_secs(INTERVAL_SECS));
+            }
+            let host_before_ns = start_instant.elapsed().as_nanos() as u64;
+            let call_deadline = deadline(Duration::from_secs(10)).unwrap();
+            let reply = guest_exec(
+                &socket,
+                &["/sbin/hermetic-clockprobe", "--read-tsc"],
+                call_deadline,
+            )
+            .expect("guest tsc reading exec reply");
+            assert_eq!(reply.code, Some(0), "helper exited with non-zero");
+            assert!(
+                !reply.truncated && !reply.timed_out,
+                "helper output truncated or timed out"
+            );
+            let host_after_ns = start_instant.elapsed().as_nanos() as u64;
+            let guest_tsc = hermetic_vmm::tsc_drift::parse_tsc_reading(&reply.output)
+                .expect("parse guest tsc reading");
+            tracker
+                .add_bracketed_sample(host_before_ns, host_after_ns, guest_tsc)
+                .expect("feed tsc sample");
+        }
+
+        vm.stop(Duration::from_secs(2)).unwrap();
+        vm.destroy(Duration::from_secs(10)).unwrap();
+
+        assert!(
+            tracker.sample_count() >= hermetic_vmm::tsc_drift::MIN_DRIFT_SAMPLES,
+            "must collect at least {} sample points",
+            hermetic_vmm::tsc_drift::MIN_DRIFT_SAMPLES
+        );
+        assert!(
+            tracker.elapsed_host_ns().unwrap()
+                >= hermetic_vmm::tsc_drift::MIN_MEASUREMENT_DURATION_NS,
+            "measurement duration must be at least 30 s"
+        );
+        // Qualifies the drift together with the measured host timing window of
+        // each read, so request latency neither fails a correct TSC nor hides drift.
+        if let Err(e) = tracker.validate_measurement(
+            hermetic_vmm::tsc_drift::MIN_MEASUREMENT_DURATION_NS,
+            hermetic_vmm::tsc_drift::MIN_DRIFT_SAMPLES,
+            hermetic_vmm::tsc_drift::MAX_PERMISSIBLE_DRIFT_PPM,
+        ) {
+            panic!(
+                "TSC drift qualification failed against 2.0 GHz virtual TSC: {e} (uncertainty {:.3} ppm)",
+                tracker.uncertainty_ppm().unwrap_or(f64::NAN)
+            );
+        }
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
+    }
+}
+
 /// Boot once, poison disk PID 1 candidates and execd, freeze the upper, then
 /// boot a copy with a trusted initrd. No touched executable may run before the
 /// host explicitly authorizes the new PID 1.
@@ -1823,7 +1922,7 @@ fn pauses_resumes_and_snapshots_guest_under_clock_hiding() {
 
 #[test]
 #[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and execd rootfs; see README"]
-fn measures_guest_tsc_drift_without_kvmclock() {
+fn measures_guest_tsc_drift_without_kvmclock_placeholder() {
     // A valid measurement needs guest-side TSC readings taken through execd
     // and compared against host elapsed time over a long interval. Deriving
     // ticks from the guest's one-second wall clock (an earlier version) does

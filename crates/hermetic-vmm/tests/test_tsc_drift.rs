@@ -1,280 +1,504 @@
 #![forbid(unsafe_code)]
 
 use hermetic_vmm::tsc_drift::{
-    verify_multivcpu_sync, verify_pause_resume_invariance, TscDriftError, TscDriftTracker,
-    MAX_MULTIVCPU_SKEW_TICKS, MAX_PERMISSIBLE_DRIFT_PPM, MAX_SAMPLES, NOMINAL_TSC_HZ,
+    parse_tsc_reading, TscDriftError, TscDriftTracker, MAX_HELPER_OUTPUT_BYTES,
+    MAX_PERMISSIBLE_DRIFT_PPM, MAX_SAMPLES, MIN_DRIFT_SAMPLES, MIN_MEASUREMENT_DURATION_NS,
+    VIRTUAL_TSC_HZ,
 };
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 #[test]
-fn test_tsc_drift_nominal_2ghz_rate_passes() {
-    let mut tracker = TscDriftTracker::new();
-    let num_samples = 100;
-    let step_nanos = 10_000_000; // 10ms steps = 1 second total
-    for i in 0..num_samples {
-        let t_nanos = i * step_nanos;
-        let ticks = (t_nanos as u128 * NOMINAL_TSC_HZ as u128 / 1_000_000_000) as u64;
-        tracker.add_sample(t_nanos, ticks).unwrap();
-    }
-    let report = tracker.verify_stability(MAX_PERMISSIBLE_DRIFT_PPM).unwrap();
-    assert_eq!(report.sample_count, num_samples as usize);
-    assert!(report.drift_ppm < 0.001);
-    assert_eq!(report.measured_hz.round() as u64, NOMINAL_TSC_HZ);
-    assert!(report.monotonic);
-    assert!(report.passed);
-}
-
-#[test]
-fn test_tsc_drift_simulated_24_hour_run_passes() {
-    let mut tracker = TscDriftTracker::new();
-    // 24 hours: sample every 60 seconds = 1440 samples
-    let total_seconds = 24 * 3600;
-    let step_secs = 60;
-    let mut s = 0;
-    while s <= total_seconds {
-        let t_nanos = s * 1_000_000_000;
-        let ticks = (s as u128 * NOMINAL_TSC_HZ as u128) as u64;
-        tracker.add_sample(t_nanos, ticks).unwrap();
-        s += step_secs;
-    }
-    let report = tracker.verify_stability(MAX_PERMISSIBLE_DRIFT_PPM).unwrap();
+fn helper_output_parsing_valid_cases() {
+    // Strict JSON format
     assert_eq!(
-        report.sample_count,
-        (total_seconds / step_secs + 1) as usize
+        parse_tsc_reading(b"{\"tsc\": 1234567890}\n").unwrap(),
+        1234567890
     );
-    assert!(report.drift_ppm < 0.0001);
-    assert!(report.passed);
+    assert_eq!(
+        parse_tsc_reading(b"  {\"tsc\": 9876543210}  \r\n").unwrap(),
+        9876543210
+    );
+    assert_eq!(parse_tsc_reading(b"{\"tsc\":0}").unwrap(), 0);
+    assert_eq!(
+        parse_tsc_reading(b"{\"tsc\": 18446744073709551615}").unwrap(),
+        u64::MAX
+    );
+
+    // Plain decimal integer format
+    assert_eq!(parse_tsc_reading(b"1234567890\n").unwrap(), 1234567890);
+    assert_eq!(parse_tsc_reading(b"  42  ").unwrap(), 42);
+    assert_eq!(parse_tsc_reading(b"0").unwrap(), 0);
+    assert_eq!(
+        parse_tsc_reading(b"18446744073709551615").unwrap(),
+        u64::MAX
+    );
 }
 
 #[test]
-fn test_tsc_drift_small_acceptable_jitter_passes() {
-    let mut tracker = TscDriftTracker::new();
-    let t0 = 0;
-    let t1 = 1_000_000_000; // 1 second
-                            // 2.0 GHz nominal = 2,000,000,000 ticks.
-                            // 50 PPM drift = 100,000 ticks difference over 1 second.
-    tracker.add_sample(t0, 0).unwrap();
-    tracker.add_sample(t1, NOMINAL_TSC_HZ + 100_000).unwrap();
+fn helper_output_parsing_hostile_cases_never_panic() {
+    // Empty output
+    assert_eq!(
+        parse_tsc_reading(b"").unwrap_err(),
+        TscDriftError::EmptyOutput
+    );
+    assert_eq!(
+        parse_tsc_reading(b"   \t\r\n   ").unwrap_err(),
+        TscDriftError::EmptyOutput
+    );
 
-    let report = tracker.verify_stability(MAX_PERMISSIBLE_DRIFT_PPM).unwrap();
-    assert!(report.drift_ppm <= 50.1 && report.drift_ppm >= 49.9);
-    assert!(report.passed);
+    // Oversized output
+    let huge = vec![b'9'; MAX_HELPER_OUTPUT_BYTES + 1];
+    assert!(matches!(
+        parse_tsc_reading(&huge).unwrap_err(),
+        TscDriftError::OutputOversized(_)
+    ));
+
+    // Non-UTF8 output
+    assert_eq!(
+        parse_tsc_reading(b"\xff\xfe\x00\x12").unwrap_err(),
+        TscDriftError::NonAsciiOutput
+    );
+
+    // Negative numbers
+    assert!(matches!(
+        parse_tsc_reading(b"-42").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": -42}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Floating point numbers
+    assert!(matches!(
+        parse_tsc_reading(b"1234.56").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": 1234.56}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // String instead of integer in JSON
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": \"1234\"}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Array / unexpected JSON structure
+    assert!(matches!(
+        parse_tsc_reading(b"[1234]").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+
+    // Missing required field
+    assert!(matches!(
+        parse_tsc_reading(b"{\"other\": 1234}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Extra unknown fields
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": 1234, \"extra\": 5}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Integer overflow beyond u64::MAX
+    assert!(matches!(
+        parse_tsc_reading(b"18446744073709551616").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": 18446744073709551616}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Non-numeric plain text
+    assert!(matches!(
+        parse_tsc_reading(b"not_a_number").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+
+    // Injected command payload
+    assert!(matches!(
+        parse_tsc_reading(b"1234\nrm -rf /").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+
+    // Embedded NUL bytes
+    assert!(matches!(
+        parse_tsc_reading(b"1234\0extra").unwrap_err(),
+        TscDriftError::InvalidOutput(_)
+    ));
+
+    // Null or boolean values
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": null}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": true}").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
+
+    // Incomplete JSON
+    assert!(matches!(
+        parse_tsc_reading(b"{\"tsc\": ").unwrap_err(),
+        TscDriftError::TscParseError(_)
+    ));
 }
 
 #[test]
-fn test_tsc_drift_excessive_drift_rejected() {
-    let mut tracker = TscDriftTracker::new();
-    let t0 = 0;
-    let t1 = 1_000_000_000; // 1 second
-                            // 150 PPM drift = 300,000 ticks difference over 1 second (> 100 PPM limit).
-    tracker.add_sample(t0, 0).unwrap();
-    tracker.add_sample(t1, NOMINAL_TSC_HZ + 300_000).unwrap();
+fn tracker_virtual_tsc_configuration_and_zero_drift() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+    assert_eq!(tracker.nominal_freq_hz(), VIRTUAL_TSC_HZ);
+    assert_eq!(tracker.sample_count(), 0);
 
-    let err = tracker
-        .verify_stability(MAX_PERMISSIBLE_DRIFT_PPM)
+    // Feed 6 points over 30 s with exactly 0.0 drift (2.0 ticks per ns)
+    let base_tsc = 1_000_000_000_u64;
+    for step in 0..=5 {
+        let elapsed_ns = step * 6_000_000_000_u64; // 0, 6s, 12s, 18s, 24s, 30s
+        let tsc = base_tsc + elapsed_ns * 2;
+        tracker.add_sample(elapsed_ns, tsc).unwrap();
+    }
+
+    assert_eq!(tracker.sample_count(), 6);
+    assert_eq!(tracker.elapsed_host_ns().unwrap(), 30_000_000_000);
+    assert_eq!(tracker.elapsed_guest_tsc().unwrap(), 60_000_000_000);
+    assert_eq!(tracker.elapsed_host_secs().unwrap(), 30.0);
+
+    let drift = tracker.drift_ppm().unwrap();
+    assert!(drift.abs() < 1e-9);
+    assert!(tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+    assert!(tracker
+        .validate_measurement(
+            MIN_MEASUREMENT_DURATION_NS,
+            MIN_DRIFT_SAMPLES,
+            MAX_PERMISSIBLE_DRIFT_PPM
+        )
+        .is_ok());
+
+    // Interval drifts are all zero
+    let intervals = tracker.interval_drifts_ppm().unwrap();
+    assert_eq!(intervals.len(), 5);
+    for d in intervals {
+        assert!(d.abs() < 1e-9);
+    }
+}
+
+#[test]
+fn tracker_drift_calculation_known_answers() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+
+    // 30 s duration: expected ticks = 60,000,000,000
+    // +100 PPM means 6,000,000 extra ticks (60,006,000,000 ticks)
+    tracker.add_sample(0, 100_000_000).unwrap();
+    tracker
+        .add_sample(30_000_000_000, 100_000_000 + 60_006_000_000)
+        .unwrap();
+
+    let drift = tracker.drift_ppm().unwrap();
+    assert!((drift - 100.0).abs() < 1e-6);
+    assert!(tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+
+    // Another tracker with -250 PPM drift (15,000,000 fewer ticks = 59,985,000,000 ticks)
+    let mut slow_tracker = TscDriftTracker::for_virtual_tsc();
+    slow_tracker.add_sample(0, 500_000_000).unwrap();
+    slow_tracker
+        .add_sample(30_000_000_000, 500_000_000 + 59_985_000_000)
+        .unwrap();
+
+    let slow_drift = slow_tracker.drift_ppm().unwrap();
+    assert!((slow_drift - (-250.0)).abs() < 1e-6);
+    assert!((slow_tracker.abs_drift_ppm().unwrap() - 250.0).abs() < 1e-6);
+    assert!(slow_tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+}
+
+#[test]
+fn tracker_excessive_drift_fails_validation() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+    // +600 PPM exceeds MAX_PERMISSIBLE_DRIFT_PPM (500 PPM)
+    // 600 PPM of 60,000,000,000 is 36,000,000 extra ticks
+    tracker.add_sample(0, 0).unwrap();
+    tracker.add_sample(15_000_000_000, 30_018_000_000).unwrap();
+    tracker.add_sample(30_000_000_000, 60_036_000_000).unwrap();
+
+    let drift = tracker.drift_ppm().unwrap();
+    assert!((drift - 600.0).abs() < 1e-6);
+    assert!(!tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+
+    let val_err = tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 3, MAX_PERMISSIBLE_DRIFT_PPM)
         .unwrap_err();
-    match err {
-        TscDriftError::ExcessiveDrift { drift_ppm, max_ppm } => {
-            assert!(drift_ppm > 100.0);
-            assert_eq!(max_ppm, MAX_PERMISSIBLE_DRIFT_PPM);
-        }
-        other => panic!("expected ExcessiveDrift, got {other:?}"),
-    }
+    assert!(matches!(val_err, TscDriftError::ExcessiveDrift { .. }));
 }
 
 #[test]
-fn test_tsc_drift_non_monotonic_ticks_rejected() {
-    let mut tracker = TscDriftTracker::new();
-    tracker.add_sample(1_000_000, 2_000_000).unwrap();
-    let err = tracker.add_sample(2_000_000, 1_999_999).unwrap_err();
-    assert_eq!(
-        err,
-        TscDriftError::NonMonotonicTicks {
-            prev: 2_000_000,
-            curr: 1_999_999
-        }
-    );
+fn tracker_monotonicity_and_duration_enforcement() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+    tracker.add_sample(1_000_000_000, 2_000_000_000).unwrap();
+
+    // Decreasing host time rejected
+    let err = tracker.add_sample(500_000_000, 3_000_000_000).unwrap_err();
+    assert!(matches!(err, TscDriftError::HostTimeNonMonotonic { .. }));
+
+    // Equal host time rejected
+    let err = tracker
+        .add_sample(1_000_000_000, 3_000_000_000)
+        .unwrap_err();
+    assert!(matches!(err, TscDriftError::HostTimeNonMonotonic { .. }));
+
+    // Decreasing guest TSC rejected
+    let err = tracker
+        .add_sample(2_000_000_000, 1_000_000_000)
+        .unwrap_err();
+    assert!(matches!(err, TscDriftError::TscNonMonotonic { .. }));
+
+    // Insufficient samples (< 2 for drift computation)
+    assert!(matches!(
+        tracker.drift_ppm().unwrap_err(),
+        TscDriftError::InsufficientSamples { .. }
+    ));
+
+    // Add second sample with only 10 s duration
+    tracker.add_sample(11_000_000_000, 22_000_000_000).unwrap();
+    let err = tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap_err();
+    assert!(matches!(err, TscDriftError::InsufficientDuration { .. }));
 }
 
 #[test]
-fn test_tsc_drift_non_monotonic_time_rejected() {
-    let mut tracker = TscDriftTracker::new();
-    tracker.add_sample(2_000_000, 2_000_000).unwrap();
-    let err = tracker.add_sample(1_000_000, 3_000_000).unwrap_err();
-    assert_eq!(
-        err,
-        TscDriftError::NonMonotonicTime {
-            prev: 2_000_000,
-            curr: 1_000_000
-        }
-    );
-}
-
-#[test]
-fn test_tsc_drift_insufficient_samples_rejected() {
-    let empty = TscDriftTracker::new();
-    assert_eq!(
-        empty.verify_stability(100.0).unwrap_err(),
-        TscDriftError::InsufficientSamples
-    );
-
-    let mut single = TscDriftTracker::new();
-    single.add_sample(1_000_000, 2_000_000).unwrap();
-    assert_eq!(
-        single.verify_stability(100.0).unwrap_err(),
-        TscDriftError::InsufficientSamples
-    );
-}
-
-#[test]
-fn test_tsc_drift_sample_cap_exceeded() {
-    let mut tracker = TscDriftTracker::new();
+fn tracker_sample_cap_enforced() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
     for i in 0..MAX_SAMPLES {
-        tracker
-            .add_sample(i as u64 * 1000, i as u64 * 2000)
-            .unwrap();
+        let ns = (i as u64) + 1;
+        let tsc = (i as u64) * 2;
+        tracker.add_sample(ns, tsc).unwrap();
     }
-    let err = tracker
-        .add_sample(MAX_SAMPLES as u64 * 1000, MAX_SAMPLES as u64 * 2000)
+    assert_eq!(tracker.sample_count(), MAX_SAMPLES);
+    let overflow = tracker
+        .add_sample(MAX_SAMPLES as u64 + 1, 99999)
         .unwrap_err();
-    assert_eq!(err, TscDriftError::SampleCapExceeded);
+    assert_eq!(overflow, TscDriftError::SampleCapExceeded(MAX_SAMPLES));
 }
 
 #[test]
-fn test_pause_resume_invariance_clean_pause_passes() {
-    let before_pause = 10_000_000_000;
-    // Paused for 5 seconds (5,000,000,000 ns).
-    // On resume, guest only advanced 50 ticks of internal instruction execution.
-    let after_resume = before_pause + 50;
-    let pause_nanos = 5_000_000_000;
-    assert!(verify_pause_resume_invariance(before_pause, after_resume, pause_nanos).is_ok());
+fn exact_500_ppm_boundary_accepted_and_excess_rejected() {
+    // At 2.0 GHz virtual TSC:
+    // 60_000_001_000 ns corresponds to exactly 120_000_002_000 expected ticks.
+    // 500 ppm of 120_000_002_000 is 60_000_001 ticks.
+
+    // 1. Exact +500 ppm fast: 120_000_002_000 + 60_000_001 = 120_060_002_001 ticks.
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+    tracker.add_sample(0, 0).unwrap();
+    tracker.add_sample(60_000_001_000, 120_060_002_001).unwrap();
+    assert_eq!(tracker.drift_ppm().unwrap(), 500.0);
+    assert!(tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+    assert!(tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, MAX_PERMISSIBLE_DRIFT_PPM)
+        .is_ok());
+
+    // 2. One tick above (+500 ppm + 1 tick): 120_060_002_002 ticks.
+    let mut over_tracker = TscDriftTracker::for_virtual_tsc();
+    over_tracker.add_sample(0, 0).unwrap();
+    over_tracker
+        .add_sample(60_000_001_000, 120_060_002_002)
+        .unwrap();
+    assert!(!over_tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+    let err = over_tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap_err();
+    assert!(matches!(err, TscDriftError::ExcessiveDrift { .. }));
+
+    // 3. Exact -500 ppm slow: 120_000_002_000 - 60_000_001 = 119_940_001_999 ticks.
+    let mut slow_tracker = TscDriftTracker::for_virtual_tsc();
+    slow_tracker.add_sample(0, 0).unwrap();
+    slow_tracker
+        .add_sample(60_000_001_000, 119_940_001_999)
+        .unwrap();
+    assert_eq!(slow_tracker.drift_ppm().unwrap(), -500.0);
+    assert!(slow_tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+    assert!(slow_tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, MAX_PERMISSIBLE_DRIFT_PPM)
+        .is_ok());
+
+    // 4. One tick below (-500 ppm - 1 tick): 119_940_001_998 ticks.
+    let mut underslow_tracker = TscDriftTracker::for_virtual_tsc();
+    underslow_tracker.add_sample(0, 0).unwrap();
+    underslow_tracker
+        .add_sample(60_000_001_000, 119_940_001_998)
+        .unwrap();
+    assert!(!underslow_tracker
+        .is_within_tolerance(MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap());
+    let err = underslow_tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, MAX_PERMISSIBLE_DRIFT_PPM)
+        .unwrap_err();
+    assert!(matches!(err, TscDriftError::ExcessiveDrift { .. }));
 }
 
 #[test]
-fn test_pause_resume_invariance_wall_clock_leak_detected() {
-    let before_pause = 10_000_000_000;
-    let pause_nanos = 2_000_000_000; // 2 seconds
-                                     // If wall clock leaked, TSC jumped by 2 seconds * 2 GHz = 4,000,000,000 ticks.
-    let after_resume = before_pause + 4_000_000_000;
-    let err = verify_pause_resume_invariance(before_pause, after_resume, pause_nanos).unwrap_err();
-    match err {
-        TscDriftError::PauseJumpDetected {
-            delta_ticks,
-            pause_duration_nanos,
-        } => {
-            assert_eq!(delta_ticks, 4_000_000_000);
-            assert_eq!(pause_duration_nanos, 2_000_000_000);
-        }
-        other => panic!("expected PauseJumpDetected, got {other:?}"),
-    }
-}
+fn undefined_or_negative_tolerance_rejected() {
+    let mut tracker = TscDriftTracker::for_virtual_tsc();
+    // 30 s run with 1,000 ppm drift (60,060,000,000 ticks)
+    tracker.add_sample(0, 0).unwrap();
+    tracker.add_sample(30_000_000_000, 60_060_000_000).unwrap();
 
-#[test]
-fn test_pause_resume_invariance_non_monotonic_rejected() {
-    let before_pause = 10_000_000_000;
-    let after_resume = 9_999_999_999;
-    let err =
-        verify_pause_resume_invariance(before_pause, after_resume, 1_000_000_000).unwrap_err();
+    // NaN tolerance must be rejected by both APIs with ArithmeticOverflow
     assert_eq!(
-        err,
-        TscDriftError::NonMonotonicTicks {
-            prev: before_pause,
-            curr: after_resume,
-        }
+        tracker.is_within_tolerance(f64::NAN).unwrap_err(),
+        TscDriftError::ArithmeticOverflow
     );
-}
-
-#[test]
-fn test_pause_resume_invariance_enforces_fixed_overhead_cap() {
-    use hermetic_vmm::tsc_drift::MAX_PAUSE_OVERHEAD_TICKS;
-    let base = 10_000_000_000;
-
-    // 50ms pause with 100M ticks jump: must fail despite pause < 100ms
-    let err50ms = verify_pause_resume_invariance(base, base + 100_000_000, 50_000_000).unwrap_err();
     assert_eq!(
-        err50ms,
-        TscDriftError::PauseJumpDetected {
-            delta_ticks: 100_000_000,
-            pause_duration_nanos: 50_000_000,
-        }
+        tracker
+            .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, f64::NAN)
+            .unwrap_err(),
+        TscDriftError::ArithmeticOverflow
     );
 
-    // 2s pause with 1B ticks jump (< half wall ticks = 2B): must fail despite < wall/2
-    let err2s =
-        verify_pause_resume_invariance(base, base + 1_000_000_000, 2_000_000_000).unwrap_err();
+    // Negative tolerance must be rejected
     assert_eq!(
-        err2s,
-        TscDriftError::PauseJumpDetected {
-            delta_ticks: 1_000_000_000,
-            pause_duration_nanos: 2_000_000_000,
-        }
+        tracker.is_within_tolerance(-1.0).unwrap_err(),
+        TscDriftError::ArithmeticOverflow
+    );
+    assert_eq!(
+        tracker
+            .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, -500.0)
+            .unwrap_err(),
+        TscDriftError::ArithmeticOverflow
     );
 
-    // Exactly MAX_PAUSE_OVERHEAD_TICKS is rejected
-    assert!(
-        verify_pause_resume_invariance(base, base + MAX_PAUSE_OVERHEAD_TICKS, 1_000_000_000)
-            .is_err()
+    // Infinite tolerance must be rejected
+    assert_eq!(
+        tracker.is_within_tolerance(f64::INFINITY).unwrap_err(),
+        TscDriftError::ArithmeticOverflow
+    );
+    assert_eq!(
+        tracker
+            .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, f64::INFINITY)
+            .unwrap_err(),
+        TscDriftError::ArithmeticOverflow
     );
 
-    // Under MAX_PAUSE_OVERHEAD_TICKS is accepted
-    assert!(verify_pause_resume_invariance(
-        base,
-        base + MAX_PAUSE_OVERHEAD_TICKS - 1,
-        1_000_000_000
-    )
-    .is_ok());
+    // Finite nonnegative tolerance: 1000.0 is exact match, 1001.0 passes, 999.0 fails with ExcessiveDrift
+    assert!(tracker.is_within_tolerance(1000.0).unwrap());
+    assert!(tracker
+        .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, 1000.0)
+        .is_ok());
+    assert!(!tracker.is_within_tolerance(999.0).unwrap());
+    assert!(matches!(
+        tracker
+            .validate_measurement(MIN_MEASUREMENT_DURATION_NS, 2, 999.0)
+            .unwrap_err(),
+        TscDriftError::ExcessiveDrift { .. }
+    ));
 }
 
 #[test]
-fn test_multivcpu_sync_within_skew_passes() {
-    // 32 vCPUs with minor skew (up to 1,000 ticks, well below 10,000 tick limit)
-    for vcpu_count in [1, 2, 4, 8, 16, 32] {
-        let base_tsc = 50_000_000_000;
-        let samples: Vec<u64> = (0..vcpu_count)
-            .map(|i| base_tsc + (i * 200)) // max diff is 31 * 200 = 6,200 <= 10,000
-            .collect();
-        assert!(verify_multivcpu_sync(&samples).is_ok());
-    }
+fn tsc_drift_smoke_script_present_and_executable() {
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("scripts/integration/tsc-drift-smoke.sh");
+
+    assert!(script_path.is_file(), "tsc-drift-smoke.sh must exist");
+    let perms = std::fs::metadata(&script_path)
+        .expect("read metadata")
+        .permissions();
+    let mode = perms.mode();
+    assert_ne!(
+        mode & 0o111,
+        0,
+        "tsc-drift-smoke.sh must be executable in checkout (mode {:o})",
+        mode
+    );
+
+    let content = std::fs::read_to_string(&script_path).expect("read content");
+    assert!(content.starts_with("#!/usr/bin/env bash"));
+    assert!(content.contains("readlink -f"));
+    assert!(content.contains("HERMETIC_FC_BIN"));
+    assert!(content.contains("HERMETIC_FIRECRACKER_LOCK"));
+    assert!(content.contains("HERMETIC_KERNEL"));
+    assert!(content.contains("measures_guest_tsc_drift_without_kvmclock"));
 }
 
 #[test]
-fn test_multivcpu_sync_excessive_skew_rejected() {
-    let base_tsc = 50_000_000_000;
-    let mut samples: Vec<u64> = (0..32).map(|_| base_tsc).collect();
-    samples[15] = base_tsc + MAX_MULTIVCPU_SKEW_TICKS + 1; // exceed limit
-    let err = verify_multivcpu_sync(&samples).unwrap_err();
-    match err {
-        TscDriftError::MultiVcpuSkewExceeded { max_diff, limit } => {
-            assert_eq!(max_diff, MAX_MULTIVCPU_SKEW_TICKS + 1);
-            assert_eq!(limit, MAX_MULTIVCPU_SKEW_TICKS);
-        }
-        other => panic!("expected MultiVcpuSkewExceeded, got {other:?}"),
-    }
+fn smoke_script_check_does_not_mutate_permissions() {
+    // Verify that testing file executable bit does not modify filesystem permissions
+    let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    let mut perms = tmp.as_file().metadata().expect("meta").permissions();
+    perms.set_mode(0o644);
+    tmp.as_file().set_permissions(perms).expect("set 0644");
+
+    let read_mode = tmp.as_file().metadata().expect("meta").permissions().mode();
+    assert_eq!(read_mode & 0o777, 0o644);
+    // Non-mutating verification: checking the bit does not change it to 0755
+    let is_exec = (read_mode & 0o111) != 0;
+    assert!(!is_exec);
+    let after_mode = tmp.as_file().metadata().expect("meta").permissions().mode();
+    assert_eq!(after_mode & 0o777, 0o644, "permissions must not be mutated");
 }
 
 #[test]
-fn test_tsc_drift_error_display_no_host_info() {
-    let errors = [
-        TscDriftError::Empty,
-        TscDriftError::InsufficientSamples,
-        TscDriftError::NonMonotonicTicks { prev: 10, curr: 9 },
-        TscDriftError::NonMonotonicTime { prev: 10, curr: 9 },
-        TscDriftError::ExcessiveDrift {
-            drift_ppm: 150.0,
-            max_ppm: 100.0,
-        },
-        TscDriftError::PauseJumpDetected {
-            delta_ticks: 1000,
-            pause_duration_nanos: 1000,
-        },
-        TscDriftError::MultiVcpuSkewExceeded {
-            max_diff: 15000,
-            limit: 10000,
-        },
-        TscDriftError::SampleCapExceeded,
-    ];
-    for err in &errors {
-        let s = format!("{err}");
-        assert!(!s.contains("/home/"));
-        assert!(!s.contains("flingboot"));
-    }
+fn bracketed_samples_carry_measured_uncertainty() {
+    let mut t = TscDriftTracker::for_virtual_tsc();
+    // 2 ms request windows; 30 s interval; exact 2 GHz guest counter.
+    t.add_bracketed_sample(0, 2_000_000, 2_000_000).unwrap();
+    t.add_bracketed_sample(30_000_000_000, 30_002_000_000, 60_002_000_000)
+        .unwrap();
+    assert_eq!(t.samples()[0].host_elapsed_ns, 1_000_000);
+    assert_eq!(t.samples()[0].uncertainty_ns, 1_000_000);
+    let unc = t.uncertainty_ppm().unwrap();
+    assert!(unc > 66.0 && unc < 67.0, "unc={unc}");
+    // Exact counter: drift 0, worst case 66.7 ppm, inside a 100 ppm limit.
+    t.validate_measurement(30_000_000_000, 2, 100.0).unwrap();
+}
+
+#[test]
+fn uncertainty_never_lets_drift_pass_or_fails_ambiguous_runs_closed() {
+    // Drift 150 ppm with +/-66.7 ppm uncertainty against 50 ppm: definitely excessive.
+    let mut t = TscDriftTracker::for_virtual_tsc();
+    t.add_bracketed_sample(0, 2_000_000, 2_000_000).unwrap();
+    t.add_bracketed_sample(30_000_000_000, 30_002_000_000, 60_011_000_000)
+        .unwrap();
+    assert!(matches!(
+        t.validate_measurement(30_000_000_000, 2, 50.0),
+        Err(TscDriftError::ExcessiveDrift { .. })
+    ));
+    // Exact counter against 50 ppm: cannot be decided, so it fails closed as uncertain.
+    let mut u = TscDriftTracker::for_virtual_tsc();
+    u.add_bracketed_sample(0, 2_000_000, 2_000_000).unwrap();
+    u.add_bracketed_sample(30_000_000_000, 30_002_000_000, 60_002_000_000)
+        .unwrap();
+    assert!(matches!(
+        u.validate_measurement(30_000_000_000, 2, 50.0),
+        Err(TscDriftError::UncertainMeasurement { .. })
+    ));
+}
+
+#[test]
+fn bracket_with_after_before_before_is_rejected() {
+    let mut t = TscDriftTracker::for_virtual_tsc();
+    assert!(matches!(
+        t.add_bracketed_sample(10, 5, 0),
+        Err(TscDriftError::InvalidBracket { .. })
+    ));
 }

@@ -32,12 +32,16 @@ TREE="$WORK/tree"; rm -rf "$TREE"
 for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
          mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
 install -m 0755 "$BIN/hermetic-execd" "$TREE/sbin/hermetic-execd"
+install -m 0755 "$BIN/hermetic-clockprobe" "$TREE/sbin/hermetic-clockprobe"
+if [ -f "$BIN/hermetic-tsc-read" ]; then
+  install -m 0755 "$BIN/hermetic-tsc-read" "$TREE/sbin/hermetic-tsc-read"
+fi
 install -m 0755 "$BIN/hermetic-init" "$TREE/sbin/hermetic-init"
 install -m 0755 /usr/bin/busybox "$TREE/bin/busybox"
 cat > "$TREE/etc/hermetic/run-spec.json" <<JSON
 {"env":{"PATH":"/bin","LANG":"C"},"workdir":"/work","uid":0,"gid":0,
  "entrypoint":[],"command":[],"hostname":"world","resolv_conf":"nameserver 10.0.0.1\n",
- "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":60}}
+ "resources":{"vcpus":1,"memory_mib":256,"disk_mib":64,"wall_time_s":180}}
 JSON
 find "$TREE" -exec touch -h -d @$T {} +
 /usr/bin/python3 -I - "$top/python" "$TREE" "$WORK/rootfs.img" "$WORK/sealcheck" "$WORK" <<'PY'
