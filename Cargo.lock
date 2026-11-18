@@ -743,7 +743,6 @@ dependencies = [
  "hermetic-clockprobe",
  "hermetic-common",
  "hermetic-run",
- "hermetic-vmm",
  "ring",
  "rustix 1.1.6",
  "serde",

@@ -21,7 +21,6 @@ hermetic-bundle = { path = "../hermetic-bundle" }
 hermetic-clockprobe = { path = "../hermetic-clockprobe" }
 hermetic-common = { path = "../hermetic-common" }
 hermetic-run = { path = "../hermetic-run" }
-hermetic-vmm = { path = "../hermetic-vmm" }
 rustix = { version = "=1.1.6", features = ["fs", "process"] }
 sha2 = { workspace = true }
 

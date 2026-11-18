@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -14,7 +14,6 @@ use crate::args::{AgentMode, RunRequest};
 use crate::backend::RUN_NOT_WIRED;
 use crate::dispatch::{BackendError, Outcome};
 use crate::fsutil::{prepare_output_dir, verify_dir_no_symlinks, verify_secret_file_no_symlinks};
-use crate::vmm_infra::VmmInfra;
 
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
@@ -344,32 +343,13 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     Ok(outcome)
 }
 
-/// Production runner with real VMM infrastructure if configured.
-pub fn run_with_real_infra(req: RunRequest) -> Result<Outcome, BackendError> {
-    let mut infra = match VmmInfra::from_env() {
-        Some(infra) => infra,
-        None => return Err(BackendError::Unavailable(RUN_NOT_WIRED)),
-    };
-
-    let run_dir = match req.run_dir {
-        Some(ref dir) => dir.clone(),
-        None => match std::env::var_os("HERMETIC_RUN_DIR") {
-            Some(val) => PathBuf::from(val),
-            None => req.world.join("runs").join(&req.task),
-        },
-    };
-
-    let key_path = req
-        .key
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HERMETIC_SIGNING_KEY").map(PathBuf::from));
-
-    execute_run_flow(
-        &mut infra,
-        &SystemClock,
-        &req,
-        &run_dir,
-        key_path.as_deref(),
-    )
+/// Production entry point for `hermetic-cli run`.
+///
+/// Real microVM orchestration (AgentVM, ExtractorVM and GraderVMs driven through
+/// `hermetic-vmm`) is not wired into the CLI yet, so `run` fails closed with a fixed
+/// message instead of producing a verdict. The run flow itself (`execute_run_flow`)
+/// is exercised with an injected `Infra` in tests; no code path may fabricate VM,
+/// extraction or grading results.
+pub fn run_with_real_infra(_req: RunRequest) -> Result<Outcome, BackendError> {
+    Err(BackendError::Unavailable(RUN_NOT_WIRED))
 }
