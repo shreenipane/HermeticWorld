@@ -539,6 +539,45 @@ fn tsc_khz_resolution_prefers_cpuid_and_fails_closed() {
 }
 
 #[test]
+fn drive_id_validation_refuses_verity_hyphen_and_accepts_underscore() {
+    assert!(!drive_id("verity-hash"));
+    assert!(drive_id("verity_hash"));
+    assert!(!valid_drive_id("verity-hash"));
+    assert!(valid_drive_id("verity_hash"));
+    assert!(!drive_id(""));
+    assert!(drive_id(&"a".repeat(64)));
+    assert!(!drive_id(&"a".repeat(65)));
+    assert!(!drive_id("drive-id"));
+    assert!(!drive_id("drive.id"));
+    assert!(!drive_id("drive id"));
+    assert!(drive_id("Drive_123"));
+
+    let mut bad = spec(Role::Agent);
+    bad.root_drive.id = "verity-hash".into();
+    assert!(bad.validate().is_err());
+
+    let mut good = spec(Role::Agent);
+    good.root_drive.id = "verity_hash".into();
+    assert!(good.validate().is_ok());
+
+    let mut bad_drive = spec(Role::Agent);
+    bad_drive.drives.push(Drive {
+        id: "verity-hash".into(),
+        path: "/images/hash".into(),
+        read_only: true,
+    });
+    assert!(bad_drive.validate().is_err());
+
+    let mut good_drive = spec(Role::Agent);
+    good_drive.drives.push(Drive {
+        id: "verity_hash".into(),
+        path: "/images/hash".into(),
+        read_only: true,
+    });
+    assert!(good_drive.validate().is_ok());
+}
+
+#[test]
 fn agent_vm_supports_read_only_agent_volume_and_rejects_writable_extra_drives() {
     let mut s = spec(Role::Agent);
     s.drives.push(Drive {

@@ -78,7 +78,7 @@ for _purpose, _names in (
     ("TR-VMM-4: root filesystems", "OVERLAY_FS EXT4_FS FS_POSIX_ACL EXT4_FS_POSIX_ACL"),
     ("TR-VMM-4: nftables, legacy iptables, TPROXY and conntrack", "NETFILTER NETFILTER_ADVANCED NETFILTER_XTABLES NF_CONNTRACK NF_NAT NF_TABLES NF_TABLES_INET NFT_CT NFT_NAT NFT_TPROXY NFT_SOCKET NETFILTER_XT_MARK NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_SOCKET NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_TARGET_REDIRECT NETFILTER_XT_TARGET_MASQUERADE IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_NAT IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_MANGLE IPV6 NF_TPROXY_IPV4 NF_TPROXY_IPV6 NF_SOCKET_IPV4 NF_SOCKET_IPV6"),
     ("TR-VMM-5: virtio devices, vsock and entropy", "VIRTIO VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE HW_RANDOM HW_RANDOM_VIRTIO VSOCKETS VIRTIO_VSOCKETS"),
-    ("TR-VMM-4: dm-verity and seccomp", "MD BLK_DEV_DM DM_VERITY CRYPTO CRYPTO_SHA256 SECCOMP SECCOMP_FILTER"),
+    ("TR-VMM-4: dm-verity and seccomp", "MD BLK_DEV_DM DM_INIT DM_VERITY CRYPTO CRYPTO_SHA256 SECCOMP SECCOMP_FILTER"),
 ):
     for _name in _names.split():
         RULES["CONFIG_" + _name] = Rule("y", _purpose)
@@ -238,30 +238,136 @@ def boot_arguments(t_clock: int, *, vmm: Path) -> str:
     return text[:-1]
 
 
-def check_boot_arguments(arguments: str) -> list[Finding]:
+def split_boot_tokens(text: str) -> list[str]:
+    """Split boot arguments into tokens, respecting quotes around dm-mod.create."""
+    tokens = []
+    current = []
+    in_quotes = False
+    for char in text:
+        if char == '"':
+            in_quotes = not in_quotes
+            current.append(char)
+        elif char == " " and not in_quotes:
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if in_quotes:
+        raise KernelError("unmatched quote in boot arguments")
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def spec_netvm_boot_arguments(t_clock: int, dm_create: str) -> str:
+    """VmSpec boot arguments for NetVM with dm-verity."""
+    if type(t_clock) is not int or not 0 <= t_clock <= MAX_CLOCK:
+        raise KernelError("t_clock must be bounded integral Unix seconds")
+    from hermetic_slice.verity import parse_dm_create
+    parse_dm_create(dm_create)
+    return (
+        f"console=ttyS0,115200n8 reboot=k panic=-1 pci=off root=/dev/dm-0 rootfstype=ext4 ro "
+        f"init=/sbin/hermetic-netvm clocksource=tsc tsc=reliable no-kvmclock hermetic.t={t_clock} {dm_create}"
+    )
+
+
+def check_boot_arguments(arguments: str, *, role: str = "agent") -> list[Finding]:
     text = _text(arguments, MAX_BOOT_BYTES)
-    tokens = text.split(" ")
+    try:
+        tokens = split_boot_tokens(text)
+    except KernelError as exc:
+        return [Finding("boot", str(exc))]
+
     findings = []
     seen: set[str] = set()
-    for token in tokens:
-        key = token.partition("=")[0]
-        if key in seen:
-            findings.append(Finding("boot", "duplicate boot argument"))
-        seen.add(key)
-        if token.startswith("hermetic.t="):
-            value = token.removeprefix("hermetic.t=")
-            if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
-                findings.append(Finding("hermetic.t", "invalid clock value"))
-        elif key.replace("-", "_") == "tsc_early_khz":
-            # It would bypass the pinned CPUID leaf 0x15 frequency.
-            findings.append(Finding("tsc_early_khz", "TSC frequency must not be a boot argument"))
-        elif token not in BOOT_FIXED.split(" "):
-            findings.append(Finding("boot", "unapproved boot argument"))
-    for required in BOOT_FIXED.split(" "):
-        if required not in tokens:
-            findings.append(Finding(required.partition("=")[0], "required boot argument missing"))
-    if "hermetic.t" not in seen:
-        findings.append(Finding("hermetic.t", "required boot argument missing"))
+
+    if role == "netvm":
+        dm_create_found = False
+        allowed_exact = {
+            "console=ttyS0,115200n8",
+            "console=ttyS0",
+            "reboot=k",
+            "panic=-1",
+            "pci=off",
+            "root=/dev/dm-0",
+            "rootfstype=ext4",
+            "ro",
+            "init=/sbin/hermetic-netvm",
+            "clocksource=tsc",
+            "tsc=reliable",
+            "no-kvmclock",
+        }
+        required_keys = {
+            "console",
+            "reboot",
+            "panic",
+            "pci",
+            "ro",
+            "init",
+            "clocksource",
+            "tsc",
+            "no-kvmclock",
+            "hermetic.t",
+            "dm-mod.create",
+        }
+
+        for token in tokens:
+            key = token.partition("=")[0]
+            if key in seen:
+                findings.append(Finding("boot", "duplicate boot argument"))
+            seen.add(key)
+
+            if token.startswith("hermetic.t="):
+                value = token.removeprefix("hermetic.t=")
+                if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
+                    findings.append(Finding("hermetic.t", "invalid clock value"))
+            elif token.startswith('dm-mod.create="') and token.endswith('"'):
+                dm_create_found = True
+                from hermetic_slice.verity import parse_dm_create, VerityError
+                try:
+                    parse_dm_create(token)
+                except VerityError:
+                    findings.append(Finding("dm-mod.create", "invalid verity table in dm-mod.create"))
+            elif key.replace("-", "_") == "tsc_early_khz":
+                findings.append(Finding("tsc_early_khz", "TSC frequency must not be a boot argument"))
+            elif '"' in token or "'" in token or "\\" in token:
+                findings.append(Finding("boot", "unapproved quotes in boot arguments"))
+            elif token not in allowed_exact:
+                findings.append(Finding("boot", "unapproved boot argument"))
+
+        if "root=/dev/dm-0" not in tokens:
+            findings.append(Finding("root", "required boot argument missing"))
+
+        for req in required_keys:
+            if req not in seen:
+                findings.append(Finding(req, "required boot argument missing"))
+    else:
+        # AgentVM (or default)
+        for token in tokens:
+            key = token.partition("=")[0]
+            if key in seen:
+                findings.append(Finding("boot", "duplicate boot argument"))
+            seen.add(key)
+            if token.startswith("hermetic.t="):
+                value = token.removeprefix("hermetic.t=")
+                if not re.fullmatch(r"0|[1-9][0-9]{0,11}", value) or int(value) > MAX_CLOCK:
+                    findings.append(Finding("hermetic.t", "invalid clock value"))
+            elif key.replace("-", "_") == "tsc_early_khz":
+                # It would bypass the pinned CPUID leaf 0x15 frequency.
+                findings.append(Finding("tsc_early_khz", "TSC frequency must not be a boot argument"))
+            elif token.startswith("dm-mod.create") or token == "root=/dev/dm-0":
+                findings.append(Finding("boot", "dm-mod.create and root=/dev/dm-0 are only permitted for NetVM"))
+            elif '"' in token or "'" in token or "\\" in token:
+                findings.append(Finding("boot", "quotes forbidden in boot arguments"))
+            elif token not in BOOT_FIXED.split(" "):
+                findings.append(Finding("boot", "unapproved boot argument"))
+        for required in BOOT_FIXED.split(" "):
+            if required not in tokens:
+                findings.append(Finding(required.partition("=")[0], "required boot argument missing"))
+        if "hermetic.t" not in seen:
+            findings.append(Finding("hermetic.t", "required boot argument missing"))
+
     return sorted(findings, key=lambda f: (f.option, f.message))
 
 

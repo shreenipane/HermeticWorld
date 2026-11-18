@@ -188,6 +188,7 @@ present with its exact value. The final config must identify Linux >= 5.10.
 | `CONFIG_DEVMEM` | `n` | Phase 3b: deny guest root access to kernel code and memory |
 | `CONFIG_DEVTMPFS` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_DEVTMPFS_MOUNT` | `y` | execd boot contract: the kernel mounts devtmpfs at /dev before PID 1 |
+| `CONFIG_DM_INIT` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_DM_VERITY` | `y` | TR-VMM-4: dm-verity and seccomp |
 | `CONFIG_ELF_CORE` | `y` | TR-VMM-4: x86 microVM boot |
 | `CONFIG_EXT4_FS` | `y` | TR-VMM-4: root filesystems |

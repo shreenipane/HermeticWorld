@@ -214,8 +214,9 @@ pub fn api_requests(valid: &ValidatedSpec) -> Vec<ApiRequest> {
         ApiRequest::new("PUT", "/cpu-config", cpu_template()),
         ApiRequest::new("PUT", "/boot-source", boot),
     ];
+    let is_verity = s.role == crate::spec::Role::Net && s.boot_args.contains("dm-mod.create=");
     for (root, d) in
-        std::iter::once((true, &s.root_drive)).chain(s.drives.iter().map(|d| (false, d)))
+        std::iter::once((!is_verity, &s.root_drive)).chain(s.drives.iter().map(|d| (false, d)))
     {
         out.push(ApiRequest::new(
             "PUT",

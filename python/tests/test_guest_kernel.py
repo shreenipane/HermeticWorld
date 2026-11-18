@@ -1018,6 +1018,13 @@ def test_netvm_tproxy_requires_policy_routing_and_mangle():
         assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
 
 
+def test_netvm_dm_verity_requires_builtin_dm_init():
+    for option in ("CONFIG_BLK_DEV_DM", "CONFIG_DM_INIT", "CONFIG_DM_VERITY", "CONFIG_CRYPTO_SHA256"):
+        assert k.RULES[option].value == "y"
+        assert k.parse_config((ROOT / "hermetic.config").read_bytes())[option] == "y"
+        assert [f.option for f in k.check_config(config(_policy(**{option: "n"})))] == [option]
+
+
 # Root must not be able to replace or inspect the trusted kernel even when it
 # creates its own device nodes or supplies arbitrary modules and BPF programs.
 LOCKDOWN_REQUIRED = (

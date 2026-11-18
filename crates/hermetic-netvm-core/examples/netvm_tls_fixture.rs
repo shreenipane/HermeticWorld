@@ -117,8 +117,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 fn main() {
-    if run().is_err() {
-        eprintln!("tls_fixture_failed");
+    if let Err(err) = run() {
+        eprintln!("tls_fixture_failed: {err}");
         std::process::exit(1);
     }
 }

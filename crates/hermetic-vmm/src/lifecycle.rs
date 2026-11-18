@@ -104,7 +104,10 @@ impl<R: Runner> Vmm<R> {
             Ok(khz) => khz,
             Err(error) => {
                 self.state = State::Failed;
-                return Err(Error::Step(prepare_category(&error)));
+                return match error {
+                    Error::Validation(e) => Err(Error::Validation(e)),
+                    _ => Err(Error::Step(prepare_category(&error))),
+                };
             }
         };
         self.tsc_khz = Some(khz);
@@ -114,7 +117,13 @@ impl<R: Runner> Vmm<R> {
                 self.state = State::Prepared;
                 Ok(())
             }
-            Err(error) => Err(self.failure(prepare_category(&error))),
+            Err(error) => {
+                let step = self.failure(prepare_category(&error));
+                match error {
+                    Error::Validation(e) => Err(Error::Validation(e)),
+                    _ => Err(step),
+                }
+            }
         }
     }
     pub fn start(&mut self, timeout: Duration) -> Result<()> {

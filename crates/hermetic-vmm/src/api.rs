@@ -208,7 +208,7 @@ fn request_bytes(req: &ApiRequest) -> Result<Vec<u8>> {
             ) || req
                 .path
                 .strip_prefix("/drives/")
-                .is_some_and(|s| crate::spec::identifier(s, 32))
+                .is_some_and(crate::spec::drive_id)
                 || req
                     .path
                     .strip_prefix("/network-interfaces/")
@@ -219,7 +219,7 @@ fn request_bytes(req: &ApiRequest) -> Result<Vec<u8>> {
                 || req
                     .path
                     .strip_prefix("/drives/")
-                    .is_some_and(|s| crate::spec::identifier(s, 32))
+                    .is_some_and(crate::spec::drive_id)
         }
         _ => false,
     };

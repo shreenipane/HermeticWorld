@@ -5,6 +5,7 @@
 use crate::spec::{absolute_path, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES};
 use crate::{remaining, Error, Result};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd;
@@ -252,7 +253,6 @@ fn initrd_snapshot(
     expected: &str,
     end: Instant,
 ) -> Result<std::io::Cursor<Vec<u8>>> {
-    use sha2::{Digest, Sha256};
     let size = source.metadata()?.len();
     if size == 0 || size > crate::spec::MAX_INITRD_BYTES {
         return Err(Error::Validation("initrd size cap"));
@@ -343,6 +343,87 @@ impl PreparedJail {
             ));
         }
         template.rewind()?;
+        if valid.spec().role == crate::spec::Role::Net
+            && valid.spec().boot_args.contains("dm-mod.create=")
+        {
+            let tokens = crate::spec::split_boot_args(&valid.spec().boot_args)?;
+            let dm_token = tokens
+                .iter()
+                .find(|t| t.starts_with("dm-mod.create="))
+                .ok_or(Error::Validation(
+                    "missing dm-mod.create in NetVM boot args",
+                ))?;
+            let verity = crate::verity::parse_dm_create(dm_token)?;
+
+            let root_dest = format!("drive-{}", valid.spec().root_drive.id);
+            let root_idx = plan
+                .files
+                .iter()
+                .position(|f| f.destination == root_dest)
+                .ok_or(Error::Io)?;
+            let root_size = sources[root_idx]
+                .as_ref()
+                .ok_or(Error::Io)?
+                .metadata()?
+                .len();
+            let expected_data_bytes = verity
+                .num_data_blocks
+                .checked_mul(crate::verity::BLOCK_BYTES as u64)
+                .ok_or(Error::Validation("verity data size overflow"))?;
+            if root_size != expected_data_bytes {
+                return Err(Error::Validation("NetVM verity data drive size mismatch"));
+            }
+
+            if valid.spec().drives.is_empty() {
+                return Err(Error::Validation(
+                    "NetVM verity requires hash drive in drives[0]",
+                ));
+            }
+            let hash_dest = format!("drive-{}", valid.spec().drives[0].id);
+            let hash_idx = plan
+                .files
+                .iter()
+                .position(|f| f.destination == hash_dest)
+                .ok_or(Error::Io)?;
+            let hash_size = sources[hash_idx]
+                .as_ref()
+                .ok_or(Error::Io)?
+                .metadata()?
+                .len();
+
+            let (expected_hash_blocks, _) =
+                crate::verity::calculate_tree_layout(verity.num_data_blocks)?;
+            let expected_hash_bytes = expected_hash_blocks
+                .checked_mul(crate::verity::BLOCK_BYTES as u64)
+                .ok_or(Error::Validation("verity hash size overflow"))?;
+            if hash_size != expected_hash_bytes {
+                return Err(Error::Validation("NetVM verity hash drive size mismatch"));
+            }
+
+            if expected_hash_blocks > 0 {
+                let hash_file = sources[hash_idx].as_mut().ok_or(Error::Io)?;
+                let mut root_block = [0u8; crate::verity::BLOCK_BYTES];
+                hash_file.rewind()?;
+                hash_file.read_exact(&mut root_block)?;
+                hash_file.rewind()?;
+                crate::verity::verify_root_block(&root_block, &verity.salt, &verity.root_hash)?;
+            } else {
+                let root_file = sources[root_idx].as_mut().ok_or(Error::Io)?;
+                let mut data_block = [0u8; crate::verity::BLOCK_BYTES];
+                root_file.rewind()?;
+                root_file.read_exact(&mut data_block)?;
+                root_file.rewind()?;
+                let salt = crate::verity::hex_decode(&verity.salt)
+                    .ok_or(Error::Validation("invalid salt"))?;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&salt);
+                hasher.update(data_block);
+                let digest = hasher.finalize();
+                if crate::verity::hex_encode(&digest) != verity.root_hash {
+                    return Err(Error::Validation("NetVM verity root hash mismatch"));
+                }
+            }
+        }
         remaining(end, "prepare")?;
         let base = Directory::open(&valid.spec().jail.base)?;
         base.exclusive()?;

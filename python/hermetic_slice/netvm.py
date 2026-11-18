@@ -27,6 +27,7 @@ from pathlib import Path
 from hermetic_safe_io import open_parent, open_regular, UnsafePathError
 from hermetic_slice.guest_kernel import DEFAULT_KERNEL_DIR
 from hermetic_slice.substrate import substrate_files
+from hermetic_slice.verity import build_verity_image, derive_verity_salt, format_dm_create
 
 NETVM_ADDRESS = "10.0.2.3"
 AGENT_ADDRESS = "10.0.2.15"
@@ -251,6 +252,8 @@ def build_netvm_image(
     dns_table: Path,
     t_clock: datetime,
     world_id: str,
+    out_hash_image: Path | None = None,
+    salt: str | None = None,
     sealcheck_bin: Path | None = None,
     work_dir: Path | None = None,
     tls_identity: dict | None = None,
@@ -259,16 +262,47 @@ def build_netvm_image(
     kernel_image: Path | None = None,
     clockprobe_bin: Path | None = None,
 ) -> dict:
-    """Build the NetVM tree and a D4-checked read-only ext4 image from it."""
+    """Build the NetVM tree, a D4-checked read-only ext4 image, and its dm-verity hash image."""
     from hermetic_slice.rootfs import build_rootfs
 
     if tls_identity is None:
         raise ValueError("TLS identity is required for the NetVM image")
     if not isinstance(tls_identity, dict) or tls_identity.get("world_id") != world_id:
         raise ValueError("TLS identity world does not match image world")
-    build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock, tls_identity=tls_identity,
-                     gateway=gateway, kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
-    return build_rootfs(
-        tree, out_image, t_clock=t_clock, world_id=world_id, sealcheck_bin=sealcheck_bin, work_dir=work_dir,
-        kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin,
+
+    if out_hash_image is None:
+        out_hash_image = out_image.with_name(out_image.stem + "-verity.img")
+
+    build_netvm_tree(
+        tree,
+        netvm_bin=netvm_bin,
+        busybox_bin=busybox_bin,
+        dns_table=dns_table,
+        t_clock=t_clock,
+        tls_identity=tls_identity,
+        gateway=gateway,
+        kernel_lock=kernel_lock,
+        kernel_image=kernel_image,
+        clockprobe_bin=clockprobe_bin,
     )
+    result = build_rootfs(
+        tree,
+        out_image,
+        t_clock=t_clock,
+        world_id=world_id,
+        sealcheck_bin=sealcheck_bin,
+        work_dir=work_dir,
+        kernel_lock=kernel_lock,
+        kernel_image=kernel_image,
+        clockprobe_bin=clockprobe_bin,
+    )
+    verity_info = build_verity_image(
+        out_image,
+        out_hash_image,
+        salt=salt,
+        world_id=world_id,
+        t_clock=t_clock,
+        work_dir=work_dir,
+    )
+    result["verity"] = verity_info
+    return result

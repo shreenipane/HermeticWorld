@@ -417,6 +417,32 @@ fn run() {
         .spec
         .boot_args
         .replace("init=/sbin/hermetic-execd", "init=/sbin/hermetic-netvm");
+    if let Ok(verity_path) = std::env::var("HERMETIC_NETVM_VERITY") {
+        let work = std::path::Path::new(&v[6]);
+        let verity_meta = work.join("netvm-verity.json");
+        let dm_create = if let Ok(data) = std::fs::read_to_string(&verity_meta) {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&data).expect("invalid netvm-verity.json");
+            parsed["dm_create"]
+                .as_str()
+                .expect("missing dm_create in netvm-verity.json")
+                .to_string()
+        } else {
+            std::env::var("HERMETIC_NETVM_DM_CREATE")
+                .expect("missing HERMETIC_NETVM_DM_CREATE or netvm-verity.json")
+        };
+        net.spec.drives = vec![hermetic_vmm::spec::Drive {
+            id: "verity_hash".into(),
+            path: verity_path,
+            read_only: true,
+        }];
+        net.spec.boot_args = net
+            .spec
+            .boot_args
+            .replace("root=/dev/vda", "root=/dev/dm-0");
+        net.spec.boot_args.push(' ');
+        net.spec.boot_args.push_str(&dm_create);
+    }
     if let Some(vsock) = net.spec.vsock.as_mut() {
         vsock.guest_cid = 4;
     }
@@ -794,6 +820,195 @@ fn development_console_survives_failure_cleanup_and_is_bounded() {
     let (serial, errors) = vm.runner().console_output();
     assert_eq!(serial, vec![b's'; MAX_CAPTURE_BYTES]);
     assert_eq!(errors, vec![b'e'; MAX_CAPTURE_BYTES]);
+}
+
+#[test]
+fn netvm_boots_with_dm_verity_and_corrupt_images_fail() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        use hermetic_vmm::runner::DevUnjailed;
+        use std::io::{Read, Seek, Write};
+        let required_env = [
+            "HERMETIC_FC_BIN",
+            "HERMETIC_KERNEL",
+            "HERMETIC_NETVM_ROOTFS",
+            "HERMETIC_NETVM_VERITY",
+        ];
+        let mut vars = Vec::new();
+        for name in required_env {
+            match std::env::var(name) {
+                Ok(val) => vars.push(val),
+                Err(_) => {
+                    eprintln!("skipped: {name} not set");
+                    return;
+                }
+            }
+        }
+        let fc = &vars[0];
+        let kernel = &vars[1];
+        let rootfs = &vars[2];
+        let verity_img = &vars[3];
+
+        let dm_create = match std::env::var("HERMETIC_NETVM_DM_CREATE") {
+            Ok(val) => val,
+            Err(_) => {
+                let p = std::path::Path::new(rootfs)
+                    .parent()
+                    .unwrap()
+                    .join("netvm-verity.json");
+                if let Ok(data) = std::fs::read_to_string(&p) {
+                    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+                    parsed["dm_create"].as_str().unwrap().to_string()
+                } else {
+                    eprintln!(
+                        "skipped: HERMETIC_NETVM_DM_CREATE not set and netvm-verity.json missing"
+                    );
+                    return;
+                }
+            }
+        };
+
+        let fixture = support::Fixture::new();
+        let launcher = python_launcher(&fixture);
+        let base = fixture.temp.path();
+
+        let mut net = support::Fixture::new();
+        net.spec.id = "net-verity-0".into();
+        net.spec.role = Role::Net;
+        net.spec.index = 0;
+        net.spec.memory_mib = 128;
+        net.spec.jail.firecracker = fc.clone();
+        net.spec.kernel_image = kernel.clone();
+        net.spec.root_drive.path = rootfs.clone();
+        net.spec.root_drive.read_only = true;
+        net.spec.drives = vec![hermetic_vmm::spec::Drive {
+            id: "verity_hash".into(),
+            path: verity_img.clone(),
+            read_only: true,
+        }];
+        net.spec.boot_args = format!(
+            "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/dm-0 init=/sbin/hermetic-netvm clocksource=tsc tsc=reliable hermetic.t=1700000000 ro {dm_create}"
+        );
+        net.spec.networks = vec![Network {
+            tap: std::env::var("HERMETIC_NET_TAP").unwrap_or_else(|_| "hwtap-net".into()),
+            guest_mac: project_mac(Role::Net, 0),
+            peer: Role::Agent,
+        }];
+
+        // 1. Corrupt data image must fail (either on VMM prepare or guest dm-verity)
+        let corrupt_data = base.join("corrupt-data.img");
+        std::fs::copy(rootfs, &corrupt_data).unwrap();
+        std::fs::set_permissions(&corrupt_data, std::fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&corrupt_data)
+                .unwrap();
+            f.seek(std::io::SeekFrom::Start(1024)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x55;
+            f.seek(std::io::SeekFrom::Start(1024)).unwrap();
+            f.write_all(&byte).unwrap();
+        }
+        std::fs::set_permissions(&corrupt_data, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let mut bad_net_data = net.spec.clone();
+        bad_net_data.id = "net-corrupt-data".into();
+        bad_net_data.root_drive.path = corrupt_data.to_str().unwrap().into();
+        let mut bad_data_vm = Vmm::new(
+            bad_net_data.validate().unwrap(),
+            DevUnjailed::new(&launcher).unwrap(),
+        );
+        let prep = bad_data_vm.prepare(Duration::from_secs(30));
+        if prep.is_ok() {
+            assert!(bad_data_vm.start(Duration::from_secs(10)).is_ok());
+            let ready = bad_data_vm.wait_ready(Duration::from_secs(10));
+            if ready.is_ok() {
+                assert!(
+                    bad_data_vm.wait_exit(Duration::from_secs(10)).is_ok(),
+                    "corrupt data image reached ready without dm-verity exit"
+                );
+            }
+        } else {
+            assert!(matches!(prep.err(), Some(Error::Validation(_))));
+        }
+
+        // 2. Corrupt hash image root block must fail closed on VMM prepare (root hash mismatch)
+        let corrupt_hash = base.join("corrupt-hash.img");
+        std::fs::copy(verity_img, &corrupt_hash).unwrap();
+        std::fs::set_permissions(&corrupt_hash, std::fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&corrupt_hash)
+                .unwrap();
+            f.seek(std::io::SeekFrom::Start(1024)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xaa;
+            f.seek(std::io::SeekFrom::Start(1024)).unwrap();
+            f.write_all(&byte).unwrap();
+        }
+        std::fs::set_permissions(&corrupt_hash, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let mut bad_net_hash = net.spec.clone();
+        bad_net_hash.id = "net-corrupt-hash".into();
+        bad_net_hash.drives[0].path = corrupt_hash.to_str().unwrap().into();
+        let mut bad_hash_vm = Vmm::new(
+            bad_net_hash.validate().unwrap(),
+            DevUnjailed::new(&launcher).unwrap(),
+        );
+        let prep_hash = bad_hash_vm.prepare(Duration::from_secs(30));
+        assert_eq!(
+            prep_hash.err(),
+            Some(Error::Validation("verity root hash mismatch"))
+        );
+
+        // 3. Corrupt hash image tree block (beyond root block) must boot-fail in guest dm-verity
+        let hash_len = std::fs::metadata(verity_img).unwrap().len();
+        if hash_len > 4096 {
+            let corrupt_tree = base.join("corrupt-tree.img");
+            std::fs::copy(verity_img, &corrupt_tree).unwrap();
+            std::fs::set_permissions(&corrupt_tree, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            {
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&corrupt_tree)
+                    .unwrap();
+                f.seek(std::io::SeekFrom::Start(4096 + 1024)).unwrap();
+                let mut byte = [0u8; 1];
+                f.read_exact(&mut byte).unwrap();
+                byte[0] ^= 0x5a;
+                f.seek(std::io::SeekFrom::Start(4096 + 1024)).unwrap();
+                f.write_all(&byte).unwrap();
+            }
+            std::fs::set_permissions(&corrupt_tree, std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            let mut bad_net_tree = net.spec;
+            bad_net_tree.id = "net-corrupt-tree".into();
+            bad_net_tree.drives[0].path = corrupt_tree.to_str().unwrap().into();
+            let mut bad_tree_vm = Vmm::new(
+                bad_net_tree.validate().unwrap(),
+                DevUnjailed::new(&launcher).unwrap(),
+            );
+            let prep_tree = bad_tree_vm.prepare(Duration::from_secs(30));
+            if prep_tree.is_ok() {
+                assert!(bad_tree_vm.start(Duration::from_secs(10)).is_ok());
+                let ready = bad_tree_vm.wait_ready(Duration::from_secs(10));
+                if ready.is_ok() {
+                    assert!(
+                        bad_tree_vm.wait_exit(Duration::from_secs(10)).is_ok(),
+                        "corrupt hash tree block guest must boot-fail and exit"
+                    );
+                }
+            } else {
+                assert!(matches!(prep_tree.err(), Some(Error::Validation(_))));
+            }
+        }
+    }
 }
 
 #[test]

@@ -83,8 +83,12 @@ n = build_netvm_image(work / "netvm-tree", work / "netvm.img", netvm_bin=Path(sy
                       world_id="net-smoke-netvm", tls_identity=json.loads((work / "tls-identity.json").read_text()), sealcheck_bin=work / "sealcheck", work_dir=work)
 for r in (a, n):
     print(json.dumps({k: r[k] for k in ("image", "sha256", "d4")}))
+(work / "netvm-verity.json").write_text(json.dumps(n["verity"]))
 PY
 chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
+if [ -f "$WORK/netvm-verity.img" ]; then
+  chmod 0400 "$WORK/netvm-verity.img"
+fi
 
 # 5. Boot both VMs and run the checks from the agent through execd (owner-run ignored test).
 # Verifies TPROXY serves arbitrary destination on 80/443 matching manifest host,
@@ -93,7 +97,8 @@ chmod 0400 "$WORK/agent.img" "$WORK/netvm.img"
 umask 077
 if \
 HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_ROOTFS="$WORK/agent.img" \
-HERMETIC_NETVM_ROOTFS="$WORK/netvm.img" HERMETIC_WORLD_SERVER_BIN="$WORK/world-server" \
+HERMETIC_NETVM_ROOTFS="$WORK/netvm.img" HERMETIC_NETVM_VERITY="$WORK/netvm-verity.img" \
+HERMETIC_WORLD_SERVER_BIN="$WORK/world-server" \
 HERMETIC_WORLD_STORE="$WORK/store" HERMETIC_NET_WORK="$WORK" \
   cargo test -p hermetic-vmm --features dev-unjailed --test net_guest \
   netvm_serves_world_to_agent_and_drops_everything_else -- --ignored --nocapture \

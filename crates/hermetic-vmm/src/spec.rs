@@ -115,6 +115,12 @@ pub fn identifier(s: &str, max: usize) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
+pub fn drive_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+pub fn valid_drive_id(s: &str) -> bool {
+    drive_id(s)
+}
 pub fn absolute_path(s: &str) -> bool {
     s.len() <= MAX_PATH_BYTES
         && !s.as_bytes().contains(&0)
@@ -143,37 +149,78 @@ pub fn project_mac(role: Role, index: usize) -> String {
 pub const GRADER_RESULT_DRIVE: &str = "result";
 /// Exact size of the GraderVM result drive (HGRD image).
 pub const GRADER_RESULT_BYTES: u64 = 1024 * 1024;
-pub fn validate_boot_args(args: &str) -> Result<()> {
-    if args.len() > MAX_BOOT_ARGS
-        || args.is_empty()
-        // Keep tokenization identical to the guest's whitespace rule table.
-        // Linux command-line quoting must not hide a required/forbidden token.
-        || !args.bytes().all(|b| {
-            (b == b' ' || b.is_ascii_graphic()) && !matches!(b, b'"' | b'\'' | b'\\')
-        })
+
+pub fn split_boot_args(args: &str) -> Result<Vec<&str>> {
+    if args.len() > MAX_BOOT_ARGS || args.is_empty() {
+        return Err(Error::Validation("boot argument encoding/cap"));
+    }
+    if !args
+        .bytes()
+        .all(|b| (b == b' ' || b.is_ascii_graphic()) && !matches!(b, b'\'' | b'\\'))
     {
         return Err(Error::Validation("boot argument encoding/cap"));
     }
+    let mut tokens = Vec::new();
+    let mut rest = args.trim_start();
+    while !rest.is_empty() {
+        if rest.starts_with("dm-mod.create=\"") {
+            let quote_end = rest[15..]
+                .find('"')
+                .ok_or(Error::Validation("unmatched quote in dm-mod.create"))?;
+            let token_end = 15 + quote_end + 1;
+            if token_end < rest.len() && !rest[token_end..].starts_with(' ') {
+                return Err(Error::Validation("dm-mod.create token boundary"));
+            }
+            tokens.push(&rest[..token_end]);
+            rest = rest[token_end..].trim_start();
+        } else {
+            let token_end = rest.find(' ').unwrap_or(rest.len());
+            let token = &rest[..token_end];
+            if token.contains('"') {
+                return Err(Error::Validation("quotes forbidden outside dm-mod.create"));
+            }
+            tokens.push(token);
+            rest = rest[token_end..].trim_start();
+        }
+    }
+    Ok(tokens)
+}
+
+pub fn validate_boot_args_for_role(args: &str, role: Role) -> Result<()> {
+    let tokens = split_boot_args(args)?;
     let mut required = [false; 4];
     let mut keys = BTreeSet::new();
-    for arg in args.split_ascii_whitespace() {
-        if arg == "--" {
+    let mut has_dm_create = false;
+    let mut has_dm_root = false;
+
+    for arg in &tokens {
+        if *arg == "--" {
             return Err(Error::Validation(
                 "standalone -- separator forbidden in boot arguments",
             ));
         }
-        let key = arg
-            .split('=')
-            .next()
-            .ok_or(Error::Validation("boot argument"))?;
+        let key = if arg.starts_with("dm-mod.create=") {
+            "dm-mod.create"
+        } else {
+            arg.split('=')
+                .next()
+                .ok_or(Error::Validation("boot argument"))?
+        };
         if !keys.insert(key) {
             return Err(Error::Validation("duplicate boot argument"));
         }
-        match arg {
+        match *arg {
             "clocksource=tsc" => required[0] = true,
             "tsc=reliable" => required[1] = true,
             "ro" => required[3] = true,
             "rw" => return Err(Error::Validation("writable root forbidden")),
+            "root=/dev/dm-0" => {
+                has_dm_root = true;
+            }
+            _ if arg.starts_with("dm-mod.create=") => {
+                has_dm_create = true;
+                crate::verity::parse_dm_create(arg)?;
+            }
             _ if arg.starts_with("hermetic.t=") => {
                 let value = arg
                     .strip_prefix("hermetic.t=")
@@ -208,7 +255,38 @@ pub fn validate_boot_args(args: &str) -> Result<()> {
             "required boot arguments: clocksource=tsc tsc=reliable hermetic.t= ro",
         ));
     }
+    if role == Role::Net {
+        if has_dm_create && !has_dm_root {
+            return Err(Error::Validation(
+                "NetVM with dm-verity requires root=/dev/dm-0",
+            ));
+        }
+        if has_dm_root && !has_dm_create {
+            return Err(Error::Validation(
+                "root=/dev/dm-0 requires dm-mod.create verity table",
+            ));
+        }
+    } else {
+        if has_dm_create {
+            return Err(Error::Validation(
+                "dm-mod.create only permitted for NetVM role",
+            ));
+        }
+        if has_dm_root {
+            return Err(Error::Validation(
+                "root=/dev/dm-0 only permitted for NetVM role",
+            ));
+        }
+    }
     Ok(())
+}
+
+pub fn validate_boot_args(args: &str) -> Result<()> {
+    if args.contains("dm-mod.create=") {
+        validate_boot_args_for_role(args, Role::Net)
+    } else {
+        validate_boot_args_for_role(args, Role::Agent)
+    }
 }
 impl VmSpec {
     pub fn read(reader: impl Read) -> Result<Self> {
@@ -267,7 +345,7 @@ impl VmSpec {
                 "Firecracker executable basename must be firecracker",
             ));
         }
-        validate_boot_args(&self.boot_args)?;
+        validate_boot_args_for_role(&self.boot_args, self.role)?;
         if crate::plan::has_tsc_arg(&self.boot_args) {
             return Err(Error::Validation("tsc_early_khz is set by the VMM"));
         }
@@ -321,12 +399,12 @@ impl VmSpec {
         }
         let mut ids = BTreeSet::new();
         for drive in std::iter::once(&self.root_drive).chain(self.drives.iter()) {
-            if !identifier(&drive.id, 32) || !ids.insert(&drive.id) || !absolute_path(&drive.path) {
+            if !drive_id(&drive.id) || !ids.insert(&drive.id) || !absolute_path(&drive.path) {
                 return Err(Error::Validation("drive id/path"));
             }
         }
         for id in &self.reserved_drives {
-            if !identifier(id, 32) || !ids.insert(id) {
+            if !drive_id(id) || !ids.insert(id) {
                 return Err(Error::Validation("reserved drive id"));
             }
         }
@@ -371,6 +449,14 @@ impl VmSpec {
         }
         if self.role == Role::Net && self.drives.iter().any(|drive| !drive.read_only) {
             return Err(Error::Validation("NetVM drives must be read-only"));
+        }
+        if self.role == Role::Net
+            && self.boot_args.contains("dm-mod.create=")
+            && (self.drives.is_empty() || !self.drives[0].read_only)
+        {
+            return Err(Error::Validation(
+                "NetVM verity requires read-only hash drive as drives[0]",
+            ));
         }
         if self.role == Role::Agent
             && (self.networks.len() > 1 || self.networks.iter().any(|n| n.peer != Role::Net))
@@ -452,4 +538,24 @@ pub fn validate_run(specs: Vec<VmSpec>) -> Result<Vec<ValidatedSpec>> {
         out.push(valid);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drive_id_validation_refuses_verity_hyphen_and_accepts_underscore() {
+        assert!(!drive_id("verity-hash"));
+        assert!(drive_id("verity_hash"));
+        assert!(!valid_drive_id("verity-hash"));
+        assert!(valid_drive_id("verity_hash"));
+        assert!(!drive_id(""));
+        assert!(drive_id(&"a".repeat(64)));
+        assert!(!drive_id(&"a".repeat(65)));
+        assert!(!drive_id("drive-id"));
+        assert!(!drive_id("drive.id"));
+        assert!(!drive_id("drive id"));
+        assert!(drive_id("Drive_123"));
+    }
 }

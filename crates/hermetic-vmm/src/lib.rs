@@ -8,6 +8,7 @@ pub mod pin;
 pub mod plan;
 pub mod runner;
 pub mod spec;
+pub mod verity;
 
 pub use extractor::{
     create_fresh_output_drive, create_overlay_cow_copy, extractor_spec, fallback_chunked_copy,
@@ -16,7 +17,8 @@ pub use extractor::{
 };
 pub use lifecycle::{State, Vmm};
 pub use plan::{api_requests, jail_plan, ApiRequest, JailPlan};
-pub use spec::{ValidatedSpec, VmSpec};
+pub use spec::{drive_id, valid_drive_id, ValidatedSpec, VmSpec};
+pub use verity::{parse_dm_create, VerityTable};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

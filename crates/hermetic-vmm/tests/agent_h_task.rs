@@ -102,6 +102,7 @@ fn runs_sealed_task_through_host_harness() -> Result<(), Box<dyn std::error::Err
         if let Err(error) = vm.prepare(Duration::from_secs(120)) {
             let category = match &error {
                 hermetic_vmm::Error::Step(category) => *category,
+                hermetic_vmm::Error::Validation(_) => "prepare-validation",
                 _ => "prepare",
             };
             println!("agent-vm-category: {category}");
