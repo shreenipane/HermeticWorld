@@ -16,7 +16,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 2: World | done 33 of 45 |
 | 3: VMs | done 40 of 58 |
 | 3b: Clock hiding | done 18 of 20 |
-| 4: Extensions | done 30 of 43 |
+| 4: Extensions | done 30 of 42 |
 
 ## Overview
 
@@ -345,7 +345,7 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
   - [ ] Trusted harness integration: close model/network access, pause and consistently snapshot memory plus disk, verify artifact bytes in isolation, match reserved drive/interface topology, redirect every interface to a tap without a peer before resume, attach/mount tests read-only, supervise grading, perform trusted-initramfs fallback, and embed the selected path in the signed run record. VM/KVM validation remains open.
 - [ ] Split mode for Mode G (agent in a second VM)
 - [ ] TEE quotes (SEV-SNP, TDX, Nitro)
-- [ ] aarch64 (pl031 RTC offset patch)
+- Deferred out of v1 (owner decision 2026-11-18): aarch64 (pl031 RTC offset patch); x86-64 only in v1.
 - [x] Resolve whether archived pages can be redistributed: owner decision 2026-11-14, archived pages stay local-only and are never redistributed or published.
 
 ### Preparation and remaining prerequisites (2026-11-14)
