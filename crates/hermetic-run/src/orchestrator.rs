@@ -324,6 +324,23 @@ fn read_artifact_bytes(
     }
 }
 
+/// Helper to read an optional artifact safely without following symlinks.
+fn read_optional_artifact_bytes(
+    run_dir: &Path,
+    artifact: &'static str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, OrchestratorError> {
+    let path = run_dir.join(artifact);
+    match safe_read_file(&path, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OrchestratorError::Fs {
+            artifact,
+            detail: e.to_string(),
+        }),
+    }
+}
+
 /// Helper to construct a sanitized JSON parse error detail without hostile parser text.
 #[inline]
 fn json_parse_error(line: usize, column: usize) -> String {
@@ -543,6 +560,52 @@ fn load_harness_sentinel(run_dir: &Path) -> Result<SentinelSummary, Orchestrator
         artifact: "harness_summary.json",
         detail: json_parse_error(e.line(), e.column()),
     })
+}
+
+/// Load and parse the probe real-date sentinel summary if present.
+fn load_probe_sentinel(run_dir: &Path) -> Result<Option<SentinelSummary>, OrchestratorError> {
+    let maybe_bytes =
+        read_optional_artifact_bytes(run_dir, "probe_sentinel.json", MAX_SENTINEL_BYTES)?;
+    let Some(bytes) = maybe_bytes else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| OrchestratorError::Json {
+            artifact: "probe_sentinel.json",
+            detail: json_parse_error(e.line(), e.column()),
+        })
+}
+
+/// Load and aggregate the dedicated escape probe output if present.
+/// Returns (Digest, ProbeResult, bool /* date_leak */) if escape_probe.jsonl exists.
+fn load_escape_probe_output(
+    run_dir: &Path,
+) -> Result<Option<(Digest, ProbeResult, bool)>, OrchestratorError> {
+    let maybe_bytes = read_optional_artifact_bytes(run_dir, "escape_probe.jsonl", MAX_PROBE_BYTES)?;
+    let Some(bytes) = maybe_bytes else {
+        return Ok(None);
+    };
+    let digest = Digest::from_sha256(&bytes);
+    let expected = hermetic_escapeprobe::probes::expected_probe_names();
+    let verdict = hermetic_escapeprobe::report::aggregate(&bytes, &expected);
+
+    let (result, date_leak) = match verdict {
+        hermetic_escapeprobe::report::Verdict::Sealed => (ProbeResult::Passed, false),
+        hermetic_escapeprobe::report::Verdict::Incomplete { .. } => (ProbeResult::Failed, false),
+        hermetic_escapeprobe::report::Verdict::Escaped { ref leaks } => {
+            let has_date_leak = leaks.iter().any(|l| l == "gateway.model_call_date");
+            (ProbeResult::Failed, has_date_leak)
+        }
+        hermetic_escapeprobe::report::Verdict::Invalid { reason } => {
+            return Err(OrchestratorError::MalformedArtifact {
+                artifact: "escape_probe.jsonl",
+                detail: reason,
+            });
+        }
+    };
+
+    Ok(Some((digest, result, date_leak)))
 }
 
 /// Gateway history-consistency hash log artifact (Mode G).
@@ -849,7 +912,9 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     // 1. Read and parse all canonical artifacts strictly no-follow and byte-capped
     let gateway_sentinel = load_gateway_sentinel(run_dir)?;
     let harness_sentinel = load_harness_sentinel(run_dir)?;
-    let (probe_records, escape_probe_digest) = load_probe_output(run_dir)?;
+    let probe_sentinel = load_probe_sentinel(run_dir)?;
+    let (probe_records, legacy_probe_digest) = load_probe_output(run_dir)?;
+    let escape_probe_artifact = load_escape_probe_output(run_dir)?;
     let boot_record = load_boot_record(run_dir)?;
     let verdict = load_verdict(run_dir)?;
     let manifest = load_world_manifest(run_dir)?;
@@ -857,12 +922,26 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     let gateway_head = load_gateway_head_summary(run_dir)?;
     let submitted_work_digest = resolve_submitted_work_digest(run_dir, &verdict)?;
 
-    // 2. Date leak is derived ONLY from the real-date sentinels (TR-SEC-5, D12)
-    let merged_sentinel = SentinelSummary::merge(&[gateway_sentinel, harness_sentinel]);
-    let date_leak_observed = merged_sentinel.date_leak_observed;
+    // 2. Date leak is derived from real-date sentinels (TR-SEC-5, D12)
+    let mut sentinels = vec![gateway_sentinel, harness_sentinel];
+    if let Some(probe_s) = probe_sentinel {
+        sentinels.push(probe_s);
+    }
+    let merged_sentinel = SentinelSummary::merge(&sentinels);
+    let escape_probe_date_leak = escape_probe_artifact
+        .as_ref()
+        .map(|(_, _, dl)| *dl)
+        .unwrap_or(false);
+    let date_leak_observed = merged_sentinel.date_leak_observed || escape_probe_date_leak;
 
     // 3. Derive escape probe result strictly from probe records
-    let escape_probe_result = derive_escape_probe_result(&probe_records);
+    let (escape_probe_digest, escape_probe_result) =
+        if let Some((ep_digest, ep_result, _)) = escape_probe_artifact {
+            (ep_digest, ep_result)
+        } else {
+            let legacy_result = derive_escape_probe_result(&probe_records);
+            (legacy_probe_digest, legacy_result)
+        };
 
     // 4. Derive host facts and clock level using the exact classifier rules
     let host = load_host_facts(run_dir)?;

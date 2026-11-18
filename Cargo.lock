@@ -785,7 +785,12 @@ name = "hermetic-escapeprobe"
 version = "0.1.0"
 dependencies = [
  "hermetic-netvm-dns",
+ "hermetic-sealcheck",
  "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -930,6 +935,7 @@ name = "hermetic-run"
 version = "0.1.0"
 dependencies = [
  "hermetic-attest",
+ "hermetic-escapeprobe",
  "hermetic-sealcheck",
  "ring",
  "serde",

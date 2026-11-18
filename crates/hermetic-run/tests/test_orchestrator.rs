@@ -1629,6 +1629,176 @@ fn test_regression_coderabbit_hostile_parser_diagnostics_sanitized() {
     }
 }
 
+fn build_escape_probe_jsonl(
+    f: impl Fn(&str) -> hermetic_escapeprobe::classify::EscapeResult,
+) -> String {
+    hermetic_escapeprobe::probes::expected_probe_names()
+        .iter()
+        .map(|n| {
+            hermetic_escapeprobe::classify::EscapeRecord::new(n.clone(), f(n), "fixed detail")
+                .to_json_line()
+                + "\n"
+        })
+        .collect()
+}
+
+#[test]
+fn test_escape_probe_jsonl_sealed_gives_passed_and_matching_digest() {
+    let f = FixturePaths::new();
+    let escape_content = build_escape_probe_jsonl(|n| {
+        if n.starts_with("positive.") {
+            hermetic_escapeprobe::classify::EscapeResult::Ok
+        } else {
+            hermetic_escapeprobe::classify::EscapeResult::Blocked
+        }
+    });
+    let escape_bytes = escape_content.as_bytes();
+    let expected_digest = Digest::from_sha256(escape_bytes);
+    fs::write(f.path().join("escape_probe.jsonl"), escape_bytes).unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble with escape_probe.jsonl");
+    assert_eq!(record.escape_probe_result, ProbeResult::Passed);
+    assert_eq!(record.escape_probe_digest, expected_digest);
+}
+
+#[test]
+fn test_escape_probe_jsonl_leak_gives_failed_and_triggers_date_leak() {
+    let f = FixturePaths::new();
+    let escape_content = build_escape_probe_jsonl(|n| {
+        if n == "gateway.model_call_date" {
+            hermetic_escapeprobe::classify::EscapeResult::Leak
+        } else if n.starts_with("positive.") {
+            hermetic_escapeprobe::classify::EscapeResult::Ok
+        } else {
+            hermetic_escapeprobe::classify::EscapeResult::Blocked
+        }
+    });
+    fs::write(
+        f.path().join("escape_probe.jsonl"),
+        escape_content.as_bytes(),
+    )
+    .unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble with leaking escape_probe.jsonl");
+    assert_eq!(record.escape_probe_result, ProbeResult::Failed);
+    assert!(record.date_leak_observed);
+    assert_eq!(record.clock, ClockLevel::Faked);
+    assert_eq!(record.run_status, RunStatus::Review);
+}
+
+#[test]
+fn test_escape_probe_jsonl_incomplete_gives_failed() {
+    let f = FixturePaths::new();
+    let escape_content = build_escape_probe_jsonl(|n| {
+        if n == "gateway.quota" {
+            hermetic_escapeprobe::classify::EscapeResult::Unavailable
+        } else if n.starts_with("positive.") {
+            hermetic_escapeprobe::classify::EscapeResult::Ok
+        } else {
+            hermetic_escapeprobe::classify::EscapeResult::Blocked
+        }
+    });
+    fs::write(
+        f.path().join("escape_probe.jsonl"),
+        escape_content.as_bytes(),
+    )
+    .unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble with incomplete escape probe");
+    assert_eq!(record.escape_probe_result, ProbeResult::Failed);
+    assert!(!record.date_leak_observed);
+}
+
+#[test]
+fn test_escape_probe_jsonl_malformed_fails_closed() {
+    let f = FixturePaths::new();
+    fs::write(
+        f.path().join("escape_probe.jsonl"),
+        b"not valid json lines\n",
+    )
+    .unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("malformed escape_probe.jsonl must fail");
+    assert!(matches!(
+        err,
+        OrchestratorError::MalformedArtifact {
+            artifact: "escape_probe.jsonl",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_escape_probe_jsonl_symlink_fails_closed() {
+    let f = FixturePaths::new();
+    let real = f.path().join("real_escape.jsonl");
+    fs::write(&real, b"clean").unwrap();
+    symlink(&real, f.path().join("escape_probe.jsonl")).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("symlinked escape_probe.jsonl must fail");
+    assert!(matches!(
+        err,
+        OrchestratorError::Fs {
+            artifact: "escape_probe.jsonl",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_probe_sentinel_json_merged_into_date_leak_observed() {
+    let f = FixturePaths::new();
+    let probe_sentinel = json!({
+        "date_leak_observed": true,
+        "scan_incomplete": false,
+        "hits": {"model_response:real_date": 1},
+        "incomplete": {},
+        "bytes_scanned": 100
+    });
+    fs::write(
+        f.path().join("probe_sentinel.json"),
+        probe_sentinel.to_string(),
+    )
+    .unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble with probe_sentinel.json");
+    assert!(record.date_leak_observed);
+    assert_eq!(record.clock, ClockLevel::Faked);
+    assert_eq!(record.run_status, RunStatus::Review);
+}
+
+#[test]
+fn test_probe_sentinel_json_malformed_fails_closed() {
+    let f = FixturePaths::new();
+    fs::write(f.path().join("probe_sentinel.json"), b"not valid json").unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("malformed probe_sentinel.json must fail");
+    assert!(matches!(
+        err,
+        OrchestratorError::Json {
+            artifact: "probe_sentinel.json",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_probe_sentinel_json_symlink_fails_closed() {
+    let f = FixturePaths::new();
+    let real = f.path().join("real_probe_sentinel.json");
+    fs::write(&real, b"{}").unwrap();
+    symlink(&real, f.path().join("probe_sentinel.json")).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("symlinked probe_sentinel.json must fail");
+    assert!(matches!(
+        err,
+        OrchestratorError::Fs {
+            artifact: "probe_sentinel.json",
+            ..
+        }
+    ));
+}
+
 #[test]
 fn test_assemble_and_sign_run_record_mode_g_records_agent_volume_digest() {
     let f = FixturePaths::new();

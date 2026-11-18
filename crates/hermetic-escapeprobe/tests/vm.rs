@@ -8,11 +8,15 @@ use hermetic_escapeprobe::report::{aggregate, Verdict};
 #[test]
 #[ignore = "dev-unjailed: run only inside an AgentVM guest"]
 fn escape_probe_in_guest_finds_no_way_out() {
-    assert_eq!(
-        std::env::var("HERMETIC_ESCAPE_PROBE_IN_GUEST").as_deref(),
-        Ok("1"),
-        "refusing to probe outside a guest"
-    );
+    let Ok(val) = std::env::var("HERMETIC_ESCAPE_PROBE_IN_GUEST") else {
+        eprintln!(
+            "skipped: run only inside an AgentVM guest (set HERMETIC_ESCAPE_PROBE_IN_GUEST=1)"
+        );
+        return;
+    };
+    if val != "1" {
+        return;
+    }
     let records = run_all();
     let report: String = records.iter().map(|r| r.to_json_line() + "\n").collect();
     print!("{report}");

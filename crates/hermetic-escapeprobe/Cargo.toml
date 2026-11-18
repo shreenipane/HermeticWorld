@@ -6,6 +6,11 @@ description = "Guest root escape probe (TR-SEC-6): tries every documented way ou
 
 [dependencies]
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+hermetic-sealcheck = { path = "../hermetic-sealcheck" }
 
 [dev-dependencies]
 hermetic-netvm-dns = { path = "../hermetic-netvm-dns" }
+tempfile.workspace = true

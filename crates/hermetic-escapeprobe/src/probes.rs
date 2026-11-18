@@ -258,7 +258,20 @@ pub fn run_all() -> Vec<EscapeRecord> {
 }
 
 /// Deliver each completed record immediately, before starting the next probe.
-pub fn run_with(mut emit: impl FnMut(&EscapeRecord)) -> Vec<EscapeRecord> {
+pub fn run_with(emit: impl FnMut(&EscapeRecord)) -> Vec<EscapeRecord> {
+    let cfg = crate::config::load_config(None).ok().flatten();
+    let (records, _) = run_with_config(cfg.as_ref(), emit);
+    records
+}
+
+/// Run all probes with an explicit configuration.
+pub fn run_with_config(
+    cfg: Option<&crate::config::EscapeConfig>,
+    mut emit: impl FnMut(&EscapeRecord),
+) -> (
+    Vec<EscapeRecord>,
+    Option<hermetic_sealcheck::d12_runtime::SentinelSummary>,
+) {
     let end = Instant::now() + MAX_PROBE_RUNTIME;
     let mut out = Vec::new();
     let mut push = |record: EscapeRecord| {
@@ -360,26 +373,21 @@ pub fn run_with(mut emit: impl FnMut(&EscapeRecord)) -> Vec<EscapeRecord> {
         "kernel.module_load".into(),
         classify::classify_module_load(sys::init_module_empty()),
     ));
-    for g in GATEWAY_PROBES {
-        push(EscapeRecord::new(
-            *g,
-            EscapeResult::Unavailable,
-            "gateway probe not configured",
-        ));
+    let (gw_records, sentinel_summary) =
+        crate::gateway::run_gateway_probes(cfg.and_then(|c| c.gateway.as_ref()), CONNECT_TIMEOUT);
+    for r in gw_records {
+        push(r);
     }
     let mut buf = [0u8; 32];
     push(rec(
         "positive.getrandom_nonblock".into(),
         classify::classify_getrandom(sys::getrandom_nonblock(&mut buf), buf.len()),
     ));
-    for p in INSTALL_PROBES {
-        push(EscapeRecord::new(
-            *p,
-            EscapeResult::Unavailable,
-            "install check not configured",
-        ));
+    let inst_records = crate::install::run_install_probes(cfg.and_then(|c| c.install.as_ref()));
+    for r in inst_records {
+        push(r);
     }
-    out
+    (out, sentinel_summary)
 }
 
 /// The control listener is outside the escape surface. Probe every other

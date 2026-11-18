@@ -4,8 +4,10 @@
 //! prints the verdict. Exit codes: 0 sealed, 2 leak/escaped, 1 otherwise.
 
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
-use hermetic_escapeprobe::{classify, probes, report};
+use hermetic_escapeprobe::{classify, config, probes, report};
 
 // A stalled kernel operation must not consume execd's entire command deadline.
 // A partial report is invalid at the aggregator, so expiry fails closed.
@@ -17,43 +19,68 @@ fn start_watchdog(timeout: std::time::Duration) {
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args_os().skip(1).take(2).collect();
-    match args.as_slice() {
-        [] => {
-            start_watchdog(probes::MAX_PROBE_RUNTIME);
-            let mut out = io::stdout().lock();
-            let records = probes::run_with(|r| {
-                if writeln!(out, "{}", r.to_json_line())
-                    .and_then(|()| out.flush())
-                    .is_err()
-                {
-                    std::process::exit(1);
-                }
-            });
-            std::process::exit(classify::exit_code(&records));
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+
+    if args.len() == 1 && args[0] == "--aggregate" {
+        let mut buf = Vec::new();
+        if io::stdin()
+            .lock()
+            .take(report::MAX_REPORT_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            std::process::exit(1);
         }
-        [a] if a == "--aggregate" => {
-            let mut buf = Vec::new();
-            if io::stdin()
-                .lock()
-                .take(report::MAX_REPORT_BYTES as u64 + 1)
-                .read_to_end(&mut buf)
-                .is_err()
-            {
-                std::process::exit(1);
-            }
-            let v = report::aggregate(&buf, &probes::expected_probe_names());
-            if writeln!(io::stdout().lock(), "{}", v.as_str()).is_err() {
-                std::process::exit(1);
-            }
-            std::process::exit(match v {
-                report::Verdict::Sealed => 0,
-                report::Verdict::Escaped { .. } => 2,
-                _ => 1,
-            });
+        let v = report::aggregate(&buf, &probes::expected_probe_names());
+        if writeln!(io::stdout().lock(), "{}", v.as_str()).is_err() {
+            std::process::exit(1);
         }
-        _ => std::process::exit(1),
+        std::process::exit(match v {
+            report::Verdict::Sealed => 0,
+            report::Verdict::Escaped { .. } => 2,
+            _ => 1,
+        });
     }
+
+    let mut config_path: Option<PathBuf> = None;
+    if args.len() == 2 && args[0] == "--config" {
+        config_path = Some(PathBuf::from(&args[1]));
+    } else if !args.is_empty() {
+        std::process::exit(1);
+    }
+
+    let cfg = match config::load_config(config_path.as_deref()) {
+        Ok(c) => c,
+        Err(_) => std::process::exit(1),
+    };
+
+    start_watchdog(probes::MAX_PROBE_RUNTIME);
+    let mut out = io::stdout().lock();
+    let (records, sentinel_summary) = probes::run_with_config(cfg.as_ref(), |r| {
+        if writeln!(out, "{}", r.to_json_line())
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            std::process::exit(1);
+        }
+    });
+
+    if let Some(summary) = sentinel_summary {
+        let target_path = cfg
+            .as_ref()
+            .and_then(|c| c.sentinel_output.as_ref().map(Path::new))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("probe_sentinel.json"));
+        if let Ok(bytes) = serde_json::to_vec(&summary) {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            if let Ok(mut file) = opts.open(target_path) {
+                let _ = file.write_all(&bytes);
+            }
+        }
+    }
+
+    std::process::exit(classify::exit_code(&records));
 }
 
 #[cfg(test)]
