@@ -19,7 +19,7 @@ sys.path.insert(0, str(INTEGRATION))
 import agent_h_image as image
 
 
-@pytest.mark.parametrize("script", ["build-agent-h-fixture.sh", "convert-agent-h-task.sh"])
+@pytest.mark.parametrize("script", ["build-agent-h-fixture.sh", "build-agent-g-fixture.sh", "convert-agent-h-task.sh"])
 def test_isolated_shell_entrypoints_load_their_modules(script):
     result = subprocess.run(["bash", str(INTEGRATION / script), "--help"],
                             capture_output=True, timeout=10)
@@ -537,7 +537,7 @@ def test_image_exclusion_never_follows_links_or_recurses(tmp_path, kind):
     assert outside.read_bytes() == b"private sentinel"
 
 
-@pytest.mark.parametrize("script", ["build-agent-h-fixture.sh", "convert-agent-h-task.sh"])
+@pytest.mark.parametrize("script", ["build-agent-h-fixture.sh", "build-agent-g-fixture.sh", "convert-agent-h-task.sh"])
 def test_image_usage_explains_group_writable_parent_refusal(script):
     result = subprocess.run(["bash", str(INTEGRATION / script), "--help"],
                             capture_output=True, timeout=10)

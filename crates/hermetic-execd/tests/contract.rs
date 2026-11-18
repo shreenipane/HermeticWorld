@@ -239,7 +239,8 @@ fn cmdline_strict_clock_bounds_defaults_and_initramfs() {
             clock: 1700000000,
             overlay: "/dev/vdb".into(),
             spec: "/etc/hermetic/run-spec.json".into(),
-            initramfs: false
+            initramfs: false,
+            agent_volume: None,
         }
     );
     for t in [
@@ -264,12 +265,27 @@ fn cmdline_strict_clock_bounds_defaults_and_initramfs() {
         "hermetic.t=1700000000 hermetic.initramfs=2",
         "hermetic.t=1700000000 hermetic.spec=/a/../b",
         "hermetic.t=1700000000 hermetic.overlay=/dev/vdb hermetic.overlay=/dev/vdc",
+        "hermetic.t=1700000000 hermetic.agent_volume=/dev/vdc hermetic.agent_volume=/dev/vdd",
+        "hermetic.t=1700000000 hermetic.agent=/dev/vdc hermetic.agent_volume=/dev/vdd",
+        "hermetic.t=1700000000 hermetic.agent_volume=/a/../b",
         "hermetic.t=1700000000 hermetic.unknown=1",
     ] {
         assert!(Config::parse(line.as_bytes()).is_err(), "{line}");
     }
     assert!(Config::parse(vec![b'a'; MAX_CMDLINE + 1].as_slice()).is_err());
     assert!(Config::parse(b"hermetic.t=315532800 hermetic.overlay=/dev/vdc hermetic.spec=/trusted/spec hermetic.initramfs=1".as_slice()).unwrap().initramfs);
+    assert_eq!(
+        Config::parse(b"hermetic.t=1700000000 hermetic.agent_volume=/dev/vdc".as_slice())
+            .unwrap()
+            .agent_volume,
+        Some("/dev/vdc".into())
+    );
+    assert_eq!(
+        Config::parse(b"hermetic.t=1700000000 hermetic.agent=/dev/vdc".as_slice())
+            .unwrap()
+            .agent_volume,
+        Some("/dev/vdc".into())
+    );
     assert!(Config::parse(b"hermetic.t=4102444799".as_slice()).is_ok());
     for line in [
         "hermetic.unknown=1",
@@ -296,11 +312,37 @@ fn cmdline_strict_clock_bounds_defaults_and_initramfs() {
             spec: "relative".into(),
             ..config()
         },
+        Config {
+            agent_volume: Some("relative".into()),
+            ..config()
+        },
+        Config {
+            agent_volume: Some("/dev/../vdc".into()),
+            ..config()
+        },
     ] {
         let mut fake = Fake::default();
         assert!(boot::boot(&mut fake, &cfg).is_err());
         assert!(fake.events.is_empty());
     }
+}
+
+#[test]
+fn boot_with_agent_volume_mounts_read_only_tools_disk() {
+    let mut fake = Fake::default();
+    let cfg = Config {
+        agent_volume: Some("/dev/vdc".into()),
+        ..config()
+    };
+    let booted = boot::boot(&mut fake, &cfg).unwrap();
+    assert_eq!(booted.upper, 313);
+    let mut expected = boot_answer();
+    let idx = expected
+        .iter()
+        .position(|e| e.starts_with("load:"))
+        .unwrap();
+    expected.insert(idx, "MountAgentVolume(\"/dev/vdc\")".into());
+    assert_eq!(fake.events, expected);
 }
 
 fn boot_answer() -> Vec<String> {

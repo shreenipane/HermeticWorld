@@ -1,19 +1,57 @@
 #!/usr/bin/env bash
-# Mode G development two-VM smoke test (no jailer): NetVM with hermetic-netvm
-# as PID 1 on tap hwtap-net, AgentVM with execd as PID 1 on tap hwtap-agent, and
-# hermetic-gateway forwarding model API calls over NetVM's vsock port 5002 to a fake
-# upstream answering one model call.
+# Mode G development smoke tests:
+# 1. Agent volume smoke: verifies /opt/agent read-only tools volume mount and overlay writes.
+# 2. Two-VM model path smoke: NetVM with hermetic-netvm on hwtap-net, AgentVM with execd
+#    on hwtap-agent, and hermetic-gateway forwarding model calls over vsock 5002.
 # Usage: scripts/integration/agent-g-smoke.sh [WORK_DIR]   (run from the worktree root)
 set -euo pipefail
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
 
-smoke_main() {
-  WORK="${HERMETIC_SMOKE_WORK:?}"
-  U="${HOME:?}"
-  KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
-  FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
-  FC_LOCK="${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
+smoke_agent_volume() {
+  local WORK="${HERMETIC_SMOKE_WORK:?}"
+  local FC="${HERMETIC_FC_BIN:?set the pinned Firecracker executable}"
+  local LOCK="${HERMETIC_FIRECRACKER_LOCK:?set the pinned Firecracker build lock}"
+  local KERNEL="${HERMETIC_KERNEL:?set the pinned kernel image}"
+
+  export HERMETIC_FC_BIN="$(readlink -f "$FC")"
+  export HERMETIC_FIRECRACKER_LOCK="$(readlink -f "$LOCK")"
+  export HERMETIC_KERNEL="$(readlink -f "$KERNEL")"
+
+  if [ -n "${HERMETIC_ROOTFS:-}" ]; then
+    export HERMETIC_ROOTFS="$(readlink -f "$HERMETIC_ROOTFS")"
+  fi
+  if [ -n "${HERMETIC_AGENT_VOLUME:-}" ]; then
+    export HERMETIC_AGENT_VOLUME="$(readlink -f "$HERMETIC_AGENT_VOLUME")"
+  fi
+
+  # If fixture images are not supplied, build them into the private work directory
+  if [ -z "${HERMETIC_ROOTFS:-}" ] || [ -z "${HERMETIC_AGENT_VOLUME:-}" ]; then
+    local FIXTURE_DIR="$WORK/fixture"
+    bash "$top/scripts/integration/build-agent-g-fixture.sh" "$FIXTURE_DIR"
+    export HERMETIC_ROOTFS="$FIXTURE_DIR/rootfs.img"
+    export HERMETIC_AGENT_VOLUME="$FIXTURE_DIR/agent.img"
+    export HERMETIC_AGENT_MANIFEST="$FIXTURE_DIR/world.json"
+  fi
+
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/hermetic/cargo-target/$(basename "$top")}"
+  export HERMETIC_AGENT_WORK="$WORK" HERMETIC_AGENT_TOP="$top"
+  export HERMETIC_AGENT_T_CLOCK="${HERMETIC_AGENT_T_CLOCK:-1700000000}"
+
+  mkdir -m 0700 -p "$WORK/config" "$WORK/published"
+  cargo build --release -q -p hermetic-extract
+  timeout 400 cargo test -q -p hermetic-vmm --features dev-unjailed --test agent_g \
+    boots_agent_g_mounts_volume_read_only_and_collects_extraction -- --exact --nocapture
+
+  echo "agent-g smoke: ok (agent volume mounted ro at /opt/agent, overlay writes preserved)"
+}
+
+smoke_model_path() {
+  local WORK="${HERMETIC_SMOKE_WORK:?}"
+  local U="${HOME:?}"
+  local KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
+  local FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
+  local FC_LOCK="${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
 
   # Resolve symlinked paths with readlink -f
   FC="$(readlink -f "$FC")"
@@ -21,7 +59,7 @@ smoke_main() {
   KERNEL="$(readlink -f "$KERNEL")"
 
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/target/agent-g-smoke}"
-  T=1700000000
+  local T=1700000000
 
   for tap in hwtap-agent hwtap-net; do
     [ -e "/sys/class/net/$tap" ] || { echo "missing host tap $tap (see BOOT_NOTES.md)" >&2; exit 2; }
@@ -33,13 +71,13 @@ smoke_main() {
   cargo build --release -q -p hermetic-gateway
   cargo build --release -q -p hermetic-netvm-core --example netvm_tls_fixture
 
-  BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
+  local BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
   umask 022
   install -m 0700 "$BIN/hermetic-sealcheck" "$WORK/sealcheck"
   install -m 0700 "$CARGO_TARGET_DIR/release/hermetic-gateway" "$WORK/hermetic-gateway"
 
   # 2. AgentVM rootfs: execd configures eth0 and the resolver before readiness.
-  TREE="$WORK/agent-tree"; rm -rf "$TREE"
+  local TREE="$WORK/agent-tree"; rm -rf "$TREE"
   for d in sbin bin dev proc sys dev/pts dev/shm tmp run etc/hermetic work \
            mnt/hermetic-overlay mnt/hermetic-root; do mkdir -p "$TREE/$d"; done
   install -m 0755 "$BIN/hermetic-execd" "$TREE/sbin/hermetic-execd"
@@ -106,11 +144,27 @@ PY
   fi
 }
 
+smoke_main() {
+  if [ "${HERMETIC_SMOKE_SUBTEST:-}" = "volume" ]; then
+    smoke_agent_volume
+  elif [ "${HERMETIC_SMOKE_SUBTEST:-}" = "model" ]; then
+    smoke_model_path
+  else
+    # Default: if host taps exist, run model path; otherwise run volume smoke
+    if [ -e "/sys/class/net/hwtap-agent" ] && [ -e "/sys/class/net/hwtap-net" ] && [ -z "${HERMETIC_AGENT_VOLUME:-}" ]; then
+      smoke_model_path
+    else
+      smoke_agent_volume
+    fi
+  fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 /usr/bin/python3 -I - <<'CHECK'
 import os
 try:
-    for path in ("/dev/kvm", "/dev/net/tun"):
+    targets = ("/dev/kvm",) if os.environ.get("HERMETIC_SMOKE_SUBTEST") == "volume" else ("/dev/kvm", "/dev/net/tun")
+    for path in targets:
         fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
         os.close(fd)
 except OSError:

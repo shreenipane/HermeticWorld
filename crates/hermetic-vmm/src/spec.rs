@@ -333,13 +333,24 @@ impl VmSpec {
         if !self.root_drive.read_only {
             return Err(Error::Validation("root must be read-only"));
         }
-        if self.role == Role::Agent
-            && !self
+        if self.role == Role::Agent {
+            if !self
                 .drives
                 .iter()
                 .any(|d| d.id == "overlay" && !d.read_only)
-        {
-            return Err(Error::Validation("AgentVM requires writable overlay"));
+            {
+                return Err(Error::Validation("AgentVM requires writable overlay"));
+            }
+            if self
+                .drives
+                .iter()
+                .filter(|d| d.id != "overlay")
+                .any(|d| !d.read_only)
+            {
+                return Err(Error::Validation(
+                    "AgentVM non-overlay drives must be read-only",
+                ));
+            }
         }
         // GraderVM layout: sealed read-only root (vda), then exactly one writable
         // drive, `result` (vdb, GRADER_RESULT_BYTES), first among further drives so

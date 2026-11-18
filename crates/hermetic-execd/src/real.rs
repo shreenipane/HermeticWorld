@@ -736,6 +736,24 @@ impl Sys for Linux {
                 let dev = self.root()?.directory("/dev")?;
                 stamp_dev(&dev, clock)?;
             }
+            Effect::MountAgentVolume(device) => {
+                let root_dir = self.root()?.directory("/")?;
+                ensure_mountpoint(&root_dir, "opt")?;
+                let opt_dir = self.root()?.directory("/opt")?;
+                ensure_mountpoint(&opt_dir, "agent")?;
+                let target = self.root()?.directory("/opt/agent")?;
+                let source = self.root()?.node(&device, fs::FileType::BlockDevice)?;
+                rustix::mount::mount(
+                    fd_path(&source),
+                    fd_path(&target),
+                    "ext4",
+                    rustix::mount::MountFlags::RDONLY
+                        | rustix::mount::MountFlags::NOSUID
+                        | rustix::mount::MountFlags::NODEV,
+                    None,
+                )
+                .map_err(|_| Error::Boot)?;
+            }
             Effect::ApplySpec => {}
             Effect::Listen(port) => {
                 let fd = sys::vsock(port)?;

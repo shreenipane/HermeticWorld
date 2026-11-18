@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const T_CLOCK: u64 = 1_700_000_000;
+const MAX_RPC_BYTES: u32 = 16 * 1024;
 const MAX_REPLY_BYTES: u32 = 64 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 64;
 const GATEWAY_PORT: u32 = 5002;
@@ -36,6 +37,74 @@ struct GuestExec {
     code: Option<i32>,
     output: Vec<u8>,
     timed_out: bool,
+}
+
+#[cfg(feature = "dev-unjailed")]
+fn call(socket: &str, request: &[u8], end: Instant) -> Result<serde_json::Value> {
+    let mut stream = api::connect(socket, end)?;
+    api::write_deadline(&mut stream, b"CONNECT 5000\n", end)?;
+    let mut line = Vec::new();
+    for _ in 0..MAX_HANDSHAKE_BYTES {
+        let mut byte = [0];
+        api::read_exact_deadline(&mut stream, &mut byte, end)?;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if !line.starts_with(b"OK ") || !line.ends_with(b"\n") {
+        return Err(Error::Protocol);
+    }
+    api::write_deadline(&mut stream, &(request.len() as u32).to_le_bytes(), end)?;
+    api::write_deadline(&mut stream, request, end)?;
+    let mut length = [0; 4];
+    api::read_exact_deadline(&mut stream, &mut length, end)?;
+    let length = u32::from_le_bytes(length);
+    if length == 0 || length > MAX_RPC_BYTES {
+        return Err(Error::Protocol);
+    }
+    let mut raw = vec![0; length as usize];
+    api::read_exact_deadline(&mut stream, &mut raw, end)?;
+    serde_json::from_slice(&raw).map_err(|_| Error::Protocol)
+}
+
+#[cfg(feature = "dev-unjailed")]
+fn finish(child: &mut std::process::Child, timeout: Duration) {
+    let end = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "smoke child failed");
+            return;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("smoke child deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_read_only_probe_failure(reply: &serde_json::Value) {
+    let code = reply.get("code").and_then(|c| c.as_i64());
+    assert!(
+        code.is_some() && code != Some(0),
+        "/opt/agent write probe must complete with a nonzero exit code, got: {code:?}"
+    );
+    let output = reply
+        .get("output")
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|b| b as u8))
+                .collect::<Vec<u8>>()
+        })
+        .unwrap_or_default();
+    let msg = String::from_utf8_lossy(&output);
+    assert!(
+        msg.contains("Read-only file system") || msg.contains("EROFS"),
+        "/opt/agent write probe must fail with read-only file system error, got code={code:?}, output: {msg}"
+    );
 }
 
 fn guest_call(path: &str, request: &[u8], end: Instant) -> Result<Vec<u8>> {
@@ -203,6 +272,216 @@ impl Drop for FakeUpstream {
             let _ = h.join();
         }
     }
+}
+
+#[test]
+fn boots_agent_g_mounts_volume_read_only_and_collects_extraction() {
+    #[cfg(feature = "dev-unjailed")]
+    run_agent_volume_smoke();
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: Mode G KVM test requires --features dev-unjailed");
+    }
+}
+
+#[cfg(feature = "dev-unjailed")]
+fn run_agent_volume_smoke() {
+    let required = |key| std::env::var(key).ok();
+    let (Some(fc_bin), Some(kernel), Some(rootfs), Some(agent_volume)) = (
+        required("HERMETIC_FC_BIN"),
+        required("HERMETIC_KERNEL"),
+        required("HERMETIC_ROOTFS"),
+        required("HERMETIC_AGENT_VOLUME"),
+    ) else {
+        eprintln!("skipped: Mode G KVM test requires HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS, and HERMETIC_AGENT_VOLUME");
+        return;
+    };
+    let clock: i64 = required("HERMETIC_AGENT_T_CLOCK")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_700_000_000);
+
+    let mut fixture = support::Fixture::new();
+    fixture.spec.jail.firecracker = fc_bin;
+    fixture.spec.kernel_image = kernel;
+    fixture.spec.root_drive.path = rootfs;
+    fixture.spec.networks.clear();
+    fixture.spec.boot_args = fixture
+        .spec
+        .boot_args
+        .replace("hermetic.t=1700000000", &format!("hermetic.t={clock}"))
+        .replace("init=/sbin/hermetic-execd", "init=/sbin/hermetic-init")
+        + " hermetic.agent_volume=/dev/vdc";
+
+    // Overlay drive (vdb, writable)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fixture.spec.drives[0].path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let mut mkfs = diagnostics::overlay_command(clock)
+        .arg(&fixture.spec.drives[0].path)
+        .spawn()
+        .unwrap();
+    finish(&mut mkfs, Duration::from_secs(30));
+
+    // Agent volume drive (vdc, read_only: true)
+    fixture.spec.drives.push(Drive {
+        id: "agent".into(),
+        path: agent_volume,
+        read_only: true,
+    });
+
+    let launcher = fixture.temp.path().join("exec-python");
+    std::fs::copy(
+        std::fs::canonicalize("/usr/bin/python3").unwrap(),
+        &launcher,
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let runner = hermetic_vmm::runner::DevUnjailed::new(launcher.to_str().unwrap()).unwrap();
+    let mut vm = Vmm::new(fixture.spec.clone().validate().unwrap(), runner);
+    diagnostics::run(&mut vm, |vm| -> hermetic_vmm::Result<()> {
+        vm.prepare(Duration::from_secs(120)).unwrap();
+        vm.start(Duration::from_secs(10)).unwrap();
+        vm.wait_ready(Duration::from_secs(30)).unwrap();
+        let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        loop {
+            if let Ok(reply) = call(&socket, br#"{"type":"status"}"#, end) {
+                diagnostics::status(&reply, clock)?;
+                break;
+            }
+            assert!(Instant::now() < end, "execd readiness deadline");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Test 1: Verify /opt/agent is read-only inside guest.
+        // Executing touch /opt/agent/should_fail_ro must fail with EROFS (non-zero exit code).
+        let end = deadline(Duration::from_secs(15)).unwrap();
+        let ro_probe = call(
+            &socket,
+            br#"{"type":"exec","argv":["/bin/bash","-c","touch /opt/agent/should_fail_ro 2>&1"],"tty":false,"timeout_ms":5000}"#,
+            end,
+        )
+        .unwrap();
+        assert_read_only_probe_failure(&ro_probe);
+
+        // Test 2: Verify /opt/agent is readable
+        let end = deadline(Duration::from_secs(15)).unwrap();
+        let list_probe = call(
+            &socket,
+            br#"{"type":"exec","argv":["/bin/bash","-c","test -r /opt/agent"],"tty":false,"timeout_ms":5000}"#,
+            end,
+        )
+        .unwrap();
+        assert_eq!(
+            list_probe.get("code").and_then(|c| c.as_i64()),
+            Some(0),
+            "/opt/agent must be readable"
+        );
+
+        // Test 3: If an agent program exists at /opt/agent/run, execute it
+        // and verify writes succeed on overlay (/testbed)
+        let end = deadline(Duration::from_secs(30)).unwrap();
+        let agent_run = call(
+            &socket,
+            br#"{"type":"exec","argv":["/bin/bash","-c","if [ -f /opt/agent/run ]; then /bin/bash /opt/agent/run; else sed -i 's/return a - b/return a + b/' /testbed/calc.py; fi"],"tty":false,"timeout_ms":10000}"#,
+            end,
+        )
+        .unwrap();
+        assert_eq!(
+            agent_run.get("code").and_then(|c| c.as_i64()),
+            Some(0),
+            "agent execution failed"
+        );
+
+        // Test 4: Verify the edit was written to the overlay filesystem
+        let end = deadline(Duration::from_secs(15)).unwrap();
+        let verify_edit = call(
+            &socket,
+            br#"{"type":"exec","argv":["/bin/cat","/testbed/calc.py"],"tty":false,"timeout_ms":5000}"#,
+            end,
+        )
+        .unwrap();
+        let output = verify_edit
+            .get("output")
+            .and_then(|o| o.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|b| b as u8))
+                    .collect::<Vec<u8>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            String::from_utf8_lossy(&output).contains("return a + b"),
+            "calc.py was not updated on overlay"
+        );
+
+        let end = deadline(Duration::from_secs(10)).unwrap();
+        // Graceful shutdown freezes upper ext4
+        let frozen = call(&socket, br#"{"type":"shutdown"}"#, end).unwrap();
+        assert_eq!(frozen["type"], "frozen");
+        vm.stop(Duration::from_secs(10)).unwrap();
+        vm.destroy(Duration::from_secs(10)).unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    std::io::stdout()
+        .write_all(b"agent-g VM test: ok (read-only /opt/agent volume, overlay writes)\n")
+        .unwrap();
+}
+
+#[test]
+fn test_ro_probe_assertion_fails_unless_nonzero_code_and_ro_error() {
+    // 1. Missing code (absent) must fail
+    let missing_code = serde_json::json!({
+        "type": "exec",
+        "output": b"touch: cannot touch '/opt/agent/should_fail_ro': Read-only file system\n".to_vec()
+    });
+    let result = std::panic::catch_unwind(|| {
+        assert_read_only_probe_failure(&missing_code);
+    });
+    assert!(result.is_err(), "missing exit code must fail");
+
+    // 2. Success exit code (0) must fail
+    let success = serde_json::json!({
+        "type": "exec",
+        "code": 0,
+        "output": []
+    });
+    let result = std::panic::catch_unwind(|| {
+        assert_read_only_probe_failure(&success);
+    });
+    assert!(result.is_err(), "exit code 0 must fail");
+
+    // 3. Nonzero exit code with unrelated error (e.g. command not found) must fail
+    let unrelated = serde_json::json!({
+        "type": "exec",
+        "code": 127,
+        "output": b"touch: command not found\n".to_vec()
+    });
+    let result = std::panic::catch_unwind(|| {
+        assert_read_only_probe_failure(&unrelated);
+    });
+    assert!(result.is_err(), "unrelated error must fail");
+
+    // 4. Nonzero exit code with "Read-only file system" must pass
+    let valid_ro_msg = serde_json::json!({
+        "type": "exec",
+        "code": 1,
+        "output": b"touch: cannot touch '/opt/agent/should_fail_ro': Read-only file system\n".to_vec()
+    });
+    assert_read_only_probe_failure(&valid_ro_msg);
+
+    // 5. Nonzero exit code with "EROFS" must pass
+    let valid_erofs = serde_json::json!({
+        "type": "exec",
+        "code": 1,
+        "output": b"touch: /opt/agent/should_fail_ro: EROFS\n".to_vec()
+    });
+    assert_read_only_probe_failure(&valid_erofs);
 }
 
 #[test]

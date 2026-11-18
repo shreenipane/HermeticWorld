@@ -44,6 +44,7 @@ pub struct Config {
     pub overlay: String,
     pub spec: String,
     pub initramfs: bool,
+    pub agent_volume: Option<String>,
 }
 impl Config {
     pub fn parse(reader: impl std::io::Read) -> Result<Self> {
@@ -53,6 +54,7 @@ impl Config {
         let mut overlay = None;
         let mut spec = None;
         let mut initramfs = None;
+        let mut agent_volume = None;
         for word in line.split_ascii_whitespace() {
             if word.starts_with("hermetic.t=") {
                 continue;
@@ -69,6 +71,14 @@ impl Config {
                     return Err(Error::InvalidInput);
                 }
                 initramfs = Some(v == "1");
+            } else if let Some(v) = word.strip_prefix("hermetic.agent_volume=") {
+                if agent_volume.replace(v.to_owned()).is_some() {
+                    return Err(Error::InvalidInput);
+                }
+            } else if let Some(v) = word.strip_prefix("hermetic.agent=") {
+                if agent_volume.replace(v.to_owned()).is_some() {
+                    return Err(Error::InvalidInput);
+                }
             } else if word.starts_with("hermetic.") {
                 return Err(Error::InvalidInput);
             }
@@ -78,6 +88,7 @@ impl Config {
             overlay: overlay.unwrap_or_else(|| "/dev/vdb".into()),
             spec: spec.unwrap_or_else(|| "/etc/hermetic/run-spec.json".into()),
             initramfs: initramfs.unwrap_or(false),
+            agent_volume,
         };
         config.validate()?;
         Ok(config)
@@ -87,7 +98,11 @@ impl Config {
             return Err(Error::InvalidClock);
         }
         spec::path(&self.overlay)?;
-        spec::path(&self.spec)
+        spec::path(&self.spec)?;
+        if let Some(agent) = &self.agent_volume {
+            spec::path(agent)?;
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +120,7 @@ pub enum Effect {
     MountSys,
     MountPts,
     MountShm,
+    MountAgentVolume(String),
     StampDev(i64),
     ApplySpec,
     Listen(u32),
@@ -191,6 +207,9 @@ pub fn boot<S: Sys>(sys: &mut S, config: &Config) -> Result<Booted<S::FreezeHand
         Effect::StampDev(config.clock),
     ] {
         sys.effect(effect)?;
+    }
+    if let Some(agent_dev) = &config.agent_volume {
+        sys.effect(Effect::MountAgentVolume(agent_dev.clone()))?;
     }
     let spec = sys.load_spec(&config.spec)?;
     spec.validate()?;

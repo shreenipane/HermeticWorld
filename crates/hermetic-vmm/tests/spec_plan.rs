@@ -537,3 +537,21 @@ fn tsc_khz_resolution_prefers_cpuid_and_fails_closed() {
         );
     }
 }
+
+#[test]
+fn agent_vm_supports_read_only_agent_volume_and_rejects_writable_extra_drives() {
+    let mut s = spec(Role::Agent);
+    s.drives.push(Drive {
+        id: "agent".into(),
+        path: "/images/agent".into(),
+        read_only: true,
+    });
+    assert!(s.clone().validate().is_ok());
+
+    let mut bad = s.clone();
+    bad.drives[1].read_only = false;
+    assert_eq!(
+        bad.validate().unwrap_err().to_string(),
+        "refused: AgentVM non-overlay drives must be read-only"
+    );
+}

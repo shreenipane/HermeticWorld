@@ -1630,6 +1630,95 @@ fn test_regression_coderabbit_hostile_parser_diagnostics_sanitized() {
 }
 
 #[test]
+fn test_assemble_and_sign_run_record_mode_g_records_agent_volume_digest() {
+    let f = FixturePaths::new();
+
+    // Mode G: replace world_manifest.json with agent_mode = "G"
+    // and gateway log fields present, harness_command_log_head absent.
+    let expected_agent_volume_digest =
+        Digest::parse("sha256:8123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
+    let gateway_log_head =
+        Digest::parse("sha256:d123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+    let manifest = json!({
+        "task_id": "pytest-dev__pytest-6202",
+        "task_class": "patch",
+        "seal_level": "strict",
+        "agent_mode": "G",
+        "substrate": "microvm",
+        "grader_isolation": "clean",
+        "deployment": "single_host",
+        "t_world": "2020-01-01T00:00:00Z",
+        "t_clock": "2020-01-01T00:00:00Z",
+        "base_commit": "abcdef0123456789abcdef0123456789abcdef01",
+        "spec_version": "v1.1",
+        "world_version": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "sealcheck_version": "v1.0",
+        "grader_image_digest": "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "world_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "task_rootfs_digest": "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "netvm_image_digest": "sha256:3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "guest_kernel_digest": "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "vm_config_digest": "sha256:5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "cpu_template_digest": "sha256:6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "firecracker_build_digest": "sha256:7123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "agent_volume_digest": expected_agent_volume_digest.to_string(),
+        "sealcheck_report_digest": "sha256:9123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "substrate_at_t": "full",
+        "exemption_list": ["pkg-a", "pkg-b"],
+        "world_server_log_head": "sha256:b123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "dedupe_index_digest": "sha256:c123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "request_count": 42,
+        "gateway_log_head": gateway_log_head.to_string(),
+        "history_rewrite_count": 0,
+        "gateway_adapter_version": "v1.0.0"
+    });
+    fs::write(
+        f.path().join("world_manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble Mode G run record");
+    assert_eq!(record.agent_mode, AgentMode::G);
+    assert_eq!(record.agent_volume_digest, expected_agent_volume_digest);
+    assert!(record.harness_command_log_head.is_none());
+    assert_eq!(record.gateway_log_head, Some(gateway_log_head));
+    assert_eq!(record.history_rewrite_count, Some(0));
+    assert_eq!(record.gateway_adapter_version.as_deref(), Some("v1.0.0"));
+
+    let (key_bytes, _signer, verifier) = generate_test_key();
+    let key_path = f.path().join("offline_key.p8");
+    fs::write(&key_path, key_bytes).unwrap();
+
+    let (assembled, envelope) =
+        assemble_and_sign_run_record(f.path(), Some(&key_path)).expect("assemble and sign Mode G");
+    assert_eq!(assembled, record);
+    let env = envelope.unwrap();
+
+    let mut guard = ReplayGuard::new();
+    let binding = RunBinding {
+        task_id: Some("pytest-dev__pytest-6202".to_string()),
+        world_root: Some(record.world_root.clone()),
+        world_bundle: Some(record.world_root.clone()),
+        sealcheck_report_digest: Some(record.sealcheck_report_digest.clone()),
+        grader_image_digest: Some(record.version_tuple.grader_image_digest.clone()),
+        boot_record: record.boot_record.clone(),
+    };
+    let envelope_json = serde_json::to_string(&env).unwrap();
+    let (statement, _digest) =
+        verify_run_attestation(&envelope_json, &verifier, &binding, &mut guard)
+            .expect("verify Mode G attestation");
+    assert_eq!(statement.predicate.agent_mode, AgentMode::G);
+    assert_eq!(
+        statement.predicate.agent_volume_digest,
+        expected_agent_volume_digest
+    );
+}
+
+#[test]
 fn test_mode_g_record_assembly_with_gateway_head_and_signing() {
     let f = FixturePaths::new();
 
