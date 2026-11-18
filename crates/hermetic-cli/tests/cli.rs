@@ -259,6 +259,13 @@ fn happy_path_run_human_and_json() {
             agent_mode: AgentMode::H,
             clock: ClockMode::Faked,
             json: false,
+            key: None,
+            out: None,
+            run_dir: None,
+            entrypoint: None,
+            model: None,
+            upstream_url: None,
+            upstream_key_file: None,
         })]
     );
 
@@ -292,6 +299,13 @@ fn happy_path_run_human_and_json() {
             agent_mode: AgentMode::G,
             clock: ClockMode::Faked,
             json: true,
+            key: None,
+            out: None,
+            run_dir: None,
+            entrypoint: None,
+            model: None,
+            upstream_url: None,
+            upstream_key_file: None,
         })]
     );
 }

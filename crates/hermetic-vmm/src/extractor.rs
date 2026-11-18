@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Host-side ExtractorVM orchestration (TR-EXT-1, TR-EXT-2, TR-EXT-5, TR-EXT-6).
+//! Host-side ExtractorVM orchestration and stream collection (TR-EXT-1 .. TR-EXT-6).
 //!
 //! Enforces:
 //! 1. The host never mounts the agent disk (TR-EXT-1).
@@ -25,8 +25,18 @@ use hermetic_run::ExtractorOutcome;
 use rustix::fs::{copy_file_range, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
-use crate::spec::{Clock, Drive, JailConfig, Limits, Role, VmSpec};
-use crate::Error;
+use crate::spec::{Clock, Drive, JailConfig, Limits, Role, VmSpec, Vsock};
+use crate::{Error, ValidatedSpec};
+
+pub const DEFAULT_EXTRACTOR_VCPUS: u8 = 2;
+pub const DEFAULT_EXTRACTOR_MEM_MIB: u32 = 256;
+pub const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RPC_BYTES: usize = 64 * 1024;
+pub const MAX_FRAME_READ_CHUNKS: usize = 4096;
+pub const STREAM_CHUNK_BYTES: usize = 4096;
+
+/// Canonical wire magic for the extractor stream ("HEXT").
+pub const EXTRACTOR_STREAM_MAGIC: [u8; 4] = *b"HEXT";
 
 /// Bounded buffer size for host file operations (64 KiB).
 pub const HOST_CHUNK_BYTES: usize = 64 * 1024;
@@ -46,6 +56,135 @@ pub const MAX_OUTPUT_DRIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Maximum allowed overlay copy size (64 GiB).
 pub const MAX_OVERLAY_COPY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Drive and kernel image paths for an ExtractorVM.
+#[derive(Debug, Clone)]
+pub struct ExtractorDrives {
+    pub kernel_image: String,
+    pub rootfs_path: String,
+    pub base_drive_path: String,
+    pub overlay_drive_path: String,
+    pub cpu_template: String,
+}
+
+/// Specification plan for the throwaway ExtractorVM.
+#[derive(Debug, Clone)]
+pub struct ExtractorPlan {
+    pub id: String,
+    pub drives: ExtractorDrives,
+    pub t_clock: u64,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub vsock_socket_path: String,
+    pub jail: JailConfig,
+    pub limits: Limits,
+}
+
+impl ExtractorPlan {
+    pub fn new(
+        id: impl Into<String>,
+        drives: ExtractorDrives,
+        t_clock: u64,
+        jail: JailConfig,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            drives,
+            t_clock,
+            vcpus: DEFAULT_EXTRACTOR_VCPUS,
+            memory_mib: DEFAULT_EXTRACTOR_MEM_MIB,
+            vsock_socket_path: "/vsock".into(),
+            jail,
+            limits: Limits {
+                pids: 128,
+                file_size_bytes: 67_108_864,
+                open_files: 128,
+            },
+        }
+    }
+
+    /// Converts this plan into a `VmSpec` configured for the `Role::Extractor` role.
+    pub fn to_vm_spec(&self) -> VmSpec {
+        VmSpec {
+            id: self.id.clone(),
+            role: Role::Extractor,
+            index: 0,
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            kernel_image: self.drives.kernel_image.clone(),
+            initrd: None,
+            boot_args: format!(
+                "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda init=/sbin/hermetic-init clocksource=tsc tsc=reliable hermetic.t={} ro",
+                self.t_clock
+            ),
+            root_drive: Drive {
+                id: "rootfs".into(),
+                path: self.drives.rootfs_path.clone(),
+                read_only: true,
+            },
+            drives: vec![
+                Drive {
+                    id: "base".into(),
+                    path: self.drives.base_drive_path.clone(),
+                    read_only: true,
+                },
+                Drive {
+                    id: "overlay".into(),
+                    path: self.drives.overlay_drive_path.clone(),
+                    read_only: true,
+                },
+            ],
+            reserved_drives: vec![],
+            vsock: Some(Vsock {
+                guest_cid: 3,
+                socket_path: self.vsock_socket_path.clone(),
+            }),
+            networks: vec![],
+            cpu_template: self.drives.cpu_template.clone(),
+            clock: Clock::Faked,
+            limits: self.limits.clone(),
+            jail: self.jail.clone(),
+        }
+    }
+
+    /// Validates the resulting `VmSpec` under the strict rules of `Role::Extractor`.
+    pub fn validate(&self) -> Result<ValidatedSpec, Error> {
+        self.to_vm_spec().validate()
+    }
+}
+
+/// Reads a 4-byte little-endian length followed by exactly `length` bytes from `reader`.
+///
+/// Bounded by `max_bytes` to prevent uncontrolled allocation from untrusted guest data.
+pub fn read_length_prefixed_stream<R: Read>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut len_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut len_bytes)
+        .map_err(|_| Error::Protocol)?;
+    let length = u32::from_le_bytes(len_bytes) as usize;
+    if length == 0 || length > max_bytes {
+        return Err(Error::Protocol);
+    }
+    let mut buffer = vec![0u8; length];
+    reader
+        .read_exact(&mut buffer)
+        .map_err(|_| Error::Protocol)?;
+    Ok(buffer)
+}
+
+/// Verifies that `stream` begins with the 4-byte stream magic and at least an 8-byte header.
+pub fn check_stream_header(stream: &[u8]) -> Result<(), Error> {
+    if stream.len() < 8 {
+        return Err(Error::Protocol);
+    }
+    if stream[0..4] != EXTRACTOR_STREAM_MAGIC {
+        return Err(Error::Protocol);
+    }
+    Ok(())
+}
 
 /// Configuration parameters for generating an ExtractorVM spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,5 +700,70 @@ impl std::error::Error for ExtractorError {
             ExtractorError::Io { source, .. } => Some(source),
             ExtractorError::Validation(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_jail() -> JailConfig {
+        JailConfig {
+            base: "/jails".into(),
+            uid_start: 200000,
+            gid_start: 200000,
+            count: 16,
+            firecracker: "/bin/firecracker".into(),
+            jailer: "/bin/jailer".into(),
+            netns: "isolated-0".into(),
+        }
+    }
+
+    #[test]
+    fn extractor_plan_validates_cleanly() {
+        let drives = ExtractorDrives {
+            kernel_image: "/images/kernel".into(),
+            rootfs_path: "/images/rootfs".into(),
+            base_drive_path: "/images/base".into(),
+            overlay_drive_path: "/images/overlay".into(),
+            cpu_template: "/images/template".into(),
+        };
+        let plan = ExtractorPlan::new("extractor-vm", drives, 1_700_000_000, sample_jail());
+        let spec = plan.validate().expect("extractor spec must validate");
+        assert_eq!(spec.spec().role, Role::Extractor);
+        assert!(spec.spec().networks.is_empty());
+        assert_eq!(spec.spec().vsock.as_ref().unwrap().guest_cid, 3);
+        assert_eq!(spec.spec().drives.len(), 2);
+        assert!(spec.spec().drives[0].read_only);
+        assert!(spec.spec().drives[1].read_only);
+    }
+
+    #[test]
+    fn stream_header_check_accepts_hext_and_rejects_garbage() {
+        assert!(check_stream_header(b"HEXT\x01\x00\x00\x00data").is_ok());
+        assert!(check_stream_header(b"HEXT").is_err());
+        assert!(check_stream_header(b"BAAD\x01\x00\x00\x00").is_err());
+    }
+
+    #[test]
+    fn read_length_prefixed_stream_bounds_and_validates() {
+        let payload = b"HEXT\x01\x00\x00\x00payload-content";
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+
+        let mut cursor = std::io::Cursor::new(data);
+        let read = read_length_prefixed_stream(&mut cursor, 1024).unwrap();
+        assert_eq!(read, payload);
+
+        // Reject zero length
+        let zero_len = 0u32.to_le_bytes();
+        let mut cursor = std::io::Cursor::new(zero_len);
+        assert!(read_length_prefixed_stream(&mut cursor, 1024).is_err());
+
+        // Reject length exceeding max_bytes
+        let big_len = 2048u32.to_le_bytes();
+        let mut cursor = std::io::Cursor::new(big_len);
+        assert!(read_length_prefixed_stream(&mut cursor, 1024).is_err());
     }
 }

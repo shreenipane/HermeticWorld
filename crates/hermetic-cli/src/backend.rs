@@ -210,8 +210,8 @@ impl Backend for RealBackend {
         Ok(probes_outcome(&records))
     }
 
-    fn run(&self, _req: RunRequest) -> Result<Outcome, BackendError> {
-        Err(BackendError::Unavailable(RUN_NOT_WIRED))
+    fn run(&self, req: RunRequest) -> Result<Outcome, BackendError> {
+        crate::run_flow::run_with_real_infra(req)
     }
 
     fn verify(&self, req: VerifyRequest) -> Result<Outcome, BackendError> {

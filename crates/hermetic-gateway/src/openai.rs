@@ -37,8 +37,20 @@ pub const ALLOWED_REMOTE_BASE_URLS: &[&str] = &[
 ];
 
 pub fn validate_base_url(url: &str) -> Result<(), String> {
-    if ALLOWED_REMOTE_BASE_URLS.contains(&url.trim_end_matches('/')) {
+    let trimmed = url.trim_end_matches('/');
+    if ALLOWED_REMOTE_BASE_URLS.contains(&trimmed) {
         return Ok(());
+    }
+    if let Ok(configured) = std::env::var("HERMETIC_UPSTREAM_URL") {
+        let conf_trimmed = configured.trim().trim_end_matches('/');
+        if trimmed == conf_trimmed
+            && trimmed.starts_with("https://")
+            && !trimmed.contains('@')
+            && !trimmed.contains('?')
+            && !trimmed.contains('#')
+        {
+            return Ok(());
+        }
     }
     // Offline tests may use an explicitly loopback HTTP upstream. No credentials, redirects,
     // arbitrary URL suffix, environment proxy or remote cleartext destination is admitted.

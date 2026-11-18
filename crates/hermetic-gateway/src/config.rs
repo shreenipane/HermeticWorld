@@ -16,7 +16,7 @@ pub enum UpstreamProtocol {
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfigFile {
     #[serde(default)]
-    pub upstream_protocol: UpstreamProtocol,
+    pub upstream_protocol: Option<UpstreamProtocol>,
     #[serde(default = "default_upstream_base_url")]
     pub upstream_base_url: String,
 
@@ -127,49 +127,86 @@ impl GatewayConfig {
         if parsed.upstream_read_timeout_s == 0 || parsed.upstream_read_timeout_s > 300 {
             return Err("Upstream timeout must be in 1..=300 seconds".into());
         }
-        if parsed.upstream_protocol == UpstreamProtocol::OpenaiChat {
-            crate::openai::validate_base_url(&parsed.upstream_base_url)?;
+
+        let upstream_base_url = if let Ok(env_url) = std::env::var("HERMETIC_UPSTREAM_URL") {
+            let env_url = env_url.trim().to_string();
+            if !env_url.is_empty() {
+                env_url
+            } else {
+                parsed.upstream_base_url
+            }
+        } else {
+            parsed.upstream_base_url
+        };
+
+        let mut pinned_models = parsed.pinned_models;
+        if let Ok(env_model) = std::env::var("HERMETIC_UPSTREAM_MODEL") {
+            let env_model = env_model.trim().to_string();
+            if !env_model.is_empty() && !pinned_models.contains(&env_model) {
+                pinned_models.push(env_model);
+            }
+        }
+
+        let api_key_file = if let Ok(env_key) = std::env::var("HERMETIC_UPSTREAM_KEY_FILE") {
+            let env_key = env_key.trim();
+            if !env_key.is_empty() {
+                PathBuf::from(env_key)
+            } else {
+                parsed.api_key_file
+            }
+        } else {
+            parsed.api_key_file
+        };
+
+        let upstream_protocol = match parsed.upstream_protocol {
+            Some(proto) => proto,
+            None => {
+                if upstream_base_url.contains("/v1")
+                    || upstream_base_url.contains("nvidia")
+                    || upstream_base_url.contains("openai")
+                {
+                    UpstreamProtocol::OpenaiChat
+                } else {
+                    UpstreamProtocol::Anthropic
+                }
+            }
+        };
+
+        if upstream_protocol == UpstreamProtocol::OpenaiChat {
+            crate::openai::validate_base_url(&upstream_base_url)?;
         }
         // The key is opened once through pinned directory descriptors, mode 0600 only.
         let raw_key = crate::fsutil::read_secret_file_capped(
-            &parsed.api_key_file,
+            &api_key_file,
             crate::fsutil::MAX_API_KEY_FILE_BYTES,
         )
         .map_err(|e| {
             format!(
                 "Failed to read API key file {}: {e}",
-                parsed.api_key_file.display()
+                api_key_file.display()
             )
         })?;
         let api_key = String::from_utf8(raw_key)
-            .map_err(|_| {
-                format!(
-                    "API key file {} is not UTF-8",
-                    parsed.api_key_file.display()
-                )
-            })?
+            .map_err(|_| format!("API key file {} is not UTF-8", api_key_file.display()))?
             .trim()
             .to_string();
 
         if api_key.is_empty() {
-            return Err(format!(
-                "API key file {} is empty",
-                parsed.api_key_file.display()
-            ));
+            return Err(format!("API key file {} is empty", api_key_file.display()));
         }
         if !api_key.bytes().all(|byte| (33..=126).contains(&byte)) {
             return Err("API key contains invalid header bytes".into());
         }
 
         Ok(Self {
-            upstream_protocol: parsed.upstream_protocol,
-            upstream_base_url: parsed.upstream_base_url,
+            upstream_protocol,
+            upstream_base_url,
             anthropic_version: parsed.anthropic_version,
             allowed_betas: parsed.allowed_betas,
-            pinned_models: parsed.pinned_models,
+            pinned_models,
             quotas: parsed.quotas,
             log_dir: parsed.log_dir,
-            api_key_file: parsed.api_key_file,
+            api_key_file,
             upstream_read_timeout_s: parsed.upstream_read_timeout_s,
             date_sentinel: parsed.date_sentinel,
             api_key,

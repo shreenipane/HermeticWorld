@@ -3,6 +3,9 @@
 pub mod args;
 pub mod backend;
 pub mod dispatch;
+pub mod fsutil;
+pub mod run_flow;
+pub mod vmm_infra;
 
 use std::ffi::OsString;
 use std::fmt;

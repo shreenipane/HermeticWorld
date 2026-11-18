@@ -98,8 +98,8 @@ impl AgentMode {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "H" => Some(Self::H),
-            "G" => Some(Self::G),
+            "H" | "h" => Some(Self::H),
+            "G" | "g" => Some(Self::G),
             _ => None,
         }
     }
@@ -171,6 +171,13 @@ pub struct RawRunArgs {
     pub agent_mode: AgentMode,
     pub clock: ClockMode,
     pub json: bool,
+    pub key: Option<String>,
+    pub out: Option<String>,
+    pub run_dir: Option<String>,
+    pub entrypoint: Option<String>,
+    pub model: Option<String>,
+    pub upstream_url: Option<String>,
+    pub upstream_key_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +233,20 @@ pub struct RunRequest {
     pub agent_mode: AgentMode,
     pub clock: ClockMode,
     pub json: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,18 +778,35 @@ where
                     ("--world", FlagSpec::Value),
                     ("--task", FlagSpec::Value),
                     ("--agent-mode", FlagSpec::Value),
+                    ("--mode", FlagSpec::Value),
                     ("--clock", FlagSpec::Value),
                     ("--json", FlagSpec::Bool),
+                    ("--key", FlagSpec::Value),
+                    ("--out", FlagSpec::Value),
+                    ("--run-dir", FlagSpec::Value),
+                    ("--entrypoint", FlagSpec::Value),
+                    ("--model", FlagSpec::Value),
+                    ("--upstream-url", FlagSpec::Value),
+                    ("--upstream-key-file", FlagSpec::Value),
                 ],
             )?;
             reject_any_positionals(SubcommandKind::Run, &parsed)?;
             let world = require_value_flag(SubcommandKind::Run, &parsed, "--world")?;
             let task = require_value_flag(SubcommandKind::Run, &parsed, "--task")?;
-            let agent_mode_raw = require_value_flag(SubcommandKind::Run, &parsed, "--agent-mode")?;
+            let (flag_name, agent_mode_raw) = match take_value_flag(&parsed, "--agent-mode") {
+                Some(val) => ("--agent-mode", val),
+                None => match take_value_flag(&parsed, "--mode") {
+                    Some(val) => ("--mode", val),
+                    None => (
+                        "--agent-mode",
+                        require_value_flag(SubcommandKind::Run, &parsed, "--agent-mode")?,
+                    ),
+                },
+            };
             let agent_mode = AgentMode::parse(&agent_mode_raw).ok_or(ParseError {
                 subcommand: Some(SubcommandKind::Run),
                 kind: ParseErrorKind::InvalidFlagChoice {
-                    flag: "--agent-mode",
+                    flag: flag_name,
                     value: agent_mode_raw,
                     expected: "H|G",
                 },
@@ -785,12 +823,26 @@ where
                 None => ClockMode::Faked,
             };
             let json = has_bool_flag(&parsed, "--json");
+            let key = take_value_flag(&parsed, "--key");
+            let out = take_value_flag(&parsed, "--out");
+            let run_dir = take_value_flag(&parsed, "--run-dir");
+            let entrypoint = take_value_flag(&parsed, "--entrypoint");
+            let model = take_value_flag(&parsed, "--model");
+            let upstream_url = take_value_flag(&parsed, "--upstream-url");
+            let upstream_key_file = take_value_flag(&parsed, "--upstream-key-file");
             Ok(RawCommand::Run(RawRunArgs {
                 world,
                 task,
                 agent_mode,
                 clock,
                 json,
+                key,
+                out,
+                run_dir,
+                entrypoint,
+                model,
+                upstream_url,
+                upstream_key_file,
             }))
         }
         SubcommandKind::Verify => {
@@ -868,12 +920,39 @@ pub fn validate_command(raw: RawCommand) -> Result<ValidatedCommand, ValidationE
         RawCommand::Run(args) => {
             let world = validate_path("--world", &args.world)?;
             validate_task_id(&args.task)?;
+            let key = args
+                .key
+                .as_deref()
+                .map(|v| validate_path("--key", v))
+                .transpose()?;
+            let out = args
+                .out
+                .as_deref()
+                .map(|v| validate_path("--out", v))
+                .transpose()?;
+            let run_dir = args
+                .run_dir
+                .as_deref()
+                .map(|v| validate_path("--run-dir", v))
+                .transpose()?;
+            let upstream_key_file = args
+                .upstream_key_file
+                .as_deref()
+                .map(|v| validate_path("--upstream-key-file", v))
+                .transpose()?;
             Ok(ValidatedCommand::Run(RunRequest {
                 world,
                 task: args.task,
                 agent_mode: args.agent_mode,
                 clock: args.clock,
                 json: args.json,
+                key,
+                out,
+                run_dir,
+                entrypoint: args.entrypoint,
+                model: args.model,
+                upstream_url: args.upstream_url,
+                upstream_key_file,
             }))
         }
         RawCommand::Verify(args) => {
