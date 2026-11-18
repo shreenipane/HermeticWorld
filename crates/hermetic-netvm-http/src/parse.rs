@@ -12,6 +12,8 @@ pub const MAX_HEADER_NAME_BYTES: usize = 64;
 pub const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 /// Maximum number of path segments checked during normalisation.
 pub const MAX_PATH_SEGMENTS: usize = 512;
+/// Maximum byte size of a POST request body (16 MiB).
+pub const MAX_POST_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
@@ -40,6 +42,7 @@ pub struct RequestHead {
     pub method: String,
     pub target: RequestTarget,
     pub headers: Vec<Header>,
+    pub content_length: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,6 +579,7 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
         }
     }
 
+    let mut parsed_content_length: Option<u64> = None;
     for h in &headers {
         match h.name.as_str() {
             "content-length" => {
@@ -586,9 +590,17 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
                 if h.value.is_empty() || !h.value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(HttpError::InvalidContentLength);
                 }
-                if h.value.bytes().any(|b| b != b'0') {
+                let cl: u64 = h
+                    .value
+                    .parse()
+                    .map_err(|_| HttpError::InvalidContentLength)?;
+                if method != "POST" && cl != 0 {
                     return Err(HttpError::NonZeroContentLength);
                 }
+                if cl > MAX_POST_BODY_BYTES {
+                    return Err(HttpError::HeaderValueTooLarge);
+                }
+                parsed_content_length = Some(cl);
             }
             "host" => {
                 host_count += 1;
@@ -634,6 +646,10 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
         }
     }
 
+    if method == "POST" && cl_count == 0 {
+        return Err(HttpError::InvalidContentLength);
+    }
+
     let raw_host = host_header_val.ok_or(HttpError::MissingHost)?;
     let (parsed_host, parsed_port) = parse_authority(raw_host.as_bytes())?;
 
@@ -647,5 +663,6 @@ pub fn parse_request_head(bytes: &[u8]) -> Result<RequestHead, HttpError> {
         method,
         target,
         headers,
+        content_length: parsed_content_length,
     })
 }

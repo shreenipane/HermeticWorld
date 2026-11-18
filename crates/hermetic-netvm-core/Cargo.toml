@@ -24,6 +24,9 @@ hermetic-trust = { path = "../hermetic-trust" }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
 sha2 = { workspace = true }
 time = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+sha1 = { workspace = true }
 
 [dev-dependencies]
 hermetic-world-server = { path = "../hermetic-world-server" }

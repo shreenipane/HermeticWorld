@@ -214,7 +214,11 @@ fn collect_single_header(headers: &[Header], target_name: &str) -> Option<String
 
 /// Evaluates forwarding policy for a validated `RequestHead`.
 pub fn decide(head: &RequestHead, allowed_hosts: &BTreeSet<String>, scheme: Scheme) -> Decision {
-    if head.method != "GET" && head.method != "HEAD" {
+    let is_git_upload_pack = head.method == "POST"
+        && (head.target.path == "/git-upload-pack"
+            || head.target.path.ends_with("/git-upload-pack"));
+
+    if head.method != "GET" && head.method != "HEAD" && !is_git_upload_pack {
         return Decision::MethodNotAllowed;
     }
 
@@ -240,9 +244,22 @@ pub fn decide(head: &RequestHead, allowed_hosts: &BTreeSet<String>, scheme: Sche
                 | "if-none-match"
                 | "if-modified-since"
                 | "user-agent"
+                | "content-type"
+                | "git-protocol"
         ) && !seen.insert(&header.name)
         {
             return Decision::Reject("duplicate_forward_header".to_owned());
+        }
+    }
+
+    if is_git_upload_pack {
+        if let Some(ct) = head.headers.iter().find(|h| h.name == "content-type") {
+            if !ct
+                .value
+                .eq_ignore_ascii_case("application/x-git-upload-pack-request")
+            {
+                return Decision::Reject("invalid_content_type".to_owned());
+            }
         }
     }
 
@@ -268,66 +285,97 @@ pub fn decide(head: &RequestHead, allowed_hosts: &BTreeSet<String>, scheme: Sche
 
     let mut out_headers: Vec<ForwardHeader> = Vec::new();
 
-    // Fixed output order:
-    // 1. accept
-    if let Some(val) = collect_single_header(&head.headers, "accept") {
-        out_headers.push(ForwardHeader {
-            name: "accept".to_owned(),
-            value: val,
-        });
-    }
-    // 2. accept-encoding (only identity or gzip)
-    let encoding = match filter_accept_encoding(&head.headers) {
-        Ok(value) => value,
-        Err(reason) => return Decision::Reject(reason.to_owned()),
-    };
-    if let Some(val) = encoding {
-        out_headers.push(ForwardHeader {
-            name: "accept-encoding".to_owned(),
-            value: val,
-        });
-    }
-    // 3. range (single bytes=a-b only)
-    if let Some(val) = filter_single_range(&head.headers) {
-        out_headers.push(ForwardHeader {
-            name: "range".to_owned(),
-            value: val,
-        });
-    }
-    // 4. if-none-match
-    if let Some(val) = collect_single_header(&head.headers, "if-none-match") {
-        out_headers.push(ForwardHeader {
-            name: "if-none-match".to_owned(),
-            value: val,
-        });
-    }
-    // 5. if-modified-since
-    if let Some(val) = collect_single_header(&head.headers, "if-modified-since") {
-        out_headers.push(ForwardHeader {
-            name: "if-modified-since".to_owned(),
-            value: val,
-        });
-    }
-    // 6. user-agent (when present, replaced by fixed string "hermetic-world/1")
-    if head.headers.iter().any(|h| h.name == "user-agent") {
-        out_headers.push(ForwardHeader {
-            name: "user-agent".to_owned(),
-            value: "hermetic-world/1".to_owned(),
-        });
+    if is_git_upload_pack {
+        // Output headers for git-upload-pack POST in fixed order:
+        // 1. accept
+        if let Some(val) = collect_single_header(&head.headers, "accept") {
+            out_headers.push(ForwardHeader {
+                name: "accept".to_owned(),
+                value: val,
+            });
+        }
+        // 2. content-length
+        if let Some(val) = collect_single_header(&head.headers, "content-length") {
+            out_headers.push(ForwardHeader {
+                name: "content-length".to_owned(),
+                value: val,
+            });
+        }
+        // 3. content-type
+        if let Some(val) = collect_single_header(&head.headers, "content-type") {
+            out_headers.push(ForwardHeader {
+                name: "content-type".to_owned(),
+                value: val,
+            });
+        }
+        // 4. git-protocol
+        if let Some(val) = collect_single_header(&head.headers, "git-protocol") {
+            out_headers.push(ForwardHeader {
+                name: "git-protocol".to_owned(),
+                value: val,
+            });
+        }
+        // 5. user-agent (replaced by fixed string "hermetic-world/1")
+        if head.headers.iter().any(|h| h.name == "user-agent") {
+            out_headers.push(ForwardHeader {
+                name: "user-agent".to_owned(),
+                value: "hermetic-world/1".to_owned(),
+            });
+        }
+    } else {
+        // Fixed output order for GET/HEAD:
+        // 1. accept
+        if let Some(val) = collect_single_header(&head.headers, "accept") {
+            out_headers.push(ForwardHeader {
+                name: "accept".to_owned(),
+                value: val,
+            });
+        }
+        // 2. accept-encoding (only identity or gzip)
+        let encoding = match filter_accept_encoding(&head.headers) {
+            Ok(value) => value,
+            Err(reason) => return Decision::Reject(reason.to_owned()),
+        };
+        if let Some(val) = encoding {
+            out_headers.push(ForwardHeader {
+                name: "accept-encoding".to_owned(),
+                value: val,
+            });
+        }
+        // 3. range (single bytes=a-b only)
+        if let Some(val) = filter_single_range(&head.headers) {
+            out_headers.push(ForwardHeader {
+                name: "range".to_owned(),
+                value: val,
+            });
+        }
+        // 4. if-none-match
+        if let Some(val) = collect_single_header(&head.headers, "if-none-match") {
+            out_headers.push(ForwardHeader {
+                name: "if-none-match".to_owned(),
+                value: val,
+            });
+        }
+        // 5. if-modified-since
+        if let Some(val) = collect_single_header(&head.headers, "if-modified-since") {
+            out_headers.push(ForwardHeader {
+                name: "if-modified-since".to_owned(),
+                value: val,
+            });
+        }
+        // 6. user-agent (when present, replaced by fixed string "hermetic-world/1")
+        if head.headers.iter().any(|h| h.name == "user-agent") {
+            out_headers.push(ForwardHeader {
+                name: "user-agent".to_owned(),
+                value: "hermetic-world/1".to_owned(),
+            });
+        }
     }
 
     // Collect names (never values) of every dropped header, deterministically sorted & deduplicated.
     let mut dropped_set: BTreeSet<String> = BTreeSet::new();
     for h in &head.headers {
-        let kept = match h.name.as_str() {
-            "accept" => out_headers.iter().any(|oh| oh.name == "accept"),
-            "accept-encoding" => out_headers.iter().any(|oh| oh.name == "accept-encoding"),
-            "range" => out_headers.iter().any(|oh| oh.name == "range"),
-            "if-none-match" => out_headers.iter().any(|oh| oh.name == "if-none-match"),
-            "if-modified-since" => out_headers.iter().any(|oh| oh.name == "if-modified-since"),
-            "user-agent" => true,
-            _ => false,
-        };
+        let kept = out_headers.iter().any(|oh| oh.name == h.name);
         if !kept {
             dropped_set.insert(h.name.clone());
         }
