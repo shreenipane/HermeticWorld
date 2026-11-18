@@ -1,63 +1,53 @@
-
 from hermetic_d5b.model import (
-
     D5bError,
-
     Exemption,
-
     InventoryPackage,
-
     PackageReportEntry,
-
     ECOSYSTEMS,
-
     MODES,
-
 )
-
 from hermetic_d5b.check import (
-
     normalize_pypi_name,
-
     parse_rfc3339_ns,
-
     load_json_bounded,
-
     safe_read_bytes,
-
     evaluate_inventory,
-
     run_check_from_paths,
-
 )
-
-
+from hermetic_d5b.inventory import (
+    SubstrateEntry,
+    build_d5b_inventory,
+    scan_rootfs_packages,
+    scan_dpkg_status,
+    scan_python_packages,
+    scan_conda_packages,
+    load_apt_release_metadata,
+    load_pypi_release_metadata,
+    load_conda_release_metadata,
+    write_canonical_inventory,
+)
 
 __all__ = [
-
     "D5bError",
-
     "Exemption",
-
     "InventoryPackage",
-
     "PackageReportEntry",
-
     "ECOSYSTEMS",
-
     "MODES",
-
     "normalize_pypi_name",
-
     "parse_rfc3339_ns",
-
     "load_json_bounded",
-
     "safe_read_bytes",
-
     "evaluate_inventory",
-
     "run_check_from_paths",
-
+    "SubstrateEntry",
+    "build_d5b_inventory",
+    "scan_rootfs_packages",
+    "scan_dpkg_status",
+    "scan_python_packages",
+    "scan_conda_packages",
+    "load_apt_release_metadata",
+    "load_pypi_release_metadata",
+    "load_conda_release_metadata",
+    "write_canonical_inventory",
 ]
-

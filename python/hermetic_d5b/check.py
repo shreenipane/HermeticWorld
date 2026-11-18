@@ -338,23 +338,43 @@ def validate_metadata(data: Any) -> Dict[str, Any]:
                     parsed_conda[pkg_name][ver] = (ns, format_ns_as_rfc3339(ns))
         validated["conda"] = parsed_conda
 
-    for eco in ("npm", "crates"):
+    for eco in ("npm", "crates", "dpkg", "apt"):
         if eco in data:
             eco_map = data[eco]
             if not isinstance(eco_map, dict) or len(eco_map) > MAX_METADATA_PACKAGES_PER_ECOSYSTEM:
                 raise D5bError(f"invalid {eco} metadata map")
-            parsed_eco: Dict[str, Dict[str, Tuple[int, str]]] = {}
+            parsed_eco: Dict[str, Dict[str, Any]] = {}
             for pkg_name, ver_map in eco_map.items():
                 if not isinstance(pkg_name, str) or not pkg_name:
                     raise D5bError(f"invalid {eco} package name")
                 if not isinstance(ver_map, dict) or len(ver_map) > MAX_VERSIONS_PER_PACKAGE:
                     raise D5bError(f"invalid {eco} version map")
                 parsed_eco[pkg_name] = {}
-                for ver, ts_str in ver_map.items():
+                for ver, val in ver_map.items():
                     if not isinstance(ver, str) or not ver:
                         raise D5bError(f"invalid {eco} version")
-                    ts_ns = parse_rfc3339_ns(ts_str)
-                    parsed_eco[pkg_name][ver] = (ts_ns, ts_str)
+                    if isinstance(val, str):
+                        ts_ns = parse_rfc3339_ns(val)
+                        parsed_eco[pkg_name][ver] = (ts_ns, val)
+                    elif isinstance(val, dict):
+                        if "release_time" in val:
+                            ts_str = val["release_time"]
+                            if not isinstance(ts_str, str):
+                                raise D5bError(f"invalid {eco} release_time")
+                            ts_ns = parse_rfc3339_ns(ts_str)
+                            parsed_eco[pkg_name][ver] = (ts_ns, ts_str)
+                        else:
+                            parsed_files: Dict[str, Tuple[int, str]] = {}
+                            for fname, ts_str in val.items():
+                                if not isinstance(fname, str) or not fname:
+                                    raise D5bError(f"invalid {eco} filename")
+                                if not isinstance(ts_str, str):
+                                    raise D5bError(f"invalid {eco} timestamp")
+                                ts_ns = parse_rfc3339_ns(ts_str)
+                                parsed_files[fname] = (ts_ns, ts_str)
+                            parsed_eco[pkg_name][ver] = parsed_files
+                    else:
+                        raise D5bError(f"invalid {eco} version entry")
             validated[eco] = parsed_eco
 
     return validated
@@ -388,11 +408,21 @@ def _lookup_release_time(
             return None
         return ver_map[pkg.version]
 
-    if eco in ("npm", "crates"):
+    if eco in ("npm", "crates", "dpkg", "apt"):
         ver_map = metadata[eco].get(pkg.name)
         if not ver_map or pkg.version not in ver_map:
             return None
-        return ver_map[pkg.version]
+        entry = ver_map[pkg.version]
+        if isinstance(entry, tuple):
+            return entry
+        if isinstance(entry, dict):
+            if pkg.file is not None:
+                return entry.get(pkg.file)
+            if entry:
+                earliest_fname = min(entry.keys(), key=lambda fn: (entry[fn][0], fn))
+                return entry[earliest_fname]
+            return None
+        return None
 
     return None
 

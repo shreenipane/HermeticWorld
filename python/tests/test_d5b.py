@@ -718,3 +718,25 @@ def test_cli_exemptions_file_and_pass_with_warnings_exit_zero(tmp_path, capsys):
     assert [e["name"] for e in report["exempt"]] == ["left-pad"]
     rc = cli_main(base + ["--mode", "strict", "--exemptions", str(ex_path)])
     assert rc == 2
+
+
+def test_named_file_missing_from_metadata_returns_none_not_fallback():
+    metadata = {
+        "dpkg": {
+            "libc6": {
+                "2.31": {
+                    "libc6_2.31_amd64.deb": "2023-01-01T00:00:00Z"
+                }
+            }
+        }
+    }
+    # When file is specified but absent from metadata, it must not fall back to earliest file
+    inv = {
+        "packages": [
+            {"ecosystem": "dpkg", "name": "libc6", "version": "2.31", "file": "libc6_nonexistent.deb"}
+        ]
+    }
+    report = evaluate_inventory(inv, metadata, CUTOFF, "repo_only")
+    assert report["counts"]["unknown"] == 1
+    assert report["counts"]["ok"] == 0
+

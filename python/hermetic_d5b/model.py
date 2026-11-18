@@ -29,7 +29,7 @@ READ_CHUNK_BYTES = 65536
 
 
 
-ECOSYSTEMS = ("pypi", "conda", "npm", "crates")
+ECOSYSTEMS = ("pypi", "conda", "npm", "crates", "dpkg", "apt")
 
 MODES = ("strict", "repo_only")
 
@@ -56,6 +56,21 @@ class InventoryPackage:
     version: str
 
     file: Optional[str]
+
+
+    def to_dict(self) -> dict:
+
+        return {
+
+            "ecosystem": self.ecosystem,
+
+            "name": self.name,
+
+            "version": self.version,
+
+            "file": self.file,
+
+        }
 
 
 

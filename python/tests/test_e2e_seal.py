@@ -487,3 +487,189 @@ def test_e2e_seal_symlinked_build_record_fails_d7_recipe(tmp_path, monkeypatch, 
     assert events[-1]["step"] == "d7_recipe"
     assert events[-1]["verdict"] == "fail"
     assert events[-1]["reason"] == "d7_recipe_RecipeSecurityError"
+
+
+def test_e2e_seal_with_d5b_inventory_removes_missing_item(tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+    d5b_file = tmp_path / "d5b-input.json"
+    d5b_file.write_text(json.dumps({
+        "schema": "hermetic-d5b-inventory/v1",
+        "cutoff": "2014-01-01T00:00:00Z",
+        "mode": "repo_only",
+        "inventory": {
+            "packages": [
+                {"ecosystem": "pypi", "name": "requests", "version": "2.31.0", "file": None}
+            ]
+        },
+        "d5b_report": {
+            "result": "pass_with_warnings",
+            "counts": {"total": 1, "ok": 1, "newer": 0, "unknown": 0, "exempt": 0}
+        },
+        "substrate": [
+            {
+                "name": "requests",
+                "version": "2.31.0",
+                "digest": "sha256:" + "a" * 64,
+                "date": "2013-12-01T00:00:00Z"
+            }
+        ],
+        "substrate_at_t": "full"
+    }))
+
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                (task / "task.json").write_text('{"cutoffs":{"t_clock":"2014-01-01T00:00:00Z"}}')
+        if "scan" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}'
+        if "d8" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
+        if "--root" in argv:
+            return (b'{"detector":"D10","findings":[],"verdict":"pass","complete":true,'
+                    b'"provenance":{"verdict":"verified","issues":[]}}')
+        return b""
+
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([INSTANCE, str(work), "--sealcheck", str(tool), "--d5b-inventory", str(d5b_file)]) == 1
+    finally:
+        os.umask(original_umask)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["step"] == "world_manifest"
+    assert events[-1]["verdict"] == "open"
+    assert "D5b_inventory_and_release_metadata" not in events[-1]["missing"]
+    assert "canonical_repository_tree_digest" in events[-1]["missing"]
+    assert "package_closure_and_baseline" in events[-1]["missing"]
+    assert "installed_world_trust_and_run_spec" in events[-1]["missing"]
+    assert (work / "d5b-inventory.json").is_file()
+
+
+def test_prepare_bundle_evidence_with_d5b_inventory(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    task_dir = work / "tasks" / INSTANCE
+    task_dir.mkdir(parents=True)
+    task_file = task_dir / "task.json"
+    task_file.write_text(json.dumps({
+        "instance_id": INSTANCE,
+        "test_services": [],
+        "cutoffs": {"t_clock": "2014-01-01T00:00:00Z"},
+    }))
+
+    for step in ("sealcheck_tiers", "D8", "D10"):
+        (work / f"{step}.json").write_text('{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}' if step == "sealcheck_tiers" else '{"detector":"D10","verdict":"pass","findings":[],"complete":true,"provenance":{"verdict":"verified","issues":[]}}' if step == "D10" else '{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}')
+
+    rootfs_content = b"rootfs-image-data-here"
+    (work / "rootfs.img").write_bytes(rootfs_content)
+    rootfs_sha = hashlib.sha256(rootfs_content).hexdigest()
+    (work / "rootfs-report.json").write_text(json.dumps({
+        "d4": "pass",
+        "sha256": rootfs_sha,
+        "size_bytes": len(rootfs_content),
+    }))
+
+    d5b_data = {
+        "schema": "hermetic-d5b-inventory/v1",
+        "cutoff": "2014-01-01T00:00:00Z",
+        "mode": "repo_only",
+        "inventory": {
+            "packages": [
+                {"ecosystem": "pypi", "name": "requests", "version": "2.31.0", "file": None}
+            ]
+        },
+        "substrate": [
+            {
+                "name": "requests",
+                "version": "2.31.0",
+                "digest": "sha256:" + "a" * 64,
+                "date": "2013-12-01T00:00:00Z"
+            }
+        ],
+        "substrate_at_t": "partial",
+    }
+    (work / "d5b-inventory.json").write_text(json.dumps(d5b_data))
+
+    evidence = e2e.prepare_bundle_evidence(work, INSTANCE)
+    assert evidence["schema"] == "hermetic-bundle-evidence/v1"
+    assert "d5b_inventory" in evidence
+    assert evidence["d5b_inventory"]["packages_count"] == 1
+    assert evidence["d5b_inventory"]["substrate_entries_count"] == 1
+    assert evidence["substrate_at_t"] == "partial"
+    assert (work / "bundle-evidence.json").is_file()
+
+
+def test_e2e_seal_with_invalid_d5b_inventory_fails_closed(tmp_path):
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused")
+    bad_file = tmp_path / "bad.json"
+    bad_file.write_text('{"not_a_valid_inventory": true}')
+
+    with pytest.raises(e2e.SealError, match="invalid_d5b_inventory_packages"):
+        e2e.run([INSTANCE, "--sealcheck", str(tool), "--d5b-inventory", str(bad_file)])
+
+    # Gated strict mode
+    gated_file = tmp_path / "gated.json"
+    gated_file.write_text(json.dumps({
+        "mode": "strict",
+        "packages": [],
+        "d5b_report": {"result": "gate"}
+    }))
+    with pytest.raises(e2e.SealError, match="d5b_inventory_gate"):
+        e2e.run([INSTANCE, "--sealcheck", str(tool), "--d5b-inventory", str(gated_file)])
+
+
+def test_prepare_bundle_evidence_combines_substrate_at_t_weaker_wins(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    task_dir = work / "tasks" / INSTANCE
+    task_dir.mkdir(parents=True)
+    task_file = task_dir / "task.json"
+    task_file.write_text(json.dumps({
+        "instance_id": INSTANCE,
+        "test_services": [],
+        "cutoffs": {"t_clock": "2014-01-01T00:00:00Z"},
+    }))
+
+    for step in ("sealcheck_tiers", "D8", "D10"):
+        (work / f"{step}.json").write_text('{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}' if step == "sealcheck_tiers" else '{"detector":"D10","verdict":"pass","findings":[],"complete":true,"provenance":{"verdict":"verified","issues":[]}}' if step == "D10" else '{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}')
+
+    rootfs_content = b"rootfs-image-data-here"
+    (work / "rootfs.img").write_bytes(rootfs_content)
+    rootfs_sha = hashlib.sha256(rootfs_content).hexdigest()
+    (work / "rootfs-report.json").write_text(json.dumps({
+        "d4": "pass",
+        "sha256": rootfs_sha,
+        "size_bytes": len(rootfs_content),
+    }))
+
+    # Non-empty exemptions -> derives "partial"
+    (work / "exemptions.json").write_text(json.dumps({
+        "exemption_list": [{"ecosystem": "pypi", "name": "requests", "version": "2.31.0", "reason": "test"}]
+    }))
+
+    # D5b inventory reports "full"
+    d5b_data = {
+        "schema": "hermetic-d5b-inventory/v1",
+        "cutoff": "2014-01-01T00:00:00Z",
+        "mode": "repo_only",
+        "inventory": {"packages": []},
+        "substrate": [],
+        "substrate_at_t": "full",
+    }
+    (work / "d5b-inventory.json").write_text(json.dumps(d5b_data))
+
+    evidence = e2e.prepare_bundle_evidence(work, INSTANCE)
+    # The weaker value ("partial" < "full") must be retained
+    assert evidence["substrate_at_t"] == "partial"
+

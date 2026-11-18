@@ -511,13 +511,38 @@ def prepare_bundle_evidence(work, instance):
             "size_bytes": len(inv_raw),
             "entries_count": len(inv_data.get("entries", [])),
         }
+    exemption_substrate_at_t = None
     if (work / "exemptions.json").exists():
         ex_raw = read_regular_file_bounded(work / "exemptions.json", MAX_REPORT_BYTES)
         ex_data = parse_json_bytes(ex_raw, MAX_REPORT_BYTES)
         ex_list = ex_data.get("exemption_list", [])
         evidence["exemption_list"] = ex_list
         evidence["exemption_list_digest"] = "sha256:" + hashlib.sha256(ex_raw).hexdigest()
-        evidence["substrate_at_t"] = "partial" if ex_list else "full"
+        exemption_substrate_at_t = "partial" if ex_list else "full"
+        evidence["substrate_at_t"] = exemption_substrate_at_t
+    if (work / "d5b-inventory.json").exists():
+        d5b_raw = read_regular_file_bounded(work / "d5b-inventory.json", MAX_REPORT_BYTES)
+        d5b_data = parse_json_bytes(d5b_raw, MAX_REPORT_BYTES)
+        pkgs = d5b_data.get("inventory", {}).get("packages", d5b_data.get("packages", []))
+        evidence["d5b_inventory"] = {
+            "digest": "sha256:" + hashlib.sha256(d5b_raw).hexdigest(),
+            "size_bytes": len(d5b_raw),
+            "packages_count": len(pkgs),
+            "substrate_entries_count": len(d5b_data.get("substrate", [])),
+        }
+        if "substrate_at_t" in d5b_data:
+            d5b_sub = d5b_data["substrate_at_t"]
+            order = {"none": 0, "partial": 1, "full": 2}
+            if d5b_sub in order:
+                if exemption_substrate_at_t is not None and exemption_substrate_at_t in order:
+                    if order[d5b_sub] < order[exemption_substrate_at_t]:
+                        evidence["substrate_at_t"] = d5b_sub
+                    else:
+                        evidence["substrate_at_t"] = exemption_substrate_at_t
+                else:
+                    evidence["substrate_at_t"] = d5b_sub
+            else:
+                evidence["substrate_at_t"] = d5b_sub
     atomic_write(work / "bundle-evidence.json", encoded(evidence))
     return evidence
 
@@ -611,6 +636,41 @@ def worker(action, work, instance):
         raise SealError("unknown_worker_step")
 
 
+def validate_d5b_inventory_data(data):
+    if not isinstance(data, dict):
+        raise SealError("invalid_d5b_inventory_format")
+    inv = data.get("inventory")
+    if inv is not None:
+        if not isinstance(inv, dict) or not isinstance(inv.get("packages"), list):
+            raise SealError("invalid_d5b_inventory_packages")
+    elif not isinstance(data.get("packages"), list):
+        raise SealError("invalid_d5b_inventory_packages")
+    substrate = data.get("substrate")
+    if substrate is not None:
+        if not isinstance(substrate, list):
+            raise SealError("invalid_d5b_substrate_format")
+        for entry in substrate:
+            if not isinstance(entry, dict):
+                raise SealError("invalid_d5b_substrate_entry")
+            if not isinstance(entry.get("name"), str) or not entry["name"]:
+                raise SealError("invalid_d5b_substrate_entry_name")
+            if not isinstance(entry.get("version"), str) or not entry["version"]:
+                raise SealError("invalid_d5b_substrate_entry_version")
+            digest = entry.get("digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"^(sha256|blake3):[0-9a-f]{64}$", digest):
+                raise SealError("invalid_d5b_substrate_entry_digest")
+            date_val = entry.get("date")
+            if not isinstance(date_val, str) or not re.fullmatch(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})?)?$", date_val):
+                raise SealError("invalid_d5b_substrate_entry_date")
+    sub_at_t = data.get("substrate_at_t")
+    if sub_at_t is not None and sub_at_t not in ("full", "partial", "none"):
+        raise SealError("invalid_d5b_substrate_at_t")
+    d5b_report = data.get("d5b_report")
+    if d5b_report is not None and isinstance(d5b_report, dict):
+        if data.get("mode") == "strict" and d5b_report.get("result") == "gate":
+            raise SealError("d5b_inventory_gate")
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         raise SealError("invalid_arguments")
@@ -621,6 +681,7 @@ def run(argv=None):
     parser.add_argument("instance")
     parser.add_argument("work", nargs="?")
     parser.add_argument("--sealcheck", default=os.environ.get("HERMETIC_SEALCHECK_BIN"))
+    parser.add_argument("--d5b-inventory", dest="d5b_inventory", default=None)
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9]{1,12}", args.instance) or len(args.instance) > 200:
         raise SealError("invalid_instance_id")
@@ -629,6 +690,12 @@ def run(argv=None):
     if not args.sealcheck:
         raise SealError("sealcheck_binary_required")
     tool = read_regular_file_bounded(args.sealcheck, MAX_TOOL_BYTES)
+    d5b_raw = None
+    if args.d5b_inventory is not None:
+        validate_path(args.d5b_inventory)
+        d5b_raw = read_regular_file_bounded(args.d5b_inventory, MAX_REPORT_BYTES)
+        d5b_json = parse_json_bytes(d5b_raw, MAX_REPORT_BYTES)
+        validate_d5b_inventory_data(d5b_json)
     if args.work is not None:
         validate_path(args.work)
     parent, name, directory, work_path = create_work(str(__file__), args.work)
@@ -636,6 +703,8 @@ def run(argv=None):
     step = "record"
     try:
         os.umask(0o077)
+        if d5b_raw is not None:
+            atomic_write(work / "d5b-inventory.json", d5b_raw)
         atomic_write(work / "record.json", encoded(row))
         atomic_write(work / "record-source.json", encoded({
             "source": "scripts/integration/fixtures/swebench/" + fixture.name,
@@ -749,9 +818,16 @@ def run(argv=None):
         # These inputs must come from the package-world and trust construction
         # components. Empty roots or arbitrary exemption lists would certify a
         # different world. Do not publish a manifest or success in their absence.
+        missing = [
+            "canonical_repository_tree_digest",
+            "D5b_inventory_and_release_metadata",
+            "package_closure_and_baseline",
+            "installed_world_trust_and_run_spec",
+        ]
+        if (work / "d5b-inventory.json").exists():
+            missing.remove("D5b_inventory_and_release_metadata")
         emit(step, "open", reason="package_world_and_trust_evidence_unavailable",
-             missing=["canonical_repository_tree_digest", "D5b_inventory_and_release_metadata", "package_closure_and_baseline",
-                      "installed_world_trust_and_run_spec"],
+             missing=missing,
              detectors={"D7": "not_applicable_without_deep_audit", "D11": "post_run_only",
                         "D12": "requires_runtime_probe"},
              oracle_inputs="prepared_host_only_not_executed")
