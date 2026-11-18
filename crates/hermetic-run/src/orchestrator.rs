@@ -26,8 +26,11 @@
 //! - `probe_output.jsonl`: Guest clock and escape probe JSON-lines output (`ProbeLineWire`, capped at 1 MiB).
 //! - `boot_record.json`: VMM host boot record (`HostBootRecord`, capped at 64 KiB).
 //! - `verdict.json`: Evaluation verdict from grading (`VerdictArtifact`, capped at 1 MiB).
-//! - `world_manifest.json`: World manifest cutoffs, digests, and host facts (`WorldManifestArtifact`, capped at 1 MiB).
+//! - `world_manifest.json`: World manifest cutoffs and digests (`WorldManifestArtifact`, capped at 1 MiB).
 //! - `submitted_work.patch`: Submitted patch artifact (capped at 16 MiB; optional if `submitted_work_digest` is in `verdict.json`).
+//! - `firecracker`: Firecracker binary (capped at 256 MiB; optional host fact artifact).
+//! - `firecracker_build.json`: Build record schema `hermetic-firecracker-build/v1` (capped at 64 KiB; optional host fact artifact).
+//! - `pinned_lock.json`: Pinned Firecracker lock (capped at 64 KiB; optional host fact artifact).
 //!
 //! To prevent ambiguous records, no alternative or fallback file names are permitted.
 //! Every file is opened without following symlinks and read within bounded byte limits.
@@ -36,7 +39,9 @@
 //! The clock level (`hidden`, `faked`, `real`) is never copied from an input file assertion.
 //! Instead, `orchestrator` computes it directly using the exact rules of the Python run
 //! classifier (`hermetic_classifier.run.clock_level`) from the probe records, host facts,
-//! substrate, and date leak observations.
+//! substrate, and date leak observations. Host facts (`patched_firecracker`, `hypercall_block`)
+//! are never read as asserted booleans; they are derived by `host_facts` from `firecracker`,
+//! `firecracker_build.json`, and `pinned_lock.json` as `python/hermetic_classifier/evidence.py` does.
 //!
 //! Computing `clock_level` directly in the orchestrator is chosen over reading `classification.json`
 //! from the run directory because:
@@ -56,6 +61,7 @@ use std::path::Path;
 
 use hermetic_attest::safe_atomic_write_file;
 use hermetic_attest::safe_read_file;
+use hermetic_attest::safe_sha256_file;
 use hermetic_attest::{
     AgentMode, ClockLevel, Deployment, Digest, DsseEnvelope, DsseError, Ed25519Signer, FsError,
     GraderIsolation, GradingRunResult, HostBootRecord, KeyError, ProbeResult, RunRecord, RunStatus,
@@ -73,9 +79,12 @@ pub const MAX_BOOT_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_VERDICT_BYTES: usize = 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_SUBMITTED_WORK_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_LOCK_BYTES: usize = 64 * 1024;
+pub const MAX_FIRECRACKER_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PROBE_LINES: usize = 10_000;
 pub const MAX_PROBE_LINE_BYTES: usize = 512;
 
+pub const BUILD_SCHEMA: &str = "hermetic-firecracker-build/v1";
 pub const RUN_SPEC_VERSION: &str = "v1.1";
 
 pub const REQUIRED_PROBES: [&str; 15] = [
@@ -178,8 +187,6 @@ pub struct WorldManifestArtifact {
     pub task_class: TaskClass,
     pub seal_level: SealLevel,
     pub agent_mode: AgentMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<HostFactsArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub substrate: Option<String>,
     pub grader_isolation: GraderIsolation,
@@ -319,6 +326,170 @@ fn read_artifact_bytes(
 #[inline]
 fn json_parse_error(line: usize, column: usize) -> String {
     format!("parse error at line {line} column {column}")
+}
+
+/// Helper to strictly parse a JSON object, rejecting duplicate keys and non-object roots.
+fn parse_strict_map(
+    bytes: &[u8],
+    artifact: &'static str,
+) -> Result<BTreeMap<String, serde_json::Value>, OrchestratorError> {
+    use serde::de::{Deserializer, MapAccess, Visitor};
+
+    struct StrictMapVisitor;
+
+    impl<'de> Visitor<'de> for StrictMapVisitor {
+        type Value = BTreeMap<String, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object without duplicate keys")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
+                if map.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate key in JSON object"));
+                }
+            }
+            Ok(map)
+        }
+    }
+
+    struct StrictMap(BTreeMap<String, serde_json::Value>);
+
+    impl<'de> serde::Deserialize<'de> for StrictMap {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer
+                .deserialize_map(StrictMapVisitor)
+                .map(StrictMap)
+        }
+    }
+
+    let parsed: StrictMap = serde_json::from_slice(bytes).map_err(|e| OrchestratorError::Json {
+        artifact,
+        detail: json_parse_error(e.line(), e.column()),
+    })?;
+    Ok(parsed.0)
+}
+
+/// Helper to extract and validate a 64-character lowercase hex digest field.
+fn get_hex_field(
+    map: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+    artifact: &'static str,
+) -> Result<String, OrchestratorError> {
+    let val =
+        map.get(key)
+            .and_then(|v| v.as_str())
+            .ok_or(OrchestratorError::MalformedArtifact {
+                artifact,
+                detail: "hash field missing or not a string",
+            })?;
+    if val.len() != 64 || !val.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(OrchestratorError::MalformedArtifact {
+            artifact,
+            detail: "hash field must be 64 lowercase hex characters",
+        });
+    }
+    Ok(val.to_string())
+}
+
+/// Derives host facts from the Firecracker executable, its build record, and the pinned lock.
+/// Replicates `python/hermetic_classifier/evidence.py host_facts`.
+pub fn host_facts(
+    firecracker_path: &Path,
+    build_record_path: &Path,
+    pinned_lock_path: &Path,
+) -> Result<HostFactsArtifact, OrchestratorError> {
+    let build_bytes =
+        safe_read_file(build_record_path, MAX_LOCK_BYTES).map_err(|e| OrchestratorError::Fs {
+            artifact: "firecracker_build.json",
+            detail: e.to_string(),
+        })?;
+    let lock_bytes =
+        safe_read_file(pinned_lock_path, MAX_LOCK_BYTES).map_err(|e| OrchestratorError::Fs {
+            artifact: "pinned_lock.json",
+            detail: e.to_string(),
+        })?;
+
+    let build_map = parse_strict_map(&build_bytes, "firecracker_build.json")?;
+    let lock_map = parse_strict_map(&lock_bytes, "pinned_lock.json")?;
+
+    match build_map.get("schema").and_then(|v| v.as_str()) {
+        Some(s) if s == BUILD_SCHEMA => {}
+        _ => {
+            return Err(OrchestratorError::MalformedArtifact {
+                artifact: "firecracker_build.json",
+                detail: "unknown Firecracker build record schema",
+            });
+        }
+    }
+
+    let built = get_hex_field(&build_map, "firecracker_sha256", "firecracker_build.json")?;
+    let lock_fc = get_hex_field(&lock_map, "firecracker_sha256", "pinned_lock.json")?;
+    let build_patch = get_hex_field(&build_map, "patch_sha256", "firecracker_build.json")?;
+    let lock_patch = get_hex_field(&lock_map, "patch_sha256", "pinned_lock.json")?;
+    let build_source = get_hex_field(&build_map, "source_sha256", "firecracker_build.json")?;
+    let lock_source = get_hex_field(&lock_map, "source_sha256", "pinned_lock.json")?;
+
+    let actual = safe_sha256_file(firecracker_path, MAX_FIRECRACKER_BYTES).map_err(|e| {
+        OrchestratorError::Fs {
+            artifact: "firecracker",
+            detail: e.to_string(),
+        }
+    })?;
+
+    let patched = actual == built
+        && built != lock_fc
+        && build_patch == lock_patch
+        && build_source == lock_source;
+
+    Ok(HostFactsArtifact {
+        patched_firecracker: patched,
+        hypercall_block: patched,
+    })
+}
+
+/// Alias for `host_facts`.
+pub fn derive_host_facts(
+    firecracker_path: &Path,
+    build_record_path: &Path,
+    pinned_lock_path: &Path,
+) -> Result<HostFactsArtifact, OrchestratorError> {
+    host_facts(firecracker_path, build_record_path, pinned_lock_path)
+}
+
+/// Load and derive host facts from canonical files in the run directory.
+/// Returns `Ok(None)` if no host fact inputs are present. If any is present, all three must be valid.
+fn load_host_facts(run_dir: &Path) -> Result<Option<HostFactsArtifact>, OrchestratorError> {
+    let fc_path = run_dir.join("firecracker");
+    let build_path = run_dir.join("firecracker_build.json");
+    let lock_path = run_dir.join("pinned_lock.json");
+
+    let has_fc = std::fs::symlink_metadata(&fc_path).is_ok();
+    let has_build = std::fs::symlink_metadata(&build_path).is_ok();
+    let has_lock = std::fs::symlink_metadata(&lock_path).is_ok();
+
+    if !has_fc && !has_build && !has_lock {
+        return Ok(None);
+    }
+    if !has_fc {
+        return Err(OrchestratorError::MissingArtifact("firecracker"));
+    }
+    if !has_build {
+        return Err(OrchestratorError::MissingArtifact("firecracker_build.json"));
+    }
+    if !has_lock {
+        return Err(OrchestratorError::MissingArtifact("pinned_lock.json"));
+    }
+
+    host_facts(&fc_path, &build_path, &lock_path).map(Some)
 }
 
 /// Load and parse the gateway real-date sentinel summary.
@@ -624,10 +795,11 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     // 3. Derive escape probe result strictly from probe records
     let escape_probe_result = derive_escape_probe_result(&probe_records);
 
-    // 4. Derive clock level using the exact classifier rules
+    // 4. Derive host facts and clock level using the exact classifier rules
+    let host = load_host_facts(run_dir)?;
     let (clock, _clock_reasons) = compute_clock_level(
         manifest.substrate.as_deref(),
-        manifest.host.as_ref(),
+        host.as_ref(),
         &probe_records,
         date_leak_observed,
     );

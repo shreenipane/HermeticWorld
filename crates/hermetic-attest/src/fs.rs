@@ -152,6 +152,49 @@ pub fn safe_read_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, FsError>
     read_with_hook(path, max_bytes, || {})
 }
 
+/// Compute SHA-256 hex digest of a regular file opened safely without following symlinks,
+/// reading in bounded chunks up to `max_bytes`.
+pub fn safe_sha256_file(path: &Path, max_bytes: usize) -> Result<String, FsError> {
+    use sha2::{Digest, Sha256};
+    let (parent, name) = open_parent(path)?;
+    let leaf_path = child_path(&parent, name);
+    let before = fs::symlink_metadata(&leaf_path)?;
+    check_type(&before, false)?;
+    let pinned = pin_entry(&leaf_path, &before, false)?;
+    let meta = pinned.metadata()?;
+    if meta.len() > max_bytes as u64 {
+        return Err(FsError::FileTooLarge {
+            path: "file".into(),
+            size: meta.len(),
+            limit: max_bytes,
+        });
+    }
+    let mut file = File::open(descriptor_path(&pinned))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total: usize = 0;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n).ok_or_else(|| FsError::FileTooLarge {
+            path: "file".into(),
+            size: u64::MAX,
+            limit: max_bytes,
+        })?;
+        if total > max_bytes {
+            return Err(FsError::FileTooLarge {
+                path: "file".into(),
+                size: total as u64,
+                limit: max_bytes,
+            });
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn read_with_hook(
     path: &Path,
     max_bytes: usize,

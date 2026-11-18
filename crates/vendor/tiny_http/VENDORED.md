@@ -69,3 +69,6 @@ Every change is marked `HERMETIC PATCH` in the source.
     before every socket write the send timeout is set to the time left, and a passed deadline
     fails the write. `Request::write_deadline()` returns a `DeadlineHandle` the application
     sets (and may renew while a stream is written).
+14. `src/lib.rs`: the accept loop checks `inside_close_trigger` immediately after `server.accept()`,
+    breaking the loop without dispatching if the server is closing.
+

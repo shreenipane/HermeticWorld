@@ -14,7 +14,13 @@ WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
 FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
-: "${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
+LOCK="${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
+if [ -e "$KERNEL" ] || [ -L "$KERNEL" ]; then KERNEL="$(readlink -f "$KERNEL")"; fi
+if [ -e "$FC" ] || [ -L "$FC" ]; then FC="$(readlink -f "$FC")"; fi
+if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then LOCK="$(readlink -f "$LOCK")"; fi
+export HERMETIC_KERNEL="$KERNEL"
+export HERMETIC_FC_BIN="$FC"
+export HERMETIC_FIRECRACKER_LOCK="$LOCK"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/target/net-smoke}"
 T=1700000000
 FIX="$top/scripts/integration/net-fixture"
@@ -93,6 +99,12 @@ HERMETIC_WORLD_STORE="$WORK/store" HERMETIC_NET_WORK="$WORK" \
   netvm_serves_world_to_agent_and_drops_everything_else -- --ignored --nocapture \
   >"$WORK/net-smoke-test.log" 2>&1; then
   cat "$WORK/net-smoke-test.log"
+  if [ "$FC" != "unused" ]; then
+    grep -q "netvm_ready.*path=tproxy" "$WORK/net-smoke-test.log" || {
+      echo "Smoke failed: NetVM ready status did not report path=tproxy" >&2
+      exit 1
+    }
+  fi
 else
   result=$?
   cat "$WORK/net-smoke-test.log" >&2

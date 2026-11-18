@@ -13,10 +13,11 @@ use hermetic_attest::{
 };
 use hermetic_run::orchestrator::{
     assemble_and_sign_run_record, assemble_run_record, compute_clock_level,
-    derive_escape_probe_result, sign_run_record_with_key_path, write_signed_run_record,
-    HostFactsArtifact, OrchestratorError, ProbeLineWire, MAX_BOOT_RECORD_BYTES,
-    MAX_HARNESS_SUMMARY_BYTES, MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES,
-    MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES, PROBE_RESULTS, REQUIRED_PROBES, RUN_SPEC_VERSION,
+    derive_escape_probe_result, derive_host_facts, host_facts, sign_run_record_with_key_path,
+    write_signed_run_record, HostFactsArtifact, OrchestratorError, ProbeLineWire, BUILD_SCHEMA,
+    MAX_BOOT_RECORD_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_MANIFEST_BYTES, MAX_PROBE_BYTES,
+    MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES, PROBE_RESULTS,
+    REQUIRED_PROBES, RUN_SPEC_VERSION,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -125,16 +126,11 @@ impl FixturePaths {
         // 6. World manifest and digests
         // Note: No 'clock' field (clock is computed, not asserted).
         // 'world_version' is required.
-        // 'host' has patched_firecracker: true, hypercall_block: true.
         let manifest = json!({
             "task_id": "pytest-dev__pytest-6202",
             "task_class": "patch",
             "seal_level": "strict",
             "agent_mode": "H",
-            "host": {
-                "patched_firecracker": true,
-                "hypercall_block": true
-            },
             "substrate": "microvm",
             "grader_isolation": "clean",
             "deployment": "single_host",
@@ -164,6 +160,40 @@ impl FixturePaths {
         fs::write(
             self.path().join("world_manifest.json"),
             manifest.to_string(),
+        )
+        .unwrap();
+
+        // 7. Host facts artifacts: Firecracker binary, build record, and pinned lock
+        let fc_bytes = b"patched firecracker binary for orchestrator tests";
+        fs::write(self.path().join("firecracker"), fc_bytes).unwrap();
+        use sha2::{Digest as ShaDigest, Sha256};
+        let fc_sha = format!("{:x}", Sha256::digest(fc_bytes));
+        let patch_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let source_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let release_sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let build_record = json!({
+            "schema": "hermetic-firecracker-build/v1",
+            "version": "1.18.0",
+            "firecracker_sha256": fc_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        });
+        fs::write(
+            self.path().join("firecracker_build.json"),
+            build_record.to_string(),
+        )
+        .unwrap();
+
+        let pinned_lock = json!({
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        });
+        fs::write(
+            self.path().join("pinned_lock.json"),
+            pinned_lock.to_string(),
         )
         .unwrap();
     }
@@ -682,23 +712,441 @@ fn test_manifest_asserting_clock_level_is_refused() {
 fn test_clock_level_computed_from_probe_and_host_facts() {
     let f = FixturePaths::new();
 
-    // Subcase 1: Missing patched firecracker -> Faked clock
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
-            .unwrap();
-    manifest["host"] = json!({
-        "patched_firecracker": false,
-        "hypercall_block": true
-    });
-    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+    // Subcase 1: Unpatched firecracker binary in run_dir -> Faked clock
+    fs::write(
+        f.path().join("firecracker"),
+        b"different unpatched firecracker binary",
+    )
+    .unwrap();
     let record = assemble_run_record(f.path()).unwrap();
     assert_eq!(record.clock, ClockLevel::Faked);
 
     // Subcase 2: Container substrate -> Real clock
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
     manifest["substrate"] = json!("container");
     fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
     let record = assemble_run_record(f.path()).unwrap();
     assert_eq!(record.clock, ClockLevel::Real);
+}
+
+#[test]
+fn test_manifest_asserting_host_facts_is_refused() {
+    let f = FixturePaths::new();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest["host"] = json!({
+        "patched_firecracker": true,
+        "hypercall_block": true
+    });
+    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+
+    let err = assemble_run_record(f.path());
+    assert!(matches!(
+        err,
+        Err(OrchestratorError::Json {
+            artifact: "world_manifest.json",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_host_facts_verified_patched_build() {
+    use sha2::{Digest as ShaDigest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let fc = dir.path().join("firecracker");
+    let fc_bytes = b"real verified patched firecracker build binary";
+    fs::write(&fc, fc_bytes).unwrap();
+    let fc_sha = format!("{:x}", Sha256::digest(fc_bytes));
+    let patch_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let source_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+    let release_sha = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    let build = dir.path().join("build.json");
+    fs::write(
+        &build,
+        json!({
+            "schema": BUILD_SCHEMA,
+            "version": "1.18.0",
+            "firecracker_sha256": fc_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let lock = dir.path().join("lock.json");
+    fs::write(
+        &lock,
+        json!({
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let facts = host_facts(&fc, &build, &lock).expect("host_facts should succeed");
+    assert_eq!(
+        facts,
+        HostFactsArtifact {
+            patched_firecracker: true,
+            hypercall_block: true,
+        }
+    );
+    assert_eq!(derive_host_facts(&fc, &build, &lock).unwrap(), facts);
+}
+
+#[test]
+fn test_host_facts_unpatched_or_mismatched_binary_gives_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let fc = dir.path().join("firecracker");
+    fs::write(&fc, b"some other unpatched binary").unwrap();
+    let patch_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let source_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+    let release_sha = "3333333333333333333333333333333333333333333333333333333333333333";
+    let expected_built = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    let build = dir.path().join("build.json");
+    fs::write(
+        &build,
+        json!({
+            "schema": BUILD_SCHEMA,
+            "version": "1.18.0",
+            "firecracker_sha256": expected_built,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let lock = dir.path().join("lock.json");
+    fs::write(
+        &lock,
+        json!({
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Actual binary sha256 does not match built sha256
+    let facts = host_facts(&fc, &build, &lock).expect("valid files");
+    assert_eq!(
+        facts,
+        HostFactsArtifact {
+            patched_firecracker: false,
+            hypercall_block: false,
+        }
+    );
+}
+
+#[test]
+fn test_host_facts_matching_unpatched_release_gives_false() {
+    use sha2::{Digest as ShaDigest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let fc = dir.path().join("firecracker");
+    let fc_bytes = b"stock release unpatched binary";
+    fs::write(&fc, fc_bytes).unwrap();
+    let release_sha = format!("{:x}", Sha256::digest(fc_bytes));
+    let patch_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let source_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    // Build record claiming release hash is not a patched build
+    let build = dir.path().join("build.json");
+    fs::write(
+        &build,
+        json!({
+            "schema": BUILD_SCHEMA,
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let lock = dir.path().join("lock.json");
+    fs::write(
+        &lock,
+        json!({
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let facts = host_facts(&fc, &build, &lock).expect("valid files");
+    assert_eq!(
+        facts,
+        HostFactsArtifact {
+            patched_firecracker: false,
+            hypercall_block: false,
+        }
+    );
+}
+
+#[test]
+fn test_host_facts_mismatched_patch_or_source_gives_false() {
+    use sha2::{Digest as ShaDigest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let fc = dir.path().join("firecracker");
+    let fc_bytes = b"binary with wrong patch";
+    fs::write(&fc, fc_bytes).unwrap();
+    let built_sha = format!("{:x}", Sha256::digest(fc_bytes));
+    let patch_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let source_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+    let release_sha = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    // 1. Mismatched patch
+    let build = dir.path().join("build.json");
+    fs::write(
+        &build,
+        json!({
+            "schema": BUILD_SCHEMA,
+            "version": "1.18.0",
+            "firecracker_sha256": built_sha,
+            "patch_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let lock = dir.path().join("lock.json");
+    fs::write(
+        &lock,
+        json!({
+            "version": "1.18.0",
+            "firecracker_sha256": release_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let facts = host_facts(&fc, &build, &lock).expect("valid files");
+    assert_eq!(
+        facts,
+        HostFactsArtifact {
+            patched_firecracker: false,
+            hypercall_block: false,
+        }
+    );
+
+    // 2. Mismatched source
+    fs::write(
+        &build,
+        json!({
+            "schema": BUILD_SCHEMA,
+            "version": "1.18.0",
+            "firecracker_sha256": built_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let facts = host_facts(&fc, &build, &lock).expect("valid files");
+    assert_eq!(
+        facts,
+        HostFactsArtifact {
+            patched_firecracker: false,
+            hypercall_block: false,
+        }
+    );
+}
+
+#[test]
+fn test_host_facts_hostile_and_malformed_inputs_refused() {
+    use sha2::{Digest as ShaDigest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let fc = dir.path().join("firecracker");
+    let fc_bytes = b"real binary";
+    fs::write(&fc, fc_bytes).unwrap();
+    let fc_sha = format!("{:x}", Sha256::digest(fc_bytes));
+    let patch_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let source_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+    let release_sha = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    let valid_build = json!({
+        "schema": BUILD_SCHEMA,
+        "version": "1.18.0",
+        "firecracker_sha256": fc_sha,
+        "patch_sha256": patch_sha,
+        "source_sha256": source_sha,
+    });
+    let build = dir.path().join("build.json");
+    fs::write(&build, valid_build.to_string()).unwrap();
+
+    let valid_lock = json!({
+        "version": "1.18.0",
+        "firecracker_sha256": release_sha,
+        "patch_sha256": patch_sha,
+        "source_sha256": source_sha,
+    });
+    let lock = dir.path().join("lock.json");
+    fs::write(&lock, valid_lock.to_string()).unwrap();
+
+    // 1. Symlinked firecracker binary is refused
+    let link_fc = dir.path().join("link_fc");
+    symlink(&fc, &link_fc).unwrap();
+    assert!(matches!(
+        host_facts(&link_fc, &build, &lock),
+        Err(OrchestratorError::Fs { .. })
+    ));
+
+    // 2. Symlinked build record is refused
+    let link_build = dir.path().join("link_build");
+    symlink(&build, &link_build).unwrap();
+    assert!(matches!(
+        host_facts(&fc, &link_build, &lock),
+        Err(OrchestratorError::Fs { .. })
+    ));
+
+    // 3. Symlinked lock is refused
+    let link_lock = dir.path().join("link_lock");
+    symlink(&lock, &link_lock).unwrap();
+    assert!(matches!(
+        host_facts(&fc, &build, &link_lock),
+        Err(OrchestratorError::Fs { .. })
+    ));
+
+    // 4. Directory instead of file is refused
+    let sub_dir = dir.path().join("sub_dir");
+    fs::create_dir(&sub_dir).unwrap();
+    assert!(matches!(
+        host_facts(&sub_dir, &build, &lock),
+        Err(OrchestratorError::Fs { .. })
+    ));
+
+    // 5. Missing file is refused
+    let missing = dir.path().join("nonexistent");
+    assert!(matches!(
+        host_facts(&missing, &build, &lock),
+        Err(OrchestratorError::Fs { .. })
+    ));
+
+    // 6. Malformed JSON syntax in build
+    let bad_build = dir.path().join("bad_build.json");
+    fs::write(&bad_build, b"{ invalid json").unwrap();
+    assert!(matches!(
+        host_facts(&fc, &bad_build, &lock),
+        Err(OrchestratorError::Json { .. })
+    ));
+
+    // 7. Non-object JSON in build (e.g. array)
+    let array_build = dir.path().join("array_build.json");
+    fs::write(&array_build, b"[]").unwrap();
+    assert!(matches!(
+        host_facts(&fc, &array_build, &lock),
+        Err(OrchestratorError::Json { .. })
+    ));
+
+    // 8. Duplicate key in build JSON
+    let dup_build = dir.path().join("dup_build.json");
+    fs::write(
+        &dup_build,
+        format!(
+            r#"{{"schema":"{}","schema":"other","firecracker_sha256":"{}","patch_sha256":"{}","source_sha256":"{}"}}"#,
+            BUILD_SCHEMA, fc_sha, patch_sha, source_sha
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        host_facts(&fc, &dup_build, &lock),
+        Err(OrchestratorError::Json { .. })
+    ));
+
+    // 9. Unknown schema in build
+    let unknown_schema = dir.path().join("unknown_schema.json");
+    fs::write(
+        &unknown_schema,
+        json!({
+            "schema": "hermetic-firecracker-build/v0-unknown",
+            "firecracker_sha256": fc_sha,
+            "patch_sha256": patch_sha,
+            "source_sha256": source_sha,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(matches!(
+        host_facts(&fc, &unknown_schema, &lock),
+        Err(OrchestratorError::MalformedArtifact { .. })
+    ));
+
+    // 10. Bad hex digest fields (too short, too long, uppercase)
+    for bad_hex in [
+        "abc",
+        "X".repeat(64).as_str(),
+        "0".repeat(63).as_str(),
+        "0".repeat(65).as_str(),
+    ] {
+        let bad_hex_build = dir.path().join(format!("bad_hex_{bad_hex}.json"));
+        fs::write(
+            &bad_hex_build,
+            json!({
+                "schema": BUILD_SCHEMA,
+                "firecracker_sha256": bad_hex,
+                "patch_sha256": patch_sha,
+                "source_sha256": source_sha,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            host_facts(&fc, &bad_hex_build, &lock),
+            Err(OrchestratorError::MalformedArtifact { .. })
+        ));
+    }
+}
+
+#[test]
+fn test_assemble_run_record_host_facts_missing_one_fails_closed() {
+    let f = FixturePaths::new();
+    // Remove pinned_lock.json while firecracker and firecracker_build.json exist
+    fs::remove_file(f.path().join("pinned_lock.json")).unwrap();
+    let err = assemble_run_record(f.path());
+    assert!(matches!(
+        err,
+        Err(OrchestratorError::MissingArtifact("pinned_lock.json"))
+    ));
+
+    // Remove firecracker_build.json while firecracker exists
+    fs::remove_file(f.path().join("firecracker_build.json")).unwrap();
+    let err = assemble_run_record(f.path());
+    assert!(matches!(
+        err,
+        Err(OrchestratorError::MissingArtifact("firecracker_build.json"))
+    ));
+}
+
+#[test]
+fn test_assemble_run_record_missing_all_host_facts_gives_faked_clock() {
+    let f = FixturePaths::new();
+    // Remove all 3 host fact artifacts
+    fs::remove_file(f.path().join("firecracker")).unwrap();
+    fs::remove_file(f.path().join("firecracker_build.json")).unwrap();
+    fs::remove_file(f.path().join("pinned_lock.json")).unwrap();
+
+    let record = assemble_run_record(f.path()).unwrap();
+    assert_eq!(record.clock, ClockLevel::Faked);
 }
 
 // =========================================================================

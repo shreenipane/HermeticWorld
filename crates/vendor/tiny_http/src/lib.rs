@@ -383,6 +383,7 @@ impl Server {
                     Err(IoError::from_raw_os_error(inject_code))
                 } else {
                     let mut res = server.accept();
+                    // HERMETIC PATCH: break immediately if close was triggered while waiting in accept.
                     if inside_close_trigger.load(Relaxed) {
                         break;
                     }

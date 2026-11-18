@@ -27,8 +27,10 @@ const DIAGNOSTIC_COMMANDS: [&[&str]; 4] = [
     &["/bin/busybox", "ip", "neigh"],
     &["/bin/busybox", "cat", "/etc/resolv.conf"],
 ];
-const ENV: [&str; 7] = [
+const MAX_CONSOLE_SCAN_BYTES: usize = 256 * 1024;
+const ENV: [&str; 8] = [
     "HERMETIC_FC_BIN",
+    "HERMETIC_FIRECRACKER_LOCK",
     "HERMETIC_KERNEL",
     "HERMETIC_ROOTFS",
     "HERMETIC_NETVM_ROOTFS",
@@ -36,6 +38,149 @@ const ENV: [&str; 7] = [
     "HERMETIC_WORLD_STORE",
     "HERMETIC_NET_WORK",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetVmReady {
+    pub interface: String,
+    pub address: String,
+    pub dns: String,
+    pub http: String,
+    pub path: String,
+    pub destination_binding: String,
+}
+
+/// Parse and validate the sealed NetVM ready status line from console output.
+pub fn parse_netvm_ready(output: &str) -> std::result::Result<NetVmReady, &'static str> {
+    if output.len() > MAX_CONSOLE_SCAN_BYTES {
+        return Err("oversized console output");
+    }
+    let mut found = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r').trim();
+        let Some(pos) = line.find("netvm_ready") else {
+            continue;
+        };
+        if pos > 0 {
+            let prev = line.as_bytes()[pos - 1];
+            if prev != b' ' && prev != b'\t' && prev != b':' && prev != b']' {
+                continue;
+            }
+        }
+        let remainder = &line[pos + "netvm_ready".len()..];
+        if !remainder.is_empty() && !remainder.starts_with(' ') && !remainder.starts_with('\t') {
+            continue;
+        }
+
+        let mut interface = None;
+        let mut address = None;
+        let mut dns = None;
+        let mut http = None;
+        let mut path = None;
+        let mut destination_binding = None;
+
+        let tokens = remainder.split_whitespace();
+        for token in tokens {
+            let Some((k, v)) = token.split_once('=') else {
+                return Err("malformed token missing '=' in netvm_ready");
+            };
+            if k.is_empty() || v.is_empty() {
+                return Err("empty key or value in netvm_ready");
+            }
+            match k {
+                "interface" => {
+                    if interface.is_some() {
+                        return Err("duplicate interface in netvm_ready");
+                    }
+                    interface = Some(v.to_string());
+                }
+                "address" => {
+                    if address.is_some() {
+                        return Err("duplicate address in netvm_ready");
+                    }
+                    address = Some(v.to_string());
+                }
+                "dns" => {
+                    if dns.is_some() {
+                        return Err("duplicate dns in netvm_ready");
+                    }
+                    dns = Some(v.to_string());
+                }
+                "http" => {
+                    if http.is_some() {
+                        return Err("duplicate http in netvm_ready");
+                    }
+                    http = Some(v.to_string());
+                }
+                "path" => {
+                    if path.is_some() {
+                        return Err("duplicate path in netvm_ready");
+                    }
+                    path = Some(v.to_string());
+                }
+                "destination_binding" => {
+                    if destination_binding.is_some() {
+                        return Err("duplicate destination_binding in netvm_ready");
+                    }
+                    destination_binding = Some(v.to_string());
+                }
+                _ => return Err("unknown key in netvm_ready"),
+            }
+        }
+
+        if interface.is_none()
+            && address.is_none()
+            && dns.is_none()
+            && http.is_none()
+            && path.is_none()
+            && destination_binding.is_none()
+        {
+            continue;
+        }
+
+        let ready = NetVmReady {
+            interface: interface.ok_or("missing interface in netvm_ready")?,
+            address: address.ok_or("missing address in netvm_ready")?,
+            dns: dns.ok_or("missing dns in netvm_ready")?,
+            http: http.ok_or("missing http in netvm_ready")?,
+            path: path.ok_or("missing path in netvm_ready")?,
+            destination_binding: destination_binding
+                .ok_or("missing destination_binding in netvm_ready")?,
+        };
+
+        if found.is_some() {
+            return Err("multiple netvm_ready status lines");
+        }
+        found = Some(ready);
+    }
+
+    found.ok_or("missing netvm_ready status line")
+}
+
+/// Assert that the NetVM ready status line reports the expected path and coherent binding.
+pub fn assert_netvm_ready_path(
+    output: &str,
+    expected_path: &str,
+) -> std::result::Result<NetVmReady, &'static str> {
+    let ready = parse_netvm_ready(output)?;
+    if ready.path != expected_path {
+        return Err("mismatched path in netvm_ready");
+    }
+    match ready.path.as_str() {
+        "tproxy" => {
+            if ready.destination_binding != "on" {
+                return Err("inconsistent destination_binding for tproxy");
+            }
+        }
+        "redirect" => {
+            if ready.destination_binding != "off" {
+                return Err("inconsistent destination_binding for redirect");
+            }
+        }
+        _ => return Err("unsupported path value in netvm_ready"),
+    }
+    Ok(ready)
+}
 
 #[derive(Debug, Deserialize)]
 struct GuestExec {
@@ -220,29 +365,34 @@ fn netvm_serves_world_to_agent_and_drops_everything_else() {
     #[cfg(feature = "dev-unjailed")]
     run();
     #[cfg(not(feature = "dev-unjailed"))]
-    panic!("build with --features dev-unjailed");
+    eprintln!("skipped: build with --features dev-unjailed");
 }
 
 #[cfg(feature = "dev-unjailed")]
 fn run() {
     use hermetic_vmm::runner::DevUnjailed;
-    let mut v = Vec::new();
     for name in ENV {
-        match std::env::var(name) {
-            Ok(value) => v.push(value),
-            Err(_) => {
-                panic!("missing smoke prerequisites: {}", ENV.join(", "));
-            }
+        if std::env::var(name).is_err() {
+            eprintln!("skipped: missing smoke prerequisites: {}", ENV.join(", "));
+            return;
         }
     }
+    let fc_bin = std::env::var("HERMETIC_FC_BIN").unwrap();
+    let kernel = std::env::var("HERMETIC_KERNEL").unwrap();
+    let agent_rootfs = std::env::var("HERMETIC_ROOTFS").unwrap();
+    let netvm_rootfs = std::env::var("HERMETIC_NETVM_ROOTFS").unwrap();
+    let world_server_bin = std::env::var("HERMETIC_WORLD_SERVER_BIN").unwrap();
+    let world_store = std::env::var("HERMETIC_WORLD_STORE").unwrap();
+    let work_dir_str = std::env::var("HERMETIC_NET_WORK").unwrap();
+
     let agent_tap = std::env::var("HERMETIC_AGENT_TAP").unwrap_or_else(|_| "hwtap-agent".into());
     let net_tap = std::env::var("HERMETIC_NET_TAP").unwrap_or_else(|_| "hwtap-net".into());
 
     let mut agent = support::Fixture::new();
     agent.spec.id = "agent-0".into();
-    agent.spec.jail.firecracker = v[0].clone();
-    agent.spec.kernel_image = v[1].clone();
-    agent.spec.root_drive.path = v[2].clone();
+    agent.spec.jail.firecracker = fc_bin.clone();
+    agent.spec.kernel_image = kernel.clone();
+    agent.spec.root_drive.path = agent_rootfs;
     agent.spec.boot_args = agent
         .spec
         .boot_args
@@ -260,9 +410,9 @@ fn run() {
     net.spec.index = 1;
     net.spec.memory_mib = 128;
     net.spec.drives.clear();
-    net.spec.jail.firecracker = v[0].clone();
-    net.spec.kernel_image = v[1].clone();
-    net.spec.root_drive.path = v[3].clone();
+    net.spec.jail.firecracker = fc_bin;
+    net.spec.kernel_image = kernel;
+    net.spec.root_drive.path = netvm_rootfs;
     net.spec.boot_args = net
         .spec
         .boot_args
@@ -283,7 +433,7 @@ fn run() {
     let mut agent_vm = Vmm::new(specs.next().unwrap(), DevUnjailed::new(&launcher).unwrap());
     let mut net_vm = Vmm::new(specs.next().unwrap(), DevUnjailed::new(&launcher).unwrap());
 
-    let work = std::path::Path::new(&v[6]);
+    let work = std::path::Path::new(&work_dir_str);
     let mut agent_socket = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         net_vm.prepare(Duration::from_secs(120)).unwrap();
@@ -294,9 +444,9 @@ fn run() {
         ));
         assert!(world_socket.parent().unwrap().is_dir(), "jail root layout");
         let _world = World(
-            Command::new(&v[4])
+            Command::new(&world_server_bin)
                 .arg("--store")
-                .arg(&v[5])
+                .arg(&world_store)
                 .arg("--socket")
                 .arg(&world_socket)
                 .arg("--log")
@@ -504,6 +654,23 @@ fn run() {
         );
         assert!(!out.contains("10.9.0.1"), "{out}");
 
+        // Assert the NetVM ready status reports path=tproxy (TR-NET-3).
+        let (net_serial, net_stderr) = net_vm.runner().console_output();
+        let mut console = String::from_utf8_lossy(&net_serial).into_owned();
+        console.push('\n');
+        console.push_str(&String::from_utf8_lossy(&net_stderr));
+        let ready = assert_netvm_ready_path(&console, "tproxy")
+            .expect("NetVM ready status must report path=tproxy");
+        eprintln!(
+            "netvm_ready interface={} address={} dns={} http={} path={} destination_binding={}",
+            ready.interface,
+            ready.address,
+            ready.dns,
+            ready.http,
+            ready.path,
+            ready.destination_binding
+        );
+
         agent_vm.stop(Duration::from_secs(2)).unwrap();
         agent_vm.destroy(Duration::from_secs(10)).unwrap();
         net_vm.stop(Duration::from_secs(2)).unwrap();
@@ -627,4 +794,122 @@ fn development_console_survives_failure_cleanup_and_is_bounded() {
     let (serial, errors) = vm.runner().console_output();
     assert_eq!(serial, vec![b's'; MAX_CAPTURE_BYTES]);
     assert_eq!(errors, vec![b'e'; MAX_CAPTURE_BYTES]);
+}
+
+#[test]
+fn test_netvm_ready_status_tproxy_known_answer() {
+    let raw = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\n";
+    let status = assert_netvm_ready_path(raw, "tproxy").expect("known-answer tproxy status");
+    assert_eq!(status.interface, "eth0");
+    assert_eq!(status.address, "10.0.2.3/24");
+    assert_eq!(status.dns, "10.0.2.3:53");
+    assert_eq!(status.http, "0.0.0.0:80");
+    assert_eq!(status.path, "tproxy");
+    assert_eq!(status.destination_binding, "on");
+}
+
+#[test]
+fn test_netvm_ready_status_rejects_redirect_fallback() {
+    let raw = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=redirect destination_binding=off\n";
+    let status = assert_netvm_ready_path(raw, "redirect").expect("valid redirect status");
+    assert_eq!(status.path, "redirect");
+    assert_eq!(status.destination_binding, "off");
+
+    let err = assert_netvm_ready_path(raw, "tproxy").unwrap_err();
+    assert_eq!(err, "mismatched path in netvm_ready");
+}
+
+#[test]
+fn test_netvm_ready_status_embedded_in_console_stream() {
+    let stream = concat!(
+        "[    0.000000] Linux version 6.6.137\r\n",
+        "[    0.051234] eth0: link up\r\n",
+        "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\r\n",
+        "netvm: listening on 10.0.2.3:53\r\n"
+    );
+    let status = assert_netvm_ready_path(stream, "tproxy").expect("embedded tproxy status");
+    assert_eq!(status.path, "tproxy");
+    assert_eq!(status.destination_binding, "on");
+}
+
+#[test]
+fn test_netvm_ready_status_hostile_and_malformed() {
+    // Missing required path field
+    let missing_path = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 destination_binding=on\n";
+    assert_eq!(
+        parse_netvm_ready(missing_path).unwrap_err(),
+        "missing path in netvm_ready"
+    );
+
+    // Empty path value
+    let empty_path = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path= destination_binding=on\n";
+    assert_eq!(
+        parse_netvm_ready(empty_path).unwrap_err(),
+        "empty key or value in netvm_ready"
+    );
+
+    // Missing = in token
+    let malformed_token = "netvm_ready interface=eth0 address=10.0.2.3/24 broken_token dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\n";
+    assert_eq!(
+        parse_netvm_ready(malformed_token).unwrap_err(),
+        "malformed token missing '=' in netvm_ready"
+    );
+
+    // Duplicate key
+    let duplicate_key = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy path=redirect destination_binding=on\n";
+    assert_eq!(
+        parse_netvm_ready(duplicate_key).unwrap_err(),
+        "duplicate path in netvm_ready"
+    );
+
+    // Inconsistent destination binding for tproxy
+    let inconsistent_tproxy = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=off\n";
+    assert_eq!(
+        assert_netvm_ready_path(inconsistent_tproxy, "tproxy").unwrap_err(),
+        "inconsistent destination_binding for tproxy"
+    );
+
+    // Inconsistent destination binding for redirect
+    let inconsistent_redirect = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=redirect destination_binding=on\n";
+    assert_eq!(
+        assert_netvm_ready_path(inconsistent_redirect, "redirect").unwrap_err(),
+        "inconsistent destination_binding for redirect"
+    );
+
+    // Unknown key
+    let unknown_key = "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on evil=true\n";
+    assert_eq!(
+        parse_netvm_ready(unknown_key).unwrap_err(),
+        "unknown key in netvm_ready"
+    );
+
+    // Missing status line completely
+    assert_eq!(
+        parse_netvm_ready("no status here\n").unwrap_err(),
+        "missing netvm_ready status line"
+    );
+
+    // Substring tricks
+    let fake_token = "fake_netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\n";
+    assert_eq!(
+        parse_netvm_ready(fake_token).unwrap_err(),
+        "missing netvm_ready status line"
+    );
+
+    // Conflicting multiple status lines
+    let conflicting = concat!(
+        "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=tproxy destination_binding=on\n",
+        "netvm_ready interface=eth0 address=10.0.2.3/24 dns=10.0.2.3:53 http=0.0.0.0:80 path=redirect destination_binding=off\n"
+    );
+    assert_eq!(
+        parse_netvm_ready(conflicting).unwrap_err(),
+        "multiple netvm_ready status lines"
+    );
+
+    // Oversized console output
+    let oversized = "x".repeat(MAX_CONSOLE_SCAN_BYTES + 1);
+    assert_eq!(
+        parse_netvm_ready(&oversized).unwrap_err(),
+        "oversized console output"
+    );
 }

@@ -11,7 +11,13 @@ WORK="${HERMETIC_SMOKE_WORK:?}"
 U="${HOME:?}"
 KERNEL="${HERMETIC_KERNEL:-$U/.hermetic/cache/kernel-out-20261113-6.6b/vmlinux}"
 FC="${HERMETIC_FC_BIN:?set measured patched Firecracker binary}"
-: "${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
+LOCK="${HERMETIC_FIRECRACKER_LOCK:?set measured patched Firecracker build lock}"
+if [ -e "$KERNEL" ] || [ -L "$KERNEL" ]; then KERNEL="$(readlink -f "$KERNEL")"; fi
+if [ -e "$FC" ] || [ -L "$FC" ]; then FC="$(readlink -f "$FC")"; fi
+if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then LOCK="$(readlink -f "$LOCK")"; fi
+export HERMETIC_KERNEL="$KERNEL"
+export HERMETIC_FC_BIN="$FC"
+export HERMETIC_FIRECRACKER_LOCK="$LOCK"
 export CARGO_TARGET_DIR="$U/hermetic/cargo-target/$(basename "$top")"
 T=1700000000
 case "${HERMETIC_ESCAPE_PROBE:-0}" in
