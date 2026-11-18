@@ -8,6 +8,7 @@ publication; diagnostic inventories live outside the served store directory.
 import base64
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
 import hashlib
 import json
@@ -19,6 +20,11 @@ from hermetic_npm_cut.cut import (
     HermeticNpmCutError, canonical_json_bytes, compare_semver, cut_packument,
     parse_json_bytes, parse_semver, read_regular_file_bounded,
 )
+from hermetic_apt_snapshot.select import (
+    DEBIAN_SNAPSHOT_START_NANOS, UBUNTU_SNAPSHOT_START_NANOS,
+    _format_snapshot_id_floor_second, parse_rfc3339_utc_nanos,
+)
+from hermetic_conda_cut.cut import HermeticCondaCutError, cut_repodata
 from hermetic_safe_io import atomic_write_at, open_parent, validate_path
 
 from .cut import CutError, _time, cut_crates_index, cut_go_versions
@@ -69,6 +75,20 @@ def _digest(value) -> str:
     return value
 
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _parse_snapshot_id_nanos(snapshot_id: str) -> int:
+    if not isinstance(snapshot_id, str):
+        raise CutError("invalid apt snapshot id")
+    try:
+        dt = datetime.strptime(snapshot_id, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except Exception as exc:
+        raise CutError("invalid apt snapshot id") from exc
+    sec = int((dt - _EPOCH_UTC) // timedelta(seconds=1))
+    return sec * 1_000_000_000
+
+
 def _json(raw: bytes, cap: int) -> dict:
     if type(raw) is not bytes or len(raw) > cap:
         raise CutError("mirror JSON byte cap or type violation")
@@ -94,7 +114,9 @@ def _recipe(raw: bytes) -> dict:
         if type(package) is not dict:
             raise CutError("invalid mirror package")
         kind = package.get("ecosystem")
-        if type(kind) is not str or kind not in {"crates", "go", "npm", "pypi-simple", "pypi-json"}:
+        if type(kind) is not str or kind not in {
+            "crates", "go", "npm", "pypi-simple", "pypi-json", "conda", "apt", "git"
+        }:
             raise CutError("unsupported mirror ecosystem")
         fields = {"ecosystem", "name", "metadata", "artifacts"}
         if kind == "go":
@@ -108,7 +130,7 @@ def _recipe(raw: bytes) -> dict:
             pattern = r"[a-z][a-z0-9_-]*"
         elif kind == "npm":
             pattern = r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*"
-        elif kind == "go":
+        elif kind in {"go", "conda", "apt", "git"}:
             pattern = r"[A-Za-z0-9][A-Za-z0-9._~-]*(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)+"
         else:
             pattern = r"[a-z0-9]+(?:-[a-z0-9]+)*"
@@ -125,9 +147,16 @@ def _recipe(raw: bytes) -> dict:
                 raise CutError("invalid mirror blob mapping")
             for key, digest in mapping.items():
                 if (not key or len(key) > MAX_ROUTE_BYTES or not key.isascii()
-                        or re.fullmatch(r"[A-Za-z0-9._+!-]+", key) is None
                         or key in {".", ".."}):
                     raise CutError("invalid mirror artifact key")
+                if kind in {"apt", "git"}:
+                    if any(not part or part in {".", ".."}
+                           or re.fullmatch(r"[A-Za-z0-9._@+!~-]+", part) is None
+                           for part in key.split("/")):
+                        raise CutError("invalid mirror artifact key")
+                else:
+                    if re.fullmatch(r"[A-Za-z0-9._+!-]+", key) is None:
+                        raise CutError("invalid mirror artifact key")
                 _digest(digest)
     return recipe
 
@@ -294,7 +323,7 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
                 used.add(filename)
             if page["files"]:
                 projects.append(name)
-        else:
+        elif kind == "npm":
             try:
                 packument, npm_report = cut_packument(_json(raw, MAX_BLOB_BYTES), cutoff)
             except HermeticNpmCutError:
@@ -340,6 +369,128 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
             if npm_report.kept:
                 put(f"registry.npmjs.org/{name}/index.html", canonical_json_bytes(packument), "application/json")
             report = npm_report
+        elif kind == "conda":
+            raw_json = _json(raw, MAX_BLOB_BYTES)
+            try:
+                cut_data, conda_report = cut_repodata(raw_json, cutoff)
+            except HermeticCondaCutError:
+                raise CutError("invalid conda repodata") from None
+            parts = name.split("/")
+            if "." in parts[0]:
+                authority = parts[0]
+                subpath = "/".join(parts[1:])
+            else:
+                authority = "conda.anaconda.org"
+                subpath = name
+            put(f"{authority}/{subpath}/repodata.json", canonical_json_bytes(cut_data), "application/json")
+            published_filenames = set()
+            for map_key in ("packages", "packages.conda"):
+                for filename, record in sorted(cut_data.get(map_key, {}).items()):
+                    if type(record) is not dict:
+                        continue
+                    body = artifact(package, filename)
+                    expected_sha = record.get("sha256")
+                    if expected_sha and _sha(body) != expected_sha:
+                        raise CutError("conda artifact digest mismatch")
+                    if filename not in published_filenames:
+                        put(f"{authority}/{subpath}/{filename}", body, "application/octet-stream")
+                        used.add(filename)
+                        published_filenames.add(filename)
+            report = conda_report
+        elif kind == "apt":
+            meta = _json(raw, MAX_BLOB_BYTES)
+            dist = meta.get("dist")
+            if not isinstance(dist, str) or dist not in {"ubuntu", "debian"}:
+                raise CutError("invalid apt distribution")
+            cutoff_nanos = parse_rfc3339_utc_nanos(cutoff)
+            if dist == "ubuntu" and cutoff_nanos < UBUNTU_SNAPSHOT_START_NANOS:
+                raise CutError("ubuntu snapshot before 2023-03-01 is unavailable")
+            if dist == "debian" and cutoff_nanos < DEBIAN_SNAPSHOT_START_NANOS:
+                raise CutError("debian snapshot before 2005-03-12 is unavailable")
+            raw_snapshot_id = meta.get("snapshot_id")
+            if raw_snapshot_id is not None:
+                if not isinstance(raw_snapshot_id, str):
+                    raise CutError("invalid apt snapshot id")
+                snapshot_id = raw_snapshot_id
+            else:
+                snapshot_id = _format_snapshot_id_floor_second(cutoff_nanos)
+
+            snap_nanos = _parse_snapshot_id_nanos(snapshot_id)
+            if snap_nanos > cutoff_nanos:
+                raise CutError("apt snapshot date is after cutoff")
+            if dist == "ubuntu" and snap_nanos < UBUNTU_SNAPSHOT_START_NANOS:
+                raise CutError("ubuntu snapshot before 2023-03-01 is unavailable")
+            if dist == "debian" and snap_nanos < DEBIAN_SNAPSHOT_START_NANOS:
+                raise CutError("debian snapshot before 2005-03-12 is unavailable")
+
+            if "/" in name and "." in name.split("/")[0]:
+                authority, _, subpath = name.partition("/")
+                base_path = f"{authority}/{subpath}"
+                route_snap = subpath.rstrip("/").split("/")[-1]
+                if route_snap != snapshot_id:
+                    raise CutError("apt route snapshot id mismatch")
+            elif dist == "ubuntu":
+                authority = "snapshot.ubuntu.com"
+                base_path = f"{authority}/ubuntu/{snapshot_id}"
+            else:
+                authority = "snapshot.debian.org"
+                base_path = f"{authority}/archive/debian/{snapshot_id}"
+            files_map = meta.get("files")
+            if type(files_map) is not dict:
+                raise CutError("invalid apt snapshot files map")
+            for rel_path, file_meta in sorted(files_map.items()):
+                if type(file_meta) is not dict:
+                    raise CutError("invalid apt file metadata")
+                body = artifact(package, rel_path)
+                expected_sha = file_meta.get("sha256")
+                if expected_sha and _sha(body) != expected_sha:
+                    raise CutError("apt artifact digest mismatch")
+                if rel_path.endswith(".deb"):
+                    expected_ct = "application/vnd.debian.binary-package"
+                elif rel_path.endswith(".xz"):
+                    expected_ct = "application/x-xz"
+                elif rel_path.endswith(".gz"):
+                    expected_ct = "application/gzip"
+                elif rel_path.endswith(".gpg"):
+                    expected_ct = "application/pgp-signature"
+                elif (rel_path.endswith("Release") or rel_path.endswith("InRelease")
+                      or rel_path.endswith("Packages") or rel_path.endswith("sources.sources")):
+                    expected_ct = "text/plain"
+                else:
+                    expected_ct = "application/octet-stream"
+
+                ct = file_meta.get("content_type")
+                if ct:
+                    if ct != expected_ct:
+                        raise CutError("invalid apt content type")
+                else:
+                    ct = expected_ct
+                put(f"{base_path}/{rel_path}", body, ct)
+                used.add(rel_path)
+            report = {"dist": dist, "snapshot_id": snapshot_id, "files": len(files_map)}
+        elif kind == "git":
+            if "/" not in name or "." not in name.split("/")[0]:
+                raise CutError("invalid git repository name (must include authority)")
+            for rel_path in sorted(package["artifacts"]):
+                if (not rel_path.isascii() or ".." in rel_path
+                        or not (rel_path in {"HEAD", "info/refs", "objects/info/packs"}
+                                or re.fullmatch(r"objects/pack/pack-[0-9a-f]{40,64}\.(?:pack|idx)", rel_path)
+                                or re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{38,62}", rel_path))):
+                    raise CutError("invalid git store path")
+                body = artifact(package, rel_path)
+                if rel_path.endswith(".pack"):
+                    ct = "application/x-git-packed-objects"
+                elif rel_path.endswith(".idx"):
+                    ct = "application/x-git-packed-objects-toc"
+                elif rel_path.startswith("objects/") and not rel_path.startswith("objects/info/") and not rel_path.startswith("objects/pack/"):
+                    ct = "application/x-git-loose-object"
+                else:
+                    ct = "text/plain"
+                put(f"{name}/{rel_path}", body, ct)
+                used.add(rel_path)
+            report = {"objects_count": len(used)}
+        else:
+            raise CutError("unsupported mirror ecosystem")
         # Supplied excluded downloads remain unserved. Refuse misspellings and
         # unknown artifact associations instead of silently ignoring them.
         inventory = set(package["artifacts"])
@@ -348,11 +499,19 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
                        for suffix in (".mod", ".zip")}
         elif kind == "npm":
             allowed = set(_json(raw, MAX_BLOB_BYTES)["versions"])
+        elif kind == "conda":
+            raw_c = _json(raw, MAX_BLOB_BYTES)
+            allowed = set(raw_c.get("packages", {})) | set(raw_c.get("packages.conda", {}))
+        elif kind == "apt":
+            allowed = set(_json(raw, MAX_BLOB_BYTES).get("files", {}))
+        elif kind == "git":
+            allowed = set(package["artifacts"])
         else:
             allowed = set(report.kept) | set(report.after_cutoff) | set(report.unknown)
         if inventory - allowed or used - inventory:
             raise CutError("unrecognized mirror artifact association")
-        reports.append({"ecosystem": kind, "name": name, "report": asdict(report)})
+        rep_dict = report if isinstance(report, dict) else (asdict(report) if hasattr(report, "__dataclass_fields__") else report.to_dict())
+        reports.append({"ecosystem": kind, "name": name, "report": rep_dict})
 
     if any(path.startswith("index.crates.io/") for path in files):
         put("index.crates.io/config.json", canonical_json_bytes({
