@@ -16,7 +16,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 2: World | done 31 of 45 |
 | 3: VMs | done 31 of 50 |
 | 3b: Clock hiding | done 18 of 20 |
-| 4: Extensions | done 28 of 39 |
+| 4: Extensions | done 29 of 41 |
 
 ## Overview
 
@@ -323,6 +323,8 @@ The probe passes, giving `clock: hidden`. Otherwise, record why and ship `faked`
   - [x] Initial Maven research: release-list metadata has no per-release publication time; snapshot metadata retains current entries. Supporting Maven requires dated, digest-bound artifact provenance or a historical snapshot, including POMs/plugins/parents/classifiers. Primary sources and remaining work are in `docs/phase4-plan.md`; no Maven support is claimed.
   - [x] Resolved 2026-11-14 (owner decision: drop post-cutoff npm tags): with no tag history in a packument, `cut_packument` drops every `dist-tags` entry except `latest`, which is recomputed from admitted versions; the mirror serves only that. Proof: `test_tags_pointing_at_admitted_versions_are_still_dropped`, `test_mirror_npm_mutable_tags_are_dropped_and_never_published`.
 - [ ] Other provider adapters for the gateway
+  - [x] Chat completions adapter (TR-GW-2 to TR-GW-8): default-deny policy core (request and response rewriting, timestamp rewriting, quotas, streaming), Bearer authentication, exact URL allowlist, function tools and tool choice schemas, inline base64 image data URIs, token accounting, streaming SSE translation with usage verification, cancellation handling, hostile and known-answer tests. Proof: `test_base_url_allowlist_full_validation`, `test_known_answer_request_translation_fixtures`, `test_hostile_request_rejection_vectors`, `test_known_answer_response_translation_fixtures`, `test_hostile_response_rejection_vectors`, `test_known_answer_streaming_translation_fixtures`, `test_hostile_streaming_rejection_vectors`, `test_gateway_e2e_openai_count_tokens_fails_closed`, `test_gateway_e2e_openai_inline_image_and_tool_flow`, `test_nested_vm_smoke_skips_cleanly_without_env_vars` (`crates/hermetic-gateway/tests/test_openai_adapter.rs`).
+  - [ ] remaining: Manager nested VM integration run (`scripts/integration/gw-adapter-smoke.sh`).
 - [ ] Smart git protocol terminated in NetVM (for shallow clones)
   - [ ] Review 2026-11-15: the branch's three commits contain no smart Git implementation. NetVM still rejects POST; sealed reachable-object repository binding, upload-pack v2 shallow/deepen, a bounded pkt-line parser and hostile protocol tests remain open. Implementing them requires the NetVM transport and repository-serving components outside this preparation change set; see `docs/phase4-plan.md`.
 - [ ] State-task live grading from a snapshot (TR-VMM-6, §11.4)

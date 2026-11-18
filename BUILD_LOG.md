@@ -29,6 +29,30 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-18: Gateway Chat Completions adapter (Phase 4)
+
+- **Phase:** 4
+- **Type:** build | test
+- **Requirements:** TR-GW-2, TR-GW-3, TR-GW-4, TR-GW-5, TR-GW-6, TR-GW-7, TR-GW-8
+
+### Done
+- Extended the model gateway with the default-deny Chat Completions adapter (`chat-completions-1`) next to the Messages adapter.
+- Request rewriting: Messages JSON to Chat Completions format with strict allowlist, nonce preservation, inline base64 image data URIs, function tool definitions and tool choices (auto, required, named tool), parallel tool calls control, and stop sequences. Thinking, top_k, metadata, documents, server tools, and `/v1/messages/count_tokens` fail closed.
+- Response rewriting: assistant text, function tool calls (`toolu_{index}`), stop reasons (`end_turn`, `max_tokens`, `tool_use`), token usage, and stripping of provider IDs, model names, and timestamps.
+- Streaming SSE translator (`SseReader`): translates chunks into standard events, tracks incremental text and tool call deltas across split frames, enforces bounds (1 MiB event line, 32 MiB total bytes, 65536 events, 128 tool calls), validates accumulated arguments as JSON objects before finish, commits token usage, and triggers limit exceeded on unverified stream drops.
+- Base URL allowlist: exact allowlist for remote providers and validated loopback authority endpoints.
+- Integration smoke: added `scripts/integration/gw-adapter-smoke.sh` resolving symlinked paths with `readlink -f` for manager execution in the nested VM, and an offline test verifying clean skip when KVM environment variables are unset.
+
+### Results / measurements
+- 23 tests pass in `crates/hermetic-gateway/tests/test_openai_adapter.rs`.
+- Offline gate passes with no warnings and safe bounded execution.
+
+### Decisions
+- Retained strict default-deny policy: count_tokens and inline documents fail closed where no exact equivalent exists.
+- Token usage is committed before validating generated content; dropping unverified streams triggers limit exceeded to prevent quota bypass.
+
+---
+
 ## 2026-11-14: 3b full probe passes in the nested VM; Mode H first real run (Phases 3, 3b, 4)
 
 - **Phase:** 3, 3b, 4

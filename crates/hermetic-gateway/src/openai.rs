@@ -30,8 +30,10 @@ fn unsupported() -> GatewayError {
 
 /// Exact remote Chat Completions endpoints; anything else must be an explicit loopback.
 pub const ALLOWED_REMOTE_BASE_URLS: &[&str] = &[
+    "https://api.openai.com/v1",
     "https://generativelanguage.googleapis.com/v1beta/openai",
     "https://integrate.api.nvidia.com/v1",
+    "https://openrouter.ai/api/v1",
 ];
 
 pub fn validate_base_url(url: &str) -> Result<(), String> {
@@ -40,9 +42,12 @@ pub fn validate_base_url(url: &str) -> Result<(), String> {
     }
     // Offline tests may use an explicitly loopback HTTP upstream. No credentials, redirects,
     // arbitrary URL suffix, environment proxy or remote cleartext destination is admitted.
-    let authority = url
-        .strip_prefix("http://127.0.0.1:")
-        .and_then(|tail| tail.strip_suffix("/v1beta/openai").or(Some(tail)));
+    let authority = url.strip_prefix("http://127.0.0.1:").and_then(|tail| {
+        let tail = tail.strip_suffix('/').unwrap_or(tail);
+        tail.strip_suffix("/v1beta/openai")
+            .or_else(|| tail.strip_suffix("/v1"))
+            .or(Some(tail))
+    });
     if authority.is_some_and(|port| {
         !port.is_empty()
             && port.bytes().all(|b| b.is_ascii_digit())
@@ -105,6 +110,9 @@ pub fn request(body: &str, endpoint: &str) -> Result<(String, String), GatewayEr
                         ContentBlock::Image { source, .. } if role == "user" => content.push(json!({
                             "type":"image_url","image_url":{"url":format!("data:{};base64,{}",source.media_type,source.data)}})),
                         ContentBlock::ToolUse { id, name, input, .. } if role == "assistant" => {
+                            if !valid_name(&name) || !input.is_object() {
+                                return Err(unsupported());
+                            }
                             calls.push(json!({"id":id,"type":"function","function":{
                                 "name":name,"arguments":serde_json::to_string(&input).map_err(|_| unsupported())?}}));
                         }
@@ -144,6 +152,9 @@ pub fn request(body: &str, endpoint: &str) -> Result<(String, String), GatewayEr
         output["stop"] = json!(value);
     }
     if let Some(tools) = req.tools {
+        if tools.len() > MAX_TOOL_CALLS || tools.iter().any(|t| !valid_name(&t.name)) {
+            return Err(unsupported());
+        }
         output["tools"] = json!(tools.into_iter().map(|t| json!({"type":"function","function":{
             "name":t.name,"description":t.description.unwrap_or_default(),"parameters":t.input_schema}})).collect::<Vec<_>>());
     }
@@ -158,10 +169,15 @@ pub fn request(body: &str, endpoint: &str) -> Result<(String, String), GatewayEr
             ToolChoice::Tool {
                 name,
                 disable_parallel_tool_use,
-            } => (
-                json!({"type":"function","function":{"name":name}}),
-                disable_parallel_tool_use,
-            ),
+            } => {
+                if !valid_name(&name) {
+                    return Err(unsupported());
+                }
+                (
+                    json!({"type":"function","function":{"name":name}}),
+                    disable_parallel_tool_use,
+                )
+            }
         };
         output["tool_choice"] = value;
         if let Some(disable) = parallel {
