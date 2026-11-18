@@ -73,6 +73,7 @@ use serde::{Deserialize, Serialize};
 
 // Bounded input constants (§12.1, TR-SEC-3)
 pub const MAX_SENTINEL_BYTES: usize = 64 * 1024;
+pub const MAX_GATEWAY_HISTORY_BYTES: usize = 64 * 1024;
 pub const MAX_HARNESS_SUMMARY_BYTES: usize = 1024 * 1024;
 pub const MAX_PROBE_BYTES: usize = 1024 * 1024;
 pub const MAX_BOOT_RECORD_BYTES: usize = 64 * 1024;
@@ -510,6 +511,38 @@ fn load_harness_sentinel(run_dir: &Path) -> Result<SentinelSummary, Orchestrator
     })
 }
 
+/// Gateway history-consistency hash log artifact (Mode G).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHistoryArtifact {
+    pub gateway_log_head: Digest,
+    pub history_rewrite_count: u64,
+    pub gateway_adapter_version: String,
+}
+
+/// Load and parse the gateway history-consistency summary (Mode G).
+fn load_gateway_history(
+    run_dir: &Path,
+) -> Result<Option<GatewayHistoryArtifact>, OrchestratorError> {
+    let artifact = "gateway_history.json";
+    let path = run_dir.join(artifact);
+    match safe_read_file(&path, MAX_GATEWAY_HISTORY_BYTES) {
+        Ok(bytes) => {
+            let parsed: GatewayHistoryArtifact =
+                serde_json::from_slice(&bytes).map_err(|e| OrchestratorError::Json {
+                    artifact,
+                    detail: json_parse_error(e.line(), e.column()),
+                })?;
+            Ok(Some(parsed))
+        }
+        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OrchestratorError::Fs {
+            artifact,
+            detail: e.to_string(),
+        }),
+    }
+}
+
 /// Load and parse the escape/clock probe output strictly.
 fn load_probe_output(run_dir: &Path) -> Result<(Vec<ProbeLineWire>, Digest), OrchestratorError> {
     let bytes = read_artifact_bytes(run_dir, "probe_output.jsonl", MAX_PROBE_BYTES)?;
@@ -786,6 +819,7 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     let boot_record = load_boot_record(run_dir)?;
     let verdict = load_verdict(run_dir)?;
     let manifest = load_world_manifest(run_dir)?;
+    let gateway_history = load_gateway_history(run_dir)?;
     let submitted_work_digest = resolve_submitted_work_digest(run_dir, &verdict)?;
 
     // 2. Date leak is derived ONLY from the real-date sentinels (TR-SEC-5, D12)
@@ -821,6 +855,25 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     }
 
     // 7. Assemble the complete RunRecord
+    let (gateway_log_head, history_rewrite_count, gateway_adapter_version) =
+        if let Some(hist) = gateway_history {
+            (
+                manifest.gateway_log_head.or(Some(hist.gateway_log_head)),
+                manifest
+                    .history_rewrite_count
+                    .or(Some(hist.history_rewrite_count)),
+                manifest
+                    .gateway_adapter_version
+                    .or(Some(hist.gateway_adapter_version)),
+            )
+        } else {
+            (
+                manifest.gateway_log_head,
+                manifest.history_rewrite_count,
+                manifest.gateway_adapter_version,
+            )
+        };
+
     let record = RunRecord {
         task_id: manifest.task_id,
         task_class: manifest.task_class,
@@ -857,9 +910,9 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
         dedupe_index_digest: manifest.dedupe_index_digest,
         request_count: manifest.request_count,
         harness_command_log_head: manifest.harness_command_log_head,
-        gateway_log_head: manifest.gateway_log_head,
-        history_rewrite_count: manifest.history_rewrite_count,
-        gateway_adapter_version: manifest.gateway_adapter_version,
+        gateway_log_head,
+        history_rewrite_count,
+        gateway_adapter_version,
         submitted_work_digest,
         r0_result: verdict.r0_result,
         r1_result: verdict.r1_result,

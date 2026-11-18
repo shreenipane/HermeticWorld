@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use hermetic_common::hash::HashChain;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -31,6 +32,7 @@ struct HistoryState {
     /// Insertion order of `seen_tips`.
     order: VecDeque<String>,
     rewrites_count: u64,
+    chain: HashChain,
 }
 
 impl HistoryState {
@@ -67,6 +69,7 @@ impl HistoryLog {
                 seen_tips: HashSet::new(),
                 order: VecDeque::new(),
                 rewrites_count: 0,
+                chain: HashChain::new(),
             }),
             capacity: capacity.max(1),
         }
@@ -78,6 +81,32 @@ impl HistoryLog {
             Ok(g) => g.seen_tips.len(),
             Err(p) => p.into_inner().seen_tips.len(),
         }
+    }
+
+    /// Return the current head of the history-consistency hash chain as a 64-character lowercase hex string.
+    pub fn head(&self) -> String {
+        let state = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.chain.head_hex()
+    }
+
+    /// Return the current head formatted as `"sha256:<64 hex chars>"`.
+    pub fn head_digest(&self) -> String {
+        format!("sha256:{}", self.head())
+    }
+
+    /// Read both the head digest and rewrite count atomically under one mutex guard.
+    pub fn snapshot(&self) -> (String, u64) {
+        let state = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (
+            format!("sha256:{}", state.chain.head_hex()),
+            state.rewrites_count,
+        )
     }
 
     /// Hash the conversation prefix step by step:
@@ -127,6 +156,7 @@ impl HistoryLog {
         };
 
         let full_tip = hashes.last().cloned().unwrap_or_default();
+        state.chain.append(full_tip.as_bytes());
 
         if msg_count <= 1 {
             // Starts a new conversation (first message only, or empty)

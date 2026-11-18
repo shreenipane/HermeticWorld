@@ -7,17 +7,17 @@ use std::path::Path;
 
 use hermetic_attest::dsse::Statement;
 use hermetic_attest::{
-    compute_run_digest, ed25519_key_id, verify_run_attestation, ClockLevel, Digest, DsseEnvelope,
-    Ed25519Signer, Ed25519Verifier, HostBootRecord, ProbeResult, ReplayGuard, RunBinding,
-    RunStatus, RunValidationError,
+    compute_run_digest, ed25519_key_id, verify_run_attestation, AgentMode, ClockLevel, Digest,
+    DsseEnvelope, Ed25519Signer, Ed25519Verifier, HostBootRecord, ProbeResult, ReplayGuard,
+    RunBinding, RunStatus, RunValidationError,
 };
 use hermetic_run::orchestrator::{
     assemble_and_sign_run_record, assemble_run_record, compute_clock_level,
     derive_escape_probe_result, derive_host_facts, host_facts, sign_run_record_with_key_path,
     write_signed_run_record, HostFactsArtifact, OrchestratorError, ProbeLineWire, BUILD_SCHEMA,
-    MAX_BOOT_RECORD_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_MANIFEST_BYTES, MAX_PROBE_BYTES,
-    MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES, PROBE_RESULTS,
-    REQUIRED_PROBES, RUN_SPEC_VERSION,
+    MAX_BOOT_RECORD_BYTES, MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES,
+    MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES,
+    MAX_VERDICT_BYTES, PROBE_RESULTS, REQUIRED_PROBES, RUN_SPEC_VERSION,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -1626,4 +1626,102 @@ fn test_regression_coderabbit_hostile_parser_diagnostics_sanitized() {
     } else {
         panic!("Expected OrchestratorError::Json, got: {err:?}");
     }
+}
+
+#[test]
+fn test_mode_g_wires_gateway_history_into_run_record() {
+    let f = FixturePaths::new();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest["agent_mode"] = json!("G");
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("harness_command_log_head");
+    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+
+    let gw_history = json!({
+        "gateway_log_head": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "history_rewrite_count": 3,
+        "gateway_adapter_version": "2026-11-1"
+    });
+    fs::write(
+        f.path().join("gateway_history.json"),
+        gw_history.to_string(),
+    )
+    .unwrap();
+
+    let record = assemble_run_record(f.path()).expect("assemble record for Mode G");
+    assert_eq!(record.agent_mode, AgentMode::G);
+    assert_eq!(record.harness_command_log_head, None);
+    assert_eq!(
+        record.gateway_log_head,
+        Some(
+            Digest::parse(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            )
+            .unwrap()
+        )
+    );
+    assert_eq!(record.history_rewrite_count, Some(3));
+    assert_eq!(
+        record.gateway_adapter_version,
+        Some("2026-11-1".to_string())
+    );
+}
+
+#[test]
+fn test_mode_g_missing_gateway_fields_fails_validation() {
+    let f = FixturePaths::new();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest["agent_mode"] = json!("G");
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("harness_command_log_head");
+    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("Mode G without gateway fields must fail");
+    assert_eq!(
+        err,
+        OrchestratorError::Validation(RunValidationError::ModeGMissingGatewayFields)
+    );
+}
+
+#[test]
+fn test_mode_g_symlinked_gateway_history_fails_closed() {
+    let f = FixturePaths::new();
+    let target = f.path().join("real_history.json");
+    let gw_history = json!({
+        "gateway_log_head": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "history_rewrite_count": 0,
+        "gateway_adapter_version": "2026-11-1"
+    });
+    fs::write(&target, gw_history.to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, f.path().join("gateway_history.json")).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("symlinked gateway_history must fail");
+    assert!(matches!(err, OrchestratorError::Fs { .. }));
+}
+
+#[test]
+fn test_mode_g_oversized_gateway_history_fails_closed() {
+    let f = FixturePaths::new();
+    let huge = " ".repeat(MAX_GATEWAY_HISTORY_BYTES + 1);
+    fs::write(f.path().join("gateway_history.json"), huge).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("oversized gateway_history must fail");
+    assert!(matches!(err, OrchestratorError::Fs { .. }));
+}
+
+#[test]
+fn test_mode_g_malformed_gateway_history_fails_closed() {
+    let f = FixturePaths::new();
+    fs::write(f.path().join("gateway_history.json"), "not valid json").unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("malformed gateway_history must fail");
+    assert!(matches!(err, OrchestratorError::Json { .. }));
 }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Cursor, ErrorKind, Read};
 use std::net::TcpStream;
@@ -28,6 +29,16 @@ use hermetic_sealcheck::d12_runtime::{DateSentinel, SentinelSummary, SseScanner}
 
 /// File in the log directory holding the D12 sentinel summary (counts only, no matched text).
 pub const DATE_SENTINEL_FILE: &str = "date_sentinel.json";
+pub const GATEWAY_HISTORY_FILE: &str = "gateway_history.json";
+
+/// Summary of gateway history-consistency hash log for run record assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHistorySummary {
+    pub gateway_log_head: String,
+    pub history_rewrite_count: u64,
+    pub gateway_adapter_version: String,
+}
 
 /// Scans the bytes of a forwarded SSE stream with the D12 sentinel as they are handed out.
 struct SentinelReader<R: Read> {
@@ -207,6 +218,8 @@ pub struct GatewayServer {
     /// Real-date sentinel (D12) over agent requests and forwarded upstream responses.
     sentinel: Arc<DateSentinel>,
     sentinel_persist: Arc<Mutex<()>>,
+    history_persist: Arc<Mutex<()>>,
+    history_persist_failed: Arc<AtomicBool>,
     /// Test seam: invoked after `request.respond` returns on a streaming response,
     /// before `slot.record_and_release()` runs in the handler thread.
     post_stream_respond_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -282,7 +295,7 @@ impl GatewayServer {
         let upstream = Arc::new(UpstreamClient::new(config_arc.clone()));
         let running = Arc::new(AtomicBool::new(true));
 
-        Ok(Self {
+        let server = Self {
             config: config_arc,
             clock,
             nonce,
@@ -306,8 +319,14 @@ impl GatewayServer {
             stream_total_deadline: STREAM_TOTAL_WRITE_DEADLINE,
             sentinel,
             sentinel_persist: Arc::new(Mutex::new(())),
+            history_persist: Arc::new(Mutex::new(())),
+            history_persist_failed: Arc::new(AtomicBool::new(false)),
             post_stream_respond_hook: None,
-        })
+        };
+        if !server.persist_history() {
+            return Err("Failed to persist initial gateway history".to_string());
+        }
+        Ok(server)
     }
 
     /// Overrides `REQUEST_HEAD_DEADLINE` and `REQUEST_BODY_DEADLINE` (tests use short ones).
@@ -441,6 +460,83 @@ impl GatewayServer {
 
     pub fn history(&self) -> &HistoryLog {
         &self.history
+    }
+
+    pub fn history_head(&self) -> String {
+        self.history.head()
+    }
+
+    pub fn history_rewrites_count(&self) -> u64 {
+        self.history.rewrites_total()
+    }
+
+    pub fn history_summary(&self) -> GatewayHistorySummary {
+        let (gateway_log_head, history_rewrite_count) = self.history.snapshot();
+        GatewayHistorySummary {
+            gateway_log_head,
+            history_rewrite_count,
+            gateway_adapter_version: self.adapter_version().to_string(),
+        }
+    }
+
+    pub fn config(&self) -> &GatewayConfig {
+        &self.config
+    }
+
+    /// Writes the history-consistency hash log head and rewrite count to `gateway_history.json`.
+    pub fn persist_history(&self) -> bool {
+        let ok = persist_history_snapshot(
+            &self.history,
+            self.adapter_version(),
+            &self.history_persist,
+            &self.history_persist_failed,
+            |bytes| {
+                let Ok(dir) = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir) else {
+                    return false;
+                };
+                crate::fsutil::write_state_file(&dir, GATEWAY_HISTORY_FILE, bytes).is_ok()
+            },
+        );
+        if !ok {
+            self.latch_history_persist_failure();
+        }
+        ok
+    }
+
+    /// Test seam: persists history using a custom writer callback while holding the persistence lock.
+    pub fn persist_history_with_writer(&self, write: impl FnOnce(&[u8]) -> bool) -> bool {
+        let ok = persist_history_snapshot(
+            &self.history,
+            self.adapter_version(),
+            &self.history_persist,
+            &self.history_persist_failed,
+            write,
+        );
+        if !ok {
+            self.latch_history_persist_failure();
+        }
+        ok
+    }
+
+    fn latch_history_persist_failure(&self) {
+        self.history_persist_failed.store(true, Ordering::SeqCst);
+        let path = self.config.log_dir.join(GATEWAY_HISTORY_FILE);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Test seam: access history persistence lock for concurrency regression testing.
+    pub fn history_persist(&self) -> &Arc<Mutex<()>> {
+        &self.history_persist
+    }
+
+    /// Test seam: returns whether history persistence failure has been latched.
+    pub fn history_persist_failed(&self) -> bool {
+        self.history_persist_failed.load(Ordering::SeqCst)
+    }
+
+    /// Test seam: triggers the history persistence failure latch for regression testing.
+    pub fn simulate_history_persist_failure(&self) {
+        self.latch_history_persist_failure();
     }
 
     pub fn clock(&self) -> &GuestClock {
@@ -582,10 +678,11 @@ impl GatewayServer {
         }
     }
 
-    /// Handles one agent request, then records the D12 sentinel summary.
+    /// Handles one agent request, then records the D12 sentinel summary and history log head.
     pub fn handle_agent_request(&self, request: Request) {
         self.handle_agent_request_inner(request);
         self.persist_sentinel();
+        self.persist_history();
     }
 
     fn handle_agent_request_inner(&self, mut request: Request) {
@@ -862,6 +959,7 @@ impl GatewayServer {
         let (is_rewrite, total_rewrites) = self
             .history
             .check_and_record(&system_canonical, &messages_canonical);
+        self.persist_history();
 
         // 10. Call Upstream
         let is_stream = parsed_req.stream == Some(true) && endpoint == "/v1/messages";
@@ -1264,6 +1362,33 @@ fn persist_snapshot(
         return false;
     };
     serde_json::to_vec(&sentinel.summary())
+        .ok()
+        .is_some_and(|bytes| write(&bytes))
+}
+
+fn persist_history_snapshot(
+    history: &HistoryLog,
+    adapter_version: &str,
+    lock: &std::sync::Mutex<()>,
+    failed: &std::sync::atomic::AtomicBool,
+    write: impl FnOnce(&[u8]) -> bool,
+) -> bool {
+    if failed.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Ok(_guard) = lock.lock() else {
+        return false;
+    };
+    if failed.load(Ordering::SeqCst) {
+        return false;
+    }
+    let (head, rewrites) = history.snapshot();
+    let summary = GatewayHistorySummary {
+        gateway_log_head: head,
+        history_rewrite_count: rewrites,
+        gateway_adapter_version: adapter_version.to_string(),
+    };
+    serde_json::to_vec_pretty(&summary)
         .ok()
         .is_some_and(|bytes| write(&bytes))
 }
