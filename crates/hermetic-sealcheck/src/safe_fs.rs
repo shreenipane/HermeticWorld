@@ -232,6 +232,44 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     File::open(pinned_dir)?.sync_all()
 }
 
+/// Format a path relative to `root` losslessly without host path leak or collisions.
+///
+/// If `path` is under `root`, the relative portion is returned. If `path` is absolute
+/// and not under `root` (e.g. non-matching prefix), it falls back to `.` so host paths
+/// are never leaked. Any non-UTF-8 bytes are encoded with `%XX` so distinct paths never
+/// collide into `\u{FFFD}` and the result is a valid UTF-8 string and SARIF URI.
+pub fn format_relative_path(path: &Path, root: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let rel = match path.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => {
+            if path.is_absolute() {
+                Path::new(".")
+            } else {
+                path
+            }
+        }
+    };
+    if rel.as_os_str().is_empty() {
+        return ".".to_string();
+    }
+    let bytes = rel.as_os_str().as_bytes();
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        s.replace('\\', "/")
+    } else {
+        let mut out = String::with_capacity(bytes.len() * 3);
+        for &b in bytes {
+            if b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'_' || b == b'-' {
+                out.push(b as char);
+            } else {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;

@@ -699,6 +699,18 @@ fn check_live_mtime(
 
 /// Scan a filesystem tree for leaks (D2, D3, D9, containers, tier 1, tier 3).
 pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Finding> {
+    if root.to_str().is_none() {
+        return vec![Finding {
+            detector: "D2".into(),
+            channel: "non_utf8_root".into(),
+            path: ".".into(),
+            visibility: opts.visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["root directory path is not valid UTF-8".into()],
+        }];
+    }
     let sink = TreeMatchSink {
         inner: MatchSink::new(fp, &opts.signatures, opts),
         d4_paths: HashSet::new(),
@@ -837,6 +849,19 @@ pub(crate) fn relative_d4_paths(findings: &mut Vec<Finding>, root: &Path) {
 /// Walk `root` as `scan_tree` does (pruning, symlinks, size limits, container recursion)
 /// and report everything to `sink`. Returns the sink.
 pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S {
+    if root.to_str().is_none() {
+        sink.fixed(Finding {
+            detector: "D2".into(),
+            channel: "non_utf8_root".into(),
+            path: ".".into(),
+            visibility: opts.visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["root directory path is not valid UTF-8".into()],
+        });
+        return sink;
+    }
     let root_str = root.display().to_string();
     let root_prefix_len = root_str.len();
 
@@ -909,6 +934,20 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
             }
         };
         let file_path = file_path_owned.as_path();
+        if file_path.to_str().is_none() {
+            let rel_path = crate::safe_fs::format_relative_path(file_path, root);
+            sink.fixed(Finding {
+                detector: "D2".into(),
+                channel: "non_utf8_path".into(),
+                path: rel_path,
+                visibility: opts.visibility,
+                severity: Severity::Gate,
+                confidence: 1.0,
+                hunk: None,
+                evidence: vec!["path contains invalid non-UTF-8 byte sequence".into()],
+            });
+            continue;
+        }
         let display_path = file_path.display().to_string();
         let metadata = match crate::safe_fs::metadata(file_path) {
             Ok(m) => m,
@@ -923,10 +962,14 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
         if metadata.file_type().is_symlink() {
             sink.symlink(&display_path, &metadata);
             if file_path.file_name().is_some_and(|n| n == ".git") {
+                let git_path = match file_path.strip_prefix(root) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+                    _ => ".git".to_string(),
+                };
                 sink.d1_finding(Finding {
                     detector: "D1".into(),
                     channel: "git_pointer".into(),
-                    path: display_path.clone(),
+                    path: git_path,
                     visibility: opts.visibility,
                     severity: Severity::Gate,
                     confidence: 1.0,
@@ -948,10 +991,14 @@ pub fn walk_tree<S: TreeSink>(root: &Path, opts: &ScanOptions, mut sink: S) -> S
             continue;
         }
         if file_path.file_name().is_some_and(|n| n == ".git") {
+            let git_path = match file_path.strip_prefix(root) {
+                Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+                _ => ".git".to_string(),
+            };
             sink.d1_finding(Finding {
                 detector: "D1".into(),
                 channel: "git_pointer".into(),
-                path: display_path.clone(),
+                path: git_path,
                 visibility: opts.visibility,
                 severity: Severity::Gate,
                 confidence: 1.0,

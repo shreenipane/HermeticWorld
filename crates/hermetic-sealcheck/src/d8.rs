@@ -2195,6 +2195,18 @@ fn check_python_build(
 // ---------------------------------------------------------------------------
 
 pub fn check_d8(root: &Path, t_clock: OffsetDateTime, visibility: Visibility) -> Vec<Finding> {
+    if root.to_str().is_none() {
+        return vec![Finding {
+            detector: "D8".into(),
+            channel: "non_utf8_root".into(),
+            path: ".".into(),
+            visibility,
+            severity: Severity::Gate,
+            confidence: 1.0,
+            hunk: None,
+            evidence: vec!["root directory path is not valid UTF-8".into()],
+        }];
+    }
     let mut findings = Vec::new();
     check_os_release(root, t_clock, visibility, &mut findings);
     check_tzdata(root, t_clock, visibility, &mut findings);
@@ -2205,9 +2217,7 @@ pub fn check_d8(root: &Path, t_clock: OffsetDateTime, visibility: Visibility) ->
     crate::d8_image::check_kernel_images(root, t_clock, visibility, &mut findings);
     findings.extend(crate::d8_image::check_cpu_template(t_clock, visibility));
     for finding in &mut findings {
-        if let Ok(relative) = Path::new(&finding.path).strip_prefix(root) {
-            finding.path = relative.to_string_lossy().into_owned();
-        }
+        finding.path = crate::safe_fs::format_relative_path(Path::new(&finding.path), root);
     }
     findings.sort_by(|a, b| {
         a.path

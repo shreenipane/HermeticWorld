@@ -119,15 +119,19 @@ pub fn generate_sarif_with_options(
             )
         };
 
+        let uri = if f.path.starts_with('/') {
+            ".".to_string()
+        } else {
+            f.path.replace('\\', "/")
+        };
+
         results.push(SarifResult {
             rule_id: f.detector.clone(),
             level: level.to_string(),
             message: SarifMessage { text: msg_text },
             locations: vec![SarifLocation {
                 physical_location: SarifPhysicalLocation {
-                    artifact_location: SarifArtifactLocation {
-                        uri: f.path.clone(),
-                    },
+                    artifact_location: SarifArtifactLocation { uri },
                 },
             }],
         });

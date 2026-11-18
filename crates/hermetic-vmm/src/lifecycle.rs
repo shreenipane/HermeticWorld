@@ -262,6 +262,112 @@ impl<R: Runner> Vmm<R> {
             "resume",
         )
     }
+    pub fn snapshot_create(
+        &mut self,
+        snapshot_path: &str,
+        mem_file_path: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.require(&[State::Paused])?;
+        if !crate::spec::absolute_path(snapshot_path) || !crate::spec::absolute_path(mem_file_path)
+        {
+            return Err(Error::Validation("snapshot paths must be absolute"));
+        }
+        let mem_bytes = u64::from(self.spec.spec().memory_mib) * 1024 * 1024;
+        if mem_bytes > self.spec.spec().limits.file_size_bytes {
+            return Err(Error::Validation(
+                "snapshot memory file exceeds file size limit",
+            ));
+        }
+        let end = deadline(timeout)?;
+        let socket = self.jail.as_ref().ok_or(Error::State)?.api_socket();
+        let body = json!({
+            "snapshot_type": "Full",
+            "snapshot_path": snapshot_path,
+            "mem_file_path": mem_file_path,
+        });
+        match self
+            .runner
+            .request(
+                &socket,
+                &ApiRequest::new("PUT", "/snapshot/create", body),
+                end,
+            )
+            .and_then(|()| remaining(end, "snapshot_create").map(|_| ()))
+        {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.failure("snapshot_create")),
+        }
+    }
+    pub fn snapshot_load(
+        &mut self,
+        snapshot_path: &str,
+        mem_file_path: &str,
+        resume: bool,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.require(&[State::Starting])?;
+        if !crate::spec::absolute_path(snapshot_path) || !crate::spec::absolute_path(mem_file_path)
+        {
+            return Err(Error::Validation("snapshot paths must be absolute"));
+        }
+        let end = deadline(timeout)?;
+        let socket = self.jail.as_ref().ok_or(Error::State)?.api_socket();
+        let ready_result: Result<()> = (|| {
+            loop {
+                let call_end = Instant::now()
+                    .checked_add(Duration::from_millis(100))
+                    .ok_or(Error::Io)?
+                    .min(end);
+                match self.runner.request(
+                    &socket,
+                    &ApiRequest::new("GET", "/", json!({})),
+                    call_end,
+                ) {
+                    Ok(()) => break,
+                    Err(Error::Io | Error::Deadline(_)) => {
+                        std::thread::sleep(remaining(end, "wait-ready")?.min(READY_RETRY))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        if ready_result.is_err() {
+            return Err(self.failure("snapshot_load"));
+        }
+        let body = json!({
+            "snapshot_path": snapshot_path,
+            "mem_file_path": mem_file_path,
+            "enable_diff_snapshots": false,
+            "resume_vm": resume,
+        });
+        match self
+            .runner
+            .request(
+                &socket,
+                &ApiRequest::new("PUT", "/snapshot/load", body),
+                end,
+            )
+            .and_then(|()| remaining(end, "snapshot_load").map(|_| ()))
+        {
+            Ok(()) => {
+                self.state = if resume {
+                    State::Running
+                } else {
+                    State::Paused
+                };
+                let s = self.spec.spec();
+                self.boot_record = Some(BootRecord {
+                    vm_id: s.id.clone(),
+                    boot_path: "snapshot_restore",
+                    initrd_sha256: None,
+                });
+                Ok(())
+            }
+            Err(_) => Err(self.failure("snapshot_load")),
+        }
+    }
     pub fn stop(&mut self, timeout: Duration) -> Result<()> {
         self.require(&[State::Starting, State::Running, State::Paused])?;
         let end = deadline(timeout)?;

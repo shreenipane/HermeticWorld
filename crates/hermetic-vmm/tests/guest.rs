@@ -1645,3 +1645,102 @@ fn escape_smoke_aggregates_exact_output_and_rejects_transport_and_verdict_failur
         )));
     }
 }
+
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and execd rootfs; see README"]
+fn boots_multivcpu_guest_and_checks_clock() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        if let Some(mut f) = environment() {
+            f.spec.vcpus = 2;
+            let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+            boot(f, runner);
+        }
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
+    }
+}
+
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and execd rootfs; see README"]
+fn pauses_resumes_and_snapshots_guest_under_clock_hiding() {
+    #[cfg(feature = "dev-unjailed")]
+    {
+        if let Some(mut f) = environment() {
+            // The memory file of a full snapshot is the guest's whole memory;
+            // the process file-size limit must admit it.
+            let memory = u64::from(f.spec.memory_mib) * 1024 * 1024;
+            f.spec.limits.file_size_bytes = f.spec.limits.file_size_bytes.max(memory);
+            let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&f)).unwrap();
+            let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+            vm.prepare(Duration::from_secs(120)).unwrap();
+            vm.start(Duration::from_secs(10)).unwrap();
+            vm.wait_ready(Duration::from_secs(30)).unwrap();
+            let end = deadline(Duration::from_secs(30)).unwrap();
+            let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+            let s0 = loop {
+                match guest_status(&socket, end) {
+                    Ok(s) => break s,
+                    Err(Error::Io) => {
+                        assert!(Instant::now() < end, "execd readiness deadline");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("execd status failed: {e}"),
+                }
+            };
+            assert!(s0.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+
+            // Pause the guest
+            vm.pause(Duration::from_secs(5)).unwrap();
+            assert_eq!(vm.state(), hermetic_vmm::State::Paused);
+
+            // Snapshot while paused
+            let snap_state = format!("{}/snap.state", f.temp.path().display());
+            let snap_mem = format!("{}/snap.mem", f.temp.path().display());
+            vm.snapshot_create(&snap_state, &snap_mem, Duration::from_secs(15))
+                .unwrap();
+
+            // Resume the guest
+            vm.resume(Duration::from_secs(5)).unwrap();
+            assert_eq!(vm.state(), hermetic_vmm::State::Running);
+
+            // Verify status after resume: must still be bounded and monotonic
+            let s1 = guest_status(&socket, end).unwrap();
+            assert!(s1.guest_time_unix >= s0.guest_time_unix);
+            assert!(s1.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+
+            vm.stop(Duration::from_secs(2)).unwrap();
+            vm.destroy(Duration::from_secs(10)).unwrap();
+        }
+    }
+    #[cfg(not(feature = "dev-unjailed"))]
+    {
+        eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
+    }
+}
+
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and execd rootfs; see README"]
+fn measures_guest_tsc_drift_without_kvmclock() {
+    // A valid measurement needs guest-side TSC readings taken through execd
+    // and compared against host elapsed time over a long interval. Deriving
+    // ticks from the guest's one-second wall clock (an earlier version) does
+    // not measure TSC drift, so this run fails rather than pass on such data.
+    panic!("nested TSC drift measurement is not implemented: it needs guest-side TSC readings");
+}
+
+#[test]
+fn audits_deployment_host_configuration() {
+    match hermetic_vmm::host_audit::audit_host_live() {
+        Ok(report) => {
+            assert!(report.all_ok);
+            assert!(report.vendor_ok);
+            assert!(report.invariant_tsc_ok);
+        }
+        Err(e) => {
+            eprintln!("live host audit skipped or failed closed: {e}");
+        }
+    }
+}

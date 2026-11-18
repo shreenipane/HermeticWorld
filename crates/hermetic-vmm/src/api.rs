@@ -160,6 +160,33 @@ fn valid_body(req: &ApiRequest) -> bool {
                     Some("Paused" | "Resumed")
                 )
         }
+        ("PUT", "/snapshot/create") => {
+            fields(b, &["snapshot_type", "snapshot_path", "mem_file_path"])
+                && matches!(
+                    b.get("snapshot_type").and_then(|v| v.as_str()),
+                    Some("Full" | "Diff")
+                )
+                && path("snapshot_path")
+                && path("mem_file_path")
+        }
+        ("PUT", "/snapshot/load") => {
+            let has_required = path("snapshot_path") && path("mem_file_path");
+            let fields_ok = fields(b, &["snapshot_path", "mem_file_path"])
+                || fields(
+                    b,
+                    &[
+                        "snapshot_path",
+                        "mem_file_path",
+                        "enable_diff_snapshots",
+                        "resume_vm",
+                    ],
+                );
+            has_required
+                && fields_ok
+                && b.get("enable_diff_snapshots")
+                    .is_none_or(|v| v.is_boolean())
+                && b.get("resume_vm").is_none_or(|v| v.is_boolean())
+        }
         (method, p) if p.starts_with("/drives/") => {
             let names: &[&str] = if method == "PUT" {
                 &["drive_id", "path_on_host", "is_root_device", "is_read_only"]
@@ -205,6 +232,8 @@ fn request_bytes(req: &ApiRequest) -> Result<Vec<u8>> {
                     | "/vsock"
                     | "/entropy"
                     | "/actions"
+                    | "/snapshot/create"
+                    | "/snapshot/load"
             ) || req
                 .path
                 .strip_prefix("/drives/")
@@ -252,6 +281,10 @@ fn request_bytes(req: &ApiRequest) -> Result<Vec<u8>> {
     .into_bytes();
     data.extend(body);
     Ok(data)
+}
+/// Validate request path, body shape, and size limits before sending.
+pub fn validate_request(req: &ApiRequest) -> Result<()> {
+    request_bytes(req).map(|_| ())
 }
 pub fn call(path: &str, req: &ApiRequest, end: Instant) -> Result<Response> {
     // Validate before even opening a socket.
