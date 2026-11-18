@@ -29,6 +29,34 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 
 ---
 
+## 2026-11-18: Web archive imports (Phase 4)
+
+- **Phase:** 4
+- **Type:** build | test
+- **Requirements:** TR-WS-3, architecture §4, §6.5
+
+### Done
+- Implemented offline web archive importers in `python/hermetic_archive/importers.py` for Common Crawl WARC/CDX, Wayback CDX captures, Software Heritage snapshots, and Stack Exchange data dumps rebuilt from post history.
+- Each importer produces exact-capture records for the existing replay archive (`hermetic-replay-recipe/v1`) and BM25 search index (`hermetic-search-recipe/v1`), with content-addressed blobs.
+- Enforced strict cutoff boundary: only captures dated at or before the cutoff are admitted; anything undated is listed in an uncertainty inventory, never guessed.
+- Stack Exchange post-history reconstruction (§4 mutable content rule): post-cutoff edits are rolled back to pre-cutoff revisions, post-cutoff creations are excluded, and deleted/undeleted post states are tracked chronologically up to the cutoff.
+- Added bounded parsers for WARC (1.0 and 1.1, uncompressed and multi-member gzip streams with decompression bomb limits), CDX/CDXJ, Wayback JSON API, Software Heritage snapshot JSON, and streaming XML for Stack Exchange data dumps.
+- CLI interfaces in `python/hermetic_archive/__main__.py` with descriptor-pinned 0600 file and 0700 directory outputs.
+- Added integration smoke script `scripts/integration/web-imports-smoke.sh` taking `HERMETIC_FC_BIN`, `HERMETIC_FIRECRACKER_LOCK`, `HERMETIC_KERNEL` with `readlink -f`, `umask 022`, and work dir via `scripts/integration/smoke_work.py`.
+- Added tests in `python/tests/test_archive_importers.py`, `python/tests/test_web_imports_smoke.py`, and `crates/hermetic-world-server/tests/test_web_imports_smoke.rs`.
+
+### Results / measurements
+- Full Rust gate (`~/.hermetic/bin/rust-gate`): exit 0.
+- Full Python gate (`~/.hermetic/bin/py-gate`): 3336 passed, 22 skipped, 13 warnings in 196s, exit 0.
+- All 18 Tantivy BM25 search and replay tests in `hermetic-world-server` pass.
+- Clean skipping verified when KVM environment variables are unset.
+
+### Decisions
+- Rebuilt Stack Exchange posts generate canonical URLs based on site URL and post ID (`questions/{id}` or `a/{id}`) and extract title and plain text for the BM25 search corpus.
+- Archive importers partition replay blobs (`to_replay_blobs_dict`) and search text blobs (`to_search_blobs_dict`) to guarantee inventory matching with `build_replay_index` and `build_search_index`.
+
+---
+
 ## 2026-11-18: Gateway Chat Completions adapter (Phase 4)
 
 - **Phase:** 4
