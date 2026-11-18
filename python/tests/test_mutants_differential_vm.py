@@ -34,6 +34,16 @@ def test_differential_runs_in_grader_vms() -> None:
     plan = build_plan([nodeid("test_add"), nodeid("test_add_neg")], [nodeid("test_double")],
                       sel.mutated_tests, sel.compared_tests)
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/")}
+    for key in (
+        "HERMETIC_FC_BIN",
+        "HERMETIC_KERNEL",
+        "HERMETIC_FIRECRACKER_LOCK",
+        "HERMETIC_DIFFERENTIAL_VM_EXPECT",
+        "CARGO_TARGET_DIR",
+        "HERMETIC_VENV",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
     runner = CommandRunner((RUNNER,), timeout_s=900, env=env)
     verdict = run_differential(reqs, plan, runner, timeout_s=1200)
     assert verdict.status == os.environ.get("HERMETIC_DIFFERENTIAL_VM_EXPECT", "resolved"), (

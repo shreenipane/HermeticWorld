@@ -1,5 +1,14 @@
 """Hermetic mutants package: test-variant generation by syntax-tree rewriting."""
 
+from hermetic_mutants.grader_runner import (
+    GraderRunnerError,
+    GraderValidationRunner,
+    ValidationPipelineResult,
+    record_base_tree_in_repo,
+    record_base_tree_with_cmd,
+    run_e4_oracle,
+    run_validation_pipeline,
+)
 from hermetic_mutants.pool import Pool, Variant, VariantPair, build_pool
 from hermetic_mutants.rewrite import (
     AssertionSite,
@@ -51,6 +60,8 @@ __all__ = [
     "find_assertion_sites",
     "find_test_functions",
     "get_renamable_locals",
+    "GraderRunnerError",
+    "GraderValidationRunner",
     "is_side_effect_free",
     "module_level_names",
     "mutate_literal_value",
@@ -58,5 +69,10 @@ __all__ = [
     "parse_test_file",
     "parse_test_source",
     "read_test_file",
+    "record_base_tree_in_repo",
+    "record_base_tree_with_cmd",
+    "run_e4_oracle",
+    "run_validation_pipeline",
     "uses_dynamic_scope",
+    "ValidationPipelineResult",
 ]

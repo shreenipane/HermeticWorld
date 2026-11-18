@@ -610,6 +610,26 @@ pub fn run_evaluation_with_log<I: Infra, C: Clock>(
                         );
                         grader_failed = true;
                     }
+                    (expected, GraderPayload::Base(_)) => {
+                        tracker.record_infra_err(
+                            step,
+                            &InfraError::GraderPayloadMismatch {
+                                expected,
+                                actual: GraderRun::Base,
+                            },
+                        );
+                        grader_failed = true;
+                    }
+                    (expected, GraderPayload::Gold(_)) => {
+                        tracker.record_infra_err(
+                            step,
+                            &InfraError::GraderPayloadMismatch {
+                                expected,
+                                actual: GraderRun::Gold,
+                            },
+                        );
+                        grader_failed = true;
+                    }
                 }
             }
             Err(err) => {
@@ -673,6 +693,26 @@ pub fn run_evaluation_with_log<I: Infra, C: Clock>(
                         );
                         return tracker.finalize(None);
                     }
+                    GraderPayload::Base(_) => {
+                        tracker.record_infra_err(
+                            step,
+                            &InfraError::GraderPayloadMismatch {
+                                expected: GraderRun::R3,
+                                actual: GraderRun::Base,
+                            },
+                        );
+                        return tracker.finalize(None);
+                    }
+                    GraderPayload::Gold(_) => {
+                        tracker.record_infra_err(
+                            step,
+                            &InfraError::GraderPayloadMismatch {
+                                expected: GraderRun::R3,
+                                actual: GraderRun::Gold,
+                            },
+                        );
+                        return tracker.finalize(None);
+                    }
                 }
             }
             Err(err) => {
@@ -717,4 +757,27 @@ pub fn run_evaluation<I: Infra, C: Clock>(
 ) -> RunSummary {
     let cleanup_log = CleanupLog::new();
     run_evaluation_with_log(infra, clock, config, &cleanup_log)
+}
+
+/// Runs a GraderVM for validation on either the base tree or gold tree.
+pub fn run_validation_grader<I: Infra, C: Clock>(
+    infra: &mut I,
+    clock: &C,
+    world: &PreparedWorld,
+    run: GraderRun,
+    extracted: &ExtractorOutcome,
+    deadlines: &DeadlineSchedule,
+) -> Result<GraderOutcome, InfraError> {
+    if !matches!(run, GraderRun::Base | GraderRun::Gold) {
+        return Err(InfraError::BackendFailure {
+            step: Step::RunGrader(run),
+            detail: "run_validation_grader requires GraderRun::Base or GraderRun::Gold".to_string(),
+        });
+    }
+    let step = Step::RunGrader(run);
+    let dl = deadlines.deadline_for(step, clock.now_ms());
+    check_deadline(clock, step, &dl)?;
+    let outcome = infra.run_grader(run, world, extracted, &dl)?;
+    check_deadline(clock, step, &dl)?;
+    Ok(outcome)
 }

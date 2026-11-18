@@ -1,7 +1,7 @@
 import json
 import os
 import stat
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Set, Tuple
 
 MAX_RUN_FILE_BYTES = 16 * 1024 * 1024
 MAX_LIST_FILE_BYTES = 4 * 1024 * 1024
@@ -314,3 +314,57 @@ def run_oracle_from_paths(
     f2p_json = load_json_bounded(f2p_raw, MAX_LIST_FILE_BYTES)
     p2p_json = load_json_bounded(p2p_raw, MAX_LIST_FILE_BYTES)
     return analyse_oracle_runs(run_objs, f2p_json, p2p_json, max_bad_f2p_permille)
+
+
+def run_oracle_with_runner(
+    runner: Callable[[str, str], Mapping[str, str]],
+    test_text: str,
+    f2p: Sequence[str],
+    p2p: Sequence[str],
+    *,
+    repeats: int = RUNS_PER_TREE,
+    max_bad_f2p_permille: int = DEFAULT_MAX_BAD_F2P_PERMILLE,
+) -> Dict[str, Any]:
+    """Run E4 oracle validation using an injected test runner.
+
+    The runner is invoked as ``runner(tree, test_text)`` for tree in ("base", "gold"),
+    exactly ``repeats`` times each (default 3, giving 6 total runs).
+    Returns the E4 analysis dictionary, or raises OracleError on invalid inputs or
+    runner failure.
+    """
+    if not callable(runner):
+        raise OracleError("runner must be callable")
+    if not isinstance(test_text, str) or len(test_text.encode("utf-8", "replace")) > MAX_RUN_FILE_BYTES:
+        raise OracleError("test_text must be a string within length bounds")
+    if "\x00" in test_text:
+        raise OracleError("test_text must not contain NUL")
+    if not isinstance(f2p, (list, tuple)) or not isinstance(p2p, (list, tuple)):
+        raise OracleError("f2p and p2p must be sequences")
+    if repeats != RUNS_PER_TREE:
+        raise OracleError(f"repeats must be {RUNS_PER_TREE}")
+
+    run_objs: List[Dict[str, Any]] = []
+    for tree in VALID_TREES:
+        for run_no in range(1, repeats + 1):
+            try:
+                raw_res = runner(tree, test_text)
+            except Exception as exc:
+                raise OracleError(f"runner error on tree '{tree}' run {run_no}") from exc
+            if not isinstance(raw_res, Mapping) or len(raw_res) > MAX_TESTS_PER_RUN:
+                raise OracleError(f"runner returned invalid results map on tree '{tree}' run {run_no}")
+            cleaned: Dict[str, str] = {}
+            for tid, outcome in raw_res.items():
+                if (
+                    not isinstance(tid, str)
+                    or not tid
+                    or len(tid) > MAX_NODE_ID_LEN
+                    or "\x00" in tid
+                ):
+                    raise OracleError(f"invalid test node id in runner results: {tid!r}")
+                if outcome not in VALID_OUTCOMES:
+                    raise OracleError(f"invalid outcome '{outcome}' in runner results")
+                cleaned[tid] = outcome
+            run_objs.append({"tree": tree, "run": run_no, "results": cleaned})
+
+    return analyse_oracle_runs(run_objs, list(f2p), list(p2p), max_bad_f2p_permille=max_bad_f2p_permille)
+

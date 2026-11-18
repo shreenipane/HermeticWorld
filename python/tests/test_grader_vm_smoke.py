@@ -29,6 +29,7 @@ def smoke_environment(tmp_path):
     shutil.copytree(ROOT / "scripts/integration/fixtures/grader-task", fixture)
     shutil.copyfile(SCRIPT, top / "scripts/integration/grader-vm-smoke.sh")
     shutil.copyfile(SCRIPT.with_name("grader-smoke.sh"), top / "scripts/integration/grader-smoke.sh")
+    shutil.copyfile(SCRIPT.with_name("grader-vm-runner.sh"), top / "scripts/integration/grader-vm-runner.sh")
     shutil.copyfile(SCRIPT.with_name("smoke_work.py"), top / "scripts/integration/smoke_work.py")
     python = top / "python"
     python.mkdir()
@@ -252,3 +253,160 @@ def test_vm_timeout_keeps_console_diagnostics_in_smoke_output(tmp_path, smoke_en
     assert "grader timeout: serial: tsc: Unable to calibrate against PIT" in result.stdout
     assert "grader timeout: stderr: VMM failure" in result.stdout
     assert "grader VM smoke: ok" not in result.stdout
+
+
+def test_runner_command_three_arguments_runs_single_microvm(tmp_path, smoke_environment):
+    test_file = tmp_path / "test_calc.py"
+    test_file.write_text("def test_add():\n    assert 2 + 2 == 4\n")
+    out_disk = tmp_path / "result.img"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "R0", str(test_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert out_disk.is_file()
+    assert out_disk.stat().st_size == 1048576
+    assert stat.S_IMODE(out_disk.stat().st_mode) == 0o600
+
+
+def test_runner_command_via_wrapper_script(tmp_path, smoke_environment):
+    runner_script = tmp_path / "repo/scripts/integration/grader-vm-runner.sh"
+    test_file = tmp_path / "test_calc.py"
+    test_file.write_text("def test_add():\n    assert 2 + 2 == 4\n")
+    out_disk = tmp_path / "result_wrapper.img"
+    result = subprocess.run(
+        ["bash", str(runner_script), "R0", str(test_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert out_disk.is_file()
+    assert out_disk.stat().st_size == 1048576
+
+
+def test_runner_command_rejects_symlink_test_file(tmp_path, smoke_environment):
+    actual_file = tmp_path / "actual.py"
+    actual_file.write_text("def test_add():\n    assert 2 + 2 == 4\n")
+    symlink_file = tmp_path / "symlink.py"
+    symlink_file.symlink_to(actual_file)
+    out_disk = tmp_path / "result_sym.img"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "R0", str(symlink_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "test_file must be an existing regular non-symlink file" in result.stderr
+
+
+def test_runner_command_rejects_invalid_run_id(tmp_path, smoke_environment):
+    test_file = tmp_path / "test_calc.py"
+    test_file.write_text("def test_add():\n    assert 2 + 2 == 4\n")
+    out_disk = tmp_path / "result_invalid.img"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "invalid_run_id", str(test_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 2
+    assert "invalid run_id: invalid_run_id" in result.stderr
+
+
+def test_symlink_env_vars_resolved_cleanly(tmp_path, smoke_environment):
+    real_fc = tmp_path / "real_fc"
+    real_fc.touch()
+    sym_fc = tmp_path / "sym_fc"
+    sym_fc.symlink_to(real_fc)
+    smoke_environment["HERMETIC_FC_BIN"] = str(sym_fc)
+
+    real_kernel = tmp_path / "real_kernel"
+    real_kernel.touch()
+    sym_kernel = tmp_path / "sym_kernel"
+    sym_kernel.symlink_to(real_kernel)
+    smoke_environment["HERMETIC_KERNEL"] = str(sym_kernel)
+
+    work = tmp_path / "work"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(work)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_runner_command_includes_class_method_test_ids(tmp_path, smoke_environment):
+    commands = Path(smoke_environment["PATH"].split(os.pathsep)[0])
+    cargo = commands / "cargo"
+    original = commands / "cargo-builder"
+    cargo.rename(original)
+    captured_json = tmp_path / "captured_run.json"
+    executable(
+        cargo,
+        "import os, sys\nfrom pathlib import Path\n"
+        "if 'boots_grader_and_collects_result_drive' not in sys.argv:\n"
+        f"    os.execv({str(original)!r}, [{str(original)!r}, *sys.argv[1:]])\n"
+        "rootfs = Path(os.environ['HERMETIC_GRADER_ROOTFS'])\n"
+        f"Path({str(captured_json)!r}).write_bytes(rootfs.with_suffix('.run.json').read_bytes())\n"
+        "result = Path(os.environ['HERMETIC_GRADER_RESULT_OUT'])\n"
+        "result.write_bytes(bytes(1048576))\n"
+        "print('test result: ok')\n"
+        "sys.exit(0)\n",
+    )
+    test_file = tmp_path / "test_calc.py"
+    test_file.write_text(
+        "def test_add():\n    assert 2 + 2 == 4\n\n"
+        "class TestCalc:\n    def test_double(self):\n        assert 2 * 2 == 4\n"
+    )
+    out_disk = tmp_path / "result.img"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "R0", str(test_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    captured = json.loads(captured_json.read_text())
+    assert "tests/test_calc.py::TestCalc::test_double" in captured["expected_test_ids"]
+
+
+def test_container_cleaned_up_when_docker_export_fails(tmp_path, smoke_environment):
+    commands = Path(smoke_environment["PATH"].split(os.pathsep)[0])
+    docker_log = tmp_path / "docker.log"
+    executable(
+        commands / "docker",
+        "import sys\n"
+        f"log = open({str(docker_log)!r}, 'a')\n"
+        "log.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "log.close()\n"
+        "if sys.argv[1] == 'create':\n"
+        "    print('cid-test-1234')\n"
+        "elif sys.argv[1] == 'export':\n"
+        "    sys.exit(1)\n"
+        "elif sys.argv[1] in ('rm', '-f'):\n"
+        "    sys.exit(0)\n",
+    )
+    test_file = tmp_path / "test_calc.py"
+    test_file.write_text("def test_add():\n    assert 2 + 2 == 4\n")
+    out_disk = tmp_path / "result.img"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "R0", str(test_file), str(out_disk)],
+        env=smoke_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    lines = docker_log.read_text().splitlines()
+    assert any("rm" in line and "cid-test-1234" in line for line in lines)

@@ -19,6 +19,8 @@ pub enum GraderRun {
     R1,
     R2,
     R3,
+    Base,
+    Gold,
 }
 
 impl GraderRun {
@@ -28,6 +30,8 @@ impl GraderRun {
             GraderRun::R1 => "R1",
             GraderRun::R2 => "R2",
             GraderRun::R3 => "R3",
+            GraderRun::Base => "base",
+            GraderRun::Gold => "gold",
         }
     }
 }
@@ -70,6 +74,8 @@ impl Step {
             Step::RunGrader(GraderRun::R1) => "run_grader_r1",
             Step::RunGrader(GraderRun::R2) => "run_grader_r2",
             Step::RunGrader(GraderRun::R3) => "run_grader_r3",
+            Step::RunGrader(GraderRun::Base) => "run_grader_base",
+            Step::RunGrader(GraderRun::Gold) => "run_grader_gold",
         }
     }
 }
@@ -116,6 +122,8 @@ pub struct DeadlineSchedule {
     pub run_grader_r1: (String, u64),
     pub run_grader_r2: (String, u64),
     pub run_grader_r3: (String, u64),
+    pub run_grader_base: (String, u64),
+    pub run_grader_gold: (String, u64),
 }
 
 impl Default for DeadlineSchedule {
@@ -134,6 +142,8 @@ impl Default for DeadlineSchedule {
             run_grader_r1: ("run_grader_r1_deadline".to_string(), 60_000),
             run_grader_r2: ("run_grader_r2_deadline".to_string(), 60_000),
             run_grader_r3: ("run_grader_r3_deadline".to_string(), 60_000),
+            run_grader_base: ("run_grader_base_deadline".to_string(), 60_000),
+            run_grader_gold: ("run_grader_gold_deadline".to_string(), 60_000),
         }
     }
 }
@@ -154,6 +164,8 @@ impl DeadlineSchedule {
             Step::RunGrader(GraderRun::R1) => &self.run_grader_r1,
             Step::RunGrader(GraderRun::R2) => &self.run_grader_r2,
             Step::RunGrader(GraderRun::R3) => &self.run_grader_r3,
+            Step::RunGrader(GraderRun::Base) => &self.run_grader_base,
+            Step::RunGrader(GraderRun::Gold) => &self.run_grader_gold,
         };
         NamedDeadline::new(name.clone(), now_ms.saturating_add(*budget))
     }
@@ -174,6 +186,8 @@ impl DeadlineSchedule {
             Step::RunGrader(GraderRun::R1) => self.run_grader_r1 = entry,
             Step::RunGrader(GraderRun::R2) => self.run_grader_r2 = entry,
             Step::RunGrader(GraderRun::R3) => self.run_grader_r3 = entry,
+            Step::RunGrader(GraderRun::Base) => self.run_grader_base = entry,
+            Step::RunGrader(GraderRun::Gold) => self.run_grader_gold = entry,
         }
     }
 }
@@ -302,6 +316,8 @@ pub enum GraderPayload {
     R1(R1Result),
     R2(R2Result),
     R3(R3Result),
+    Base(R0Result),
+    Gold(R0Result),
 }
 
 /// Output from `run_grader` / `finish_grader`.

@@ -6,11 +6,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use hermetic_run::{
     run_evaluation, run_evaluation_with_log, verdict, AgentMode, AgentOutcome, CleanupLog, Clock,
-    ExtractorOutcome, GraderHandle, GraderOutcome, GraderPayload, GraderResults, GraderRun, Infra,
-    InfraError, LimitKind, MutatedTestResult, NamedDeadline, PairedTestResult, PreparedWorld,
-    R0Result, R1Result, R2Result, R3Result, RunConfig, RunState, RunStatus, ShutdownKind,
-    StateMachine, Step, StepOutcome, TestResult, TransitionError, Verdict, VmGuard, VmHandle, VmId,
-    VmKind, WorldSpec,
+    DeadlineSchedule, ExtractorOutcome, GraderHandle, GraderOutcome, GraderPayload, GraderResults,
+    GraderRun, Infra, InfraError, LimitKind, MutatedTestResult, NamedDeadline, PairedTestResult,
+    PreparedWorld, R0Result, R1Result, R2Result, R3Result, RunConfig, RunState, RunStatus,
+    ShutdownKind, StateMachine, Step, StepOutcome, TestResult, TransitionError, Verdict, VmGuard,
+    VmHandle, VmId, VmKind, WorldSpec,
 };
 use serde_json::Value;
 
@@ -278,6 +278,8 @@ impl Infra for FakeInfra<'_> {
             GraderRun::R1 => GraderPayload::R1(self.grader_results.r1.clone()),
             GraderRun::R2 => GraderPayload::R2(self.grader_results.r2.clone()),
             GraderRun::R3 => GraderPayload::R3(self.grader_results.r3.clone().unwrap_or_default()),
+            GraderRun::Base => GraderPayload::Base(self.grader_results.r0.clone()),
+            GraderRun::Gold => GraderPayload::Gold(self.grader_results.r0.clone()),
         };
 
         Ok(GraderOutcome {
@@ -1068,4 +1070,124 @@ fn regression_r0_without_required_tests_is_unresolved_not_resolved() {
         hermetic_run::resolve_status(false, false, false, Some(&only_optional)),
         RunStatus::Unresolved
     );
+}
+
+#[test]
+fn test_validation_grader_base_and_gold_execution() {
+    let clock = FakeClock::new(100);
+    let mut infra = FakeInfra::new(&clock);
+    let world = PreparedWorld {
+        world_id: "world-test".to_string(),
+        image_digest: "digest:test".to_string(),
+    };
+    let extracted = ExtractorOutcome {
+        patch_digest: "sha256:123".to_string(),
+        tamper_evidence: None,
+    };
+    let deadlines = DeadlineSchedule::default();
+
+    // Run base
+    let base_res = hermetic_run::run_validation_grader(
+        &mut infra,
+        &clock,
+        &world,
+        GraderRun::Base,
+        &extracted,
+        &deadlines,
+    )
+    .expect("base grader should succeed");
+    assert_eq!(base_res.run, GraderRun::Base);
+    match base_res.payload {
+        GraderPayload::Base(r) => assert_eq!(r.tests.len(), 2),
+        other => panic!("expected GraderPayload::Base, got {:?}", other),
+    }
+
+    // Run gold
+    let gold_res = hermetic_run::run_validation_grader(
+        &mut infra,
+        &clock,
+        &world,
+        GraderRun::Gold,
+        &extracted,
+        &deadlines,
+    )
+    .expect("gold grader should succeed");
+    assert_eq!(gold_res.run, GraderRun::Gold);
+    match gold_res.payload {
+        GraderPayload::Gold(r) => assert_eq!(r.tests.len(), 2),
+        other => panic!("expected GraderPayload::Gold, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_validation_grader_rejects_non_validation_run() {
+    let clock = FakeClock::new(100);
+    let mut infra = FakeInfra::new(&clock);
+    let world = PreparedWorld {
+        world_id: "world-test".to_string(),
+        image_digest: "digest:test".to_string(),
+    };
+    let extracted = ExtractorOutcome {
+        patch_digest: "sha256:123".to_string(),
+        tamper_evidence: None,
+    };
+    let deadlines = DeadlineSchedule::default();
+
+    let err = hermetic_run::run_validation_grader(
+        &mut infra,
+        &clock,
+        &world,
+        GraderRun::R0,
+        &extracted,
+        &deadlines,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires GraderRun::Base or GraderRun::Gold"),
+        "error was: {}",
+        err
+    );
+}
+
+#[test]
+fn test_validation_grader_deadline_exceeded() {
+    let clock = FakeClock::new(100);
+    let mut infra = FakeInfra::new(&clock);
+    infra.step_advance_ms = 50;
+    let world = PreparedWorld {
+        world_id: "world-test".to_string(),
+        image_digest: "digest:test".to_string(),
+    };
+    let extracted = ExtractorOutcome {
+        patch_digest: "sha256:123".to_string(),
+        tamper_evidence: None,
+    };
+    let mut deadlines = DeadlineSchedule::default();
+    deadlines.set_step(Step::RunGrader(GraderRun::Base), "base_deadline", 20);
+
+    let err = hermetic_run::run_validation_grader(
+        &mut infra,
+        &clock,
+        &world,
+        GraderRun::Base,
+        &extracted,
+        &deadlines,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, InfraError::DeadlineExceeded { .. }),
+        "expected DeadlineExceeded, got {:?}",
+        err
+    );
+}
+
+#[test]
+fn test_grader_run_base_and_gold_serialization_and_display() {
+    assert_eq!(GraderRun::Base.as_str(), "base");
+    assert_eq!(GraderRun::Gold.as_str(), "gold");
+    assert_eq!(format!("{}", GraderRun::Base), "base");
+    assert_eq!(format!("{}", GraderRun::Gold), "gold");
+    assert_eq!(Step::RunGrader(GraderRun::Base).as_str(), "run_grader_base");
+    assert_eq!(Step::RunGrader(GraderRun::Gold).as_str(), "run_grader_gold");
 }
