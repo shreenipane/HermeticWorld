@@ -63,6 +63,7 @@ pub struct ScanOptions {
     pub target_packages: Vec<String>,
     pub task_version: Option<String>,
     pub undated: bool,
+    pub exemptions: std::sync::Arc<crate::exemptions::ExemptionMap>,
 }
 
 impl Default for ScanOptions {
@@ -86,6 +87,7 @@ impl Default for ScanOptions {
             target_packages: Vec::new(),
             task_version: None,
             undated: false,
+            exemptions: std::sync::Arc::new(crate::exemptions::ExemptionMap::default()),
         }
     }
 }
@@ -703,7 +705,117 @@ pub fn scan_tree(root: &Path, fp: &FingerprintSet, opts: &ScanOptions) -> Vec<Fi
     };
     let mut findings = walk_tree(root, opts, sink).inner.findings;
     relative_d4_paths(&mut findings, root);
+    if !opts.exemptions.is_empty() {
+        filter_exempt_d4(&mut findings, root, &opts.exemptions);
+    }
     findings
+}
+
+fn check_archive_member(archive_path: &Path, member_name: &str, expected_sha256: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let path_str = archive_path.to_string_lossy();
+    if path_str.ends_with(".zip") || path_str.ends_with(".whl") || path_str.ends_with(".jar") {
+        let file = match crate::safe_fs::open_regular(archive_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut zip = match zip::ZipArchive::new(file) {
+            Ok(z) => z,
+            Err(_) => return false,
+        };
+        let member = match zip.by_name(member_name) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if member.size() > crate::exemptions::MAX_VERIFY_FILE_BYTES {
+            return false;
+        }
+        let mut bytes = Vec::new();
+        if member
+            .take(crate::exemptions::MAX_VERIFY_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > crate::exemptions::MAX_VERIFY_FILE_BYTES
+        {
+            return false;
+        }
+        let actual = hex::encode(Sha256::digest(&bytes));
+        actual == expected_sha256
+    } else if path_str.ends_with(".tar")
+        || path_str.ends_with(".tar.gz")
+        || path_str.ends_with(".tgz")
+    {
+        let file = match crate::safe_fs::open_regular(archive_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut reader: Box<dyn Read> =
+            if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") {
+                Box::new(flate2::read::GzDecoder::new(file))
+            } else {
+                Box::new(file)
+            };
+        let mut archive = tar::Archive::new(&mut reader);
+        let entries = match archive.entries() {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        for (idx, entry_res) in entries.enumerate() {
+            if idx >= crate::exemptions::MAX_ARCHIVE_ENTRIES {
+                return false;
+            }
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if let Ok(entry_path) = entry.path() {
+                if entry_path.to_string_lossy() == member_name {
+                    let mut bytes = Vec::new();
+                    if entry
+                        .take(crate::exemptions::MAX_VERIFY_FILE_BYTES.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                        .is_err()
+                        || bytes.len() as u64 > crate::exemptions::MAX_VERIFY_FILE_BYTES
+                    {
+                        return false;
+                    }
+                    let actual = hex::encode(Sha256::digest(&bytes));
+                    return actual == expected_sha256;
+                }
+            }
+        }
+        false
+    } else {
+        false
+    }
+}
+
+pub(crate) fn filter_exempt_d4(
+    findings: &mut Vec<Finding>,
+    root: &Path,
+    exemptions: &crate::exemptions::ExemptionMap,
+) {
+    findings.retain(|f| {
+        if f.detector != "D4" || f.severity != Severity::Gate {
+            return true;
+        }
+        if let Some(ex) = exemptions.get("D4", &f.path) {
+            if let Some((archive_part, member_part)) = f.path.split_once("!/") {
+                let archive_full = root.join(archive_part);
+                if check_archive_member(&archive_full, member_part, &ex.sha256) {
+                    return false;
+                }
+            } else {
+                let full_path = root.join(&f.path);
+                if exemptions.check_file("D4", &f.path, &full_path) {
+                    return false;
+                }
+            }
+        }
+        true
+    });
 }
 
 pub(crate) fn relative_d4_paths(findings: &mut Vec<Finding>, root: &Path) {

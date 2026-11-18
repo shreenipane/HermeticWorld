@@ -331,5 +331,20 @@ pub fn scan_oci(
         }
     }
 
+    if !opts.exemptions.is_empty() {
+        findings.retain(|f| {
+            if f.detector != "D6" || f.severity != Severity::Gate {
+                return true;
+            }
+            if let Some(_ex) = opts.exemptions.get("D6", &f.path) {
+                let full_path = Path::new(&f.path);
+                if opts.exemptions.check_file("D6", &f.path, full_path) {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
     Ok(findings)
 }

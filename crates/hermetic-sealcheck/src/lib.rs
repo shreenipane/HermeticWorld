@@ -13,6 +13,7 @@ pub mod d6;
 pub mod d8;
 pub mod d8_image;
 pub mod diff;
+pub mod exemptions;
 pub mod ext4;
 pub mod fingerprint;
 pub mod gitstore;
@@ -47,6 +48,10 @@ pub use d6::{parse_oci_date, scan_oci, D6Error};
 pub use d8::check_d8;
 pub use diff::{
     parse_patch, DiffLine, DiffLineType, FilePatch, Hunk, HunkHeader, HunkRange, Patch,
+};
+pub use exemptions::{
+    normalize_exemption_path, validate_exemption, validate_exemption_path, ExemptionError,
+    ExemptionMap, NamedExemption, MAX_EXEMPTIONS, MAX_EXEMPTIONS_BYTES,
 };
 pub use ext4::{scan_ext4_image, scan_ext4_slice, Ext4Error};
 pub use fingerprint::{FingerprintError, FingerprintSet, HunkFingerprints, PycFunctionFingerprint};

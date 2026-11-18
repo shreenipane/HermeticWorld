@@ -40,6 +40,46 @@ def _default_sentinel() -> DateSentinel:
     )
 
 
+def load_run_exemptions(task_dir: Path | str) -> tuple[str, list[str]]:
+    """Derive substrate_at_t and exemption_list from authoritative exemption entries."""
+    task_p = Path(task_dir)
+    exemptions_path = task_p / "seal" / "exemptions.json"
+    if not exemptions_path.exists():
+        exemptions_path = task_p / "exemptions.json"
+    exemption_list: list[str] = []
+    substrate_at_t = "full"
+    if exemptions_path.exists():
+        try:
+            ex_data = json.loads(exemptions_path.read_text(encoding="utf-8"))
+            if isinstance(ex_data, dict):
+                raw_entries = ex_data.get("exemptions")
+                if raw_entries is None and "exemption_list" in ex_data:
+                    raw_entries = ex_data["exemption_list"]
+            elif isinstance(ex_data, list):
+                raw_entries = ex_data
+            else:
+                raise ValueError("invalid exemptions format")
+
+            if raw_entries is None or not isinstance(raw_entries, list):
+                raise ValueError("exemptions entries must be a list")
+
+            paths: list[str] = []
+            for entry in raw_entries:
+                if isinstance(entry, dict) and "path" in entry and isinstance(entry["path"], str):
+                    paths.append(entry["path"])
+                elif isinstance(entry, str):
+                    paths.append(entry)
+                else:
+                    raise ValueError("invalid exemption entry")
+
+            exemption_list = sorted(list(set(paths)))
+            substrate_at_t = "partial" if exemption_list else "full"
+        except Exception:
+            exemption_list = []
+            substrate_at_t = "none"
+    return substrate_at_t, exemption_list
+
+
 def run_task(
     task_dir: Path,
     *,
@@ -106,6 +146,8 @@ def run_task(
         extract: dict[str, Any] | None = None,
         grade: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        substrate_at_t, exemption_list = load_run_exemptions(task_dir)
+
         date_sentinel = merge_summaries([sentinel.summary(), *(extra_sentinel_summaries or [])])
         record: dict[str, Any] = {
             "schema": "hermetic-slice-run/v0-unsigned",
@@ -115,6 +157,8 @@ def run_task(
             "clock": "real",
             "grader_isolation": "clean_container",
             "deployment": "single_host",
+            "substrate_at_t": substrate_at_t,
+            "exemption_list": exemption_list,
             "task": {
                 "t_world": task_json.get("cutoffs", {}).get("t_world") or task_json.get("t_world"),
                 "t_clock": task_json.get("cutoffs", {}).get("t_clock") or task_json.get("t_clock"),
@@ -223,6 +267,8 @@ def run_task(
         # Compute digests
         digests = {
             "seal/report.json": _sha256_of_file(task_dir / "seal" / "report.json"),
+            "seal/exemptions.json": _sha256_of_file(task_dir / "seal" / "exemptions.json") or _sha256_of_file(task_dir / "exemptions.json"),
+            "seal/substrate-inventory.json": _sha256_of_file(task_dir / "seal" / "substrate-inventory.json") or _sha256_of_file(task_dir / "substrate-inventory.json"),
             "index/index-report.json": _sha256_of_file(task_dir / "index" / "index-report.json"),
             "world/probe.json": _sha256_of_file(task_dir / "world" / "probe.json"),
             "trajectory.jsonl": _sha256_of_file(trajectory_path),

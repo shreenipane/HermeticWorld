@@ -503,6 +503,21 @@ def prepare_bundle_evidence(work, instance):
                  "size_bytes": len(task_raw)},
         "test_services": services,
     }
+    if (work / "substrate-inventory.json").exists():
+        inv_raw = read_regular_file_bounded(work / "substrate-inventory.json", MAX_REPORT_BYTES)
+        inv_data = parse_json_bytes(inv_raw, MAX_REPORT_BYTES)
+        evidence["substrate_inventory"] = {
+            "digest": "sha256:" + hashlib.sha256(inv_raw).hexdigest(),
+            "size_bytes": len(inv_raw),
+            "entries_count": len(inv_data.get("entries", [])),
+        }
+    if (work / "exemptions.json").exists():
+        ex_raw = read_regular_file_bounded(work / "exemptions.json", MAX_REPORT_BYTES)
+        ex_data = parse_json_bytes(ex_raw, MAX_REPORT_BYTES)
+        ex_list = ex_data.get("exemption_list", [])
+        evidence["exemption_list"] = ex_list
+        evidence["exemption_list_digest"] = "sha256:" + hashlib.sha256(ex_raw).hexdigest()
+        evidence["substrate_at_t"] = "partial" if ex_list else "full"
     atomic_write(work / "bundle-evidence.json", encoded(evidence))
     return evidence
 
@@ -689,10 +704,31 @@ def run(argv=None):
             raise SealError(f"d7_recipe_{type(exc).__name__}") from exc
         if recipe_data is not None:
             atomic_write(work / "d7-recipe.json", recipe_data)
+
+        # Inventory substrate and generate named exemptions for post-cutoff base environment files
+        ex_path = None
+        if (work / "source-tree").is_dir():
+            from hermetic_slice.substrate import (
+                inventory_substrate,
+                generate_exemptions,
+                write_substrate_outputs,
+            )
+            clock_iso = clock.replace("Z", "+00:00") if clock.endswith("Z") else clock
+            t_clock_dt = datetime.fromisoformat(clock_iso)
+            substrate_inv = inventory_substrate(work / "source-tree")
+            exemptions_doc = generate_exemptions(
+                work / "source-tree",
+                substrate_inv,
+                t_clock_dt,
+                oci_inspect_path=work / "source-inspect.json",
+            )
+            _, ex_path = write_substrate_outputs(work, substrate_inv, exemptions_doc)
+
         scans = [
             ("sealcheck_tiers", [str(work / "sealcheck"), "scan", "--task", str(task_dir),
                                  "--base-tree", str(work / "base-tree"), "--root", str(work / "source-tree"),
-                                 "--oci-inspect", str(work / "source-inspect.json")]),
+                                 "--oci-inspect", str(work / "source-inspect.json"),
+                                 *([ "--exemptions", str(ex_path)] if ex_path else [])]),
             ("D8", [str(work / "sealcheck"), "d8", "--root", str(work / "source-tree"), "--t-clock", clock]),
             ("D10", [sys.executable, "-I", "-B", "-c",
                       "import sys; sys.path.insert(0, sys.argv.pop(1)); from hermetic_d10.__main__ import main; raise SystemExit(main())",
@@ -715,7 +751,7 @@ def run(argv=None):
         # different world. Do not publish a manifest or success in their absence.
         emit(step, "open", reason="package_world_and_trust_evidence_unavailable",
              missing=["canonical_repository_tree_digest", "D5b_inventory_and_release_metadata", "package_closure_and_baseline",
-                      "substrate_inventory_and_exemptions", "installed_world_trust_and_run_spec"],
+                      "installed_world_trust_and_run_spec"],
              detectors={"D7": "not_applicable_without_deep_audit", "D11": "post_run_only",
                         "D12": "requires_runtime_probe"},
              oracle_inputs="prepared_host_only_not_executed")

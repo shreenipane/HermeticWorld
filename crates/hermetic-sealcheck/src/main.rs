@@ -112,6 +112,10 @@ struct QueryArgs {
     /// Baseline byte budget for subtraction
     #[arg(long)]
     baseline_budget: Option<usize>,
+
+    /// Path to optional exemptions JSON file
+    #[arg(long)]
+    exemptions: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +190,10 @@ struct ScanArgs {
     /// Baseline byte budget for subtraction
     #[arg(long)]
     baseline_budget: Option<usize>,
+
+    /// Path to optional exemptions JSON file
+    #[arg(long)]
+    exemptions: Option<PathBuf>,
 }
 
 fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -198,6 +206,12 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
         .into());
     }
+
+    let exemptions = if let Some(ref path) = args.exemptions {
+        std::sync::Arc::new(hermetic_sealcheck::ExemptionMap::load(path)?)
+    } else {
+        std::sync::Arc::new(hermetic_sealcheck::ExemptionMap::empty())
+    };
 
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
@@ -270,6 +284,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 signatures: signatures.clone(),
                 exclude_dirs: canonical_task_dir.iter().cloned().collect(),
                 undated: true,
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             let tree_findings = scan_tree(root, &fp, &opts);
@@ -281,6 +296,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 visibility: Visibility::ImageOnly,
                 signatures: signatures.clone(),
                 undated: true,
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             let oci_findings = hermetic_sealcheck::scan_oci(
@@ -349,6 +365,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 t_clock: Some(task.cutoffs.t_clock),
                 target_packages: target_packages.clone(),
                 task_version: task.version.clone(),
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             let tree_findings = scan_tree(root, &fp, &opts);
@@ -360,6 +377,7 @@ fn run_scan(args: ScanArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 visibility: Visibility::ImageOnly,
                 signatures: signatures.clone(),
                 t_clock: Some(task.cutoffs.t_clock),
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             let oci_findings = hermetic_sealcheck::scan_oci(
@@ -494,6 +512,12 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .into());
     }
 
+    let exemptions = if let Some(ref path) = args.exemptions {
+        std::sync::Arc::new(hermetic_sealcheck::ExemptionMap::load(path)?)
+    } else {
+        std::sync::Arc::new(hermetic_sealcheck::ExemptionMap::empty())
+    };
+
     if args.undated {
         let undated_task = load_undated_task(&args.task)?;
         let mut fp = FingerprintSet::from_files_with_budget(
@@ -574,6 +598,7 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 visibility: vis.into(),
                 exclude_dirs: canonical_task_dir.iter().cloned().collect(),
                 undated: true,
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             all_findings.extend(query_index(index, &fp, &opts)?);
@@ -636,6 +661,7 @@ fn run_query(args: QueryArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 t_clock: Some(task.cutoffs.t_clock),
                 target_packages: target_packages.clone(),
                 task_version: task.version.clone(),
+                exemptions: exemptions.clone(),
                 ..Default::default()
             };
             all_findings.extend(query_index(index, &fp, &opts)?);
