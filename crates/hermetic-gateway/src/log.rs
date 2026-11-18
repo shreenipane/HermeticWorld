@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use hermetic_common::hash::HashChain;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -9,6 +10,17 @@ use std::sync::Mutex;
 use crate::quota::QuotaSnapshot;
 
 pub const ANTHROPIC_ADAPTER_VERSION: &str = "2026-11-1";
+
+pub const GATEWAY_HEAD_FILE: &str = "gateway_head.json";
+pub const GATEWAY_LOG_HEAD_FILE: &str = "gateway.jsonl.head";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayHeadSummary {
+    pub records: u64,
+    pub head: String,
+    pub history_rewrite_count: u64,
+    pub adapter_version: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostLogEntry {
@@ -39,6 +51,8 @@ struct LogState {
     file: Option<std::fs::File>,
     written: u64,
     exhausted: bool,
+    chain: HashChain,
+    records: u64,
 }
 
 /// Append-only JSON-lines host log.
@@ -92,6 +106,8 @@ impl HostLogger {
                 file: Some(file),
                 written,
                 exhausted: written >= budget,
+                chain: HashChain::new(),
+                records: 0,
             }),
             secrets: secrets.into_iter().filter(|s| !s.is_empty()).collect(),
             budget,
@@ -153,11 +169,65 @@ impl HostLogger {
         };
         if ok {
             state.written = state.written.saturating_add(len);
+            state.chain.append(json_line.as_bytes());
+            state.records = state.records.saturating_add(1);
         } else {
             state.exhausted = true;
             state.file = None;
         }
         ok
+    }
+
+    /// Current hash chain head as lowercase hexadecimal string.
+    pub fn head_hex(&self) -> String {
+        let state = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.chain.head_hex()
+    }
+
+    /// Current hash chain head formatted as standard digest `sha256:<hex>`.
+    pub fn head_digest(&self) -> String {
+        format!("sha256:{}", self.head_hex())
+    }
+
+    /// Total count of log records recorded in the hash chain.
+    pub fn records_count(&self) -> u64 {
+        let state = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.records
+    }
+
+    /// Atomically persists the gateway log head summary to `GATEWAY_HEAD_FILE` and
+    /// `GATEWAY_LOG_HEAD_FILE` in `log_dir`.
+    pub fn persist_head(
+        &self,
+        log_dir: &Path,
+        history_rewrite_count: u64,
+        adapter_version: &str,
+    ) -> Result<(), std::io::Error> {
+        let (head, records) = {
+            let state = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            (format!("sha256:{}", state.chain.head_hex()), state.records)
+        };
+        let summary = GatewayHeadSummary {
+            records,
+            head,
+            history_rewrite_count,
+            adapter_version: adapter_version.to_string(),
+        };
+        let bytes = serde_json::to_vec(&summary)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let dir = crate::fsutil::open_dir_nofollow_create(log_dir)?;
+        crate::fsutil::write_state_file(&dir, GATEWAY_HEAD_FILE, &bytes)?;
+        crate::fsutil::write_state_file(&dir, GATEWAY_LOG_HEAD_FILE, &bytes)?;
+        Ok(())
     }
 
     /// True once the log can no longer be written for this run.

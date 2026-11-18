@@ -16,8 +16,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
@@ -274,6 +275,45 @@ pub fn write_state_file(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> 
         return result;
     }
     Err(invalid("state temporary attempts exhausted".into()))
+}
+
+/// Bind a Unix domain socket, preserving live sockets and refusing non-socket files.
+///
+/// Attempt the bind first. If `path` already exists:
+/// - Refuse regular files, symlinks, directories, or other non-socket files without unlinking.
+/// - If it is a live socket (another process is listening), refuse without unlinking.
+/// - Only if it is confirmed to be a stale socket (connect returns ECONNREFUSED),
+///   remove the stale socket file and re-attempt the bind.
+pub fn bind_unix_socket(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            Ok(listener)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "existing path is not a socket",
+                ));
+            }
+            match UnixStream::connect(path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "socket is in use by a live server",
+                )),
+                Err(conn_err) if conn_err.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)?;
+                    let listener = UnixListener::bind(path)?;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    Ok(listener)
+                }
+                Err(conn_err) => Err(conn_err),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

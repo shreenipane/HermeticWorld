@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::dns::{run_dns_loop, DnsResponder, SourceRateLimiter, StaticDnsResponder};
 use crate::headers::parse_t_clock_str;
 use crate::http::{
-    run_http_loop, HttpRuntimeConfig, MethodAllowFilter, RequestFilter, StaticUpstream, Upstream,
+    HttpRuntimeConfig, MethodAllowFilter, RequestFilter, StaticUpstream, Upstream,
     DEFAULT_HTTP_CHUNK_WRITE_TIMEOUT_MS, DEFAULT_HTTP_HEAD_TIMEOUT_MS,
     DEFAULT_HTTP_OVERALL_TIMEOUT_MS, MAX_CONCURRENT_CONNECTIONS,
 };
@@ -464,6 +464,30 @@ impl RunningNetvm {
         upstream: Arc<dyn Upstream>,
         log_sink: Arc<dyn LogSink>,
     ) -> Result<Self, NetvmError> {
+        Self::start_with_gateway(
+            dns_socket,
+            http_listener,
+            http_config,
+            dns_responder,
+            request_filter,
+            upstream,
+            None,
+            log_sink,
+        )
+    }
+
+    /// Starts both the DNS UDP loop and HTTP TCP loop with optional model gateway upstream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_gateway(
+        dns_socket: UdpSocket,
+        http_listener: TcpListener,
+        http_config: HttpRuntimeConfig,
+        dns_responder: Arc<dyn DnsResponder>,
+        request_filter: Arc<dyn RequestFilter>,
+        upstream: Arc<dyn Upstream>,
+        gateway_upstream: Option<Arc<upstream::GatewayUpstream>>,
+        log_sink: Arc<dyn LogSink>,
+    ) -> Result<Self, NetvmError> {
         let dns_addr = dns_socket.local_addr()?;
         let http_addr = http_listener.local_addr()?;
 
@@ -491,11 +515,12 @@ impl RunningNetvm {
         let http_thread = match std::thread::Builder::new()
             .name("hermetic-http".to_string())
             .spawn(move || {
-                run_http_loop(
+                crate::http::run_http_loop_with_gateway(
                     &http_listener,
                     http_config,
                     request_filter,
                     upstream,
+                    gateway_upstream,
                     http_metrics,
                     http_shutdown.as_ref(),
                 );

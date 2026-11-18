@@ -29,5 +29,7 @@ hex = { workspace = true }
 sha1 = { workspace = true }
 
 [dev-dependencies]
+hermetic-gateway = { path = "../hermetic-gateway" }
 hermetic-world-server = { path = "../hermetic-world-server" }
 tempfile = { workspace = true }
+tiny_http = { path = "../vendor/tiny_http" }

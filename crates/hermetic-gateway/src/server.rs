@@ -435,6 +435,25 @@ impl GatewayServer {
         self.sentinel.summary()
     }
 
+    /// Current hash-chain head of the gateway log formatted as `sha256:<hex>`.
+    pub fn gateway_log_head(&self) -> String {
+        self.logger.head_digest()
+    }
+
+    /// Total number of conversation history rewrites detected so far.
+    pub fn history_rewrites_total(&self) -> u64 {
+        self.history.rewrites_total()
+    }
+
+    /// Persists the gateway log head summary (`gateway_head.json` and `gateway.jsonl.head`).
+    pub fn persist_gateway_head(&self) {
+        let _ = self.logger.persist_head(
+            &self.config.log_dir,
+            self.history_rewrites_total(),
+            self.adapter_version(),
+        );
+    }
+
     /// Writes the sentinel summary to `DATE_SENTINEL_FILE` in the log directory. A failure
     /// to write marks the scan incomplete (so the result fails closed when next read).
     fn persist_sentinel(&self) {
@@ -583,6 +602,7 @@ impl GatewayServer {
 
     pub fn run_loop(&self, server: Server) {
         server.set_request_deadlines(self.client_deadlines);
+        self.persist_gateway_head();
         while self.running.load(Ordering::SeqCst) {
             // Use recv_timeout so the loop can check running flag
             match server.recv_timeout(Duration::from_millis(200)) {
@@ -611,6 +631,7 @@ impl GatewayServer {
                 }
             }
         }
+        self.persist_gateway_head();
     }
 
     fn respond_with_error(
@@ -678,10 +699,11 @@ impl GatewayServer {
         }
     }
 
-    /// Handles one agent request, then records the D12 sentinel summary and history log head.
+    /// Handles one agent request, then records the D12 sentinel summary, gateway log head, and history log head.
     pub fn handle_agent_request(&self, request: Request) {
         self.handle_agent_request_inner(request);
         self.persist_sentinel();
+        self.persist_gateway_head();
         self.persist_history();
     }
 

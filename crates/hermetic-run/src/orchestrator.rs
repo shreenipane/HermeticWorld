@@ -73,6 +73,7 @@ use serde::{Deserialize, Serialize};
 
 // Bounded input constants (§12.1, TR-SEC-3)
 pub const MAX_SENTINEL_BYTES: usize = 64 * 1024;
+pub const MAX_GATEWAY_HEAD_BYTES: usize = 64 * 1024;
 pub const MAX_GATEWAY_HISTORY_BYTES: usize = 64 * 1024;
 pub const MAX_HARNESS_SUMMARY_BYTES: usize = 1024 * 1024;
 pub const MAX_PROBE_BYTES: usize = 1024 * 1024;
@@ -502,6 +503,39 @@ fn load_gateway_sentinel(run_dir: &Path) -> Result<SentinelSummary, Orchestrator
     })
 }
 
+/// Gateway head summary artifact (written by hermetic-gateway for Mode G).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHeadSummary {
+    pub records: u64,
+    pub head: String,
+    pub history_rewrite_count: u64,
+    pub adapter_version: String,
+}
+
+/// Load and parse the gateway head summary (for Mode G).
+fn load_gateway_head_summary(
+    run_dir: &Path,
+) -> Result<Option<GatewayHeadSummary>, OrchestratorError> {
+    let artifact = "gateway_head.json";
+    let path = run_dir.join(artifact);
+    match safe_read_file(&path, MAX_GATEWAY_HEAD_BYTES) {
+        Ok(bytes) => {
+            let parsed: GatewayHeadSummary =
+                serde_json::from_slice(&bytes).map_err(|e| OrchestratorError::Json {
+                    artifact,
+                    detail: json_parse_error(e.line(), e.column()),
+                })?;
+            Ok(Some(parsed))
+        }
+        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OrchestratorError::Fs {
+            artifact,
+            detail: e.to_string(),
+        }),
+    }
+}
+
 /// Load and parse the harness summary.
 fn load_harness_sentinel(run_dir: &Path) -> Result<SentinelSummary, OrchestratorError> {
     let bytes = read_artifact_bytes(run_dir, "harness_summary.json", MAX_HARNESS_SUMMARY_BYTES)?;
@@ -820,6 +854,7 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     let verdict = load_verdict(run_dir)?;
     let manifest = load_world_manifest(run_dir)?;
     let gateway_history = load_gateway_history(run_dir)?;
+    let gateway_head = load_gateway_head_summary(run_dir)?;
     let submitted_work_digest = resolve_submitted_work_digest(run_dir, &verdict)?;
 
     // 2. Date leak is derived ONLY from the real-date sentinels (TR-SEC-5, D12)
@@ -854,26 +889,33 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
         }
     }
 
-    // 7. Assemble the complete RunRecord
-    let (gateway_log_head, history_rewrite_count, gateway_adapter_version) =
-        if let Some(hist) = gateway_history {
-            (
-                manifest.gateway_log_head.or(Some(hist.gateway_log_head)),
-                manifest
-                    .history_rewrite_count
-                    .or(Some(hist.history_rewrite_count)),
-                manifest
-                    .gateway_adapter_version
-                    .or(Some(hist.gateway_adapter_version)),
-            )
-        } else {
-            (
-                manifest.gateway_log_head,
-                manifest.history_rewrite_count,
-                manifest.gateway_adapter_version,
-            )
-        };
+    // Mode G gateway log head, history rewrite count, and adapter version resolution
+    let (gw_head, gw_rewrites, gw_version) = if let Some(hist) = gateway_history {
+        (
+            Some(hist.gateway_log_head),
+            Some(hist.history_rewrite_count),
+            Some(hist.gateway_adapter_version),
+        )
+    } else if let Some(summary) = gateway_head {
+        let head_digest: Digest =
+            Digest::parse(&summary.head).map_err(|_| OrchestratorError::MalformedArtifact {
+                artifact: "gateway_head.json",
+                detail: "invalid digest string in gateway head",
+            })?;
+        (
+            Some(head_digest),
+            Some(summary.history_rewrite_count),
+            Some(summary.adapter_version),
+        )
+    } else {
+        (None, None, None)
+    };
 
+    let gateway_log_head = manifest.gateway_log_head.or(gw_head);
+    let history_rewrite_count = manifest.history_rewrite_count.or(gw_rewrites);
+    let gateway_adapter_version = manifest.gateway_adapter_version.or(gw_version);
+
+    // 7. Assemble the complete RunRecord
     let record = RunRecord {
         task_id: manifest.task_id,
         task_class: manifest.task_class,

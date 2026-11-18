@@ -42,6 +42,15 @@ def test_tree_layout_modes_and_config(tmp_path: Path) -> None:
     assert not any(p.is_symlink() for p in tree.rglob("*"))
 
 
+def test_tree_with_gateway_config(tmp_path: Path) -> None:
+    gateway_cfg = {"host": "api.anthropic.com", "port": 5002}
+    tree = netvm.build_netvm_tree(tmp_path / "tree_gw", **_inputs(tmp_path), gateway=gateway_cfg)
+    assert json.loads((tree / "etc/hermetic/netvm.json").read_text()) == {
+        "gateway": gateway_cfg,
+        "t_clock": 1700000000,
+    }
+
+
 def test_symlinked_input_is_refused(tmp_path: Path) -> None:
     args = _inputs(tmp_path)
     os.symlink(tmp_path / "netvm", tmp_path / "link")

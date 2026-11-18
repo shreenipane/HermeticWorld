@@ -74,6 +74,8 @@ pub const GATEWAY_TIMEOUT_RESPONSE_BYTES: &[u8] =
 pub enum FilterDecision {
     /// Forward the serialized JSON request descriptor to [`Upstream::fetch`].
     Forward(Vec<u8>),
+    /// Forward an HTTP request to the model gateway.
+    ForwardGateway,
     /// Respond with `HTTP/1.1 405 Method Not Allowed` and close.
     NotAllowed,
     /// Close the connection immediately without sending any bytes.
@@ -448,7 +450,7 @@ enum HeadReadError {
 fn read_http_head(
     stream: &mut HttpStream,
     head_timeout: Duration,
-) -> Result<Vec<u8>, HeadReadError> {
+) -> Result<(Vec<u8>, Vec<u8>), HeadReadError> {
     let deadline = Instant::now() + head_timeout;
     let mut head_buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; HTTP_READ_CHUNK_BYTES];
@@ -477,8 +479,15 @@ fn read_http_head(
                 let search_start = prev_len.saturating_sub(3);
                 if let Some(rel) = find_crlf_crlf(&head_buf[search_start..]) {
                     let end = search_start + rel + 4;
+                    let mut leftover = Vec::new();
+                    if head_buf.len() > end {
+                        leftover.extend_from_slice(&head_buf[end..]);
+                    }
+                    if n > take {
+                        leftover.extend_from_slice(&chunk[take..n]);
+                    }
                     head_buf.truncate(end);
-                    return Ok(head_buf);
+                    return Ok((head_buf, leftover));
                 }
 
                 if n > allowed || head_buf.len() >= MAX_HTTP_HEAD_BYTES {
@@ -506,6 +515,40 @@ enum StreamWriteError {
 
 fn write_all_with_deadlines(
     stream: &mut HttpStream,
+    mut data: &[u8],
+    chunk_write_timeout: Duration,
+    overall_deadline: Instant,
+) -> Result<(), StreamWriteError> {
+    while !data.is_empty() {
+        let now = Instant::now();
+        if now >= overall_deadline {
+            return Err(StreamWriteError::Timeout);
+        }
+        let chunk_deadline = now + chunk_write_timeout;
+        let effective_deadline = chunk_deadline.min(overall_deadline);
+        let timeout = effective_deadline.saturating_duration_since(now);
+
+        if stream.set_write_timeout(Some(timeout)).is_err() {
+            return Err(StreamWriteError::Io);
+        }
+
+        match stream.write(data) {
+            Ok(0) => return Err(StreamWriteError::Io),
+            Ok(written) => {
+                data = &data[written..];
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(StreamWriteError::Timeout);
+            }
+            Err(_) => return Err(StreamWriteError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn write_stream_all_with_deadlines(
+    stream: &mut std::os::unix::net::UnixStream,
     mut data: &[u8],
     chunk_write_timeout: Duration,
     overall_deadline: Instant,
@@ -573,6 +616,252 @@ fn format_response_head(status: u16, filtered_headers: &[(String, String)]) -> V
     head
 }
 
+fn forward_to_gateway(
+    stream: &mut HttpStream,
+    head: &[u8],
+    leftover: &[u8],
+    gateway_upstream: &crate::upstream::GatewayUpstream,
+    config: HttpRuntimeConfig,
+    metrics: &Metrics,
+) {
+    let parsed = match parse_request_head(head) {
+        Ok(p) => p,
+        Err(_) => {
+            metrics.inc_http_rejected();
+            stream.reset();
+            return;
+        }
+    };
+
+    let overall_deadline = Instant::now() + config.overall_timeout;
+    let mut gw_conn = match gateway_upstream.connect(overall_deadline) {
+        Ok(c) => c,
+        Err(_) => {
+            metrics.inc_http_upstream_errors();
+            let err_deadline = Instant::now() + config.chunk_write_timeout;
+            let _ = write_all_with_deadlines(
+                stream,
+                BAD_GATEWAY_RESPONSE_BYTES,
+                config.chunk_write_timeout,
+                err_deadline,
+            );
+            stream.finish();
+            return;
+        }
+    };
+    let _ = gw_conn.set_nonblocking(false);
+
+    // Reconstruct request head with Connection: close
+    let mut out_head = format!("{} {} {}\r\n", parsed.method, parsed.target, parsed.version);
+    for (k, v) in &parsed.headers {
+        if !k.eq_ignore_ascii_case("connection") {
+            out_head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    out_head.push_str("connection: close\r\n\r\n");
+
+    let content_length = parsed
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if content_length > MAX_HTTP_BODY_BYTES {
+        metrics.inc_http_rejected();
+        stream.reset();
+        return;
+    }
+
+    if leftover.len() as u64 > content_length {
+        metrics.inc_http_rejected();
+        stream.reset();
+        return;
+    }
+
+    // Write request head to gateway
+    if write_stream_all_with_deadlines(
+        &mut gw_conn,
+        out_head.as_bytes(),
+        config.chunk_write_timeout,
+        overall_deadline,
+    )
+    .is_err()
+    {
+        metrics.inc_http_upstream_errors();
+        let err_deadline = Instant::now() + config.chunk_write_timeout;
+        let _ = write_all_with_deadlines(
+            stream,
+            BAD_GATEWAY_RESPONSE_BYTES,
+            config.chunk_write_timeout,
+            err_deadline,
+        );
+        stream.finish();
+        return;
+    }
+
+    // Write leftover body to gateway
+    if !leftover.is_empty()
+        && write_stream_all_with_deadlines(
+            &mut gw_conn,
+            leftover,
+            config.chunk_write_timeout,
+            overall_deadline,
+        )
+        .is_err()
+    {
+        metrics.inc_http_upstream_errors();
+        let err_deadline = Instant::now() + config.chunk_write_timeout;
+        let _ = write_all_with_deadlines(
+            stream,
+            BAD_GATEWAY_RESPONSE_BYTES,
+            config.chunk_write_timeout,
+            err_deadline,
+        );
+        stream.finish();
+        return;
+    }
+
+    // Stream remaining body from client stream to gateway
+    let mut body_forwarded = leftover.len() as u64;
+    let mut body_buf = [0u8; HTTP_STREAM_CHUNK_BYTES];
+    while body_forwarded < content_length {
+        let now = Instant::now();
+        if now >= overall_deadline {
+            metrics.inc_http_upstream_errors();
+            stream.reset();
+            return;
+        }
+        let rem_time = overall_deadline.saturating_duration_since(now);
+        let read_timeout = config.chunk_write_timeout.min(rem_time);
+        if stream.set_read_timeout(Some(read_timeout)).is_err() {
+            metrics.inc_http_upstream_errors();
+            stream.reset();
+            return;
+        }
+
+        let needed = (content_length - body_forwarded).min(HTTP_STREAM_CHUNK_BYTES as u64) as usize;
+        match stream.read(&mut body_buf[..needed]) {
+            Ok(0) => {
+                metrics.inc_http_rejected();
+                stream.reset();
+                return;
+            }
+            Ok(n) => {
+                if write_stream_all_with_deadlines(
+                    &mut gw_conn,
+                    &body_buf[..n],
+                    config.chunk_write_timeout,
+                    overall_deadline,
+                )
+                .is_err()
+                {
+                    metrics.inc_http_upstream_errors();
+                    stream.reset();
+                    return;
+                }
+                body_forwarded += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => {
+                metrics.inc_http_rejected();
+                stream.reset();
+                return;
+            }
+        }
+    }
+
+    // Now stream gateway response back to client stream
+    let mut resp_buf = [0u8; HTTP_STREAM_CHUNK_BYTES];
+    let mut bytes_written_to_client = 0u64;
+    loop {
+        let now = Instant::now();
+        if now >= overall_deadline {
+            metrics.inc_http_write_timeouts();
+            if bytes_written_to_client == 0 {
+                let err_deadline = Instant::now() + config.chunk_write_timeout;
+                let _ = write_all_with_deadlines(
+                    stream,
+                    GATEWAY_TIMEOUT_RESPONSE_BYTES,
+                    config.chunk_write_timeout,
+                    err_deadline,
+                );
+                stream.finish();
+            } else {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            return;
+        }
+        let rem_time = overall_deadline.saturating_duration_since(now);
+        let read_timeout = config.chunk_write_timeout.min(rem_time);
+        if gw_conn.set_read_timeout(Some(read_timeout)).is_err() {
+            metrics.inc_http_upstream_errors();
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+
+        match gw_conn.read(&mut resp_buf) {
+            Ok(0) => {
+                // EOF from gateway
+                break;
+            }
+            Ok(n) => {
+                if write_all_with_deadlines(
+                    stream,
+                    &resp_buf[..n],
+                    config.chunk_write_timeout,
+                    overall_deadline,
+                )
+                .is_err()
+                {
+                    metrics.inc_http_write_timeouts();
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+                bytes_written_to_client += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                metrics.inc_http_upstream_errors();
+                if bytes_written_to_client == 0 {
+                    let err_deadline = Instant::now() + config.chunk_write_timeout;
+                    let _ = write_all_with_deadlines(
+                        stream,
+                        GATEWAY_TIMEOUT_RESPONSE_BYTES,
+                        config.chunk_write_timeout,
+                        err_deadline,
+                    );
+                    stream.finish();
+                } else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                return;
+            }
+            Err(_) => {
+                metrics.inc_http_upstream_errors();
+                if bytes_written_to_client == 0 {
+                    let err_deadline = Instant::now() + config.chunk_write_timeout;
+                    let _ = write_all_with_deadlines(
+                        stream,
+                        BAD_GATEWAY_RESPONSE_BYTES,
+                        config.chunk_write_timeout,
+                        err_deadline,
+                    );
+                    stream.finish();
+                } else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                return;
+            }
+        }
+    }
+
+    metrics.inc_http_forwarded();
+    metrics.inc_http_responses_completed();
+    let _ = stream.flush();
+    stream.finish();
+}
+
 /// Processes a single accepted TCP stream end-to-end (strictly one request per connection).
 pub fn handle_http_connection(
     stream: TcpStream,
@@ -583,6 +872,20 @@ pub fn handle_http_connection(
     upstream: &dyn Upstream,
     metrics: &Metrics,
 ) {
+    handle_http_connection_with_gateway(stream, tls, sni, config, filter, upstream, None, metrics);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_http_connection_with_gateway(
+    stream: TcpStream,
+    tls: bool,
+    sni: Option<&str>,
+    config: HttpRuntimeConfig,
+    filter: &dyn RequestFilter,
+    upstream: &dyn Upstream,
+    gateway_upstream: Option<&crate::upstream::GatewayUpstream>,
+    metrics: &Metrics,
+) {
     handle_stream(
         HttpStream::Plain(stream),
         tls,
@@ -590,10 +893,12 @@ pub fn handle_http_connection(
         config,
         filter,
         upstream,
+        gateway_upstream,
         metrics,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_stream(
     mut stream: HttpStream,
     tls: bool,
@@ -601,11 +906,12 @@ pub(crate) fn handle_stream(
     config: HttpRuntimeConfig,
     filter: &dyn RequestFilter,
     upstream: &dyn Upstream,
+    gateway_upstream: Option<&crate::upstream::GatewayUpstream>,
     metrics: &Metrics,
 ) {
     let _ = stream.set_nodelay(true);
 
-    let head = match read_http_head(&mut stream, config.head_timeout) {
+    let (head, leftover) = match read_http_head(&mut stream, config.head_timeout) {
         Ok(h) => h,
         Err(HeadReadError::Timeout) => {
             metrics.inc_http_head_timeouts();
@@ -643,6 +949,21 @@ pub(crate) fn handle_stream(
             );
             let _ = stream.flush();
             stream.finish();
+        }
+        FilterDecision::ForwardGateway => {
+            if let Some(gw_up) = gateway_upstream {
+                forward_to_gateway(&mut stream, &head, &leftover, gw_up, config, metrics);
+            } else {
+                metrics.inc_http_upstream_errors();
+                let err_deadline = Instant::now() + config.chunk_write_timeout;
+                let _ = write_all_with_deadlines(
+                    &mut stream,
+                    BAD_GATEWAY_RESPONSE_BYTES,
+                    config.chunk_write_timeout,
+                    err_deadline,
+                );
+                stream.finish();
+            }
         }
         FilterDecision::Forward(request_json) => {
             metrics.inc_http_forwarded();
@@ -798,6 +1119,18 @@ pub fn run_http_loop(
     metrics: Arc<Metrics>,
     shutdown: &AtomicBool,
 ) {
+    run_http_loop_with_gateway(listener, config, filter, upstream, None, metrics, shutdown);
+}
+
+pub fn run_http_loop_with_gateway(
+    listener: &TcpListener,
+    config: HttpRuntimeConfig,
+    filter: Arc<dyn RequestFilter>,
+    upstream: Arc<dyn Upstream>,
+    gateway_upstream: Option<Arc<crate::upstream::GatewayUpstream>>,
+    metrics: Arc<Metrics>,
+    shutdown: &AtomicBool,
+) {
     let _ = listener.set_nonblocking(true);
     let active_connections = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
@@ -829,19 +1162,21 @@ pub fn run_http_loop(
 
                 let filter_cloned = Arc::clone(&filter);
                 let upstream_cloned = Arc::clone(&upstream);
+                let gateway_cloned = gateway_upstream.clone();
                 let metrics_cloned = Arc::clone(&metrics);
 
                 let spawn_res = std::thread::Builder::new()
                     .name("hermetic-http-conn".to_string())
                     .spawn(move || {
                         let _guard = slot_guard;
-                        handle_http_connection(
+                        handle_http_connection_with_gateway(
                             stream,
                             false,
                             None,
                             config,
                             filter_cloned.as_ref(),
                             upstream_cloned.as_ref(),
+                            gateway_cloned.as_deref(),
                             metrics_cloned.as_ref(),
                         );
                     });

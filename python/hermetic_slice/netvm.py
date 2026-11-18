@@ -142,6 +142,7 @@ def build_netvm_tree(
     dns_table: Path,
     t_clock: datetime,
     tls_identity: dict | None = None,
+    gateway: dict | None = None,
     kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
     kernel_image: Path | None = None,
     clockprobe_bin: Path | None = None,
@@ -167,6 +168,10 @@ def build_netvm_tree(
             or tls_identity["dns_sha256"] != hashlib.sha256(table).hexdigest()):
             raise ValueError("invalid TLS identity")
         config["tls"] = dict(tls_identity)
+    if gateway is not None:
+        if not isinstance(gateway, dict) or "host" not in gateway or not isinstance(gateway["host"], str):
+            raise ValueError("invalid gateway config")
+        config["gateway"] = dict(gateway)
     files = {
         "sbin/hermetic-netvm": (netvm, 0o755),
         "sbin/hermetic-busybox": (busybox, 0o755),
@@ -249,6 +254,7 @@ def build_netvm_image(
     sealcheck_bin: Path | None = None,
     work_dir: Path | None = None,
     tls_identity: dict | None = None,
+    gateway: dict | None = None,
     kernel_lock: Path = DEFAULT_KERNEL_DIR / "kernel.lock.json",
     kernel_image: Path | None = None,
     clockprobe_bin: Path | None = None,
@@ -261,7 +267,7 @@ def build_netvm_image(
     if not isinstance(tls_identity, dict) or tls_identity.get("world_id") != world_id:
         raise ValueError("TLS identity world does not match image world")
     build_netvm_tree(tree, netvm_bin=netvm_bin, busybox_bin=busybox_bin, dns_table=dns_table, t_clock=t_clock, tls_identity=tls_identity,
-                     kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
+                     gateway=gateway, kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin)
     return build_rootfs(
         tree, out_image, t_clock=t_clock, world_id=world_id, sealcheck_bin=sealcheck_bin, work_dir=work_dir,
         kernel_lock=kernel_lock, kernel_image=kernel_image, clockprobe_bin=clockprobe_bin,

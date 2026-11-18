@@ -551,6 +551,18 @@ pub fn handle_connection(
     upstream: &dyn http::Upstream,
     metrics: &Metrics,
 ) {
+    handle_connection_with_gateway(socket, config, http_config, filter, upstream, None, metrics);
+}
+
+pub fn handle_connection_with_gateway(
+    socket: TcpStream,
+    config: Arc<ServerConfig>,
+    http_config: http::HttpRuntimeConfig,
+    filter: &dyn http::RequestFilter,
+    upstream: &dyn http::Upstream,
+    gateway_upstream: Option<&crate::upstream::GatewayUpstream>,
+    metrics: &Metrics,
+) {
     let mut socket = DeadlineTcp::new(socket, Instant::now() + HANDSHAKE_TIMEOUT);
     let result = (|| -> io::Result<(ServerConnection, String)> {
         let (hello, sni) = client_hello(&mut socket)?;
@@ -589,6 +601,7 @@ pub fn handle_connection(
             http_config,
             filter,
             upstream,
+            gateway_upstream,
             metrics,
         ),
         Err(_) => {
@@ -607,6 +620,29 @@ pub fn run_loop(
     metrics: Arc<Metrics>,
     shutdown: Arc<AtomicBool>,
 ) {
+    run_loop_with_gateway(
+        listener,
+        config,
+        http_config,
+        filter,
+        upstream,
+        None,
+        metrics,
+        shutdown,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_loop_with_gateway(
+    listener: TcpListener,
+    config: Arc<ServerConfig>,
+    http_config: http::HttpRuntimeConfig,
+    filter: Arc<dyn http::RequestFilter>,
+    upstream: Arc<dyn http::Upstream>,
+    gateway_upstream: Option<Arc<crate::upstream::GatewayUpstream>>,
+    metrics: Arc<Metrics>,
+    shutdown: Arc<AtomicBool>,
+) {
     if listener.set_nonblocking(true).is_err() {
         shutdown.store(true, Ordering::Release);
         return;
@@ -617,12 +653,13 @@ pub fn run_loop(
                 if socket.set_nonblocking(false).is_err() {
                     continue;
                 }
-                handle_connection(
+                handle_connection_with_gateway(
                     socket,
                     config.clone(),
                     http_config,
                     filter.as_ref(),
                     upstream.as_ref(),
+                    gateway_upstream.as_deref(),
                     &metrics,
                 );
             }

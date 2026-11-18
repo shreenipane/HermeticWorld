@@ -58,3 +58,41 @@ fn secrets_crossing_field_truncation_boundary_are_redacted() {
         }
     }
 }
+
+#[test]
+fn test_bind_unix_socket_preserves_live_sockets_and_regular_files_and_cleans_stale() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Fresh path binds successfully
+    let sock1 = dir.path().join("sock1.sock");
+    let l1 = hermetic_gateway::fsutil::bind_unix_socket(&sock1).unwrap();
+    assert!(sock1.exists());
+
+    // 2. Existing regular file: bind fails, file is NOT removed
+    let reg_file = dir.path().join("regular.txt");
+    std::fs::write(&reg_file, b"important data").unwrap();
+    let err = hermetic_gateway::fsutil::bind_unix_socket(&reg_file).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(reg_file.exists());
+    assert_eq!(std::fs::read(&reg_file).unwrap(), b"important data");
+
+    // 3. Existing live socket: bind fails with AddrInUse, existing listener still works
+    let err = hermetic_gateway::fsutil::bind_unix_socket(&sock1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    drop(l1);
+
+    // 4. Stale socket: l1 was dropped, so sock1 exists on disk without an active listener.
+    // Binding detects stale socket, unlinks it, and binds successfully.
+    let l2 = hermetic_gateway::fsutil::bind_unix_socket(&sock1).unwrap();
+    drop(l2);
+
+    // 5. Symlink to regular file or socket: refused without deleting target
+    let target = dir.path().join("symlink_target.txt");
+    std::fs::write(&target, b"target data").unwrap();
+    let sym = dir.path().join("symlink.sock");
+    std::os::unix::fs::symlink(&target, &sym).unwrap();
+    let err = hermetic_gateway::fsutil::bind_unix_socket(&sym).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(target.exists());
+    assert_eq!(std::fs::read(&target).unwrap(), b"target data");
+}

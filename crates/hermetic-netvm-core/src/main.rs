@@ -235,7 +235,12 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         while let Some(key) = iter.next() {
             if !matches!(
                 key.as_str(),
-                "--config" | "--dns-table" | "--world-socket" | "--dns" | "--http"
+                "--config"
+                    | "--dns-table"
+                    | "--world-socket"
+                    | "--gateway-socket"
+                    | "--dns"
+                    | "--http"
             ) {
                 return Err("invalid_arguments".into());
             }
@@ -244,7 +249,12 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
                 return Err("invalid_arguments".into());
             }
         }
-        if flags.len() != 5 {
+        if !flags.contains_key("--config")
+            || !flags.contains_key("--dns-table")
+            || !flags.contains_key("--world-socket")
+            || !flags.contains_key("--dns")
+            || !flags.contains_key("--http")
+        {
             return Err("invalid_arguments".into());
         }
     } else {
@@ -354,9 +364,30 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
     if pid1 && path == hermetic_netvm_core::firewall::InterceptionPath::Tproxy {
         hermetic_netvm_core::sys::set_transparent(&http).map_err(|_| "bind_failed")?;
     }
-    let filter = Arc::new(WorldFilter::with_path(&table, path));
+    let gateway_upstream: Option<Arc<hermetic_netvm_core::upstream::GatewayUpstream>> =
+        if let Some(gw_cfg) = &config.gateway {
+            if pid1 {
+                Some(Arc::new(
+                    hermetic_netvm_core::upstream::GatewayUpstream::guest(gw_cfg.port as u32),
+                ))
+            } else if let Some(sock) = flags.get("--gateway-socket") {
+                Some(Arc::new(
+                    hermetic_netvm_core::upstream::GatewayUpstream::unix(sock),
+                ))
+            } else {
+                gw_cfg.unix_socket.as_ref().map(|sock| {
+                    Arc::new(hermetic_netvm_core::upstream::GatewayUpstream::unix(sock))
+                })
+            }
+        } else {
+            flags
+                .get("--gateway-socket")
+                .map(|sock| Arc::new(hermetic_netvm_core::upstream::GatewayUpstream::unix(sock)))
+        };
+    let gateway_host = config.gateway.as_ref().map(|g| g.host.clone());
+    let filter = Arc::new(WorldFilter::with_gateway(&table, path, gateway_host));
     let upstream = Arc::new(upstream);
-    let server = RunningNetvm::start(
+    let server = RunningNetvm::start_with_gateway(
         dns,
         http,
         hermetic_netvm_core::http::HttpRuntimeConfig::bounded(
@@ -369,6 +400,7 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
         Arc::new(WorldDns(table)),
         filter.clone(),
         upstream.clone(),
+        gateway_upstream.clone(),
         Arc::new(StderrLogSink),
     )
     .map_err(|_| "start_failed")?;
@@ -379,7 +411,7 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
             std::thread::Builder::new()
                 .name("hermetic-https".into())
                 .spawn(move || {
-                    hermetic_netvm_core::tls::run_loop(
+                    hermetic_netvm_core::tls::run_loop_with_gateway(
                         listener,
                         tls_config,
                         hermetic_netvm_core::http::HttpRuntimeConfig::bounded(
@@ -391,6 +423,7 @@ fn run_world(pid1: bool, args: &[String]) -> Result<(), String> {
                         ),
                         filter,
                         upstream,
+                        gateway_upstream,
                         metrics,
                         shutdown,
                     );

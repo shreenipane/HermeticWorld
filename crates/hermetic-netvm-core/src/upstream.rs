@@ -19,6 +19,7 @@ use std::{
 
 /// Dedicated WorldServer port; 5000 remains execd, 5002 reserved for gateway.
 pub const WORLD_PORT: u32 = 5001;
+pub const GATEWAY_PORT: u32 = 5002;
 pub const HOST_CID: u32 = 2;
 /// First request id on a connection; ids then increase by one per request.
 pub const FIRST_REQUEST_ID: u64 = 1;
@@ -85,7 +86,7 @@ fn wire_error(error: WireError) -> UpstreamError {
 #[derive(Clone, Debug)]
 enum Endpoint {
     Unix(PathBuf),
-    Vsock,
+    Vsock(u32),
 }
 
 /// The single WorldServer connection. A sandboxed WorldServer accepts exactly one
@@ -113,7 +114,7 @@ pub struct VsockUpstream {
 impl VsockUpstream {
     pub fn guest() -> Self {
         Self {
-            endpoint: Endpoint::Vsock,
+            endpoint: Endpoint::Vsock(WORLD_PORT),
             shared: Arc::default(),
         }
     }
@@ -126,7 +127,7 @@ impl VsockUpstream {
     }
     fn connect(&self, deadline: Instant) -> io::Result<UnixStream> {
         match &self.endpoint {
-            Endpoint::Vsock => sys::vsock(WORLD_PORT, deadline),
+            Endpoint::Vsock(port) => sys::vsock(*port, deadline),
             Endpoint::Unix(path) => {
                 let pinned = files::pin(path)?;
                 if !pinned.metadata()?.file_type().is_socket() {
@@ -333,6 +334,51 @@ impl Upstream for VsockUpstream {
             headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
             body: Box::new(ExactBody::new(lease, length)),
         })
+    }
+}
+
+/// Upstream model gateway channel: connects over guest AF_VSOCK (port 5002)
+/// or host Unix socket in offline tests.
+#[derive(Clone, Debug)]
+pub struct GatewayUpstream {
+    endpoint: Endpoint,
+}
+
+impl GatewayUpstream {
+    pub fn guest(port: u32) -> Self {
+        Self {
+            endpoint: Endpoint::Vsock(port),
+        }
+    }
+
+    pub fn guest_default() -> Self {
+        Self::guest(GATEWAY_PORT)
+    }
+
+    pub fn vsock_port(&self) -> Option<u32> {
+        match self.endpoint {
+            Endpoint::Vsock(port) => Some(port),
+            Endpoint::Unix(_) => None,
+        }
+    }
+
+    pub fn unix(path: impl AsRef<Path>) -> Self {
+        Self {
+            endpoint: Endpoint::Unix(path.as_ref().to_owned()),
+        }
+    }
+
+    pub fn connect(&self, deadline: Instant) -> io::Result<UnixStream> {
+        match &self.endpoint {
+            Endpoint::Vsock(port) => sys::vsock(*port, deadline),
+            Endpoint::Unix(path) => {
+                let pinned = files::pin(path)?;
+                if !pinned.metadata()?.file_type().is_socket() {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
+                sys::unix(files::fd_path(&pinned).as_os_str().as_bytes(), deadline)
+            }
+        }
     }
 }
 

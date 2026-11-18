@@ -45,6 +45,7 @@ fn material() -> (Vec<u8>, WorldConfig) {
             t_clock: EPOCH,
             tls: Some(m.identity(ca()).unwrap()),
             redirect_fallback: false,
+            gateway: None,
         },
     )
 }

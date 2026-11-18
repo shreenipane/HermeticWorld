@@ -65,6 +65,20 @@ pub fn write_boot_log(mut out: impl std::io::Write, path: InterceptionPath) -> s
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRouteConfig {
+    pub host: String,
+    #[serde(default = "default_gateway_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_socket: Option<String>,
+}
+
+fn default_gateway_port() -> u16 {
+    5002
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldConfig {
@@ -73,6 +87,8 @@ pub struct WorldConfig {
     pub tls: Option<crate::tls::TlsIdentity>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redirect_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayRouteConfig>,
 }
 impl WorldConfig {
     pub fn parse(reader: impl Read) -> Result<Self, &'static str> {
@@ -91,6 +107,11 @@ impl WorldConfig {
         if let Some(tls) = &config.tls {
             tls.validate().map_err(|_| "invalid_config")?;
         }
+        if let Some(gw) = &config.gateway {
+            if gw.host.is_empty() || gw.host.len() > 255 {
+                return Err("invalid_config");
+            }
+        }
         Ok(config)
     }
 }
@@ -105,6 +126,7 @@ pub struct WorldFilter {
     hosts: BTreeSet<String>,
     table: DnsTable,
     path: InterceptionPath,
+    gateway_host: Option<String>,
 }
 impl WorldFilter {
     pub fn new(table: &DnsTable) -> Self {
@@ -112,10 +134,19 @@ impl WorldFilter {
     }
 
     pub fn with_path(table: &DnsTable, path: InterceptionPath) -> Self {
+        Self::with_gateway(table, path, None)
+    }
+
+    pub fn with_gateway(
+        table: &DnsTable,
+        path: InterceptionPath,
+        gateway_host: Option<String>,
+    ) -> Self {
         Self {
             hosts: table.names().map(str::to_owned).collect(),
             table: table.clone(),
             path,
+            gateway_host,
         }
     }
 }
@@ -131,13 +162,68 @@ impl RequestFilter for WorldFilter {
         sni: Option<&str>,
         destination: Option<std::net::IpAddr>,
     ) -> FilterDecision {
-        let parsed = match parse_request_head(head) {
+        let parsed = match crate::headers::parse_request_head(head) {
             Ok(p) => p,
             Err(_) => return FilterDecision::Reject,
         };
+        let raw_host = match parsed.host.as_deref() {
+            Some(h) if !h.is_empty() => h,
+            _ => return FilterDecision::Reject,
+        };
+        let host = raw_host
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(raw_host)
+            .trim();
+        if host.is_empty() {
+            return FilterDecision::Reject;
+        }
+
+        if let Some(gw_host) = &self.gateway_host {
+            if host.eq_ignore_ascii_case(gw_host) {
+                if !self.check_destination(host, destination) {
+                    return FilterDecision::Reject;
+                }
+                if tls && sni.is_none_or(|s| !s.eq_ignore_ascii_case(host)) {
+                    return FilterDecision::Reject;
+                }
+                let path_only = parsed.target.split('?').next().unwrap_or("");
+                let is_adapter_endpoint = matches!(
+                    path_only,
+                    "/v1/messages" | "/v1/messages/count_tokens" | "/v1/chat/completions"
+                );
+                if !is_adapter_endpoint {
+                    return FilterDecision::Reject;
+                }
+                if parsed.method != "POST" {
+                    return FilterDecision::NotAllowed;
+                }
+                return FilterDecision::ForwardGateway;
+            }
+        }
+
+        let world_parsed = match parse_request_head(head) {
+            Ok(p) => p,
+            Err(_) => {
+                // If it's a known world host with an unsupported method (e.g. POST), return 405
+                if self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    if !self.check_destination(host, destination) {
+                        return FilterDecision::Reject;
+                    }
+                    if tls && sni.is_none_or(|s| !s.eq_ignore_ascii_case(host)) {
+                        return FilterDecision::Reject;
+                    }
+                    if parsed.method != "GET" && parsed.method != "HEAD" {
+                        return FilterDecision::NotAllowed;
+                    }
+                }
+                return FilterDecision::Reject;
+            }
+        };
+
         // Host policy applies to every method, including requests that get 405.
-        let method = parsed.method.clone();
-        let mut policy_head = parsed;
+        let method = world_parsed.method.clone();
+        let mut policy_head = world_parsed;
         policy_head.method = "GET".into();
         let scheme = if tls { Scheme::Https } else { Scheme::Http };
         match decide(&policy_head, &self.hosts, scheme) {

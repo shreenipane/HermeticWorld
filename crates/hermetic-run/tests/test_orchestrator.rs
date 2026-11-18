@@ -13,11 +13,12 @@ use hermetic_attest::{
 };
 use hermetic_run::orchestrator::{
     assemble_and_sign_run_record, assemble_run_record, compute_clock_level,
-    derive_escape_probe_result, derive_host_facts, host_facts, sign_run_record_with_key_path,
-    write_signed_run_record, HostFactsArtifact, OrchestratorError, ProbeLineWire, BUILD_SCHEMA,
-    MAX_BOOT_RECORD_BYTES, MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES,
-    MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES,
-    MAX_VERDICT_BYTES, PROBE_RESULTS, REQUIRED_PROBES, RUN_SPEC_VERSION,
+    derive_escape_probe_result, derive_host_facts, host_facts, sign_run_record,
+    sign_run_record_with_key_path, write_signed_run_record, HostFactsArtifact, OrchestratorError,
+    ProbeLineWire, BUILD_SCHEMA, MAX_BOOT_RECORD_BYTES, MAX_GATEWAY_HEAD_BYTES,
+    MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_MANIFEST_BYTES, MAX_PROBE_BYTES,
+    MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES, PROBE_RESULTS,
+    REQUIRED_PROBES, RUN_SPEC_VERSION,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -1629,6 +1630,83 @@ fn test_regression_coderabbit_hostile_parser_diagnostics_sanitized() {
 }
 
 #[test]
+fn test_mode_g_record_assembly_with_gateway_head_and_signing() {
+    let f = FixturePaths::new();
+
+    // Change agent_mode to G in world_manifest.json and remove Mode H harness_command_log_head
+    let mut manifest_val: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest_val["agent_mode"] = json!("G");
+    manifest_val["harness_command_log_head"] = json!(null);
+    fs::write(
+        f.path().join("world_manifest.json"),
+        manifest_val.to_string(),
+    )
+    .unwrap();
+
+    // Mode G without gateway_head.json or manifest fields fails closed
+    let err = assemble_run_record(f.path()).expect_err("Mode G without gateway head must fail");
+    assert!(matches!(
+        err,
+        OrchestratorError::MissingArtifact("gateway_head.json")
+            | OrchestratorError::Validation(RunValidationError::ModeGMissingGatewayFields)
+    ));
+
+    // Provide gateway_head.json
+    let gw_head = json!({
+        "records": 5,
+        "head": "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "history_rewrite_count": 2,
+        "adapter_version": "2026-11-1"
+    });
+    fs::write(f.path().join("gateway_head.json"), gw_head.to_string()).unwrap();
+
+    let record = assemble_run_record(f.path()).expect("Mode G assembly with gateway_head succeeds");
+    assert_eq!(record.agent_mode, AgentMode::G);
+    assert_eq!(
+        record.gateway_log_head,
+        Some(
+            Digest::parse(
+                "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .unwrap()
+        )
+    );
+    assert_eq!(record.history_rewrite_count, Some(2));
+    assert_eq!(record.gateway_adapter_version.as_deref(), Some("2026-11-1"));
+
+    // Verify signing and DSSE envelope
+    let (_pkcs8, signer, verifier) = generate_test_key();
+    let envelope = sign_run_record(&record, &signer).expect("signing succeeds");
+    let mut guard = ReplayGuard::new();
+    let binding = RunBinding {
+        task_id: Some("pytest-dev__pytest-6202".to_string()),
+        world_root: Some(record.world_root.clone()),
+        world_bundle: Some(record.world_root.clone()),
+        sealcheck_report_digest: Some(record.sealcheck_report_digest.clone()),
+        grader_image_digest: Some(record.version_tuple.grader_image_digest.clone()),
+        boot_record: record.boot_record.clone(),
+    };
+    let envelope_json = serde_json::to_string(&envelope).unwrap();
+    let (statement, _) = verify_run_attestation(&envelope_json, &verifier, &binding, &mut guard)
+        .expect("verification succeeds");
+    assert_eq!(statement.predicate.agent_mode, AgentMode::G);
+    assert_eq!(
+        statement.predicate.gateway_log_head,
+        record.gateway_log_head
+    );
+    assert_eq!(
+        statement.predicate.history_rewrite_count,
+        record.history_rewrite_count
+    );
+    assert_eq!(
+        statement.predicate.gateway_adapter_version,
+        record.gateway_adapter_version
+    );
+}
+
+#[test]
 fn test_mode_g_wires_gateway_history_into_run_record() {
     let f = FixturePaths::new();
     let mut manifest: serde_json::Value =
@@ -1723,5 +1801,41 @@ fn test_mode_g_malformed_gateway_history_fails_closed() {
     fs::write(f.path().join("gateway_history.json"), "not valid json").unwrap();
 
     let err = assemble_run_record(f.path()).expect_err("malformed gateway_history must fail");
+    assert!(matches!(err, OrchestratorError::Json { .. }));
+}
+
+#[test]
+fn test_mode_g_symlinked_gateway_head_fails_closed() {
+    let f = FixturePaths::new();
+    let target = f.path().join("real_head.json");
+    let gw_head = json!({
+        "records": 5,
+        "head": "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "history_rewrite_count": 2,
+        "adapter_version": "2026-11-1"
+    });
+    fs::write(&target, gw_head.to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, f.path().join("gateway_head.json")).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("symlinked gateway_head must fail");
+    assert!(matches!(err, OrchestratorError::Fs { .. }));
+}
+
+#[test]
+fn test_mode_g_oversized_gateway_head_fails_closed() {
+    let f = FixturePaths::new();
+    let huge = " ".repeat(MAX_GATEWAY_HEAD_BYTES + 1);
+    fs::write(f.path().join("gateway_head.json"), huge).unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("oversized gateway_head must fail");
+    assert!(matches!(err, OrchestratorError::Fs { .. }));
+}
+
+#[test]
+fn test_mode_g_malformed_gateway_head_fails_closed() {
+    let f = FixturePaths::new();
+    fs::write(f.path().join("gateway_head.json"), "not valid json").unwrap();
+
+    let err = assemble_run_record(f.path()).expect_err("malformed gateway_head must fail");
     assert!(matches!(err, OrchestratorError::Json { .. }));
 }

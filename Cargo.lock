@@ -894,6 +894,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "hermetic-common",
+ "hermetic-gateway",
  "hermetic-netvm-dns",
  "hermetic-netvm-http",
  "hermetic-trust",
@@ -906,6 +907,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "time",
+ "tiny_http",
 ]
 
 [[package]]
@@ -990,10 +992,13 @@ dependencies = [
 name = "hermetic-vmm"
 version = "0.1.0"
 dependencies = [
+ "hermetic-attest",
  "hermetic-common",
  "hermetic-extract",
+ "hermetic-gateway",
  "hermetic-netvm-core",
  "hermetic-run",
+ "ring",
  "rustix 1.1.6",
  "serde",
  "serde_json",
