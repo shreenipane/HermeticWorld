@@ -160,8 +160,8 @@ fn probes_outcome(records: &[ProbeRecord]) -> Outcome {
 }
 
 impl Backend for RealBackend {
-    fn seal(&self, _req: SealRequest) -> Result<Outcome, BackendError> {
-        Err(BackendError::Unavailable(SEAL_NOT_WIRED))
+    fn seal(&self, req: SealRequest) -> Result<Outcome, BackendError> {
+        crate::seal::execute_seal(req)
     }
 
     fn verify_bundle(&self, req: VerifyBundleRequest) -> Result<Outcome, BackendError> {

@@ -8,7 +8,7 @@ use std::time::Instant;
 use hermetic_run::infra::{AgentMode as RunAgentMode, CleanupLog, Clock, Infra, WorldSpec};
 use hermetic_run::orchestrator::{assemble_and_sign_run_record, write_signed_run_record};
 use hermetic_run::verdict::RunStatus;
-use hermetic_run::{RunConfig, RunSummary};
+use hermetic_run::RunConfig;
 
 use crate::args::{AgentMode, RunRequest};
 use crate::backend::RUN_NOT_WIRED;
@@ -56,177 +56,48 @@ impl Clock for FakeClock {
     }
 }
 
-/// Standard blocked probe lines for synthetic run dir artifacts.
-const DEFAULT_PROBE_LINES: &str = "\
-{\"probe\":\"clock_pairing_hc\",\"result\":\"unavailable\",\"detail\":\"hypercall blocked\"}\n\
-{\"probe\":\"clocksource_sysfs\",\"result\":\"blocked\",\"detail\":\"masked\"}\n\
-{\"probe\":\"cpuid\",\"result\":\"blocked\",\"detail\":\"masked\"}\n\
-{\"probe\":\"cpuinfo\",\"result\":\"blocked\",\"detail\":\"filtered\"}\n\
-{\"probe\":\"dmesg_dates\",\"result\":\"blocked\",\"detail\":\"clear\"}\n\
-{\"probe\":\"hpet\",\"result\":\"blocked\",\"detail\":\"disabled\"}\n\
-{\"probe\":\"kernel_canary\",\"result\":\"blocked\",\"detail\":\"canary blocked\"}\n\
-{\"probe\":\"kvmclock_msr\",\"result\":\"blocked\",\"detail\":\"disabled\"}\n\
-{\"probe\":\"module_load\",\"result\":\"blocked\",\"detail\":\"disabled\"}\n\
-{\"probe\":\"posix_clocks\",\"result\":\"blocked\",\"detail\":\"locked\"}\n\
-{\"probe\":\"proc_driver_rtc\",\"result\":\"blocked\",\"detail\":\"masked\"}\n\
-{\"probe\":\"rdtsc\",\"result\":\"blocked\",\"detail\":\"trapped\"}\n\
-{\"probe\":\"ring0_paths\",\"result\":\"blocked\",\"detail\":\"inaccessible\"}\n\
-{\"probe\":\"rtc_sysfs_dev\",\"result\":\"blocked\",\"detail\":\"masked\"}\n\
-{\"probe\":\"vmclock\",\"result\":\"blocked\",\"detail\":\"disabled\"}";
-
-/// Ensures all necessary artifacts exist in `run_dir` for attestation assembly.
-fn ensure_run_dir_artifacts(
-    req: &RunRequest,
-    run_dir: &Path,
-    summary: &RunSummary,
-) -> Result<(), BackendError> {
-    // 1. world_manifest.json
-    let dest_manifest = run_dir.join("world_manifest.json");
-    if !dest_manifest.exists() {
-        let src_manifest = req.world.join("world_manifest.json");
-        let manifest_bytes = if src_manifest.exists() {
-            hermetic_attest::safe_read_file(&src_manifest, MAX_MANIFEST_BYTES)
-                .map_err(|_| BackendError::Io("failed to read world_manifest.json".to_string()))?
-        } else {
-            let mut manifest_val = serde_json::json!({
-                "task_id": req.task,
-                "task_class": "patch",
-                "seal_level": "strict",
-                "agent_mode": match req.agent_mode {
-                    AgentMode::H => "H",
-                    AgentMode::G => "G",
-                },
-                "substrate": "microvm",
-                "grader_isolation": "clean",
-                "deployment": "single_host",
-                "t_world": "2020-01-01T00:00:00Z",
-                "t_clock": "2020-01-01T00:00:00Z",
-                "base_commit": "0000000000000000000000000000000000000000",
-                "spec_version": "v1.1",
-                "world_version": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "sealcheck_version": "v1.0",
-                "grader_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "world_root": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "task_rootfs_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "netvm_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "guest_kernel_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "vm_config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "cpu_template_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "firecracker_build_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "agent_volume_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "sealcheck_report_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-            });
-            match req.agent_mode {
-                AgentMode::G => {
-                    manifest_val["gateway_log_head"] = serde_json::Value::from(
-                        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                    );
-                    manifest_val["history_rewrite_count"] = serde_json::Value::from(0);
-                    manifest_val["gateway_adapter_version"] = serde_json::Value::from("v1");
-                }
-                AgentMode::H => {
-                    manifest_val["harness_command_log_head"] = serde_json::Value::from(
-                        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                    );
-                }
+fn extract_infra_error(summary: &hermetic_run::RunSummary) -> (String, String) {
+    for reason in &summary.reasons {
+        if let Some(rest) = reason.strip_prefix("infra_error at step '") {
+            if let Some((step, detail)) = rest.split_once("': ") {
+                let kind = classify_infra_detail(detail);
+                return (step.to_string(), kind.to_string());
             }
-            serde_json::to_vec_pretty(&manifest_val)
-                .map_err(|_| BackendError::Internal("failed to serialize manifest".to_string()))?
-        };
-        hermetic_attest::safe_atomic_write_file(&dest_manifest, &manifest_bytes)
-            .map_err(|_| BackendError::Io("failed to write world_manifest.json".to_string()))?;
+        }
+        if let Some(rest) = reason.strip_prefix("tampered at step '") {
+            if let Some((step, _)) = rest.split_once("': ") {
+                return (step.to_string(), "tamper_detected".to_string());
+            }
+        }
     }
-
-    // 2. verdict.json
-    let verdict_path = run_dir.join("verdict.json");
-    let mut verdict_json = if verdict_path.exists() {
-        let raw = hermetic_attest::safe_read_file(&verdict_path, 1024 * 1024).ok();
-        raw.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .unwrap_or_else(|| serde_json::json!({}))
-    } else {
-        serde_json::json!({
-            "r0_result": if summary.status == RunStatus::Resolved { "passed" } else { "failed" },
-            "r1_result": if summary.status == RunStatus::Resolved { "passed" } else { "failed" },
-            "r2_result": if summary.status == RunStatus::Resolved { "passed" } else { "failed" },
-            "r3_result": if summary.status == RunStatus::Resolved { "passed" } else { "failed" },
-            "r1_coverage": 1000,
-            "submitted_work_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    let failed_step = summary
+        .steps
+        .iter()
+        .find(|s| {
+            s.outcome == hermetic_run::StepOutcome::Failed
+                || s.outcome == hermetic_run::StepOutcome::Tampered
         })
-    };
-    if !verdict_json.is_object() {
-        verdict_json = serde_json::json!({});
-    }
-    verdict_json["run_status"] = serde_json::Value::from(summary.status.as_str());
-    verdict_json["unclean_shutdown"] = serde_json::Value::from(summary.unclean_shutdown);
-    let bytes = serde_json::to_vec_pretty(&verdict_json)
-        .map_err(|_| BackendError::Internal("failed to serialize verdict".to_string()))?;
-    hermetic_attest::safe_atomic_write_file(&verdict_path, &bytes)
-        .map_err(|_| BackendError::Io("failed to write verdict.json".to_string()))?;
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
-    // 3. date_sentinel.json
-    let date_sentinel_path = run_dir.join("date_sentinel.json");
-    if !date_sentinel_path.exists() {
-        let gateway = serde_json::json!({
-            "date_leak_observed": false,
-            "scan_incomplete": false,
-            "hits": {},
-            "incomplete": {},
-            "bytes_scanned": 1000
-        });
-        let bytes = serde_json::to_vec(&gateway)
-            .map_err(|_| BackendError::Internal("failed to serialize sentinel".to_string()))?;
-        hermetic_attest::safe_atomic_write_file(&date_sentinel_path, &bytes)
-            .map_err(|_| BackendError::Io("failed to write date_sentinel.json".to_string()))?;
-    }
-
-    // 4. harness_summary.json
-    let harness_path = run_dir.join("harness_summary.json");
-    if !harness_path.exists() {
-        let harness = serde_json::json!({
-            "date_leak_observed": false,
-            "scan_incomplete": false,
-            "hits": {},
-            "incomplete": {},
-            "bytes_scanned": 1000
-        });
-        let bytes = serde_json::to_vec(&harness)
-            .map_err(|_| BackendError::Internal("failed to serialize harness".to_string()))?;
-        hermetic_attest::safe_atomic_write_file(&harness_path, &bytes)
-            .map_err(|_| BackendError::Io("failed to write harness_summary.json".to_string()))?;
-    }
-
-    // 5. probe_output.jsonl
-    let probe_path = run_dir.join("probe_output.jsonl");
-    if !probe_path.exists() {
-        hermetic_attest::safe_atomic_write_file(&probe_path, DEFAULT_PROBE_LINES.as_bytes())
-            .map_err(|_| BackendError::Io("failed to write probe_output.jsonl".to_string()))?;
-    }
-
-    // 6. boot_record.json
-    let boot_path = run_dir.join("boot_record.json");
-    if !boot_path.exists() {
-        let boot = serde_json::json!({
-            "vm_id": "agent-vm-0",
-            "boot_path": "sealed_disk"
-        });
-        let bytes = serde_json::to_vec(&boot)
-            .map_err(|_| BackendError::Internal("failed to serialize boot record".to_string()))?;
-        hermetic_attest::safe_atomic_write_file(&boot_path, &bytes)
-            .map_err(|_| BackendError::Io("failed to write boot_record.json".to_string()))?;
-    }
-
-    Ok(())
+    (failed_step, "backend_failure".to_string())
 }
 
-pub fn attest_status_as_str(status: &hermetic_attest::RunStatus) -> &'static str {
-    match status {
-        hermetic_attest::RunStatus::Resolved => "resolved",
-        hermetic_attest::RunStatus::Unresolved => "unresolved",
-        hermetic_attest::RunStatus::Tampered => "tampered",
-        hermetic_attest::RunStatus::LimitExceeded => "limit_exceeded",
-        hermetic_attest::RunStatus::Review => "review",
-        hermetic_attest::RunStatus::InfraError => "infra_error",
-        hermetic_attest::RunStatus::GateBlocked => "gate_blocked",
+fn classify_infra_detail(detail: &str) -> &'static str {
+    if detail.contains("exceeded deadline") {
+        "deadline_exceeded"
+    } else if detail.contains("tamper detected") {
+        "tamper_detected"
+    } else if detail.contains("does not exist") {
+        "vm_not_found"
+    } else if detail.contains("expected VM kind") {
+        "invalid_vm_kind"
+    } else if detail.contains("returned payload for") {
+        "grader_payload_mismatch"
+    } else if detail.contains("invalid state transition") {
+        "transition_error"
+    } else {
+        "backend_failure"
     }
 }
 
@@ -241,23 +112,45 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     run_dir: &Path,
     key_path: Option<&Path>,
 ) -> Result<Outcome, BackendError> {
+    // 0. Validate task ID as a single path segment
+    if req.task.is_empty()
+        || req.task.len() > 128
+        || req.task == "."
+        || req.task == ".."
+        || req.task.contains('/')
+        || req.task.contains('\\')
+        || !req
+            .task
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(BackendError::Data(
+            "invalid task id: must be a single non-empty path segment matching [A-Za-z0-9._-]{1,128}".to_string(),
+        ));
+    }
+
+    // Refuse run directory inside the sealed world
+    if run_dir.starts_with(&req.world) {
+        return Err(BackendError::Data(
+            "run directory cannot be placed inside the sealed world".to_string(),
+        ));
+    }
+
     // 1. Strict component-by-component no-follow check on world directory
     verify_dir_no_symlinks(&req.world)?;
 
-    // 2. Validate signing key file if provided (0600, no symlinks, regular file)
+    // Signing key and upstream key files: 0600, no symlinks, regular files
     if let Some(kp) = key_path {
         verify_secret_file_no_symlinks(kp)?;
     }
-
-    // 3. Validate upstream key file if provided (0600, no symlinks, regular file)
     if let Some(ref ukp) = req.upstream_key_file {
         verify_secret_file_no_symlinks(ukp)?;
     }
 
-    // 4. Prepare run output directory with mode 0700
+    // 2. Prepare run output directory with mode 0700
     prepare_output_dir(run_dir)?;
 
-    // 5. Configure evaluation run
+    // 3. Configure evaluation run
     let world_spec = WorldSpec {
         world_id: req.task.clone(),
         cutoff_seal: req.world.display().to_string(),
@@ -275,14 +168,128 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     };
     let config = RunConfig::new(world_spec, agent_mode);
 
-    // 6. Drive the state machine with deterministic RAII teardown
+    // 4. Drive the state machine with deterministic RAII teardown
     let cleanup_log = CleanupLog::new();
     let summary = hermetic_run::run_evaluation_with_log(infra, clock, &config, &cleanup_log);
 
-    // 7. Ensure necessary run dir artifacts exist for record assembly
-    ensure_run_dir_artifacts(req, run_dir, &summary)?;
+    // 5. Ensure world_manifest.json is present in run_dir if available in world directory
+    let src_manifest = req.world.join("world_manifest.json");
+    let dest_manifest = run_dir.join("world_manifest.json");
+    if src_manifest.exists() && !dest_manifest.exists() {
+        if let Ok(bytes) = hermetic_attest::safe_read_file(&src_manifest, MAX_MANIFEST_BYTES) {
+            let mut manifest_val: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or_default();
+            // If bundle.manifest.json exists in req.world, sync world_root and world_version to bundle root
+            let bundle_manifest = req.world.join("bundle.manifest.json");
+            if bundle_manifest.exists() {
+                if let Ok(b_bytes) =
+                    hermetic_attest::safe_read_file(&bundle_manifest, MAX_MANIFEST_BYTES)
+                {
+                    if let Ok(b_val) = serde_json::from_slice::<serde_json::Value>(&b_bytes) {
+                        if let Some(root_str) = b_val.get("root").and_then(|r| r.as_str()) {
+                            if let Some(obj) = manifest_val.as_object_mut() {
+                                obj.insert(
+                                    "world_root".to_string(),
+                                    serde_json::Value::from(root_str),
+                                );
+                                obj.insert(
+                                    "world_version".to_string(),
+                                    serde_json::Value::from(root_str),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(updated_bytes) = serde_json::to_vec_pretty(&manifest_val) {
+                let _ = hermetic_attest::safe_atomic_write_file(&dest_manifest, &updated_bytes);
+            } else {
+                let _ = hermetic_attest::safe_atomic_write_file(&dest_manifest, &bytes);
+            }
+        }
+    }
 
-    // 8. Handle terminal failures
+    // Every attestation input must come from the run itself; nothing is defaulted here.
+
+    // 6. Ensure terminal status is accurately written to verdict.json in run_dir
+    let verdict_path = run_dir.join("verdict.json");
+    if summary.status == RunStatus::Resolved || summary.status == RunStatus::Review {
+        if !verdict_path.exists() {
+            return Err(BackendError::ProblemFound(
+                "missing verdict.json: cannot fabricate evaluation results".to_string(),
+            ));
+        }
+        let bytes = hermetic_attest::safe_read_file(&verdict_path, hermetic_run::MAX_VERDICT_BYTES)
+            .map_err(|_| BackendError::Io("failed to read verdict.json".to_string()))?;
+        let mut val: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| BackendError::ProblemFound("invalid JSON in verdict.json".to_string()))?;
+        let file_status = val
+            .get("run_status")
+            .or_else(|| val.get("status"))
+            .and_then(|s| s.as_str());
+        if file_status != Some(summary.status.as_str()) {
+            return Err(BackendError::ProblemFound(format!(
+                "verdict run_status ({:?}) does not match summary status ({})",
+                file_status,
+                summary.status.as_str()
+            )));
+        }
+        // The host observed the shutdown itself; record it alongside the grader verdict.
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "unclean_shutdown".to_string(),
+                serde_json::Value::from(summary.unclean_shutdown),
+            );
+        }
+        let bytes = serde_json::to_vec_pretty(&val)
+            .map_err(|_| BackendError::Internal("failed to serialize verdict".to_string()))?;
+        hermetic_attest::safe_atomic_write_file(&verdict_path, &bytes)
+            .map_err(|_| BackendError::Io("failed to write verdict.json".to_string()))?;
+    } else {
+        let mut verdict_map = if verdict_path.exists() {
+            let bytes =
+                hermetic_attest::safe_read_file(&verdict_path, hermetic_run::MAX_VERDICT_BYTES)
+                    .unwrap_or_default();
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(obj) = verdict_map.as_object_mut() {
+            obj.insert(
+                "run_status".to_string(),
+                serde_json::Value::from(summary.status.as_str()),
+            );
+            obj.insert(
+                "unclean_shutdown".to_string(),
+                serde_json::Value::from(summary.unclean_shutdown),
+            );
+            if !obj.contains_key("r0_result") {
+                obj.insert("r0_result".to_string(), serde_json::Value::from("failed"));
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&verdict_map)
+            .map_err(|_| BackendError::Internal("failed to serialize verdict".to_string()))?;
+        hermetic_attest::safe_atomic_write_file(&verdict_path, &bytes)
+            .map_err(|_| BackendError::Io("failed to write verdict.json".to_string()))?;
+    }
+
+    if summary.status == RunStatus::InfraError {
+        let (step_name, error_kind) = extract_infra_error(&summary);
+        let infra_err_doc = serde_json::json!({
+            "step": step_name,
+            "error_kind": error_kind,
+            "error": error_kind,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&infra_err_doc) {
+            let infra_err_path = run_dir.join("infra_error.json");
+            let _ = hermetic_attest::safe_atomic_write_file(&infra_err_path, &bytes);
+        }
+        eprintln!("infra failure at step '{step_name}': {error_kind}");
+    }
+
+    // 7. Terminal failures: sign a record of the failure when every attestation
+    // input is present; if any is missing, report the failure without a record.
     if summary.status != RunStatus::Resolved && summary.status != RunStatus::Review {
         let mut problem =
             Outcome::problem(format!("run failed: status {}", summary.status.as_str()))
@@ -292,39 +299,42 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
                     "unclean_shutdown",
                     serde_json::Value::from(summary.unclean_shutdown),
                 );
+        if summary.status == RunStatus::InfraError {
+            let (step_name, error_kind) = extract_infra_error(&summary);
+            problem = problem
+                .with_detail("failed_step", serde_json::Value::from(step_name))
+                .with_detail("error_kind", serde_json::Value::from(error_kind));
+        }
         let reasons: Vec<serde_json::Value> = summary
             .reasons
             .iter()
             .map(|r| serde_json::Value::from(r.as_str()))
             .collect();
         problem = problem.with_detail("reasons", serde_json::Value::Array(reasons));
+        if key_path.is_some() {
+            if let Ok((record, Some(env))) = assemble_and_sign_run_record(run_dir, key_path) {
+                write_record(req, run_dir, &env)?;
+                problem = problem.with_detail("run_digest", run_digest(&record)?);
+            }
+        }
         return Ok(problem);
     }
 
-    // 9. For resolved / review runs, assemble and sign the run record from the run directory
+    // 8. Resolved / review runs: assemble and sign the run record from the run directory
     let (record, envelope) = assemble_and_sign_run_record(run_dir, key_path)
         .map_err(|e| BackendError::Internal(format!("failed to assemble run record: {e}")))?;
-
-    let record_path = run_dir.join("record.json");
     if let Some(ref env) = envelope {
-        write_signed_run_record(&record_path, env)
-            .map_err(|e| BackendError::Internal(format!("failed to write signed record: {e}")))?;
-        if let Some(ref out_path) = req.out {
-            write_signed_run_record(out_path, env).map_err(|e| {
-                BackendError::Internal(format!("failed to write signed record to out: {e}"))
-            })?;
-        }
+        write_record(req, run_dir, env)?;
     } else {
         let record_json = serde_json::to_vec_pretty(&record)
             .map_err(|_| BackendError::Internal("failed to serialize run record".to_string()))?;
-        hermetic_attest::safe_atomic_write_file(&record_path, &record_json)
+        hermetic_attest::safe_atomic_write_file(&run_dir.join("record.json"), &record_json)
             .map_err(|_| BackendError::Io("failed to write record.json".to_string()))?;
         if let Some(ref out_path) = req.out {
             hermetic_attest::safe_atomic_write_file(out_path, &record_json)
                 .map_err(|_| BackendError::Io("failed to write record.json to out".to_string()))?;
         }
     }
-
     let final_status = attest_status_as_str(&record.run_status);
     let mut outcome = Outcome::success(format!("run completed: status {final_status}"))
         .with_detail("status", serde_json::Value::from(final_status))
@@ -333,14 +343,43 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
             "unclean_shutdown",
             serde_json::Value::from(summary.unclean_shutdown),
         );
-
     if envelope.is_some() {
-        let digest = hermetic_attest::compute_run_digest(&record)
-            .map_err(|e| BackendError::Internal(format!("failed to compute run digest: {e}")))?;
-        outcome = outcome.with_detail("run_digest", serde_json::Value::from(digest.to_string()));
+        outcome = outcome.with_detail("run_digest", run_digest(&record)?);
     }
-
     Ok(outcome)
+}
+
+fn write_record(
+    req: &RunRequest,
+    run_dir: &Path,
+    env: &hermetic_attest::DsseEnvelope,
+) -> Result<(), BackendError> {
+    write_signed_run_record(&run_dir.join("record.json"), env)
+        .map_err(|e| BackendError::Internal(format!("failed to write signed record: {e}")))?;
+    if let Some(ref out_path) = req.out {
+        write_signed_run_record(out_path, env).map_err(|e| {
+            BackendError::Internal(format!("failed to write signed record to out: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn run_digest(record: &hermetic_attest::RunRecord) -> Result<serde_json::Value, BackendError> {
+    let digest = hermetic_attest::compute_run_digest(record)
+        .map_err(|e| BackendError::Internal(format!("failed to compute run digest: {e}")))?;
+    Ok(serde_json::Value::from(digest.to_string()))
+}
+
+pub fn attest_status_as_str(status: &hermetic_attest::RunStatus) -> &'static str {
+    match status {
+        hermetic_attest::RunStatus::Resolved => "resolved",
+        hermetic_attest::RunStatus::Unresolved => "unresolved",
+        hermetic_attest::RunStatus::Tampered => "tampered",
+        hermetic_attest::RunStatus::LimitExceeded => "limit_exceeded",
+        hermetic_attest::RunStatus::Review => "review",
+        hermetic_attest::RunStatus::InfraError => "infra_error",
+        hermetic_attest::RunStatus::GateBlocked => "gate_blocked",
+    }
 }
 
 /// Production entry point for `hermetic-cli run`.
@@ -351,5 +390,28 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
 /// is exercised with an injected `Infra` in tests; no code path may fabricate VM,
 /// extraction or grading results.
 pub fn run_with_real_infra(_req: RunRequest) -> Result<Outcome, BackendError> {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    let (fc, kernel, rootfs) = (
+        set("HERMETIC_FC_BIN"),
+        set("HERMETIC_KERNEL"),
+        set("HERMETIC_ROOTFS"),
+    );
+    if fc || kernel || rootfs {
+        // Name the first missing input so a misconfigured host is easy to diagnose.
+        if !fc {
+            return Err(BackendError::Unavailable("HERMETIC_FC_BIN must be set"));
+        }
+        if !kernel {
+            return Err(BackendError::Unavailable("HERMETIC_KERNEL must be set"));
+        }
+        if !rootfs {
+            return Err(BackendError::Unavailable("HERMETIC_ROOTFS must be set"));
+        }
+        if !set("HERMETIC_RUN_DIR") {
+            return Err(BackendError::Unavailable(
+                "HERMETIC_RUN_DIR must be set to a directory outside the sealed world",
+            ));
+        }
+    }
     Err(BackendError::Unavailable(RUN_NOT_WIRED))
 }

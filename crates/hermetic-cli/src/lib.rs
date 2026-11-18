@@ -5,6 +5,7 @@ pub mod backend;
 pub mod dispatch;
 pub mod fsutil;
 pub mod run_flow;
+pub mod seal;
 
 use std::ffi::OsString;
 use std::fmt;
