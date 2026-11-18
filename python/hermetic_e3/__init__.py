@@ -49,6 +49,18 @@ __all__ = [
     "bootstrap_confidence_interval",
     "evaluate_exit_criterion",
     "evaluate",
+    "FixtureTask",
+    "get_fixture_tasks",
+    "materialize_task",
+    "run_seeding_wizard",
+    "plant_seed",
+    "CHANNELS",
+    "CHANNEL_IDS",
+    "run_score_blind",
+    "evaluate_blind_cases",
+    "format_report_text",
+    "AggregateScoreReport",
+    "CaseScoreResult",
 ]
 
 # Named constant caps bounding every file read, validation pass, and loop.
@@ -143,5 +155,24 @@ from hermetic_e3.metrics import (  # noqa: E402
     evaluate_exit_criterion,
     to_permille_floor,
 )
+from hermetic_e3.fixtures import (  # noqa: E402
+    FixtureTask,
+    get_fixture_tasks,
+    materialize_task,
+)
+from hermetic_e3.seed_leaks import (  # noqa: E402
+    CHANNELS,
+    CHANNEL_IDS,
+    plant_seed,
+    run_seeding_wizard,
+)
+from hermetic_e3.score_blind import (  # noqa: E402
+    AggregateScoreReport,
+    CaseScoreResult,
+    evaluate_blind_cases,
+    format_report_text,
+    run_score_blind,
+)
+
 
 

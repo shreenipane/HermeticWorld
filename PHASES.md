@@ -12,7 +12,7 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | Phase | Verified checklist |
 |---|---|
 | 0: Vertical slice | done 10 of 10 |
-| 1: sealcheck | done 42 of 48 |
+| 1: sealcheck | done 43 of 49 |
 | 2: World | done 33 of 45 |
 | 3: VMs | done 50 of 67 |
 | 3b: Clock hiding | done 18 of 20 |
@@ -122,6 +122,7 @@ The oracle passes on every slice task, and one agent run is graded.
 - [x] JSON and SARIF output; exit code 2 on an agent-visible gate finding (TR-SC-8) (T1.1). Proof: `test_cli_execution`, `cli_sarif_query_and_scan_properties` (`crates/hermetic-sealcheck/tests/`).
 - [x] Layer index plus per-task query, under 5 s (TR-SC-10). Proof: `perf_query_50mb_5000_files_under_5s` (`crates/hermetic-sealcheck/tests/test_index.rs`).
 - [ ] remaining: E3 corpus: seeded leaks (done, T1.5: precision 100%, recall 89.8% on 175 cases), blind-seeded leaks from a second person, and real leaks (pytest-6202, SWE-Bench+ cases, the Cybench config), including deletion-only and one-character fixes, patch files, archives and SQLite
+  - [x] Blind-seeding wizard tool (`python -m hermetic_e3.seed_leaks`, `scripts/e3-seed-leaks.sh`) and scoring harness (`python -m hermetic_e3.score_blind`): guided terminal wizard for a second person (the project owner) to plant seeds or harmless decoys across 8 channels (code comment, docs/README line, config value, test file, file name, archive member, SQLite row, patch file), writing private answer key (mode 0600) under `~/.hermetic-e3-blind/` outside the repository; scoring harness evaluates precision, recall, and per-channel counts with details concealed unless `--reveal`; Ctrl-C safety leaves nothing half-written. Proof: `python/tests/test_blind_seeding.py` (10 tests). The blind run itself remains for the owner.
 - [ ] remaining: Calibrate the tier-1 and tier-2 thresholds against E3
 
 ### Exit
