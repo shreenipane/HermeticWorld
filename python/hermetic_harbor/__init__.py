@@ -41,6 +41,7 @@ from .task import (
     parse_task_toml,
 )
 from .verifier import (
+    GraderVerifierRunner,
     VerificationResult,
     extract_declared_artifacts,
     run_harbor_verification,
@@ -49,6 +50,7 @@ from .verifier import (
 __all__ = [
     "EnvironmentCapabilities",
     "ExecResult",
+    "GraderVerifierRunner",
     "HARBOR_RELEASE_DATE",
     "HarborConfigError",
     "HarborDependencyError",

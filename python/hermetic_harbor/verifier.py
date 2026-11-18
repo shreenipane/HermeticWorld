@@ -46,6 +46,44 @@ MAX_VERIFIER_OUTPUT_BYTES = 1024 * 1024  # 1 MiB
 
 
 @dataclass(frozen=True)
+class GraderVerifierRunner:
+    """Isolated GraderVM runner for Harbor verification (TR-HB-1).
+
+    Contract: executes verification commands inside the project's isolated grader
+    runner (GraderVM / hermetic-run grader runner).
+    """
+    argv: tuple[str, ...]
+    timeout_s: float = 300.0
+    env: dict[str, str] = field(default_factory=dict)
+
+    def __call__(
+        self,
+        argv: list[str],
+        cwd: str,
+        env: dict[str, str],
+        timeout: float,
+    ) -> dict[str, Any]:
+        if not self.argv:
+            raise HarborVerificationError("Empty grader runner command")
+        sub_env = dict(env)
+        sub_env.update(self.env)
+        eff_timeout = min(timeout, self.timeout_s) if self.timeout_s > 0 else timeout
+        proc = subprocess.run(
+            [*self.argv, *argv],
+            cwd=cwd,
+            capture_output=True,
+            env=sub_env,
+            timeout=eff_timeout,
+            check=False,
+        )
+        return {
+            "stdout": proc.stdout[:MAX_VERIFIER_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+            "stderr": proc.stderr[:MAX_VERIFIER_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+            "return_code": proc.returncode,
+        }
+
+
+@dataclass(frozen=True)
 class VerificationResult:
     """Outcome of Harbor task verification."""
     status: str  # "resolved", "unresolved", "tampered", "timeout", "error"
@@ -135,11 +173,18 @@ def run_harbor_verification(
 ) -> VerificationResult:
     """Execute Harbor verification matching TR-HB-1.
 
+    Grading of agent artifacts must never run on the host. An isolated grader runner
+    (GraderVM / hermetic-run grader runner) must be configured; with no isolated runner
+    configured, verification fails closed immediately before accessing the agent tree.
+
     In separate-verifier mode:
     1. Extracts declared artifacts via ExtractorVM logic.
     2. Runs verifier tests in the verifier sandbox via GraderVM logic.
     3. Emits /logs/verifier/reward.txt and writes test logs.
     """
+    if runner is None or not callable(runner):
+        raise HarborVerificationError("Isolated grader runner is required; host execution is prohibited")
+
     logs_p = Path(os.fspath(logs_dir)).resolve()
     verifier_log_dir = logs_p / "verifier"
     verifier_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -190,41 +235,19 @@ def run_harbor_verification(
         "SOURCE_DATE_EPOCH": str(t_clock),
     }
 
-    if runner is not None:
-        try:
-            res = runner(argv, str(target_work_dir), clean_env, timeout)
-            stdout = res.get("stdout", "")
-            stderr = res.get("stderr", "")
-            rc = res.get("return_code", 0)
-        except subprocess.TimeoutExpired:
-            rc = 124
-            stdout = ""
-            stderr = "Verifier execution timed out"
-        except Exception:
-            rc = 1
-            stdout = ""
-            stderr = "Verifier runner failed"
-    else:
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(target_work_dir),
-                capture_output=True,
-                env=clean_env,
-                timeout=timeout,
-                check=False,
-            )
-            stdout = proc.stdout[:MAX_VERIFIER_OUTPUT_BYTES].decode("utf-8", errors="replace")
-            stderr = proc.stderr[:MAX_VERIFIER_OUTPUT_BYTES].decode("utf-8", errors="replace")
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            rc = 124
-            stdout = ""
-            stderr = "Verifier execution timed out"
-        except Exception:
-            rc = 1
-            stdout = ""
-            stderr = "Verifier execution failed"
+    try:
+        res = runner(argv, str(target_work_dir), clean_env, timeout)
+        stdout = res.get("stdout", "")
+        stderr = res.get("stderr", "")
+        rc = res.get("return_code", 0)
+    except subprocess.TimeoutExpired:
+        rc = 124
+        stdout = ""
+        stderr = "Verifier execution timed out"
+    except Exception:
+        rc = 1
+        stdout = ""
+        stderr = "Verifier runner failed"
 
     # Determine reward and status
     reasons: list[str] = []

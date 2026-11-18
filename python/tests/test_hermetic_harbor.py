@@ -62,6 +62,7 @@ from hermetic_harbor.task import (
     validate_artifact_path,
 )
 from hermetic_harbor.verifier import (
+    GraderVerifierRunner,
     VerificationResult,
     extract_declared_artifacts,
     run_harbor_verification,
@@ -443,7 +444,56 @@ environment_mode = "separate"
 # ---------------------------------------------------------------------------
 
 
-def test_separate_verifier_gold_artifact_passes(tmp_path):
+@pytest.fixture
+def isolated_test_runner():
+    """Test-only in-process runner fixture that NEVER imports agent-controlled code.
+
+    Evaluates test commands offline using pure AST syntax inspection and synthetic
+    dispatch, ensuring host-side import of arbitrary agent code never occurs.
+    """
+    def runner(argv: list[str], cwd: str, env: dict[str, str], timeout: float) -> dict[str, Any]:
+        p_cwd = Path(cwd)
+        cmd_str = argv[-1] if argv else ""
+
+        if "echo hello" in cmd_str:
+            return {"stdout": "hello\n", "stderr": "", "return_code": 0}
+
+        state_test = p_cwd / "tests" / "test_state.py"
+        if state_test.exists():
+            return {"stdout": "tests/test_state.py::test_ok PASSED\n", "stderr": "", "return_code": 0}
+
+        calc_path = p_cwd / "calc.py"
+        if calc_path.exists():
+            try:
+                import ast
+                code_text = calc_path.read_text(encoding="utf-8")
+                tree = ast.parse(code_text)
+                is_gold = False
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef) and node.name == "add":
+                        for stmt in node.body:
+                            if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.BinOp):
+                                if isinstance(stmt.value.op, ast.Add):
+                                    is_gold = True
+                                elif isinstance(stmt.value.op, ast.Sub):
+                                    is_gold = False
+                if is_gold:
+                    return {"stdout": "1 passed in 0.01s\n", "stderr": "", "return_code": 0}
+                else:
+                    return {
+                        "stdout": "1 failed in 0.01s\n",
+                        "stderr": "AssertionError: assert add(2, 3) == 5\n",
+                        "return_code": 1,
+                    }
+            except Exception as exc:
+                return {"stdout": "", "stderr": f"Syntax error: {exc}", "return_code": 1}
+
+        return {"stdout": "", "stderr": "No tests run", "return_code": 0}
+
+    return runner
+
+
+def test_separate_verifier_gold_artifact_passes(tmp_path, isolated_test_runner):
     # Setup agent workspace where agent created calc.py
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir(mode=0o700)
@@ -481,6 +531,7 @@ def test_add():
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     assert res.status == "resolved"
@@ -498,7 +549,7 @@ def test_add():
     assert data["reward"] == 1.0
 
 
-def test_separate_verifier_buggy_artifact_fails(tmp_path):
+def test_separate_verifier_buggy_artifact_fails(tmp_path, isolated_test_runner):
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir(mode=0o700)
     buggy_code = "def add(a, b): return a - b\n"  # Buggy
@@ -534,6 +585,7 @@ def test_add():
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     assert res.status == "unresolved"
@@ -545,7 +597,7 @@ def test_add():
     assert reward_file.read_text().strip() == "0.0"
 
 
-def test_separate_verifier_drops_undeclared_agent_modifications(tmp_path):
+def test_separate_verifier_drops_undeclared_agent_modifications(tmp_path, isolated_test_runner):
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir(mode=0o700)
     (agent_dir / "calc.py").write_text("def add(a, b): return a + b\n")
@@ -581,6 +633,7 @@ def test_add(): assert add(1, 1) == 2
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     assert res.status == "resolved"
@@ -590,7 +643,7 @@ def test_add(): assert add(1, 1) == 2
     assert not (verifier_dir / "test_sneaked.py").exists()
 
 
-def test_separate_verifier_refuses_symlinked_artifact(tmp_path):
+def test_separate_verifier_refuses_symlinked_artifact(tmp_path, isolated_test_runner):
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir(mode=0o700)
 
@@ -613,6 +666,7 @@ def test_separate_verifier_refuses_symlinked_artifact(tmp_path):
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     assert res.status == "tampered"
@@ -621,7 +675,7 @@ def test_separate_verifier_refuses_symlinked_artifact(tmp_path):
     assert (logs_dir / "verifier" / "reward.txt").read_text().strip() == "0.0"
 
 
-def test_shared_verifier_mode_records_shared_isolation(tmp_path):
+def test_shared_verifier_mode_records_shared_isolation(tmp_path, isolated_test_runner):
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir(mode=0o700)
     (agent_dir / "tests").mkdir(mode=0o700)
@@ -644,6 +698,7 @@ def test_shared_verifier_mode_records_shared_isolation(tmp_path):
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     assert res.status == "resolved"
@@ -655,7 +710,7 @@ def test_shared_verifier_mode_records_shared_isolation(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_no_host_environment_or_paths_in_output_or_errors(tmp_path, monkeypatch):
+def test_no_host_environment_or_paths_in_output_or_errors(tmp_path, monkeypatch, isolated_test_runner):
     host_secret = "sensitive-host-identity-token-998877"
     for var in ("USER", "LOGNAME", "HOSTNAME", "HOME", "HOST_TOKEN"):
         monkeypatch.setenv(var, host_secret)
@@ -681,6 +736,7 @@ def test_no_host_environment_or_paths_in_output_or_errors(tmp_path, monkeypatch)
         agent_work_dir=agent_dir,
         verifier_tree_dir=verifier_dir,
         logs_dir=logs_dir,
+        runner=isolated_test_runner,
     )
 
     reward_content = (logs_dir / "verifier" / "reward.txt").read_text()
@@ -692,6 +748,178 @@ def test_no_host_environment_or_paths_in_output_or_errors(tmp_path, monkeypatch)
     with pytest.raises(HarborError) as exc_info:
         register_hermetic(raise_if_missing=True)
     assert host_secret not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# 7. Regression Tests: CWE-653 Refusal of Host Execution & Runner Verification
+# ---------------------------------------------------------------------------
+
+
+def test_verifier_refuses_runner_none_without_importing_agent_tree(tmp_path):
+    """Regression: runner=None refuses before importing or executing anything from agent tree.
+
+    If the agent-controlled file were imported or executed on the host, it would create
+    a marker file. The verifier must fail closed with HarborVerificationError and the
+    marker must never exist.
+    """
+    marker = tmp_path / "hostile_agent_code_executed.marker"
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir(mode=0o700)
+
+    # Hostile code that creates marker if imported or evaluated
+    hostile_code = f"""
+import pathlib
+pathlib.Path({str(marker)!r}).write_text("HOST_COMPROMISED")
+def add(a, b): return a + b
+"""
+    (agent_dir / "calc.py").write_text(hostile_code)
+
+    verifier_dir = tmp_path / "verifier"
+    verifier_dir.mkdir(mode=0o700)
+    (verifier_dir / "tests").mkdir(mode=0o700)
+    (verifier_dir / "tests" / "test_calc.py").write_text("def test_dummy(): pass\n")
+
+    logs_dir = tmp_path / "logs"
+
+    cfg = TaskConfig(
+        name="test-fail-closed-none",
+        artifacts=("calc.py",),
+        verifier=VerifierConfig(
+            environment_mode="separate",
+            test_command="python3 -m pytest -q tests/test_calc.py",
+        ),
+    )
+
+    # 1. Explicit runner=None
+    with pytest.raises(HarborVerificationError, match="Isolated grader runner is required"):
+        run_harbor_verification(
+            task_config=cfg,
+            agent_work_dir=agent_dir,
+            verifier_tree_dir=verifier_dir,
+            logs_dir=logs_dir,
+            runner=None,
+        )
+    assert not marker.exists(), "Hostile agent file was imported or executed when runner=None!"
+
+    # 2. Omitted runner (default None)
+    with pytest.raises(HarborVerificationError, match="Isolated grader runner is required"):
+        run_harbor_verification(
+            task_config=cfg,
+            agent_work_dir=agent_dir,
+            verifier_tree_dir=verifier_dir,
+            logs_dir=logs_dir,
+        )
+    assert not marker.exists(), "Hostile agent file was imported or executed when runner omitted!"
+
+    # 3. Non-callable runner
+    with pytest.raises(HarborVerificationError, match="Isolated grader runner is required"):
+        run_harbor_verification(
+            task_config=cfg,
+            agent_work_dir=agent_dir,
+            verifier_tree_dir=verifier_dir,
+            logs_dir=logs_dir,
+            runner="invalid_non_callable",  # type: ignore[arg-type]
+        )
+    assert not marker.exists(), "Hostile agent file was imported or executed with invalid runner!"
+
+
+def test_verifier_uses_configured_isolated_runner(tmp_path):
+    """Regression: a configured isolated runner is used to execute verification."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir(mode=0o700)
+    (agent_dir / "calc.py").write_text("def add(a, b): return a + b\n")
+
+    verifier_dir = tmp_path / "verifier"
+    verifier_dir.mkdir(mode=0o700)
+    (verifier_dir / "tests").mkdir(mode=0o700)
+    (verifier_dir / "tests" / "test_calc.py").write_text("def test_ok(): pass\n")
+
+    logs_dir = tmp_path / "logs"
+
+    cfg = TaskConfig(
+        name="test-configured-isolated-runner",
+        artifacts=("calc.py",),
+        verifier=VerifierConfig(
+            environment_mode="separate",
+            test_command="python3 -m pytest -q tests/test_calc.py",
+            timeout_sec=42,
+        ),
+    )
+
+    recorded_calls: list[dict[str, Any]] = []
+
+    def mock_isolated_grader_runner(argv, cwd, env, timeout):
+        recorded_calls.append({
+            "argv": argv,
+            "cwd": cwd,
+            "env": env,
+            "timeout": timeout,
+        })
+        return {
+            "stdout": "isolated-grader: 1 passed in 0.02s\n",
+            "stderr": "",
+            "return_code": 0,
+        }
+
+    res = run_harbor_verification(
+        task_config=cfg,
+        agent_work_dir=agent_dir,
+        verifier_tree_dir=verifier_dir,
+        logs_dir=logs_dir,
+        runner=mock_isolated_grader_runner,
+    )
+
+    assert len(recorded_calls) == 1
+    assert recorded_calls[0]["cwd"] == str(verifier_dir.resolve())
+    assert recorded_calls[0]["timeout"] == 42.0
+    assert recorded_calls[0]["argv"] == [
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        "python3 -m pytest -q tests/test_calc.py",
+    ]
+    assert res.status == "resolved"
+    assert res.reward == 1.0
+    assert res.return_code == 0
+    assert res.stdout == "isolated-grader: 1 passed in 0.02s\n"
+
+
+def test_environment_exec_refuses_without_isolated_runner():
+    """Regression: HermeticEnvironment.exec fails closed without isolated runner or vsock."""
+    async def run():
+        env = HermeticEnvironment(
+            environment_name="test-fail-closed",
+            session_id="s-fail-closed",
+        )
+        await env.start()
+        with pytest.raises(HarborExecutionError, match="Isolated runner is required"):
+            await env.exec("echo hostile_command")
+
+    asyncio.run(run())
+
+
+def test_grader_verifier_runner_contract(tmp_path):
+    """Test GraderVerifierRunner wrapper invocation and empty command rejection."""
+    script = tmp_path / "mock_grader.py"
+    script.write_text("""#!/usr/bin/env python3
+import sys
+print("mock-grader-output")
+sys.exit(0)
+""")
+    script.chmod(0o700)
+
+    runner = GraderVerifierRunner(
+        argv=(sys.executable, str(script)),
+        timeout_s=15.0,
+    )
+    res = runner(["--check"], str(tmp_path), {}, 10.0)
+    assert res["return_code"] == 0
+    assert "mock-grader-output" in res["stdout"]
+
+    empty_runner = GraderVerifierRunner(argv=())
+    with pytest.raises(HarborVerificationError, match="Empty grader runner command"):
+        empty_runner(["--check"], str(tmp_path), {}, 10.0)
 
 
 # ---------------------------------------------------------------------------

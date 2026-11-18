@@ -265,41 +265,8 @@ class HermeticEnvironment(_Base):
             code = reply.get("code")
             return result_cls(stdout=text, stderr="", return_code=code if code is not None else 128)
 
-        # 3. Default fallback runner: isolated subprocess with sanitized environment
-        py_dir = str(Path(sys.executable).parent)
-        clean_env = {
-            "PATH": f"{py_dir}:/usr/local/bin:/usr/bin:/bin",
-            "LC_ALL": "C.UTF-8",
-            "LANG": "C.UTF-8",
-            "HOME": "/tmp",
-            "SOURCE_DATE_EPOCH": str(self.t_clock),
-        }
-        clean_env.update(cmd_env)
-
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                env=clean_env,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            raise HarborExecutionError("Command execution timed out") from None
-        except Exception as exc:
-            raise HarborExecutionError("Subprocess execution failed") from exc
-
-        stdout_bytes = proc.stdout[:MAX_OUTPUT_BYTES]
-        stderr_bytes = proc.stderr[:MAX_OUTPUT_BYTES]
-        self._output_bytes += len(stdout_bytes) + len(stderr_bytes)
-        if self._output_bytes > MAX_RUN_OUTPUT_BYTES:
-            raise HarborExecutionError("Environment cumulative output byte limit exceeded")
-
-        return result_cls(
-            stdout=stdout_bytes.decode("utf-8", errors="replace"),
-            stderr=stderr_bytes.decode("utf-8", errors="replace"),
-            return_code=proc.returncode,
-        )
+        # 3. Fail closed: host execution of agent commands is prohibited
+        raise HarborExecutionError("Isolated runner is required; host execution is prohibited")
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         """Upload a local file from the host into the environment using safe I/O."""
