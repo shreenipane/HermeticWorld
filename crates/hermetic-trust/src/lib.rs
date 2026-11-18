@@ -25,12 +25,12 @@ pub use install::{
     bundle_contains_cert, check_report_target_collision, encode_path_lossless, install_ca,
     install_ca_with_options, open_child_dir, open_dir_handle, open_parent_dir_handle,
     read_file_capped_from_parent, record_ownership_guard, resolve_in_rootfs, safe_join_rootfs,
-    safe_join_rootfs_from, set_before_dir_enum_hook_guard, set_before_use_hook_guard,
-    set_chown_failure_guard, BeforeDirEnumHookGuard, BeforeUseHookGuard, ChownFailureGuard,
-    GuestOwner, InstallOptions, InstallReport, OwnershipRecord, OwnershipRecordGuard,
-    OwnershipTarget, Resolution, SkippedPath, MAX_AGGREGATE_BYTES, MAX_CA_CERT_INPUT_BYTES,
-    MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES, MAX_REPORT_ENTRIES, MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
-    NEW_DIR_MODE, NEW_FILE_MODE,
+    safe_join_rootfs_from, set_before_dir_enum_hook_guard, set_before_mutation_hook_guard,
+    set_before_use_hook_guard, set_chown_failure_guard, BeforeDirEnumHookGuard,
+    BeforeMutationHookGuard, BeforeUseHookGuard, ChownFailureGuard, GuestOwner, InstallOptions,
+    InstallReport, OwnershipRecord, OwnershipRecordGuard, OwnershipTarget, Resolution, SkippedPath,
+    MAX_AGGREGATE_BYTES, MAX_CA_CERT_INPUT_BYTES, MAX_JKS_BYTES, MAX_PEM_BUNDLE_BYTES,
+    MAX_REPORT_ENTRIES, MAX_TREE_DEPTH, MAX_TREE_ENTRIES, NEW_DIR_MODE, NEW_FILE_MODE,
 };
 pub use jks::{
     compute_jks_integrity_hash, create_empty_jks, inject_ca_into_jks, is_pkcs12, parse_jks,

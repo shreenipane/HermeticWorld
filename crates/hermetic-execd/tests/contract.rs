@@ -663,6 +663,68 @@ fn upload_temporary_collisions_have_a_work_cap_and_preserve_existing_files() {
 }
 
 #[test]
+fn upload_publication_mid_race_replacement_is_refused() {
+    use std::os::unix::fs::symlink;
+    for use_symlink in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), b"outside secret").unwrap();
+
+        let mut root = Root::open_root(temp.path().to_str().unwrap()).unwrap();
+        let temp_dir = temp.path().to_path_buf();
+        let outside_target = outside.path().join("secret");
+
+        hermetic_execd::fs::test_hooks::set_before_rename_hook(move || {
+            for entry in fs::read_dir(&temp_dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".hermetic-upload-") {
+                    fs::remove_file(entry.path()).unwrap();
+                    if use_symlink {
+                        symlink(&outside_target, entry.path()).unwrap();
+                    } else {
+                        fs::write(entry.path(), b"adversary forged").unwrap();
+                    }
+                }
+            }
+        });
+
+        let res = root.atomic("/dest", b"clean payload", 1700000000);
+        assert_eq!(res, Err(Error::InvalidInput));
+
+        // Destination must not exist
+        assert!(!temp.path().join("dest").exists());
+        // Outside file must remain untouched
+        assert_eq!(
+            fs::read(outside.path().join("secret")).unwrap(),
+            b"outside secret"
+        );
+
+        // The adversary entry was not deleted by error recovery
+        let mut found_replaced = false;
+        for entry in fs::read_dir(temp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".hermetic-upload-") {
+                found_replaced = true;
+                if use_symlink {
+                    let meta = fs::symlink_metadata(entry.path()).unwrap();
+                    assert!(meta.file_type().is_symlink());
+                } else {
+                    assert_eq!(fs::read(entry.path()).unwrap(), b"adversary forged");
+                }
+            }
+        }
+        assert!(
+            found_replaced,
+            "symlink={use_symlink}: adversary entry deleted"
+        );
+    }
+}
+
+#[test]
 fn transfers_refuse_regular_looking_pseudo_files() {
     let root = Root::open_root("/").unwrap();
     assert!(fs::metadata("/proc/version").unwrap().is_file());

@@ -523,7 +523,7 @@ impl LogManager {
             map.insert(format!("{auth} {pq} {status}"), entry);
         }
         let data = serde_json::to_vec_pretty(&map)?;
-        self.directory()?.atomic_write(
+        self.directory()?.atomic_replace(
             Path::new("dedupe.json"),
             Path::new(".dedupe.json.tmp"),
             &data,
@@ -666,7 +666,7 @@ fn publish_head(directory: &Directory, name: &Path, head: &LogHead) -> io::Resul
     if data.len() as u64 > MAX_CHECKPOINT_BYTES {
         return Err(invalid());
     }
-    directory.atomic_write(name, Path::new(".head.tmp"), &data)
+    directory.atomic_replace(name, Path::new(".head.tmp"), &data)
 }
 pub fn write_head_atomic(head_path: &Path, head: &LogHead) -> io::Result<()> {
     let (directory, name) = directory_and_name(head_path)?;

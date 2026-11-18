@@ -155,6 +155,8 @@ impl Directory {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_raw_mode(0o600),
         )?);
+        let created_stat = fs::fstat(&file)?;
+        let expected_id = (created_stat.st_dev, created_stat.st_ino);
         let result = (|| {
             let mut total = 0u64;
             let mut buffer = [0u8; COPY_BUFFER_BYTES];
@@ -192,13 +194,35 @@ impl Directory {
             }
             fs::fchmod(&file, Mode::from_raw_mode(mode))?;
             file.sync_all()?;
+            let pre_stat = fs::statat(&self.0, &temp, AtFlags::SYMLINK_NOFOLLOW)?;
+            if (pre_stat.st_dev, pre_stat.st_ino) != expected_id {
+                return Err(Error::Validation("temporary entry replaced"));
+            }
+            #[cfg(test)]
+            test_hooks::run_before_rename_hook();
+            let pre_stat2 = fs::statat(&self.0, &temp, AtFlags::SYMLINK_NOFOLLOW)?;
+            if (pre_stat2.st_dev, pre_stat2.st_ino) != expected_id {
+                return Err(Error::Validation("temporary entry replaced"));
+            }
             fs::renameat_with(&self.0, &temp, &self.0, name, fs::RenameFlags::NOREPLACE)?;
+            let post_stat = fs::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if (post_stat.st_dev, post_stat.st_ino) != expected_id {
+                return Err(Error::Validation("destination entry replaced"));
+            }
+            let fcheck = fs::fstat(&file)?;
+            if (fcheck.st_dev, fcheck.st_ino) != expected_id {
+                return Err(Error::Validation("descriptor mismatch"));
+            }
             self.0.sync_all()?;
             remaining(end, "prepare-copy")?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::unlinkat(&self.0, &temp, AtFlags::empty());
+            if let Ok(st) = fs::statat(&self.0, &temp, AtFlags::SYMLINK_NOFOLLOW) {
+                if (st.st_dev, st.st_ino) == expected_id {
+                    let _ = fs::unlinkat(&self.0, &temp, AtFlags::empty());
+                }
+            }
         }
         result
     }
@@ -542,6 +566,38 @@ fn remove_contents(
 }
 
 #[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_RENAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub fn set_before_rename_hook<F: FnMut() + 'static>(f: F) {
+        BEFORE_RENAME_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(f));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_before_rename_hook() {
+        BEFORE_RENAME_HOOK.with(|h| {
+            *h.borrow_mut() = None;
+        });
+    }
+
+    pub fn run_before_rename_hook() {
+        let mut hook = None;
+        BEFORE_RENAME_HOOK.with(|h| {
+            hook = h.borrow_mut().take();
+        });
+        if let Some(mut f) = hook {
+            f();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -664,5 +720,63 @@ mod tests {
             b"payload"
         );
         assert!(!temp.path().join(".image.tmp").exists());
+    }
+
+    #[test]
+    fn publication_refuses_when_temporary_entry_replaced_mid_publication() {
+        use std::os::unix::fs::symlink;
+        for use_symlink in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("sentinel"), b"outside secret").unwrap();
+
+            let dir = Directory::open(temp.path().to_str().unwrap()).unwrap();
+            fs::fchmod(&dir.0, Mode::from_raw_mode(0o700)).unwrap();
+            let end = crate::deadline(std::time::Duration::from_secs(2)).unwrap();
+            let mut source = tempfile::tempfile().unwrap();
+            source.write_all(b"payload").unwrap();
+            source.rewind().unwrap();
+
+            let temp_dir = temp.path().to_path_buf();
+            let outside_target = outside.path().join("sentinel");
+
+            test_hooks::set_before_rename_hook(move || {
+                let tmp_path = temp_dir.join(".image.tmp");
+                if tmp_path.exists() {
+                    std::fs::remove_file(&tmp_path).unwrap();
+                    if use_symlink {
+                        symlink(&outside_target, &tmp_path).unwrap();
+                    } else {
+                        std::fs::write(&tmp_path, b"forged-replacement").unwrap();
+                    }
+                }
+            });
+
+            let mut budget = 4096;
+            let res = dir.publish("image", Some(&mut source), false, (0, 0), &mut budget, end);
+            assert!(matches!(
+                res,
+                Err(Error::Validation("temporary entry replaced"))
+            ));
+
+            // Destination image must not exist
+            assert!(!temp.path().join("image").exists());
+
+            // Outside secret must remain untouched
+            assert_eq!(
+                std::fs::read(outside.path().join("sentinel")).unwrap(),
+                b"outside secret"
+            );
+
+            // Replaced temporary entry must NOT have been unlinked
+            let tmp_path = temp.path().join(".image.tmp");
+            assert!(tmp_path.exists());
+            if use_symlink {
+                let meta = std::fs::symlink_metadata(&tmp_path).unwrap();
+                assert!(meta.file_type().is_symlink());
+            } else {
+                assert_eq!(std::fs::read(&tmp_path).unwrap(), b"forged-replacement");
+            }
+        }
     }
 }

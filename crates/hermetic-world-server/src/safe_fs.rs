@@ -259,6 +259,17 @@ impl Directory {
         self.0.sync_all()
     }
 
+    pub fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        rustix::fs::renameat_with(
+            &*self.0,
+            from,
+            &*self.0,
+            to,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn atomic_write(&self, name: &Path, temp: &Path, data: &[u8]) -> io::Result<()> {
         if data.len() > MAX_ATOMIC_WRITE_BYTES {
             return Err(invalid());
@@ -266,9 +277,22 @@ impl Directory {
         // Refuse before any artifact is created or removed.
         self.check_exclusive()?;
         self.validate_atomic_write(name, temp)?;
-        // Check the destination before creating any temporary artifact.
+        // Check the destination before creating any temporary artifact:
+        // publication uses renameat2(RENAME_NOREPLACE) and refuses to overwrite an existing destination.
         let destination = self.path(name)?;
         let temporary = self.path(temp)?;
+
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("destination '{}' already exists", name.display()),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+        }
+
         match fs::symlink_metadata(&temporary) {
             Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => return Err(invalid()),
             Ok(_) => {
@@ -290,15 +314,18 @@ impl Directory {
             file.sync_all()?;
             #[cfg(test)]
             publication_tests::at_boundary(temp, "synced");
-            // rename(2) works on names, so the temporary name is bound to the
-            // written descriptor immediately before and the destination
-            // immediately after: a replaced staging entry is never accepted.
-            // check_exclusive() leaves only this uid (or root) able to race
-            // the remaining window between these checks and the rename.
+            // renameat2(RENAME_NOREPLACE) ensures create-exclusive publication.
+            // Check temporary entry dev/ino immediately before rename.
             if !entry_is(&temporary, id)? {
                 return Err(invalid());
             }
-            fs::rename(&temporary, &destination)?;
+            rustix::fs::renameat_with(
+                &self.0,
+                temp,
+                &self.0,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )?;
             if !entry_is(&destination, id)? {
                 return Err(invalid());
             }
@@ -306,6 +333,144 @@ impl Directory {
         })();
         if result.is_err() && entry_is(&temporary, id).unwrap_or(false) {
             // Remove only the artifact this call created, never a replacement.
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+
+    /// Explicit, documented replace path for callers that legitimately replace an existing file
+    /// (such as updating dedupe index or head checkpoint).
+    ///
+    /// Writes to a temporary staging file, syncs, and atomically replaces `name` while
+    /// verifying the replaced inode. If a same-uid process attempts to swap or redirect the destination
+    /// file before replacement, the mismatch is detected and the operation is refused.
+    pub fn atomic_replace(&self, name: &Path, temp: &Path, data: &[u8]) -> io::Result<()> {
+        if data.len() > MAX_ATOMIC_WRITE_BYTES {
+            return Err(invalid());
+        }
+        self.check_exclusive()?;
+        self.validate_atomic_write(name, temp)?;
+        let destination = self.path(name)?;
+        let temporary = self.path(temp)?;
+
+        match fs::symlink_metadata(&temporary) {
+            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => return Err(invalid()),
+            Ok(_) => {
+                fs::remove_file(&temporary)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+        }
+
+        // Record expected destination identity before writing or syncing the staging file.
+        let initial_dest_id = match fs::symlink_metadata(&destination) {
+            Ok(dest_meta) => {
+                if !dest_meta.is_file() || dest_meta.file_type().is_symlink() {
+                    return Err(invalid());
+                }
+                Some((dest_meta.dev(), dest_meta.ino()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        let mut file = self.open_file(temp, true, true)?;
+        let written = file.metadata()?;
+        let id = (written.dev(), written.ino());
+        #[cfg(test)]
+        publication_tests::at_boundary(temp, "created");
+        let result = (|| {
+            file.write_all(data)?;
+            #[cfg(test)]
+            publication_tests::at_boundary(temp, "written");
+            file.sync_all()?;
+            #[cfg(test)]
+            {
+                publication_tests::at_boundary(temp, "synced");
+                publication_tests::at_boundary(name, "synced");
+            }
+
+            if !entry_is(&temporary, id)? {
+                return Err(invalid());
+            }
+
+            let Some(expected_replaced_id) = initial_dest_id else {
+                // Destination did not exist initially: attempt create-exclusive rename.
+                rustix::fs::renameat_with(
+                    &self.0,
+                    temp,
+                    &self.0,
+                    name,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                )?;
+                if !entry_is(&destination, id)? {
+                    return Err(invalid());
+                }
+                return self.sync();
+            };
+
+            #[cfg(test)]
+            {
+                publication_tests::at_boundary(name, "before_replace");
+                publication_tests::at_boundary(temp, "before_replace");
+            }
+
+            // RENAME_EXCHANGE atomically swaps temporary and destination.
+            rustix::fs::renameat_with(
+                &self.0,
+                temp,
+                &self.0,
+                name,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )?;
+
+            // Verify that what was swapped into temporary is exactly the expected replaced inode.
+            let swapped_meta = match fs::symlink_metadata(&temporary) {
+                Ok(m) => (m.dev(), m.ino()),
+                Err(_) => {
+                    let _ = rustix::fs::renameat_with(
+                        &self.0,
+                        temp,
+                        &self.0,
+                        name,
+                        rustix::fs::RenameFlags::EXCHANGE,
+                    );
+                    return Err(invalid());
+                }
+            };
+
+            if swapped_meta != expected_replaced_id {
+                // Inode mismatch: the destination was swapped out from under us!
+                // Swap back to restore, and refuse.
+                let _ = rustix::fs::renameat_with(
+                    &self.0,
+                    temp,
+                    &self.0,
+                    name,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                );
+                return Err(invalid());
+            }
+
+            // Verify destination now holds our written file.
+            if !matches!(entry_is(&destination, id), Ok(true)) {
+                let _ = rustix::fs::renameat_with(
+                    &self.0,
+                    temp,
+                    &self.0,
+                    name,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                );
+                return Err(invalid());
+            }
+
+            // Safely clean up the replaced old inode now in temporary.
+            let _ = fs::remove_file(&temporary);
+
+            self.sync()
+        })();
+
+        if result.is_err() && entry_is(&temporary, id).unwrap_or(false) {
             let _ = fs::remove_file(temporary);
         }
         result
@@ -472,7 +637,7 @@ mod publication_tests {
     }
 
     pub(super) fn at_boundary(temp: &Path, boundary: &str) {
-        if boundary == "synced" {
+        if boundary == "synced" || boundary == "before_replace" {
             let selected = REPLACE_AT.with(|point| {
                 let mut point = point.borrow_mut();
                 if point
@@ -485,7 +650,7 @@ mod publication_tests {
                 }
             });
             if let Some((name, dir, outside, use_symlink)) = selected {
-                // Atomically swap a forged entry in for the synced temporary.
+                // Atomically swap a forged entry in for the temporary or destination.
                 let staged = dir.join("forged.staging");
                 if use_symlink {
                     std::os::unix::fs::symlink(&outside, &staged).unwrap();
@@ -685,6 +850,235 @@ mod publication_tests {
                 assert_eq!(dedupe.values().map(|entry| entry.count).sum::<u64>(), 3);
                 assert!(!root.path().join(".head.tmp").exists());
                 assert!(!root.path().join(".dedupe.json.tmp").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn test_atomic_write_refuses_to_overwrite_existing_destination() {
+        let root = crate::safe_fs::private_tempdir().unwrap();
+        let dir = Directory::open(root.path()).unwrap();
+        let target = Path::new("dest.txt");
+        let temp = Path::new(".dest.tmp");
+
+        // First atomic_write creates and publishes successfully.
+        dir.atomic_write(target, temp, b"initial payload").unwrap();
+        assert_eq!(
+            fs::read(root.path().join(target)).unwrap(),
+            b"initial payload"
+        );
+        assert!(!root.path().join(temp).exists());
+
+        // Second atomic_write refuses to overwrite existing destination.
+        let err = dir
+            .atomic_write(target, temp, b"second payload")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(root.path().join(target)).unwrap(),
+            b"initial payload"
+        );
+        assert!(!root.path().join(temp).exists());
+
+        // Pre-existing file created outside atomic_write also causes immediate refusal.
+        let other = Path::new("preexisting.txt");
+        let other_temp = Path::new(".preexisting.tmp");
+        fs::write(root.path().join(other), b"adversary content").unwrap();
+        let err2 = dir
+            .atomic_write(other, other_temp, b"new content")
+            .unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(root.path().join(other)).unwrap(),
+            b"adversary content"
+        );
+        assert!(!root.path().join(other_temp).exists());
+    }
+
+    #[test]
+    fn test_atomic_replace_legitimate_replacement_and_inode_verification() {
+        let root = crate::safe_fs::private_tempdir().unwrap();
+        let dir = Directory::open(root.path()).unwrap();
+        let target = Path::new("replace.txt");
+        let temp = Path::new(".replace.tmp");
+
+        // Initial atomic_replace succeeds (creates new file).
+        dir.atomic_replace(target, temp, b"version 1").unwrap();
+        assert_eq!(fs::read(root.path().join(target)).unwrap(), b"version 1");
+        assert!(!root.path().join(temp).exists());
+
+        // Legitimate replacement succeeds and overwrites destination.
+        dir.atomic_replace(target, temp, b"version 2").unwrap();
+        assert_eq!(fs::read(root.path().join(target)).unwrap(), b"version 2");
+        assert!(!root.path().join(temp).exists());
+
+        // Another legitimate replacement.
+        dir.atomic_replace(target, temp, b"version 3").unwrap();
+        assert_eq!(fs::read(root.path().join(target)).unwrap(), b"version 3");
+        assert!(!root.path().join(temp).exists());
+    }
+
+    #[test]
+    fn test_atomic_replace_refuses_when_destination_inode_swapped() {
+        for use_symlink in [false, true] {
+            let root = crate::safe_fs::private_tempdir().unwrap();
+            let dir = Directory::open(root.path()).unwrap();
+            let target = Path::new("swapped.txt");
+            let temp = Path::new(".swapped.tmp");
+            let outside = root.path().join("outside.txt");
+            fs::write(&outside, b"outside secret").unwrap();
+
+            // Establish legitimate target file.
+            dir.atomic_replace(target, temp, b"original legitimate")
+                .unwrap();
+            assert_eq!(
+                fs::read(root.path().join(target)).unwrap(),
+                b"original legitimate"
+            );
+
+            // Setup hook: right before the exchange rename, swap the destination file with forged entry.
+            REPLACE_AT.with(|point| {
+                *point.borrow_mut() = Some((
+                    "swapped.txt".into(),
+                    root.path().to_path_buf(),
+                    outside.clone(),
+                    use_symlink,
+                ));
+            });
+
+            // atomic_replace should detect that destination inode was swapped out from under it and refuse.
+            let result = dir.atomic_replace(target, temp, b"tampered replacement");
+            assert!(
+                result.is_err(),
+                "symlink={use_symlink}: expected atomic_replace failure on swapped inode"
+            );
+
+            let fired = REPLACE_AT.with(|point| point.borrow_mut().take().is_none());
+            assert!(
+                fired,
+                "symlink={use_symlink}: replacement boundary hook was not called"
+            );
+
+            // Destination must NOT have been replaced by "tampered replacement".
+            if use_symlink {
+                let meta = fs::symlink_metadata(root.path().join(target)).unwrap();
+                assert!(meta.file_type().is_symlink());
+                assert_eq!(fs::read(&outside).unwrap(), b"outside secret");
+            } else {
+                assert_eq!(fs::read(root.path().join(target)).unwrap(), b"forged");
+            }
+            assert!(!root.path().join(temp).exists());
+        }
+    }
+
+    #[test]
+    fn test_atomic_replace_refuses_when_destination_inode_swapped_at_synced() {
+        for use_symlink in [false, true] {
+            let root = crate::safe_fs::private_tempdir().unwrap();
+            let dir = Directory::open(root.path()).unwrap();
+            let target = Path::new("swapped.txt");
+            let temp = Path::new(".swapped.tmp");
+            let outside = root.path().join("outside.txt");
+            fs::write(&outside, b"outside secret").unwrap();
+
+            // Establish legitimate target file.
+            dir.atomic_replace(target, temp, b"original legitimate")
+                .unwrap();
+            assert_eq!(
+                fs::read(root.path().join(target)).unwrap(),
+                b"original legitimate"
+            );
+
+            // Setup hook: at the synced boundary, swap the destination file with forged entry.
+            REPLACE_AT.with(|point| {
+                *point.borrow_mut() = Some((
+                    "swapped.txt".into(),
+                    root.path().to_path_buf(),
+                    outside.clone(),
+                    use_symlink,
+                ));
+            });
+
+            // atomic_replace should detect that destination inode was swapped during staging and refuse.
+            let result = dir.atomic_replace(target, temp, b"tampered replacement");
+            assert!(
+                result.is_err(),
+                "symlink={use_symlink}: expected atomic_replace failure on destination swapped at synced"
+            );
+
+            let fired = REPLACE_AT.with(|point| point.borrow_mut().take().is_none());
+            assert!(
+                fired,
+                "symlink={use_symlink}: replacement boundary hook was not called at synced"
+            );
+
+            // Substituted file must NOT be deleted, and destination must NOT have been replaced by tampered replacement.
+            if use_symlink {
+                let meta = fs::symlink_metadata(root.path().join(target)).unwrap();
+                assert!(meta.file_type().is_symlink());
+                assert_eq!(fs::read(&outside).unwrap(), b"outside secret");
+            } else {
+                assert_eq!(fs::read(root.path().join(target)).unwrap(), b"forged");
+            }
+            assert!(!root.path().join(temp).exists());
+        }
+    }
+
+    #[test]
+    fn test_atomic_replace_restores_destination_when_temp_swapped_before_exchange() {
+        for use_symlink in [false, true] {
+            let root = crate::safe_fs::private_tempdir().unwrap();
+            let dir = Directory::open(root.path()).unwrap();
+            let target = Path::new("target.txt");
+            let temp = Path::new(".target.tmp");
+            let outside = root.path().join("outside.txt");
+            fs::write(&outside, b"outside secret").unwrap();
+
+            // Establish legitimate target file.
+            dir.atomic_replace(target, temp, b"original destination")
+                .unwrap();
+            assert_eq!(
+                fs::read(root.path().join(target)).unwrap(),
+                b"original destination"
+            );
+
+            // Setup hook: immediately before the exchange rename, swap the temporary staging file with forged entry.
+            REPLACE_AT.with(|point| {
+                *point.borrow_mut() = Some((
+                    ".target.tmp".into(),
+                    root.path().to_path_buf(),
+                    outside.clone(),
+                    use_symlink,
+                ));
+            });
+
+            // atomic_replace should detect destination staging mismatch and restore destination.
+            let result = dir.atomic_replace(target, temp, b"tampered replacement");
+            assert!(
+                result.is_err(),
+                "symlink={use_symlink}: expected atomic_replace failure when temp swapped"
+            );
+
+            let fired = REPLACE_AT.with(|point| point.borrow_mut().take().is_none());
+            assert!(
+                fired,
+                "symlink={use_symlink}: replacement boundary hook was not called"
+            );
+
+            // Displaced destination must have been restored.
+            assert_eq!(
+                fs::read(root.path().join(target)).unwrap(),
+                b"original destination",
+                "symlink={use_symlink}: destination was not restored"
+            );
+
+            // Temporary file containing forged entry was not deleted by outer cleanup.
+            let temp_meta = fs::symlink_metadata(root.path().join(temp)).unwrap();
+            if use_symlink {
+                assert!(temp_meta.file_type().is_symlink());
+                assert_eq!(fs::read(&outside).unwrap(), b"outside secret");
+            } else {
+                assert_eq!(fs::read(root.path().join(temp)).unwrap(), b"forged");
             }
         }
     }

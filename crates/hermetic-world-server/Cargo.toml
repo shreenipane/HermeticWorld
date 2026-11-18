@@ -9,7 +9,7 @@ name = "hermetic-world-server"
 path = "src/main.rs"
 
 [dependencies]
-rustix = { version = "=1.1.6", features = ["net"] }
+rustix = { version = "=1.1.6", features = ["fs", "net"] }
 hermetic-common = { workspace = true }
 blake3 = { workspace = true }
 landlock = { workspace = true }

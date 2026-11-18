@@ -253,6 +253,8 @@ impl Root {
         }
         let (temp, fd) = created.ok_or(Error::Limit)?;
         let mut file = File::from(fd);
+        let created_stat = fs::fstat(&file)?;
+        let expected_id = (created_stat.st_dev, created_stat.st_ino);
         let result = (|| {
             file.write_all(data)?;
             if let Some((uid, gid)) = owner {
@@ -261,12 +263,41 @@ impl Root {
             fs::fchmod(&file, mode)?;
             stamp(&file, clock)?;
             file.sync_all()?;
+
+            // Verify dev/ino of open descriptor against temporary entry before rename.
+            let pre = fs::statat(&parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            if (pre.st_dev, pre.st_ino) != expected_id {
+                return Err(Error::InvalidInput);
+            }
+            test_hooks::run_before_rename_hook();
+            let pre2 = fs::statat(&parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            if (pre2.st_dev, pre2.st_ino) != expected_id {
+                return Err(Error::InvalidInput);
+            }
+
             fs::renameat(&parent, temp.as_str(), &parent, name.as_str())?;
+
+            // Verify dev/ino of destination entry after rename.
+            let post = fs::statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            if (post.st_dev, post.st_ino) != expected_id {
+                return Err(Error::InvalidInput);
+            }
+            let fcheck = fs::fstat(&file)?;
+            if (fcheck.st_dev, fcheck.st_ino) != expected_id {
+                return Err(Error::InvalidInput);
+            }
+
             fs::fsync(&parent)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::unlinkat(&parent, temp.as_str(), AtFlags::empty());
+            // Clean up temporary entry ONLY if it still holds our created inode.
+            // Never unlink a replacement entry or symlink installed by a concurrent guest process.
+            if let Ok(st) = fs::statat(&parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                if (st.st_dev, st.st_ino) == expected_id {
+                    let _ = fs::unlinkat(&parent, temp.as_str(), AtFlags::empty());
+                }
+            }
         }
         result
     }
@@ -317,6 +348,38 @@ pub fn stamp(fd: impl std::os::fd::AsFd, clock: i64) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_RENAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub fn set_before_rename_hook<F: FnMut() + 'static>(f: F) {
+        BEFORE_RENAME_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(f));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_before_rename_hook() {
+        BEFORE_RENAME_HOOK.with(|h| {
+            *h.borrow_mut() = None;
+        });
+    }
+
+    pub fn run_before_rename_hook() {
+        let mut hook = None;
+        BEFORE_RENAME_HOOK.with(|h| {
+            hook = h.borrow_mut().take();
+        });
+        if let Some(mut f) = hook {
+            f();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,5 +596,69 @@ mod tests {
             ),
             Err(Error::Timeout)
         );
+    }
+
+    #[test]
+    fn upload_refuses_when_temporary_entry_replaced_mid_publication() {
+        for use_symlink in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("sentinel"), b"outside secret").unwrap();
+
+            let mut root = Root::open_root(temp.path().to_str().unwrap()).unwrap();
+
+            let target = "/destination";
+            let outside_target = outside.path().join("sentinel");
+            let temp_dir = temp.path().to_path_buf();
+
+            test_hooks::set_before_rename_hook(move || {
+                for entry in std::fs::read_dir(&temp_dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(".hermetic-upload-") {
+                        std::fs::remove_file(entry.path()).unwrap();
+                        if use_symlink {
+                            symlink(&outside_target, entry.path()).unwrap();
+                        } else {
+                            std::fs::write(entry.path(), b"forged-replacement").unwrap();
+                        }
+                    }
+                }
+            });
+
+            let res = root.atomic(target, b"trusted-payload", 1700000000);
+            assert_eq!(res, Err(Error::InvalidInput));
+
+            // Destination must NOT exist
+            assert!(!temp.path().join("destination").exists());
+
+            // Outside secret must NOT be modified
+            assert_eq!(
+                std::fs::read(outside.path().join("sentinel")).unwrap(),
+                b"outside secret"
+            );
+
+            // Replaced temporary entry must NOT have been unlinked by error cleanup
+            let mut found_replaced = false;
+            for entry in std::fs::read_dir(temp.path()).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".hermetic-upload-") {
+                    found_replaced = true;
+                    if use_symlink {
+                        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+                        assert!(meta.file_type().is_symlink());
+                    } else {
+                        assert_eq!(std::fs::read(entry.path()).unwrap(), b"forged-replacement");
+                    }
+                }
+            }
+            assert!(
+                found_replaced,
+                "symlink={use_symlink}: replaced entry was deleted"
+            );
+        }
     }
 }

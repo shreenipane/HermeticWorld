@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::TrustError;
 use crate::jks::{inject_ca_into_jks, is_pkcs12};
+use cap_std::fs::{Dir, OpenOptionsExt};
 
 /// Skipped path entry in report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +282,7 @@ thread_local! {
     static THREAD_CHOWN_FAILURE: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
     static THREAD_BEFORE_USE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static THREAD_BEFORE_DIR_ENUM_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static THREAD_BEFORE_MUTATION_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static THREAD_OWNERSHIP_RECORDS: std::cell::RefCell<Option<Vec<OwnershipRecord>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -364,6 +366,18 @@ impl Drop for BeforeDirEnumHookGuard {
 pub fn set_before_dir_enum_hook_guard<F: Fn() + 'static>(f: F) -> BeforeDirEnumHookGuard {
     THREAD_BEFORE_DIR_ENUM_HOOK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
     BeforeDirEnumHookGuard
+}
+
+pub struct BeforeMutationHookGuard;
+impl Drop for BeforeMutationHookGuard {
+    fn drop(&mut self) {
+        THREAD_BEFORE_MUTATION_HOOK.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub fn set_before_mutation_hook_guard<F: Fn() + 'static>(f: F) -> BeforeMutationHookGuard {
+    THREAD_BEFORE_MUTATION_HOOK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    BeforeMutationHookGuard
 }
 
 /// Losslessly encode a filesystem path into a valid UTF-8 String for reporting.
@@ -451,15 +465,37 @@ pub fn open_child_dir<P: AsRef<std::ffi::OsStr> + ?Sized>(
     comp: &P,
 ) -> Result<fs::File, TrustError> {
     let comp = single_component(comp.as_ref())?;
-    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd)).join(comp);
-    let mut options = fs::OpenOptions::new();
+    let parent_file =
+        fs::File::open(format!("/proc/self/fd/{}", parent_fd)).map_err(TrustError::Io)?;
+    let parent_dir = Dir::from_std_file(parent_file);
+
+    let sym_meta = parent_dir.symlink_metadata(comp).map_err(|e| {
+        if e.raw_os_error() == Some(ELOOP) {
+            TrustError::Symlink("symlink target refused".to_string())
+        } else {
+            TrustError::Io(e)
+        }
+    })?;
+    if sym_meta.file_type().is_symlink() {
+        return Err(TrustError::Symlink("symlink target refused".to_string()));
+    }
+    if !sym_meta.file_type().is_dir() {
+        return Err(TrustError::Cert("not a directory".to_string()));
+    }
+
+    let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    }
-    let f = options.open(&proc_path).map_err(TrustError::Io)?;
+    options.custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    let child_cap_file = parent_dir.open_with(comp, &options).map_err(|e| {
+        if e.raw_os_error() == Some(ELOOP) {
+            TrustError::Symlink("symlink target refused".to_string())
+        } else {
+            TrustError::Io(e)
+        }
+    })?;
+    let f = child_cap_file.into_std();
     let meta = f.metadata()?;
     if !meta.file_type().is_dir() {
         return Err(TrustError::Cert("not a directory".to_string()));
@@ -610,10 +646,12 @@ fn create_dir_in(
     name: &OsStr,
     owner: GuestOwner,
 ) -> Result<fs::File, TrustError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
-    let path = proc_child(parent.as_raw_fd(), name);
-    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    let parent_file =
+        fs::File::open(format!("/proc/self/fd/{}", parent.as_raw_fd())).map_err(TrustError::Io)?;
+    let parent_dir = Dir::from_std_file(parent_file);
+    parent_dir.create_dir(name)?;
     let res = (|| -> Result<fs::File, TrustError> {
         let dir = open_child_dir(parent.as_raw_fd(), name)?;
         set_owner_fd(
@@ -628,7 +666,7 @@ fn create_dir_in(
         Ok(dir)
     })();
     if res.is_err() {
-        let _ = fs::remove_dir(&path);
+        let _ = parent_dir.remove_dir(name);
     }
     res
 }
@@ -639,7 +677,10 @@ type CreatedDirs = Vec<(fs::File, OsString)>;
 /// Remove directories recorded in `created`, deepest first.
 fn remove_created_dirs(created: CreatedDirs) {
     for (parent, name) in created.into_iter().rev() {
-        let _ = fs::remove_dir(proc_child(parent.as_raw_fd(), &name));
+        if let Ok(parent_file) = fs::File::open(format!("/proc/self/fd/{}", parent.as_raw_fd())) {
+            let parent_dir = Dir::from_std_file(parent_file);
+            let _ = parent_dir.remove_dir(&name);
+        }
     }
 }
 
@@ -678,16 +719,31 @@ pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
     cap: u64,
 ) -> Result<Vec<u8>, TrustError> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
 
     let file_name = single_component(file_name.as_ref())?;
-    let proc_path =
-        PathBuf::from(format!("/proc/self/fd/{}", parent_dir.as_raw_fd())).join(file_name);
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    let parent_file = fs::File::open(format!("/proc/self/fd/{}", parent_dir.as_raw_fd()))
+        .map_err(TrustError::Io)?;
+    let dir = Dir::from_std_file(parent_file);
+
+    let meta = dir.symlink_metadata(file_name).map_err(|e| {
+        if e.raw_os_error() == Some(ELOOP) {
+            TrustError::Symlink("symlink target refused".to_string())
+        } else {
+            TrustError::Io(e)
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(TrustError::Symlink("symlink target refused".to_string()));
+    }
+    if !meta.file_type().is_file() {
+        return Err(TrustError::Cert("not a regular file".to_string()));
+    }
+    if meta.len() > cap {
+        return Err(TrustError::Cert(format!(
+            "file exceeds size cap of {} bytes",
+            cap
+        )));
+    }
 
     THREAD_BEFORE_USE_HOOK.with(|cell| {
         if let Some(ref hook) = *cell.borrow() {
@@ -695,14 +751,20 @@ pub fn read_file_capped_from_parent<P: AsRef<std::ffi::OsStr> + ?Sized>(
         }
     });
 
-    let file = options.open(&proc_path).map_err(|e| {
-        #[cfg(unix)]
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+
+    let cap_file = dir.open_with(file_name, &options).map_err(|e| {
         if e.raw_os_error() == Some(ELOOP) {
-            return TrustError::Symlink("symlink target refused".to_string());
+            TrustError::Symlink("symlink target refused".to_string())
+        } else {
+            TrustError::Io(e)
         }
-        TrustError::Io(e)
     })?;
 
+    let file = cap_file.into_std();
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(TrustError::Cert("not a regular file".to_string()));
@@ -743,22 +805,22 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
     new_owner: GuestOwner,
 ) -> Result<(), TrustError> {
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
 
     let file_name = single_component(file_name.as_ref())?;
-    let parent_fd = parent_dir.as_raw_fd();
-    let target_proc_path = proc_child(parent_fd, file_name);
+    let parent_file = fs::File::open(format!("/proc/self/fd/{}", parent_dir.as_raw_fd()))
+        .map_err(TrustError::Io)?;
+    let dir = Dir::from_std_file(parent_file);
 
     // Validate target through handle with O_NOFOLLOW | O_NONBLOCK
-    let mut check_opts = fs::OpenOptions::new();
+    let mut check_opts = cap_std::fs::OpenOptions::new();
     check_opts.read(true);
     #[cfg(unix)]
     check_opts.custom_flags(O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 
-    let existing_meta = match check_opts.open(&target_proc_path) {
+    let existing_meta = match dir.open_with(file_name, &check_opts) {
         Ok(existing_file) => {
-            let meta = existing_file.metadata()?;
+            let meta = existing_file.into_std().metadata()?;
             if meta.file_type().is_symlink() {
                 return Err(TrustError::Symlink(format!(
                     "target '{}' is a symlink",
@@ -803,9 +865,8 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
                 .unwrap_or(0),
             attempt
         );
-        let tmp_proc_path = proc_child(parent_fd, OsStr::new(&tmp_name));
 
-        let mut options = fs::OpenOptions::new();
+        let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
@@ -813,11 +874,13 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
             options.mode(0o600);
         }
 
-        match options.open(&tmp_proc_path) {
-            Ok(mut temp_file) => {
+        match dir.open_with(&tmp_name, &options) {
+            Ok(mut temp_cap_file) => {
                 let write_res = (|| -> Result<(), TrustError> {
-                    temp_file.write_all(data)?;
-                    temp_file.sync_all()?;
+                    temp_cap_file.write_all(data)?;
+                    temp_cap_file.sync_all()?;
+
+                    let temp_file = temp_cap_file.into_std();
 
                     if let Some(ref meta) = existing_meta {
                         let target_uid = meta.uid();
@@ -858,8 +921,8 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
 
                     drop(temp_file);
 
-                    // Re-check target before replacement
-                    if let Ok(m) = fs::symlink_metadata(&target_proc_path) {
+                    // Re-check target before replacement through capability Dir
+                    if let Ok(m) = dir.symlink_metadata(file_name) {
                         if m.file_type().is_symlink() {
                             return Err(TrustError::Symlink(format!(
                                 "target '{}' is a symlink",
@@ -868,13 +931,22 @@ pub fn atomic_write_preserving_handle<P: AsRef<std::ffi::OsStr> + ?Sized>(
                         }
                     }
 
-                    // Replacement through directory handle
-                    fs::rename(&tmp_proc_path, &target_proc_path)?;
+                    // Replacement through directory handle (race-free renameat beneath dir)
+                    dir.rename(&tmp_name, &dir, file_name).map_err(|e| {
+                        if e.raw_os_error() == Some(ELOOP) {
+                            TrustError::Symlink(format!(
+                                "target '{}' is a symlink",
+                                file_name.to_string_lossy()
+                            ))
+                        } else {
+                            TrustError::Io(e)
+                        }
+                    })?;
                     Ok(())
                 })();
 
                 if write_res.is_err() {
-                    let _ = fs::remove_file(&tmp_proc_path);
+                    let _ = dir.remove_file(&tmp_name);
                 }
                 return write_res;
             }
@@ -1575,6 +1647,12 @@ pub fn install_ca_with_options(
     let mut first_existing_system_bundle: Option<String> = None;
 
     // PHASE 2: Execution (Handle-Anchored Mutations)
+    THREAD_BEFORE_MUTATION_HOOK.with(|cell| {
+        if let Some(ref hook) = *cell.borrow() {
+            hook();
+        }
+    });
+
     for cand in candidates {
         let is_system_bundle = cand.is_system_bundle();
 
@@ -1582,6 +1660,7 @@ pub fn install_ca_with_options(
             let (parent_dir, file_name) =
                 match open_parent_from_root(&root_handle, &cand.target_rel) {
                     Ok(p) => p,
+                    Err(TrustError::Symlink(s)) => return Err(TrustError::Symlink(s)),
                     Err(e) => {
                         skipped_paths.push(SkippedPath {
                             path: encode_path_lossless(&cand.target_rel),
@@ -1602,6 +1681,7 @@ pub fn install_ca_with_options(
                         Err(TrustError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                             Vec::new()
                         }
+                        Err(TrustError::Symlink(s)) => return Err(TrustError::Symlink(s)),
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
                                 path: encode_path_lossless(&cand.target_rel),
@@ -1646,6 +1726,7 @@ pub fn install_ca_with_options(
                                 successful_system_bundle_targets.insert(cand.target_rel.clone());
                             }
                         }
+                        Err(TrustError::Symlink(s)) => return Err(TrustError::Symlink(s)),
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
                                 path: encode_path_lossless(&cand.target_rel),
@@ -1661,6 +1742,7 @@ pub fn install_ca_with_options(
                         MAX_JKS_BYTES,
                     ) {
                         Ok(c) => c,
+                        Err(TrustError::Symlink(s)) => return Err(TrustError::Symlink(s)),
                         Err(e) => {
                             skipped_paths.push(SkippedPath {
                                 path: encode_path_lossless(&cand.target_rel),
@@ -1690,6 +1772,7 @@ pub fn install_ca_with_options(
                                 Ok(()) => {
                                     modified_paths.insert(cand.target_rel.clone());
                                 }
+                                Err(TrustError::Symlink(s)) => return Err(TrustError::Symlink(s)),
                                 Err(e) => {
                                     skipped_paths.push(SkippedPath {
                                         path: encode_path_lossless(&cand.target_rel),

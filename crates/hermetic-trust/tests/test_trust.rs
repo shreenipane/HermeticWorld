@@ -4001,3 +4001,119 @@ fn test_regression_strict_der_certificate_fields() {
         assert!(!installs(&pem), "{what} must be rejected");
     }
 }
+
+#[test]
+fn test_installer_race_component_swapped_for_symlink_between_steps() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"INITIAL_BUNDLE\n").expect("write bundle");
+
+    let outside_victim = temp_dir.path().join("victim_secret.txt");
+    fs::write(&outside_victim, b"OUTSIDE_SECRET_DO_NOT_TOUCH\n").expect("write victim");
+
+    let seed: [u8; 32] = [42u8; 32];
+    let ca = mint_ca("race-world", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let bundle_clone = bundle_path.clone();
+    let victim_clone = outside_victim.clone();
+
+    let _hook = hermetic_trust::set_before_use_hook_guard(move || {
+        let _ = fs::remove_file(&bundle_clone);
+        let _ = std::os::unix::fs::symlink(&victim_clone, &bundle_clone);
+    });
+
+    let result = install_ca(&rootfs, &ca.cert_pem);
+    drop(_hook);
+
+    assert!(
+        result.is_err(),
+        "Installer must refuse when target component is swapped for symlink"
+    );
+    assert_eq!(
+        fs::read(&outside_victim).expect("read victim"),
+        b"OUTSIDE_SECRET_DO_NOT_TOUCH\n"
+    );
+}
+
+#[test]
+fn test_installer_race_intermediate_component_swapped_between_steps() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let ssl_dir = rootfs.join("etc/ssl");
+    let certs_dir = ssl_dir.join("certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let bundle_path = certs_dir.join("ca-certificates.crt");
+    fs::write(&bundle_path, b"INITIAL_BUNDLE\n").expect("write bundle");
+
+    let outside_dir = temp_dir.path().join("outside_target_dir");
+    fs::create_dir_all(&outside_dir).expect("create outside dir");
+    let outside_canary = outside_dir.join("canary.txt");
+    fs::write(&outside_canary, b"CANARY_INITIAL").expect("write canary");
+
+    let seed: [u8; 32] = [43u8; 32];
+    let ca = mint_ca("race-world-2", datetime!(2024-01-01 00:00:00 UTC), &seed).expect("mint ca");
+
+    let ssl_clone = ssl_dir.clone();
+    let ssl_staged = rootfs.join("etc/ssl_staged");
+    let outside_clone = outside_dir.clone();
+
+    let _hook = hermetic_trust::set_before_mutation_hook_guard(move || {
+        if fs::rename(&ssl_clone, &ssl_staged).is_ok() {
+            let _ = std::os::unix::fs::symlink(&outside_clone, &ssl_clone);
+        }
+    });
+
+    let result = install_ca(&rootfs, &ca.cert_pem);
+    drop(_hook);
+
+    assert!(
+        result.is_err(),
+        "Installer must refuse when intermediate component is swapped for symlink"
+    );
+    assert_eq!(
+        fs::read(&outside_canary).expect("read canary"),
+        b"CANARY_INITIAL"
+    );
+    assert!(!outside_dir.join("ca-certificates.crt").exists());
+}
+
+#[test]
+fn test_installer_race_swapping_component_during_atomic_write_refuses() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs = temp_dir.path().join("rootfs");
+    let certs_dir = rootfs.join("etc/ssl/certs");
+    fs::create_dir_all(&certs_dir).expect("create certs");
+    let file_path = certs_dir.join("bundle.crt");
+    fs::write(&file_path, b"ORIGINAL_DATA").expect("write file");
+
+    let outside_file = temp_dir.path().join("outside_secret.txt");
+    fs::write(&outside_file, b"OUTSIDE_SECRET").expect("write secret");
+
+    let file_clone = file_path.clone();
+    let outside_clone = outside_file.clone();
+
+    let _hook = hermetic_trust::set_before_use_hook_guard(move || {
+        let _ = fs::remove_file(&file_clone);
+        let _ = std::os::unix::fs::symlink(&outside_clone, &file_clone);
+    });
+
+    let root_handle = open_dir_handle(&rootfs).expect("open rootfs");
+    let result = atomic_write_in_root(
+        &root_handle,
+        std::path::Path::new("etc/ssl/certs/bundle.crt"),
+        b"ATTACK_PAYLOAD",
+        NEW_FILE_MODE,
+        current_owner(),
+    );
+    drop(_hook);
+
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), TrustError::Symlink(_)));
+    assert_eq!(
+        fs::read(&outside_file).expect("read outside"),
+        b"OUTSIDE_SECRET"
+    );
+}

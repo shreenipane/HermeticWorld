@@ -615,13 +615,12 @@ fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::
         name.to_string_lossy(),
         random_suffix()
     )))?;
-    // rename(2) would replace an existing entry; renameat2(RENAME_NOREPLACE)
-    // needs unsafe code, so an existence check on the random name is used.
-    match std::fs::symlink_metadata(&private) {
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        _ => return Err(not_owned()),
-    }
-    std::fs::rename(&entry, &private)?;
+    let private_name = Path::new(private.file_name().ok_or_else(not_owned)?);
+    // Publish / move to temporary private name using renameat2(RENAME_NOREPLACE)
+    // so no existing destination can be overwritten.
+    directory
+        .rename_noreplace(name, private_name)
+        .map_err(|_| not_owned())?;
     if matches!(socket_identity(&private), Some((current, _)) if current == id) {
         return std::fs::remove_file(&private);
     }
@@ -631,7 +630,7 @@ fn remove_owned_socket(directory: &Directory, name: &Path, id: EntryId) -> std::
         let _ = std::fs::remove_file(&private);
     } else if matches!(std::fs::symlink_metadata(&entry), Err(e) if e.kind() == ErrorKind::NotFound)
     {
-        let _ = std::fs::rename(&private, &entry);
+        let _ = directory.rename_noreplace(private_name, name);
     }
     Err(not_owned())
 }
@@ -2168,5 +2167,44 @@ mod review_tests {
         );
         // A non-socket entry never reaches the probe: both callers first require
         // the lock to be a socket owned by the directory owner (`socket_identity`).
+    }
+
+    #[test]
+    fn endpoint_reclaim_with_rename_noreplace_succeeds() {
+        let temp = tempdir().unwrap();
+        let directory = Directory::open(temp.path()).unwrap();
+        let entry = temp.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&entry).unwrap();
+        let meta = fs::symlink_metadata(&entry).unwrap();
+        let id = (
+            std::os::unix::fs::MetadataExt::dev(&meta),
+            std::os::unix::fs::MetadataExt::ino(&meta),
+        );
+        drop(listener);
+
+        let result = remove_owned_socket(&directory, Path::new("socket"), id);
+        assert!(
+            result.is_ok(),
+            "remove_owned_socket should succeed: {result:?}"
+        );
+        assert!(!entry.exists(), "socket must be unlinked");
+    }
+
+    #[test]
+    fn endpoint_reclaim_refuses_if_destination_already_exists() {
+        let temp = tempdir().unwrap();
+        let directory = Directory::open(temp.path()).unwrap();
+        let from = temp.path().join("from_socket");
+        let to = temp.path().join("to_socket");
+        fs::write(&from, b"source socket").unwrap();
+        fs::write(&to, b"destination already exists").unwrap();
+
+        let result = directory.rename_noreplace(Path::new("from_socket"), Path::new("to_socket"));
+        assert!(
+            result.is_err(),
+            "rename_noreplace must refuse to overwrite existing destination"
+        );
+        assert_eq!(fs::read(&from).unwrap(), b"source socket");
+        assert_eq!(fs::read(&to).unwrap(), b"destination already exists");
     }
 }
