@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermetic-harbor"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+harbor = ["harbor==0.25.0"]
+
+[tool.setuptools]
+packages = ["hermetic_harbor"]
+package-dir = {"" = "..", hermetic_harbor = "."}
+py-modules = ["hermetic_safe_io"]

@@ -50,6 +50,30 @@ A dated, append-only record of what was built, measured and decided. Newest entr
 ### Decisions
 - Retained strict default-deny policy: count_tokens and inline documents fail closed where no exact equivalent exists.
 - Token usage is committed before validating generated content; dropping unverified streams triggers limit exceeded to prevent quota bypass.
+## 2026-11-18: Harbor backend and registration prototype (TR-HB-1, Phase 3)
+
+- **Phase:** 3
+- **Type:** build | decision
+- **Requirements:** TR-HB-1
+
+### Done
+- Approved new dependency 'harbor' (Python) pinned to exact version `0.25.0` (PyPI release date: 2026-10-25, older than two weeks before 2026-11-18 cutoff); recorded in `python/pyproject.toml`, `python/hermetic_harbor/pyproject.toml`, `python/hermetic_harbor/README.md`, `PHASES.md` and this log.
+- Registration prototype (`python/hermetic_harbor/registration.py`): prototyped dynamic registration into Harbor's closed `EnvironmentType` enum via `type.__setattr__` (bypassing EnumMeta modification blocks) and injection into `harbor.environments.factory._ENVIRONMENT_REGISTRY`; verified version gate requiring exact `0.25.0`, idempotent registration, and reversible target cleanup via `unregister_from_targets` for test isolation.
+- `HermeticEnvironment` backend (`python/hermetic_harbor/environment.py`): implements Harbor's `BaseEnvironment` async contract (`start`, `stop`, `exec`, `upload_file`, `download_file`, `upload_dir`, `download_dir`, `capabilities`, `connect_ssh`). Enforces strict bounded execution (`MAX_COMMAND_BYTES`, `MAX_RUN_OUTPUT_BYTES`, `MAX_TIMEOUT_SECONDS`), 64 KiB output truncation, safe I/O (`hermetic_safe_io`) regular-file descriptor pinning with atomic 0600 mode, and explicit refusal of symlinks, FIFOs, device nodes, and path escapes.
+- Task configuration parser (`python/hermetic_harbor/task.py`): validates `task.toml` under strict size (64 KiB) and count (256 artifacts) bounds, rejecting path traversal and null bytes.
+- Separate-verifier mapping (`python/hermetic_harbor/verifier.py`): ExtractorVM extracts only declared artifacts from the agent workspace, dropping undeclared modifications and preventing test-file tampering; GraderVM runs tests in a clean verifier sandbox under supervisor isolation (T_clock, clean environment) and produces standard Harbor `/logs/verifier/reward.txt` (1.0 for gold resolved, 0.0 for unresolved/tampered) and `reward.json`. Shared verifier mode records shared isolation.
+- KVM nested VM integration: created `scripts/integration/harbor-smoke.sh` (resolving symlinked paths with `readlink -f`, taking `HERMETIC_FC_BIN`, `HERMETIC_FIRECRACKER_LOCK`, `HERMETIC_KERNEL`) and added offline test `test_harbor_vm_separate_verifier_nested` that cleanly skips when env vars are unset.
+
+### Results / measurements
+- Offline test suite `python/tests/test_hermetic_harbor.py`: 29 passed, 1 skipped (nested KVM smoke).
+- Host sanitization: verified no host usernames, hostnames, timestamps, or paths reach verifier outputs, rewards, or error diagnostics.
+
+### Decisions
+- Harbor `EnvironmentType` dynamic extension: used `type.__setattr__` on the Enum class to register `HERMETIC = "hermetic"` without triggering Python EnumMeta member re-assignment errors.
+- ExtractorVM artifact isolation: in separate-verifier mode, only artifacts explicitly declared in `task.toml` are admitted into the verifier sandbox; any undeclared agent changes or symlinked artifacts fail closed.
+
+### Remaining
+- Manager run of `scripts/integration/harbor-smoke.sh` in the nested VM with `/dev/kvm`.
 
 ---
 
