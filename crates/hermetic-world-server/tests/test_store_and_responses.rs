@@ -35,6 +35,8 @@ fn start_test_server(
         recover: false,
         frame_deadline: None,
         transmission_deadline: None,
+        search_index_dir: None,
+        replay_index_path: None,
     };
 
     let server = WorldServer::new(config).expect("create server");
@@ -715,6 +717,8 @@ fn test_fix1_relative_store_root_with_parent_dir() {
         recover: false,
         frame_deadline: None,
         transmission_deadline: None,
+        search_index_dir: None,
+        replay_index_path: None,
     };
     let server_res = WorldServer::new(config);
     assert!(

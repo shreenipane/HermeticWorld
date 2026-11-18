@@ -43,6 +43,8 @@ fn world(temp: &Path) -> PathBuf {
         recover: false,
         frame_deadline: None,
         transmission_deadline: None,
+        search_index_dir: None,
+        replay_index_path: None,
     })
     .unwrap();
     std::thread::spawn(move || {

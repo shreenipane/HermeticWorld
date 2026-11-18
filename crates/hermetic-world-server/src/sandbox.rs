@@ -57,6 +57,17 @@ pub fn apply_landlock_for_endpoint(
     socket_dir: Option<&Path>,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
+    apply_landlock_full(store_dir, log_dir, socket_dir, None, allow_no_landlock)
+}
+
+/// Apply Landlock filesystem restrictions with optional endpoint and search directory access.
+pub fn apply_landlock_full(
+    store_dir: &Path,
+    log_dir: &Path,
+    socket_dir: Option<&Path>,
+    search_dir: Option<&Path>,
+    allow_no_landlock: bool,
+) -> Result<SandboxLandlockStatus, SandboxError> {
     if INJECT_LANDLOCK_UNAVAILABLE.load(std::sync::atomic::Ordering::SeqCst)
         || std::env::var_os("HERMETIC_TEST_INJECT_LANDLOCK_UNAVAILABLE").is_some()
     {
@@ -79,6 +90,11 @@ pub fn apply_landlock_for_endpoint(
         .and_then(|r| r.create())
         .and_then(|r| r.add_rules(path_beneath_rules(&[store_dir], AccessFs::from_read(abi))))
         .and_then(|r| r.add_rules(path_beneath_rules(&[log_dir], AccessFs::from_all(abi))));
+
+    if let Some(search) = search_dir {
+        ruleset = ruleset
+            .and_then(|r| r.add_rules(path_beneath_rules(&[search], AccessFs::from_read(abi))));
+    }
 
     if let Some(sock_dir) = socket_dir {
         ruleset = ruleset.and_then(|r| {
@@ -318,8 +334,24 @@ pub fn apply_sandbox_for_endpoint(
     socket_dir: Option<&Path>,
     allow_no_landlock: bool,
 ) -> Result<SandboxLandlockStatus, SandboxError> {
-    let landlock_status =
-        apply_landlock_for_endpoint(store_dir, log_dir, socket_dir, allow_no_landlock)?;
+    apply_sandbox_full(store_dir, log_dir, socket_dir, None, allow_no_landlock)
+}
+
+/// Apply full sandbox with optional endpoint and search directory access (Landlock then Seccomp).
+pub fn apply_sandbox_full(
+    store_dir: &Path,
+    log_dir: &Path,
+    socket_dir: Option<&Path>,
+    search_dir: Option<&Path>,
+    allow_no_landlock: bool,
+) -> Result<SandboxLandlockStatus, SandboxError> {
+    let landlock_status = apply_landlock_full(
+        store_dir,
+        log_dir,
+        socket_dir,
+        search_dir,
+        allow_no_landlock,
+    )?;
     apply_seccomp()?;
     Ok(landlock_status)
 }

@@ -4,6 +4,7 @@ pub mod limits;
 pub mod log;
 mod safe_fs;
 pub mod sandbox;
+pub mod search;
 pub mod server;
 pub mod store;
 
@@ -14,8 +15,9 @@ pub use log::{
     VerifyError, INITIAL_PREV_HASH,
 };
 pub use sandbox::{
-    apply_landlock, apply_landlock_for_endpoint, apply_sandbox, apply_sandbox_for_endpoint,
-    apply_seccomp, SandboxError, SandboxLandlockStatus,
+    apply_landlock, apply_landlock_for_endpoint, apply_landlock_full, apply_sandbox,
+    apply_sandbox_for_endpoint, apply_sandbox_full, apply_seccomp, SandboxError,
+    SandboxLandlockStatus,
 };
 pub use server::{filter_headers, format_imf_fixdate, ServerConfig, ServerExit, WorldServer};
 pub use store::{is_inside_root, DirStore, Store, StoredObject};

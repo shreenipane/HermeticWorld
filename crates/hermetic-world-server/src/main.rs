@@ -56,6 +56,12 @@ struct Cli {
 
     #[arg(long)]
     transmission_deadline_ms: Option<u64>,
+
+    #[arg(long)]
+    search_index: Option<PathBuf>,
+
+    #[arg(long)]
+    replay_index: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -73,6 +79,21 @@ enum Commands {
 
         #[arg(long, default_value_t = false)]
         recover: bool,
+    },
+
+    #[command(name = "index")]
+    Index {
+        #[arg(long)]
+        recipe: PathBuf,
+
+        #[arg(long)]
+        blobs: PathBuf,
+
+        #[arg(long)]
+        month: Option<String>,
+
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -103,6 +124,62 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("verify-log failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(Commands::Index {
+        recipe,
+        blobs,
+        month,
+        output,
+    }) = cli.cmd
+    {
+        let raw_recipe = std::fs::read(&recipe).unwrap_or_else(|e| {
+            eprintln!("Error reading recipe file {}: {e}", recipe.display());
+            std::process::exit(1);
+        });
+
+        let mut blobs_map = std::collections::HashMap::new();
+        let entries = std::fs::read_dir(&blobs).unwrap_or_else(|e| {
+            eprintln!("Error reading blobs directory {}: {e}", blobs.display());
+            std::process::exit(1);
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
+                eprintln!("Error reading blob entry: {e}");
+                std::process::exit(1);
+            });
+            let meta = entry.metadata().unwrap_or_else(|e| {
+                eprintln!("Error reading blob metadata: {e}");
+                std::process::exit(1);
+            });
+            if meta.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let bytes = std::fs::read(entry.path()).unwrap_or_else(|e| {
+                    eprintln!("Error reading blob file: {e}");
+                    std::process::exit(1);
+                });
+                blobs_map.insert(name, bytes);
+            }
+        }
+
+        match hermetic_world_server::search::build_month_index(
+            &raw_recipe,
+            &blobs_map,
+            &output,
+            month.as_deref(),
+        ) {
+            Ok(report) => {
+                println!(
+                    "Search index built: {} documents for month {} (cutoff: {})",
+                    report.documents_indexed, report.month, report.first_day_cutoff
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Error building search index: {e}");
                 std::process::exit(1);
             }
         }
@@ -148,6 +225,8 @@ fn main() {
         transmission_deadline: cli
             .transmission_deadline_ms
             .map(std::time::Duration::from_millis),
+        search_index_dir: cli.search_index,
+        replay_index_path: cli.replay_index,
     };
 
     let server = match WorldServer::new(config) {

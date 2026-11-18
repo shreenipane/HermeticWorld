@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use crate::limits::{validate_rate, Limits};
 use crate::log::{LogEventParams, LogManager};
 use crate::safe_fs::{is_descendant_of, Directory, LogTarget};
-use crate::sandbox::{apply_sandbox_for_endpoint, SandboxLandlockStatus};
+use crate::sandbox::SandboxLandlockStatus;
 use crate::store::DirStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +51,8 @@ pub struct ServerConfig {
     pub recover: bool,
     pub frame_deadline: Option<std::time::Duration>,
     pub transmission_deadline: Option<std::time::Duration>,
+    pub search_index_dir: Option<PathBuf>,
+    pub replay_index_path: Option<PathBuf>,
 }
 
 pub const DEFAULT_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -381,6 +383,8 @@ pub struct WorldServer {
     socket_name: PathBuf,
     owned_endpoint: Option<EntryId>,
     owned_lock: Option<EntryId>,
+    search_engine: Option<crate::search::SearchEngine>,
+    replay_index: Option<crate::search::ReplayIndex>,
 }
 
 enum ReadFrameResult {
@@ -694,6 +698,91 @@ impl WorldServer {
 
         let store = DirStore::from_directory(store_directory, &config.store_dir);
 
+        let search_engine = if let Some(search_dir) = &config.search_index_dir {
+            Some(
+                crate::search::SearchEngine::open(search_dir, None, Some(config.t_clock)).map_err(
+                    |e| {
+                        eprintln!("Failed to open search index {}: {e}", search_dir.display());
+                        ServerExit::StartupFailed
+                    },
+                )?,
+            )
+        } else if config.store_dir.join("_search_index").is_dir() {
+            Some(
+                crate::search::SearchEngine::open(
+                    &config.store_dir.join("_search_index"),
+                    None,
+                    Some(config.t_clock),
+                )
+                .map_err(|e| {
+                    eprintln!("Failed to open default search index: {e}");
+                    ServerExit::StartupFailed
+                })?,
+            )
+        } else if config.store_dir.join("search_index").is_dir() {
+            Some(
+                crate::search::SearchEngine::open(
+                    &config.store_dir.join("search_index"),
+                    None,
+                    Some(config.t_clock),
+                )
+                .map_err(|e| {
+                    eprintln!("Failed to open default search index: {e}");
+                    ServerExit::StartupFailed
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let replay_index = if let Some(replay_path) = &config.replay_index_path {
+            let blob_root = replay_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join("blobs");
+            Some(
+                crate::search::ReplayIndex::load_from_files(replay_path, &blob_root, None)
+                    .map_err(|e| {
+                        eprintln!("Failed to open replay index {}: {e}", replay_path.display());
+                        ServerExit::StartupFailed
+                    })?,
+            )
+        } else if config.store_dir.join("replay_index.json").is_file() {
+            Some(
+                crate::search::ReplayIndex::load_from_files(
+                    &config.store_dir.join("replay_index.json"),
+                    &config.store_dir.join("blobs"),
+                    None,
+                )
+                .map_err(|e| {
+                    eprintln!("Failed to open default replay index: {e}");
+                    ServerExit::StartupFailed
+                })?,
+            )
+        } else if config.store_dir.join("_replay_index.json").is_file() {
+            Some(
+                crate::search::ReplayIndex::load_from_files(
+                    &config.store_dir.join("_replay_index.json"),
+                    &config.store_dir.join("blobs"),
+                    None,
+                )
+                .map_err(|e| {
+                    eprintln!("Failed to open default replay index: {e}");
+                    ServerExit::StartupFailed
+                })?,
+            )
+        } else {
+            None
+        };
+
+        if let Some(replay) = &replay_index {
+            if replay.cutoff_nanos() > config.t_clock.unix_timestamp_nanos() {
+                eprintln!("Replay index cutoff is later than t_clock");
+                return Err(ServerExit::StartupFailed);
+            }
+        }
+
         let socket_directory = Directory::open(
             config
                 .socket_path
@@ -769,7 +858,8 @@ impl WorldServer {
             remove_owned_socket(&socket_directory, &socket_name, socket_id)
                 .map_err(|_| ServerExit::StartupFailed)?;
         }
-        // Bind the run to its supplied clock, resource policy, store and sandbox policy.
+        // Bind the run to its supplied clock, resource policy, store and sandbox policy,
+        // as well as search and replay configuration and loaded index content digests.
         let binding_data = serde_json::to_vec(&(
             config.t_clock.unix_timestamp_nanos().to_string(),
             config.rate_rps.map(f64::to_bits),
@@ -779,6 +869,18 @@ impl WorldServer {
             config.allow_no_landlock,
             config.no_sandbox,
             config.store_dir.as_os_str().as_encoded_bytes(),
+            config
+                .search_index_dir
+                .as_ref()
+                .map(|p| p.as_os_str().as_encoded_bytes()),
+            config
+                .replay_index_path
+                .as_ref()
+                .map(|p| p.as_os_str().as_encoded_bytes()),
+            search_engine
+                .as_ref()
+                .map(|s| s.meta().index_sha256.as_str()),
+            replay_index.as_ref().map(|r| r.index_sha256()),
         ))
         .map_err(|_| ServerExit::StartupFailed)?;
         let binding = blake3::hash(&binding_data).to_hex().to_string();
@@ -827,6 +929,8 @@ impl WorldServer {
             socket_name,
             owned_endpoint: None,
             owned_lock: None,
+            search_engine,
+            replay_index,
         })
     }
 
@@ -943,8 +1047,9 @@ impl WorldServer {
         let status = if self.config.no_sandbox {
             None
         } else {
+            let search_dir_ref = self.config.search_index_dir.as_deref();
             Some(
-                apply_sandbox_for_endpoint(
+                crate::sandbox::apply_sandbox_full(
                     &self
                         .store
                         .descriptor_path()
@@ -954,6 +1059,7 @@ impl WorldServer {
                         .descriptor_path()
                         .map_err(|_| ServerExit::StartupFailed)?,
                     Some(&self.socket_directory.descriptor_path()),
+                    search_dir_ref,
                     self.config.allow_no_landlock,
                 )
                 .map_err(|_| ServerExit::StartupFailed)?,
@@ -1227,7 +1333,29 @@ impl WorldServer {
                 }
             };
 
-            let stored = self.store.open(&frame.authority, &frame.path_and_query);
+            let is_search_authority = frame.authority == "search"
+                || frame.authority == "search.local"
+                || frame.authority == "search.internal"
+                || frame.authority == "search.hermetic"
+                || frame.authority == "search.archive.org"
+                || (frame.authority == "archive.org"
+                    && (frame.path_and_query == "/search"
+                        || frame.path_and_query.starts_with("/search?")));
+
+            let is_search_path = frame.path_and_query == "/search"
+                || frame.path_and_query.starts_with("/search?")
+                || frame.path_and_query == "/api/search"
+                || frame.path_and_query.starts_with("/api/search?")
+                || frame.path_and_query == "/_search"
+                || frame.path_and_query.starts_with("/_search?")
+                || (is_search_authority
+                    && (frame.path_and_query == "/" || frame.path_and_query.starts_with("/?")));
+
+            let stored = if is_search_authority {
+                None
+            } else {
+                self.store.open(&frame.authority, &frame.path_and_query)
+            };
 
             let (status, headers, response_bytes, body_file_info, body_mem) = match stored {
                 Some(obj) => {
@@ -1274,31 +1402,112 @@ impl WorldServer {
                     )
                 }
                 None => {
-                    // Miss -> 404
-                    let (st, ct, b) = if DirStore::is_internal_metadata_path(&frame.path_and_query)
+                    if let (true, Some(search)) =
+                        (is_search_authority && is_search_path, &self.search_engine)
                     {
-                        (
-                            404,
-                            Some("text/html".to_string()),
-                            b"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>".to_vec(),
-                        )
+                        let (st, ct, b) = search.handle_http_request(&frame.path_and_query);
+                        let length = b.len();
+                        let headers =
+                            filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
+                        let resp_bytes = if frame.method == Method::Head {
+                            0u64
+                        } else {
+                            length as u64
+                        };
+                        let mem_body = if frame.method == Method::Head {
+                            None
+                        } else {
+                            Some(b)
+                        };
+                        (st, headers, resp_bytes, None, mem_body)
+                    } else if let Some(replay) = &self.replay_index {
+                        let full_url_https =
+                            format!("https://{}{}", frame.authority, frame.path_and_query);
+                        let full_url_http =
+                            format!("http://{}{}", frame.authority, frame.path_and_query);
+                        let replay_resp = replay
+                            .lookup(&full_url_https, method_str)
+                            .or_else(|| replay.lookup(&full_url_http, method_str));
+
+                        if let Some(resp) = replay_resp {
+                            let mut extra = Vec::new();
+                            if let Some(loc) = &resp.location {
+                                extra.push(("location".to_string(), loc.clone()));
+                            }
+                            let length = resp.content_length;
+                            let headers = filter_headers(
+                                extra,
+                                Some(&resp.content_type),
+                                length,
+                                &date_str,
+                                None,
+                            );
+                            let resp_bytes = if frame.method == Method::Head {
+                                0u64
+                            } else {
+                                length as u64
+                            };
+                            let mem_body = if frame.method == Method::Head {
+                                None
+                            } else {
+                                Some(resp.body)
+                            };
+                            (resp.status, headers, resp_bytes, None, mem_body)
+                        } else {
+                            let (st, ct, b) = if DirStore::is_internal_metadata_path(
+                                &frame.path_and_query,
+                            ) {
+                                (
+                                        404,
+                                        Some("text/html".to_string()),
+                                        b"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>".to_vec(),
+                                    )
+                            } else {
+                                self.store.get_404(&frame.authority)
+                            };
+                            let length = b.len();
+                            let headers =
+                                filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
+                            let resp_bytes = if frame.method == Method::Head {
+                                0u64
+                            } else {
+                                length as u64
+                            };
+                            let mem_body = if frame.method == Method::Head {
+                                None
+                            } else {
+                                Some(b)
+                            };
+                            (st, headers, resp_bytes, None, mem_body)
+                        }
                     } else {
-                        self.store.get_404(&frame.authority)
-                    };
-                    let length = b.len();
-                    let headers =
-                        filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
-                    let resp_bytes = if frame.method == Method::Head {
-                        0u64
-                    } else {
-                        length as u64
-                    };
-                    let mem_body = if frame.method == Method::Head {
-                        None
-                    } else {
-                        Some(b)
-                    };
-                    (st, headers, resp_bytes, None, mem_body)
+                        // Miss -> 404
+                        let (st, ct, b) = if DirStore::is_internal_metadata_path(
+                            &frame.path_and_query,
+                        ) {
+                            (
+                                    404,
+                                    Some("text/html".to_string()),
+                                    b"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>".to_vec(),
+                                )
+                        } else {
+                            self.store.get_404(&frame.authority)
+                        };
+                        let length = b.len();
+                        let headers =
+                            filter_headers(Vec::new(), ct.as_deref(), length, &date_str, None);
+                        let resp_bytes = if frame.method == Method::Head {
+                            0u64
+                        } else {
+                            length as u64
+                        };
+                        let mem_body = if frame.method == Method::Head {
+                            None
+                        } else {
+                            Some(b)
+                        };
+                        (st, headers, resp_bytes, None, mem_body)
+                    }
                 }
             };
 
@@ -1547,6 +1756,8 @@ mod review_tests {
             recover: false,
             frame_deadline: None,
             transmission_deadline: None,
+            search_index_dir: None,
+            replay_index_path: None,
         }
     }
     fn request() -> RequestFrame {
