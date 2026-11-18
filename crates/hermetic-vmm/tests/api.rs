@@ -97,6 +97,111 @@ fn trusted_reboot_boot_source_passes_transport_and_rejects_malformed_initrd() {
 }
 
 #[test]
+fn snapshot_create_and_load_pass_transport_and_reject_malformed_requests() {
+    let create_req = ApiRequest {
+        method: "PUT".into(),
+        path: "/snapshot/create".into(),
+        body: json!({
+            "snapshot_type": "Full",
+            "snapshot_path": "/snapshot",
+            "mem_file_path": "/mem",
+        }),
+    };
+    let (resp, wire) = fake_request(
+        create_req.clone(),
+        b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+        false,
+    );
+    assert_eq!(resp.unwrap().status, 204);
+    let body = wire.split(|b| *b == b'\n').next_back().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+        create_req.body
+    );
+
+    for (key, val) in [
+        // "Diff" is accepted by the shared validator (test_snapshot_and_multivcpu.rs).
+        ("snapshot_type", json!("Incremental")),
+        ("snapshot_type", json!(null)),
+        ("snapshot_path", json!("relative/path")),
+        ("snapshot_path", json!("/../escaped")),
+        ("mem_file_path", json!("")),
+        ("extra", json!("hostile")),
+    ] {
+        let mut bad = create_req.clone();
+        if key == "extra" {
+            bad.body["extra"] = val;
+        } else {
+            bad.body[key] = val;
+        }
+        let (result, wire) = fake_request(bad, Vec::new(), false);
+        assert!(result.is_err());
+        assert!(wire.is_empty());
+    }
+
+    // Identical snapshot_path and mem_file_path must be rejected:
+    let mut same_path_req = create_req.clone();
+    same_path_req.body["snapshot_path"] = json!("/same/path");
+    same_path_req.body["mem_file_path"] = json!("/same/path");
+    let (result, wire) = fake_request(same_path_req, Vec::new(), false);
+    assert!(result.is_err());
+    assert!(wire.is_empty());
+
+    let load_req = ApiRequest {
+        method: "PUT".into(),
+        path: "/snapshot/load".into(),
+        body: json!({
+            "snapshot_path": "/snapshot",
+            "mem_backend": {
+                "backend_path": "/mem",
+                "backend_type": "File"
+            },
+            "enable_diff_snapshots": false,
+            "resume_vm": false,
+            "network_overrides": [
+                {"iface_id": "eth0", "host_dev_name": "tap-peerless"}
+            ],
+        }),
+    };
+    let (resp, wire) = fake_request(
+        load_req.clone(),
+        b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+        false,
+    );
+    assert_eq!(resp.unwrap().status, 204);
+    let body = wire.split(|b| *b == b'\n').next_back().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+        load_req.body
+    );
+
+    for (key, val) in [
+        ("resume_vm", json!(true)),
+        ("enable_diff_snapshots", json!(true)),
+        ("snapshot_path", json!("relative")),
+        (
+            "mem_backend",
+            json!({"backend_path": "/../mem", "backend_type": "File"}),
+        ),
+        (
+            "mem_backend",
+            json!({"backend_path": "/mem", "backend_type": "Anon"}),
+        ),
+        ("network_overrides", json!([{"iface_id": "eth0"}])),
+        (
+            "network_overrides",
+            json!([{"iface_id": "", "host_dev_name": "tap0"}]),
+        ),
+    ] {
+        let mut bad = load_req.clone();
+        bad.body[key] = val;
+        let (result, wire) = fake_request(bad, Vec::new(), false);
+        assert!(result.is_err());
+        assert!(wire.is_empty());
+    }
+}
+
+#[test]
 fn every_planned_request_passes_the_strict_transport_schema() {
     #[path = "support/mod.rs"]
     mod support;

@@ -168,24 +168,84 @@ fn valid_body(req: &ApiRequest) -> bool {
                 )
                 && path("snapshot_path")
                 && path("mem_file_path")
+                && b.get("snapshot_path") != b.get("mem_file_path")
         }
         ("PUT", "/snapshot/load") => {
-            let has_required = path("snapshot_path") && path("mem_file_path");
-            let fields_ok = fields(b, &["snapshot_path", "mem_file_path"])
-                || fields(
-                    b,
-                    &[
-                        "snapshot_path",
-                        "mem_file_path",
-                        "enable_diff_snapshots",
-                        "resume_vm",
-                    ],
-                );
-            has_required
-                && fields_ok
-                && b.get("enable_diff_snapshots")
-                    .is_none_or(|v| v.is_boolean())
-                && b.get("resume_vm").is_none_or(|v| v.is_boolean())
+            // Plain load (pause/resume tests) or a load with a file memory backend
+            // and peerless-tap network overrides (live grading).
+            let plain = {
+                let has_required = path("snapshot_path") && path("mem_file_path");
+                let fields_ok = fields(b, &["snapshot_path", "mem_file_path"])
+                    || fields(
+                        b,
+                        &[
+                            "snapshot_path",
+                            "mem_file_path",
+                            "enable_diff_snapshots",
+                            "resume_vm",
+                        ],
+                    );
+                has_required
+                    && fields_ok
+                    && b.get("enable_diff_snapshots")
+                        .is_none_or(|v| v.is_boolean())
+                    && b.get("resume_vm").is_none_or(|v| v.is_boolean())
+            };
+            let with_backend = {
+                let has_base = b
+                    .get("snapshot_path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(absolute_path)
+                    && b.get("mem_backend").is_some_and(|m| {
+                        fields(m, &["backend_path", "backend_type"])
+                            && m.get("backend_type").and_then(|v| v.as_str()) == Some("File")
+                            && m.get("backend_path")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(absolute_path)
+                    })
+                    && b.get("resume_vm").and_then(|v| v.as_bool()) == Some(false)
+                    && b.get("enable_diff_snapshots").and_then(|v| v.as_bool()) == Some(false);
+                if !has_base {
+                    false
+                } else if b.get("network_overrides").is_some() {
+                    fields(
+                        b,
+                        &[
+                            "snapshot_path",
+                            "mem_backend",
+                            "enable_diff_snapshots",
+                            "resume_vm",
+                            "network_overrides",
+                        ],
+                    ) && b
+                        .get("network_overrides")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().all(|item| {
+                                fields(item, &["iface_id", "host_dev_name"])
+                                    && item
+                                        .get("iface_id")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|s| crate::spec::identifier(s, 15))
+                                    && item
+                                        .get("host_dev_name")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|s| crate::spec::identifier(s, 15))
+                            })
+                        })
+                } else {
+                    fields(
+                        b,
+                        &[
+                            "snapshot_path",
+                            "mem_backend",
+                            "enable_diff_snapshots",
+                            "resume_vm",
+                        ],
+                    )
+                }
+            };
+            plain || with_backend
         }
         (method, p) if p.starts_with("/drives/") => {
             let names: &[&str] = if method == "PUT" {

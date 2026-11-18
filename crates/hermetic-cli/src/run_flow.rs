@@ -389,7 +389,7 @@ pub fn attest_status_as_str(status: &hermetic_attest::RunStatus) -> &'static str
 /// message instead of producing a verdict. The run flow itself (`execute_run_flow`)
 /// is exercised with an injected `Infra` in tests; no code path may fabricate VM,
 /// extraction or grading results.
-pub fn run_with_real_infra(_req: RunRequest) -> Result<Outcome, BackendError> {
+pub fn run_with_real_infra(req: RunRequest) -> Result<Outcome, BackendError> {
     let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     let (fc, kernel, rootfs) = (
         set("HERMETIC_FC_BIN"),
@@ -407,11 +407,29 @@ pub fn run_with_real_infra(_req: RunRequest) -> Result<Outcome, BackendError> {
         if !rootfs {
             return Err(BackendError::Unavailable("HERMETIC_ROOTFS must be set"));
         }
-        if !set("HERMETIC_RUN_DIR") {
-            return Err(BackendError::Unavailable(
-                "HERMETIC_RUN_DIR must be set to a directory outside the sealed world",
-            ));
-        }
+        let run_dir = match req
+            .run_dir
+            .clone()
+            .or_else(|| std::env::var_os("HERMETIC_RUN_DIR").map(std::path::PathBuf::from))
+        {
+            Some(rd) => rd,
+            None => {
+                return Err(BackendError::Unavailable(
+                    "HERMETIC_RUN_DIR must be set to a directory outside the sealed world",
+                ));
+            }
+        };
+
+        let key_path = req
+            .key
+            .clone()
+            .or_else(|| std::env::var_os("HERMETIC_SIGNING_KEY").map(std::path::PathBuf::from));
+        let mut infra = hermetic_vmm::vmm_infra::VmmInfra::from_env_with_run_dir(run_dir.clone())
+            .map_err(|e| {
+            BackendError::Internal(format!("failed to initialize VMM infrastructure: {e}"))
+        })?;
+        let clock = SystemClock;
+        return execute_run_flow(&mut infra, &clock, &req, &run_dir, key_path.as_deref());
     }
     Err(BackendError::Unavailable(RUN_NOT_WIRED))
 }

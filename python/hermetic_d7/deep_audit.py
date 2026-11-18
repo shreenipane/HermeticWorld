@@ -369,6 +369,7 @@ def run_deep_audit(
     recipe_rel: str,
     builder: IsolatedBuilder | None = None,
     limits: ResourceLimits | None = None,
+    vm_config: Any | None = None,
 ) -> dict[str, Any]:
     """Rebuild every recipe entry with the isolated builder and diff it.
 
@@ -376,7 +377,27 @@ def run_deep_audit(
     'error'. Overall verdict is 'error' if any entry errored, else 'differs'
     if any differs, else 'identical'.
     """
-    active_builder = builder or RefusingBuilder()
+    if builder is not None:
+        active_builder = builder
+    elif vm_config is not None:
+        from hermetic_d7.vm_builder import VmIsolatedBuilder
+
+        active_builder = VmIsolatedBuilder(vm_config)
+    else:
+        from hermetic_d7.vm_builder import VmBuilderConfig, VmIsolatedBuilder
+
+        try:
+            env_cfg = VmBuilderConfig.from_env()
+        except HermeticD7Error as exc:
+            # A bad environment config is an error report, not an uncaught exception.
+            return {
+                "audit_only": True,
+                "detector": "D7",
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "verdict": "error",
+            }
+        active_builder = VmIsolatedBuilder(env_cfg) if env_cfg is not None else RefusingBuilder()
+
     active_limits = limits or ResourceLimits()
     root = Path(shipped_root)
     report: dict[str, Any] = {
@@ -441,12 +462,43 @@ def run_deep_audit(
 
 
 def run_deep_audit_cli(argv: Sequence[str]) -> dict[str, Any]:
-    """CLI path: the command line can only reach the refusing builder."""
-    if len(argv) != 2:
+    """CLI path: runs deep audit with the configured isolated builder or refuses."""
+    args = list(argv)
+    vm_config = None
+    if "--vm-config" in args:
+        idx = args.index("--vm-config")
+        if idx + 1 >= len(args):
+            return {
+                "audit_only": True,
+                "detector": "D7",
+                "error": {
+                    "type": "CliUsageError",
+                    "message": "usage: --deep-audit ROOT RECIPE [--vm-config PATH]",
+                },
+                "verdict": "error",
+            }
+        config_path = args[idx + 1]
+        args = args[:idx] + args[idx + 2 :]
+        try:
+            from hermetic_d7.vm_builder import VmBuilderConfig
+
+            vm_config = VmBuilderConfig.from_json_file(config_path)
+        except HermeticD7Error as exc:
+            return {
+                "audit_only": True,
+                "detector": "D7",
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "verdict": "error",
+            }
+
+    if len(args) != 2:
         return {
             "audit_only": True,
             "detector": "D7",
-            "error": {"type": "CliUsageError", "message": "usage: --deep-audit ROOT RECIPE"},
+            "error": {
+                "type": "CliUsageError",
+                "message": "usage: --deep-audit ROOT RECIPE [--vm-config PATH]",
+            },
             "verdict": "error",
         }
-    return run_deep_audit(argv[0], argv[1])
+    return run_deep_audit(args[0], args[1], vm_config=vm_config)

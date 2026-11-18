@@ -354,3 +354,83 @@ fn test_boot_record_validation_and_tampering() {
         Err(RunValidationError::InvalidBootRecord(_))
     ));
 }
+
+#[test]
+fn test_state_grade_record_validation() {
+    use hermetic_attest::{ArtifactDigestSize, StateGradeRecord, StateGradingPath};
+
+    let mut record = sample_run_record();
+    record.task_class = TaskClass::State;
+    record.grader_isolation = GraderIsolation::Shared;
+
+    let valid_state_grade = StateGradeRecord {
+        schema: "hermetic-state-grade/v1".to_string(),
+        grader_isolation: GraderIsolation::Shared,
+        path: StateGradingPath::Live,
+        fallback_reason: None,
+        snapshot_sha256: "0".repeat(64),
+        run_sha256: "1".repeat(64),
+        tests: ArtifactDigestSize {
+            sha256: "2".repeat(64),
+            size: 4096,
+        },
+        result: ArtifactDigestSize {
+            sha256: "3".repeat(64),
+            size: 512,
+        },
+    };
+
+    // Valid live state grade on State task passes:
+    record.state_grade = Some(valid_state_grade.clone());
+    record.boot_record = Some(hermetic_attest::HostBootRecord::live_snapshot());
+    assert!(record.validate().is_ok());
+
+    // Live path cannot have a fallback reason:
+    let mut bad_grade = valid_state_grade.clone();
+    bad_grade.fallback_reason = Some("execd_unresponsive".to_string());
+    record.state_grade = Some(bad_grade);
+    assert!(record.validate().is_err());
+
+    // Reboot path requires a fallback reason:
+    let mut reboot_grade = valid_state_grade.clone();
+    reboot_grade.path = StateGradingPath::Reboot;
+    reboot_grade.fallback_reason = None;
+    record.state_grade = Some(reboot_grade.clone());
+    assert!(record.validate().is_err());
+
+    reboot_grade.fallback_reason = Some("execd_unresponsive".to_string());
+    record.state_grade = Some(reboot_grade.clone());
+    // Reboot grade with live_snapshot boot must be rejected:
+    assert!(record.validate().is_err());
+
+    // Reboot grade with trusted_initramfs boot passes:
+    record.boot_record = Some(hermetic_attest::HostBootRecord::trusted_initramfs(
+        hermetic_attest::Digest::from_sha256(b"initrd-content"),
+    ));
+    assert!(record.validate().is_ok());
+
+    // Live grade with trusted_initramfs boot must be rejected:
+    record.state_grade = Some(valid_state_grade.clone());
+    assert!(record.validate().is_err());
+
+    // live_snapshot boot without state_grade must be rejected:
+    record.state_grade = None;
+    record.boot_record = Some(hermetic_attest::HostBootRecord::live_snapshot());
+    assert!(record.validate().is_err());
+
+    // Reset boot_record and state_grade for remaining tests:
+    record.boot_record = Some(hermetic_attest::HostBootRecord::live_snapshot());
+    record.state_grade = Some(valid_state_grade.clone());
+
+    // Wrong isolation in state grade:
+    let mut bad_iso = valid_state_grade.clone();
+    bad_iso.grader_isolation = GraderIsolation::Clean;
+    record.state_grade = Some(bad_iso);
+    assert!(record.validate().is_err());
+
+    // Non-state task cannot carry state_grade:
+    record.task_class = TaskClass::Patch;
+    record.grader_isolation = GraderIsolation::Clean;
+    record.state_grade = Some(valid_state_grade);
+    assert!(record.validate().is_err());
+}

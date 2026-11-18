@@ -34,6 +34,29 @@ pub struct Linux {
     base: Option<OwnedFd>,
     upload_owner: Option<(process::Uid, process::Gid)>,
 }
+/// The RPC filesystem worker's own root handle: the same no-follow,
+/// descriptor-relative rules as `Linux::upload`/`download`, plus cancellation.
+struct WorkerFs {
+    root: Root,
+    owner: Option<(process::Uid, process::Gid)>,
+}
+impl crate::rpc::FsOps for WorkerFs {
+    fn upload(&mut self, path: &str, data: &[u8], gate: &crate::fs::CommitGate) -> Result<()> {
+        let owner = self.owner.ok_or(Error::Boot)?;
+        self.root.atomic_cancellable(
+            path,
+            data,
+            now(),
+            Some(owner),
+            Mode::RUSR | Mode::WUSR,
+            Some(gate),
+        )
+    }
+    fn download(&mut self, path: &str) -> Result<Vec<u8>> {
+        self.root.read(path, MAX_TRANSFER)
+    }
+}
+
 pub struct VsockListener(OwnedFd);
 impl Listener for VsockListener {
     type Stream = DeadlineStream;
@@ -917,6 +940,12 @@ impl Sys for Linux {
     }
     fn download(&mut self, path: &str) -> Result<Vec<u8>> {
         self.root()?.read(path, MAX_TRANSFER)
+    }
+    fn fs_ops(&mut self) -> Result<Option<Box<dyn crate::rpc::FsOps>>> {
+        Ok(Some(Box::new(WorkerFs {
+            root: self.root()?.worker_clone()?,
+            owner: self.upload_owner,
+        })))
     }
     fn child(
         &mut self,

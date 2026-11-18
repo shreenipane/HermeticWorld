@@ -201,11 +201,9 @@ impl HostLogger {
         state.records
     }
 
-    /// Atomically persists the gateway log head summary to `GATEWAY_HEAD_FILE` and
-    /// `GATEWAY_LOG_HEAD_FILE` in `log_dir`.
-    pub fn persist_head(
+    pub fn persist_head_with_dir(
         &self,
-        log_dir: &Path,
+        dir: &std::fs::File,
         history_rewrite_count: u64,
         adapter_version: &str,
     ) -> Result<(), std::io::Error> {
@@ -224,10 +222,21 @@ impl HostLogger {
         };
         let bytes = serde_json::to_vec(&summary)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let dir = crate::fsutil::open_dir_nofollow_create(log_dir)?;
-        crate::fsutil::write_state_file(&dir, GATEWAY_HEAD_FILE, &bytes)?;
-        crate::fsutil::write_state_file(&dir, GATEWAY_LOG_HEAD_FILE, &bytes)?;
+        crate::fsutil::write_state_file(dir, GATEWAY_HEAD_FILE, &bytes)?;
+        crate::fsutil::write_state_file(dir, GATEWAY_LOG_HEAD_FILE, &bytes)?;
         Ok(())
+    }
+
+    /// Atomically persists the gateway log head summary to `GATEWAY_HEAD_FILE` and
+    /// `GATEWAY_LOG_HEAD_FILE` in `log_dir`.
+    pub fn persist_head(
+        &self,
+        log_dir: &Path,
+        history_rewrite_count: u64,
+        adapter_version: &str,
+    ) -> Result<(), std::io::Error> {
+        let dir = crate::fsutil::open_dir_nofollow_create(log_dir)?;
+        self.persist_head_with_dir(&dir, history_rewrite_count, adapter_version)
     }
 
     /// True once the log can no longer be written for this run.

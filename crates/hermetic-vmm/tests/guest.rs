@@ -36,6 +36,20 @@ fn guest_status(path: &str, end: Instant) -> Result<GuestStatus> {
     let stream = api::connect(path, end)?;
     guest_status_stream(stream, end)
 }
+/// Poll execd status until it answers: right after boot (or a snapshot
+/// restore) the vsock listener may not be up yet, which reads as `Error::Io`.
+fn wait_guest_status(path: &str, end: Instant) -> GuestStatus {
+    loop {
+        match guest_status(path, end) {
+            Ok(s) => return s,
+            Err(Error::Io) => {
+                assert!(Instant::now() < end, "execd readiness deadline");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("execd status failed: {e}"),
+        }
+    }
+}
 fn guest_status_stream(
     stream: std::os::unix::net::UnixStream,
     end: Instant,
@@ -198,16 +212,7 @@ fn boot<R: Runner>(f: support::Fixture, runner: R) {
     vm.wait_ready(Duration::from_secs(30)).unwrap();
     let end = deadline(Duration::from_secs(30)).unwrap();
     let socket = vm.jail().unwrap().root.descriptor_path("vsock");
-    let status = loop {
-        match guest_status(&socket, end) {
-            Ok(s) => break s,
-            Err(Error::Io) => {
-                assert!(Instant::now() < end, "execd readiness deadline");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("execd status failed: {e}"),
-        }
-    };
+    let status = wait_guest_status(&socket, end);
     assert_eq!(status.kind, "status");
     assert!(
         status.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS,
@@ -422,6 +427,101 @@ fn reboots_touched_disk_with_trusted_initramfs() {
     vm.stop(Duration::from_secs(2)).unwrap();
     vm.destroy(Duration::from_secs(10)).unwrap();
     eprintln!("trusted reboot: touched disk, locked startup, authorization, trusted child helper, boot record passed");
+}
+
+#[cfg(feature = "dev-unjailed")]
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and rootfs"]
+fn resumes_guest_snapshot_with_peerless_tap_and_attached_drive() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(mut first) = environment() else {
+        return;
+    };
+    first.spec.limits.file_size_bytes =
+        (u64::from(first.spec.memory_mib) * 1024 * 1024).max(first.spec.limits.file_size_bytes);
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&first)).unwrap();
+    let mut vm = Vmm::new(first.spec.clone().validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+    vm.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let socket = vm.jail().unwrap().root.descriptor_path("vsock");
+    let end = deadline(Duration::from_secs(30)).unwrap();
+    let status = wait_guest_status(&socket, end);
+    assert!(status.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+
+    // Pause VM and create snapshot
+    vm.pause(Duration::from_secs(10)).unwrap();
+    let snap_dir = first.temp.path().join("snapshot");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    let snap_path = snap_dir.join("vm.snap");
+    let mem_path = snap_dir.join("vm.mem");
+
+    vm.snapshot_create(
+        snap_path.to_str().unwrap(),
+        mem_path.to_str().unwrap(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    vm.stop(Duration::from_secs(5)).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+
+    // Prepare tests drive to attach
+    let tests_img = first.temp.path().join("tests.img");
+    let tests_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tests_img)
+        .unwrap();
+    tests_file.set_len(4096).unwrap();
+
+    // Restore into fresh VM instance
+    let mut second_spec = first.spec.clone();
+    second_spec.reserved_drives = vec!["tests".into()];
+    let runner = hermetic_vmm::runner::DevUnjailed::new(&python_launcher(&first)).unwrap();
+    let mut vm = Vmm::new(second_spec.validate().unwrap(), runner);
+    vm.prepare(Duration::from_secs(120)).unwrap();
+    vm.start(Duration::from_secs(10)).unwrap();
+
+    vm.restore_from_snapshot(
+        snap_path.to_str().unwrap(),
+        mem_path.to_str().unwrap(),
+        &[],
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    assert_eq!(vm.boot_record().unwrap().boot_path, "live_snapshot");
+
+    // Attach tests drive read-only into reserved slot
+    vm.attach_drive(
+        "tests",
+        tests_img.to_str().unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    // Resume execution
+    vm.resume(Duration::from_secs(10)).unwrap();
+
+    let socket2 = vm.jail().unwrap().root.descriptor_path("vsock");
+    let end2 = deadline(Duration::from_secs(30)).unwrap();
+    let status2 = wait_guest_status(&socket2, end2);
+    assert!(status2.guest_time_unix.abs_diff(T_CLOCK) <= CLOCK_TOLERANCE_SECONDS);
+
+    vm.stop(Duration::from_secs(5)).unwrap();
+    vm.destroy(Duration::from_secs(10)).unwrap();
+    eprintln!("snapshot restore and drive attachment passed");
+}
+
+#[cfg(not(feature = "dev-unjailed"))]
+#[test]
+#[ignore = "needs dev-unjailed feature, /dev/kvm, pinned Firecracker, guest kernel and rootfs"]
+fn resumes_guest_snapshot_with_peerless_tap_and_attached_drive() {
+    eprintln!("skipped: build with --features dev-unjailed and set HERMETIC_FC_BIN, HERMETIC_KERNEL, HERMETIC_ROOTFS");
 }
 /// The guest serial line `grader-init SECONDS clock`, printed right after the
 /// grader PID 1 sets the clock.

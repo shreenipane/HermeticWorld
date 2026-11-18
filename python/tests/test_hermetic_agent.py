@@ -581,3 +581,226 @@ def test_runner_pins_both_config_paths_for_entire_run_and_restores_env(tmp_path,
     assert len(seen) == 3
     assert {key: os.environ.get(key) for key in settings} == settings
     assert sentinel.read_text() == "HOST_IDENTITY=must-not-load\n"
+
+
+def test_mode_h_environment_scans_observation_before_truncation(tmp_path):
+    import datetime as dt
+    from hermetic_slice.date_sentinel import DateSentinel
+
+    sentinel = DateSentinel(dt.date(2030, 6, 15))
+    env = ExecdEnvironment("/not-used", cwd="/testbed", sentinel=sentinel)
+    # Mock client reply with real date in output
+    leak_date = b"2030-06-15"
+    big_output = list(b"a" * 5000 + leak_date + b"b" * 5000)
+    mock_reply = {
+        "type": "exec",
+        "code": 0,
+        "output": big_output,
+        "truncated": False,
+        "timed_out": False,
+    }
+    env._client.call = lambda req, timeout=None: mock_reply
+    res = env.execute("echo test")
+    assert res["returncode"] == 0
+    # Sentinel saw the date before truncation
+    assert sentinel.summary().date_leak_observed is True
+    assert sentinel.summary().hits.get("observation:real_date", 0) >= 1
+
+
+def test_mode_h_runner_scans_prompts(tmp_path, monkeypatch):
+    import types
+    import datetime as dt
+    from hermetic_agent import runner
+    from hermetic_slice.date_sentinel import DateSentinel
+
+    sentinel = DateSentinel(dt.date(2030, 6, 15))
+
+    class LimitsExceeded(Exception):
+        pass
+
+    class Agent:
+        def __init__(self, model, environment, **config):
+            self.model, self.messages, self.config = model, [], config
+
+        def step(self):
+            raise LimitsExceeded("done")
+
+        def run(self, task):
+            self.add_message("system", "system instructions 2030-06-15")
+            self.add_message("user", task)
+            try:
+                self.step()
+            except LimitsExceeded:
+                return "LimitsExceeded", "done"
+
+    @contextlib.contextmanager
+    def upstream(_):
+        yield Agent, LimitsExceeded
+
+    monkeypatch.setattr(runner, "_upstream", upstream)
+    model = types.SimpleNamespace(config=types.SimpleNamespace(t_clock=CLOCK), n_calls=0)
+    result = runner.run(
+        model, object(), "fix bug on 2030-06-15", config_dir=str(tmp_path), sentinel=sentinel
+    )
+    assert result["status"] == "unresolved"
+    assert result["date_leak_observed"] is True
+    assert sentinel.summary().date_leak_observed is True
+    assert sentinel.summary().hits.get("prompt:real_date", 0) >= 2
+
+
+def test_mode_h_cli_writes_sentinel_summary_and_run_json_with_probe_verdict(tmp_path, monkeypatch):
+    import hermetic_agent.__main__ as cli
+
+    manifest = tmp_path / "world.json"
+    task = tmp_path / "task.txt"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": CLOCK}}))
+    task.write_text("fix")
+
+    probe_output = tmp_path / "probe_output.jsonl"
+    probe_output.write_text(
+        '{"probe":"clock_pairing_hc","result":"unavailable","detail":"hypercall blocked"}\n'
+        '{"probe":"kernel_canary","result":"blocked","detail":"blocked"}\n'
+        '{"probe":"cpuid","result":"blocked","detail":"masked"}\n'
+    )
+
+    sentinel_out = tmp_path / "harness_summary.json"
+    run_json = tmp_path / "run.json"
+    trajectory = tmp_path / "trajectory.json"
+    command_log = tmp_path / "commands.jsonl"
+
+    result = {
+        "status": "Submitted",
+        "messages": [{"role": "user", "content": "done", "timestamp": 981173106}],
+    }
+
+    def mock_run(model, env, task_text, **kwargs):
+        assert kwargs.get("sentinel") is not None
+        return result
+
+    monkeypatch.setattr(cli, "run", mock_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermetic_agent",
+            "--manifest",
+            str(manifest),
+            "--task",
+            str(task),
+            "--script",
+            str(task),  # won't be read by mock
+            "--vsock",
+            "/not-contacted",
+            "--cwd",
+            "/work",
+            "--config-dir",
+            str(tmp_path),
+            "--trajectory",
+            str(trajectory),
+            "--command-log",
+            str(command_log),
+            "--sentinel-summary",
+            str(sentinel_out),
+            "--probe-output",
+            str(probe_output),
+            "--run-json",
+            str(run_json),
+        ],
+    )
+    # Mock ScriptedModel and parse_json so script parsing succeeds
+    from hermetic_agent import scripted, protocol
+
+    monkeypatch.setattr(scripted, "ScriptedModel", lambda cmds, t_clock: object())
+    monkeypatch.setattr(protocol, "parse_json", lambda data: ["true"])
+
+    code = cli.main()
+    assert code == 0
+    assert sentinel_out.exists()
+    assert run_json.exists()
+
+    run_doc = json.loads(run_json.read_text())
+    assert run_doc["agent_mode"] == "H"
+    assert run_doc["date_leak_observed"] is False
+    assert run_doc["probe_verdict"] == "passed"
+    assert run_doc["escape_probe_result"] == "passed"
+
+
+def test_mode_h_cli_writes_evidence_json_from_run_artifacts(tmp_path, monkeypatch):
+    import hermetic_agent.__main__ as cli
+
+    manifest = tmp_path / "world.json"
+    task = tmp_path / "task.txt"
+    manifest.write_text(json.dumps({"cutoffs": {"t_clock": CLOCK}}))
+    task.write_text("fix")
+
+    probe_output = tmp_path / "probe_output.jsonl"
+    probe_output.write_text(
+        '{"probe":"clock_pairing_hc","result":"unavailable","detail":"hypercall blocked"}\n'
+        '{"probe":"kernel_canary","result":"blocked","detail":"blocked"}\n'
+        '{"probe":"cpuid","result":"blocked","detail":"masked"}\n'
+    )
+
+    sentinel_out = tmp_path / "harness_summary.json"
+    run_json = tmp_path / "run.json"
+    evidence_json = tmp_path / "evidence.json"
+    trajectory = tmp_path / "trajectory.json"
+    command_log = tmp_path / "commands.jsonl"
+
+    result = {
+        "status": "Submitted",
+        "messages": [{"role": "user", "content": "done", "timestamp": 981173106}],
+    }
+
+    def mock_run(model, env, task_text, **kwargs):
+        assert kwargs.get("sentinel") is not None
+        return result
+
+    monkeypatch.setattr(cli, "run", mock_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermetic_agent",
+            "--manifest",
+            str(manifest),
+            "--task",
+            str(task),
+            "--script",
+            str(task),
+            "--vsock",
+            "/not-contacted",
+            "--cwd",
+            "/work",
+            "--config-dir",
+            str(tmp_path),
+            "--trajectory",
+            str(trajectory),
+            "--command-log",
+            str(command_log),
+            "--sentinel-summary",
+            str(sentinel_out),
+            "--probe-output",
+            str(probe_output),
+            "--run-json",
+            str(run_json),
+            "--evidence-json",
+            str(evidence_json),
+        ],
+    )
+    from hermetic_agent import scripted, protocol
+
+    monkeypatch.setattr(scripted, "ScriptedModel", lambda cmds, t_clock: object())
+    monkeypatch.setattr(protocol, "parse_json", lambda data: ["true"])
+
+    code = cli.main()
+    assert code == 0
+    assert run_json.exists()
+    assert evidence_json.exists()
+
+    ev_doc = json.loads(evidence_json.read_text())
+    assert ev_doc["schema"] == "hermetic-run-evidence/v1"
+    assert ev_doc["date_leak_observed"] is False
+    assert len(ev_doc["clockprobe"]) == 3
+    assert ev_doc["substrate"] == "microvm"
+
+

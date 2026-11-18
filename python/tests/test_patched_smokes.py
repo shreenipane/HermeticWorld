@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize('name', ['boot-smoke', 'net-smoke', 'multivcpu-smoke', 'snapshot-smoke', 'tsc-drift-smoke'])
+@pytest.mark.parametrize('name', ['boot-smoke', 'net-smoke', 'multivcpu-smoke', 'snapshot-smoke', 'tsc-drift-smoke', 'd7-smoke'])
 def test_smoke_preserves_patched_binary_and_requires_measured_lock(tmp_path, name):
     script = ROOT / 'scripts/integration' / (name + '.sh')
     # Stop at the first builder, before any filesystem effects. Stub only tap

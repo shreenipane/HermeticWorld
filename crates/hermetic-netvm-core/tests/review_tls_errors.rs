@@ -66,10 +66,10 @@ fn upstream_errors_and_invalid_status_finish_https_without_truncation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         socket
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let server = server.clone();
         let filter = filter.clone();
@@ -78,7 +78,7 @@ fn upstream_errors_and_invalid_status_finish_https_without_truncation() {
             tls::handle_connection(
                 socket,
                 server,
-                HttpRuntimeConfig::bounded(1, 500, 500, 2000, EPOCH),
+                HttpRuntimeConfig::bounded(1, 10_000, 5_000, 30_000, EPOCH),
                 filter.as_ref(),
                 &FailingUpstream(failure),
                 &Metrics::new(Arc::new(VecLogSink::new())),

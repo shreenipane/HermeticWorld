@@ -288,6 +288,7 @@ pub struct PreparedJail {
     pub root: Directory,
     id: String,
     uid: u32,
+    remaining_image_bytes: std::sync::Mutex<u64>,
 }
 impl PreparedJail {
     pub fn prepare(valid: &crate::ValidatedSpec, end: Instant) -> Result<Self> {
@@ -448,6 +449,7 @@ impl PreparedJail {
             root,
             id: valid.spec().id.clone(),
             uid: plan.uid,
+            remaining_image_bytes: std::sync::Mutex::new(0),
         };
         let result = (|| {
             let mut budget = MAX_TOTAL_IMAGE_BYTES;
@@ -479,6 +481,9 @@ impl PreparedJail {
                     &mut budget,
                     end,
                 )?;
+            }
+            if let Ok(mut rem) = jail.remaining_image_bytes.lock() {
+                *rem = budget;
             }
             remaining(end, "prepare")?;
             Ok(())
@@ -529,6 +534,59 @@ impl PreparedJail {
     }
     pub fn api_socket(&self) -> String {
         self.root.descriptor_path("api.socket")
+    }
+    pub fn publish_attached_drive(
+        &self,
+        drive_id: &str,
+        source_path: &str,
+        end: Instant,
+    ) -> Result<()> {
+        remaining(end, "publish_attached_drive")?;
+        let mut file = open_image(source_path)?;
+        let size = file.metadata()?.len();
+        if size == 0 || size > MAX_IMAGE_BYTES {
+            return Err(Error::Validation("attached drive image size cap"));
+        }
+        let owner = if rustix::process::geteuid().is_root() {
+            (self.uid, self.uid)
+        } else {
+            (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            )
+        };
+        let mut copy_budget = self
+            .remaining_image_bytes
+            .lock()
+            .map_err(|_| Error::State)?;
+        let dest_name = format!("drive-{drive_id}");
+        if let Ok(st) = fs::statat(&self.root.0, &dest_name, AtFlags::SYMLINK_NOFOLLOW) {
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                return Err(Error::Validation(
+                    "reserved drive placeholder must be regular file",
+                ));
+            }
+            let placeholder_size = st.st_size as u64;
+            *copy_budget = copy_budget
+                .saturating_add(placeholder_size)
+                .min(MAX_TOTAL_IMAGE_BYTES);
+            fs::unlinkat(&self.root.0, &dest_name, AtFlags::empty())?;
+        }
+        self.root.publish(
+            &dest_name,
+            Some(&mut file),
+            false,
+            owner,
+            &mut copy_budget,
+            end,
+        )?;
+        Ok(())
+    }
+    pub fn remaining_image_bytes(&self) -> u64 {
+        *self.remaining_image_bytes.lock().unwrap()
+    }
+    pub fn set_remaining_image_bytes(&self, bytes: u64) {
+        *self.remaining_image_bytes.lock().unwrap() = bytes;
     }
     pub fn check_identity(&self) -> Result<()> {
         self.base.exclusive()?;

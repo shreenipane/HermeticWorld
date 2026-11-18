@@ -468,6 +468,8 @@ def _validate_str(val: Any, field: str, max_len: int = MAX_STRING_LEN) -> str:
 def cut_packument(
     packument: Any,
     cutoff: str,
+    *,
+    tag_history: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], NpmCutReport]:
     """Filter an npm registry packument at cutoff and recompute time, dist-tags, and metadata."""
     cutoff_nanos = parse_rfc3339_utc_nanos(cutoff)
@@ -549,20 +551,64 @@ def cut_packument(
             best_latest_sv = sv
             best_latest_ver = ver
 
-    # Recompute dist-tags. A packument carries no tag history: a tag's name and
-    # target can be set after the cutoff even when it points at an admitted
-    # version (e.g. "added-after-cutoff-2026" -> a 2020 release). Owner decision
-    # (2026-11-14): drop every tag except "latest", which is recomputed from the
-    # admitted versions alone.
+    # Recompute dist-tags. A packument without tag history carries only mutable tags,
+    # so by default every tag except "latest" is dropped and "latest" is recomputed
+    # from admitted versions alone. When dated tag history is provided, historical
+    # tags pointing to admitted versions at or before the cutoff are restored.
+    verified_historical_tags: dict[str, str] = {}
+    if tag_history is not None:
+        tag_history = _validate_json_tree(tag_history, DEFAULT_PACKUMENT_CAP_BYTES, snapshot=True)
+        if not isinstance(tag_history, dict):
+            raise ValidationError("tag_history must be a JSON object")
+    # Only caller-supplied (pinned, dated) history counts. A "dist-tag-history" or
+    # "tag-history" field inside the packument is unauthenticated registry data and
+    # could re-admit tags created after the cutoff, so it is ignored.
+    history_source = tag_history
+
+    if history_source is not None:
+        if not isinstance(history_source, dict):
+            raise ValidationError("tag_history must be a JSON object")
+        if len(history_source) > MAX_TAGS:
+            raise CapExceededError("tag_history exceeds MAX_TAGS")
+        for tag_name, entries in sorted(history_source.items()):
+            _validate_str(tag_name, "tag_history.key", max_len=256)
+            if isinstance(entries, dict):
+                entry_list = [entries]
+            elif isinstance(entries, list):
+                entry_list = list(entries)
+            else:
+                raise ValidationError("tag_history entry must be an object or list of objects")
+            if len(entry_list) > 1000:
+                raise CapExceededError("tag_history entries per tag exceeds cap")
+            valid_entries: list[tuple[int, str]] = []
+            for entry in entry_list:
+                if not isinstance(entry, dict):
+                    raise ValidationError("tag_history entry must be an object")
+                ver = _validate_str(entry.get("version"), "tag_history.version", max_len=MAX_VERSION_LEN)
+                t_str = _validate_str(entry.get("time"), "tag_history.time", max_len=64)
+                t_ns = parse_rfc3339_utc_nanos(t_str)
+                if t_ns <= cutoff_nanos:
+                    valid_entries.append((t_ns, ver))
+            if valid_entries:
+                valid_entries.sort(key=lambda item: (item[0], item[1]))
+                target_ver = valid_entries[-1][1]
+                if target_ver in kept_versions:
+                    verified_historical_tags[tag_name] = target_ver
+
     recomputed_tags: dict[str, str] = {}
-    tags_dropped: list[str] = sorted(tag for tag in raw_dist_tags if tag != "latest")
+    tags_dropped_set = set(raw_dist_tags.keys())
+
+    for tag, ver in sorted(verified_historical_tags.items()):
+        recomputed_tags[tag] = ver
+        tags_dropped_set.discard(tag)
 
     if best_latest_ver is not None:
         recomputed_tags["latest"] = best_latest_ver
-    elif "latest" in raw_dist_tags:
-        tags_dropped.append("latest")
+        tags_dropped_set.discard("latest")
+    elif "latest" in raw_dist_tags and "latest" not in verified_historical_tags:
+        tags_dropped_set.add("latest")
 
-    tags_dropped.sort()
+    tags_dropped = sorted(tags_dropped_set)
 
     # Build the output from an allow-list (fail closed): every top-level key not listed
     # here ("users", "_rev", "_attachments", unknown registry keys) may carry post-cutoff

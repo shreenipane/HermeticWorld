@@ -11,11 +11,13 @@ dev-unjailed = []
 [dependencies]
 hermetic-common = { workspace = true }
 hermetic-extract = { path = "../hermetic-extract" }
+hermetic-grader-result = { path = "../hermetic-grader-result" }
 hermetic-run = { path = "../hermetic-run" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustix = { version = "=1.1.6", features = ["fs", "process", "net", "event", "mount", "thread"] }
 sha2 = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 hermetic-attest = { path = "../hermetic-attest" }

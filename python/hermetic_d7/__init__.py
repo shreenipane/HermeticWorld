@@ -10,10 +10,15 @@ from hermetic_d7.compare import (
     format_report_json,
 )
 from hermetic_d7.deep_audit import (
+    BuildFailedError,
+    BuildRequest,
+    IsolatedBuilder,
     RECIPE_SCHEMA,
     RecipeEntry,
+    RefusingBuilder,
     parse_recipe,
     run_deep_audit,
+    run_deep_audit_cli,
 )
 from hermetic_d7.recipe import (
     MAX_UNATTRIBUTED_ENTRIES,
@@ -24,6 +29,10 @@ from hermetic_d7.recipe import (
     build_recipe,
     emit_recipe,
     scan_built_artifacts,
+)
+from hermetic_d7.vm_builder import (
+    VmBuilderConfig,
+    VmIsolatedBuilder,
 )
 from hermetic_d7.normalise import (
     MAX_ARCHIVE_MEMBERS,
@@ -57,9 +66,12 @@ from hermetic_d7.normalise import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "BuildFailedError",
+    "BuildRequest",
     "CliUsageError",
     "HermeticD7Error",
     "InvalidArtifactError",
+    "IsolatedBuilder",
     "MAX_ARCHIVE_MEMBERS",
     "MAX_DIFF_INPUT_LINES",
     "MAX_DIFF_LINES",
@@ -80,9 +92,12 @@ __all__ = [
     "RecipeFormatError",
     "RecipeResourceLimitError",
     "RecipeSecurityError",
+    "RefusingBuilder",
     "ResourceLimitError",
     "ResourceLimits",
     "SecurityViolationError",
+    "VmBuilderConfig",
+    "VmIsolatedBuilder",
     "__version__",
     "build_error_report",
     "build_recipe",
@@ -98,6 +113,7 @@ __all__ = [
     "normalise_record",
     "parse_recipe",
     "run_deep_audit",
+    "run_deep_audit_cli",
     "scan_built_artifacts",
     "validate_member_path",
 ]

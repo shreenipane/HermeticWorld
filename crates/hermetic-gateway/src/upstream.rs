@@ -37,6 +37,22 @@ impl Drop for UnverifiedChatUsage {
     }
 }
 
+fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
+    let (stripped, default_port) = if let Some(rest) = base_url.strip_prefix("https://") {
+        (rest, 443)
+    } else {
+        let rest = base_url.strip_prefix("http://")?;
+        (rest, 80)
+    };
+    let authority = stripped.split('/').next()?.split('?').next()?;
+    if let Some((host, port_str)) = authority.split_once(':') {
+        let port = port_str.parse::<u16>().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        Some((authority.to_string(), default_port))
+    }
+}
+
 impl UpstreamClient {
     pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB limit
     /// A non-2xx body is only inspected for its error type and is never forwarded, so far
@@ -45,13 +61,41 @@ impl UpstreamClient {
     pub const MAX_CHAT_TOTAL_SECONDS: u64 = 300;
 
     pub fn new(config: Arc<GatewayConfig>) -> Self {
-        let agent = ureq::AgentBuilder::new()
+        let mut pre_resolved = Vec::new();
+        let target_host = if let Some((host, port)) = parse_host_port(&config.upstream_base_url) {
+            use std::net::ToSocketAddrs;
+            if let Ok(addrs) = (host.as_str(), port).to_socket_addrs() {
+                pre_resolved = addrs.collect();
+            }
+            Some(host)
+        } else {
+            None
+        };
+
+        let mut builder = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(std::time::Duration::from_secs(30))
             .timeout_read(std::time::Duration::from_secs(
                 config.upstream_read_timeout_s,
-            ))
-            .build();
+            ));
+
+        if let Some(host) = target_host {
+            if !pre_resolved.is_empty() {
+                let addrs = pre_resolved;
+                builder = builder.resolver(move |addr: &str| {
+                    if let Some((req_host, _)) = addr.split_once(':') {
+                        if req_host == host {
+                            return Ok(addrs.clone());
+                        }
+                    } else if addr == host {
+                        return Ok(addrs.clone());
+                    }
+                    std::net::ToSocketAddrs::to_socket_addrs(addr).map(|iter| iter.collect())
+                });
+            }
+        }
+
+        let agent = builder.build();
         Self { agent, config }
     }
 

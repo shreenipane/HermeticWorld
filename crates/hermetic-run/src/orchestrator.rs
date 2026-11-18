@@ -65,8 +65,8 @@ use hermetic_attest::safe_sha256_file;
 use hermetic_attest::{
     AgentMode, ClockLevel, Deployment, Digest, DsseEnvelope, DsseError, Ed25519Signer, FsError,
     GraderIsolation, GradingRunResult, HostBootRecord, KeyError, ProbeResult, RunRecord, RunStatus,
-    RunValidationError, SealLevel, Signer, Statement, SubstrateAtT, TaskClass, TeeQuote,
-    VersionTuple,
+    RunValidationError, SealLevel, Signer, SigstoreBundle, SigstoreError, SigstoreSigner,
+    StateGradeRecord, Statement, SubstrateAtT, TaskClass, TeeQuote, VersionTuple,
 };
 use hermetic_sealcheck::d12_runtime::SentinelSummary;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,7 @@ pub const MAX_GATEWAY_HISTORY_BYTES: usize = 64 * 1024;
 pub const MAX_HARNESS_SUMMARY_BYTES: usize = 1024 * 1024;
 pub const MAX_PROBE_BYTES: usize = 1024 * 1024;
 pub const MAX_BOOT_RECORD_BYTES: usize = 64 * 1024;
+pub const MAX_STATE_GRADE_BYTES: usize = 16 * 1024;
 pub const MAX_VERDICT_BYTES: usize = 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_SUBMITTED_WORK_BYTES: usize = 16 * 1024 * 1024;
@@ -129,6 +130,7 @@ pub enum OrchestratorError {
     Validation(RunValidationError),
     Key(KeyError),
     Dsse(DsseError),
+    Sigstore(SigstoreError),
 }
 
 impl fmt::Display for OrchestratorError {
@@ -149,6 +151,7 @@ impl fmt::Display for OrchestratorError {
             Self::Validation(e) => write!(f, "Run record validation failed: {e}"),
             Self::Key(e) => write!(f, "Key error: {e}"),
             Self::Dsse(e) => write!(f, "DSSE error: {e}"),
+            Self::Sigstore(e) => write!(f, "Sigstore error: {e}"),
         }
     }
 }
@@ -170,6 +173,12 @@ impl From<KeyError> for OrchestratorError {
 impl From<DsseError> for OrchestratorError {
     fn from(e: DsseError) -> Self {
         Self::Dsse(e)
+    }
+}
+
+impl From<SigstoreError> for OrchestratorError {
+    fn from(e: SigstoreError) -> Self {
+        Self::Sigstore(e)
     }
 }
 
@@ -851,11 +860,48 @@ fn load_boot_record(run_dir: &Path) -> Result<HostBootRecord, OrchestratorError>
             };
             Ok(HostBootRecord::trusted_initramfs(digest))
         }
+        "live_snapshot" => {
+            if wire.initrd_sha256.is_some() || wire.initrd_digest.is_some() {
+                return Err(OrchestratorError::MalformedArtifact {
+                    artifact: "boot_record.json",
+                    detail: "live_snapshot must not have initrd digest",
+                });
+            }
+            Ok(HostBootRecord::live_snapshot())
+        }
         _ => Err(OrchestratorError::MalformedArtifact {
             artifact: "boot_record.json",
             detail: "unknown boot_path in host boot record",
         }),
     }
+}
+
+/// Load and parse the state task grading path record if present (§11.4).
+fn load_state_grade(run_dir: &Path) -> Result<Option<StateGradeRecord>, OrchestratorError> {
+    let artifact = "state_grade.json";
+    let p = run_dir.join(artifact);
+    let bytes = match safe_read_file(&p, MAX_STATE_GRADE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(OrchestratorError::Fs {
+                artifact,
+                detail: e.to_string(),
+            });
+        }
+    };
+    let record: StateGradeRecord =
+        serde_json::from_slice(&bytes).map_err(|e| OrchestratorError::Json {
+            artifact,
+            detail: json_parse_error(e.line(), e.column()),
+        })?;
+    record
+        .validate()
+        .map_err(|_| OrchestratorError::MalformedArtifact {
+            artifact,
+            detail: "state_grade validation failed",
+        })?;
+    Ok(Some(record))
 }
 
 /// Load and parse the evaluation verdict from hermetic-run.
@@ -921,6 +967,7 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
     let gateway_history = load_gateway_history(run_dir)?;
     let gateway_head = load_gateway_head_summary(run_dir)?;
     let submitted_work_digest = resolve_submitted_work_digest(run_dir, &verdict)?;
+    let state_grade = load_state_grade(run_dir)?;
 
     // 2. Date leak is derived from real-date sentinels (TR-SEC-5, D12)
     let mut sentinels = vec![gateway_sentinel, harness_sentinel];
@@ -1045,6 +1092,7 @@ pub fn assemble_run_record(run_dir: &Path) -> Result<RunRecord, OrchestratorErro
         unclean_shutdown: verdict.unclean_shutdown,
         tee_quote: manifest.tee_quote,
         boot_record: Some(boot_record),
+        state_grade,
     };
 
     // 8. Full schema validation
@@ -1097,6 +1145,44 @@ pub fn write_signed_run_record(
     })?;
     safe_atomic_write_file(output_path, &json_bytes).map_err(|e| OrchestratorError::Fs {
         artifact: "output_record",
+        detail: e.to_string(),
+    })
+}
+
+/// Signs an assembled `RunRecord` into a Sigstore bundle with a SigstoreSigner.
+pub fn sign_run_record_sigstore(
+    record: &RunRecord,
+    signer: &SigstoreSigner,
+) -> Result<SigstoreBundle, OrchestratorError> {
+    record.validate().map_err(OrchestratorError::Validation)?;
+    let statement =
+        Statement::new_run_statement(record.clone()).map_err(OrchestratorError::Dsse)?;
+    signer
+        .sign_statement(&statement)
+        .map_err(OrchestratorError::Sigstore)
+}
+
+/// Assembles a `RunRecord` from a run directory and signs it with a SigstoreSigner.
+pub fn assemble_and_sign_run_record_sigstore(
+    run_dir: &Path,
+    signer: &SigstoreSigner,
+) -> Result<(RunRecord, SigstoreBundle), OrchestratorError> {
+    let record = assemble_run_record(run_dir)?;
+    let bundle = sign_run_record_sigstore(&record, signer)?;
+    Ok((record, bundle))
+}
+
+/// Atomically writes a Sigstore bundle to destination with mode 0600.
+pub fn write_sigstore_bundle(
+    output_path: &Path,
+    bundle: &SigstoreBundle,
+) -> Result<(), OrchestratorError> {
+    let json_bytes = serde_json::to_vec(bundle).map_err(|e| OrchestratorError::Json {
+        artifact: "output_bundle",
+        detail: json_parse_error(e.line(), e.column()),
+    })?;
+    safe_atomic_write_file(output_path, &json_bytes).map_err(|e| OrchestratorError::Fs {
+        artifact: "output_bundle",
         detail: e.to_string(),
     })
 }

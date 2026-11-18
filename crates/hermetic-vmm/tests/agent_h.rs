@@ -3,42 +3,12 @@
 #[path = "support/agent_h.rs"]
 mod diagnostics;
 mod support;
-use hermetic_vmm::{api, deadline, Vmm};
+use hermetic_vmm::exec_client::{call, vsock_socket_path};
+use hermetic_vmm::{deadline, Vmm};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-const MAX_RPC_BYTES: u32 = 16 * 1024;
-const MAX_HANDSHAKE_BYTES: usize = 64;
-
-fn call(socket: &str, request: &[u8], end: Instant) -> hermetic_vmm::Result<serde_json::Value> {
-    let mut stream = api::connect(socket, end)?;
-    api::write_deadline(&mut stream, b"CONNECT 5000\n", end)?;
-    let mut line = Vec::new();
-    for _ in 0..MAX_HANDSHAKE_BYTES {
-        let mut byte = [0];
-        api::read_exact_deadline(&mut stream, &mut byte, end)?;
-        line.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    if !line.starts_with(b"OK ") || !line.ends_with(b"\n") {
-        return Err(hermetic_vmm::Error::Protocol);
-    }
-    api::write_deadline(&mut stream, &(request.len() as u32).to_le_bytes(), end)?;
-    api::write_deadline(&mut stream, request, end)?;
-    let mut length = [0; 4];
-    api::read_exact_deadline(&mut stream, &mut length, end)?;
-    let length = u32::from_le_bytes(length);
-    if length == 0 || length > MAX_RPC_BYTES {
-        return Err(hermetic_vmm::Error::Protocol);
-    }
-    let mut raw = vec![0; length as usize];
-    api::read_exact_deadline(&mut stream, &mut raw, end)?;
-    serde_json::from_slice(&raw).map_err(|_| hermetic_vmm::Error::Protocol)
-}
 
 fn finish(child: &mut std::process::Child, timeout: Duration) {
     let end = Instant::now() + timeout;
@@ -112,7 +82,7 @@ fn boots_agent_runs_harness_and_collects_untrusted_extraction() {
         }
         // /proc/self/fd paths are meaningful only in the Vmm process. Keep its pinned directory
         // descriptor open and address it from the child through the parent's pid.
-        let socket = socket.replacen("/proc/self/", &format!("/proc/{}/", std::process::id()), 1);
+        let socket = vsock_socket_path(&socket);
         let mut harness = Command::new(&python)
             .arg(format!("{top}/scripts/integration/agent_h_smoke.py"))
             .args(["--vsock", &socket, "--manifest", &manifest, "--work", &work])

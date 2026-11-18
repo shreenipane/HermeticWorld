@@ -1925,3 +1925,76 @@ def test_image_work_defaults_to_per_test_directory(tmp_path: Path) -> None:
         binary = Path(os.environ["HERMETIC_SEALCHECK_BIN"])
         assert binary.is_relative_to(tmp_path)
         assert stat.S_IMODE(binary.parent.stat().st_mode) == 0o700
+
+
+def test_t2_4_decision_confirmed_no_xattrs_clamped_mtimes_symlinked_ancestors_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirm T2.4 decision: no extended attributes, mtimes clamped to min(source, T_clock),
+    and source paths with symlinked ancestors refused."""
+    t_clock = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    t_epoch = int(t_clock.timestamp())
+
+    # 1. Mtimes clamped to min(source, T_clock) and no extended attributes
+    src = tmp_path / "src_t24"
+    src.mkdir(mode=0o700)
+    future_file = src / "future.txt"
+    future_file.write_text("future content")
+    past_file = src / "past.txt"
+    past_file.write_text("past content")
+
+    # Future file has mtime > T_clock; past file has mtime < T_clock
+    os.utime(future_file, (t_epoch + 10000, t_epoch + 10000))
+    os.utime(past_file, (t_epoch - 5000, t_epoch - 5000))
+
+    try:
+        os.setxattr(future_file, "user.test_attr", b"secret_xattr")
+    except OSError:
+        pass  # If fs lacks user xattrs, pax header assertions below still hold
+
+    tar_path = tmp_path / "t24.tar"
+    rootfs.write_rootfs_tar(src, tar_path, mtime_ceiling=t_epoch)
+
+    with tarfile.open(tar_path, "r") as tf:
+        members = {m.name: m for m in tf.getmembers()}
+        assert "future.txt" in members
+        assert "past.txt" in members
+        # Future mtime clamped to min(source, T_clock) == T_clock
+        assert members["future.txt"].mtime == t_epoch
+        # Past mtime preserved at min(source, T_clock) == source mtime
+        assert members["past.txt"].mtime == t_epoch - 5000
+        # No extended attributes or ACLs in pax headers for any member
+        for m in members.values():
+            assert not any("xattr" in k.lower() or "acl" in k.lower() for k in m.pax_headers)
+
+    # 2. build_rootfs reports xattrs: "none"
+    _hooked_toolchain(monkeypatch)
+    out_img = tmp_path / "out_t24.img"
+    res = build_rootfs(src=src, out_image=out_img, t_clock=t_clock, world_id="w-t24", work_dir=tmp_path)
+    assert res["xattrs"] == "none"
+
+    # 3. Source paths with symlinked ancestors are strictly refused
+    ancestor_parent = tmp_path / "ancestor_box"
+    ancestor_real = ancestor_parent / "real_dir"
+    ancestor_real.mkdir(parents=True)
+    (ancestor_real / "sub_src").mkdir()
+    (ancestor_real / "sub_src" / "file.txt").write_text("ok")
+
+    outside_target = tmp_path / "outside_target"
+    (outside_target / "sub_src").mkdir(parents=True)
+    (outside_target / "sub_src" / "file.txt").write_text("outside")
+
+    # Replace intermediate ancestor with a symlink
+    shutil.rmtree(ancestor_real)
+    ancestor_real.symlink_to(outside_target)
+    symlinked_src = ancestor_real / "sub_src"
+
+    with pytest.raises(ValueError, match="symlinked"):
+        rootfs.open_dir_anchored(symlinked_src)
+
+    with pytest.raises(ValueError, match="symlinked"):
+        build_rootfs(src=symlinked_src, out_image=tmp_path / "bad.img", t_clock=t_clock, world_id="w-bad")
+
+    with pytest.raises(ValueError, match="symlinked"):
+        rootfs.write_rootfs_tar(symlinked_src, tmp_path / "bad.tar", mtime_ceiling=t_epoch)
+

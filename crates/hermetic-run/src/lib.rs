@@ -16,12 +16,14 @@ pub use infra::{
 };
 pub use machine::{FailureReason, RunState, StateMachine, TransitionError};
 pub use orchestrator::{
-    assemble_and_sign_run_record, assemble_run_record, derive_host_facts, host_facts,
-    sign_run_record, sign_run_record_with_key_path, write_signed_run_record, BootRecordArtifact,
-    GatewayHistoryArtifact, HostFactsArtifact, OrchestratorError, VerdictArtifact,
-    WorldManifestArtifact, BUILD_SCHEMA, MAX_BOOT_RECORD_BYTES, MAX_FIRECRACKER_BYTES,
-    MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_LOCK_BYTES, MAX_MANIFEST_BYTES,
-    MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES,
+    assemble_and_sign_run_record, assemble_and_sign_run_record_sigstore, assemble_run_record,
+    derive_host_facts, host_facts, sign_run_record, sign_run_record_sigstore,
+    sign_run_record_with_key_path, write_signed_run_record, write_sigstore_bundle,
+    BootRecordArtifact, GatewayHistoryArtifact, HostFactsArtifact, OrchestratorError,
+    VerdictArtifact, WorldManifestArtifact, BUILD_SCHEMA, MAX_BOOT_RECORD_BYTES,
+    MAX_FIRECRACKER_BYTES, MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_LOCK_BYTES,
+    MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES,
+    MAX_VERDICT_BYTES,
 };
 pub use verdict::{
     resolve_status, verdict, verdict_reasons, GraderResults, MutatedTestResult, PairedTestResult,

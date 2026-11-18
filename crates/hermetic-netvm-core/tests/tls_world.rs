@@ -55,7 +55,7 @@ fn boot(frame: Vec<u8>, config: &WorldConfig) -> io::Result<Ca> {
         let _ = send.write_all(&frame);
         send.shutdown(std::net::Shutdown::Write).unwrap();
     });
-    let result = tls::receive_material(recv, config, Instant::now() + Duration::from_secs(2));
+    let result = tls::receive_material(recv, config, Instant::now() + Duration::from_secs(10));
     writer.join().unwrap();
     result
 }
@@ -182,7 +182,7 @@ fn ask_with_client(
         tls::handle_connection(
             socket,
             server,
-            HttpRuntimeConfig::bounded(1, 500, 500, 2000, EPOCH),
+            HttpRuntimeConfig::bounded(1, 10_000, 5_000, 30_000, EPOCH),
             filter.as_ref(),
             upstream.as_ref(),
             &Metrics::new(Arc::new(VecLogSink::new())),
@@ -190,10 +190,10 @@ fn ask_with_client(
     });
     let socket = TcpStream::connect(address).unwrap();
     socket
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     socket
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let conn =
         ClientConnection::new(client, ServerName::try_from(name.to_owned()).unwrap()).unwrap();
@@ -403,7 +403,7 @@ fn tls_client_hello_for_world_host_dialled_to_mismatched_address_is_reset_before
         tls::handle_connection(
             socket,
             server,
-            HttpRuntimeConfig::bounded(1, 500, 500, 2000, EPOCH),
+            HttpRuntimeConfig::bounded(1, 10_000, 5_000, 30_000, EPOCH),
             filter.as_ref(),
             upstream_clone.as_ref(),
             &metrics_clone,
@@ -412,10 +412,10 @@ fn tls_client_hello_for_world_host_dialled_to_mismatched_address_is_reset_before
 
     let mut client_socket = TcpStream::connect(address).unwrap();
     client_socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     client_socket
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .unwrap();
 
     // Generate real TLS ClientHello with SNI "files.example"

@@ -74,6 +74,7 @@ MAX_TASK_ID_BYTES = 128
 MAX_EVIDENCE_BYTES = 1024 * 1024
 MAX_FINDING_PATH_BYTES = 4096
 MAX_CHANNEL_BYTES = 64
+MAX_TRAVERSAL_RETRIES = 5
 DETECTORS = frozenset([f"D{i}" for i in range(13)] + ["D3b", "D5a", "T2"])
 
 # Strict pattern for task_id: SWE-bench instance IDs (e.g. django__django-11099, sympy__sympy-20590).
@@ -169,18 +170,22 @@ class SafeDirectory:
             raise
 
     def _open_directory(self, name: str) -> int:
-        try:
-            before = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-            if not stat.S_ISDIR(before.st_mode):
-                raise DispositionsError("Symlink rejected or non-directory component")
-            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-            after = os.fstat(fd)
-            if directory_identity(before) != directory_identity(after):
-                os.close(fd)
-                raise DispositionsError("Directory changed during traversal")
-            return fd
-        except OSError:
-            raise DispositionsError("Directory access rejected") from None
+        for attempt in range(MAX_TRAVERSAL_RETRIES):
+            try:
+                before = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise DispositionsError("Symlink rejected or non-directory component")
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+                after = os.fstat(fd)
+                if directory_identity(before) != directory_identity(after):
+                    os.close(fd)
+                    if (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino) and attempt + 1 < MAX_TRAVERSAL_RETRIES:
+                        continue
+                    raise DispositionsError("Directory changed during traversal")
+                return fd
+            except OSError:
+                raise DispositionsError("Directory access rejected") from None
+        raise DispositionsError("Directory changed during traversal")
 
     def child(self, name: str) -> SafeDirectory:
         child = object.__new__(SafeDirectory)
@@ -630,27 +635,37 @@ def open_safe_descendant(
     cur_fd = os.dup(root_dir.fd)
     try:
         for idx, part in enumerate(rel_path):
-            before = os.stat(part, dir_fd=cur_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(before.st_mode):
-                raise DispositionsError("Symlink rejected or non-directory component")
-            if expected_identities is not None:
-                expected_id = expected_identities[idx]
-                if directory_identity(before) != expected_id:
-                    raise DispositionsError("Directory substituted or changed during traversal")
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
-            try:
-                after = os.fstat(next_fd)
-                if directory_identity(before) != directory_identity(after):
-                    raise DispositionsError("Directory changed during traversal")
+            opened = False
+            for attempt in range(MAX_TRAVERSAL_RETRIES):
+                before = os.stat(part, dir_fd=cur_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise DispositionsError("Symlink rejected or non-directory component")
                 if expected_identities is not None:
                     expected_id = expected_identities[idx]
-                    if directory_identity(after) != expected_id:
+                    if directory_identity(before) != expected_id:
                         raise DispositionsError("Directory substituted or changed during traversal")
-            except BaseException:
-                os.close(next_fd)
-                raise
-            os.close(cur_fd)
-            cur_fd = next_fd
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+                try:
+                    after = os.fstat(next_fd)
+                    if directory_identity(before) != directory_identity(after):
+                        if (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino) and attempt + 1 < MAX_TRAVERSAL_RETRIES:
+                            os.close(next_fd)
+                            continue
+                        # The except clause below closes next_fd exactly once.
+                        raise DispositionsError("Directory changed during traversal")
+                    if expected_identities is not None:
+                        expected_id = expected_identities[idx]
+                        if directory_identity(after) != expected_id:
+                            raise DispositionsError("Directory substituted or changed during traversal")
+                except BaseException:
+                    os.close(next_fd)
+                    raise
+                os.close(cur_fd)
+                cur_fd = next_fd
+                opened = True
+                break
+            if not opened:
+                raise DispositionsError("Directory changed during traversal")
         obj = object.__new__(SafeDirectory)
         obj.fd = cur_fd
         return obj

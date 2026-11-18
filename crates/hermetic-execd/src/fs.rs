@@ -5,9 +5,88 @@ use std::{
     fs::File,
     io::Write,
     os::fd::{AsRawFd, OwnedFd},
-    rc::Rc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+
+/// Decides, exactly once, whether a filesystem call is cancelled or allowed to
+/// commit (publish). Both transitions start from `OPEN`, so cancellation and
+/// publication are mutually exclusive. The gate carries the call's deadline:
+/// a commit attempted after it fails even if the RPC loop has not yet cancelled
+/// (it may be busy with another request), so nothing publishes late.
+#[derive(Debug)]
+pub struct CommitGate {
+    state: AtomicU8,
+    deadline: Option<Instant>,
+}
+const GATE_OPEN: u8 = 0;
+const GATE_CANCELLED: u8 = 1;
+const GATE_COMMITTING: u8 = 2;
+impl Default for CommitGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl CommitGate {
+    /// A gate without a deadline (cancelled only explicitly).
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU8::new(GATE_OPEN),
+            deadline: None,
+        }
+    }
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            state: AtomicU8::new(GATE_OPEN),
+            deadline: Some(deadline),
+        }
+    }
+    /// The worker is about to publish; false if the call was cancelled or its
+    /// deadline has passed (which cancels it).
+    pub fn begin_commit(&self) -> bool {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            self.cancel();
+            return false;
+        }
+        if self
+            .state
+            .compare_exchange(
+                GATE_OPEN,
+                GATE_COMMITTING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        test_hooks::run_provisional_claim_hook();
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            self.state.store(GATE_CANCELLED, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+    /// Cancel the call; false if the worker had already begun publishing, in
+    /// which case the outcome is indeterminate rather than cancelled.
+    pub fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                GATE_OPEN,
+                GATE_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+            || self.state.load(Ordering::SeqCst) == GATE_CANCELLED
+    }
+}
+
+/// First temporary-name sequence number of a worker handle.
+const WORKER_SEQUENCE_BASE: u64 = 1 << 40;
 
 pub(crate) const SEALED_SHELL: &str = "/bin/bash";
 
@@ -85,7 +164,7 @@ impl Proc {
 
 pub struct Root {
     dir: OwnedFd,
-    pub(crate) proc: Rc<Proc>,
+    pub(crate) proc: Arc<Proc>,
     sequence: u64,
 }
 impl Root {
@@ -95,7 +174,7 @@ impl Root {
         }
         Ok(Self {
             dir,
-            proc: Rc::new(Proc::open()?),
+            proc: Arc::new(Proc::open()?),
             sequence: 0,
         })
     }
@@ -198,6 +277,16 @@ impl Root {
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
         )?)
     }
+    /// A second handle on the same root for the RPC filesystem worker. Its
+    /// temporary names start in a separate range so the two handles do not
+    /// collide on `O_EXCL` creation (a collision would still only retry).
+    pub fn worker_clone(&self) -> Result<Self> {
+        Ok(Self {
+            dir: rustix::io::fcntl_dupfd_cloexec(&self.dir, 0)?,
+            proc: self.proc.clone(),
+            sequence: WORKER_SEQUENCE_BASE,
+        })
+    }
     pub fn read(&self, path: &str, cap: usize) -> Result<Vec<u8>> {
         read_file_capped(
             self.regular(path)?,
@@ -215,6 +304,20 @@ impl Root {
         clock: i64,
         owner: Option<(rustix::process::Uid, rustix::process::Gid)>,
         mode: Mode,
+    ) -> Result<()> {
+        self.atomic_cancellable(path, data, clock, owner, mode, None)
+    }
+    /// As `atomic_as`, but publication first wins `gate` (after the last
+    /// pre-rename identity check, immediately before `renameat`): a cancelled
+    /// call never publishes, and once committing it can no longer be cancelled.
+    pub fn atomic_cancellable(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        clock: i64,
+        owner: Option<(rustix::process::Uid, rustix::process::Gid)>,
+        mode: Mode,
+        gate: Option<&CommitGate>,
     ) -> Result<()> {
         spec::path(path)?;
         if data.len() > MAX_TRANSFER {
@@ -275,6 +378,9 @@ impl Root {
                 return Err(Error::InvalidInput);
             }
 
+            if gate.is_some_and(|g| !g.begin_commit()) {
+                return Err(Error::Timeout);
+            }
             fs::renameat(&parent, temp.as_str(), &parent, name.as_str())?;
 
             // Verify dev/ino of destination entry after rename.
@@ -356,6 +462,7 @@ pub mod test_hooks {
 
     thread_local! {
         static BEFORE_RENAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+        static PROVISIONAL_CLAIM_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
     pub fn set_before_rename_hook<F: FnMut() + 'static>(f: F) {
@@ -374,6 +481,29 @@ pub mod test_hooks {
     pub fn run_before_rename_hook() {
         let mut hook = None;
         BEFORE_RENAME_HOOK.with(|h| {
+            hook = h.borrow_mut().take();
+        });
+        if let Some(mut f) = hook {
+            f();
+        }
+    }
+
+    pub fn set_provisional_claim_hook<F: FnMut() + 'static>(f: F) {
+        PROVISIONAL_CLAIM_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(f));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_provisional_claim_hook() {
+        PROVISIONAL_CLAIM_HOOK.with(|h| {
+            *h.borrow_mut() = None;
+        });
+    }
+
+    pub fn run_provisional_claim_hook() {
+        let mut hook = None;
+        PROVISIONAL_CLAIM_HOOK.with(|h| {
             hook = h.borrow_mut().take();
         });
         if let Some(mut f) = hook {
@@ -530,7 +660,7 @@ mod tests {
             // retained proc handles rather than rediscover visible /proc.
             assert_eq!(root.read("/file", 100).unwrap(), b"substitute");
             let rerooted = root.reroot(root.directory("/").unwrap()).unwrap();
-            assert!(Rc::ptr_eq(&root.proc, &rerooted.proc));
+            assert!(Arc::ptr_eq(&root.proc, &rerooted.proc));
             assert_eq!(rerooted.read("/old", 100).unwrap(), b"original");
             // TempDir cleanup also uses paths; leave it to the parent fixture
             // rather than attempting forbidden opens under this test filter.

@@ -116,6 +116,7 @@ pub fn sample_run_record() -> RunRecord {
                 .unwrap(),
             ),
         }),
+        state_grade: None,
     }
 }
 

@@ -220,6 +220,7 @@ pub struct GatewayServer {
     sentinel_persist: Arc<Mutex<()>>,
     history_persist: Arc<Mutex<()>>,
     history_persist_failed: Arc<AtomicBool>,
+    log_dir_file: Arc<std::fs::File>,
     /// Test seam: invoked after `request.respond` returns on a streaming response,
     /// before `slot.record_and_release()` runs in the handler thread.
     post_stream_respond_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -294,6 +295,14 @@ impl GatewayServer {
         );
         let upstream = Arc::new(UpstreamClient::new(config_arc.clone()));
         let running = Arc::new(AtomicBool::new(true));
+        let log_dir_file =
+            crate::fsutil::open_dir_nofollow_create(&config_arc.log_dir).map_err(|e| {
+                format!(
+                    "Failed to open log directory '{}': {e}",
+                    config_arc.log_dir.display()
+                )
+            })?;
+        let log_dir_file = Arc::new(log_dir_file);
 
         let server = Self {
             config: config_arc,
@@ -321,6 +330,7 @@ impl GatewayServer {
             sentinel_persist: Arc::new(Mutex::new(())),
             history_persist: Arc::new(Mutex::new(())),
             history_persist_failed: Arc::new(AtomicBool::new(false)),
+            log_dir_file,
             post_stream_respond_hook: None,
         };
         if !server.persist_history() {
@@ -440,6 +450,20 @@ impl GatewayServer {
         self.logger.head_digest()
     }
 
+    /// Apply host-side sandbox restrictions (TR-GW-1).
+    pub fn apply_sandbox(
+        &self,
+        socket_dir: Option<&std::path::Path>,
+        allow_no_landlock: bool,
+    ) -> Result<crate::sandbox::SandboxLandlockStatus, crate::sandbox::SandboxError> {
+        crate::sandbox::apply_sandbox(
+            &self.config.log_dir,
+            &self.config.api_key_file,
+            socket_dir,
+            allow_no_landlock,
+        )
+    }
+
     /// Total number of conversation history rewrites detected so far.
     pub fn history_rewrites_total(&self) -> u64 {
         self.history.rewrites_total()
@@ -447,8 +471,8 @@ impl GatewayServer {
 
     /// Persists the gateway log head summary (`gateway_head.json` and `gateway.jsonl.head`).
     pub fn persist_gateway_head(&self) {
-        let _ = self.logger.persist_head(
-            &self.config.log_dir,
+        let _ = self.logger.persist_head_with_dir(
+            &self.log_dir_file,
             self.history_rewrites_total(),
             self.adapter_version(),
         );
@@ -457,11 +481,8 @@ impl GatewayServer {
     /// Writes the sentinel summary to `DATE_SENTINEL_FILE` in the log directory. A failure
     /// to write marks the scan incomplete (so the result fails closed when next read).
     fn persist_sentinel(&self) {
-        let ok = persist_snapshot(&self.sentinel, &self.sentinel_persist, |bytes| {
-            let Some(dir) = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir).ok()
-            else {
-                return false;
-            };
+        let dir = Arc::clone(&self.log_dir_file);
+        let ok = persist_snapshot(&self.sentinel, &self.sentinel_persist, move |bytes| {
             crate::fsutil::write_state_file(&dir, DATE_SENTINEL_FILE, bytes).is_ok()
         });
         if !ok {
@@ -504,17 +525,13 @@ impl GatewayServer {
 
     /// Writes the history-consistency hash log head and rewrite count to `gateway_history.json`.
     pub fn persist_history(&self) -> bool {
+        let dir = Arc::clone(&self.log_dir_file);
         let ok = persist_history_snapshot(
             &self.history,
             self.adapter_version(),
             &self.history_persist,
             &self.history_persist_failed,
-            |bytes| {
-                let Ok(dir) = crate::fsutil::open_dir_nofollow_create(&self.config.log_dir) else {
-                    return false;
-                };
-                crate::fsutil::write_state_file(&dir, GATEWAY_HISTORY_FILE, bytes).is_ok()
-            },
+            move |bytes| crate::fsutil::write_state_file(&dir, GATEWAY_HISTORY_FILE, bytes).is_ok(),
         );
         if !ok {
             self.latch_history_persist_failure();

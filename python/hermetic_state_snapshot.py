@@ -9,9 +9,11 @@ perform restore in an isolated VM. No guest disk is opened or mounted here.
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
 
 from hermetic_npm_cut.cut import HermeticNpmCutError, parse_json_bytes
+from hermetic_safe_io import IO_CHUNK_BYTES, UnsafePathError, open_regular
 
 MAX_DOCUMENT_BYTES = 16 * 1024
 MAX_STATE_BYTES = 64 * 1024 * 1024
@@ -194,3 +196,221 @@ def build_state_grade_record(raw_manifest: bytes, expected_sha256: str,
     if len(raw) > MAX_DOCUMENT_BYTES:
         raise SnapshotError("snapshot record output byte cap exceeded")
     return raw
+
+
+@dataclass(frozen=True)
+class VerifiedArtifactFile:
+    name: str
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SnapshotFiles:
+    handoff: SnapshotHandoff
+    artifacts: tuple[VerifiedArtifactFile, ...]
+
+
+def load_snapshot_files(manifest_path: str | os.PathLike[str],
+                        artifacts_dir: str | os.PathLike[str] | dict[str, str | os.PathLike[str]],
+                        expected_sha256: str,
+                        run_sha256: str,
+                        runtime_sha256: str) -> SnapshotFiles:
+    """Safely verify immutable snapshot files on disk using descriptor-pinned I/O.
+
+    Rejects symlinks, FIFOs, special devices, directory mutations, and tampered
+    or oversized files. Streams contents in bounded chunks without loading
+    large disks into memory. Fixed errors never leak host paths or names.
+    """
+    try:
+        manifest_raw_path = os.fspath(manifest_path)
+    except Exception:
+        raise SnapshotError("invalid snapshot manifest path") from None
+
+    try:
+        manifest_fd = open_regular(manifest_raw_path, MAX_DOCUMENT_BYTES)
+    except (UnsafePathError, OSError, ValueError):
+        raise SnapshotError("snapshot manifest file access failed") from None
+
+    try:
+        try:
+            chunks = []
+            total = 0
+            while total <= MAX_DOCUMENT_BYTES:
+                chunk = os.read(manifest_fd, IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                chunks.append(chunk)
+            if total > MAX_DOCUMENT_BYTES:
+                raise SnapshotError("snapshot document byte cap or type violation")
+            raw_manifest = b"".join(chunks)
+        except OSError:
+            raise SnapshotError("snapshot manifest read failed") from None
+    finally:
+        os.close(manifest_fd)
+
+    handoff = verify_snapshot_handoff(raw_manifest, expected_sha256, run_sha256, runtime_sha256)
+    declarations = _handoff(handoff.manifest)["artifacts"]
+
+    if isinstance(artifacts_dir, dict):
+        if set(artifacts_dir) != set(ARTIFACT_CAPS):
+            raise SnapshotError("invalid snapshot payload inventory")
+        paths = {}
+        for name in ARTIFACT_CAPS:
+            try:
+                paths[name] = os.fspath(artifacts_dir[name])
+            except Exception:
+                raise SnapshotError("invalid snapshot artifact path") from None
+    elif isinstance(artifacts_dir, (str, os.PathLike)):
+        try:
+            base_dir = os.fspath(artifacts_dir)
+            paths = {name: os.path.join(base_dir, name) for name in ARTIFACT_CAPS}
+        except Exception:
+            raise SnapshotError("invalid snapshot artifacts directory") from None
+    else:
+        raise SnapshotError("invalid snapshot artifacts specification")
+
+    total_size = 0
+    verified_list = []
+    for name in sorted(ARTIFACT_CAPS):
+        cap = ARTIFACT_CAPS[name]
+        expected_size = declarations[name]["size"]
+        expected_sha = declarations[name]["sha256"]
+        file_path = paths[name]
+
+        try:
+            fd = open_regular(file_path, cap)
+        except (UnsafePathError, OSError, ValueError):
+            raise SnapshotError("snapshot artifact file access failed") from None
+
+        try:
+            try:
+                st = os.fstat(fd)
+                if st.st_size != expected_size:
+                    raise SnapshotError("snapshot payload size or type mismatch")
+                total_size += st.st_size
+                if total_size > MAX_TOTAL_ARTIFACT_BYTES:
+                    raise SnapshotError("snapshot aggregate payload byte cap exceeded")
+
+                hasher = hashlib.sha256()
+                bytes_read = 0
+                while bytes_read <= expected_size:
+                    chunk = os.read(fd, IO_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    hasher.update(chunk)
+                if bytes_read != expected_size:
+                    raise SnapshotError("snapshot payload size or type mismatch")
+                if hasher.hexdigest() != expected_sha:
+                    raise SnapshotError("snapshot payload digest mismatch")
+            except OSError:
+                raise SnapshotError("snapshot artifact read failed") from None
+        finally:
+            os.close(fd)
+
+        verified_list.append(VerifiedArtifactFile(name=name, path=file_path, size=expected_size, sha256=expected_sha))
+
+    return SnapshotFiles(handoff, tuple(verified_list))
+
+
+def load_snapshot_artifacts_from_files(manifest_path: str | os.PathLike[str],
+                                       artifacts_dir: str | os.PathLike[str] | dict[str, str | os.PathLike[str]],
+                                       expected_sha256: str,
+                                       run_sha256: str,
+                                       runtime_sha256: str) -> SnapshotArtifacts:
+    """Verify snapshot files on disk and return verified immutable bytes in memory."""
+    try:
+        manifest_raw_path = os.fspath(manifest_path)
+    except Exception:
+        raise SnapshotError("invalid snapshot manifest path") from None
+
+    try:
+        manifest_fd = open_regular(manifest_raw_path, MAX_DOCUMENT_BYTES)
+    except (UnsafePathError, OSError, ValueError):
+        raise SnapshotError("snapshot manifest file access failed") from None
+
+    try:
+        try:
+            chunks = []
+            total = 0
+            while total <= MAX_DOCUMENT_BYTES:
+                chunk = os.read(manifest_fd, IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                chunks.append(chunk)
+            if total > MAX_DOCUMENT_BYTES:
+                raise SnapshotError("snapshot document byte cap or type violation")
+            raw_manifest = b"".join(chunks)
+        except OSError:
+            raise SnapshotError("snapshot manifest read failed") from None
+    finally:
+        os.close(manifest_fd)
+
+    handoff = verify_snapshot_handoff(raw_manifest, expected_sha256, run_sha256, runtime_sha256)
+    declarations = _handoff(handoff.manifest)["artifacts"]
+
+    if isinstance(artifacts_dir, dict):
+        if set(artifacts_dir) != set(ARTIFACT_CAPS):
+            raise SnapshotError("invalid snapshot payload inventory")
+        paths = {}
+        for name in ARTIFACT_CAPS:
+            try:
+                paths[name] = os.fspath(artifacts_dir[name])
+            except Exception:
+                raise SnapshotError("invalid snapshot artifact path") from None
+    elif isinstance(artifacts_dir, (str, os.PathLike)):
+        try:
+            base_dir = os.fspath(artifacts_dir)
+            paths = {name: os.path.join(base_dir, name) for name in ARTIFACT_CAPS}
+        except Exception:
+            raise SnapshotError("invalid snapshot artifacts directory") from None
+    else:
+        raise SnapshotError("invalid snapshot artifacts specification")
+
+    total_size = 0
+    loaded = {}
+    for name in sorted(ARTIFACT_CAPS):
+        cap = ARTIFACT_CAPS[name]
+        expected_size = declarations[name]["size"]
+        expected_sha = declarations[name]["sha256"]
+        file_path = paths[name]
+
+        try:
+            fd = open_regular(file_path, cap)
+        except (UnsafePathError, OSError, ValueError):
+            raise SnapshotError("snapshot artifact file access failed") from None
+
+        try:
+            try:
+                st = os.fstat(fd)
+                if st.st_size != expected_size:
+                    raise SnapshotError("snapshot payload size or type mismatch")
+                total_size += st.st_size
+                if total_size > MAX_TOTAL_ARTIFACT_BYTES:
+                    raise SnapshotError("snapshot aggregate payload byte cap exceeded")
+
+                chunks = []
+                bytes_read = 0
+                while bytes_read <= expected_size:
+                    chunk = os.read(fd, IO_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    chunks.append(chunk)
+                if bytes_read != expected_size:
+                    raise SnapshotError("snapshot payload size or type mismatch")
+                data = b"".join(chunks)
+                if hashlib.sha256(data).hexdigest() != expected_sha:
+                    raise SnapshotError("snapshot payload digest mismatch")
+                loaded[name] = data
+            except OSError:
+                raise SnapshotError("snapshot artifact read failed") from None
+        finally:
+            os.close(fd)
+
+    return SnapshotArtifacts(handoff, tuple(sorted(loaded.items())))
+

@@ -23,13 +23,21 @@ class InstallConfigs:
     manifest: bytes
 
 
-def build_install_configs() -> InstallConfigs:
+def build_install_configs(*, enable_sumdb: bool = False) -> InstallConfigs:
     """Return rootfs-relative files and a manifest binding every config byte.
 
     No acquisition input, host setting, credential or clock is consulted.
-    Go has no direct/VCS fallback, sumdb lookup or automatic toolchain download.
-    Disabling sumdb does not authenticate acquisition; go.sum checks still apply.
+    Go has no direct/VCS fallback or automatic toolchain download.
+    When enable_sumdb is False, sumdb is off and go.sum checks still apply.
+    When enable_sumdb is True, sumdb points at sum.golang.org served by the offline store.
     """
+    go_env = (
+        b"GOPROXY=https://proxy.golang.org\nGOSUMDB=sum.golang.org\nGONOSUMDB=\n"
+        b"GONOPROXY=none\nGOPRIVATE=\nGOTOOLCHAIN=local\nGOVCS=*:off\n"
+        if enable_sumdb
+        else b"GOPROXY=https://proxy.golang.org\nGOSUMDB=off\nGONOSUMDB=*\n"
+        b"GONOPROXY=none\nGOPRIVATE=\nGOTOOLCHAIN=local\nGOVCS=*:off\n"
+    )
     files = tuple(sorted({
         "etc/hermetic/pip.conf": (
             b"[global]\nindex-url = https://pypi.org/simple/\nextra-index-url =\n"
@@ -45,10 +53,7 @@ def build_install_configs() -> InstallConfigs:
             b'[registries.crates-io]\nprotocol = "sparse"\n'
             b"[net]\nretry = 0\ngit-fetch-with-cli = false\n"
         ),
-        "etc/hermetic/go.env": (
-            b"GOPROXY=https://proxy.golang.org\nGOSUMDB=off\nGONOSUMDB=*\n"
-            b"GONOPROXY=none\nGOPRIVATE=\nGOTOOLCHAIN=local\nGOVCS=*:off\n"
-        ),
+        "etc/hermetic/go.env": go_env,
     }.items()))
     if len(files) > MAX_CONFIG_FILES or sum(len(body) for _, body in files) > MAX_CONFIG_BYTES:
         raise CutError("client configuration cap exceeded")
@@ -60,7 +65,12 @@ def build_install_configs() -> InstallConfigs:
     return InstallConfigs(files, manifest)
 
 
-def verify_install_configs(raw_manifest: bytes, files: dict[str, bytes]) -> InstallConfigs:
+def verify_install_configs(
+    raw_manifest: bytes,
+    files: dict[str, bytes],
+    *,
+    enable_sumdb: bool = False,
+) -> InstallConfigs:
     """Validate an untrusted bundle completely before a rootfs writer uses it."""
     manifest = _json(raw_manifest, MAX_CONFIG_MANIFEST_BYTES)
     if type(files) is not dict or len(files) > MAX_CONFIG_FILES:
@@ -72,7 +82,7 @@ def verify_install_configs(raw_manifest: bytes, files: dict[str, bytes]) -> Inst
         total += len(body)
         if total > MAX_CONFIG_BYTES:
             raise CutError("client configuration byte cap exceeded")
-    expected = build_install_configs()
+    expected = build_install_configs(enable_sumdb=enable_sumdb)
     # An installer accepts exactly this versioned configuration policy, rather
     # than trusting attacker-selected destinations or self-asserted hashes.
     if manifest != _json(expected.manifest, MAX_CONFIG_MANIFEST_BYTES) or files != dict(expected.files):

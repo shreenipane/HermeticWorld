@@ -368,6 +368,168 @@ impl<R: Runner> Vmm<R> {
             Err(_) => Err(self.failure("snapshot_load")),
         }
     }
+    pub fn restore_from_snapshot(
+        &mut self,
+        snapshot_path: &str,
+        mem_file_path: &str,
+        network_overrides: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<()> {
+        self.require(&[State::Starting])?;
+        if !crate::spec::absolute_path(snapshot_path) || !crate::spec::absolute_path(mem_file_path)
+        {
+            return Err(Error::Validation(
+                "snapshot paths must be absolute normalized paths",
+            ));
+        }
+        let end = deadline(timeout)?;
+        let socket = self.jail.as_ref().ok_or(Error::State)?.api_socket();
+        let mut ready = false;
+        while Instant::now() < end {
+            let call_end = Instant::now()
+                .checked_add(Duration::from_millis(100))
+                .ok_or(Error::Io)?
+                .min(end);
+            match self
+                .runner
+                .request(&socket, &ApiRequest::new("GET", "/", json!({})), call_end)
+            {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(Error::Io | Error::Deadline(_)) => {
+                    match remaining(end, "restore_from_snapshot") {
+                        Ok(rem) => std::thread::sleep(rem.min(READY_RETRY)),
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !ready {
+            return Err(self.failure("wait_ready"));
+        }
+        let s = self.spec.spec();
+        if s.networks.len() != network_overrides.len() {
+            return Err(Error::Validation(
+                "network overrides must match the complete network interface topology",
+            ));
+        }
+        for (i, net) in s.networks.iter().enumerate() {
+            let iface_id = format!("eth{i}");
+            let override_entry = network_overrides
+                .iter()
+                .find(|(id, _)| id == &iface_id)
+                .ok_or(Error::Validation("missing network override for interface"))?;
+            if !crate::spec::identifier(&override_entry.1, 15) {
+                return Err(Error::Validation("invalid peerless tap name"));
+            }
+            if override_entry.1 == net.tap {
+                return Err(Error::Validation(
+                    "peerless tap override cannot reuse the original connected tap",
+                ));
+            }
+        }
+        let overrides_json: Vec<serde_json::Value> = network_overrides
+            .iter()
+            .map(|(iface, tap)| {
+                json!({
+                    "iface_id": iface,
+                    "host_dev_name": tap,
+                })
+            })
+            .collect();
+        let req_body = if overrides_json.is_empty() {
+            json!({
+                "snapshot_path": snapshot_path,
+                "mem_backend": {
+                    "backend_path": mem_file_path,
+                    "backend_type": "File"
+                },
+                "enable_diff_snapshots": false,
+                "resume_vm": false,
+            })
+        } else {
+            json!({
+                "snapshot_path": snapshot_path,
+                "mem_backend": {
+                    "backend_path": mem_file_path,
+                    "backend_type": "File"
+                },
+                "enable_diff_snapshots": false,
+                "resume_vm": false,
+                "network_overrides": overrides_json,
+            })
+        };
+        match self
+            .runner
+            .request(
+                &socket,
+                &ApiRequest::new("PUT", "/snapshot/load", req_body),
+                end,
+            )
+            .and_then(|()| remaining(end, "restore_from_snapshot").map(|_| ()))
+        {
+            Ok(()) => {
+                self.state = State::Paused;
+                self.boot_record = Some(BootRecord {
+                    vm_id: s.id.clone(),
+                    boot_path: "live_snapshot",
+                    initrd_sha256: None,
+                });
+                Ok(())
+            }
+            Err(_) => Err(self.failure("restore_from_snapshot")),
+        }
+    }
+    pub fn attach_drive(
+        &mut self,
+        drive_id: &str,
+        source_path: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.require(&[State::Paused])?;
+        if !self
+            .spec
+            .spec()
+            .reserved_drives
+            .iter()
+            .any(|d| d == drive_id)
+        {
+            return Err(Error::Validation(
+                "attached drive must match a drive slot reserved at boot",
+            ));
+        }
+        if !crate::spec::absolute_path(source_path) {
+            return Err(Error::Validation(
+                "drive path on host must be an absolute normalized path",
+            ));
+        }
+        let end = deadline(timeout)?;
+        let jail = self.jail.as_ref().ok_or(Error::State)?;
+        jail.publish_attached_drive(drive_id, source_path, end)?;
+        let socket = jail.api_socket();
+        let path_on_host = format!("/drive-{drive_id}");
+        match self.runner.request(
+            &socket,
+            &ApiRequest::new(
+                "PATCH",
+                &format!("/drives/{drive_id}"),
+                json!({
+                    "drive_id": drive_id,
+                    "path_on_host": path_on_host,
+                }),
+            ),
+            end,
+        ) {
+            Ok(()) => {
+                remaining(end, "attach_drive")?;
+                Ok(())
+            }
+            Err(_) => Err(self.failure("attach_drive")),
+        }
+    }
     pub fn stop(&mut self, timeout: Duration) -> Result<()> {
         self.require(&[State::Starting, State::Running, State::Paused])?;
         let end = deadline(timeout)?;

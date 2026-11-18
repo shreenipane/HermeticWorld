@@ -24,11 +24,12 @@ def guest_directory(cwd):
 
 
 class ExecdEnvironment:
-    def __init__(self, vsock_path: str, *, cwd: str, timeout: float = 60, journal=None):
+    def __init__(self, vsock_path: str, *, cwd: str, timeout: float = 60, journal=None, sentinel=None):
         self.config = EnvironmentConfig(guest_directory(cwd), timeout_seconds(timeout))
         self._client = ExecdClient(vsock_path)
         self._output_bytes = 0
         self._journal = journal
+        self._sentinel = sentinel
         self._run_deadline = None
 
     def set_run_deadline(self, deadline):
@@ -75,6 +76,9 @@ class ExecdEnvironment:
         self._output_bytes += len(output)
         if self._output_bytes > MAX_RUN_OUTPUT_BYTES:
             raise LimitError("Run output limit")
+        raw_output = bytes(output)
+        if self._sentinel is not None:
+            self._sentinel.scan_text("observation", raw_output)
         encoded = bytes(output[:MAX_OUTPUT_BYTES]).decode("utf-8", errors="replace").encode("utf-8")
         marker = b"\n[output truncated]"
         if result["truncated"] or len(output) > MAX_OUTPUT_BYTES or len(encoded) > MAX_OUTPUT_BYTES:

@@ -13,6 +13,7 @@ use crate::audit::TranscriptAuditRecord;
 use crate::digest::Digest;
 use crate::dsse::{verify_audit_envelope, verify_run_envelope, DsseError, Statement, Verifier};
 use crate::run::{ClockLevel, HostBootRecord, RunRecord, RunStatus};
+use crate::sigstore::{verify_sigstore_bundle, SigstoreError, SigstoreTrustRoot};
 
 /// Largest replay guard (distinct run digests remembered).
 pub const MAX_REPLAY_ENTRIES: usize = 100_000;
@@ -26,6 +27,7 @@ pub const CLASSIFICATION_SCHEMA: &str = "hermetic-run-classification/v1";
 #[derive(Clone, PartialEq, Eq)]
 pub enum VerifyError {
     Envelope(DsseError),
+    Sigstore(SigstoreError),
     BindingMismatch(&'static str),
     Replay,
     ReplayGuardFull { limit: usize },
@@ -38,6 +40,7 @@ impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Envelope(e) => write!(f, "envelope: {e}"),
+            Self::Sigstore(e) => write!(f, "sigstore: {e}"),
             Self::BindingMismatch(field) => write!(f, "record does not match expected {field}"),
             Self::Replay => write!(f, "run record already verified (replay)"),
             Self::ReplayGuardFull { limit } => write!(f, "replay guard full ({limit})"),
@@ -153,6 +156,22 @@ pub fn verify_run_attestation(
 ) -> Result<(Statement<RunRecord>, Digest), VerifyError> {
     let statement =
         verify_run_envelope(envelope_json, None, verifier).map_err(VerifyError::Envelope)?;
+    binding.check(&statement.predicate)?;
+    let digest = crate::canonical::compute_run_digest(&statement.predicate)
+        .map_err(|e| VerifyError::Envelope(DsseError::CanonicalJson(e)))?;
+    guard.admit(digest.clone())?;
+    Ok((statement, digest))
+}
+
+/// Verify a run Sigstore bundle, check its binding, and admit it once.
+pub fn verify_run_sigstore_attestation(
+    bundle_json: &str,
+    trust_root: &SigstoreTrustRoot,
+    binding: &RunBinding,
+    guard: &mut ReplayGuard,
+) -> Result<(Statement<RunRecord>, Digest), VerifyError> {
+    let statement =
+        verify_sigstore_bundle(bundle_json, trust_root, None).map_err(VerifyError::Sigstore)?;
     binding.check(&statement.predicate)?;
     let digest = crate::canonical::compute_run_digest(&statement.predicate)
         .map_err(|e| VerifyError::Envelope(DsseError::CanonicalJson(e)))?;

@@ -7,23 +7,25 @@ use std::path::Path;
 
 use hermetic_attest::dsse::Statement;
 use hermetic_attest::{
-    compute_run_digest, ed25519_key_id, verify_run_attestation, AgentMode, ClockLevel, Digest,
+    base64::base64_encode, compute_run_digest, ed25519_key_id, hex::hex_encode,
+    verify_run_attestation, verify_run_sigstore_attestation, AgentMode, ClockLevel, Digest,
     DsseEnvelope, Ed25519Signer, Ed25519Verifier, HostBootRecord, ProbeResult, ReplayGuard,
-    RunBinding, RunStatus, RunValidationError,
+    RunBinding, RunStatus, RunValidationError, SigstoreSigner, SigstoreTrustRoot,
 };
 use hermetic_run::orchestrator::{
-    assemble_and_sign_run_record, assemble_run_record, compute_clock_level,
-    derive_escape_probe_result, derive_host_facts, host_facts, sign_run_record,
-    sign_run_record_with_key_path, write_signed_run_record, HostFactsArtifact, OrchestratorError,
-    ProbeLineWire, BUILD_SCHEMA, MAX_BOOT_RECORD_BYTES, MAX_GATEWAY_HEAD_BYTES,
-    MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES, MAX_MANIFEST_BYTES, MAX_PROBE_BYTES,
-    MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES, MAX_VERDICT_BYTES, PROBE_RESULTS,
-    REQUIRED_PROBES, RUN_SPEC_VERSION,
+    assemble_and_sign_run_record, assemble_and_sign_run_record_sigstore, assemble_run_record,
+    compute_clock_level, derive_escape_probe_result, derive_host_facts, host_facts,
+    sign_run_record, sign_run_record_with_key_path, write_signed_run_record, write_sigstore_bundle,
+    HostFactsArtifact, OrchestratorError, ProbeLineWire, BUILD_SCHEMA, MAX_BOOT_RECORD_BYTES,
+    MAX_GATEWAY_HEAD_BYTES, MAX_GATEWAY_HISTORY_BYTES, MAX_HARNESS_SUMMARY_BYTES,
+    MAX_MANIFEST_BYTES, MAX_PROBE_BYTES, MAX_SENTINEL_BYTES, MAX_SUBMITTED_WORK_BYTES,
+    MAX_VERDICT_BYTES, PROBE_RESULTS, REQUIRED_PROBES, RUN_SPEC_VERSION,
 };
 use ring::rand::SystemRandom;
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest as Sha2Digest, Sha256};
 
 fn generate_test_key() -> (Vec<u8>, Ed25519Signer, Ed25519Verifier) {
     let rng = SystemRandom::new();
@@ -2097,4 +2099,314 @@ fn test_mode_g_malformed_gateway_head_fails_closed() {
 
     let err = assemble_run_record(f.path()).expect_err("malformed gateway_head must fail");
     assert!(matches!(err, OrchestratorError::Json { .. }));
+}
+
+// =====================================================================// Sigstore Orchestrator Signing & Verification Integration
+// ============================================================================
+
+fn test_der_len(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        vec![len as u8]
+    } else if len < 0x100 {
+        vec![0x81, len as u8]
+    } else {
+        vec![0x82, (len >> 8) as u8, len as u8]
+    }
+}
+
+fn test_der_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&test_der_len(val.len()));
+    out.extend_from_slice(val);
+    out
+}
+
+fn test_der_seq(items: &[&[u8]]) -> Vec<u8> {
+    let mut p = Vec::new();
+    for i in items {
+        p.extend_from_slice(i);
+    }
+    test_der_tlv(0x30, &p)
+}
+
+fn test_mint_ed25519_cert(
+    issuer: Option<(&Ed25519KeyPair, &str)>,
+    subject_cn: &str,
+    subject_key: &Ed25519KeyPair,
+    san: Option<&str>,
+    oidc_issuer: Option<&str>,
+) -> Vec<u8> {
+    let (signer_pair, issuer_cn) = match issuer {
+        Some((ca, cn)) => (ca, cn),
+        None => (subject_key, subject_cn),
+    };
+
+    let version = test_der_tlv(0xA0, &test_der_tlv(0x02, &[0x02]));
+    let serial = test_der_tlv(0x02, &[0x01, 0x01]);
+    let sig_alg = test_der_seq(&[&test_der_tlv(0x06, &[0x2B, 0x65, 0x70])]);
+    let oid_cn = &[0x55, 0x04, 0x03];
+    let issuer_name = test_der_seq(&[&test_der_tlv(
+        0x31,
+        &test_der_seq(&[
+            &test_der_tlv(0x06, oid_cn),
+            &test_der_tlv(0x0C, issuer_cn.as_bytes()),
+        ]),
+    )]);
+    let validity = test_der_seq(&[
+        &test_der_tlv(0x17, b"240101000000Z"),
+        &test_der_tlv(0x17, b"280101000000Z"),
+    ]);
+    let subject_name = test_der_seq(&[&test_der_tlv(
+        0x31,
+        &test_der_seq(&[
+            &test_der_tlv(0x06, oid_cn),
+            &test_der_tlv(0x0C, subject_cn.as_bytes()),
+        ]),
+    )]);
+    let spki_alg = test_der_seq(&[&test_der_tlv(0x06, &[0x2B, 0x65, 0x70])]);
+    let mut pub_bits_val = vec![0x00];
+    pub_bits_val.extend_from_slice(subject_key.public_key().as_ref());
+    let spki = test_der_seq(&[&spki_alg, &test_der_tlv(0x03, &pub_bits_val)]);
+
+    let mut extensions = Vec::new();
+    if let Some(s) = san {
+        let gn = test_der_tlv(0x81, s.as_bytes());
+        let gns = test_der_seq(&[&gn]);
+        let ext_san = test_der_seq(&[
+            &test_der_tlv(0x06, &[0x55, 0x1D, 0x11]),
+            &test_der_tlv(0x04, &gns),
+        ]);
+        extensions.extend_from_slice(&ext_san);
+    }
+    if let Some(iss) = oidc_issuer {
+        let iss_str = test_der_tlv(0x0C, iss.as_bytes());
+        let ext_iss = test_der_seq(&[
+            &test_der_tlv(
+                0x06,
+                &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x01, 0x01],
+            ),
+            &test_der_tlv(0x04, &iss_str),
+        ]);
+        extensions.extend_from_slice(&ext_iss);
+    }
+
+    let mut tbs_items = vec![
+        version.as_slice(),
+        serial.as_slice(),
+        sig_alg.as_slice(),
+        issuer_name.as_slice(),
+        validity.as_slice(),
+        subject_name.as_slice(),
+        spki.as_slice(),
+    ];
+    let exts_seq = test_der_seq(&[&extensions]);
+    let exts_wrap = test_der_tlv(0xA3, &exts_seq);
+    if !extensions.is_empty() {
+        tbs_items.push(&exts_wrap);
+    }
+
+    let tbs_der = test_der_seq(&tbs_items);
+    let sig = signer_pair.sign(&tbs_der);
+    let mut sig_val = vec![0x00];
+    sig_val.extend_from_slice(sig.as_ref());
+    test_der_seq(&[&tbs_der, &sig_alg, &test_der_tlv(0x03, &sig_val)])
+}
+
+struct TestEd25519Signer(Ed25519KeyPair);
+impl hermetic_attest::dsse::Signer for TestEd25519Signer {
+    fn key_id(&self) -> Option<String> {
+        None
+    }
+    fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, hermetic_attest::dsse::SignatureError> {
+        Ok(self.0.sign(pae_bytes).as_ref().to_vec())
+    }
+}
+
+#[test]
+fn test_orchestrator_sigstore_signing_and_verification() {
+    let f = FixturePaths::new();
+    let record = assemble_run_record(f.path()).expect("assemble record");
+
+    let rng = SystemRandom::new();
+    let ca_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let ca_pair = Ed25519KeyPair::from_pkcs8(ca_pkcs8.as_ref()).unwrap();
+    let ca_cert_der = test_mint_ed25519_cert(None, "Fulcio Root CA", &ca_pair, None, None);
+
+    let leaf_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let leaf_pair = Ed25519KeyPair::from_pkcs8(leaf_pkcs8.as_ref()).unwrap();
+    let leaf_cert_der = test_mint_ed25519_cert(
+        Some((&ca_pair, "Fulcio Root CA")),
+        "Hermetic Runner",
+        &leaf_pair,
+        Some("runner@hermetic.world"),
+        Some("https://accounts.google.com"),
+    );
+
+    let rekor_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let rekor_pair = Ed25519KeyPair::from_pkcs8(rekor_pkcs8.as_ref()).unwrap();
+    let rekor_key_id = hex_encode(&Sha256::digest(rekor_pair.public_key().as_ref()));
+
+    let signer = SigstoreSigner {
+        leaf_cert_der: leaf_cert_der.clone(),
+        dsse_signer: Box::new(TestEd25519Signer(leaf_pair)),
+        rekor_key_id: rekor_key_id.clone(),
+        integrated_time: 1780272000, // 2026-06-01
+        rekor_signer: Box::new(move |bytes: &[u8]| Ok(rekor_pair.sign(bytes).as_ref().to_vec())),
+    };
+
+    let trust_root = SigstoreTrustRoot {
+        fulcio_roots: vec![base64_encode(&ca_cert_der)],
+        rekor_keys: vec![hermetic_attest::sigstore::RekorKey {
+            key_id: rekor_key_id,
+            algorithm: hermetic_attest::sigstore::RekorKeyAlgorithm::Ed25519,
+            public_key: base64_encode(
+                Ed25519KeyPair::from_pkcs8(rekor_pkcs8.as_ref())
+                    .unwrap()
+                    .public_key()
+                    .as_ref(),
+            ),
+        }],
+        expected_san: Some("runner@hermetic.world".to_string()),
+        expected_issuer: Some("https://accounts.google.com".to_string()),
+    };
+
+    // Assemble and sign with Sigstore
+    let (assembled, bundle) =
+        assemble_and_sign_run_record_sigstore(f.path(), &signer).expect("sigstore signing");
+    assert_eq!(assembled, record);
+
+    // Atomically write bundle and check permissions
+    let bundle_path = f.path().join("record.sigstore.json");
+    write_sigstore_bundle(&bundle_path, &bundle).expect("write sigstore bundle");
+
+    let meta = fs::metadata(&bundle_path).expect("bundle metadata");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    // Read bundle and verify
+    let bundle_str = fs::read_to_string(&bundle_path).expect("read bundle");
+    let binding = RunBinding {
+        task_id: Some("pytest-dev__pytest-6202".to_string()),
+        world_root: Some(record.world_root.clone()),
+        world_bundle: Some(record.world_root.clone()),
+        sealcheck_report_digest: Some(record.sealcheck_report_digest.clone()),
+        grader_image_digest: Some(record.version_tuple.grader_image_digest.clone()),
+        boot_record: record.boot_record.clone(),
+    };
+    let mut guard = ReplayGuard::new();
+    let (stmt, digest) =
+        verify_run_sigstore_attestation(&bundle_str, &trust_root, &binding, &mut guard)
+            .expect("bundle must verify");
+    assert_eq!(stmt.predicate.task_id, "pytest-dev__pytest-6202");
+    assert!(guard.contains(&digest));
+}
+
+#[test]
+fn test_state_task_live_and_fallback_run_record_assembly() {
+    use hermetic_attest::{GraderIsolation, StateGradingPath, TaskClass};
+
+    // 1. Live path
+    let f = FixturePaths::new();
+
+    // Modify manifest for state task
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest["task_class"] = json!("state");
+    manifest["grader_isolation"] = json!("shared");
+    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+
+    // Boot record is live_snapshot
+    let boot = json!({
+        "vm_id": "agent-vm-0",
+        "boot_path": "live_snapshot"
+    });
+    fs::write(f.path().join("boot_record.json"), boot.to_string()).unwrap();
+
+    // Write valid live state grade
+    let state_grade = json!({
+        "schema": "hermetic-state-grade/v1",
+        "grader_isolation": "shared",
+        "path": "live",
+        "fallback_reason": null,
+        "snapshot_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "run_sha256": "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "tests": {
+            "sha256": "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "size": 4096
+        },
+        "result": {
+            "sha256": "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "size": 512
+        }
+    });
+    fs::write(f.path().join("state_grade.json"), state_grade.to_string()).unwrap();
+
+    let record = assemble_run_record(f.path()).expect("live state run record assembly");
+    assert_eq!(record.task_class, TaskClass::State);
+    assert_eq!(record.grader_isolation, GraderIsolation::Shared);
+    assert_eq!(
+        record.boot_record.as_ref().unwrap().boot_path,
+        "live_snapshot"
+    );
+
+    let sg = record.state_grade.as_ref().expect("state_grade record");
+    assert_eq!(sg.path, StateGradingPath::Live);
+    assert!(sg.fallback_reason.is_none());
+
+    // 2. Fallback reboot path with trusted_initramfs
+    let mut reboot_grade = state_grade.clone();
+    reboot_grade["path"] = json!("reboot");
+    reboot_grade["fallback_reason"] = json!("execd_unresponsive");
+    fs::write(f.path().join("state_grade.json"), reboot_grade.to_string()).unwrap();
+
+    let reboot_boot = json!({
+        "vm_id": "agent-vm-0",
+        "boot_path": "trusted_initramfs",
+        "initrd_sha256": "f123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    });
+    fs::write(f.path().join("boot_record.json"), reboot_boot.to_string()).unwrap();
+
+    let record2 = assemble_run_record(f.path()).expect("reboot fallback state run record assembly");
+    let sg2 = record2.state_grade.as_ref().expect("state_grade record");
+    assert_eq!(sg2.path, StateGradingPath::Reboot);
+    assert_eq!(sg2.fallback_reason.as_deref(), Some("execd_unresponsive"));
+
+    // 3. Symlinked state_grade.json fails
+    fs::remove_file(f.path().join("state_grade.json")).unwrap();
+    let target = f.path().join("other_grade.json");
+    fs::write(&target, state_grade.to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, f.path().join("state_grade.json")).unwrap();
+    assert!(assemble_run_record(f.path()).is_err());
+}
+
+#[test]
+fn test_state_grade_dangling_symlink_fails() {
+    let f = FixturePaths::new();
+
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path().join("world_manifest.json")).unwrap())
+            .unwrap();
+    manifest["task_class"] = json!("state");
+    manifest["grader_isolation"] = json!("shared");
+    fs::write(f.path().join("world_manifest.json"), manifest.to_string()).unwrap();
+
+    let boot = json!({
+        "vm_id": "agent-vm-0",
+        "boot_path": "live_snapshot"
+    });
+    fs::write(f.path().join("boot_record.json"), boot.to_string()).unwrap();
+
+    // Create a dangling symlink for state_grade.json pointing to a non-existent file
+    let nonexistent = f.path().join("does_not_exist.json");
+    std::os::unix::fs::symlink(&nonexistent, f.path().join("state_grade.json")).unwrap();
+
+    let err = assemble_run_record(f.path())
+        .expect_err("dangling symlink state_grade.json must be rejected");
+    match err {
+        OrchestratorError::Fs { artifact, detail } => {
+            assert_eq!(artifact, "state_grade.json");
+            assert!(detail.contains("Symlink") || detail.contains("symlink"));
+        }
+        other => panic!("expected Fs error on dangling symlink, got: {other:?}"),
+    }
 }

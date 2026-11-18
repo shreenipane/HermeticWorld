@@ -7,11 +7,34 @@ import json
 import os
 from pathlib import Path
 import shutil
+import tempfile
 
 import pytest
 
 from hermetic_slice import dispositions as d
 from tests.disposition_fixtures import complete_manifest, complete_task, d0, report
+
+_WORKTREE_ROOT = Path(__file__).resolve().parents[2]
+_ISOLATED_TEMP_BASE = _WORKTREE_ROOT / ".g-tmp"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_review_temp_dirs(monkeypatch):
+    _ISOLATED_TEMP_BASE.mkdir(mode=0o700, exist_ok=True)
+    staging_base = tempfile.mkdtemp(prefix="staging_", dir=str(_ISOLATED_TEMP_BASE))
+    monkeypatch.setattr(tempfile, "tempdir", staging_base)
+    test_dir = tempfile.mkdtemp(prefix="dispositions_", dir=str(_ISOLATED_TEMP_BASE))
+    try:
+        yield Path(test_dir)
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(staging_base, ignore_errors=True)
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def tmp_path(_isolate_review_temp_dirs: Path) -> Path:
+    return _isolate_review_temp_dirs
 
 LEAK = "execute_critical_leak_line()"
 STATEMENT = (

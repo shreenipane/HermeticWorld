@@ -695,3 +695,255 @@ fn verify_refuses_hostile_record_key_classification_and_bundle_paths() {
 fn valid_record_json() -> String {
     serde_json::to_string(&attest_common::sample_run_record()).unwrap()
 }
+
+fn cli_test_der_len(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        vec![len as u8]
+    } else if len < 0x100 {
+        vec![0x81, len as u8]
+    } else {
+        vec![0x82, (len >> 8) as u8, len as u8]
+    }
+}
+
+fn cli_test_der_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&cli_test_der_len(val.len()));
+    out.extend_from_slice(val);
+    out
+}
+
+fn cli_test_der_seq(items: &[&[u8]]) -> Vec<u8> {
+    let mut p = Vec::new();
+    for i in items {
+        p.extend_from_slice(i);
+    }
+    cli_test_der_tlv(0x30, &p)
+}
+
+fn cli_test_mint_cert(
+    issuer: Option<(&ring::signature::Ed25519KeyPair, &str)>,
+    subject_cn: &str,
+    subject_key: &ring::signature::Ed25519KeyPair,
+    san: Option<&str>,
+    oidc_issuer: Option<&str>,
+) -> Vec<u8> {
+    use ring::signature::KeyPair;
+    let (signer_pair, issuer_cn) = match issuer {
+        Some((ca, cn)) => (ca, cn),
+        None => (subject_key, subject_cn),
+    };
+    let version = cli_test_der_tlv(0xA0, &cli_test_der_tlv(0x02, &[0x02]));
+    let serial = cli_test_der_tlv(0x02, &[0x01, 0x01]);
+    let sig_alg = cli_test_der_seq(&[&cli_test_der_tlv(0x06, &[0x2B, 0x65, 0x70])]);
+    let oid_cn = &[0x55, 0x04, 0x03];
+    let issuer_name = cli_test_der_seq(&[&cli_test_der_tlv(
+        0x31,
+        &cli_test_der_seq(&[
+            &cli_test_der_tlv(0x06, oid_cn),
+            &cli_test_der_tlv(0x0C, issuer_cn.as_bytes()),
+        ]),
+    )]);
+    let validity = cli_test_der_seq(&[
+        &cli_test_der_tlv(0x17, b"240101000000Z"),
+        &cli_test_der_tlv(0x17, b"280101000000Z"),
+    ]);
+    let subject_name = cli_test_der_seq(&[&cli_test_der_tlv(
+        0x31,
+        &cli_test_der_seq(&[
+            &cli_test_der_tlv(0x06, oid_cn),
+            &cli_test_der_tlv(0x0C, subject_cn.as_bytes()),
+        ]),
+    )]);
+    let spki_alg = cli_test_der_seq(&[&cli_test_der_tlv(0x06, &[0x2B, 0x65, 0x70])]);
+    let mut pub_bits_val = vec![0x00];
+    pub_bits_val.extend_from_slice(subject_key.public_key().as_ref());
+    let spki = cli_test_der_seq(&[&spki_alg, &cli_test_der_tlv(0x03, &pub_bits_val)]);
+
+    let mut extensions = Vec::new();
+    if let Some(s) = san {
+        let gn = cli_test_der_tlv(0x81, s.as_bytes());
+        let gns = cli_test_der_seq(&[&gn]);
+        let ext_san = cli_test_der_seq(&[
+            &cli_test_der_tlv(0x06, &[0x55, 0x1D, 0x11]),
+            &cli_test_der_tlv(0x04, &gns),
+        ]);
+        extensions.extend_from_slice(&ext_san);
+    }
+    if let Some(iss) = oidc_issuer {
+        let iss_str = cli_test_der_tlv(0x0C, iss.as_bytes());
+        let ext_iss = cli_test_der_seq(&[
+            &cli_test_der_tlv(
+                0x06,
+                &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x01, 0x01],
+            ),
+            &cli_test_der_tlv(0x04, &iss_str),
+        ]);
+        extensions.extend_from_slice(&ext_iss);
+    }
+
+    let mut tbs_items = vec![
+        version.as_slice(),
+        serial.as_slice(),
+        sig_alg.as_slice(),
+        issuer_name.as_slice(),
+        validity.as_slice(),
+        subject_name.as_slice(),
+        spki.as_slice(),
+    ];
+    let exts_seq = cli_test_der_seq(&[&extensions]);
+    let exts_wrap = cli_test_der_tlv(0xA3, &exts_seq);
+    if !extensions.is_empty() {
+        tbs_items.push(&exts_wrap);
+    }
+
+    let tbs_der = cli_test_der_seq(&tbs_items);
+    let sig = signer_pair.sign(&tbs_der);
+    let mut sig_val = vec![0x00];
+    sig_val.extend_from_slice(sig.as_ref());
+    cli_test_der_seq(&[&tbs_der, &sig_alg, &cli_test_der_tlv(0x03, &sig_val)])
+}
+
+#[test]
+fn verify_accepts_a_sigstore_bundle_from_the_trusted_root() {
+    use ring::signature::KeyPair;
+    let rng = ring::rand::SystemRandom::new();
+    let ca_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let ca_pair = Ed25519KeyPair::from_pkcs8(ca_pkcs8.as_ref()).unwrap();
+    let ca_cert_der = cli_test_mint_cert(None, "Fulcio Root CA", &ca_pair, None, None);
+
+    let leaf_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let leaf_pair = Ed25519KeyPair::from_pkcs8(leaf_pkcs8.as_ref()).unwrap();
+    let leaf_cert_der = cli_test_mint_cert(
+        Some((&ca_pair, "Fulcio Root CA")),
+        "Hermetic Runner",
+        &leaf_pair,
+        Some("cli-runner@hermetic.world"),
+        Some("https://accounts.google.com"),
+    );
+
+    let rekor_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let rekor_pair = Ed25519KeyPair::from_pkcs8(rekor_pkcs8.as_ref()).unwrap();
+    use sha2::Digest as Sha2Digest;
+    let rekor_key_id =
+        hermetic_attest::hex::hex_encode(&sha2::Sha256::digest(rekor_pair.public_key().as_ref()));
+
+    let record = attest_common::sample_run_record();
+    let statement = Statement::new_run_statement(record.clone()).unwrap();
+    let payload_bytes = hermetic_attest::canonical::to_canonical_json_bytes(&statement).unwrap();
+    let pae = hermetic_attest::dsse_pae("application/vnd.in-toto+json", &payload_bytes);
+    let dsse_sig = leaf_pair.sign(&pae).as_ref().to_vec();
+
+    let envelope = DsseEnvelope {
+        payload: hermetic_attest::base64::base64_encode(&payload_bytes),
+        payload_type: "application/vnd.in-toto+json".to_string(),
+        signatures: vec![hermetic_attest::DsseSignature {
+            keyid: None,
+            sig: hermetic_attest::base64::base64_encode(&dsse_sig),
+        }],
+    };
+
+    let payload_sha256 = hermetic_attest::hex::hex_encode(&sha2::Sha256::digest(&payload_bytes));
+    let rekor_body = serde_json::json!({
+        "apiVersion": "0.0.2",
+        "kind": "intoto",
+        "spec": {
+            "content": {
+                "hash": {
+                    "algorithm": "sha256",
+                    "value": payload_sha256,
+                }
+            }
+        }
+    });
+    let rekor_body_bytes =
+        hermetic_attest::canonical::to_canonical_json_bytes(&rekor_body).unwrap();
+    let set_sig = rekor_pair.sign(&rekor_body_bytes).as_ref().to_vec();
+
+    let bundle = hermetic_attest::sigstore::SigstoreBundle {
+        media_type: "application/vnd.dev.sigstore.bundle+json;version=0.3".to_string(),
+        verification_material: hermetic_attest::sigstore::VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: Some(hermetic_attest::sigstore::RawCert {
+                raw_bytes: hermetic_attest::base64::base64_encode(&leaf_cert_der),
+            }),
+            tlog_entries: vec![hermetic_attest::sigstore::TlogEntry {
+                log_index: serde_json::Value::from(1),
+                log_id: hermetic_attest::sigstore::LogId {
+                    key_id: rekor_key_id.clone(),
+                },
+                integrated_time: serde_json::Value::from(1780272000),
+                inclusion_promise: Some(hermetic_attest::sigstore::InclusionPromise {
+                    signed_entry_timestamp: hermetic_attest::base64::base64_encode(&set_sig),
+                }),
+                inclusion_proof: None,
+                canonicalized_body: hermetic_attest::base64::base64_encode(&rekor_body_bytes),
+            }],
+        },
+        dsse_envelope: envelope,
+    };
+
+    let trust_root = hermetic_attest::SigstoreTrustRoot {
+        fulcio_roots: vec![hermetic_attest::base64::base64_encode(&ca_cert_der)],
+        rekor_keys: vec![hermetic_attest::sigstore::RekorKey {
+            key_id: rekor_key_id,
+            algorithm: hermetic_attest::sigstore::RekorKeyAlgorithm::Ed25519,
+            public_key: hermetic_attest::base64::base64_encode(rekor_pair.public_key().as_ref()),
+        }],
+        expected_san: Some("cli-runner@hermetic.world".to_string()),
+        expected_issuer: Some("https://accounts.google.com".to_string()),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let record_file = dir.path().join("bundle.json");
+    let key_file = dir.path().join("trust_root.json");
+    fs::write(&record_file, serde_json::to_string(&bundle).unwrap()).unwrap();
+    fs::write(&key_file, serde_json::to_string(&trust_root).unwrap()).unwrap();
+
+    let (code, out, err) = exec(&["verify", "--record", p(&record_file), "--key", p(&key_file)]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let digest = compute_run_digest(&record).unwrap();
+    assert_eq!(out, format!("verify: verified run {digest}\n"));
+
+    // Tampered payload fails verify
+    let mut tampered_bundle = bundle.clone();
+    tampered_bundle.dsse_envelope.payload = hermetic_attest::base64::base64_encode(b"tampered");
+    let tampered_file = dir.path().join("tampered_bundle.json");
+    fs::write(
+        &tampered_file,
+        serde_json::to_string(&tampered_bundle).unwrap(),
+    )
+    .unwrap();
+
+    let (code2, _, err2) = exec(&[
+        "verify",
+        "--record",
+        p(&tampered_file),
+        "--key",
+        p(&key_file),
+    ]);
+    assert_eq!(code2, ExitCode::PROBLEM_FOUND);
+    assert!(err2.contains("record invalid"), "{err2}");
+
+    // Untrusted root CA fails verify
+    let other_ca_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let other_ca_pair = Ed25519KeyPair::from_pkcs8(other_ca_pkcs8.as_ref()).unwrap();
+    let other_ca_der = cli_test_mint_cert(None, "Other CA", &other_ca_pair, None, None);
+    let mut untrusted_root = trust_root;
+    untrusted_root.fulcio_roots = vec![hermetic_attest::base64::base64_encode(&other_ca_der)];
+    let untrusted_file = dir.path().join("untrusted_root.json");
+    fs::write(
+        &untrusted_file,
+        serde_json::to_string(&untrusted_root).unwrap(),
+    )
+    .unwrap();
+    let (code3, _, err3) = exec(&[
+        "verify",
+        "--record",
+        p(&record_file),
+        "--key",
+        p(&untrusted_file),
+    ]);
+    assert_eq!(code3, ExitCode::PROBLEM_FOUND);
+    assert!(err3.contains("record invalid"), "{err3}");
+}

@@ -11,6 +11,7 @@ pub mod nonce;
 pub mod openai;
 pub mod quota;
 pub mod response;
+pub mod sandbox;
 pub mod server;
 pub mod upstream;
 
@@ -24,6 +25,10 @@ pub use nonce::RunNonce;
 pub use quota::{QuotaBreach, QuotaSnapshot, QuotaTracker, QuotasConfig};
 pub use response::{
     format_imf_fixdate, GuestClock, SanitizingSseReader, StreamSlotGuard, StreamUsage,
+};
+pub use sandbox::{
+    apply_landlock, apply_resource_limits, apply_sandbox, apply_seccomp, SandboxError,
+    SandboxLandlockStatus,
 };
 pub use server::{GatewayHistorySummary, GatewayServer, GATEWAY_HISTORY_FILE};
 pub use upstream::UpstreamClient;

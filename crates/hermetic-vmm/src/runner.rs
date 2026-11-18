@@ -30,6 +30,30 @@ pub trait Runner {
     fn exited(&mut self, end: Instant) -> Result<bool>;
     fn kill(&mut self, end: Instant) -> Result<()>;
 }
+
+impl<R: Runner + ?Sized> Runner for Box<R> {
+    fn tsc_khz(&self) -> Result<u64> {
+        (**self).tsc_khz()
+    }
+    fn spawn(
+        &mut self,
+        spec: &ValidatedSpec,
+        plan: &JailPlan,
+        jail: &PreparedJail,
+        end: Instant,
+    ) -> Result<()> {
+        (**self).spawn(spec, plan, jail, end)
+    }
+    fn request(&mut self, socket: &str, request: &ApiRequest, end: Instant) -> Result<()> {
+        (**self).request(socket, request, end)
+    }
+    fn exited(&mut self, end: Instant) -> Result<bool> {
+        (**self).exited(end)
+    }
+    fn kill(&mut self, end: Instant) -> Result<()> {
+        (**self).kill(end)
+    }
+}
 /// A pinned Python 3 interpreter used only for descriptor sanitation and exec.
 /// Its path obeys the same no-symlink, ownership and mode rules as images.
 pub struct ExecLauncher {

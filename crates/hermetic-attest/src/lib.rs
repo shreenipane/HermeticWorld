@@ -39,9 +39,10 @@ pub use dsse::{
 };
 pub use fs::{safe_atomic_write_file, safe_read_file, safe_sha256_file, FsError};
 pub use run::{
-    AgentMode, BootRecord, ClockLevel, Deployment, GraderIsolation, GradingRunResult,
-    HostBootRecord, ProbeResult, RunRecord, RunStatus, RunValidationError, SealLevel, SubstrateAtT,
-    TaskClass, TeePlatform, TeeQuote, VersionTuple, MAX_RUN_RECORD_SIZE,
+    AgentMode, ArtifactDigestSize, BootRecord, ClockLevel, Deployment, GraderIsolation,
+    GradingRunResult, HostBootRecord, ProbeResult, RunRecord, RunStatus, RunValidationError,
+    SealLevel, StateGradeRecord, StateGradingPath, SubstrateAtT, TaskClass, TeePlatform, TeeQuote,
+    VersionTuple, MAX_RUN_RECORD_SIZE,
 };
 pub use score_card::{
     generate_score_card, ExcludedTask, RepairedTask, ScoreCard, ScoreCardError,
@@ -49,10 +50,18 @@ pub use score_card::{
 };
 pub use status::{compute_run_status, GradingInputs};
 pub mod offline_key;
+pub mod sigstore;
 pub mod verify;
 
 pub use offline_key::{ed25519_key_id, Ed25519Signer, Ed25519Verifier, KeyError};
+pub use sigstore::{
+    verify_sigstore_bundle, ParsedCertificate, RekorKey, RekorKeyAlgorithm, RekorSignerFn,
+    SigstoreBundle, SigstoreError, SigstoreSigner, SigstoreTrustRoot, MAX_FULCIO_ROOTS,
+    MAX_REKOR_KEYS, MAX_SIGSTORE_BUNDLE_BYTES, MAX_TRUST_ROOT_BYTES,
+    SIGSTORE_BUNDLE_MEDIA_TYPE_V02, SIGSTORE_BUNDLE_MEDIA_TYPE_V03,
+    SIGSTORE_BUNDLE_MEDIA_TYPE_V03_ALT,
+};
 pub use verify::{
-    check_against_classification, verify_audit_attestation, verify_run_attestation, ReplayGuard,
-    RunBinding, RunClassification, VerifyError,
+    check_against_classification, verify_audit_attestation, verify_run_attestation,
+    verify_run_sigstore_attestation, ReplayGuard, RunBinding, RunClassification, VerifyError,
 };

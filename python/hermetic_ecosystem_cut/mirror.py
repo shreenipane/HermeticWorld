@@ -121,8 +121,30 @@ def _recipe(raw: bytes) -> dict:
         fields = {"ecosystem", "name", "metadata", "artifacts"}
         if kind == "go":
             fields.add("infos")
+            if "sums" in package:
+                fields.add("sums")
+            if "sumdb" in package:
+                fields.add("sumdb")
+        elif kind == "npm":
+            if "tag_history" in package:
+                fields.add("tag_history")
         if set(package) != fields:
             raise CutError("invalid mirror package fields")
+        if kind == "npm" and "tag_history" in package:
+            th = package["tag_history"]
+            if type(th) is str:
+                _digest(th)
+            elif type(th) is not dict:
+                raise CutError("invalid tag_history field")
+        if kind == "go":
+            if "sums" in package:
+                sums = package["sums"]
+                if type(sums) is str:
+                    _digest(sums)
+                elif type(sums) is not dict:
+                    raise CutError("invalid sums field")
+            if "sumdb" in package and type(package["sumdb"]) is not bool:
+                raise CutError("invalid sumdb flag")
         name = package.get("name")
         if type(name) is not str or not 0 < len(name) <= MAX_NAME_BYTES:
             raise CutError("invalid mirror package name")
@@ -167,6 +189,12 @@ def _references(recipe: dict) -> set[str]:
         result.add(package["metadata"])
         result.update(package["artifacts"].values())
         result.update(package.get("infos", {}).values())
+        th = package.get("tag_history")
+        if type(th) is str:
+            result.add(th)
+        sums = package.get("sums")
+        if type(sums) is str:
+            result.add(sums)
     if len(result) > MAX_BLOBS:
         raise CutError("mirror blob count cap exceeded")
     return result
@@ -286,12 +314,51 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
             root = "proxy.golang.org/" + _go_escape(name)
             if report.kept:
                 put(root + "/@v/list", listing, "text/plain")
+            expected_sums: dict[str, str] = {}
+            if "sums" in package:
+                if type(package["sums"]) is str:
+                    raw_sums = blobs[package["sums"]]
+                    expected_sums = _json(raw_sums, MAX_BLOB_BYTES)
+                elif type(package["sums"]) is dict:
+                    expected_sums = package["sums"]
+            has_sumdb = package.get("sumdb", False) or bool(expected_sums)
             for version, info in admitted.items():
                 put(f"{root}/@v/{_go_escape(version)}.info", info, "application/json")
                 for extension, mime in (("mod", "text/plain"), ("zip", "application/zip")):
                     key = f"{version}.{extension}"
                     put(f"{root}/@v/{_go_escape(key)}", artifact(package, key), mime)
                     used.add(key)
+                if has_sumdb:
+                    mod_bytes = artifact(package, f"{version}.mod")
+                    zip_bytes = artifact(package, f"{version}.zip")
+                    if f"{version}.mod" in expected_sums:
+                        exp_mod = expected_sums[f"{version}.mod"]
+                    elif f"{version}/go.mod" in expected_sums:
+                        exp_mod = expected_sums[f"{version}/go.mod"]
+                    else:
+                        exp_mod = None
+
+                    if version in expected_sums:
+                        exp_zip = expected_sums[version]
+                    elif f"{version}.zip" in expected_sums:
+                        exp_zip = expected_sums[f"{version}.zip"]
+                    else:
+                        exp_zip = None
+
+                    if exp_mod is not None and (not isinstance(exp_mod, str) or not exp_mod):
+                        raise CutError("invalid expected mod checksum")
+                    if exp_zip is not None and (not isinstance(exp_zip, str) or not exp_zip):
+                        raise CutError("invalid expected zip checksum")
+                    try:
+                        from .provenance import format_sumdb_lookup, verify_go_provenance
+                        zip_h1, mod_h1 = verify_go_provenance(
+                            name, version, mod_bytes, zip_bytes,
+                            expected_mod_h1=exp_mod, expected_zip_h1=exp_zip,
+                        )
+                    except Exception as exc:
+                        raise CutError("Go h1 checksum verification failed") from exc
+                    lookup_record = format_sumdb_lookup(name, version, zip_h1, mod_h1)
+                    put(f"sum.golang.org/lookup/{_go_escape(name)}@{_go_escape(version)}", lookup_record, "text/plain")
             if admitted:
                 def compare(left, right):
                     return compare_semver(parse_semver(left.removeprefix("v")),
@@ -324,13 +391,22 @@ def build_mirror(raw_recipe: bytes, blobs: dict[str, bytes]) -> MirrorBuild:
             if page["files"]:
                 projects.append(name)
         elif kind == "npm":
+            tag_history = None
+            if "tag_history" in package:
+                if type(package["tag_history"]) is str:
+                    tag_history = _json(blobs[package["tag_history"]], MAX_BLOB_BYTES)
+                elif type(package["tag_history"]) is dict:
+                    tag_history = package["tag_history"]
+            raw_packument = _json(raw, MAX_BLOB_BYTES)
             try:
-                packument, npm_report = cut_packument(_json(raw, MAX_BLOB_BYTES), cutoff)
+                packument, npm_report = cut_packument(
+                    raw_packument, cutoff, tag_history=tag_history
+                )
             except HermeticNpmCutError:
                 raise CutError("invalid npm mirror metadata") from None
             if packument["name"] != name:
                 raise CutError("mirror npm package name mismatch")
-            if set(packument["dist-tags"]) - {"latest"}:
+            if set(packument["dist-tags"]) - {"latest"} and tag_history is None:
                 raise CutError("npm tag history required")
             for version, manifest in packument["versions"].items():
                 if (parse_semver(version) is None or manifest.get("name") != name

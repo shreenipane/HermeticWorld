@@ -1,6 +1,6 @@
 use hermetic_execd::{
     boot::{self, Booted, Config, Effect, Sys},
-    fs::Root,
+    fs::{self as fs_gate, Root},
     real::{serial_failure, stamp_dev, DeadlineStream},
     rpc::{self, ExecReply, Listener, Reply, Request, Server},
     spec::{self, RunSpec, MAX_NETWORK_MTU, MIN_NETWORK_MTU},
@@ -40,6 +40,11 @@ struct Fake {
     guest_clock: Option<i64>,
     uploaded: Vec<(String, Vec<u8>)>,
     trace: Option<Rc<RefCell<Vec<String>>>>,
+    worker_fs: Option<WorkerFake>,
+    exec_delay_ms: u64,
+    release_after_exec: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    wait_commit_attempt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    wait_finished_after_exec: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl Fake {
     fn record(&mut self, event: String) -> Result<()> {
@@ -109,6 +114,22 @@ impl Sys for Fake {
         cap: usize,
     ) -> Result<ExecReply> {
         self.record("exec".into())?;
+        if self.exec_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(self.exec_delay_ms));
+        }
+        if let Some(release) = &self.release_after_exec {
+            release.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(attempted) = &self.wait_commit_attempt {
+            WorkerFake::wait_for("the worker to attempt commit", || {
+                attempted.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        }
+        if let Some(finished) = &self.wait_finished_after_exec {
+            WorkerFake::wait_for("the worker to finish", || {
+                finished.load(std::sync::atomic::Ordering::SeqCst) >= 1
+            });
+        }
         if let Some(error) = self.execute_error {
             return Err(error);
         }
@@ -133,6 +154,12 @@ impl Sys for Fake {
     fn download(&mut self, _: &str) -> Result<Vec<u8>> {
         self.record("download".into())?;
         Ok(vec![1; self.output_size])
+    }
+    fn fs_ops(&mut self) -> Result<Option<Box<dyn rpc::FsOps>>> {
+        Ok(self
+            .worker_fs
+            .take()
+            .map(|w| Box::new(w) as Box<dyn rpc::FsOps>))
     }
     fn guest_time(&mut self) -> Result<i64> {
         Ok(self.guest_clock.unwrap_or(1700000000))
@@ -208,6 +235,103 @@ impl rpc::Connection for Pipe {
         Ok(())
     }
 }
+type Published = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+const RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+const SHUTDOWN_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Send filesystem fake for the RPC worker: the next call can be made to hang
+/// until released, before or after it wins the commit gate, and publishes only
+/// after winning the gate (as `Root::atomic_cancellable`).
+#[derive(Clone, Default)]
+struct WorkerFake {
+    published: Published,
+    hang_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hang_in_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    committing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    attempted_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl WorkerFake {
+    fn wait_release(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.running.store(true, SeqCst);
+        let end = Instant::now() + RELEASE_WAIT_TIMEOUT;
+        while !self.release.load(SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.running.store(false, SeqCst);
+    }
+    /// Wait (bounded) until `flag` holds.
+    fn wait_for(what: &str, flag: impl Fn() -> bool) {
+        let end = Instant::now() + WAIT_DEADLINE;
+        while !flag() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    /// Wait (bounded) until `n` calls have fully returned.
+    fn wait_finished(&self, n: usize) {
+        let end = Instant::now() + WAIT_DEADLINE;
+        while self.finished.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(Instant::now() < end, "worker call did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl rpc::FsOps for WorkerFake {
+    fn upload(&mut self, path: &str, data: &[u8], gate: &fs_gate::CommitGate) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.entered.fetch_add(1, SeqCst);
+        let in_commit = self.hang_in_commit.swap(false, SeqCst);
+        if self.hang_next.swap(false, SeqCst) && !in_commit {
+            self.wait_release();
+        }
+        self.attempted_commit.store(true, SeqCst);
+        let result = if gate.begin_commit() {
+            if in_commit {
+                self.committing.store(true, SeqCst);
+                self.wait_release();
+            }
+            self.published
+                .lock()
+                .unwrap()
+                .push((path.into(), data.to_vec()));
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        };
+        self.finished.fetch_add(1, SeqCst);
+        result
+    }
+    fn download(&mut self, _: &str) -> Result<Vec<u8>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.hang_next.swap(false, SeqCst) {
+            self.wait_release();
+        }
+        self.finished.fetch_add(1, SeqCst);
+        Ok(b"downloaded".to_vec())
+    }
+}
+fn worker_server(deadline_ms: u64) -> (Server<Fake>, WorkerFake) {
+    let worker = WorkerFake::default();
+    let mut server = server(false);
+    server.sys.worker_fs = Some(worker.clone());
+    server.set_fs_deadline(Duration::from_millis(deadline_ms));
+    (server, worker)
+}
+fn upload(path: &str, data: &[u8]) -> Request {
+    Request::Upload {
+        path: path.into(),
+        data: data.to_vec(),
+    }
+}
+
 fn server(locked: bool) -> Server<Fake> {
     Server::new(
         Fake::default(),
@@ -1655,4 +1779,615 @@ fn network_point_to_point_routes_neighbours_via_netvm() {
         );
         assert_eq!(seen, fail + 1);
     }
+}
+
+#[test]
+fn hung_filesystem_call_times_out_and_does_not_block_other_rpcs() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut server, worker) = worker_server(200);
+    worker.hang_next.store(true, SeqCst);
+    let start = Instant::now();
+    assert_eq!(
+        ask(&mut server, upload("/work/late", b"late")),
+        Reply::Error {
+            reason: Error::Timeout
+        }
+    );
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_millis(200) && waited < Duration::from_secs(3));
+    WorkerFake::wait_for("the hung call to be running", || {
+        worker.running.load(SeqCst)
+    });
+    assert!(matches!(
+        ask(&mut server, Request::Status {}),
+        Reply::Status { .. }
+    ));
+    assert!(matches!(
+        ask(&mut server, exec(false, 1000)),
+        Reply::Exec(_)
+    ));
+    // Back-pressure: no second filesystem call starts behind the hung one.
+    for request in [
+        upload("/work/next", b"next"),
+        Request::Download {
+            path: "/work/next".into(),
+        },
+    ] {
+        assert_eq!(
+            ask(&mut server, request),
+            Reply::Error {
+                reason: Error::Busy
+            }
+        );
+    }
+    worker.release.store(true, SeqCst);
+    worker.wait_finished(1);
+    // The cancelled upload never published, even after it was released.
+    assert!(worker.published.lock().unwrap().is_empty());
+    // Busy replies prove a refused call never started, so retrying is safe.
+    let end = Instant::now() + Duration::from_secs(5);
+    let reply = loop {
+        match ask(&mut server, upload("/work/next", b"next")) {
+            Reply::Error {
+                reason: Error::Busy,
+            } if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
+            other => break other,
+        }
+    };
+    assert_eq!(reply, Reply::Ok);
+    assert_eq!(
+        *worker.published.lock().unwrap(),
+        [("/work/next".to_string(), b"next".to_vec())]
+    );
+    assert!(
+        server.sys.uploaded.is_empty(),
+        "no inline fallback was used"
+    );
+}
+
+type ReplyLog = Rc<RefCell<Vec<(&'static str, Vec<u8>)>>>;
+
+/// Connection whose reply lands in a shared, labelled log, so a test can see
+/// the order in which `Server::run` answered its connections.
+struct Logged {
+    input: Cursor<Vec<u8>>,
+    label: &'static str,
+    log: ReplyLog,
+    entry: RefCell<Option<usize>>,
+    drain_hook: Option<Rc<dyn Fn()>>,
+}
+impl Read for Logged {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.input.read(bytes)
+    }
+}
+impl Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut log = self.log.borrow_mut();
+        let mut entry = self.entry.borrow_mut();
+        let idx = match *entry {
+            Some(idx) => idx,
+            None => {
+                let idx = log.len();
+                log.push((self.label, Vec::new()));
+                *entry = Some(idx);
+                idx
+            }
+        };
+        log[idx].1.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl rpc::Connection for Logged {
+    fn drain_reply(&mut self) -> io::Result<()> {
+        if let Some(hook) = &self.drain_hook {
+            hook();
+        }
+        Ok(())
+    }
+}
+enum Step {
+    Connect(&'static str, Request),
+    ConnectWithDrainHook(&'static str, Request, Rc<dyn Fn()>),
+    Release,
+    /// Keep returning no connection until `label` has been answered.
+    AwaitReply(&'static str),
+    /// Wait (bounded) until the worker has returned from `n` calls.
+    AwaitFinished(usize),
+    /// Retry Shutdown (bounded) while it returns Busy, until Frozen.
+    RetryShutdown,
+    /// Listener accept returns an error.
+    FailAccept(Error),
+}
+struct Script {
+    steps: VecDeque<Step>,
+    log: ReplyLog,
+    worker: WorkerFake,
+    waiting_since: Option<Instant>,
+}
+impl Listener for Script {
+    type Stream = Logged;
+    fn accept(&mut self) -> Result<Option<Logged>> {
+        match self.steps.pop_front() {
+            Some(Step::Connect(label, request)) => {
+                let mut bytes = Vec::new();
+                rpc::write_frame(&request, &mut bytes).unwrap();
+                Ok(Some(Logged {
+                    input: Cursor::new(bytes),
+                    label,
+                    log: self.log.clone(),
+                    entry: RefCell::new(None),
+                    drain_hook: None,
+                }))
+            }
+            Some(Step::ConnectWithDrainHook(label, request, hook)) => {
+                let mut bytes = Vec::new();
+                rpc::write_frame(&request, &mut bytes).unwrap();
+                Ok(Some(Logged {
+                    input: Cursor::new(bytes),
+                    label,
+                    log: self.log.clone(),
+                    entry: RefCell::new(None),
+                    drain_hook: Some(hook),
+                }))
+            }
+            Some(Step::Release) => {
+                self.worker
+                    .release
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            }
+            Some(Step::AwaitFinished(n)) => {
+                self.worker.wait_finished(n);
+                Ok(None)
+            }
+            Some(Step::AwaitReply(label)) => {
+                if !self.log.borrow().iter().any(|(l, _)| *l == label) {
+                    let started = *self.waiting_since.get_or_insert_with(Instant::now);
+                    assert!(started.elapsed() < WAIT_DEADLINE, "no reply for {label}");
+                    self.steps.push_front(Step::AwaitReply(label));
+                } else {
+                    self.waiting_since = None;
+                }
+                Ok(None)
+            }
+            Some(Step::FailAccept(err)) => Err(err),
+            Some(Step::RetryShutdown) => {
+                let last_busy = self.log.borrow().iter().rev().find_map(|(l, b)| {
+                    if *l == "shutdown" {
+                        Some(rpc::read_frame::<Reply>(&mut b.as_slice()).ok())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(Some(Reply::Error {
+                    reason: Error::Busy,
+                })) = last_busy
+                {
+                    let started = *self.waiting_since.get_or_insert_with(Instant::now);
+                    assert!(
+                        started.elapsed() < SHUTDOWN_RETRY_TIMEOUT,
+                        "timed out retrying shutdown"
+                    );
+                    std::thread::sleep(RETRY_INTERVAL);
+                } else {
+                    self.waiting_since = Some(Instant::now());
+                }
+                self.steps.push_front(Step::RetryShutdown);
+                let mut bytes = Vec::new();
+                rpc::write_frame(&Request::Shutdown {}, &mut bytes).unwrap();
+                Ok(Some(Logged {
+                    input: Cursor::new(bytes),
+                    label: "shutdown",
+                    log: self.log.clone(),
+                    entry: RefCell::new(None),
+                    drain_hook: None,
+                }))
+            }
+            None => panic!("server kept running after the script ended"),
+        }
+    }
+}
+
+#[test]
+fn run_loop_serves_other_rpcs_while_a_transfer_is_pending() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut server, worker) = worker_server(2000);
+    worker.hang_next.store(true, SeqCst);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut script = Script {
+        steps: VecDeque::from([
+            Step::Connect("upload", upload("/work/slow", b"slow")),
+            Step::Connect("status", Request::Status {}),
+            Step::Connect("exec", exec(false, 1000)),
+            Step::Connect("second", upload("/work/other", b"other")),
+            Step::Connect("early-shutdown", Request::Shutdown {}),
+            Step::Release,
+            Step::AwaitReply("upload"),
+            Step::RetryShutdown,
+        ]),
+        log: log.clone(),
+        worker: worker.clone(),
+        waiting_since: None,
+    };
+    let start = Instant::now();
+    server.run(&mut script).unwrap();
+    // Everything ran well inside the 2 s transfer deadline.
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let replies: Vec<(&str, Reply)> = log
+        .borrow()
+        .iter()
+        .map(|(label, bytes)| (*label, rpc::read_frame(&mut bytes.as_slice()).unwrap()))
+        .collect();
+    let labels: Vec<&str> = replies.iter().map(|(l, _)| *l).collect();
+    assert!(labels.len() >= 6);
+    assert_eq!(
+        &labels[..5],
+        &["status", "exec", "second", "early-shutdown", "upload",]
+    );
+    for label in &labels[5..] {
+        assert_eq!(*label, "shutdown");
+    }
+    assert!(matches!(replies[0].1, Reply::Status { .. }));
+    assert!(matches!(replies[1].1, Reply::Exec(_)));
+    for (_, reply) in &replies[2..4] {
+        assert_eq!(
+            *reply,
+            Reply::Error {
+                reason: Error::Busy
+            }
+        );
+    }
+    assert_eq!(replies[4].1, Reply::Ok);
+    for (_, reply) in &replies[5..replies.len() - 1] {
+        assert_eq!(
+            *reply,
+            Reply::Error {
+                reason: Error::Busy
+            }
+        );
+    }
+    assert_eq!(replies.last().unwrap().1, Reply::Frozen);
+    assert_eq!(
+        *worker.published.lock().unwrap(),
+        [("/work/slow".to_string(), b"slow".to_vec())]
+    );
+}
+
+#[test]
+fn deadline_after_commit_began_is_indeterminate_not_cancelled() {
+    use std::sync::atomic::Ordering::SeqCst;
+    // The worker enters the commit phase at once and then stalls there; the
+    // deadline is long enough that it is reached only after the gate was won.
+    let (mut server, worker) = worker_server(1000);
+    worker.hang_in_commit.store(true, SeqCst);
+    assert_eq!(
+        ask(&mut server, upload("/work/racing", b"racing")),
+        Reply::Error {
+            reason: Error::Indeterminate
+        }
+    );
+    assert!(
+        worker.committing.load(SeqCst),
+        "the deadline expired only after publication began"
+    );
+    worker.release.store(true, SeqCst);
+    worker.wait_finished(1);
+    // It did publish: the server must not have claimed it was cancelled.
+    assert_eq!(
+        *worker.published.lock().unwrap(),
+        [("/work/racing".to_string(), b"racing".to_vec())]
+    );
+}
+
+#[test]
+fn filesystem_worker_keeps_request_order() {
+    let (mut server, worker) = worker_server(2000);
+    for n in 0..20u8 {
+        assert_eq!(ask(&mut server, upload("/work/file", &[n])), Reply::Ok);
+    }
+    assert_eq!(
+        ask(
+            &mut server,
+            Request::Download {
+                path: "/work/file".into()
+            }
+        ),
+        Reply::Download {
+            data: b"downloaded".to_vec()
+        }
+    );
+    let published = worker.published.lock().unwrap();
+    let order: Vec<u8> = published.iter().map(|(_, d)| d[0]).collect();
+    assert_eq!(order, (0..20).collect::<Vec<u8>>());
+}
+
+#[test]
+fn shutdown_refuses_instead_of_freezing_under_a_running_filesystem_call() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut server, worker) = worker_server(100);
+    worker.hang_next.store(true, SeqCst);
+    assert_eq!(
+        ask(&mut server, upload("/work/late", b"late")),
+        Reply::Error {
+            reason: Error::Timeout
+        }
+    );
+    let start = Instant::now();
+    assert_eq!(
+        ask(&mut server, Request::Shutdown {}),
+        Reply::Error {
+            reason: Error::Busy
+        }
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "shutdown is bounded"
+    );
+    assert!(!server.sys.events.iter().any(|e| e.starts_with("freeze")));
+    worker.release.store(true, SeqCst);
+    worker.wait_finished(1);
+    assert!(worker.published.lock().unwrap().is_empty());
+    let end = Instant::now() + SHUTDOWN_RETRY_TIMEOUT;
+    let reply = loop {
+        match ask(&mut server, Request::Shutdown {}) {
+            Reply::Error {
+                reason: Error::Busy,
+            } if Instant::now() < end => std::thread::sleep(RETRY_INTERVAL),
+            other => break other,
+        }
+    };
+    assert_eq!(reply, Reply::Frozen);
+    assert!(server.sys.events.iter().any(|e| e == "freeze:313"));
+}
+
+#[test]
+fn cancelled_upload_is_never_published_and_leaves_no_temporary() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), b"old").unwrap();
+    let root = Root::new(fs::File::open(temp.path()).unwrap().into()).unwrap();
+    let mut worker = root.worker_clone().unwrap();
+    let mode = rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR;
+    let cancelled = fs_gate::CommitGate::new();
+    assert!(cancelled.cancel());
+    assert_eq!(
+        worker.atomic_cancellable("/file", b"new", 1700000000, None, mode, Some(&cancelled)),
+        Err(Error::Timeout)
+    );
+    assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"old");
+    let names: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["file"]);
+    // An open gate is won by the commit, after which cancellation fails.
+    let open = fs_gate::CommitGate::new();
+    worker
+        .atomic_cancellable("/file", b"new", 1700000000, None, mode, Some(&open))
+        .unwrap();
+    assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"new");
+    assert!(
+        !open.cancel(),
+        "a committed call can no longer be cancelled"
+    );
+}
+
+#[test]
+fn transfer_deadline_holds_while_the_loop_is_blocked_in_another_request() {
+    use std::sync::atomic::Ordering::SeqCst;
+    // The upload hangs; an Exec then blocks the RPC loop past the upload's
+    // deadline and only afterwards releases the worker. The worker must not
+    // publish after its deadline even though the loop had not cancelled it yet.
+    let (mut server, worker) = worker_server(200);
+    worker.hang_next.store(true, SeqCst);
+    server.sys.exec_delay_ms = 400;
+    server.sys.release_after_exec = Some(worker.release.clone());
+    server.sys.wait_finished_after_exec = Some(worker.finished.clone());
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut script = Script {
+        steps: VecDeque::from([
+            Step::Connect("upload", upload("/work/late", b"late")),
+            Step::Connect("exec", exec(false, 1000)),
+            Step::AwaitReply("upload"),
+            Step::AwaitFinished(1),
+            Step::RetryShutdown,
+        ]),
+        log: log.clone(),
+        worker: worker.clone(),
+        waiting_since: None,
+    };
+    server.run(&mut script).unwrap();
+    let replies: Vec<(&str, Reply)> = log
+        .borrow()
+        .iter()
+        .map(|(label, bytes)| (*label, rpc::read_frame(&mut bytes.as_slice()).unwrap()))
+        .collect();
+    assert_eq!(replies[0].0, "exec");
+    assert_eq!(
+        replies[1],
+        (
+            "upload",
+            Reply::Error {
+                reason: Error::Timeout
+            }
+        )
+    );
+    worker.wait_finished(1);
+    assert!(
+        worker.published.lock().unwrap().is_empty(),
+        "nothing publishes after its deadline"
+    );
+}
+
+#[test]
+fn download_finishing_after_deadline_while_exec_blocks_loop_replies_timeout() {
+    use std::sync::atomic::Ordering::SeqCst;
+    // The download hangs; an Exec then blocks the RPC loop past the download's
+    // deadline and releases the worker. The worker must convert the late
+    // download to Timeout.
+    let (mut server, worker) = worker_server(200);
+    worker.hang_next.store(true, SeqCst);
+    server.sys.exec_delay_ms = 400;
+    server.sys.release_after_exec = Some(worker.release.clone());
+    server.sys.wait_finished_after_exec = Some(worker.finished.clone());
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut script = Script {
+        steps: VecDeque::from([
+            Step::Connect(
+                "download",
+                Request::Download {
+                    path: "/work/late".into(),
+                },
+            ),
+            Step::Connect("exec", exec(false, 1000)),
+            Step::AwaitReply("download"),
+            Step::AwaitFinished(1),
+            Step::RetryShutdown,
+        ]),
+        log: log.clone(),
+        worker: worker.clone(),
+        waiting_since: None,
+    };
+    server.run(&mut script).unwrap();
+    let replies: Vec<(&str, Reply)> = log
+        .borrow()
+        .iter()
+        .map(|(label, bytes)| (*label, rpc::read_frame(&mut bytes.as_slice()).unwrap()))
+        .collect();
+    assert_eq!(replies[0].0, "exec");
+    assert_eq!(
+        replies[1],
+        (
+            "download",
+            Reply::Error {
+                reason: Error::Timeout
+            }
+        )
+    );
+    worker.wait_finished(1);
+}
+
+#[test]
+fn listener_accept_error_while_transfer_pending_abandons_worker_so_later_fs_call_succeeds() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut server, worker) = worker_server(5000);
+    worker.hang_next.store(true, SeqCst);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut script = Script {
+        steps: VecDeque::from([
+            Step::Connect("upload", upload("/work/pending", b"pending")),
+            Step::FailAccept(Error::Io),
+        ]),
+        log: log.clone(),
+        worker: worker.clone(),
+        waiting_since: None,
+    };
+    assert_eq!(server.run(&mut script), Err(Error::Io));
+    // The worker is still running the cancelled upload; a filesystem call
+    // refuses with Busy while the worker thread is still active.
+    assert_eq!(
+        ask(&mut server, upload("/work/next", b"next")),
+        Reply::Error {
+            reason: Error::Busy
+        }
+    );
+    worker.release.store(true, SeqCst);
+    worker.wait_finished(1);
+    // Because abandon_pending_fs marked the abandoned transfer answered,
+    // the slot is reaped once the thread ends instead of staying busy forever.
+    let end = Instant::now() + SHUTDOWN_RETRY_TIMEOUT;
+    let reply = loop {
+        match ask(&mut server, upload("/work/next", b"next")) {
+            Reply::Error {
+                reason: Error::Busy,
+            } if Instant::now() < end => std::thread::sleep(RETRY_INTERVAL),
+            other => break other,
+        }
+    };
+    assert_eq!(reply, Reply::Ok);
+    assert_eq!(
+        *worker.published.lock().unwrap(),
+        [("/work/next".to_string(), b"next".to_vec())]
+    );
+}
+
+#[test]
+fn commit_gate_refuses_after_its_deadline() {
+    let gate = fs_gate::CommitGate::with_deadline(Instant::now());
+    assert!(!gate.begin_commit());
+    assert!(gate.cancel(), "an expired gate reads as cancelled");
+    let gate = fs_gate::CommitGate::with_deadline(Instant::now() + Duration::from_secs(60));
+    assert!(gate.begin_commit());
+    assert!(!gate.cancel());
+}
+
+#[test]
+fn logged_connections_with_same_label_record_separate_entries() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut conn1 = Logged {
+        input: Cursor::new(Vec::new()),
+        label: "shutdown",
+        log: log.clone(),
+        entry: RefCell::new(None),
+        drain_hook: None,
+    };
+    let mut conn2 = Logged {
+        input: Cursor::new(Vec::new()),
+        label: "shutdown",
+        log: log.clone(),
+        entry: RefCell::new(None),
+        drain_hook: None,
+    };
+    conn1.write_all(b"first").unwrap();
+    conn2.write_all(b"second").unwrap();
+    let entries = log.borrow().clone();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], ("shutdown", b"first".to_vec()));
+    assert_eq!(entries[1], ("shutdown", b"second".to_vec()));
+}
+
+#[test]
+fn commit_gate_refuses_when_deadline_expires_during_provisional_claim() {
+    let gate = fs_gate::CommitGate::with_deadline(Instant::now() + Duration::from_millis(50));
+    hermetic_execd::fs::test_hooks::set_provisional_claim_hook(|| {
+        std::thread::sleep(Duration::from_millis(100));
+    });
+    assert!(!gate.begin_commit());
+    assert!(gate.cancel(), "an expired gate reads as cancelled");
+}
+
+#[test]
+fn child_stuck_terminal_reply_cancels_pending_upload_before_drain() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut server, worker) = worker_server(5000);
+    worker.hang_next.store(true, SeqCst);
+    server.sys.execute_error = Some(Error::ChildStuck);
+
+    let worker_for_hook = worker.clone();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut script = Script {
+        steps: VecDeque::from([
+            Step::Connect("upload", upload("/work/pending", b"data")),
+            Step::ConnectWithDrainHook(
+                "exec",
+                exec(false, 1000),
+                Rc::new(move || {
+                    worker_for_hook.release.store(true, SeqCst);
+                    worker_for_hook.wait_finished(1);
+                }),
+            ),
+        ]),
+        log: log.clone(),
+        worker: worker.clone(),
+        waiting_since: None,
+    };
+
+    let _ = server.run(&mut script);
+    assert!(
+        worker.published.lock().unwrap().is_empty(),
+        "unanswered upload must be cancelled before terminal reply drain"
+    );
 }

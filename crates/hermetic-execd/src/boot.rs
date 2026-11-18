@@ -160,6 +160,12 @@ pub trait Sys {
     ) -> Result<ExecReply>;
     fn upload(&mut self, path: &str, data: &[u8]) -> Result<()>;
     fn download(&mut self, path: &str) -> Result<Vec<u8>>;
+    /// A filesystem handle the RPC server moves to its worker thread, so a slow
+    /// or hung filesystem call cannot stall other RPCs. `None` keeps uploads and
+    /// downloads inline on `upload`/`download`.
+    fn fs_ops(&mut self) -> Result<Option<Box<dyn crate::rpc::FsOps>>> {
+        Ok(None)
+    }
     fn maintain(&mut self) -> Result<()>;
     fn guest_time(&mut self) -> Result<i64>;
     fn child_cwd(&mut self, cwd: &std::fs::File) -> Result<()>;

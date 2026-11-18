@@ -31,6 +31,12 @@ pub enum Error {
     Timeout,
     Shutdown,
     ChildStuck,
+    /// A filesystem request is refused while an earlier one that missed its
+    /// deadline is still running (back-pressure; requests are never reordered).
+    Busy,
+    /// A filesystem call missed its deadline after it had begun publishing:
+    /// it may or may not have taken effect.
+    Indeterminate,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +92,10 @@ pub const MAX_DRAIN_READS: usize = 16;
 pub const IO_BUFFER: usize = 8192;
 pub const MAX_FINAL_DRAIN_READS: usize = MAX_COMMAND_OUTPUT / IO_BUFFER + MAX_DRAIN_READS;
 pub const FRAME_TIMEOUT_MS: u64 = 5000;
+/// Deadline for one upload or download on the filesystem worker, below the
+/// frame timeout. Nothing publishes or is returned after it; the reply itself
+/// is written when the RPC loop is free (a long Exec can delay it).
+pub const FS_OP_DEADLINE_MS: u64 = 4000;
 pub const REPLY_LINGER_MS: u64 = 1000;
 pub const VSOCK_PORT: u32 = 5000;
 

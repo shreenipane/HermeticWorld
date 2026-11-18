@@ -716,7 +716,6 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hermetic-attest"
 version = "0.1.0"
 dependencies = [
- "hermetic-common",
  "ring",
  "serde",
  "serde_json",
@@ -743,6 +742,7 @@ dependencies = [
  "hermetic-clockprobe",
  "hermetic-common",
  "hermetic-run",
+ "hermetic-vmm",
  "ring",
  "rustix 1.1.6",
  "serde",
@@ -850,6 +850,10 @@ dependencies = [
  "hermetic-common",
  "hermetic-sealcheck",
  "hex",
+ "landlock",
+ "libc",
+ "rustix 1.1.6",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2",
@@ -1001,6 +1005,7 @@ dependencies = [
  "hermetic-common",
  "hermetic-extract",
  "hermetic-gateway",
+ "hermetic-grader-result",
  "hermetic-netvm-core",
  "hermetic-run",
  "ring",
@@ -1009,6 +1014,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
 ]
 
 [[package]]

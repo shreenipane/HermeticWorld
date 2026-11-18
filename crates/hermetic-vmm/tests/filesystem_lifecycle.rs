@@ -129,6 +129,104 @@ fn trusted_reboot_copies_pinned_bytes_and_records_actual_boot_without_host_data(
     assert_eq!(vm.boot_record().unwrap().boot_path, "sealed_disk");
     assert!(vm.boot_record().unwrap().initrd_sha256.is_none());
 }
+
+#[test]
+fn snapshot_create_and_restore_and_drive_attach_lifecycle() {
+    let mut f = Fixture::new();
+    f.spec.limits.file_size_bytes =
+        (u64::from(f.spec.memory_mib) * 1024 * 1024).max(f.spec.limits.file_size_bytes);
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    vm.prepare(TIMEOUT).unwrap();
+
+    // In Prepared state: create_snapshot and restore_from_snapshot must fail
+    assert!(vm.snapshot_create("/snapshot", "/mem", TIMEOUT).is_err());
+    assert!(vm
+        .restore_from_snapshot("/snapshot", "/mem", &[], TIMEOUT)
+        .is_err());
+
+    vm.start(TIMEOUT).unwrap();
+    // Now in Starting state:
+    // Missing override for eth0 fails:
+    assert!(vm
+        .restore_from_snapshot("/snapshot", "/mem", &[], TIMEOUT)
+        .is_err());
+
+    // Reusing original connected tap fails:
+    assert!(vm
+        .restore_from_snapshot(
+            "/snapshot",
+            "/mem",
+            &[("eth0".into(), "agent-tap".into())],
+            TIMEOUT
+        )
+        .is_err());
+
+    // Extra/unknown override fails:
+    assert!(vm
+        .restore_from_snapshot(
+            "/snapshot",
+            "/mem",
+            &[("eth1".into(), "peerless-tap".into())],
+            TIMEOUT
+        )
+        .is_err());
+
+    // Valid override redirects eth0 to peerless tap:
+    vm.restore_from_snapshot(
+        "/snapshot",
+        "/mem",
+        &[("eth0".into(), "peerless-tap".into())],
+        TIMEOUT,
+    )
+    .unwrap();
+
+    // Now in Paused state!
+    assert_eq!(vm.boot_record().unwrap().boot_path, "live_snapshot");
+    assert!(vm.boot_record().unwrap().initrd_sha256.is_none());
+
+    // Drive attachment:
+    let tests_file = f.temp.path().join("tests.img");
+    fs::write(&tests_file, b"test-suite-bytes").unwrap();
+    fs::set_permissions(&tests_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Attaching unreserved drive fails:
+    assert!(vm
+        .attach_drive("unreserved", tests_file.to_str().unwrap(), TIMEOUT)
+        .is_err());
+
+    // Attaching symlink fails:
+    let symlink_path = f.temp.path().join("symlink_tests.img");
+    symlink(&tests_file, &symlink_path).unwrap();
+    assert!(vm
+        .attach_drive("tests", symlink_path.to_str().unwrap(), TIMEOUT)
+        .is_err());
+
+    // Attaching valid tests drive into reserved slot:
+    vm.attach_drive("tests", tests_file.to_str().unwrap(), TIMEOUT)
+        .unwrap();
+
+    // Verify published file in jail root has mode 0400:
+    let published = f.root().join("drive-tests");
+    assert_eq!(fs::read(&published).unwrap(), b"test-suite-bytes");
+    assert_eq!(fs::metadata(&published).unwrap().mode() & 0o777, 0o400);
+
+    // Resume VM:
+    vm.resume(TIMEOUT).unwrap();
+
+    // While Running, create_snapshot fails (must be paused first):
+    assert!(vm.snapshot_create("/snapshot2", "/mem2", TIMEOUT).is_err());
+
+    // Pause VM:
+    vm.pause(TIMEOUT).unwrap();
+
+    // Now create_snapshot succeeds:
+    vm.snapshot_create("/snapshot2", "/mem2", TIMEOUT).unwrap();
+
+    // Resume and shutdown:
+    vm.resume(TIMEOUT).unwrap();
+    vm.stop(TIMEOUT).unwrap();
+    vm.destroy(TIMEOUT).unwrap();
+}
 #[derive(Default)]
 struct Fake {
     events: Vec<String>,
@@ -138,6 +236,7 @@ struct Fake {
     /// Number of `exited` polls after which a running guest ends itself.
     exit_after: Option<u32>,
     exit_delay: Duration,
+    load_delay: Option<Duration>,
     killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Runner for Fake {
@@ -164,6 +263,11 @@ impl Runner for Fake {
     }
     fn request(&mut self, _: &str, r: &ApiRequest, end: Instant) -> Result<()> {
         self.events.push(format!("{} {}", r.method, r.path));
+        if r.path == "/snapshot/load" {
+            if let Some(d) = self.load_delay {
+                std::thread::sleep(d);
+            }
+        }
         if self.stalled {
             while Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(1));
@@ -794,4 +898,81 @@ fn unavailable_tsc_is_rejected_before_jail_creation_or_spawn() {
     assert!(vm.prepare(TIMEOUT).is_err());
     assert!(!f.temp.path().join("firecracker").exists());
     assert!(vm.runner().events.is_empty());
+}
+
+#[test]
+fn restore_from_snapshot_fails_closed_when_api_unresponsive() {
+    let f = Fixture::new();
+    let runner = Fake {
+        fail: Some("/".into()),
+        ..Fake::default()
+    };
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    assert_eq!(
+        vm.restore_from_snapshot(
+            "/snapshot",
+            "/mem",
+            &[("eth0".into(), "peerless-tap".into())],
+            Duration::from_millis(50),
+        ),
+        Err(Error::Step("wait_ready"))
+    );
+    assert_eq!(vm.state(), State::Failed);
+    assert!(vm.runner().killed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!f.root().exists());
+}
+
+#[test]
+fn restore_from_snapshot_deadline_fails_closed_before_state_commit() {
+    let f = Fixture::new();
+    let runner = Fake {
+        load_delay: Some(Duration::from_millis(50)),
+        ..Fake::default()
+    };
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), runner);
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    assert_eq!(
+        vm.restore_from_snapshot(
+            "/snapshot",
+            "/mem",
+            &[("eth0".into(), "peerless-tap".into())],
+            Duration::from_millis(20),
+        ),
+        Err(Error::Step("restore_from_snapshot"))
+    );
+    assert_eq!(vm.state(), State::Failed);
+    assert!(vm.boot_record().is_none());
+    assert!(vm.runner().killed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!f.root().exists());
+}
+
+#[test]
+fn attached_drive_charges_remaining_image_budget() {
+    let mut f = Fixture::new();
+    f.spec.reserved_drives = vec!["tests".into()];
+    let mut vm = Vmm::new(f.spec.clone().validate().unwrap(), Fake::default());
+    vm.prepare(TIMEOUT).unwrap();
+    vm.start(TIMEOUT).unwrap();
+    vm.restore_from_snapshot(
+        "/snapshot",
+        "/mem",
+        &[("eth0".into(), "peerless-tap".into())],
+        TIMEOUT,
+    )
+    .unwrap();
+
+    let tests_file = f.temp.path().join("budget_tests.img");
+    fs::write(&tests_file, vec![0u8; 8192]).unwrap();
+    fs::set_permissions(&tests_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Artificially restrict remaining budget to 100 bytes (+ 4096 placeholder credit = 4196 bytes)
+    vm.jail().unwrap().set_remaining_image_bytes(100);
+
+    // Attaching an 8192-byte file exceeds the 4196-byte available budget and must fail:
+    assert!(vm
+        .attach_drive("tests", tests_file.to_str().unwrap(), TIMEOUT)
+        .is_err());
 }

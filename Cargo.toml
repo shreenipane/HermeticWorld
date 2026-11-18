@@ -64,3 +64,10 @@ tree-sitter-python = "=0.25.0"
 # 0.22.1 provides stable BM25 scoring, Document trait and bounded single-thread indexing).
 # Pinned to an exact version for build reproducibility and supply-chain hermeticity.
 tantivy = "=0.22.1"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+

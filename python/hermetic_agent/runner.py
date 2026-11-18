@@ -65,12 +65,14 @@ def _upstream(config_dir):
         os.close(directory)
 
 
-def run(model, environment, task: str, *, config_dir: str, step_limit: int = DEFAULT_STEPS):
+def run(model, environment, task: str, *, config_dir: str, step_limit: int = DEFAULT_STEPS, sentinel=None):
     if type(step_limit) is not int or not 0 < step_limit <= MAX_STEPS:
         raise LimitError("Step limit")
     if not isinstance(task, str) or len(task.encode()) > 1024 * 1024:
         raise LimitError("Task byte limit")
     timestamp = clock_value(model.config.t_clock)
+    if sentinel is not None:
+        sentinel.scan_text("prompt", task)
     with _upstream(config_dir) as (DefaultAgent, LimitsExceeded):
         template = parse_json(read_input(os.path.join(os.path.dirname(__file__), "swebench.json")))
         template["step_limit"] = step_limit
@@ -85,6 +87,8 @@ def run(model, environment, task: str, *, config_dir: str, step_limit: int = DEF
                 # No arbitrary metadata or upstream timestamp is copied into a trajectory.
                 if len(self.messages) >= MAX_MESSAGES or sum(len(m["content"].encode()) for m in self.messages) + len(content.encode()) > MAX_HISTORY_BYTES:
                     raise LimitError("Trajectory limit")
+                if sentinel is not None and role in ("system", "user"):
+                    sentinel.scan_text("prompt", content)
                 self.messages.append({"role": role, "content": content, "timestamp": timestamp})
 
             def step(self):
@@ -102,5 +106,10 @@ def run(model, environment, task: str, *, config_dir: str, step_limit: int = DEF
         except HarnessError:
             raise
         if status == "LimitsExceeded":
-            return {"status": "unresolved", "reason": limit_reason, "messages": agent.messages}
-        return {"status": status, "messages": agent.messages}
+            res = {"status": "unresolved", "reason": limit_reason, "messages": agent.messages}
+        else:
+            res = {"status": status, "messages": agent.messages}
+        if sentinel is not None:
+            res["date_sentinel"] = sentinel.summary().to_dict()
+            res["date_leak_observed"] = sentinel.summary().date_leak_observed
+        return res

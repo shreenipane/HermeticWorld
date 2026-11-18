@@ -253,6 +253,13 @@ impl HostBootRecord {
         }
     }
 
+    pub fn live_snapshot() -> Self {
+        Self {
+            boot_path: "live_snapshot".to_string(),
+            initrd_digest: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), RunValidationError> {
         if !valid_record_text(&self.boot_path) {
             return Err(RunValidationError::InvalidBootRecord("invalid boot_path"));
@@ -272,9 +279,119 @@ impl HostBootRecord {
                     ));
                 }
             }
+            "live_snapshot" => {
+                if self.initrd_digest.is_some() {
+                    return Err(RunValidationError::InvalidBootRecord(
+                        "live_snapshot must not carry initrd_digest",
+                    ));
+                }
+            }
             _ => {
                 return Err(RunValidationError::InvalidBootRecord("unknown boot_path"));
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateGradingPath {
+    Live,
+    Reboot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactDigestSize {
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateGradeRecord {
+    pub schema: String,
+    pub grader_isolation: GraderIsolation,
+    pub path: StateGradingPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub tests: ArtifactDigestSize,
+    pub result: ArtifactDigestSize,
+    pub snapshot_sha256: String,
+    pub run_sha256: String,
+}
+
+impl StateGradeRecord {
+    pub fn validate(&self) -> Result<(), RunValidationError> {
+        if self.schema != "hermetic-state-grade/v1" {
+            return Err(RunValidationError::InvalidField("state_grade.schema"));
+        }
+        if self.grader_isolation != GraderIsolation::Shared {
+            return Err(RunValidationError::InvalidField(
+                "state_grade.grader_isolation",
+            ));
+        }
+        match self.path {
+            StateGradingPath::Live => {
+                if self.fallback_reason.is_some() {
+                    return Err(RunValidationError::InvalidField(
+                        "state_grade.fallback_reason",
+                    ));
+                }
+            }
+            StateGradingPath::Reboot => {
+                let Some(ref reason) = self.fallback_reason else {
+                    return Err(RunValidationError::InvalidField(
+                        "state_grade.fallback_reason",
+                    ));
+                };
+                if reason != "execd_unresponsive" && reason != "no_live_state" {
+                    return Err(RunValidationError::InvalidField(
+                        "state_grade.fallback_reason",
+                    ));
+                }
+            }
+        }
+        if self.snapshot_sha256.len() != 64
+            || !self
+                .snapshot_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(RunValidationError::InvalidField(
+                "state_grade.snapshot_sha256",
+            ));
+        }
+        if self.run_sha256.len() != 64
+            || !self
+                .run_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(RunValidationError::InvalidField("state_grade.run_sha256"));
+        }
+        if self.tests.sha256.len() != 64
+            || !self
+                .tests
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || self.tests.size == 0
+            || self.tests.size > 64 * 1024 * 1024 * 1024
+        {
+            return Err(RunValidationError::InvalidField("state_grade.tests"));
+        }
+        if self.result.sha256.len() != 64
+            || !self
+                .result
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || self.result.size == 0
+            || self.result.size > 1024 * 1024
+        {
+            return Err(RunValidationError::InvalidField("state_grade.result"));
         }
         Ok(())
     }
@@ -373,6 +490,10 @@ pub struct RunRecord {
     // Optional Host Boot Record (versioned field: required for spec_version >= v1.1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_record: Option<HostBootRecord>,
+
+    // Optional State Grade Record (§11.4: State tasks)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_grade: Option<StateGradeRecord>,
 }
 
 impl RunRecord {
@@ -572,6 +693,34 @@ impl RunRecord {
                     return Err(RunValidationError::MissingBootRecord);
                 };
                 boot.validate()?;
+            }
+        }
+
+        if let Some(ref boot) = self.boot_record {
+            if boot.boot_path == "live_snapshot" && self.state_grade.is_none() {
+                return Err(RunValidationError::InvalidField(
+                    "live_snapshot boot requires state_grade",
+                ));
+            }
+        }
+
+        if let Some(ref sg) = self.state_grade {
+            sg.validate()?;
+            if self.task_class != TaskClass::State {
+                return Err(RunValidationError::InvalidField(
+                    "state_grade on non-state task",
+                ));
+            }
+            if let Some(ref boot) = self.boot_record {
+                match (sg.path, boot.boot_path.as_str()) {
+                    (StateGradingPath::Live, "live_snapshot") => {}
+                    (StateGradingPath::Reboot, "trusted_initramfs") => {}
+                    _ => {
+                        return Err(RunValidationError::InvalidField(
+                            "state_grade path does not match boot path",
+                        ));
+                    }
+                }
             }
         }
 

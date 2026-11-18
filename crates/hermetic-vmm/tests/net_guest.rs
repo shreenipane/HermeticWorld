@@ -418,7 +418,7 @@ fn run() {
         .boot_args
         .replace("init=/sbin/hermetic-execd", "init=/sbin/hermetic-netvm");
     if let Ok(verity_path) = std::env::var("HERMETIC_NETVM_VERITY") {
-        let work = std::path::Path::new(&v[6]);
+        let work = std::path::Path::new(&work_dir_str);
         let verity_meta = work.join("netvm-verity.json");
         let dm_create = if let Ok(data) = std::fs::read_to_string(&verity_meta) {
             let parsed: serde_json::Value =

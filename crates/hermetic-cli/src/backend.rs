@@ -12,10 +12,10 @@ use serde_json::Value;
 
 use hermetic_attest::offline_key::Ed25519Verifier;
 use hermetic_attest::verify::{
-    check_against_classification, verify_run_attestation, ReplayGuard, RunBinding,
-    RunClassification,
+    check_against_classification, verify_run_attestation, verify_run_sigstore_attestation,
+    ReplayGuard, RunBinding, RunClassification,
 };
-use hermetic_attest::{safe_read_file, Digest, FsError};
+use hermetic_attest::{safe_read_file, Digest, FsError, SigstoreTrustRoot};
 use hermetic_bundle::{BundleError, Verdict};
 use hermetic_clockprobe::canary;
 use hermetic_clockprobe::classify::{determine_exit_code, ProbeRecord, ProbeResult, MAX_ITEMS};
@@ -215,12 +215,12 @@ impl Backend for RealBackend {
     }
 
     fn verify(&self, req: VerifyRequest) -> Result<Outcome, BackendError> {
-        // Read and validate every input before any verdict.
-        let verifier = Ed25519Verifier::from_public_key_path(&req.key)
-            .map_err(|e| BackendError::Data(format!("refused key file: {e}")))?;
         let bytes = read_input(&req.record, MAX_RECORD_BYTES)?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| BackendError::ProblemFound("record invalid: not UTF-8".to_string()))?;
+        let is_sigstore = text.contains("\"verificationMaterial\"")
+            || text.contains("application/vnd.dev.sigstore.bundle");
+
         let classification = match &req.classification {
             Some(path) => {
                 let raw = read_input(path, MAX_CLASSIFICATION_FILE_BYTES)?;
@@ -250,8 +250,21 @@ impl Backend for RealBackend {
         // A single invocation has a fresh guard; replay across runs is the
         // caller's responsibility (the guard is exposed by hermetic-attest).
         let mut guard = ReplayGuard::new();
-        let (statement, digest) = verify_run_attestation(text, &verifier, &binding, &mut guard)
-            .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?;
+        let (statement, digest) = if is_sigstore {
+            let key_bytes = read_input(&req.key, hermetic_attest::MAX_TRUST_ROOT_BYTES)?;
+            let key_text = std::str::from_utf8(&key_bytes).map_err(|_| {
+                BackendError::ProblemFound("trust root invalid: not UTF-8".to_string())
+            })?;
+            let trust_root = SigstoreTrustRoot::from_json_str(key_text)
+                .map_err(|e| BackendError::Data(format!("refused trust root file: {e}")))?;
+            verify_run_sigstore_attestation(text, &trust_root, &binding, &mut guard)
+                .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?
+        } else {
+            let verifier = Ed25519Verifier::from_public_key_path(&req.key)
+                .map_err(|e| BackendError::Data(format!("refused key file: {e}")))?;
+            verify_run_attestation(text, &verifier, &binding, &mut guard)
+                .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?
+        };
         if let Some(c) = &classification {
             check_against_classification(&statement.predicate, c)
                 .map_err(|e| BackendError::ProblemFound(format!("record invalid: {e}")))?;

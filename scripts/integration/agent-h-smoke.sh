@@ -6,11 +6,14 @@ top="$(git rev-parse --show-toplevel)"
 cd "$top"
 smoke_main() {
   WORK="${HERMETIC_SMOKE_WORK:?}"
+  umask 022
   : "${HERMETIC_AGENT_MANIFEST:?set the fixture world manifest}"
   : "${HERMETIC_ROOTFS:?set the sealed fixture AgentVM image}"
-  : "${HERMETIC_FC_BIN:?set the pinned Firecracker executable}"
-  : "${HERMETIC_KERNEL:?set the pinned kernel image}"
-  : "${HERMETIC_AGENT_PYTHON:?set the interpreter with hermetic-agent[mini] installed}"
+  FC="$(readlink -f "${HERMETIC_FC_BIN:?set the pinned Firecracker executable}")"
+  KERNEL="$(readlink -f "${HERMETIC_KERNEL:?set the pinned kernel image}")"
+  LOCK="$(readlink -f "${HERMETIC_FIRECRACKER_LOCK:?set the pinned Firecracker build lock}")"
+  PYTHON="$(readlink -f "${HERMETIC_AGENT_PYTHON:?set the interpreter with hermetic-agent[mini] installed}")"
+  export HERMETIC_FC_BIN="$FC" HERMETIC_KERNEL="$KERNEL" HERMETIC_FIRECRACKER_LOCK="$LOCK" HERMETIC_AGENT_PYTHON="$PYTHON"
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$top/.review/cargo-target}"
   export HERMETIC_AGENT_WORK="$WORK" HERMETIC_AGENT_TOP="$top"
   HERMETIC_AGENT_T_CLOCK="$(PYTHONPATH="$top/python" PYTHONDONTWRITEBYTECODE=1 "$HERMETIC_AGENT_PYTHON" -c \
