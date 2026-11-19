@@ -16,20 +16,6 @@ Counts include nested checklist items. Checked items cite merged tests or named 
 | 2: World | done 40 of 48 |
 | 3: VMs | done 56 of 72 |
 | 3b: Clock hiding | done 22 of 25 |
-| 1: sealcheck | done 47 of 52 |
-| 2: World | done 40 of 48 |
-| 3: VMs | done 56 of 72 |
-| 3b: Clock hiding | done 22 of 25 |
-| 2: World | done 40 of 48 |
-| 3: VMs | done 56 of 72 |
-| 3b: Clock hiding | done 22 of 25 |
-| 4: Extensions | done 39 of 50 |
-| 1: sealcheck | done 47 of 52 |
-| 2: World | done 40 of 48 |
-| 1: sealcheck | done 47 of 52 |
-| 2: World | done 40 of 48 |
-| 3: VMs | done 56 of 72 |
-| 3b: Clock hiding | done 22 of 25 |
 | 4: Extensions | done 39 of 50 |
 
 ## Overview
