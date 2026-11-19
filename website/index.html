@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermetic World — time-sealed evaluation for AI agents</title>
+  <meta name="description" content="Hermetic World runs each AI-agent task in a world frozen at the moment the task was created, so the agent has to derive the answer instead of looking it up.">
+  <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b0b0f" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="Hermetic World">
+  <meta property="og:description" content="A time-sealed evaluation environment for AI agents. Benchmarks that can't be looked up.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header" id="top">
+    <div class="wrap bar">
+      <a class="brand" href="#top" aria-label="Hermetic World, home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M16 7 25 16 16 25 7 16Z" fill="var(--accent)"/></svg>
+        <span>Hermetic World</span>
+      </a>
+      <button class="nav-toggle" aria-expanded="false" aria-controls="nav" aria-label="Menu"><span></span><span></span></button>
+      <nav id="nav" class="nav" aria-label="Primary">
+        <a href="#why">Why</a>
+        <a href="#features">Features</a>
+        <a href="#cutoff">Try it</a>
+        <a href="#run">How it runs</a>
+        <a href="#properties">Properties</a>
+        <a href="#status">Status</a>
+        <a href="#faq">FAQ</a>
+        <a class="btn btn-ghost" href="https://github.com/shreenipane/HermeticWorld/blob/main/HERMETIC_WORLD_ARCHITECTURE.md">Read the spec</a>
+        <a class="btn btn-primary" href="https://github.com/shreenipane/HermeticWorld">GitHub ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- HERO -->
+    <section class="hero">
+      <div class="wrap">
+        <p class="eyebrow">Open source · Apache-2.0 · Early stage</p>
+        <h1>Benchmarks that<br><span class="grad">can’t be looked up.</span></h1>
+        <p class="lede">Hermetic World is a time-sealed evaluation environment for AI agents. Each task runs in a world frozen at the moment the task was created, so the agent can only solve it by working it out.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary btn-lg" href="https://github.com/shreenipane/HermeticWorld">View on GitHub ↗</a>
+          <a class="btn btn-ghost btn-lg" href="#cutoff">Try the cutoff ↓</a>
+        </div>
+        <p class="fine">Linux x86_64 with KVM · Rust core, Python bridge · Status as of 2026-11-14: Phases 1–3 in progress</p>
+
+        <figure class="window hero-window" aria-label="Illustration of a sealed task run">
+          <div class="window-bar"><i></i><i></i><i></i><span>task · sealed at T<sub>world</sub></span></div>
+          <div class="hero-grid">
+            <div class="hero-col">
+              <h3>Before the cutoff</h3>
+              <ul class="chips">
+                <li class="ok">repo @ base commit</li>
+                <li class="ok">packages ≤ cutoff</li>
+                <li class="ok">web archive ≤ cutoff</li>
+                <li class="ok">guest clock = cutoff</li>
+              </ul>
+            </div>
+            <div class="hero-seal" aria-hidden="true">
+              <svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="52" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 6"/><circle cx="60" cy="60" r="38" fill="var(--accent)" opacity=".12"/><path d="M60 26 94 60 60 94 26 60Z" fill="none" stroke="var(--accent)" stroke-width="3"/><path d="M48 60h24M60 48v24" stroke="var(--accent)" stroke-width="3" stroke-linecap="round"/></svg>
+              <span>T<sub>world</sub></span>
+            </div>
+            <div class="hero-col">
+              <h3>After the cutoff</h3>
+              <ul class="chips">
+                <li class="sealed">later commits</li>
+                <li class="sealed">newer library versions</li>
+                <li class="sealed">the merged PR</li>
+                <li class="sealed">the benchmark itself</li>
+              </ul>
+            </div>
+          </div>
+          <figcaption>Illustration of the idea. Everything on the right is unreachable from inside the run.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- EVIDENCE -->
+    <section class="band" id="why">
+      <div class="wrap">
+        <h2 class="center">Agents run in today’s world. Benchmarks come from the past.</h2>
+        <p class="sub center">When the answer already exists online, an agent can retrieve it instead of deriving it. The README and PRD cite a Cursor study of one model on SWE-bench Pro.</p>
+        <div class="stats">
+          <article class="stat">
+            <p class="num" data-count="63" data-suffix="%">63%</p>
+            <p>of the model’s successful fixes were retrieved rather than derived.</p>
+          </article>
+          <article class="stat">
+            <p class="num"><span data-count="87.1" data-decimals="1">87.1</span><small> → </small><span data-count="73.0" data-decimals="1">73.0</span><small>%</small></p>
+            <p>score after sealing git history and the internet.</p>
+          </article>
+          <article class="stat">
+            <p class="num" data-count="57" data-suffix="%">57%</p>
+            <p>of its trajectories found the merged PR online.</p>
+          </article>
+        </div>
+        <p class="note center">Figures as cited in the project’s <a href="https://github.com/shreenipane/HermeticWorld/blob/main/PRD.md">PRD</a>. Real escapes have also happened: DNS delegation out of an “offline” sandbox, answers left in task configs, and <code>conftest.py</code> hooks that force every test to pass.</p>
+      </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section id="features">
+      <div class="wrap">
+        <h2 class="center">Get to know Hermetic World.</h2>
+        <p class="sub center">Seal the answer. Seal the date. Grade in a clean room. Sign the result.</p>
+
+        <div class="feature">
+          <div class="feature-copy">
+            <p class="tag">P1 · Answer seal</p>
+            <h3>Nothing newer than the cutoff is reachable.</h3>
+            <p>The sealer builds a frozen world for each task: the repo cut at the base commit, a root filesystem stamped at the cutoff, and a package mirror and web archive dated at or before it. <strong>sealcheck</strong> then scans for anything newer, before a run starts.</p>
+            <a class="more" href="#cutoff">Move the cutoff ↓</a>
+          </div>
+          <div class="feature-art window">
+            <div class="window-bar"><i></i><i></i><i></i><span>sealcheck</span></div>
+            <ul class="check-list">
+              <li><b>✓</b> repo history ends at base commit</li>
+              <li><b>✓</b> package mirror dated ≤ cutoff</li>
+              <li><b>✓</b> web archive dated ≤ cutoff</li>
+              <li><b>✓</b> rootfs stamped at cutoff</li>
+            </ul>
+            <p class="caption">Illustrative checks. See the spec for the real scanner.</p>
+          </div>
+        </div>
+
+        <div class="feature flip">
+          <div class="feature-copy">
+            <p class="tag">P2 · Date seal</p>
+            <h3>The clock inside never runs ahead.</h3>
+            <p>Nothing the agent can read states a date later than the guest clock. This one is best effort, so it’s measured and recorded at one of three levels rather than promised outright.</p>
+            <a class="more" href="#properties">See the three properties ↓</a>
+          </div>
+          <div class="feature-art window">
+            <div class="window-bar"><i></i><i></i><i></i><span>clock level</span></div>
+            <div class="levels" role="img" aria-label="Three clock levels: hidden, faked, real">
+              <div class="level on"><b>hidden</b><span>no clock to read</span></div>
+              <div class="level"><b>faked</b><span>clock pinned to cutoff</span></div>
+              <div class="level"><b>real</b><span>actual time exposed</span></div>
+            </div>
+            <p class="caption">The recorded level is part of the claim.</p>
+          </div>
+        </div>
+
+        <div class="feature">
+          <div class="feature-copy">
+            <p class="tag">P3 · Score integrity</p>
+            <h3>The score depends only on the submitted work.</h3>
+            <p>When the agent stops, a throwaway ExtractorVM pulls out its work. A clean GraderVM the agent never touched runs the tests three ways: normal, mutant and equivalence, to detect forged results.</p>
+            <a class="more" href="#run">Step through a run ↓</a>
+          </div>
+          <div class="feature-art window">
+            <div class="window-bar"><i></i><i></i><i></i><span>GraderVM</span></div>
+            <div class="trio">
+              <div><b>normal</b><span>run the tests</span></div>
+              <div><b>mutant</b><span>break the code on purpose</span></div>
+              <div><b>equivalence</b><span>compare behaviour</span></div>
+            </div>
+            <p class="caption">Three passes, so a forged “pass” stands out.</p>
+          </div>
+        </div>
+
+        <div class="feature flip">
+          <div class="feature-copy">
+            <p class="tag">Checkable claims</p>
+            <h3>Every run ends in a signed record.</h3>
+            <p>The host signs a record of everything: how well each channel was closed, the clock level, and the grading. Someone else can verify it, and readers of a published number can see what it does and doesn’t prove.</p>
+            <a class="more" href="#cli">Planned CLI ↓</a>
+          </div>
+          <div class="feature-art window">
+            <div class="window-bar"><i></i><i></i><i></i><span>run record</span></div>
+            <dl class="record">
+              <dt>seal</dt><dd>P1 gated</dd>
+              <dt>clock</dt><dd>level recorded</dd>
+              <dt>grade</dt><dd>3 passes</dd>
+              <dt>signature</dt><dd><code>host-signed</code></dd>
+            </dl>
+            <p class="caption">Shape only. Field names are defined in the spec.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INTERACTIVE CUTOFF -->
+    <section class="band" id="cutoff">
+      <div class="wrap">
+        <h2 class="center">Move the cutoff.</h2>
+        <p class="sub center">Drag the slider to set when the task was created. Anything after it disappears from the agent’s world. This is a made-up example project, just to show the idea.</p>
+
+        <div class="demo window">
+          <div class="window-bar"><i></i><i></i><i></i><span>acme/parser · illustrative</span></div>
+          <div class="demo-body">
+            <div class="demo-controls">
+              <div class="seg" role="group" aria-label="World mode">
+                <button type="button" data-mode="sealed" aria-pressed="true">Sealed</button>
+                <button type="button" data-mode="open" aria-pressed="false">Open world</button>
+              </div>
+              <label class="slider">
+                <span>Task created: <b id="cutoff-date">Apr 2026</b></span>
+                <input id="cutoff-range" type="range" min="0" max="7" value="3" step="1" aria-describedby="cutoff-help">
+              </label>
+              <div class="presets" role="group" aria-label="Cutoff presets">
+                <button type="button" data-v="1">Early</button>
+                <button type="button" data-v="3">Middle</button>
+                <button type="button" data-v="6">Late</button>
+              </div>
+              <p id="cutoff-help" class="note">Use the arrow keys on the slider to step through events.</p>
+            </div>
+            <div class="demo-out">
+              <p class="demo-summary" id="cutoff-summary" aria-live="polite"></p>
+              <ol class="timeline" id="timeline"></ol>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RUN STEPPER -->
+    <section id="run">
+      <div class="wrap">
+        <h2 class="center">Go on, step through a run.</h2>
+        <p class="sub center">Staging is online. Everything the agent touches is offline.</p>
+
+        <div class="stepper window">
+          <div class="window-bar"><i></i><i></i><i></i><span>run lifecycle</span></div>
+          <div class="stepper-body">
+            <ol class="steps" id="steps" role="tablist" aria-label="Run lifecycle"></ol>
+            <div class="step-detail" id="step-detail" aria-live="polite">
+              <p class="tag" id="step-tag"></p>
+              <h3 id="step-title"></h3>
+              <p id="step-text"></p>
+              <div class="step-nav">
+                <button type="button" class="btn btn-ghost" id="step-prev">← Back</button>
+                <button type="button" class="btn btn-primary" id="step-next">Next →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="note center">Components: staging host, sealer, sealcheck, AgentVM (Firecracker), NetVM, gateway, ExtractorVM, GraderVM, attestation.</p>
+      </div>
+    </section>
+
+    <!-- CLI -->
+    <section class="band" id="cli">
+      <div class="wrap narrow">
+        <h2 class="center">A small command line. Planned.</h2>
+        <p class="sub center">Only <code>seal --task &lt;id&gt;</code> has its arguments fixed by the spec. The rest are still to be designed.</p>
+        <div class="window term">
+          <div class="window-bar"><i></i><i></i><i></i><span>hermetic</span></div>
+          <div class="term-tabs" role="tablist" aria-label="CLI commands" id="cli-tabs"></div>
+          <pre class="term-body" id="cli-body" aria-live="polite"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- PROPERTIES -->
+    <section id="properties">
+      <div class="wrap">
+        <h2 class="center">Three properties, stated honestly.</h2>
+        <p class="sub center">P1 is the product. It doesn’t depend on P2.</p>
+        <div class="props">
+          <article class="prop">
+            <p class="tag">P1 · Answer seal</p>
+            <h3>No post-cutoff information is reachable.</h3>
+            <p>Nothing created after the world cutoff can reach the agent.</p>
+            <p class="strength strong">Hard guarantee, gated</p>
+          </article>
+          <article class="prop">
+            <p class="tag">P2 · Date seal</p>
+            <h3>No date later than the guest clock.</h3>
+            <p>Nothing the agent can read states a later date, at three measured levels.</p>
+            <p class="strength mid">Best effort, measured</p>
+          </article>
+          <article class="prop">
+            <p class="tag">P3 · Score integrity</p>
+            <h3>Graded where the agent never was.</h3>
+            <p>The score depends only on the submitted work.</p>
+            <p class="strength strong">Full for patch and artifact tasks, reduced for state tasks</p>
+          </article>
+        </div>
+
+        <h3 class="center table-title">Open world vs. Hermetic World</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">What an agent could do</th><th scope="col">Open world</th><th scope="col">Hermetic World</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Walk git history past the base commit</th><td class="no">Possible</td><td class="yes">Sealed</td></tr>
+              <tr><th scope="row">Install a later version of a library</th><td class="no">Possible</td><td class="yes">Sealed</td></tr>
+              <tr><th scope="row">Find the merged PR online</th><td class="no">Possible</td><td class="yes">Sealed</td></tr>
+              <tr><th scope="row">Read the benchmark from a cache</th><td class="no">Possible</td><td class="yes">Sealed</td></tr>
+              <tr><th scope="row">Force tests to pass with a <code>conftest.py</code> hook</th><td class="no">Possible</td><td class="yes">Detected by clean grading</td></tr>
+              <tr><th scope="row">Let someone else check the claim</th><td class="no">Not provided</td><td class="yes">Signed run record</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- AUDIENCE -->
+    <section class="band">
+      <div class="wrap">
+        <h2 class="center">Built for people who publish numbers.</h2>
+        <div class="grid4">
+          <article class="card"><h3>Benchmark maintainers</h3><p>Find leaks in your tasks, repair or exclude them, and publish scores that mean “derived”.</p></article>
+          <article class="card"><h3>Evaluation researchers</h3><p>Measure how much of a model’s score is retrieval, and compare models on a sealed footing.</p></article>
+          <article class="card"><h3>Labs and model developers</h3><p>Publish results with a signed claim about the seal and the grading that others can check.</p></article>
+          <article class="card"><h3>Readers of scores</h3><p>See what a number does and doesn’t prove, with a score card that spells it out.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATUS -->
+    <section id="status">
+      <div class="wrap narrow">
+        <h2 class="center">Where it stands.</h2>
+        <p class="sub center">Status as of 2026-11-14, from the README. The first sealed agent run has completed.</p>
+        <ol class="roadmap">
+          <li class="done"><b>Phase 0 · Vertical slice</b><span>Complete</span></li>
+          <li class="wip"><b>Phase 1 · sealcheck</b><span>In progress</span></li>
+          <li class="wip"><b>Phase 2 · World</b><span>In progress</span></li>
+          <li class="wip"><b>Phase 3 · VMs</b><span>In progress</span></li>
+          <li class="wip"><b>Phase 3b · Clock hiding</b><span>Reaches <code>clock: hidden</code> in a nested VM</span></li>
+          <li class="next"><b>Phase 4 · Extensions</b><span>Preparation under way</span></li>
+        </ol>
+        <p class="note center">Details live in <a href="https://github.com/shreenipane/HermeticWorld/blob/main/PHASES.md">PHASES.md</a> and <a href="https://github.com/shreenipane/HermeticWorld/blob/main/BUILD_LOG.md">BUILD_LOG.md</a>.</p>
+      </div>
+    </section>
+
+    <!-- DOCS -->
+    <section class="band" id="docs">
+      <div class="wrap">
+        <h2 class="center">Read the documents.</h2>
+        <p class="sub center">If a derived document disagrees with the specification, the specification wins.</p>
+        <div class="grid3">
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/HERMETIC_WORLD_ARCHITECTURE.md"><h3>Specification ↗</h3><p>The full design. Source of truth.</p></a>
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/PRD.md"><h3>PRD ↗</h3><p>Problem, users, goals, requirements and success metrics.</p></a>
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/TRD.md"><h3>TRD ↗</h3><p>Stack, per-component requirements, formats, security, performance.</p></a>
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/ARCHITECTURE.md"><h3>Architecture overview ↗</h3><p>Rings, components, data flow, invariants and key decisions.</p></a>
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/PHASES.md"><h3>Phases ↗</h3><p>Build plan, checklists, exit criteria and the cut list.</p></a>
+          <a class="card link" href="https://github.com/shreenipane/HermeticWorld/blob/main/BUILD_LOG.md"><h3>Build log ↗</h3><p>Dated record of what was built, measured and decided.</p></a>
+        </div>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section id="faq">
+      <div class="wrap narrow">
+        <h2 class="center">Questions.</h2>
+        <div class="faq">
+          <details><summary>What is Hermetic World?</summary><p>A time-sealed evaluation environment for AI agents. Each task runs in a world frozen at the moment the task was created, so the agent can only solve it by working it out, not by looking the answer up.</p></details>
+          <details><summary>What is sealcheck?</summary><p>The first component. Before a run, it proves that nothing created after the cutoff is reachable.</p></details>
+          <details><summary>Does it hide the cutoff itself?</summary><p>No. Hiding the cutoff is out of scope, as are undetectability, closing timing side channels, contamination in a model’s weights, and hiding the CPU generation.</p></details>
+          <details><summary>What do I need to run it?</summary><p>Linux x86_64 with KVM and Firecracker microVMs, with aarch64 later. Phases 0–1 need no VMs and run in containers. Phase 3 onwards needs KVM, either bare metal or EC2 with nested virtualization.</p></details>
+          <details><summary>What languages is it written in?</summary><p>The core is Rust. The Harbor bridge, package resolvers, test rewriting and classifier are Python.</p></details>
+          <details><summary>Is it ready to use?</summary><p>It’s early stage. Phase 0 is complete and Phases 1–3 are in progress. The CLI is planned, and only <code>seal --task &lt;id&gt;</code> has its arguments fixed so far.</p></details>
+          <details><summary>What’s not in the first release?</summary><p>Multi-container tasks, nested Docker, GPU tasks, and tasks that need the live internet by design.</p></details>
+          <details><summary>What’s the license?</summary><p>Apache-2.0.</p></details>
+        </div>
+      </div>
+    </section>
+
+    <!-- CLOSING CTA -->
+    <section class="closing">
+      <div class="wrap center">
+        <h2>Make the answer unreachable.</h2>
+        <p class="sub">Follow the build, read the spec, or open an issue.</p>
+        <div class="cta-row center-row">
+          <a class="btn btn-primary btn-lg" href="https://github.com/shreenipane/HermeticWorld">View on GitHub ↗</a>
+          <a class="btn btn-ghost btn-lg" href="https://github.com/shreenipane/HermeticWorld/blob/main/README.md">Read the README ↗</a>
+        </div>
+        <p class="fine">Open source under Apache-2.0.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="foot-grid">
+        <div>
+          <a class="brand" href="#top"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M16 7 25 16 16 25 7 16Z" fill="var(--accent)"/></svg><span>Hermetic World</span></a>
+          <p class="fine">A time-sealed evaluation environment for AI agents.</p>
+        </div>
+        <div><h4>Project</h4><a href="https://github.com/shreenipane/HermeticWorld">Repository</a><a href="https://github.com/shreenipane/HermeticWorld/issues">Issues</a><a href="https://github.com/shreenipane/HermeticWorld/blob/main/LICENSE">License</a></div>
+        <div><h4>Explore</h4><a href="#why">Why</a><a href="#features">Features</a><a href="#cutoff">Try it</a><a href="#run">How it runs</a></div>
+        <div><h4>Docs</h4><a href="https://github.com/shreenipane/HermeticWorld/blob/main/HERMETIC_WORLD_ARCHITECTURE.md">Specification</a><a href="https://github.com/shreenipane/HermeticWorld/blob/main/PHASES.md">Phases</a><a href="https://github.com/shreenipane/HermeticWorld/blob/main/BUILD_LOG.md">Build log</a></div>
+      </div>
+      <p class="legal">© 2026 Shree Nipane. Site layout inspired by the product-page style of cubbypad.com; all copy is about Hermetic World. Not affiliated with Cursor or any other company named here. Statistics are cited from the project documents.</p>
+    </div>
+  </footer>
+
+  <script src="assets/js/main.js" defer></script>
+</body>
+</html>

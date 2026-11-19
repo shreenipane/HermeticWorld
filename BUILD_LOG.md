@@ -2,6 +2,8 @@
 
 A dated, append-only record of what was built, measured and decided. Newest entries go at the top. Phase checklists live in [PHASES.md](PHASES.md). This log records what actually happened.
 
+The per-task agent briefs (`agy-tasks/`) and the session handoff (`HANDOFF.md`) named in older entries were removed from the tree on 2026-11-19; they remain in git history.
+
 ## Entry template
 
 ```markdown
