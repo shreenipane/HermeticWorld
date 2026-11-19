@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -37,6 +37,17 @@ use crate::spec::{
     GRADER_RESULT_DRIVE,
 };
 use crate::{deadline, remaining};
+use hermetic_attest::{
+    safe_atomic_write_file, safe_sha256_file, AgentMode as AttestAgentMode, Deployment, Digest,
+    GraderIsolation, SealLevel as AttestSealLevel, SubstrateAtT as AttestSubstrateAtT,
+    TaskClass as AttestTaskClass,
+};
+use hermetic_bundle::{Verdict as BundleVerdict, MANIFEST_FILENAME as BUNDLE_MANIFEST_FILENAME};
+use hermetic_common::world_manifest::{
+    SealLevel as CommonSealLevel, SubstrateAtT as CommonSubstrateAtT, TaskClass as CommonTaskClass,
+    WorldManifest,
+};
+use hermetic_run::orchestrator::WorldManifestArtifact;
 
 pub const DEFAULT_T_CLOCK: i64 = 1_700_000_000;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -81,6 +92,13 @@ pub struct VmmInfra {
 
     // Pluggable runner builder for offline testing against process boundaries
     runner_factory: Option<RunnerFactory>,
+
+    // Configured agent mode
+    agent_mode: Option<AgentMode>,
+
+    // Resolved AgentVM resource limits
+    agent_vcpus: u8,
+    agent_memory_mib: u32,
 }
 
 impl VmmInfra {
@@ -112,6 +130,9 @@ impl VmmInfra {
             r2_result: None,
             r3_result: None,
             runner_factory: None,
+            agent_mode: None,
+            agent_vcpus: 1,
+            agent_memory_mib: 2048,
         }
     }
 
@@ -162,6 +183,19 @@ impl VmmInfra {
     /// Sets explicit clock for testing.
     pub fn with_clock(mut self, t_clock: i64) -> Self {
         self.t_clock = t_clock;
+        self
+    }
+
+    /// Sets explicit agent mode.
+    pub fn with_agent_mode(mut self, mode: AgentMode) -> Self {
+        self.agent_mode = Some(mode);
+        self
+    }
+
+    /// Sets explicit agent resources for testing.
+    pub fn with_agent_resources(mut self, vcpus: u8, memory_mib: u32) -> Self {
+        self.agent_vcpus = vcpus;
+        self.agent_memory_mib = memory_mib;
         self
     }
 
@@ -292,65 +326,106 @@ impl Infra for VmmInfra {
         self.sealed_world = Some(sealed_path.clone());
         self.task_id = world.world_id.clone();
 
-        // Parse world_manifest.json if present to extract t_clock, task_class, and image digests
-        let manifest_file = sealed_path.join("world_manifest.json");
-        let mut image_digest =
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
-
-        if manifest_file.exists() {
-            let m_meta =
-                fs::symlink_metadata(&manifest_file).map_err(|e| InfraError::BackendFailure {
+        // 1. If bundle.manifest.json exists in sealed_path, verify it matches
+        let bundle_manifest_path = sealed_path.join(BUNDLE_MANIFEST_FILENAME);
+        if bundle_manifest_path.exists() {
+            let report = hermetic_bundle::verify(&sealed_path, None).map_err(|e| {
+                InfraError::BackendFailure {
                     step,
-                    detail: format!("lstat world_manifest.json failed: {e}"),
-                })?;
-            if m_meta.file_type().is_symlink() || !m_meta.file_type().is_file() {
-                return Err(InfraError::BackendFailure {
-                    step,
-                    detail: "world_manifest.json must be a regular file".to_string(),
-                });
-            }
-            let bytes = fs::read(&manifest_file).map_err(|e| InfraError::BackendFailure {
-                step,
-                detail: format!("read world_manifest.json failed: {e}"),
+                    detail: format!("sealed world bundle verification failed: {e}"),
+                }
             })?;
-            if bytes.len() > MAX_MANIFEST_BYTES {
+            if report.verdict != BundleVerdict::Ok || !report.manifest_root_matches {
                 return Err(InfraError::BackendFailure {
                     step,
-                    detail: "world_manifest.json exceeds size cap".to_string(),
+                    detail: "sealed world bundle verification failed: bundle does not match"
+                        .to_string(),
                 });
-            }
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(t_val) = val.get("t_clock") {
-                    if let Some(s) = t_val.as_str() {
-                        if let Ok(parsed) = s.parse::<i64>() {
-                            self.t_clock = parsed;
-                        } else if let Ok(dt) = time::OffsetDateTime::parse(
-                            s,
-                            &time::format_description::well_known::Rfc3339,
-                        ) {
-                            self.t_clock = dt.unix_timestamp();
-                        }
-                    } else if let Some(i) = t_val.as_i64() {
-                        self.t_clock = i;
-                    }
-                }
-                if let Some(cls) = val.get("task_class").and_then(|v| v.as_str()) {
-                    self.task_class = cls.to_string();
-                }
-                if let Some(dig) = val
-                    .get("task_rootfs_digest")
-                    .or_else(|| val.get("world_root"))
-                    .and_then(|v| v.as_str())
-                {
-                    image_digest = dig.to_string();
-                }
             }
         }
 
-        // Run evidence (boot record, probe output, sentinels, submitted patch) is only ever
-        // produced by this run's own VMs; nothing is copied in from other directories.
+        // 2. Load and validate canonical WorldManifest from sealed_path/world_manifest.json
+        let manifest_file = sealed_path.join("world_manifest.json");
+        if !manifest_file.exists() {
+            return Err(InfraError::BackendFailure {
+                step,
+                detail: "world_manifest.json does not exist in sealed world".to_string(),
+            });
+        }
+        let m_meta =
+            fs::symlink_metadata(&manifest_file).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("lstat world_manifest.json failed: {e}"),
+            })?;
+        if m_meta.file_type().is_symlink() || !m_meta.file_type().is_file() {
+            return Err(InfraError::BackendFailure {
+                step,
+                detail: "world_manifest.json must be a regular file".to_string(),
+            });
+        }
+        if m_meta.len() > MAX_MANIFEST_BYTES as u64 {
+            return Err(InfraError::BackendFailure {
+                step,
+                detail: "world_manifest.json exceeds size cap".to_string(),
+            });
+        }
+        let manifest_file_fd =
+            fs::File::open(&manifest_file).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("open world_manifest.json failed: {e}"),
+            })?;
+        let mut bytes = Vec::new();
+        manifest_file_fd
+            .take((MAX_MANIFEST_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("read world_manifest.json failed: {e}"),
+            })?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(InfraError::BackendFailure {
+                step,
+                detail: "world_manifest.json exceeds size cap".to_string(),
+            });
+        }
+        let canonical = WorldManifest::from_json_str(std::str::from_utf8(&bytes).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("world_manifest.json is not valid UTF-8: {e}"),
+            }
+        })?)
+        .map_err(|e| InfraError::BackendFailure {
+            step,
+            detail: format!("invalid canonical WorldManifest: {e}"),
+        })?;
 
-        // Prepare overlay image in run_dir for AgentVM if not already present
+        // 3. Compute Merkle world_root from the verified canonical manifest
+        let world_root_str = canonical
+            .world_root()
+            .map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("failed to compute world root: {e}"),
+            })?;
+        let world_root_digest =
+            Digest::parse(&world_root_str).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("invalid world root digest: {e}"),
+            })?;
+
+        // 4. Update t_clock and task_class from canonical manifest
+        if let Ok(dt) = time::OffsetDateTime::parse(
+            &canonical.cutoffs.t_clock,
+            &time::format_description::well_known::Rfc3339,
+        ) {
+            self.t_clock = dt.unix_timestamp();
+        } else if let Ok(parsed) = canonical.cutoffs.t_clock.parse::<i64>() {
+            self.t_clock = parsed;
+        }
+        self.task_class = match canonical.task_class {
+            CommonTaskClass::Dated | CommonTaskClass::Undated => "patch".to_string(),
+        };
+
+        // 5. Prepare overlay image in run_dir for AgentVM if not already present
         let overlay_path = self.run_dir.join("agent_overlay.img");
         if !overlay_path.exists() {
             let file = OpenOptions::new()
@@ -370,7 +445,7 @@ impl Infra for VmmInfra {
                 })?;
         }
 
-        // Prepare CPU template file in run_dir matching embedded clock-3b template
+        // 6. Prepare CPU template file in run_dir matching embedded clock-3b template
         let template_path = self.run_dir.join("cpu-template.json");
         if !template_path.exists() {
             let mut file = OpenOptions::new()
@@ -390,9 +465,254 @@ impl Infra for VmmInfra {
                 })?;
         }
 
+        // 7. Prepare VM configuration descriptor in run_dir
+        self.agent_vcpus = u8::try_from(canonical.run_spec.resources.vcpus).map_err(|_| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!(
+                    "vcpus {} exceeds u8 max",
+                    canonical.run_spec.resources.vcpus
+                ),
+            }
+        })?;
+        self.agent_memory_mib =
+            u32::try_from(canonical.run_spec.resources.memory_mib).map_err(|_| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!(
+                        "memory_mib {} exceeds u32 max",
+                        canonical.run_spec.resources.memory_mib
+                    ),
+                }
+            })?;
+        let vm_config_path = self.run_dir.join("vm-config.json");
+        if !vm_config_path.exists() {
+            let vm_cfg = serde_json::json!({
+                "cpu_template": "cpu-template.json",
+                "vcpus": self.agent_vcpus,
+                "mem_size_mib": self.agent_memory_mib,
+                "disk_mib": canonical.run_spec.resources.disk_mib,
+            });
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&vm_config_path)
+                .map_err(|e| InfraError::BackendFailure {
+                    step,
+                    detail: format!("failed to create vm-config.json: {e}"),
+                })?;
+            file.write_all(serde_json::to_string_pretty(&vm_cfg).unwrap().as_bytes())
+                .map_err(|e| InfraError::BackendFailure {
+                    step,
+                    detail: format!("failed to write vm-config.json: {e}"),
+                })?;
+        }
+
+        // 8. Compute deployment digests from actual files the run uses (never read from sealed manifest):
+        let task_rootfs_hex = safe_sha256_file(&self.rootfs_image, 64 * 1024 * 1024 * 1024)
+            .map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("failed to compute task_rootfs digest: {e}"),
+            })?;
+        let task_rootfs_digest =
+            Digest::parse(&format!("sha256:{task_rootfs_hex}")).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid task_rootfs digest: {e}"),
+                }
+            })?;
+
+        let guest_kernel_hex =
+            safe_sha256_file(&self.kernel_image, 1024 * 1024 * 1024).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("failed to compute guest_kernel digest: {e}"),
+                }
+            })?;
+        let guest_kernel_digest =
+            Digest::parse(&format!("sha256:{guest_kernel_hex}")).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid guest_kernel digest: {e}"),
+                }
+            })?;
+
+        let netvm_image_digest = if let Some(ref netvm) = self.netvm_rootfs {
+            let hex = safe_sha256_file(netvm, 64 * 1024 * 1024 * 1024).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("failed to compute netvm digest: {e}"),
+                }
+            })?;
+            Digest::parse(&format!("sha256:{hex}")).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("invalid netvm digest: {e}"),
+            })?
+        } else {
+            Digest::from_sha256(&[])
+        };
+
+        let fc_build_path = if self.run_dir.join("firecracker_build.json").exists() {
+            self.run_dir.join("firecracker_build.json")
+        } else if let Some(ref lock) = self.lock_file {
+            lock.clone()
+        } else {
+            self.fc_bin.clone()
+        };
+        let fc_build_hex = safe_sha256_file(&fc_build_path, 256 * 1024 * 1024).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("failed to compute firecracker_build digest: {e}"),
+            }
+        })?;
+        let firecracker_build_digest =
+            Digest::parse(&format!("sha256:{fc_build_hex}")).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid firecracker_build digest: {e}"),
+                }
+            })?;
+
+        let cpu_template_hex = safe_sha256_file(&template_path, 16 * 1024 * 1024).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("failed to compute cpu_template digest: {e}"),
+            }
+        })?;
+        let cpu_template_digest =
+            Digest::parse(&format!("sha256:{cpu_template_hex}")).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid cpu_template digest: {e}"),
+                }
+            })?;
+
+        let vm_config_hex = safe_sha256_file(&vm_config_path, 16 * 1024 * 1024).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("failed to compute vm_config digest: {e}"),
+            }
+        })?;
+        let vm_config_digest = Digest::parse(&format!("sha256:{vm_config_hex}")).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("invalid vm_config digest: {e}"),
+            }
+        })?;
+
+        let agent_volume_hex =
+            safe_sha256_file(&overlay_path, 1024 * 1024 * 1024).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("failed to compute agent_volume digest: {e}"),
+                }
+            })?;
+        let agent_volume_digest =
+            Digest::parse(&format!("sha256:{agent_volume_hex}")).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid agent_volume digest: {e}"),
+                }
+            })?;
+
+        let sealcheck_report_digest =
+            Digest::parse(&canonical.sealcheck_report_digest).map_err(|e| {
+                InfraError::BackendFailure {
+                    step,
+                    detail: format!("invalid sealcheck_report digest: {e}"),
+                }
+            })?;
+
+        let task_class = match canonical.task_class {
+            CommonTaskClass::Dated | CommonTaskClass::Undated => AttestTaskClass::Patch,
+        };
+        let seal_level = match canonical.seal_level {
+            CommonSealLevel::RepoOnly => AttestSealLevel::RepoOnly,
+            CommonSealLevel::Strict => AttestSealLevel::Strict,
+        };
+        let (substrate_at_t, substrate_str) = match canonical.substrate_at_t {
+            CommonSubstrateAtT::Full => (AttestSubstrateAtT::Full, "full"),
+            CommonSubstrateAtT::Partial => (AttestSubstrateAtT::Partial, "partial"),
+            CommonSubstrateAtT::None => (AttestSubstrateAtT::None, "none"),
+        };
+
+        let agent_mode = match self.agent_mode {
+            Some(AgentMode::HarnessDriven { .. }) => AttestAgentMode::H,
+            Some(AgentMode::GuestAutonomous { .. }) => AttestAgentMode::G,
+            None => {
+                if self.run_dir.join("gateway_head.json").exists()
+                    || self.run_dir.join("gateway_history.json").exists()
+                {
+                    AttestAgentMode::G
+                } else {
+                    AttestAgentMode::H
+                }
+            }
+        };
+
+        // 9. Build WorldManifestArtifact for run_dir
+        let run_manifest = WorldManifestArtifact {
+            task_id: canonical.task_id.clone(),
+            task_class,
+            seal_level,
+            agent_mode,
+            substrate: Some(substrate_str.to_string()),
+            grader_isolation: GraderIsolation::Clean,
+            deployment: Deployment::SingleHost,
+            t_world: canonical.cutoffs.t_world.clone(),
+            t_clock: canonical.cutoffs.t_clock.clone(),
+            base_commit: canonical.cutoffs.base_commit.clone().unwrap_or_default(),
+            pkg_cutoff: Some(canonical.cutoffs.pkg_cutoff.clone()),
+            spec_version: Some(canonical.spec_version.clone()),
+            world_version: world_root_digest.clone(),
+            sealcheck_version: "v1.0".to_string(),
+            grader_image_digest: task_rootfs_digest.clone(),
+            world_root: world_root_digest,
+            task_rootfs_digest,
+            netvm_image_digest,
+            guest_kernel_digest,
+            vm_config_digest,
+            cpu_template_digest,
+            firecracker_build_digest,
+            agent_volume_digest,
+            sealcheck_report_digest,
+            substrate_at_t,
+            exemption_list: canonical
+                .exemptions
+                .iter()
+                .map(|e| e.package.clone())
+                .collect(),
+            d5b_warning_list: None,
+            world_server_log_head: Digest::from_sha256(&[]),
+            dedupe_index_digest: Digest::from_sha256(&[]),
+            request_count: 0,
+            harness_command_log_head: None,
+            gateway_log_head: None,
+            history_rewrite_count: None,
+            gateway_adapter_version: None,
+            tee_quote: None,
+        };
+
+        let run_manifest_json =
+            serde_json::to_vec_pretty(&run_manifest).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("failed to serialize WorldManifestArtifact: {e}"),
+            })?;
+
+        safe_atomic_write_file(
+            &self.run_dir.join("world_manifest.json"),
+            &run_manifest_json,
+        )
+        .map_err(|e| InfraError::BackendFailure {
+            step,
+            detail: format!("failed to write run world_manifest.json: {e}"),
+        })?;
+
         Ok(PreparedWorld {
             world_id: world.world_id.clone(),
-            image_digest,
+            image_digest: format!("sha256:{task_rootfs_hex}"),
         })
     }
 
@@ -432,8 +752,8 @@ impl Infra for VmmInfra {
             id: vm_id.into(),
             role: Role::Agent,
             index: 0,
-            vcpus: 1,
-            memory_mib: 2048,
+            vcpus: self.agent_vcpus,
+            memory_mib: self.agent_memory_mib,
             kernel_image: self.kernel_image.display().to_string(),
             initrd: None,
             boot_args: format!(

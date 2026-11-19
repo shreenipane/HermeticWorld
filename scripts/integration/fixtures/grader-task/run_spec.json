@@ -1,0 +1,15 @@
+{
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "PYTHONPATH": "/testbed"
+  },
+  "workdir": "/testbed",
+  "user": "root",
+  "entrypoint": ["/bin/sh"],
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 4096,
+    "disk_mib": 8192,
+    "wall_time_s": 1800
+  }
+}

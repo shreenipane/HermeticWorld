@@ -315,6 +315,31 @@ fn test_validation_reports_multiple_errors_at_once() {
 }
 
 #[test]
+fn test_repo_tree_digest_schemes() {
+    let mut m = sample_manifest();
+    // 40-char SHA-1 git tree object id
+    m.repo_tree_digest = "sha1:4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string();
+    assert!(m.validate().is_ok());
+
+    // 40-char git: prefix
+    m.repo_tree_digest = "git:4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string();
+    assert!(m.validate().is_ok());
+
+    // 64-char sha256 git tree object id
+    m.repo_tree_digest =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+    assert!(m.validate().is_ok());
+
+    // Bad length for sha1
+    m.repo_tree_digest = "sha1:4b825dc642cb".to_string();
+    assert!(m.validate().is_err());
+
+    // Uppercase hex
+    m.repo_tree_digest = "sha1:4B825DC642CB6EB9A060E54BF8D69288FBEE4904".to_string();
+    assert!(m.validate().is_err());
+}
+
+#[test]
 fn test_deny_unknown_fields() {
     let json_with_unknown = r#"{
         "unknown_extra_field": 123,

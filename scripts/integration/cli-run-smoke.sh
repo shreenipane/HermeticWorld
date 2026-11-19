@@ -19,15 +19,18 @@ smoke_main() {
   export HERMETIC_FIRECRACKER_LOCK="$FC_LOCK"
   export HERMETIC_KERNEL="$KERNEL"
 
-  # 2. Build release CLI and sealcheck
+  # 2. Build release CLI, sealcheck and trust
   export CARGO_TARGET_DIR="$HOME/hermetic/cargo-target/$(basename "$top")"
   RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -q \
-    -p hermetic-cli -p hermetic-sealcheck \
+    -p hermetic-cli -p hermetic-sealcheck -p hermetic-trust \
     --target x86_64-unknown-linux-gnu
   CLI="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/hermetic"
   install -m 0700 "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/hermetic-sealcheck" "$WORK/sealcheck"
   SEALCHECK="$WORK/sealcheck"
-  export HERMETIC_SEALCHECK_BIN="$SEALCHECK"
+  export HERMETIC_SEALCHECK_BIN="${HERMETIC_SEALCHECK_BIN:-$SEALCHECK}"
+  install -m 0700 "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/hermetic-trust" "$WORK/trust"
+  TRUST="$WORK/trust"
+  export HERMETIC_TRUST_BIN="${HERMETIC_TRUST_BIN:-$TRUST}"
 
   # 3. Setup work directories with mode 0700
   SEALED_WORLD="$WORK/sealed-world"
@@ -39,73 +42,26 @@ smoke_main() {
   FIXTURE_SRC="$top/scripts/integration/fixtures/grader-task/repo"
   TASK_ID="fixture-task"
 
-  # If HERMETIC_SEALER_BIN is unset, configure a helper sealer subprocess
-  if [ -z "${HERMETIC_SEALER_BIN:-}" ]; then
-    SEALER_SCRIPT="$WORK/sealer-helper.sh"
-    cat << 'EOF' > "$SEALER_SCRIPT"
-#!/bin/sh
-out=""
-src=""
-t_clock="2020-01-01T00:00:00Z"
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --out) out="$2"; shift 2 ;;
-    --src) src="$2"; shift 2 ;;
-    --t-clock) t_clock="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-if [ -n "$out" ] && [ -n "$src" ]; then
-  mkdir -p "$out"
-  cp -r "$src"/* "$out/" 2>/dev/null || true
-  if [ ! -f "$out/world_manifest.json" ]; then
-    cat << 'MANIFEST' > "$out/world_manifest.json"
+  # Use repo's real sealer binary
+  export HERMETIC_SEALER_BIN="$(readlink -f "${HERMETIC_SEALER_BIN:-$top/scripts/hermetic-sealer}")"
+
+  PACKAGES_RECORD="$WORK/packages-record.json"
+  cat << 'EOF' > "$PACKAGES_RECORD"
 {
-  "task_id": "fixture-task",
-  "task_class": "patch",
-  "seal_level": "strict",
-  "agent_mode": "H",
-  "host": {
-    "patched_firecracker": true,
-    "hypercall_block": true
-  },
-  "substrate": "microvm",
-  "grader_isolation": "clean",
-  "deployment": "single_host",
-  "t_world": "2020-01-01T00:00:00Z",
-  "t_clock": "2020-01-01T00:00:00Z",
-  "base_commit": "abcdef0123456789abcdef0123456789abcdef01",
-  "spec_version": "v1.1",
-  "world_version": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "sealcheck_version": "v1.0",
-  "grader_image_digest": "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "world_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "task_rootfs_digest": "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "netvm_image_digest": "sha256:3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "guest_kernel_digest": "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "vm_config_digest": "sha256:5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "cpu_template_digest": "sha256:6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "firecracker_build_digest": "sha256:7123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "agent_volume_digest": "sha256:8123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "sealcheck_report_digest": "sha256:9123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "substrate_at_t": "full",
-  "exemption_list": ["pkg-a", "pkg-b"],
-  "world_server_log_head": "sha256:b123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "dedupe_index_digest": "sha256:c123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "request_count": 42,
-  "harness_command_log_head": "sha256:d123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  "closure_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "baseline_month": "2020-01",
+  "baseline_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
-MANIFEST
-  fi
-  find "$out" -exec touch -h -d "$t_clock" {} +
-fi
-exit 0
 EOF
-    chmod 0700 "$SEALER_SCRIPT"
-    export HERMETIC_SEALER_BIN="$SEALER_SCRIPT"
-  else
-    export HERMETIC_SEALER_BIN="$(readlink -f "$HERMETIC_SEALER_BIN")"
-  fi
+
+  SUBSTRATE_FILE="$WORK/substrate.json"
+  cat << 'EOF' > "$SUBSTRATE_FILE"
+{
+  "substrate": [],
+  "substrate_at_t": "none",
+  "exemptions": []
+}
+EOF
 
   echo "cli-run smoke: sealing fixture..."
   "$CLI" seal \
@@ -113,31 +69,18 @@ EOF
     --out "$SEALED_WORLD" \
     --t-clock "2020-01-01T00:00:00Z" \
     --world-id "$TASK_ID" \
-    --seal-level strict
+    --seal-level repo_only \
+    --packages-record "$PACKAGES_RECORD" \
+    --substrate "$SUBSTRATE_FILE"
 
   echo "cli-run smoke: verifying sealed bundle..."
   "$CLI" verify-bundle "$SEALED_WORLD"
 
-  # Produce AgentVM rootfs image from seal output
-  echo "cli-run smoke: producing rootfs from sealed world..."
-  ROOTFS_IMG="$WORK/rootfs.img"
-  /usr/bin/python3 -I - "$top/python" "$SEALED_WORLD" "$ROOTFS_IMG" "$SEALCHECK" "$WORK" << 'PY'
-import sys
-from datetime import datetime
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from hermetic_slice.rootfs import build_rootfs
-
-r = build_rootfs(
-    Path(sys.argv[2]),
-    Path(sys.argv[3]),
-    t_clock=datetime.fromisoformat("2020-01-01T00:00:00+00:00"),
-    world_id="fixture-task",
-    sealcheck_bin=Path(sys.argv[4]),
-    work_dir=Path(sys.argv[5]),
-)
-assert r["d4"] == "pass", f"D4 check failed: {r}"
-PY
+  # AgentVM rootfs image produced by real sealer
+  echo "cli-run smoke: using rootfs from sealed world..."
+  ROOTFS_IMG="$SEALED_WORLD/rootfs.img"
+  chmod 0600 "$ROOTFS_IMG"
+  export HERMETIC_ROOTFS="$ROOTFS_IMG"
   chmod 0600 "$ROOTFS_IMG"
   export HERMETIC_ROOTFS="$ROOTFS_IMG"
 

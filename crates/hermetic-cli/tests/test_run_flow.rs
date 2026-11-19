@@ -1133,3 +1133,105 @@ fn test_run_flow_missing_attestation_input_is_never_defaulted() {
         );
     }
 }
+
+#[test]
+fn test_run_flow_with_valid_bundle_manifest_verifies_successfully() {
+    let temp = tempfile::tempdir().unwrap();
+    let world_dir = temp.path().join("world");
+    fs::create_dir_all(&world_dir).unwrap();
+    fs::set_permissions(&world_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let dummy_file = world_dir.join("world_manifest.json");
+    fs::write(&dummy_file, b"{\"task_id\":\"fixture-task\"}").unwrap();
+    fs::set_permissions(&dummy_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Seal the bundle
+    let bundle_manifest = hermetic_bundle::seal(&world_dir).unwrap();
+    assert!(!bundle_manifest.root.is_empty());
+
+    let run_dir = temp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let clock = FakeClock::new(1000);
+    let mut infra = MockInfra::new(run_dir.clone());
+
+    let (pkcs8, _signer, _verifier) = generate_test_key();
+    let key_file = temp.path().join("signing.key");
+    fs::write(&key_file, &pkcs8).unwrap();
+    fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let req = RunRequest {
+        world: world_dir,
+        task: "fixture-task".into(),
+        agent_mode: AgentMode::H,
+        clock: ClockMode::Faked,
+        json: false,
+        key: None,
+        out: None,
+        run_dir: None,
+        entrypoint: None,
+        model: None,
+        upstream_url: None,
+        upstream_key_file: None,
+    };
+
+    let outcome = execute_run_flow(&mut infra, &clock, &req, &run_dir, Some(&key_file))
+        .expect("valid bundle must verify and succeed");
+    assert!(outcome.ok);
+}
+
+#[test]
+fn test_run_flow_with_tampered_bundle_manifest_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let world_dir = temp.path().join("world");
+    fs::create_dir_all(&world_dir).unwrap();
+    fs::set_permissions(&world_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let dummy_file = world_dir.join("world_manifest.json");
+    fs::write(&dummy_file, b"{\"task_id\":\"fixture-task\"}").unwrap();
+    fs::set_permissions(&dummy_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Seal the bundle
+    hermetic_bundle::seal(&world_dir).unwrap();
+
+    // Tamper with bundle contents after sealing
+    fs::write(&dummy_file, b"{\"task_id\":\"tampered-task\"}").unwrap();
+
+    let run_dir = temp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let clock = FakeClock::new(1000);
+    let mut infra = MockInfra::new(run_dir.clone());
+
+    let (pkcs8, _signer, _verifier) = generate_test_key();
+    let key_file = temp.path().join("signing.key");
+    fs::write(&key_file, &pkcs8).unwrap();
+    fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let req = RunRequest {
+        world: world_dir,
+        task: "fixture-task".into(),
+        agent_mode: AgentMode::H,
+        clock: ClockMode::Faked,
+        json: false,
+        key: None,
+        out: None,
+        run_dir: None,
+        entrypoint: None,
+        model: None,
+        upstream_url: None,
+        upstream_key_file: None,
+    };
+
+    let err = execute_run_flow(&mut infra, &clock, &req, &run_dir, Some(&key_file))
+        .expect_err("tampered bundle must fail closed");
+    match err {
+        hermetic_cli::dispatch::BackendError::ProblemFound(msg) => {
+            assert!(
+                msg.contains("bundle") || msg.contains("verification"),
+                "unexpected error: {msg}"
+            );
+        }
+        other => panic!("expected BackendError::ProblemFound, got {other:?}"),
+    }
+}

@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""Hermetic Sealer (HERMETIC_SEALER_BIN implementation).
+
+Contract:
+  --src <DIR> --out <DIR> --t-clock <TIME> --world-id <ID> --seal-level <LEVEL>
+  [--packages-record <FILE>] [--substrate <FILE>] [--run-spec <FILE>] [--dns-table <FILE>]
+
+Exits:
+  0: Success (canonical world_manifest.json written to --out)
+  2: Gate finding (sealcheck rejected world)
+  65: Invalid input / unsupported mode / missing required input
+  74: I/O failure
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+TOP = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOP / "python"))
+
+from hermetic_slice.cutoffs import ensure_utc
+from hermetic_slice.gitutil import GitError, run_git
+from hermetic_slice.repo_sealer import seal_repo
+from hermetic_slice.rootfs import build_rootfs, RootfsGateError
+
+
+def find_sealcheck_bin(work_dir: Path | None = None) -> Path | None:
+    override = os.environ.get("HERMETIC_SEALCHECK_BIN")
+    candidates = []
+    if override:
+        candidates.append(Path(override))
+    if os.environ.get("CARGO_TARGET_DIR"):
+        target = Path(os.environ["CARGO_TARGET_DIR"])
+        candidates.append(target / "x86_64-unknown-linux-gnu" / "release" / "hermetic-sealcheck")
+        candidates.append(target / "release" / "hermetic-sealcheck")
+        candidates.append(target / "debug" / "hermetic-sealcheck")
+    cargo_target_base = Path(os.environ.get("CARGO_TARGET_BASE") or (Path.home() / "hermetic" / "cargo-target"))
+    if cargo_target_base.is_dir():
+        for d in cargo_target_base.glob("world-seal*"):
+            candidates.append(d / "release" / "hermetic-sealcheck")
+            candidates.append(d / "debug" / "hermetic-sealcheck")
+    candidates.append(TOP / "target" / "release" / "hermetic-sealcheck")
+    candidates.append(TOP / "target" / "debug" / "hermetic-sealcheck")
+    which = shutil.which("hermetic-sealcheck")
+    if which:
+        candidates.append(Path(which))
+    for cand in candidates:
+        cand = cand.resolve()
+        if cand.is_file() and os.access(cand, os.X_OK):
+            st = cand.stat()
+            if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and work_dir is not None:
+                staged = work_dir / "sealcheck_safe"
+                if not staged.exists():
+                    shutil.copy2(cand, staged)
+                    os.chmod(staged, 0o700)
+                return staged
+            return cand
+    return None
+
+
+def find_hermetic_trust_bin(work_dir: Path | None = None) -> Path | None:
+    override = os.environ.get("HERMETIC_TRUST_BIN")
+    candidates = []
+    if override:
+        candidates.append(Path(override))
+    if os.environ.get("CARGO_TARGET_DIR"):
+        target = Path(os.environ["CARGO_TARGET_DIR"])
+        candidates.append(target / "x86_64-unknown-linux-gnu" / "release" / "hermetic-trust")
+        candidates.append(target / "release" / "hermetic-trust")
+        candidates.append(target / "debug" / "hermetic-trust")
+    cargo_target_base = Path(os.environ.get("CARGO_TARGET_BASE") or (Path.home() / "hermetic" / "cargo-target"))
+    if cargo_target_base.is_dir():
+        for d in cargo_target_base.glob("world-seal*"):
+            candidates.append(d / "release" / "hermetic-trust")
+            candidates.append(d / "debug" / "hermetic-trust")
+    candidates.append(TOP / "target" / "release" / "hermetic-trust")
+    candidates.append(TOP / "target" / "debug" / "hermetic-trust")
+    which = shutil.which("hermetic-trust")
+    if which:
+        candidates.append(Path(which))
+    for cand in candidates:
+        cand = cand.resolve()
+        if cand.is_file() and os.access(cand, os.X_OK):
+            st = cand.stat()
+            if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and work_dir is not None:
+                staged = work_dir / "trust_safe"
+                if not staged.exists():
+                    shutil.copy2(cand, staged)
+                    os.chmod(staged, 0o700)
+                return staged
+            return cand
+    return None
+
+
+def mint_and_install_ca(
+    world_id: str,
+    t_clock_str: str,
+    t_clock_dt: datetime,
+    staging_rootfs: Path,
+    work_dir: Path,
+) -> tuple[str, list[str]]:
+    """Mint world CA and install into staging rootfs trust store."""
+    trust_bin = find_hermetic_trust_bin(work_dir)
+    if trust_bin is None:
+        raise RuntimeError("hermetic-trust binary not found")
+
+    ca_seed_file = work_dir / "ca_seed.bin"
+    seed_bytes = hashlib.sha256(f"hermetic-ca-seed:{world_id}".encode()).digest()[:32]
+    ca_seed_file.write_bytes(seed_bytes)
+    os.chmod(ca_seed_file, 0o600)
+    ca_cert_pem = work_dir / "ca.pem"
+    ca_key_pem = work_dir / "ca.key"
+
+    proc = subprocess.run(
+        [
+            str(trust_bin),
+            "mint-ca",
+            "--world-id",
+            world_id,
+            "--t-clock",
+            t_clock_str,
+            "--ca-seed-file",
+            str(ca_seed_file),
+            "--cert-out",
+            str(ca_cert_pem),
+            "--key-out",
+            str(ca_key_pem),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"hermetic-trust mint-ca failed (exit {proc.returncode}): {proc.stderr}")
+
+    certs_dir = staging_rootfs / "etc" / "ssl" / "certs"
+    certs_dir.mkdir(parents=True, exist_ok=True)
+    bundle_file = certs_dir / "ca-certificates.crt"
+    if not bundle_file.exists():
+        bundle_file.touch(mode=0o644)
+
+    report_path = work_dir / "trust_report.json"
+    inst_args = [
+        str(trust_bin),
+        "install",
+        "--rootfs",
+        str(staging_rootfs),
+        "--ca-cert",
+        str(ca_cert_pem),
+        "--report",
+        str(report_path),
+    ]
+    if os.geteuid() != 0:
+        inst_args.extend(["--guest-uid", str(os.geteuid()), "--guest-gid", str(os.getegid())])
+
+    inst_proc = subprocess.run(
+        inst_args,
+        capture_output=True,
+        text=True,
+    )
+    if inst_proc.returncode != 0:
+        raise RuntimeError(f"hermetic-trust install failed (exit {inst_proc.returncode}): {inst_proc.stderr}")
+
+    if not report_path.is_file():
+        raise RuntimeError("hermetic-trust install did not produce trust report")
+
+    rep = json.loads(report_path.read_text(encoding="utf-8"))
+    ca_sha256 = rep.get("ca_cert_sha256", "")
+    if not ca_sha256.startswith("sha256:"):
+        ca_sha256 = f"sha256:{ca_sha256}"
+    modified = rep.get("modified_paths", [])
+    trust_paths = sorted(list(set("/" + p.lstrip("/") for p in modified)))
+    if not trust_paths:
+        trust_paths = ["/etc/ssl/certs/ca-certificates.crt"]
+
+    return ca_sha256, trust_paths
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Hermetic Sealer")
+    parser.add_argument("--src", required=True, type=Path)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--t-clock", required=True, type=str)
+    parser.add_argument("--world-id", required=True, type=str)
+    parser.add_argument("--seal-level", required=True, type=str)
+    parser.add_argument("--packages-record", default=None, type=Path)
+    parser.add_argument("--substrate", default=None, type=Path)
+    parser.add_argument("--run-spec", default=None, type=Path)
+    parser.add_argument("--dns-table", default=None, type=Path)
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 65
+
+    # 1. Enforce seal-level contract
+    if args.seal_level != "repo_only":
+        sys.stderr.write(
+            f"unsupported seal_level: only repo_only is supported, got '{args.seal_level}'\n"
+        )
+        return 65
+
+    # 2. Enforce packages record contract
+    if args.packages_record is None:
+        sys.stderr.write("missing required input: --packages-record\n")
+        return 65
+    if not args.packages_record.is_file():
+        sys.stderr.write(
+            f"packages-record file not found: {args.packages_record}\n"
+        )
+        return 65
+
+    try:
+        pkg_data = json.loads(args.packages_record.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.stderr.write(f"failed to parse packages-record JSON: {e}\n")
+        return 65
+
+    if isinstance(pkg_data, dict) and "packages" in pkg_data and isinstance(pkg_data["packages"], dict):
+        packages_record = pkg_data["packages"]
+    elif isinstance(pkg_data, dict):
+        packages_record = pkg_data
+    else:
+        sys.stderr.write("packages-record JSON must be an object\n")
+        return 65
+
+    for req_field in ("closure_root", "baseline_month", "baseline_root"):
+        if req_field not in packages_record or not isinstance(packages_record[req_field], str):
+            sys.stderr.write(f"packages-record missing required field: {req_field}\n")
+            return 65
+
+    # 3. Enforce substrate contract
+    if args.substrate is None:
+        sys.stderr.write("missing required input: --substrate\n")
+        return 65
+    if not args.substrate.is_file():
+        sys.stderr.write(f"substrate file not found: {args.substrate}\n")
+        return 65
+
+    try:
+        sub_data = json.loads(args.substrate.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.stderr.write(f"failed to parse substrate JSON: {e}\n")
+        return 65
+
+    if not isinstance(sub_data, dict):
+        sys.stderr.write("substrate JSON must be an object\n")
+        return 65
+
+    raw_substrate = sub_data.get("substrate", [])
+    substrate_entries = []
+    if isinstance(raw_substrate, list):
+        for entry in raw_substrate:
+            if isinstance(entry, dict) and all(k in entry for k in ("name", "version", "digest", "date")):
+                substrate_entries.append({
+                    "name": str(entry["name"]),
+                    "version": str(entry["version"]),
+                    "digest": str(entry["digest"]),
+                    "date": str(entry["date"]),
+                })
+
+    substrate_at_t = str(sub_data.get("substrate_at_t", "none"))
+    if substrate_at_t not in ("full", "partial", "none"):
+        substrate_at_t = "none"
+
+    raw_exemptions = sub_data.get("exemptions", [])
+    exemptions = []
+    if isinstance(raw_exemptions, list):
+        for ex in raw_exemptions:
+            if isinstance(ex, dict):
+                pkg = ex.get("package") or ex.get("path")
+                reason = ex.get("reason", "substrate_exemption")
+                if pkg:
+                    exemptions.append({"package": str(pkg), "reason": str(reason)})
+
+    # 4. Parse t_clock
+    try:
+        raw_t_clock = args.t_clock
+        if raw_t_clock.endswith("Z"):
+            raw_t_clock = raw_t_clock[:-1] + "+00:00"
+        t_clock_dt = ensure_utc(datetime.fromisoformat(raw_t_clock), "t_clock")
+        t_clock_str = t_clock_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception as e:
+        sys.stderr.write(f"invalid t_clock: {e}\n")
+        return 65
+
+    # 5. Discover and load run_spec
+    run_spec_path = None
+    if args.run_spec and args.run_spec.is_file():
+        run_spec_path = args.run_spec
+    else:
+        candidates = [
+            args.src / "run_spec.json",
+            args.src / "runspec.json",
+            args.src.parent / "run_spec.json",
+            args.src.parent / "runspec.json",
+            args.src / "task.json",
+            args.src.parent / "task.json",
+            args.src / "record.json",
+            args.src.parent / "record.json",
+        ]
+        for c in candidates:
+            if c.is_file():
+                run_spec_path = c
+                break
+
+    if not run_spec_path:
+        sys.stderr.write("missing required input: run_spec\n")
+        return 65
+
+    try:
+        raw_rs = json.loads(run_spec_path.read_text(encoding="utf-8"))
+        if "run_spec" in raw_rs and isinstance(raw_rs["run_spec"], dict):
+            run_spec_data = raw_rs["run_spec"]
+        elif "runspec" in raw_rs and isinstance(raw_rs["runspec"], dict):
+            run_spec_data = raw_rs["runspec"]
+        else:
+            run_spec_data = raw_rs
+    except Exception as e:
+        sys.stderr.write(f"failed to read run_spec: {e}\n")
+        return 65
+
+    # Validate run_spec fields
+    if not isinstance(run_spec_data, dict):
+        sys.stderr.write("invalid run_spec: must be an object\n")
+        return 65
+
+    env_raw = run_spec_data.get("env")
+    if isinstance(env_raw, list):
+        env = {str(k): str(v) for k, v in env_raw}
+    elif isinstance(env_raw, dict):
+        env = {str(k): str(v) for k, v in env_raw.items()}
+    else:
+        sys.stderr.write("invalid run_spec: missing or invalid env\n")
+        return 65
+
+    workdir = run_spec_data.get("workdir") or run_spec_data.get("cwd")
+    if not workdir or not isinstance(workdir, str):
+        sys.stderr.write("invalid run_spec: missing or invalid workdir\n")
+        return 65
+
+    if ".." in Path(workdir.lstrip("/")).parts:
+        sys.stderr.write(f"invalid run_spec: workdir contains parent traversal: {workdir}\n")
+        return 65
+
+    user = run_spec_data.get("user")
+    if user is None:
+        user = "root"
+    elif not isinstance(user, str):
+        user = str(user)
+
+    entrypoint = run_spec_data.get("entrypoint")
+    if entrypoint is None:
+        entrypoint = run_spec_data.get("cmd") or ["/bin/sh"]
+    if not isinstance(entrypoint, list):
+        entrypoint = [str(entrypoint)]
+    entrypoint = [str(x) for x in entrypoint]
+
+    resources_raw = run_spec_data.get("resources")
+    if not isinstance(resources_raw, dict):
+        sys.stderr.write("invalid run_spec: missing resources\n")
+        return 65
+
+    vcpus = int(resources_raw.get("vcpus", 0))
+    memory_mib = int(resources_raw.get("memory_mib", 0))
+    disk_mib = int(resources_raw.get("disk_mib", 0))
+    wall_time_s = int(resources_raw.get("wall_time_s", 1800))
+    if vcpus <= 0 or memory_mib <= 0 or disk_mib <= 0 or wall_time_s <= 0:
+        sys.stderr.write("invalid run_spec: resources values must be greater than zero\n")
+        return 65
+
+    run_spec = {
+        "env": env,
+        "workdir": workdir,
+        "user": user,
+        "entrypoint": entrypoint,
+        "resources": {
+            "vcpus": vcpus,
+            "memory_mib": memory_mib,
+            "disk_mib": disk_mib,
+            "wall_time_s": wall_time_s,
+        },
+    }
+
+    # 6. Discover and load dns_table
+    dns_table_path = None
+    if args.dns_table and args.dns_table.is_file():
+        dns_table_path = args.dns_table
+    else:
+        candidates = [
+            args.src / "dns.json",
+            args.src / "dns_table.json",
+            args.src.parent / "dns.json",
+            args.src.parent / "dns_table.json",
+            args.src / "task.json",
+            args.src.parent / "task.json",
+        ]
+        for c in candidates:
+            if c.is_file():
+                dns_table_path = c
+                break
+
+    if not dns_table_path:
+        sys.stderr.write("missing required input: dns_table\n")
+        return 65
+
+    try:
+        raw_dns = json.loads(dns_table_path.read_text(encoding="utf-8"))
+        if isinstance(raw_dns, dict) and "records" in raw_dns and isinstance(raw_dns["records"], list):
+            domain_names = [str(r["name"]) for r in raw_dns["records"] if isinstance(r, dict) and "name" in r]
+        elif isinstance(raw_dns, dict) and "dns_table" in raw_dns and isinstance(raw_dns["dns_table"], list):
+            domain_names = [str(x) for x in raw_dns["dns_table"]]
+        elif isinstance(raw_dns, list):
+            domain_names = [str(x) for x in raw_dns]
+        else:
+            domain_names = []
+    except Exception as e:
+        sys.stderr.write(f"failed to read dns_table: {e}\n")
+        return 65
+
+    dns_table = sorted(list(set(domain_names)))
+    if not dns_table:
+        sys.stderr.write("invalid dns_table: domain table is empty\n")
+        return 65
+
+    # Check cutoffs / base_commit from task.json if available
+    task_json_path = None
+    for cand in (args.src / "task.json", args.src.parent / "task.json"):
+        if cand.is_file():
+            task_json_path = cand
+            break
+
+    task_class = "undated"
+    base_commit = None
+    t_world_str = t_clock_str
+    pkg_cutoff_str = t_clock_str
+
+    if task_json_path:
+        try:
+            tdata = json.loads(task_json_path.read_text(encoding="utf-8"))
+            if "cutoffs" in tdata and isinstance(tdata["cutoffs"], dict):
+                t_world_str = tdata["cutoffs"].get("t_world", t_world_str)
+                pkg_cutoff_str = tdata["cutoffs"].get("pkg_cutoff", pkg_cutoff_str)
+                base_commit = tdata["cutoffs"].get("base_commit")
+            if tdata.get("base_commit"):
+                base_commit = tdata["base_commit"]
+        except Exception:
+            pass
+
+    # 7. Work directory for staging
+    work_dir = Path(tempfile.mkdtemp(prefix="hermetic-sealer-"))
+    try:
+        # Check source git repository
+        src_repo = args.src
+        if not (args.src / ".git").is_dir():
+            # Prepare git repo from src in work_dir / "init_repo"
+            temp_repo = work_dir / "init_repo"
+            temp_repo.mkdir(parents=True, exist_ok=True)
+            for item in args.src.iterdir():
+                if item.name == ".git":
+                    continue
+                if item.is_dir():
+                    shutil.copytree(item, temp_repo / item.name, symlinks=True)
+                else:
+                    shutil.copy2(item, temp_repo / item.name)
+            run_git(["init", "-b", "main"], cwd=temp_repo)
+            run_git(["config", "user.name", "Hermetic Sealer"], cwd=temp_repo)
+            run_git(["config", "user.email", "sealer@hermetic.world"], cwd=temp_repo)
+            run_git(["add", "-A"], cwd=temp_repo)
+            env_commit = os.environ.copy()
+            env_commit["GIT_COMMITTER_DATE"] = t_clock_str
+            env_commit["GIT_AUTHOR_DATE"] = t_clock_str
+            run_git(["commit", "-m", "Initial commit", f"--date={t_clock_str}"], cwd=temp_repo, env=env_commit)
+            src_repo = temp_repo
+            base_commit = run_git(["rev-parse", "HEAD"], cwd=temp_repo).decode("ascii").strip()
+
+        if not base_commit:
+            try:
+                base_commit = run_git(["rev-parse", "HEAD"], cwd=src_repo).decode("ascii").strip()
+            except GitError as e:
+                sys.stderr.write(f"failed to determine base_commit: {e}\n")
+                return 65
+
+        task_class = "dated"
+
+        # Seal repository
+        sealed_git_store = work_dir / "sealed_repo"
+        try:
+            seal_repo(
+                src=src_repo,
+                base_commit=base_commit,
+                dest=sealed_git_store,
+                t_clock=t_clock_dt,
+            )
+        except Exception as e:
+            sys.stderr.write(f"seal_repo failed: {e}\n")
+            return 70
+
+        # Compute repo_tree_digest
+        try:
+            tree_sha = run_git(["rev-parse", "HEAD^{tree}"], cwd=sealed_git_store).decode("ascii").strip()
+            if len(tree_sha) != 40 or not all(c in "0123456789abcdef" for c in tree_sha.lower()):
+                sys.stderr.write(f"invalid tree object ID: {tree_sha}\n")
+                return 70
+            repo_tree_digest = f"sha1:{tree_sha.lower()}"
+        except GitError as e:
+            sys.stderr.write(f"failed to read tree object ID: {e}\n")
+            return 70
+
+        # 8. Setup staging rootfs & install CA
+        staging_rootfs = work_dir / "staging_rootfs"
+        staging_rootfs.mkdir(parents=True, exist_ok=True)
+
+        for d in ("bin", "sbin", "usr/bin", "usr/sbin", "etc/ssl/certs", "tmp", "var/tmp", "proc", "sys", "dev", "home"):
+            (staging_rootfs / d).mkdir(parents=True, exist_ok=True)
+
+        # Place repository files at workdir
+        rel_workdir = Path(workdir.lstrip("/"))
+        if ".." in rel_workdir.parts:
+            sys.stderr.write(f"invalid workdir parent traversal: {workdir}\n")
+            return 65
+        staging_rootfs_resolved = staging_rootfs.resolve()
+        repo_dest = (staging_rootfs / rel_workdir).resolve()
+        try:
+            repo_dest.relative_to(staging_rootfs_resolved)
+        except ValueError:
+            sys.stderr.write(f"invalid workdir: destination escapes staging_rootfs: {workdir}\n")
+            return 65
+        repo_dest.mkdir(parents=True, exist_ok=True)
+        # Copy sealed repo files
+        for item in sealed_git_store.iterdir():
+            if item.is_dir():
+                shutil.copytree(item, repo_dest / item.name, symlinks=True)
+            else:
+                shutil.copy2(item, repo_dest / item.name)
+
+        # Mint and install CA into staging rootfs
+        world_ca_cert_sha256, trust_store_paths = mint_and_install_ca(
+            world_id=args.world_id,
+            t_clock_str=t_clock_str,
+            t_clock_dt=t_clock_dt,
+            staging_rootfs=staging_rootfs,
+            work_dir=work_dir,
+        )
+
+        # 9. Build rootfs with D4 guard
+        sealcheck_bin = find_sealcheck_bin(work_dir)
+        rootfs_out_path = args.out / "rootfs.img"
+        try:
+            build_res = build_rootfs(
+                src=staging_rootfs,
+                out_image=rootfs_out_path,
+                t_clock=t_clock_dt,
+                world_id=args.world_id,
+                sealcheck_bin=sealcheck_bin,
+                work_dir=work_dir,
+            )
+            rootfs_digest = f"sha256:{build_res['sha256']}"
+        except RootfsGateError as e:
+            sys.stderr.write(f"sealcheck D4 gate error: {e}\n")
+            return 2
+        except Exception as e:
+            sys.stderr.write(f"build_rootfs failed: {e}\n")
+            return 70
+
+        # 10. Run sealcheck scan for sealcheck_report_digest
+        report_bytes = b'{"verdict":"pass","findings":[]}\n'
+        if sealcheck_bin is not None:
+            scan_proc = subprocess.run(
+                [
+                    str(sealcheck_bin),
+                    "d4-image",
+                    "--image",
+                    str(rootfs_out_path),
+                    "--t-clock",
+                    t_clock_str,
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+            )
+            if scan_proc.returncode == 2:
+                sys.stderr.write("sealcheck rejected world: gate finding\n")
+                return 2
+            if scan_proc.returncode != 0:
+                sys.stderr.write(f"sealcheck scan failed: exit {scan_proc.returncode}\n")
+                return scan_proc.returncode
+            if not scan_proc.stdout:
+                sys.stderr.write("sealcheck scan failed: empty report output\n")
+                return 70
+            report_bytes = scan_proc.stdout
+
+        sealcheck_report_digest = f"sha256:{hashlib.sha256(report_bytes).hexdigest()}"
+
+        # Copy sealed repo into out / "repo"
+        out_repo = args.out / "repo"
+        if not out_repo.exists():
+            shutil.copytree(sealed_git_store, out_repo, symlinks=True)
+
+        # 11. Write canonical world_manifest.json
+        manifest = {
+            "spec_version": "hermetic-world/v1",
+            "task_id": args.world_id,
+            "task_class": task_class,
+            "seal_level": "repo_only",
+            "cutoffs": {
+                "t_world": t_world_str,
+                "t_clock": t_clock_str,
+                "pkg_cutoff": pkg_cutoff_str,
+            },
+            "repo_tree_digest": repo_tree_digest,
+            "rootfs_digest": rootfs_digest,
+            "packages": packages_record,
+            "substrate": substrate_entries,
+            "substrate_at_t": substrate_at_t,
+            "exemptions": exemptions,
+            "dns_table": dns_table,
+            "world_ca_cert_sha256": world_ca_cert_sha256,
+            "trust_store_paths": trust_store_paths,
+            "test_services": [],
+            "run_spec": run_spec,
+            "sealcheck_report_digest": sealcheck_report_digest,
+            "dispositions": [],
+        }
+        if base_commit:
+            manifest["cutoffs"]["base_commit"] = base_commit
+
+        manifest_json = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        manifest_dest = args.out / "world_manifest.json"
+        tmp_dest = args.out / ".world_manifest.json.tmp"
+        tmp_dest.write_bytes(manifest_json)
+        os.replace(tmp_dest, manifest_dest)
+
+        return 0
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

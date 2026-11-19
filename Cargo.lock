@@ -1002,6 +1002,7 @@ name = "hermetic-vmm"
 version = "0.1.0"
 dependencies = [
  "hermetic-attest",
+ "hermetic-bundle",
  "hermetic-common",
  "hermetic-extract",
  "hermetic-gateway",

@@ -241,35 +241,54 @@ fn create_test_world(temp: &Path, t_clock_str: &str) -> (PathBuf, PathBuf) {
     let sealed_world = temp.join("sealed-world");
     fs::create_dir_all(&sealed_world).unwrap();
 
+    let rfc3339_clock = if let Ok(epoch) = t_clock_str.parse::<i64>() {
+        time::OffsetDateTime::from_unix_timestamp(epoch)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    } else {
+        t_clock_str.to_string()
+    };
+
     let manifest = serde_json::json!({
+        "spec_version": "hermetic-world/v1",
         "task_id": "test-task",
-        "task_class": "patch",
-        "seal_level": "strict",
-        "agent_mode": "H",
-        "substrate": "microvm",
-        "grader_isolation": "clean",
-        "deployment": "single_host",
-        "t_world": "2020-01-01T00:00:00Z",
-        "t_clock": t_clock_str,
-        "base_commit": "abcdef0123456789abcdef0123456789abcdef01",
-        "spec_version": "v1.1",
-        "world_version": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "sealcheck_version": "v1.0",
-        "grader_image_digest": "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "world_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "task_rootfs_digest": "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "netvm_image_digest": "sha256:3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "guest_kernel_digest": "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "vm_config_digest": "sha256:5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "cpu_template_digest": "sha256:6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "firecracker_build_digest": "sha256:7123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "agent_volume_digest": "sha256:8123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "sealcheck_report_digest": "sha256:9123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "task_class": "dated",
+        "seal_level": "repo_only",
+        "cutoffs": {
+            "t_world": "2020-01-01T00:00:00Z",
+            "t_clock": rfc3339_clock,
+            "base_commit": "abcdef0123456789abcdef0123456789abcdef01",
+            "pkg_cutoff": "2020-01-01T00:00:00Z"
+        },
+        "repo_tree_digest": "sha1:abcdef0123456789abcdef0123456789abcdef01",
+        "rootfs_digest": "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "packages": {
+            "closure_root": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "baseline_month": "2020-01",
+            "baseline_root": "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "substrate": [],
         "substrate_at_t": "full",
-        "world_server_log_head": "sha256:b123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "dedupe_index_digest": "sha256:c123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "request_count": 42,
-        "harness_command_log_head": "sha256:d123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "exemptions": [],
+        "dns_table": ["alpha.example.com"],
+        "world_ca_cert_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000007",
+        "trust_store_paths": ["/etc/ssl/certs/ca-certificates.crt"],
+        "test_services": [],
+        "run_spec": {
+            "env": { "PATH": "/usr/bin:/bin" },
+            "workdir": "/workspace",
+            "user": "root",
+            "entrypoint": ["/bin/sh"],
+            "resources": {
+                "vcpus": 2,
+                "memory_mib": 2048,
+                "disk_mib": 32768,
+                "wall_time_s": 3600
+            }
+        },
+        "sealcheck_report_digest": "sha256:9123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "dispositions": []
     });
     fs::write(
         sealed_world.join("world_manifest.json"),
@@ -279,6 +298,7 @@ fn create_test_world(temp: &Path, t_clock_str: &str) -> (PathBuf, PathBuf) {
 
     let run_dir = temp.join("run");
     fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
     for name in ["firecracker", "kernel", "rootfs"] {
         let p = temp.join(name);
@@ -796,4 +816,99 @@ fn test_nonexistent_vm_fails_closed() {
     };
     let err = infra.finish_grader(grader_handle, &dl).unwrap_err();
     assert!(matches!(err, InfraError::VmNotFound { .. }));
+}
+
+#[test]
+fn test_agentvm_spec_matches_manifest_resource_configuration() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    // Rewrite world_manifest.json with 4 vCPUs and 8192 MiB memory
+    let manifest_path = sealed_world.join("world_manifest.json");
+    let mut manifest_val: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest_val["run_spec"]["resources"]["vcpus"] = serde_json::json!(4);
+    manifest_val["run_spec"]["resources"]["memory_mib"] = serde_json::json!(8192);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest_val).unwrap(),
+    )
+    .unwrap();
+
+    let captured_resources = Arc::new(std::sync::Mutex::new(None));
+    let captured_clone = captured_resources.clone();
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_runner_factory(move |spec| {
+        if spec.role == hermetic_vmm::spec::Role::Agent {
+            *captured_clone.lock().unwrap() = Some((spec.vcpus, spec.memory_mib));
+        }
+        Ok(Box::new(FakeRunner::new(spec.role)))
+    });
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("step", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+    let net = infra.start_netvm(&prepared, &dl).unwrap();
+    let _agent = infra.start_agentvm(&prepared, &net, &dl).unwrap();
+
+    // VmSpec resources received by runner must match manifest (4 vCPUs, 8192 MiB)
+    assert_eq!(*captured_resources.lock().unwrap(), Some((4u8, 8192u32)));
+
+    // vm-config.json descriptor must also record 4 vCPUs and 8192 MiB
+    let vm_cfg_bytes = fs::read(run_dir.join("vm-config.json")).unwrap();
+    let vm_cfg: serde_json::Value = serde_json::from_slice(&vm_cfg_bytes).unwrap();
+    assert_eq!(vm_cfg["vcpus"], 4);
+    assert_eq!(vm_cfg["mem_size_mib"], 8192);
+}
+
+#[test]
+fn test_prepare_world_bounds_manifest_read() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let manifest_path = sealed_world.join("world_manifest.json");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&manifest_path)
+        .unwrap();
+    file.set_len(hermetic_vmm::vmm_infra::MAX_MANIFEST_BYTES as u64 + 1024)
+        .unwrap();
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir,
+        None,
+    );
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("step", 5000);
+    let err = infra.prepare_world(&spec, &dl).unwrap_err();
+    match err {
+        InfraError::BackendFailure { step, detail } => {
+            assert_eq!(step, Step::PrepareWorld);
+            assert!(
+                detail.contains("world_manifest.json exceeds size cap"),
+                "got: {detail}"
+            );
+        }
+        other => panic!("expected BackendError, got {other:?}"),
+    }
 }

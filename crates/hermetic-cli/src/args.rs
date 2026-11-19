@@ -148,6 +148,8 @@ pub struct RawSealArgs {
     pub t_clock: String,
     pub world_id: String,
     pub seal_level: SealLevel,
+    pub packages_record: Option<String>,
+    pub substrate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +208,10 @@ pub struct SealRequest {
     pub t_clock: String,
     pub world_id: String,
     pub seal_level: SealLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages_record: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substrate: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +706,8 @@ where
                     ("--t-clock", FlagSpec::Value),
                     ("--world-id", FlagSpec::Value),
                     ("--seal-level", FlagSpec::Value),
+                    ("--packages-record", FlagSpec::Value),
+                    ("--substrate", FlagSpec::Value),
                 ],
             )?;
             reject_any_positionals(SubcommandKind::Seal, &parsed)?;
@@ -718,12 +726,16 @@ where
                 })?,
                 None => SealLevel::Strict,
             };
+            let packages_record = take_value_flag(&parsed, "--packages-record");
+            let substrate = take_value_flag(&parsed, "--substrate");
             Ok(RawCommand::Seal(RawSealArgs {
                 src,
                 out,
                 t_clock,
                 world_id,
                 seal_level,
+                packages_record,
+                substrate,
             }))
         }
         SubcommandKind::VerifyBundle => {
@@ -880,12 +892,22 @@ pub fn validate_command(raw: RawCommand) -> Result<ValidatedCommand, ValidationE
             let out = validate_path("--out", &args.out)?;
             validate_rfc3339_utc(&args.t_clock)?;
             validate_world_id(&args.world_id)?;
+            let packages_record = match args.packages_record {
+                Some(p) => Some(validate_path("--packages-record", &p)?),
+                None => None,
+            };
+            let substrate = match args.substrate {
+                Some(p) => Some(validate_path("--substrate", &p)?),
+                None => None,
+            };
             Ok(ValidatedCommand::Seal(SealRequest {
                 src,
                 out,
                 t_clock: args.t_clock,
                 world_id: args.world_id,
                 seal_level: args.seal_level,
+                packages_record,
+                substrate,
             }))
         }
         RawCommand::VerifyBundle(args) => {

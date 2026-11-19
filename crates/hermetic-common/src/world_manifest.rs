@@ -179,6 +179,11 @@ pub struct WorldManifest {
     pub cutoffs: ManifestCutoffs,
 
     // Content
+    /// Repository tree digest.
+    ///
+    /// Under the chosen scheme, `repo_tree_digest` represents the Git object ID of
+    /// the tree at `base_commit` in the sealed Git store (e.g. `sha1:<40 hex>`,
+    /// `git:<40 or 64 hex>`, or `sha256:<64 hex>`), or a `blake3:<64 hex>` Merkle tree.
     pub repo_tree_digest: String,
     pub rootfs_digest: String,
     pub packages: PackagesRecord,
@@ -373,6 +378,44 @@ fn parse_hash_32(hash: &str) -> Result<[u8; 32], WorldManifestError> {
     parse_digest_64(hex_part)
 }
 
+fn validate_repo_tree_digest(name: &str, s: &str, errors: &mut Vec<String>) {
+    let (algo, hex_part) = if let Some(stripped) = s.strip_prefix("blake3:") {
+        ("blake3", stripped)
+    } else if let Some(stripped) = s.strip_prefix("sha256:") {
+        ("sha256", stripped)
+    } else if let Some(stripped) = s.strip_prefix("git:") {
+        ("git", stripped)
+    } else if let Some(stripped) = s.strip_prefix("sha1:") {
+        ("sha1", stripped)
+    } else {
+        errors.push(format!(
+            "Digest '{name}' must start with 'blake3:', 'sha256:', 'git:', or 'sha1:', got '{s}'"
+        ));
+        return;
+    };
+
+    let expected_len = match algo {
+        "blake3" | "sha256" => hex_part.len() == 64,
+        "sha1" => hex_part.len() == 40,
+        "git" => hex_part.len() == 40 || hex_part.len() == 64,
+        _ => false,
+    };
+
+    if !expected_len {
+        errors.push(format!(
+            "Digest '{name}' hex portion has invalid length for algorithm '{algo}', got {}",
+            hex_part.len()
+        ));
+    } else if !hex_part
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        errors.push(format!(
+            "Digest '{name}' hex portion must be lowercase hex characters, got '{hex_part}'"
+        ));
+    }
+}
+
 fn validate_digest(name: &str, s: &str, errors: &mut Vec<String>) {
     let hex_part = if let Some(stripped) = s.strip_prefix("blake3:") {
         stripped
@@ -519,7 +562,7 @@ impl WorldManifest {
         }
 
         // 3. Content
-        validate_digest("repo_tree_digest", &self.repo_tree_digest, &mut errors);
+        validate_repo_tree_digest("repo_tree_digest", &self.repo_tree_digest, &mut errors);
         validate_digest("rootfs_digest", &self.rootfs_digest, &mut errors);
         validate_digest("closure_root", &self.packages.closure_root, &mut errors);
         validate_digest("baseline_root", &self.packages.baseline_root, &mut errors);

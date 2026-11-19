@@ -139,6 +139,18 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     // 1. Strict component-by-component no-follow check on world directory
     verify_dir_no_symlinks(&req.world)?;
 
+    // If bundle.manifest.json is present, verify that the bundle matches its recorded root
+    let bundle_manifest = req.world.join(hermetic_bundle::MANIFEST_FILENAME);
+    if bundle_manifest.exists() {
+        let report = hermetic_bundle::verify(&req.world, None)
+            .map_err(|e| BackendError::ProblemFound(format!("bundle verification failed: {e}")))?;
+        if report.verdict != hermetic_bundle::Verdict::Ok || !report.manifest_root_matches {
+            return Err(BackendError::ProblemFound(
+                "sealed world bundle root verification failed: bundle does not match".to_string(),
+            ));
+        }
+    }
+
     // Signing key and upstream key files: 0600, no symlinks, regular files
     if let Some(kp) = key_path {
         verify_secret_file_no_symlinks(kp)?;
@@ -171,43 +183,6 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     // 4. Drive the state machine with deterministic RAII teardown
     let cleanup_log = CleanupLog::new();
     let summary = hermetic_run::run_evaluation_with_log(infra, clock, &config, &cleanup_log);
-
-    // 5. Ensure world_manifest.json is present in run_dir if available in world directory
-    let src_manifest = req.world.join("world_manifest.json");
-    let dest_manifest = run_dir.join("world_manifest.json");
-    if src_manifest.exists() && !dest_manifest.exists() {
-        if let Ok(bytes) = hermetic_attest::safe_read_file(&src_manifest, MAX_MANIFEST_BYTES) {
-            let mut manifest_val: serde_json::Value =
-                serde_json::from_slice(&bytes).unwrap_or_default();
-            // If bundle.manifest.json exists in req.world, sync world_root and world_version to bundle root
-            let bundle_manifest = req.world.join("bundle.manifest.json");
-            if bundle_manifest.exists() {
-                if let Ok(b_bytes) =
-                    hermetic_attest::safe_read_file(&bundle_manifest, MAX_MANIFEST_BYTES)
-                {
-                    if let Ok(b_val) = serde_json::from_slice::<serde_json::Value>(&b_bytes) {
-                        if let Some(root_str) = b_val.get("root").and_then(|r| r.as_str()) {
-                            if let Some(obj) = manifest_val.as_object_mut() {
-                                obj.insert(
-                                    "world_root".to_string(),
-                                    serde_json::Value::from(root_str),
-                                );
-                                obj.insert(
-                                    "world_version".to_string(),
-                                    serde_json::Value::from(root_str),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            if let Ok(updated_bytes) = serde_json::to_vec_pretty(&manifest_val) {
-                let _ = hermetic_attest::safe_atomic_write_file(&dest_manifest, &updated_bytes);
-            } else {
-                let _ = hermetic_attest::safe_atomic_write_file(&dest_manifest, &bytes);
-            }
-        }
-    }
 
     // Every attestation input must come from the run itself; nothing is defaulted here.
 
@@ -424,10 +399,22 @@ pub fn run_with_real_infra(req: RunRequest) -> Result<Outcome, BackendError> {
             .key
             .clone()
             .or_else(|| std::env::var_os("HERMETIC_SIGNING_KEY").map(std::path::PathBuf::from));
+        let run_agent_mode = match req.agent_mode {
+            AgentMode::H => hermetic_run::infra::AgentMode::HarnessDriven {
+                commands: Vec::new(),
+            },
+            AgentMode::G => hermetic_run::infra::AgentMode::GuestAutonomous {
+                entrypoint: req
+                    .entrypoint
+                    .clone()
+                    .unwrap_or_else(|| "/opt/agent/run".to_string()),
+            },
+        };
         let mut infra = hermetic_vmm::vmm_infra::VmmInfra::from_env_with_run_dir(run_dir.clone())
             .map_err(|e| {
-            BackendError::Internal(format!("failed to initialize VMM infrastructure: {e}"))
-        })?;
+                BackendError::Internal(format!("failed to initialize VMM infrastructure: {e}"))
+            })?
+            .with_agent_mode(run_agent_mode);
         let clock = SystemClock;
         return execute_run_flow(&mut infra, &clock, &req, &run_dir, key_path.as_deref());
     }

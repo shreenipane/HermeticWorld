@@ -125,6 +125,8 @@ fn happy_path_seal_default_and_explicit_level() {
             t_clock: "2026-03-15T12:00:00Z".to_string(),
             world_id: "bench-world-01".to_string(),
             seal_level: SealLevel::Strict,
+            packages_record: None,
+            substrate: None,
         })]
     );
 
@@ -155,6 +157,8 @@ fn happy_path_seal_default_and_explicit_level() {
             t_clock: "2026-03-15T12:00:00.250Z".to_string(),
             world_id: "w1".to_string(),
             seal_level: SealLevel::RepoOnly,
+            packages_record: None,
+            substrate: None,
         })]
     );
 }
@@ -380,6 +384,8 @@ fn flag_equals_value_form_supported_everywhere() {
             t_clock: "2026-01-01T00:00:00Z".to_string(),
             world_id: "world-eq".to_string(),
             seal_level: SealLevel::RepoOnly,
+            packages_record: None,
+            substrate: None,
         })]
     );
 }

@@ -121,3 +121,32 @@ smoke_main
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode != 0
         assert not record.exists(), 'invalid selection must fail before building'
+
+
+def test_cli_run_smoke_builds_trust_and_exports_hermetic_trust_bin(tmp_path):
+    script = ROOT / 'scripts/integration/cli-run-smoke.sh'
+    content = script.read_text()
+    assert '-p hermetic-trust' in content
+    assert 'HERMETIC_TRUST_BIN' in content
+    work = tmp_path / 'work'
+    work.mkdir()
+    record = tmp_path / 'record'
+    body = '''
+cargo() { printf 'cargo %s\\n' "$*" >> "$RECORD"; }
+install() { printf 'install %s\\n' "$*" >> "$RECORD"; }
+mkdir() { :; }
+cat() { :; }
+chmod() { :; }
+readlink() { printf '%s' "$1"; }
+export -f cargo install readlink
+eval "$(sed -n '/# 2\\. Build release/,/export HERMETIC_TRUST_BIN/p' "$SCRIPT")"
+printf 'TRUST_BIN=%s\\n' "$HERMETIC_TRUST_BIN" >> "$RECORD"
+'''
+    env = dict(os.environ, SCRIPT=str(script), RECORD=str(record), WORK=str(work),
+               HOME=str(tmp_path / 'home'), top=str(ROOT))
+    result = subprocess.run(['bash', '-c', body], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    calls = record.read_text().splitlines()
+    assert any('cargo build' in c and '-p hermetic-trust' in c for c in calls)
+    assert any('install -m 0700' in c and 'release/hermetic-trust' in c for c in calls)
+    assert any(c == f'TRUST_BIN={work}/trust' for c in calls)

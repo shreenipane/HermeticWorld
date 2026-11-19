@@ -1,0 +1,9 @@
+{
+  "records": [
+    {
+      "name": "example.com",
+      "a": ["10.9.0.1"],
+      "aaaa": []
+    }
+  ]
+}

@@ -136,6 +136,52 @@ pub fn verify_executable_file_no_symlinks(path: &Path) -> Result<(), BackendErro
     Ok(())
 }
 
+/// Verifies that a regular file exists, is regular, and contains no symlinks.
+pub fn verify_regular_file_no_symlinks(path: &Path) -> Result<(), BackendError> {
+    if path.as_os_str().is_empty() {
+        return Err(BackendError::Data("empty file path".to_string()));
+    }
+    let raw_parent = path.parent().unwrap_or(Path::new(""));
+    let parent = if raw_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        raw_parent
+    };
+    verify_dir_no_symlinks(parent)?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| BackendError::Data("path has no filename".to_string()))?;
+
+    let parent_fd = openat(
+        rustix::fs::CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| BackendError::Data("cannot open file parent directory".to_string()))?;
+
+    let st = statat(&parent_fd, filename, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
+        if e.raw_os_error() == rustix::io::Errno::NOENT.raw_os_error() {
+            BackendError::Io("file not found".to_string())
+        } else if e.raw_os_error() == rustix::io::Errno::LOOP.raw_os_error() {
+            BackendError::Data("refused file: symlink".to_string())
+        } else {
+            BackendError::Data("refused file".to_string())
+        }
+    })?;
+
+    let mode = st.st_mode & 0o170000;
+    if mode == 0o120000 {
+        return Err(BackendError::Data("refused file: symlink".to_string()));
+    }
+    if mode != 0o100000 {
+        return Err(BackendError::Data(
+            "refused file: not a regular file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Prepares the output directory with mode 0700, refusing symlinks and non-empty existing dirs.
 pub fn prepare_output_dir(path: &Path) -> Result<(), BackendError> {
     if path.as_os_str().is_empty() {
@@ -242,6 +288,25 @@ pub fn execute_seal(req: SealRequest) -> Result<Outcome, BackendError> {
         "--seal-level",
         req.seal_level.as_str(),
     ]);
+
+    if let Some(ref pkg_rec) = req.packages_record {
+        verify_regular_file_no_symlinks(pkg_rec)?;
+        cmd.args([
+            "--packages-record",
+            pkg_rec
+                .to_str()
+                .ok_or_else(|| BackendError::Data("non-utf8 packages_record path".to_string()))?,
+        ]);
+    }
+
+    if let Some(ref sub) = req.substrate {
+        verify_regular_file_no_symlinks(sub)?;
+        cmd.args([
+            "--substrate",
+            sub.to_str()
+                .ok_or_else(|| BackendError::Data("non-utf8 substrate path".to_string()))?,
+        ]);
+    }
 
     cmd.env_clear();
     cmd.env("PATH", "/usr/bin:/bin");

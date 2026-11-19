@@ -9,6 +9,8 @@ default = []
 dev-unjailed = []
 
 [dependencies]
+hermetic-attest = { path = "../hermetic-attest" }
+hermetic-bundle = { path = "../hermetic-bundle" }
 hermetic-common = { workspace = true }
 hermetic-extract = { path = "../hermetic-extract" }
 hermetic-grader-result = { path = "../hermetic-grader-result" }

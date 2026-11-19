@@ -52,6 +52,29 @@ fn test_ecosystems_smoke_script_present_and_executable() {
 }
 
 #[test]
+fn test_ecosystems_smoke_script_check_does_not_mutate_permissions() {
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("scripts/integration/ecosystems-smoke.sh");
+    let mode_before = std::fs::metadata(&script_path)
+        .unwrap()
+        .permissions()
+        .mode();
+    check_script_executable(&script_path);
+    let mode_after = std::fs::metadata(&script_path)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode_before, mode_after,
+        "script permissions must not be mutated"
+    );
+}
+
+#[test]
 fn test_ecosystems_smoke_script_permission_check_rejects_non_executable() {
     let temp = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
