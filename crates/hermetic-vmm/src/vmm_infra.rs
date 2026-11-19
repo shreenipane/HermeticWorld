@@ -38,11 +38,12 @@ use crate::spec::{
 };
 use crate::{deadline, remaining};
 use hermetic_attest::{
-    safe_atomic_write_file, safe_sha256_file, AgentMode as AttestAgentMode, Deployment, Digest,
-    GraderIsolation, SealLevel as AttestSealLevel, SubstrateAtT as AttestSubstrateAtT,
-    TaskClass as AttestTaskClass,
+    safe_atomic_write_file, safe_sha256_file_with_deadline, AgentMode as AttestAgentMode,
+    Deployment, Digest, FsError, GraderIsolation, SealLevel as AttestSealLevel,
+    SubstrateAtT as AttestSubstrateAtT, TaskClass as AttestTaskClass,
 };
 use hermetic_bundle::{Verdict as BundleVerdict, MANIFEST_FILENAME as BUNDLE_MANIFEST_FILENAME};
+use hermetic_common::hash::HashChain;
 use hermetic_common::world_manifest::{
     SealLevel as CommonSealLevel, SubstrateAtT as CommonSubstrateAtT, TaskClass as CommonTaskClass,
     WorldManifest,
@@ -70,7 +71,10 @@ pub struct VmmInfra {
     netvm_rootfs: Option<PathBuf>,
     run_dir: PathBuf,
     lock_file: Option<PathBuf>,
+    agent_volume: Option<PathBuf>,
     python_launcher: Option<PathBuf>,
+    /// Trusted ExtractorVM image (never the task rootfs).
+    extractor_image: Option<PathBuf>,
 
     // Extracted from world manifest during prepare_world
     sealed_world: Option<PathBuf>,
@@ -118,7 +122,9 @@ impl VmmInfra {
             netvm_rootfs,
             run_dir,
             lock_file,
+            agent_volume: None,
             python_launcher: None,
+            extractor_image: None,
             sealed_world: None,
             t_clock: DEFAULT_T_CLOCK,
             task_id: "unknown-task".to_string(),
@@ -154,15 +160,33 @@ impl VmmInfra {
             })?;
         let netvm = std::env::var_os("HERMETIC_NETVM_ROOTFS").map(PathBuf::from);
         let lock = std::env::var_os("HERMETIC_FIRECRACKER_LOCK").map(PathBuf::from);
+        let agent_volume = std::env::var_os("HERMETIC_AGENT_VOLUME").map(PathBuf::from);
 
-        Ok(Self::new(
+        let mut infra = Self::new(
             PathBuf::from(fc),
             PathBuf::from(kernel),
             PathBuf::from(rootfs),
             netvm,
             run_dir,
             lock,
-        ))
+        );
+        infra.agent_volume = agent_volume;
+        infra.extractor_image = std::env::var_os("HERMETIC_EXTRACTOR_IMAGE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        Ok(infra)
+    }
+
+    /// Sets the trusted ExtractorVM image.
+    pub fn with_extractor_image(mut self, image: PathBuf) -> Self {
+        self.extractor_image = Some(image);
+        self
+    }
+
+    /// Sets an explicit agent volume image path.
+    pub fn with_agent_volume(mut self, volume: PathBuf) -> Self {
+        self.agent_volume = Some(volume);
+        self
     }
 
     /// Injects a custom runner factory for offline tests.
@@ -204,8 +228,13 @@ impl VmmInfra {
         step: Step,
         deadline_spec: &NamedDeadline,
     ) -> Result<Instant, InfraError> {
-        // Step deadline is checked against standard timeout duration
-        let timeout = Duration::from_millis(deadline_spec.deadline_ms.max(100));
+        if deadline_spec.deadline_ms == 0 {
+            return Err(InfraError::DeadlineExceeded {
+                step,
+                deadline_name: deadline_spec.name.clone(),
+            });
+        }
+        let timeout = Duration::from_millis(deadline_spec.deadline_ms);
         deadline(timeout).map_err(|_| InfraError::DeadlineExceeded {
             step,
             deadline_name: deadline_spec.name.clone(),
@@ -256,10 +285,18 @@ impl VmmInfra {
         #[cfg(not(feature = "dev-unjailed"))]
         {
             if rustix::process::geteuid().is_root() {
+                // The launcher is opened without following symlinks, and
+                // /usr/bin/python3 is usually a symlink: HERMETIC_PYTHON names the
+                // real interpreter file.
                 let py = self
                     .python_launcher
                     .as_ref()
                     .map(|p| p.display().to_string())
+                    .or_else(|| {
+                        std::env::var("HERMETIC_PYTHON")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    })
                     .unwrap_or_else(|| "/usr/bin/python3".to_string());
                 let runner = crate::runner::JailerRunner::new(&py).map_err(|e| {
                     InfraError::BackendFailure {
@@ -287,10 +324,148 @@ impl VmmInfra {
             gid_start: 200000,
             count: 16,
             firecracker: self.fc_bin.display().to_string(),
-            jailer: "/bin/jailer".into(),
+            // The jailer must be the one built with the pinned Firecracker: take
+            // HERMETIC_JAILER_BIN, else the `jailer` next to the Firecracker binary.
+            // (A fixed /bin/jailer fails the no-symlink walk where /bin -> usr/bin.)
+            jailer: std::env::var("HERMETIC_JAILER_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    self.fc_bin
+                        .parent()
+                        .map(|d| d.join("jailer").display().to_string())
+                        .unwrap_or_else(|| "/usr/bin/jailer".to_string())
+                }),
             netns: "isolated-0".into(),
         }
     }
+
+    fn finish_harness_artifacts(
+        &self,
+        chain: Option<&HashChain>,
+        bytes_scanned: u64,
+    ) -> Result<(), InfraError> {
+        if let Some(ch) = chain {
+            let manifest_path = self.run_dir.join("world_manifest.json");
+            if manifest_path.exists() {
+                let bytes = fs::read(&manifest_path).map_err(|e| InfraError::BackendFailure {
+                    step: Step::RunAgent,
+                    detail: format!("failed to read world_manifest.json: {e}"),
+                })?;
+                let mut doc = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+                    InfraError::BackendFailure {
+                        step: Step::RunAgent,
+                        detail: format!("failed to parse world_manifest.json: {e}"),
+                    }
+                })?;
+                doc["harness_command_log_head"] =
+                    serde_json::json!(format!("sha256:{}", ch.head_hex()));
+                let out_bytes =
+                    serde_json::to_vec_pretty(&doc).map_err(|e| InfraError::BackendFailure {
+                        step: Step::RunAgent,
+                        detail: format!("failed to serialize world_manifest.json: {e}"),
+                    })?;
+                hermetic_attest::safe_atomic_write_file(&manifest_path, &out_bytes).map_err(
+                    |e| InfraError::BackendFailure {
+                        step: Step::RunAgent,
+                        detail: format!("failed to write world_manifest.json: {e}"),
+                    },
+                )?;
+            }
+        }
+
+        // Sentinel summaries: if no scanner produced them, mark as incomplete.
+        // An incomplete scan must be treated as a potential leak.
+        let harness_summary_path = self.run_dir.join("harness_summary.json");
+        if !harness_summary_path.exists() {
+            let summary = serde_json::json!({
+                "date_leak_observed": false,
+                "scan_incomplete": true,
+                "hits": {},
+                "incomplete": {},
+                "bytes_scanned": bytes_scanned,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&summary) {
+                let _ = hermetic_attest::safe_atomic_write_file(&harness_summary_path, &bytes);
+            }
+        }
+
+        let date_sentinel_path = self.run_dir.join("date_sentinel.json");
+        if !date_sentinel_path.exists() {
+            let summary = serde_json::json!({
+                "date_leak_observed": false,
+                "scan_incomplete": true,
+                "hits": {},
+                "incomplete": {},
+                "bytes_scanned": 0,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&summary) {
+                let _ = hermetic_attest::safe_atomic_write_file(&date_sentinel_path, &bytes);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes bounded guest console (stdout) and Firecracker stderr to run_dir
+    /// with mode 0600 on failure before teardown.
+    /// Never included in the signed record.
+    pub fn write_failure_console_logs(&self, runner: &dyn Runner) {
+        let (stdout, stderr) = runner.console_output();
+        let max_bytes = crate::runner::MAX_CAPTURE_BYTES;
+        let stdout_bounded = if stdout.len() > max_bytes {
+            &stdout[..max_bytes]
+        } else {
+            &stdout[..]
+        };
+        let stderr_bounded = if stderr.len() > max_bytes {
+            &stderr[..max_bytes]
+        } else {
+            &stderr[..]
+        };
+
+        let console_path = self.run_dir.join("guest_console.log");
+        let stderr_path = self.run_dir.join("firecracker_stderr.log");
+
+        let _ = hermetic_attest::safe_atomic_write_file(&console_path, stdout_bounded);
+        let _ = hermetic_attest::safe_atomic_write_file(&stderr_path, stderr_bounded);
+    }
+
+    pub fn write_active_vm_failure_logs(&self, vm_id: &VmId) {
+        if let Some(active) = self.active_vms.get(vm_id) {
+            if let Some(ref vmm) = active.vmm {
+                self.write_failure_console_logs(vmm.runner().as_ref());
+            }
+        }
+    }
+}
+
+fn hash_file_deadline(
+    path: &std::path::Path,
+    max_bytes: usize,
+    end: Instant,
+    step: Step,
+    deadline_name: &str,
+    context: &str,
+) -> Result<String, InfraError> {
+    if Instant::now() >= end {
+        return Err(InfraError::DeadlineExceeded {
+            step,
+            deadline_name: deadline_name.to_string(),
+        });
+    }
+    safe_sha256_file_with_deadline(path, max_bytes, Some(end)).map_err(|e| match e {
+        FsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut => {
+            InfraError::DeadlineExceeded {
+                step,
+                deadline_name: deadline_name.to_string(),
+            }
+        }
+        other => InfraError::BackendFailure {
+            step,
+            detail: format!("failed to compute {context} digest: {other}"),
+        },
+    })
 }
 
 impl Infra for VmmInfra {
@@ -300,7 +475,7 @@ impl Infra for VmmInfra {
         deadline_spec: &NamedDeadline,
     ) -> Result<PreparedWorld, InfraError> {
         let step = Step::PrepareWorld;
-        let _end = self.check_step_deadline(step, deadline_spec)?;
+        let end = self.check_step_deadline(step, deadline_spec)?;
 
         let sealed_path = PathBuf::from(&world.cutoff_seal);
         let meta = fs::symlink_metadata(&sealed_path).map_err(|e| InfraError::BackendFailure {
@@ -443,6 +618,11 @@ impl Infra for VmmInfra {
                     step,
                     detail: format!("failed to set agent overlay len: {e}"),
                 })?;
+            drop(file);
+            // execd mounts the overlay as ext4 at boot, so it must hold an empty
+            // filesystem. Deterministic UUID, hash seed and timestamps (T_clock) so
+            // the image carries no host time or randomness into the guest.
+            format_empty_overlay(&overlay_path, self.t_clock, step)?;
         }
 
         // 6. Prepare CPU template file in run_dir matching embedded clock-3b template
@@ -486,36 +666,33 @@ impl Infra for VmmInfra {
                 }
             })?;
         let vm_config_path = self.run_dir.join("vm-config.json");
-        if !vm_config_path.exists() {
-            let vm_cfg = serde_json::json!({
-                "cpu_template": "cpu-template.json",
-                "vcpus": self.agent_vcpus,
-                "mem_size_mib": self.agent_memory_mib,
-                "disk_mib": canonical.run_spec.resources.disk_mib,
-            });
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&vm_config_path)
-                .map_err(|e| InfraError::BackendFailure {
-                    step,
-                    detail: format!("failed to create vm-config.json: {e}"),
-                })?;
-            file.write_all(serde_json::to_string_pretty(&vm_cfg).unwrap().as_bytes())
-                .map_err(|e| InfraError::BackendFailure {
-                    step,
-                    detail: format!("failed to write vm-config.json: {e}"),
-                })?;
-        }
+        let vm_cfg = serde_json::json!({
+            "cpu_template": "cpu-template.json",
+            "vcpus": self.agent_vcpus,
+            "mem_size_mib": self.agent_memory_mib,
+            "disk_mib": canonical.run_spec.resources.disk_mib,
+        });
+        let vm_cfg_bytes =
+            serde_json::to_vec_pretty(&vm_cfg).map_err(|e| InfraError::BackendFailure {
+                step,
+                detail: format!("failed to serialize vm-config.json: {e}"),
+            })?;
+        safe_atomic_write_file(&vm_config_path, &vm_cfg_bytes).map_err(|e| {
+            InfraError::BackendFailure {
+                step,
+                detail: format!("failed to write vm-config.json: {e}"),
+            }
+        })?;
 
         // 8. Compute deployment digests from actual files the run uses (never read from sealed manifest):
-        let task_rootfs_hex = safe_sha256_file(&self.rootfs_image, 64 * 1024 * 1024 * 1024)
-            .map_err(|e| InfraError::BackendFailure {
-                step,
-                detail: format!("failed to compute task_rootfs digest: {e}"),
-            })?;
+        let task_rootfs_hex = hash_file_deadline(
+            &self.rootfs_image,
+            64 * 1024 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "task_rootfs",
+        )?;
         let task_rootfs_digest =
             Digest::parse(&format!("sha256:{task_rootfs_hex}")).map_err(|e| {
                 InfraError::BackendFailure {
@@ -524,13 +701,14 @@ impl Infra for VmmInfra {
                 }
             })?;
 
-        let guest_kernel_hex =
-            safe_sha256_file(&self.kernel_image, 1024 * 1024 * 1024).map_err(|e| {
-                InfraError::BackendFailure {
-                    step,
-                    detail: format!("failed to compute guest_kernel digest: {e}"),
-                }
-            })?;
+        let guest_kernel_hex = hash_file_deadline(
+            &self.kernel_image,
+            1024 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "guest_kernel",
+        )?;
         let guest_kernel_digest =
             Digest::parse(&format!("sha256:{guest_kernel_hex}")).map_err(|e| {
                 InfraError::BackendFailure {
@@ -540,12 +718,14 @@ impl Infra for VmmInfra {
             })?;
 
         let netvm_image_digest = if let Some(ref netvm) = self.netvm_rootfs {
-            let hex = safe_sha256_file(netvm, 64 * 1024 * 1024 * 1024).map_err(|e| {
-                InfraError::BackendFailure {
-                    step,
-                    detail: format!("failed to compute netvm digest: {e}"),
-                }
-            })?;
+            let hex = hash_file_deadline(
+                netvm,
+                64 * 1024 * 1024 * 1024,
+                end,
+                step,
+                &deadline_spec.name,
+                "netvm",
+            )?;
             Digest::parse(&format!("sha256:{hex}")).map_err(|e| InfraError::BackendFailure {
                 step,
                 detail: format!("invalid netvm digest: {e}"),
@@ -561,12 +741,14 @@ impl Infra for VmmInfra {
         } else {
             self.fc_bin.clone()
         };
-        let fc_build_hex = safe_sha256_file(&fc_build_path, 256 * 1024 * 1024).map_err(|e| {
-            InfraError::BackendFailure {
-                step,
-                detail: format!("failed to compute firecracker_build digest: {e}"),
-            }
-        })?;
+        let fc_build_hex = hash_file_deadline(
+            &fc_build_path,
+            256 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "firecracker_build",
+        )?;
         let firecracker_build_digest =
             Digest::parse(&format!("sha256:{fc_build_hex}")).map_err(|e| {
                 InfraError::BackendFailure {
@@ -575,12 +757,14 @@ impl Infra for VmmInfra {
                 }
             })?;
 
-        let cpu_template_hex = safe_sha256_file(&template_path, 16 * 1024 * 1024).map_err(|e| {
-            InfraError::BackendFailure {
-                step,
-                detail: format!("failed to compute cpu_template digest: {e}"),
-            }
-        })?;
+        let cpu_template_hex = hash_file_deadline(
+            &template_path,
+            16 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "cpu_template",
+        )?;
         let cpu_template_digest =
             Digest::parse(&format!("sha256:{cpu_template_hex}")).map_err(|e| {
                 InfraError::BackendFailure {
@@ -589,12 +773,14 @@ impl Infra for VmmInfra {
                 }
             })?;
 
-        let vm_config_hex = safe_sha256_file(&vm_config_path, 16 * 1024 * 1024).map_err(|e| {
-            InfraError::BackendFailure {
-                step,
-                detail: format!("failed to compute vm_config digest: {e}"),
-            }
-        })?;
+        let vm_config_hex = hash_file_deadline(
+            &vm_config_path,
+            16 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "vm_config",
+        )?;
         let vm_config_digest = Digest::parse(&format!("sha256:{vm_config_hex}")).map_err(|e| {
             InfraError::BackendFailure {
                 step,
@@ -602,13 +788,23 @@ impl Infra for VmmInfra {
             }
         })?;
 
-        let agent_volume_hex =
-            safe_sha256_file(&overlay_path, 1024 * 1024 * 1024).map_err(|e| {
-                InfraError::BackendFailure {
-                    step,
-                    detail: format!("failed to compute agent_volume digest: {e}"),
-                }
-            })?;
+        let av_path = self.agent_volume.clone().or_else(|| {
+            let candidate = self.run_dir.join("agent_volume.img");
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        });
+        let agent_volume_target = av_path.as_deref().unwrap_or(&overlay_path);
+        let agent_volume_hex = hash_file_deadline(
+            agent_volume_target,
+            1024 * 1024 * 1024,
+            end,
+            step,
+            &deadline_spec.name,
+            "agent_volume",
+        )?;
         let agent_volume_digest =
             Digest::parse(&format!("sha256:{agent_volume_hex}")).map_err(|e| {
                 InfraError::BackendFailure {
@@ -688,7 +884,16 @@ impl Infra for VmmInfra {
             world_server_log_head: Digest::from_sha256(&[]),
             dedupe_index_digest: Digest::from_sha256(&[]),
             request_count: 0,
-            harness_command_log_head: None,
+            harness_command_log_head: if agent_mode == AttestAgentMode::H {
+                Some(
+                    Digest::parse(
+                        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            },
             gateway_log_head: None,
             history_rewrite_count: None,
             gateway_adapter_version: None,
@@ -700,6 +905,13 @@ impl Infra for VmmInfra {
                 step,
                 detail: format!("failed to serialize WorldManifestArtifact: {e}"),
             })?;
+
+        if Instant::now() >= end {
+            return Err(InfraError::DeadlineExceeded {
+                step,
+                deadline_name: deadline_spec.name.clone(),
+            });
+        }
 
         safe_atomic_write_file(
             &self.run_dir.join("world_manifest.json"),
@@ -748,6 +960,31 @@ impl Infra for VmmInfra {
 
         let vm_id = "agent-vm-0";
         let overlay_path = self.run_dir.join("agent_overlay.img");
+        let av_path = self.agent_volume.clone().or_else(|| {
+            let candidate = self.run_dir.join("agent_volume.img");
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        });
+        let mut boot_args = format!(
+            "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda init=/sbin/hermetic-init clocksource=tsc tsc=reliable hermetic.t={} ro",
+            self.t_clock
+        );
+        let mut drives = vec![Drive {
+            id: "overlay".into(),
+            path: overlay_path.display().to_string(),
+            read_only: false,
+        }];
+        if let Some(ref av) = av_path {
+            drives.push(Drive {
+                id: "agent".into(),
+                path: av.display().to_string(),
+                read_only: true,
+            });
+            boot_args.push_str(" hermetic.agent_volume=/dev/vdc");
+        }
         let spec = VmSpec {
             id: vm_id.into(),
             role: Role::Agent,
@@ -756,20 +993,13 @@ impl Infra for VmmInfra {
             memory_mib: self.agent_memory_mib,
             kernel_image: self.kernel_image.display().to_string(),
             initrd: None,
-            boot_args: format!(
-                "console=ttyS0 reboot=k panic=-1 pci=off root=/dev/vda init=/sbin/hermetic-init clocksource=tsc tsc=reliable hermetic.t={} ro",
-                self.t_clock
-            ),
+            boot_args,
             root_drive: Drive {
                 id: "rootfs".into(),
                 path: self.rootfs_image.display().to_string(),
                 read_only: true,
             },
-            drives: vec![Drive {
-                id: "overlay".into(),
-                path: overlay_path.display().to_string(),
-                read_only: false,
-            }],
+            drives,
             reserved_drives: vec![],
             vsock: Some(Vsock {
                 guest_cid: 3,
@@ -801,23 +1031,29 @@ impl Infra for VmmInfra {
         })?;
         let mut v = Vmm::new(validated, runner);
         let prep_timeout = remaining(end, "prepare").unwrap_or(Duration::from_secs(10));
-        v.prepare(prep_timeout)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.prepare(prep_timeout) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("agent VMM prepare failed: {e}"),
-            })?;
+            });
+        }
         let start_timeout = remaining(end, "start").unwrap_or(Duration::from_secs(5));
-        v.start(start_timeout)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.start(start_timeout) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("agent VMM start failed: {e}"),
-            })?;
+            });
+        }
         let ready_timeout = remaining(end, "wait-ready").unwrap_or(Duration::from_secs(5));
-        v.wait_ready(ready_timeout)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.wait_ready(ready_timeout) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("agent VMM wait_ready failed: {e}"),
-            })?;
+            });
+        }
 
         // Determine vsock address for in-process or child communication
         let vsock_path = {
@@ -873,7 +1109,13 @@ impl Infra for VmmInfra {
         deadline_spec: &NamedDeadline,
     ) -> Result<(), InfraError> {
         let step = Step::WaitAgentReady;
-        let end = self.check_step_deadline(step, deadline_spec)?;
+        let end = match self.check_step_deadline(step, deadline_spec) {
+            Ok(end) => end,
+            Err(e) => {
+                self.write_active_vm_failure_logs(&agent_vm.id);
+                return Err(e);
+            }
+        };
 
         let vm = self
             .active_vms
@@ -891,6 +1133,7 @@ impl Infra for VmmInfra {
         if let Some(ref sock) = vm.vsock_path {
             loop {
                 if Instant::now() >= end {
+                    self.write_active_vm_failure_logs(&agent_vm.id);
                     return Err(InfraError::DeadlineExceeded {
                         step,
                         deadline_name: deadline_spec.name.clone(),
@@ -899,6 +1142,7 @@ impl Infra for VmmInfra {
                 match crate::exec_client::check_status(sock, self.t_clock, end) {
                     Ok(_) => return Ok(()),
                     Err(crate::Error::Deadline(_)) => {
+                        self.write_active_vm_failure_logs(&agent_vm.id);
                         return Err(InfraError::DeadlineExceeded {
                             step,
                             deadline_name: deadline_spec.name.clone(),
@@ -921,7 +1165,13 @@ impl Infra for VmmInfra {
         deadline_spec: &NamedDeadline,
     ) -> Result<AgentOutcome, InfraError> {
         let step = Step::RunAgent;
-        let end = self.check_step_deadline(step, deadline_spec)?;
+        let end = match self.check_step_deadline(step, deadline_spec) {
+            Ok(end) => end,
+            Err(e) => {
+                self.write_active_vm_failure_logs(&agent_vm.id);
+                return Err(e);
+            }
+        };
 
         let vm = self
             .active_vms
@@ -936,26 +1186,72 @@ impl Infra for VmmInfra {
             });
         }
 
+        let mut total_output_bytes: u64 = 0;
+        let mut chain = HashChain::new();
+
         if let Some(ref sock) = vm.vsock_path {
+            let probe_path = self.run_dir.join("probe_output.jsonl");
+            if !probe_path.exists() {
+                let probe_argv = vec!["/sbin/hermetic-clockprobe".to_string()];
+                // The probe must not consume the agent's deadline: bound the host
+                // wait to the guest-side timeout plus a margin.
+                let probe_end = Instant::now()
+                    .checked_add(Duration::from_secs(40))
+                    .map_or(end, |t| t.min(end));
+                let probe = crate::exec_client::exec(sock, &probe_argv, false, 30_000, probe_end);
+                if let Err(ref e) = probe {
+                    eprintln!("hermetic-vmm: clock probe exec failed: {e}");
+                }
+                if let Ok(probe_res) = probe {
+                    if !probe_res.output.is_empty() {
+                        let _ =
+                            hermetic_attest::safe_atomic_write_file(&probe_path, &probe_res.output);
+                    }
+                }
+            }
+
             match mode {
                 AgentMode::HarnessDriven { commands } => {
-                    if commands.is_empty() {
-                        return Ok(AgentOutcome::Completed { exit_code: 0 });
-                    }
-                    for cmd in commands {
+                    let cmds = if commands.is_empty() {
+                        vec!["/bin/sh /opt/agent/run".to_string()]
+                    } else {
+                        commands.clone()
+                    };
+                    for cmd in &cmds {
                         if Instant::now() >= end {
+                            self.write_active_vm_failure_logs(&agent_vm.id);
                             return Err(InfraError::DeadlineExceeded {
                                 step,
                                 deadline_name: deadline_spec.name.clone(),
                             });
                         }
                         let argv = vec!["/bin/sh".to_string(), "-c".to_string(), cmd.clone()];
-                        let res = crate::exec_client::exec(sock, &argv, false, 30_000, end)
-                            .map_err(|e| InfraError::BackendFailure {
-                                step,
-                                detail: format!("exec command failed: {e}"),
-                            })?;
+                        let res = match crate::exec_client::exec(sock, &argv, false, 300_000, end) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                self.write_active_vm_failure_logs(&agent_vm.id);
+                                return Err(InfraError::BackendFailure {
+                                    step,
+                                    detail: format!("exec command failed: {e}"),
+                                });
+                            }
+                        };
+                        if res.timed_out || res.code != Some(0) {
+                            let tail = &res.output[res.output.len().saturating_sub(4096)..];
+                            eprintln!(
+                                "hermetic-vmm: agent command exit={:?} timed_out={} output tail:\n{}",
+                                res.code,
+                                res.timed_out,
+                                String::from_utf8_lossy(tail)
+                            );
+                        }
+                        chain.append(cmd.as_bytes());
+                        total_output_bytes =
+                            total_output_bytes.saturating_add(res.output.len() as u64);
+
                         if res.timed_out {
+                            self.write_active_vm_failure_logs(&agent_vm.id);
+                            self.finish_harness_artifacts(Some(&chain), total_output_bytes)?;
                             return Ok(AgentOutcome::LimitExceeded {
                                 kind: LimitKind::Quota,
                                 detail: format!("command '{cmd}' timed out"),
@@ -963,21 +1259,30 @@ impl Infra for VmmInfra {
                         }
                         if let Some(code) = res.code {
                             if code != 0 {
+                                self.finish_harness_artifacts(Some(&chain), total_output_bytes)?;
                                 return Ok(AgentOutcome::Completed { exit_code: code });
                             }
                         }
                     }
+                    self.finish_harness_artifacts(Some(&chain), total_output_bytes)?;
                     Ok(AgentOutcome::Completed { exit_code: 0 })
                 }
                 AgentMode::GuestAutonomous { entrypoint } => {
                     let argv = vec![entrypoint.clone()];
-                    let res = crate::exec_client::exec(sock, &argv, false, 300_000, end).map_err(
-                        |e| InfraError::BackendFailure {
-                            step,
-                            detail: format!("entrypoint exec failed: {e}"),
-                        },
-                    )?;
+                    let res = match crate::exec_client::exec(sock, &argv, false, 300_000, end) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            self.write_active_vm_failure_logs(&agent_vm.id);
+                            return Err(InfraError::BackendFailure {
+                                step,
+                                detail: format!("entrypoint exec failed: {e}"),
+                            });
+                        }
+                    };
+                    total_output_bytes = total_output_bytes.saturating_add(res.output.len() as u64);
+                    self.finish_harness_artifacts(None, total_output_bytes)?;
                     if res.timed_out {
+                        self.write_active_vm_failure_logs(&agent_vm.id);
                         return Ok(AgentOutcome::LimitExceeded {
                             kind: LimitKind::Quota,
                             detail: "agent entrypoint timed out".to_string(),
@@ -989,6 +1294,14 @@ impl Infra for VmmInfra {
                 }
             }
         } else {
+            if let AgentMode::HarnessDriven { commands } = mode {
+                for cmd in commands {
+                    chain.append(cmd.as_bytes());
+                }
+                self.finish_harness_artifacts(Some(&chain), 0)?;
+            } else {
+                self.finish_harness_artifacts(None, 0)?;
+            }
             Ok(AgentOutcome::Completed { exit_code: 0 })
         }
     }
@@ -999,7 +1312,13 @@ impl Infra for VmmInfra {
         deadline_spec: &NamedDeadline,
     ) -> Result<ShutdownKind, InfraError> {
         let step = Step::ShutdownAgent;
-        let end = self.check_step_deadline(step, deadline_spec)?;
+        let end = match self.check_step_deadline(step, deadline_spec) {
+            Ok(end) => end,
+            Err(e) => {
+                self.write_active_vm_failure_logs(&agent_vm.id);
+                return Err(e);
+            }
+        };
 
         let vm = self
             .active_vms
@@ -1027,6 +1346,10 @@ impl Infra for VmmInfra {
             }
         }
 
+        if !clean {
+            self.write_active_vm_failure_logs(&agent_vm.id);
+        }
+
         Ok(if clean {
             ShutdownKind::Clean
         } else {
@@ -1048,7 +1371,37 @@ impl Infra for VmmInfra {
 
         if let Some(mut active) = self.active_vms.remove(&vm.id) {
             if let Some(ref mut vmm) = active.vmm {
+                // The jail holds the VM's own copy of each drive; the agent's
+                // writes live in the jail's overlay copy. Take it back before the
+                // jail is destroyed so extraction reads what the agent produced.
+                let mut saved = Ok(());
+                if vm.kind == VmKind::Agent {
+                    saved = match vmm.jail() {
+                        Some(jail) => {
+                            let src = jail.root.descriptor_path("drive-overlay");
+                            let dst = self.run_dir.join("agent_overlay.img");
+                            fs::copy(&src, &dst).map(|_| ()).map_err(|e| {
+                                InfraError::BackendFailure {
+                                    step,
+                                    detail: format!(
+                                        "saving the agent overlay from the jail failed: {e}"
+                                    ),
+                                }
+                            })
+                        }
+                        None => Err(InfraError::BackendFailure {
+                            step,
+                            detail: "agent VM has no jail to save the overlay from".to_string(),
+                        }),
+                    };
+                }
                 let _ = vmm.destroy(Duration::from_secs(5));
+                saved?;
+            } else if vm.kind == VmKind::Agent {
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: "agent VM is not running: no overlay to save".to_string(),
+                });
             }
         }
 
@@ -1124,10 +1477,21 @@ impl Infra for VmmInfra {
             })?
             .class_kind();
 
+        // The ExtractorVM boots its own trusted image (hermetic-extract-init and the
+        // extract agent), never the task rootfs the agent could have shaped.
+        let extractor_image = self
+            .extractor_image
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .ok_or_else(|| InfraError::BackendFailure {
+                step,
+                detail: "HERMETIC_EXTRACTOR_IMAGE is not set: no trusted extractor image"
+                    .to_string(),
+            })?;
         let config = ExtractorVmConfig {
             vm_id: vm_id.into(),
             index: 0,
-            extractor_image: self.rootfs_image.display().to_string(),
+            extractor_image,
             kernel_image: self.kernel_image.display().to_string(),
             base_drive: self.rootfs_image.display().to_string(),
             overlay_cow_drive: overlay_cow.display().to_string(),
@@ -1153,30 +1517,58 @@ impl Infra for VmmInfra {
         })?;
         let mut vmm = Vmm::new(validated, runner);
         let prep_time = remaining(end, "prepare").unwrap_or(Duration::from_secs(10));
-        vmm.prepare(prep_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = vmm.prepare(prep_time) {
+            self.write_failure_console_logs(vmm.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("extractor VMM prepare failed: {e}"),
-            })?;
+            });
+        }
         let start_time = remaining(end, "start").unwrap_or(Duration::from_secs(5));
-        vmm.start(start_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = vmm.start(start_time) {
+            self.write_failure_console_logs(vmm.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("extractor VMM start failed: {e}"),
-            })?;
+            });
+        }
         let ready_time = remaining(end, "wait-ready").unwrap_or(Duration::from_secs(5));
-        vmm.wait_ready(ready_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = vmm.wait_ready(ready_time) {
+            self.write_failure_console_logs(vmm.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("extractor VMM wait_ready failed: {e}"),
-            })?;
+            });
+        }
         let exit_time = remaining(end, "wait-exit").unwrap_or(Duration::from_secs(60));
-        vmm.wait_exit(exit_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = vmm.wait_exit(exit_time) {
+            self.write_failure_console_logs(vmm.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("extractor VMM wait_exit failed: {e}"),
-            })?;
-        let _ = vmm.destroy(Duration::from_secs(5));
+            });
+        }
+
+        // The extractor wrote to the jail's copy of the output drive; read that
+        // copy back over the host file before parsing it.
+        match vmm.jail() {
+            Some(jail) => {
+                let src = jail.root.descriptor_path("drive-output");
+                if let Err(e) = fs::copy(&src, &output_drive) {
+                    let _ = vmm.destroy(Duration::from_secs(5));
+                    return Err(InfraError::BackendFailure {
+                        step,
+                        detail: format!("reading the extractor output from the jail failed: {e}"),
+                    });
+                }
+            }
+            None => {
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: "extractor VM has no jail to read its output from".to_string(),
+                });
+            }
+        }
 
         // 5. Parse output drive using read_extractor_output
         let base_dir = self.run_dir.join("extracted_base");
@@ -1187,18 +1579,25 @@ impl Infra for VmmInfra {
         let extract_cfg = hermetic_extract::config::ExtractConfig::default();
 
         // If the output drive does not exist or fails closed, report specific failure
-        let outcome = read_extractor_output(
+        let outcome = match read_extractor_output(
             &output_drive,
             &nonce,
             &base_dir,
             &out_dir,
             host_class,
             &extract_cfg,
-        )
-        .map_err(|e| InfraError::BackendFailure {
-            step,
-            detail: format!("read_extractor_output failed: {e:?}"),
-        })?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.write_failure_console_logs(vmm.runner().as_ref());
+                let _ = vmm.destroy(Duration::from_secs(5));
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: format!("read_extractor_output failed: {e:?}"),
+                });
+            }
+        };
+        let _ = vmm.destroy(Duration::from_secs(5));
 
         // If submitted_work.patch was generated in out_dir, move/copy it to run_dir
         let patch_candidate = out_dir.join("submitted_work.patch");
@@ -1310,23 +1709,29 @@ impl Infra for VmmInfra {
         })?;
         let mut v = Vmm::new(validated, runner);
         let prep_time = remaining(end, "prepare").unwrap_or(Duration::from_secs(10));
-        v.prepare(prep_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.prepare(prep_time) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("grader VMM prepare failed: {e}"),
-            })?;
+            });
+        }
         let start_time = remaining(end, "start").unwrap_or(Duration::from_secs(5));
-        v.start(start_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.start(start_time) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("grader VMM start failed: {e}"),
-            })?;
+            });
+        }
         let ready_time = remaining(end, "wait-ready").unwrap_or(Duration::from_secs(5));
-        v.wait_ready(ready_time)
-            .map_err(|e| InfraError::BackendFailure {
+        if let Err(e) = v.wait_ready(ready_time) {
+            self.write_failure_console_logs(v.runner().as_ref());
+            return Err(InfraError::BackendFailure {
                 step,
                 detail: format!("grader VMM wait_ready failed: {e}"),
-            })?;
+            });
+        }
         let vmm = Some(v);
 
         let handle = GraderHandle {
@@ -1364,12 +1769,35 @@ impl Infra for VmmInfra {
 
         if let Some(ref mut vmm) = vm.vmm {
             let wait_time = remaining(end, "wait-exit").unwrap_or(Duration::from_secs(60));
-            vmm.wait_exit(wait_time)
-                .map_err(|e| InfraError::BackendFailure {
+            if let Err(e) = vmm.wait_exit(wait_time) {
+                self.write_failure_console_logs(vmm.runner().as_ref());
+                let _ = vmm.destroy(Duration::from_secs(5));
+                return Err(InfraError::BackendFailure {
                     step,
                     detail: format!("grader VMM wait_exit failed: {e}"),
-                })?;
+                });
+            }
+            // The supervisor wrote the jail's copy of the result drive; take it back
+            // over the host file before the jail is destroyed.
+            let saved = match (vmm.jail(), vm.result_disk.as_ref()) {
+                (Some(jail), Some(dst)) => {
+                    let src = jail
+                        .root
+                        .descriptor_path(&format!("drive-{GRADER_RESULT_DRIVE}"));
+                    fs::copy(&src, dst)
+                        .map(|_| ())
+                        .map_err(|e| InfraError::BackendFailure {
+                            step,
+                            detail: format!("reading the grader result from the jail failed: {e}"),
+                        })
+                }
+                _ => Err(InfraError::BackendFailure {
+                    step,
+                    detail: "grader VM has no jail or result disk to read".to_string(),
+                }),
+            };
             let _ = vmm.destroy(Duration::from_secs(5));
+            saved?;
         }
 
         let result_disk_path = vm.result_disk.ok_or_else(|| InfraError::BackendFailure {
@@ -1565,5 +1993,67 @@ impl Infra for VmmInfra {
             payload,
             tamper_evidence,
         })
+    }
+}
+
+/// Format `path` as an empty ext4 filesystem with deterministic parameters.
+fn format_empty_overlay(
+    path: &std::path::Path,
+    t_clock: i64,
+    step: Step,
+) -> Result<(), InfraError> {
+    let mut child = std::process::Command::new("/usr/sbin/mke2fs")
+        .args([
+            "-q",
+            "-t",
+            "ext4",
+            "-F",
+            "-U",
+            "00000000-0000-0000-0000-000000000001",
+            "-E",
+            "hash_seed=00000000-0000-0000-0000-000000000002,lazy_itable_init=0,lazy_journal_init=0",
+        ])
+        .arg(path)
+        .env_clear()
+        .env("SOURCE_DATE_EPOCH", t_clock.to_string())
+        .env("E2FSPROGS_FAKE_TIME", t_clock.to_string())
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| InfraError::BackendFailure {
+            step,
+            detail: format!("failed to start mke2fs for the agent overlay: {e}"),
+        })?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: format!("mke2fs failed for the agent overlay: {status}"),
+                })
+            }
+            Ok(None) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: "mke2fs deadline exceeded for the agent overlay".to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(InfraError::BackendFailure {
+                    step,
+                    detail: format!("waiting for mke2fs failed: {e}"),
+                })
+            }
+        }
     }
 }

@@ -37,7 +37,10 @@ pub use dsse::{
     IN_TOTO_STATEMENT_V1_TYPE, MAX_ENVELOPE_JSON_BYTES, MAX_PAYLOAD_BYTES, MAX_SIGNATURES,
     PREDICATE_TYPE_AUDIT_V1, PREDICATE_TYPE_RUN_V1,
 };
-pub use fs::{safe_atomic_write_file, safe_read_file, safe_sha256_file, FsError};
+pub use fs::{
+    safe_atomic_write_file, safe_read_file, safe_sha256_file, safe_sha256_file_with_deadline,
+    FsError,
+};
 pub use run::{
     AgentMode, ArtifactDigestSize, BootRecord, ClockLevel, Deployment, GraderIsolation,
     GradingRunResult, HostBootRecord, ProbeResult, RunRecord, RunStatus, RunValidationError,

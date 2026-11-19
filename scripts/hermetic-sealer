@@ -70,24 +70,53 @@ def find_sealcheck_bin(work_dir: Path | None = None) -> Path | None:
     return None
 
 
-def find_hermetic_trust_bin(work_dir: Path | None = None) -> Path | None:
-    override = os.environ.get("HERMETIC_TRUST_BIN")
+def is_static_elf(path: Path) -> bool:
+    """True for a 64-bit little-endian ELF executable with no PT_INTERP segment."""
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(64)
+        if len(head) < 64 or head[:4] != b"\x7fELF" or head[4] != 2 or head[5] != 1:
+            return False
+        phoff, = struct.unpack_from("<Q", head, 32)
+        phentsize, phnum = struct.unpack_from("<HH", head, 54)
+        if phentsize < 4 or phnum > 512:
+            return False
+        f.seek(phoff)
+        table = f.read(phentsize * phnum)
+        if len(table) != phentsize * phnum:
+            return False
+        for i in range(phnum):
+            p_type, = struct.unpack_from("<I", table, i * phentsize)
+            if p_type == 3:  # PT_INTERP: needs a dynamic loader
+                return False
+    return True
+
+
+def find_hermetic_tool_bin(name: str, work_dir: Path | None = None) -> Path | None:
+    tool_name = name
+    if tool_name.startswith("hermetic-"):
+        tool_name = tool_name[len("hermetic-"):]
+    env_var = "HERMETIC_" + tool_name.upper().replace("-", "_") + "_BIN"
+    override = os.environ.get(env_var)
     candidates = []
     if override:
         candidates.append(Path(override))
     if os.environ.get("CARGO_TARGET_DIR"):
         target = Path(os.environ["CARGO_TARGET_DIR"])
-        candidates.append(target / "x86_64-unknown-linux-gnu" / "release" / "hermetic-trust")
-        candidates.append(target / "release" / "hermetic-trust")
-        candidates.append(target / "debug" / "hermetic-trust")
+        candidates.append(target / "x86_64-unknown-linux-gnu" / "release" / name)
+        candidates.append(target / "release" / name)
+        candidates.append(target / "debug" / name)
     cargo_target_base = Path(os.environ.get("CARGO_TARGET_BASE") or (Path.home() / "hermetic" / "cargo-target"))
     if cargo_target_base.is_dir():
         for d in cargo_target_base.glob("world-seal*"):
-            candidates.append(d / "release" / "hermetic-trust")
-            candidates.append(d / "debug" / "hermetic-trust")
-    candidates.append(TOP / "target" / "release" / "hermetic-trust")
-    candidates.append(TOP / "target" / "debug" / "hermetic-trust")
-    which = shutil.which("hermetic-trust")
+            candidates.append(d / "release" / name)
+            candidates.append(d / "debug" / name)
+        for d in cargo_target_base.glob("honest-run*"):
+            candidates.append(d / "release" / name)
+            candidates.append(d / "debug" / name)
+    candidates.append(TOP / "target" / "release" / name)
+    candidates.append(TOP / "target" / "debug" / name)
+    which = shutil.which(name)
     if which:
         candidates.append(Path(which))
     for cand in candidates:
@@ -95,13 +124,17 @@ def find_hermetic_trust_bin(work_dir: Path | None = None) -> Path | None:
         if cand.is_file() and os.access(cand, os.X_OK):
             st = cand.stat()
             if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and work_dir is not None:
-                staged = work_dir / "trust_safe"
+                staged = work_dir / f"{name}_safe"
                 if not staged.exists():
                     shutil.copy2(cand, staged)
                     os.chmod(staged, 0o700)
                 return staged
             return cand
     return None
+
+
+def find_hermetic_trust_bin(work_dir: Path | None = None) -> Path | None:
+    return find_hermetic_tool_bin("hermetic-trust", work_dir)
 
 
 def mint_and_install_ca(
@@ -201,8 +234,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         args = parser.parse_args(argv)
-    except SystemExit:
-        return 65
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) and e.code == 0 else 65
 
     # 1. Enforce seal-level contract
     if args.seal_level != "repo_only":
@@ -240,6 +273,15 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"packages-record missing required field: {req_field}\n")
             return 65
 
+    closure_root = packages_record["closure_root"]
+    if not (
+        (closure_root.startswith("blake3:") or closure_root.startswith("sha256:"))
+        and len(closure_root.split(":", 1)[1]) == 64
+        and all(c in "0123456789abcdef" for c in closure_root.split(":", 1)[1])
+    ):
+        sys.stderr.write(f"packages-record closure_root is not a valid digest: {closure_root}\n")
+        return 65
+
     # 3. Enforce substrate contract
     if args.substrate is None:
         sys.stderr.write("missing required input: --substrate\n")
@@ -258,7 +300,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("substrate JSON must be an object\n")
         return 65
 
-    raw_substrate = sub_data.get("substrate", [])
+    # A substrate request asks the sealer to take the D5b inventory of the rootfs it
+    # stages itself (the image actually shipped), instead of a precomputed file.
+    scan_staged_rootfs = sub_data.get("schema") == "hermetic-sealer-substrate-request/v1"
+    if scan_staged_rootfs:
+        if set(sub_data) - {"schema", "allow_empty"} or not isinstance(sub_data.get("allow_empty", False), bool):
+            sys.stderr.write("substrate request accepts only 'schema' and boolean 'allow_empty'\n")
+            return 65
+        scan_allow_empty = sub_data.get("allow_empty", False)
+    raw_substrate = [] if scan_staged_rootfs else sub_data.get("substrate", [])
     substrate_entries = []
     if isinstance(raw_substrate, list):
         for entry in raw_substrate:
@@ -297,7 +347,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Discover and load run_spec
     run_spec_path = None
-    if args.run_spec and args.run_spec.is_file():
+    if args.run_spec is not None:
+        if not args.run_spec.is_file():
+            sys.stderr.write(f"run-spec file not found: {args.run_spec}\n")
+            return 65
         run_spec_path = args.run_spec
     else:
         candidates = [
@@ -338,7 +391,12 @@ def main(argv: list[str] | None = None) -> int:
 
     env_raw = run_spec_data.get("env")
     if isinstance(env_raw, list):
-        env = {str(k): str(v) for k, v in env_raw}
+        env = {}
+        for entry in env_raw:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                sys.stderr.write("invalid run_spec: env list entries must be key-value pairs\n")
+                return 65
+            env[str(entry[0])] = str(entry[1])
     elif isinstance(env_raw, dict):
         env = {str(k): str(v) for k, v in env_raw.items()}
     else:
@@ -372,13 +430,26 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("invalid run_spec: missing resources\n")
         return 65
 
-    vcpus = int(resources_raw.get("vcpus", 0))
-    memory_mib = int(resources_raw.get("memory_mib", 0))
-    disk_mib = int(resources_raw.get("disk_mib", 0))
+    for field in ("vcpus", "memory_mib", "disk_mib", "wall_time_s"):
+        val = resources_raw.get(field)
+        if field == "wall_time_s" and field not in resources_raw:
+            continue
+        if val is None or isinstance(val, bool):
+            sys.stderr.write(f"invalid run_spec: resource '{field}' is missing or malformed\n")
+            return 65
+        try:
+            int_val = int(val)
+        except (ValueError, TypeError):
+            sys.stderr.write(f"invalid run_spec: resource '{field}' must be an integer\n")
+            return 65
+        if int_val <= 0:
+            sys.stderr.write(f"invalid run_spec: resource '{field}' must be greater than zero\n")
+            return 65
+
+    vcpus = int(resources_raw["vcpus"])
+    memory_mib = int(resources_raw["memory_mib"])
+    disk_mib = int(resources_raw["disk_mib"])
     wall_time_s = int(resources_raw.get("wall_time_s", 1800))
-    if vcpus <= 0 or memory_mib <= 0 or disk_mib <= 0 or wall_time_s <= 0:
-        sys.stderr.write("invalid run_spec: resources values must be greater than zero\n")
-        return 65
 
     run_spec = {
         "env": env,
@@ -395,7 +466,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # 6. Discover and load dns_table
     dns_table_path = None
-    if args.dns_table and args.dns_table.is_file():
+    if args.dns_table is not None:
+        if not args.dns_table.is_file():
+            sys.stderr.write(f"dns-table file not found: {args.dns_table}\n")
+            return 65
         dns_table_path = args.dns_table
     else:
         candidates = [
@@ -470,10 +544,12 @@ def main(argv: list[str] | None = None) -> int:
             for item in args.src.iterdir():
                 if item.name == ".git":
                     continue
-                if item.is_dir():
+                if item.is_symlink():
+                    shutil.copy2(item, temp_repo / item.name, follow_symlinks=False)
+                elif item.is_dir():
                     shutil.copytree(item, temp_repo / item.name, symlinks=True)
                 else:
-                    shutil.copy2(item, temp_repo / item.name)
+                    shutil.copy2(item, temp_repo / item.name, follow_symlinks=False)
             run_git(["init", "-b", "main"], cwd=temp_repo)
             run_git(["config", "user.name", "Hermetic Sealer"], cwd=temp_repo)
             run_git(["config", "user.email", "sealer@hermetic.world"], cwd=temp_repo)
@@ -522,8 +598,59 @@ def main(argv: list[str] | None = None) -> int:
         staging_rootfs = work_dir / "staging_rootfs"
         staging_rootfs.mkdir(parents=True, exist_ok=True)
 
-        for d in ("bin", "sbin", "usr/bin", "usr/sbin", "etc/ssl/certs", "tmp", "var/tmp", "proc", "sys", "dev", "home"):
+        # Mount points execd uses at boot (base, overlay, new root, agent volume)
+        # and the pseudo filesystems it mounts after switching root.
+        for d in ("bin", "sbin", "usr/bin", "usr/sbin", "etc/ssl/certs", "etc/hermetic", "tmp", "var/tmp",
+                  "proc", "sys", "dev", "dev/pts", "dev/shm", "run", "home",
+                  "mnt/hermetic-base", "mnt/hermetic-overlay", "mnt/hermetic-root", "opt/agent"):
             (staging_rootfs / d).mkdir(parents=True, exist_ok=True)
+
+        # Guest binaries run as PID 1 and services inside a rootfs with no dynamic
+        # loader: take them only from HERMETIC_GUEST_BIN_DIR and require static ELF.
+        guest_dir = os.environ.get("HERMETIC_GUEST_BIN_DIR")
+        if not guest_dir:
+            sys.stderr.write("missing required input: HERMETIC_GUEST_BIN_DIR (static guest binaries)\n")
+            return 65
+        for tool_name, rel_path in [
+            ("hermetic-init", "sbin/hermetic-init"),
+            ("hermetic-execd", "sbin/hermetic-execd"),
+            ("hermetic-clockprobe", "sbin/hermetic-clockprobe"),
+        ]:
+            tool_bin = Path(guest_dir) / tool_name
+            if tool_bin.is_symlink() or not tool_bin.is_file():
+                sys.stderr.write(f"guest binary missing or not a regular file: {tool_bin}\n")
+                return 65
+            if not is_static_elf(tool_bin):
+                sys.stderr.write(f"guest binary is not a static ELF executable: {tool_bin}\n")
+                return 65
+            dest = staging_rootfs / rel_path
+            shutil.copy2(tool_bin, dest)
+            os.chmod(dest, 0o755)
+
+        busybox_cand = shutil.which("busybox") or "/usr/bin/busybox"
+        if Path(busybox_cand).is_file():
+            # Reject dynamically linked busybox: guest rootfs has no interpreter/libs.
+            try:
+                file_out = subprocess.run(
+                    ["file", "-L", busybox_cand],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if file_out.returncode == 0 and "statically linked" not in file_out.stdout:
+                    sys.stderr.write(
+                        f"busybox binary is not statically linked: {busybox_cand}\n"
+                    )
+                    return 65
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                sys.stderr.write(
+                    f"cannot verify busybox binary is statically linked: {busybox_cand}\n"
+                )
+                return 65
+            dest = staging_rootfs / "bin" / "busybox"
+            shutil.copy2(busybox_cand, dest)
+            os.chmod(dest, 0o755)
+            sh_dest = staging_rootfs / "bin" / "sh"
+            shutil.copy2(busybox_cand, sh_dest)
+            os.chmod(sh_dest, 0o755)
 
         # Place repository files at workdir
         rel_workdir = Path(workdir.lstrip("/"))
@@ -540,10 +667,12 @@ def main(argv: list[str] | None = None) -> int:
         repo_dest.mkdir(parents=True, exist_ok=True)
         # Copy sealed repo files
         for item in sealed_git_store.iterdir():
-            if item.is_dir():
+            if item.is_symlink():
+                shutil.copy2(item, repo_dest / item.name, follow_symlinks=False)
+            elif item.is_dir():
                 shutil.copytree(item, repo_dest / item.name, symlinks=True)
             else:
-                shutil.copy2(item, repo_dest / item.name)
+                shutil.copy2(item, repo_dest / item.name, follow_symlinks=False)
 
         # Mint and install CA into staging rootfs
         world_ca_cert_sha256, trust_store_paths = mint_and_install_ca(
@@ -553,6 +682,55 @@ def main(argv: list[str] | None = None) -> int:
             staging_rootfs=staging_rootfs,
             work_dir=work_dir,
         )
+
+        # execd reads its guest run spec from /etc/hermetic/run-spec.json at boot.
+        # Derive it from the same validated run_spec the manifest records; only
+        # "root" or a numeric "uid[:gid]" user is accepted (no passwd lookup).
+        if user == "root":
+            g_uid, g_gid = 0, 0
+        elif re.fullmatch(r"[0-9]{1,9}(:[0-9]{1,9})?", user):
+            parts = user.split(":")
+            g_uid = int(parts[0]); g_gid = int(parts[1]) if len(parts) > 1 else g_uid
+        else:
+            sys.stderr.write(f"run_spec user must be 'root' or numeric uid[:gid] for the guest: {user}\n")
+            return 65
+        guest_spec = {
+            "env": env,
+            "workdir": workdir,
+            "uid": g_uid,
+            "gid": g_gid,
+            "entrypoint": entrypoint,
+            "command": [],
+            "hostname": "world",
+            # Name resolution goes through the NetVM, which the run configures;
+            # the sealed image carries no resolver address of its own.
+            "resolv_conf": "",
+            "resources": {
+                "vcpus": vcpus,
+                "memory_mib": memory_mib,
+                "disk_mib": disk_mib,
+                "wall_time_s": wall_time_s,
+            },
+        }
+        (staging_rootfs / "etc" / "hermetic").mkdir(parents=True, exist_ok=True)
+        spec_out = staging_rootfs / "etc" / "hermetic" / "run-spec.json"
+        spec_out.write_text(json.dumps(guest_spec, sort_keys=True, separators=(",", ":")) + "\n")
+        os.chmod(spec_out, 0o644)
+
+        if scan_staged_rootfs:
+            from hermetic_d5b.inventory import build_d5b_inventory
+            from hermetic_d5b.model import D5bError
+            try:
+                inv = build_d5b_inventory(
+                    staging_rootfs, t_clock_str, mode="repo_only", allow_empty=scan_allow_empty
+                )
+            except D5bError as e:
+                sys.stderr.write(f"D5b inventory of the staged rootfs failed: {e}\n")
+                return 65
+            substrate_entries = [
+                {k: str(e[k]) for k in ("name", "version", "digest", "date")} for e in inv["substrate"]
+            ]
+            substrate_at_t = inv["substrate_at_t"]
 
         # 9. Build rootfs with D4 guard
         sealcheck_bin = find_sealcheck_bin(work_dir)
@@ -599,14 +777,34 @@ def main(argv: list[str] | None = None) -> int:
             if not scan_proc.stdout:
                 sys.stderr.write("sealcheck scan failed: empty report output\n")
                 return 70
+            try:
+                rep_json = json.loads(scan_proc.stdout.decode("utf-8"))
+            except Exception as e:
+                sys.stderr.write(f"sealcheck scan report is not valid JSON: {e}\n")
+                return 70
+            if not isinstance(rep_json, dict):
+                sys.stderr.write("sealcheck scan report is not a JSON object\n")
+                return 70
+            is_pass = False
+            if rep_json.get("gate") is False:
+                is_pass = True
+            elif rep_json.get("verdict") == "pass":
+                is_pass = True
+            if not is_pass:
+                sys.stderr.write("sealcheck scan report missing or invalid pass verdict\n")
+                return 70
             report_bytes = scan_proc.stdout
 
         sealcheck_report_digest = f"sha256:{hashlib.sha256(report_bytes).hexdigest()}"
 
         # Copy sealed repo into out / "repo"
         out_repo = args.out / "repo"
-        if not out_repo.exists():
-            shutil.copytree(sealed_git_store, out_repo, symlinks=True)
+        if out_repo.exists() or out_repo.is_symlink():
+            if out_repo.is_dir() and not out_repo.is_symlink():
+                shutil.rmtree(out_repo)
+            else:
+                out_repo.unlink()
+        shutil.copytree(sealed_git_store, out_repo, symlinks=True)
 
         # 11. Write canonical world_manifest.json
         manifest = {
@@ -639,8 +837,12 @@ def main(argv: list[str] | None = None) -> int:
         manifest_json = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         manifest_dest = args.out / "world_manifest.json"
         tmp_dest = args.out / ".world_manifest.json.tmp"
-        tmp_dest.write_bytes(manifest_json)
-        os.replace(tmp_dest, manifest_dest)
+        try:
+            tmp_dest.write_bytes(manifest_json)
+            os.replace(tmp_dest, manifest_dest)
+        except OSError as e:
+            sys.stderr.write(f"failed to publish world_manifest.json: {e}\n")
+            return 74
 
         return 0
     finally:

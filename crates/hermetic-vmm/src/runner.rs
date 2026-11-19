@@ -29,6 +29,10 @@ pub trait Runner {
     fn request(&mut self, socket: &str, request: &ApiRequest, end: Instant) -> Result<()>;
     fn exited(&mut self, end: Instant) -> Result<bool>;
     fn kill(&mut self, end: Instant) -> Result<()>;
+    /// Bounded stdout (guest serial console) and stderr captures.
+    fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        (Vec::new(), Vec::new())
+    }
 }
 
 impl<R: Runner + ?Sized> Runner for Box<R> {
@@ -53,6 +57,9 @@ impl<R: Runner + ?Sized> Runner for Box<R> {
     fn kill(&mut self, end: Instant) -> Result<()> {
         (**self).kill(end)
     }
+    fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        (**self).console_output()
+    }
 }
 /// A pinned Python 3 interpreter used only for descriptor sanitation and exec.
 /// Its path obeys the same no-symlink, ownership and mode rules as images.
@@ -71,6 +78,7 @@ pub struct JailerRunner {
     process: Option<OwnedProcess>,
     namespace: Option<File>,
     launcher: Option<ExecLauncher>,
+    console: std::sync::Arc<std::sync::Mutex<CaptureData>>,
 }
 impl JailerRunner {
     pub fn new(python: &str) -> Result<Self> {
@@ -78,6 +86,19 @@ impl JailerRunner {
             launcher: Some(ExecLauncher::open(python)?),
             ..Self::default()
         })
+    }
+
+    /// Diagnostics: bounded stdout (serial) and stderr captures.
+    /// Retained after lifecycle failure cleanup kills and drops the process.
+    pub fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        let data = self.console.lock().unwrap_or_else(|e| e.into_inner());
+        (data.stdout.clone(), data.stderr.clone())
+    }
+
+    /// Diagnostics: serial console output (stdout).
+    pub fn serial(&self) -> Vec<u8> {
+        let data = self.console.lock().unwrap_or_else(|e| e.into_inner());
+        data.stdout.clone()
     }
 }
 impl Runner for JailerRunner {
@@ -121,7 +142,7 @@ impl Runner for JailerRunner {
             i += 1;
         }
         self.namespace = Some(namespace);
-        self.process = Some(OwnedProcess::spawn(
+        let process = OwnedProcess::spawn(
             binary,
             &args,
             spec,
@@ -129,7 +150,9 @@ impl Runner for JailerRunner {
                 .as_ref()
                 .ok_or(Error::Validation("configure pinned exec launcher"))?,
             end,
-        )?);
+        )?;
+        self.console = process.output._data.clone();
+        self.process = Some(process);
         Ok(())
     }
     fn request(&mut self, socket: &str, request: &ApiRequest, end: Instant) -> Result<()> {
@@ -147,6 +170,10 @@ impl Runner for JailerRunner {
         }
         self.process = None;
         Ok(())
+    }
+    fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        let data = self.console.lock().unwrap_or_else(|e| e.into_inner());
+        (data.stdout.clone(), data.stderr.clone())
     }
 }
 /// Production configuration has no selector for this runner.
@@ -227,6 +254,10 @@ impl Runner for DevUnjailed {
         }
         self.process = None;
         Ok(())
+    }
+    fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        let data = self.console.lock().unwrap_or_else(|e| e.into_inner());
+        (data.stdout.clone(), data.stderr.clone())
     }
 }
 #[cfg(feature = "dev-unjailed")]
@@ -751,5 +782,40 @@ mod tests {
         // Malformed public request bodies cannot panic during path rewriting.
         let request = ApiRequest::new("PUT", "/entropy", serde_json::json!(1));
         assert_eq!(development_request(&request, "/proc/123/fd/7/"), request);
+    }
+
+    #[test]
+    fn jailer_runner_console_output_bounded_and_retained() {
+        let mut runner = JailerRunner::default();
+        let (out, err) = runner.console_output();
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+
+        let capture_stdout = vec![b'x'; MAX_CAPTURE_BYTES];
+        let capture_stderr = vec![b'y'; MAX_CAPTURE_BYTES];
+
+        {
+            let mut data = runner.console.lock().unwrap();
+            data.stdout = capture_stdout.clone();
+            data.stderr = capture_stderr.clone();
+        }
+
+        let (out, err) = runner.console_output();
+        assert_eq!(out.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(err.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(runner.serial().len(), MAX_CAPTURE_BYTES);
+
+        // Retained after kill
+        let end = crate::deadline(Duration::from_secs(1)).unwrap();
+        runner.kill(end).unwrap();
+        let (out_after_kill, err_after_kill) = runner.console_output();
+        assert_eq!(out_after_kill.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(err_after_kill.len(), MAX_CAPTURE_BYTES);
+
+        // Box<dyn Runner> trait implementation
+        let runner_box: Box<dyn Runner> = Box::new(runner);
+        let (b_out, b_err) = runner_box.console_output();
+        assert_eq!(b_out.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(b_err.len(), MAX_CAPTURE_BYTES);
     }
 }

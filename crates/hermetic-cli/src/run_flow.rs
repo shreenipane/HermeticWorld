@@ -169,7 +169,11 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
     };
     let agent_mode = match req.agent_mode {
         AgentMode::H => RunAgentMode::HarnessDriven {
-            commands: Vec::new(),
+            commands: req
+                .entrypoint
+                .as_ref()
+                .map(|ep| vec![ep.clone()])
+                .unwrap_or_else(|| vec!["/bin/sh /opt/agent/run".to_string()]),
         },
         AgentMode::G => RunAgentMode::GuestAutonomous {
             entrypoint: req
@@ -261,6 +265,11 @@ pub fn execute_run_flow<I: Infra, C: Clock>(
             let _ = hermetic_attest::safe_atomic_write_file(&infra_err_path, &bytes);
         }
         eprintln!("infra failure at step '{step_name}': {error_kind}");
+        // The classified kind alone hides the cause; print the backend's reasons
+        // to stderr for the operator (they are not written into the run record).
+        for reason in &summary.reasons {
+            eprintln!("  reason: {reason}");
+        }
     }
 
     // 7. Terminal failures: sign a record of the failure when every attestation
@@ -401,7 +410,11 @@ pub fn run_with_real_infra(req: RunRequest) -> Result<Outcome, BackendError> {
             .or_else(|| std::env::var_os("HERMETIC_SIGNING_KEY").map(std::path::PathBuf::from));
         let run_agent_mode = match req.agent_mode {
             AgentMode::H => hermetic_run::infra::AgentMode::HarnessDriven {
-                commands: Vec::new(),
+                commands: req
+                    .entrypoint
+                    .as_ref()
+                    .map(|ep| vec![ep.clone()])
+                    .unwrap_or_else(|| vec!["/bin/sh /opt/agent/run".to_string()]),
             },
             AgentMode::G => hermetic_run::infra::AgentMode::GuestAutonomous {
                 entrypoint: req

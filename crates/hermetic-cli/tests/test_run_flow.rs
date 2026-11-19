@@ -153,6 +153,7 @@ struct MockInfra {
     skip_write_verdict: bool,
     mismatched_verdict_status: Option<String>,
     drop_artifact: Option<&'static str>,
+    captured_agent_mode: Option<RunAgentMode>,
 }
 
 impl MockInfra {
@@ -167,6 +168,7 @@ impl MockInfra {
             skip_write_verdict: false,
             mismatched_verdict_status: None,
             drop_artifact: None,
+            captured_agent_mode: None,
         }
     }
 
@@ -252,9 +254,10 @@ impl Infra for MockInfra {
     fn run_agent(
         &mut self,
         _agent_vm: &VmHandle,
-        _mode: &RunAgentMode,
+        mode: &RunAgentMode,
         _deadline: &NamedDeadline,
     ) -> Result<AgentOutcome, InfraError> {
+        self.captured_agent_mode = Some(mode.clone());
         self.check_step(Step::RunAgent)?;
         Ok(AgentOutcome::Completed { exit_code: 0 })
     }
@@ -1233,5 +1236,86 @@ fn test_run_flow_with_tampered_bundle_manifest_fails_closed() {
             );
         }
         other => panic!("expected BackendError::ProblemFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_run_flow_mode_h_default_and_custom_entrypoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let world_dir = temp.path().join("world");
+    fs::create_dir_all(&world_dir).unwrap();
+    fs::set_permissions(&world_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let dummy_file = world_dir.join("world_manifest.json");
+    fs::write(&dummy_file, b"{\"task_id\":\"fixture-task\"}").unwrap();
+    fs::set_permissions(&dummy_file, fs::Permissions::from_mode(0o644)).unwrap();
+    hermetic_bundle::seal(&world_dir).unwrap();
+
+    let run_dir = temp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (pkcs8, _signer, _verifier) = generate_test_key();
+    let key_file = temp.path().join("signing.key");
+    fs::write(&key_file, &pkcs8).unwrap();
+    fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // 1. Without entrypoint: defaults to ["/bin/sh /opt/agent/run"]
+    {
+        let clock = FakeClock::new(1000);
+        let mut infra = MockInfra::new(run_dir.clone());
+        let req = RunRequest {
+            world: world_dir.clone(),
+            task: "fixture-task".into(),
+            agent_mode: AgentMode::H,
+            clock: ClockMode::Faked,
+            json: false,
+            key: None,
+            out: None,
+            run_dir: None,
+            entrypoint: None,
+            model: None,
+            upstream_url: None,
+            upstream_key_file: None,
+        };
+
+        let outcome = execute_run_flow(&mut infra, &clock, &req, &run_dir, Some(&key_file))
+            .expect("must succeed");
+        assert!(outcome.ok);
+        assert_eq!(
+            infra.captured_agent_mode,
+            Some(RunAgentMode::HarnessDriven {
+                commands: vec!["/bin/sh /opt/agent/run".to_string()]
+            })
+        );
+    }
+
+    // 2. With entrypoint: uses custom entrypoint command
+    {
+        let clock = FakeClock::new(2000);
+        let mut infra = MockInfra::new(run_dir.clone());
+        let req = RunRequest {
+            world: world_dir,
+            task: "fixture-task".into(),
+            agent_mode: AgentMode::H,
+            clock: ClockMode::Faked,
+            json: false,
+            key: None,
+            out: None,
+            run_dir: None,
+            entrypoint: Some("python3 /testbed/custom_agent.py".to_string()),
+            model: None,
+            upstream_url: None,
+            upstream_key_file: None,
+        };
+
+        let outcome = execute_run_flow(&mut infra, &clock, &req, &run_dir, Some(&key_file))
+            .expect("must succeed");
+        assert!(outcome.ok);
+        assert_eq!(
+            infra.captured_agent_mode,
+            Some(RunAgentMode::HarnessDriven {
+                commands: vec!["python3 /testbed/custom_agent.py".to_string()]
+            })
+        );
     }
 }

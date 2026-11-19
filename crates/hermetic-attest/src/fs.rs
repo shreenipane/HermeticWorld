@@ -153,8 +153,12 @@ pub fn safe_read_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, FsError>
 }
 
 /// Compute SHA-256 hex digest of a regular file opened safely without following symlinks,
-/// reading in bounded chunks up to `max_bytes`.
-pub fn safe_sha256_file(path: &Path, max_bytes: usize) -> Result<String, FsError> {
+/// reading in bounded chunks up to `max_bytes`, optionally enforcing a deadline between reads.
+pub fn safe_sha256_file_with_deadline(
+    path: &Path,
+    max_bytes: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<String, FsError> {
     use sha2::{Digest, Sha256};
     let (parent, name) = open_parent(path)?;
     let leaf_path = child_path(&parent, name);
@@ -174,6 +178,14 @@ pub fn safe_sha256_file(path: &Path, max_bytes: usize) -> Result<String, FsError
     let mut buffer = [0u8; 64 * 1024];
     let mut total: usize = 0;
     loop {
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() >= dl {
+                return Err(FsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "deadline exceeded during safe_sha256_file",
+                )));
+            }
+        }
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -193,6 +205,12 @@ pub fn safe_sha256_file(path: &Path, max_bytes: usize) -> Result<String, FsError
         hasher.update(&buffer[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Compute SHA-256 hex digest of a regular file opened safely without following symlinks,
+/// reading in bounded chunks up to `max_bytes`.
+pub fn safe_sha256_file(path: &Path, max_bytes: usize) -> Result<String, FsError> {
+    safe_sha256_file_with_deadline(path, max_bytes, None)
 }
 
 fn read_with_hook(

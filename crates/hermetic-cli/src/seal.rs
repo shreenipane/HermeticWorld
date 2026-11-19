@@ -315,6 +315,11 @@ pub fn execute_seal(req: SealRequest) -> Result<Outcome, BackendError> {
     if let Some(sealcheck) = std::env::var_os("HERMETIC_SEALCHECK_BIN") {
         cmd.env("HERMETIC_SEALCHECK_BIN", sealcheck);
     }
+    // Directory of the static guest binaries (hermetic-init, hermetic-execd,
+    // hermetic-clockprobe) the sealer installs into the rootfs.
+    if let Some(dir) = std::env::var_os("HERMETIC_GUEST_BIN_DIR") {
+        cmd.env("HERMETIC_GUEST_BIN_DIR", dir);
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());

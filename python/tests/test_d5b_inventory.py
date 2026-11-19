@@ -614,3 +614,16 @@ def test_unpinned_metadata_does_not_overwrite_verified_version(tmp_path):
 
 
 
+
+
+def test_empty_rootfs_refused_unless_explicitly_allowed(tmp_path):
+    from hermetic_d5b.inventory import build_d5b_inventory
+    from hermetic_d5b.model import D5bError
+
+    (tmp_path / "bin").mkdir()
+    with pytest.raises(D5bError, match="empty_rootfs_inventory"):
+        build_d5b_inventory(tmp_path, "2020-01-01T00:00:00Z")
+    result = build_d5b_inventory(tmp_path, "2020-01-01T00:00:00Z", allow_empty=True)
+    # Nothing is claimed for a rootfs without package databases.
+    assert result["substrate"] == []
+    assert result["substrate_at_t"] == "none"

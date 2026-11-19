@@ -631,6 +631,16 @@ fn test_real_sealer_happy_path_end_to_end() {
     // Ensure executable permissions
     let _ = fs::set_permissions(&sealer_bin, fs::Permissions::from_mode(0o755));
 
+    // Static stand-in guest binaries (copies of the host's static busybox): the
+    // sealer only accepts static ELF guest binaries from HERMETIC_GUEST_BIN_DIR.
+    let guest_bins = temp.path().join("guest-bin");
+    fs::create_dir_all(&guest_bins).unwrap();
+    for name in ["hermetic-init", "hermetic-execd", "hermetic-clockprobe"] {
+        fs::copy("/usr/bin/busybox", guest_bins.join(name)).unwrap();
+    }
+    let original_guest = std::env::var_os("HERMETIC_GUEST_BIN_DIR");
+    std::env::set_var("HERMETIC_GUEST_BIN_DIR", &guest_bins);
+
     let original = std::env::var_os("HERMETIC_SEALER_BIN");
     std::env::set_var("HERMETIC_SEALER_BIN", &sealer_bin);
 
@@ -646,6 +656,10 @@ fn test_real_sealer_happy_path_end_to_end() {
 
     let res = hermetic_cli::seal::execute_seal(req);
 
+    match original_guest {
+        Some(val) => std::env::set_var("HERMETIC_GUEST_BIN_DIR", val),
+        None => std::env::remove_var("HERMETIC_GUEST_BIN_DIR"),
+    }
     if let Some(val) = original {
         std::env::set_var("HERMETIC_SEALER_BIN", val);
     } else {

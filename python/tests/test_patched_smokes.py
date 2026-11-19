@@ -132,13 +132,15 @@ def test_cli_run_smoke_builds_trust_and_exports_hermetic_trust_bin(tmp_path):
     work.mkdir()
     record = tmp_path / 'record'
     body = '''
+set -e
 cargo() { printf 'cargo %s\\n' "$*" >> "$RECORD"; }
 install() { printf 'install %s\\n' "$*" >> "$RECORD"; }
 mkdir() { :; }
 cat() { :; }
 chmod() { :; }
 readlink() { printf '%s' "$1"; }
-export -f cargo install readlink
+bash() { printf 'bash %s\\n' "$*" >> "$RECORD"; }
+export -f cargo install readlink bash
 eval "$(sed -n '/# 2\\. Build release/,/export HERMETIC_TRUST_BIN/p' "$SCRIPT")"
 printf 'TRUST_BIN=%s\\n' "$HERMETIC_TRUST_BIN" >> "$RECORD"
 '''
@@ -148,5 +150,71 @@ printf 'TRUST_BIN=%s\\n' "$HERMETIC_TRUST_BIN" >> "$RECORD"
     assert result.returncode == 0, result.stderr
     calls = record.read_text().splitlines()
     assert any('cargo build' in c and '-p hermetic-trust' in c for c in calls)
-    assert any('install -m 0700' in c and 'release/hermetic-trust' in c for c in calls)
+    assert any('install -m 0700' in c and 'release/hermetic-trust' in c and f'{work}/trust' in c for c in calls)
+    assert any('bash scripts/build-trusted-execd.sh' in c for c in calls)
     assert any(c == f'TRUST_BIN={work}/trust' for c in calls)
+
+
+def test_cli_run_smoke_eval_failure_terminates_shell(tmp_path):
+    work = tmp_path / 'work'
+    work.mkdir()
+    record = tmp_path / 'record'
+    script = ROOT / 'scripts/integration/cli-run-smoke.sh'
+    # Fail during cargo build inside the extracted fragment; ensure subsequent
+    # fragment commands (bash, install, export) and trailing printf do not run under errexit.
+    body = '''
+set -e
+cargo() { printf 'cargo failed\\n' >> "$RECORD"; return 1; }
+install() { printf 'install %s\\n' "$*" >> "$RECORD"; }
+mkdir() { :; }
+cat() { :; }
+chmod() { :; }
+readlink() { printf '%s' "$1"; }
+bash() { printf 'bash %s\\n' "$*" >> "$RECORD"; }
+export -f cargo install readlink bash
+eval "$(sed -n '/# 2\\. Build release/,/export HERMETIC_TRUST_BIN/p' "$SCRIPT")"
+printf 'UNREACHED\\n' >> "$RECORD"
+'''
+    env = dict(os.environ, SCRIPT=str(script), RECORD=str(record), WORK=str(work),
+               HOME=str(tmp_path / 'home'), top=str(ROOT))
+    result = subprocess.run(['bash', '-c', body], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    lines = record.read_text().splitlines()
+    assert 'cargo failed' in lines
+    assert 'UNREACHED' not in lines
+    assert not any('install' in line for line in lines)
+    assert not any('bash' in line for line in lines)
+
+
+def test_cli_run_smoke_structure_and_no_fabricated_artifacts():
+    script = ROOT / 'scripts/integration/cli-run-smoke.sh'
+    content = script.read_text()
+
+    # 1. No fabricated run artifacts written by smoke script before run
+    assert 'gold.patch" "$RUN_DIR/submitted_work.patch"' not in content
+    assert 'cat > "$RUN_DIR/date_sentinel.json"' not in content
+    assert 'cat > "$RUN_DIR/harness_summary.json"' not in content
+    assert 'cat > "$RUN_DIR/boot_record.json"' not in content
+    assert 'cat > "$RUN_DIR/probe_output.jsonl"' not in content
+
+    # 2. Uses HERMETIC_RUN_DIR directly
+    assert 'HERMETIC_RUN_DIR="$RUN_DIR"' in content
+
+    # 3. Real package record and substrate fixtures from existing components
+    assert 'from hermetic_pkgrec.freeze import freeze_world' in content
+    assert 'hermetic-sealer-substrate-request/v1' in content  # sealer inventories its own staged rootfs
+    assert '--packages-record "$PACKAGES_RECORD"' in content
+    assert '--substrate "$SUBSTRATE_FILE"' in content
+
+    # 4. Mode H fixture agent volume
+    assert 'from hermetic_slice.agent_volume import build_agent_volume_image' in content
+    assert 'export HERMETIC_AGENT_VOLUME=' in content
+    assert '--agent-mode H' in content
+
+    # 5. Asserts VM-produced evidence
+    assert '$CLI" verify' in content
+    assert 'submitted_work_digest' in content
+    assert 'agent_volume_digest' in content
+    assert 'probe_output.jsonl' in content
+    assert 'date_sentinel.json' in content
+

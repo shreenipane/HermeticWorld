@@ -140,7 +140,11 @@ impl<R: Runner> Vmm<R> {
                 self.state = State::Starting;
                 Ok(())
             }
-            Err(_) => Err(self.failure("start")),
+            Err(e) => {
+                // The step error is categorical; keep the cause visible to the operator.
+                eprintln!("hermetic-vmm: start failed: {e}");
+                Err(self.failure("start"))
+            }
         }
     }
     /// Wait for the API, configure devices, start vCPUs, then confirm Running.

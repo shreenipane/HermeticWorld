@@ -127,9 +127,15 @@ fn start_mock_vsock_server(
 struct FakeRunner {
     spec_role: hermetic_vmm::spec::Role,
     output_drive: Option<PathBuf>,
+    /// The jail's copy of the output drive, which a real ExtractorVM writes.
+    jail_output: Option<String>,
+    /// A forged result a compromised grader writes into its jail drive copy.
+    forged_result: Option<Vec<u8>>,
     result_disk: Option<PathBuf>,
     nonce: [u8; 32],
     started: bool,
+    console_stdout: Vec<u8>,
+    console_stderr: Vec<u8>,
 }
 
 impl FakeRunner {
@@ -137,10 +143,20 @@ impl FakeRunner {
         Self {
             spec_role,
             output_drive: None,
+            jail_output: None,
+            forged_result: None,
             result_disk: None,
             nonce: [0u8; 32],
             started: false,
+            console_stdout: Vec::new(),
+            console_stderr: Vec::new(),
         }
+    }
+
+    fn with_console(mut self, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        self.console_stdout = stdout;
+        self.console_stderr = stderr;
+        self
     }
 }
 
@@ -153,6 +169,15 @@ impl Runner for FakeRunner {
         _end: Instant,
     ) -> hermetic_vmm::Result<()> {
         jail.check_identity()?;
+        if self.spec_role == hermetic_vmm::spec::Role::Extractor {
+            self.jail_output = Some(jail.root.descriptor_path("drive-output"));
+        }
+        if self.spec_role == hermetic_vmm::spec::Role::Grader {
+            self.jail_output = Some(jail.root.descriptor_path(&format!(
+                "drive-{}",
+                hermetic_vmm::spec::GRADER_RESULT_DRIVE
+            )));
+        }
         Ok(())
     }
 
@@ -200,11 +225,22 @@ impl Runner for FakeRunner {
                 disk_data[..header_bytes.len()].copy_from_slice(&header_bytes);
                 disk_data[header_bytes.len()..header_bytes.len() + stream_bytes.len()]
                     .copy_from_slice(&stream_bytes);
-                let _ = fs::write(out_path, &disk_data);
-                let _ = fs::set_permissions(out_path, fs::Permissions::from_mode(0o600));
+                // Like a real VM, write the jail's copy of the drive.
+                let target = self
+                    .jail_output
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| out_path.clone());
+                let _ = fs::write(&target, &disk_data);
             }
         }
 
+        if self.spec_role == hermetic_vmm::spec::Role::Grader {
+            if let (Some(forged), Some(target)) = (&self.forged_result, &self.jail_output) {
+                let _ = fs::write(target, forged);
+                return Ok(true);
+            }
+        }
         // If this is a grader VM, simulate the supervisor writing HGRD format
         if self.spec_role == hermetic_vmm::spec::Role::Grader {
             if let Some(ref res_path) = self.result_disk {
@@ -223,8 +259,13 @@ impl Runner for FakeRunner {
                     },
                 };
                 if let Ok((encoded, _)) = encode_disk(&sample_result) {
-                    let _ = fs::write(res_path, &encoded);
-                    let _ = fs::set_permissions(res_path, fs::Permissions::from_mode(0o600));
+                    // Like a real VM, write the jail's copy of the result drive.
+                    let target = self
+                        .jail_output
+                        .clone()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| res_path.clone());
+                    let _ = fs::write(&target, &encoded);
                 }
             }
         }
@@ -234,6 +275,10 @@ impl Runner for FakeRunner {
 
     fn kill(&mut self, _end: Instant) -> hermetic_vmm::Result<()> {
         Ok(())
+    }
+
+    fn console_output(&self) -> (Vec<u8>, Vec<u8>) {
+        (self.console_stdout.clone(), self.console_stderr.clone())
     }
 }
 
@@ -300,7 +345,7 @@ fn create_test_world(temp: &Path, t_clock_str: &str) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&run_dir).unwrap();
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
-    for name in ["firecracker", "kernel", "rootfs"] {
+    for name in ["firecracker", "kernel", "rootfs", "extractor.img"] {
         let p = temp.join(name);
         fs::write(&p, format!("dummy {name}").as_bytes()).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
@@ -500,6 +545,7 @@ fn test_run_extractor_with_output_parsing() {
         run_dir.clone(),
         None,
     )
+    .with_extractor_image(temp.path().join("extractor.img"))
     .with_runner_factory(move |spec| {
         let nonce = if let Some(arg) = spec
             .boot_args
@@ -523,6 +569,7 @@ fn test_run_extractor_with_output_parsing() {
             result_disk: None,
             nonce,
             started: false,
+            ..FakeRunner::new(spec.role)
         }))
     });
 
@@ -603,6 +650,7 @@ fn test_grader_runs_r0_r1_r2_and_verdict_emission() {
             result_disk: Some(res_path),
             nonce: [0u8; 32],
             started: false,
+            ..FakeRunner::new(spec.role)
         }))
     });
 
@@ -728,6 +776,20 @@ fn test_finish_grader_mismatched_payload_fails_closed() {
     let temp = TempDir::new().unwrap();
     let (sealed_world, run_dir) = create_test_world(temp.path(), "1700000000");
 
+    // A compromised grader writes an R1 payload into the R0 result drive (its jail copy).
+    let r1_result = RunResult {
+        run: RunId::R1,
+        variant_set: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        tests: BTreeMap::new(),
+        supervisor: SupervisorSummary {
+            exit: SupervisorExit::Clean,
+            tests_started: 0,
+            tests_finished: 0,
+        },
+    };
+    let (encoded, _) = encode_disk(&r1_result).unwrap();
+    let forged = encoded;
+
     let mut infra = VmmInfra::new(
         temp.path().join("firecracker"),
         temp.path().join("kernel"),
@@ -736,7 +798,12 @@ fn test_finish_grader_mismatched_payload_fails_closed() {
         run_dir.clone(),
         None,
     )
-    .with_runner_factory(|spec| Ok(Box::new(FakeRunner::new(spec.role))));
+    .with_runner_factory(move |spec| {
+        Ok(Box::new(FakeRunner {
+            forged_result: Some(forged.clone()),
+            ..FakeRunner::new(spec.role)
+        }))
+    });
 
     let spec = WorldSpec {
         world_id: "test-task".into(),
@@ -753,25 +820,6 @@ fn test_finish_grader_mismatched_payload_fails_closed() {
     let h0 = infra
         .start_grader(GraderRun::R0, &prepared, &extracted, &dl)
         .unwrap();
-
-    // Write R1 payload into R0 result disk
-    let r1_result = RunResult {
-        run: RunId::R1,
-        variant_set: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-        tests: BTreeMap::new(),
-        supervisor: SupervisorSummary {
-            exit: SupervisorExit::Clean,
-            tests_started: 0,
-            tests_finished: 0,
-        },
-    };
-    let (encoded, _) = encode_disk(&r1_result).unwrap();
-    fs::write(run_dir.join("grader_result_R0.img"), &encoded).unwrap();
-    fs::set_permissions(
-        run_dir.join("grader_result_R0.img"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
 
     let err = infra.finish_grader(h0, &dl).unwrap_err();
     assert!(matches!(
@@ -911,4 +959,765 @@ fn test_prepare_world_bounds_manifest_read() {
         }
         other => panic!("expected BackendError, got {other:?}"),
     }
+}
+
+#[test]
+fn test_vm_config_regenerated_atomically_from_resolved_settings() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    // Pre-populate vm-config.json with mismatched, stale settings
+    let vm_config_path = run_dir.join("vm-config.json");
+    let stale_cfg = serde_json::json!({
+        "cpu_template": "cpu-template.json",
+        "vcpus": 1,
+        "mem_size_mib": 512,
+        "disk_mib": 1024,
+    });
+    fs::write(
+        &vm_config_path,
+        serde_json::to_vec_pretty(&stale_cfg).unwrap(),
+    )
+    .unwrap();
+
+    // Manifest requests 4 vCPUs and 8192 MiB
+    let manifest_path = sealed_world.join("world_manifest.json");
+    let mut manifest_val: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest_val["run_spec"]["resources"]["vcpus"] = serde_json::json!(4);
+    manifest_val["run_spec"]["resources"]["memory_mib"] = serde_json::json!(8192);
+    manifest_val["run_spec"]["resources"]["disk_mib"] = serde_json::json!(4096);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest_val).unwrap(),
+    )
+    .unwrap();
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    );
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("step", 5000);
+    let _prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    // vm-config.json must be regenerated to match resolved settings
+    let updated_bytes = fs::read(&vm_config_path).unwrap();
+    let updated_cfg: serde_json::Value = serde_json::from_slice(&updated_bytes).unwrap();
+    assert_eq!(updated_cfg["vcpus"], 4);
+    assert_eq!(updated_cfg["mem_size_mib"], 8192);
+    assert_eq!(updated_cfg["disk_mib"], 4096);
+}
+
+#[test]
+fn test_prepare_world_deadline_exceeded_before_manifest_write() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    );
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("test-step", 0);
+
+    let err = infra.prepare_world(&spec, &dl).unwrap_err();
+    match err {
+        InfraError::DeadlineExceeded {
+            step,
+            deadline_name,
+        } => {
+            assert_eq!(step, Step::PrepareWorld);
+            assert_eq!(deadline_name, "test-step");
+        }
+        other => panic!("expected DeadlineExceeded, got {other:?}"),
+    }
+    assert!(!run_dir.join("world_manifest.json").exists());
+}
+
+#[test]
+fn test_vmm_infra_agent_volume_digest_and_drive_spec() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let agent_volume_path = run_dir.join("test_agent_volume.img");
+    let dummy_bytes = b"deterministic agent volume test contents";
+    fs::write(&agent_volume_path, dummy_bytes).unwrap();
+    fs::set_permissions(&agent_volume_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let expected_av_digest = format!("sha256:{}", hermetic_common::hash::sha256_hex(dummy_bytes));
+
+    let captured_spec = Arc::new(std::sync::Mutex::new(None));
+    let captured_spec_clone = captured_spec.clone();
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_agent_volume(agent_volume_path.clone())
+    .with_runner_factory(move |spec| {
+        *captured_spec_clone.lock().unwrap() = Some(spec.clone());
+        Ok(Box::new(FakeRunner::new(spec.role)))
+    });
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+    assert_eq!(prepared.world_id, "test-task");
+
+    let manifest_bytes = fs::read(run_dir.join("world_manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(manifest["agent_volume_digest"], expected_av_digest);
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+    assert_eq!(agent_handle.id.0.as_str(), "agent-vm-0");
+
+    let spec_guard = captured_spec.lock().unwrap();
+    let recorded_spec = spec_guard.as_ref().expect("AgentVM spec was not captured");
+    assert!(recorded_spec
+        .boot_args
+        .contains("hermetic.agent_volume=/dev/vdc"));
+    assert!(recorded_spec.drives.iter().any(|d| d.id == "agent"
+        && d.read_only
+        && d.path == agent_volume_path.display().to_string()));
+}
+
+#[test]
+fn test_vmm_infra_mode_h_artifacts_emission_and_command_hash_chain() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let commands = vec!["echo cmd1".to_string(), "echo cmd2".to_string()];
+    let mut expected_chain = hermetic_common::hash::HashChain::new();
+    for c in &commands {
+        expected_chain.append(c.as_bytes());
+    }
+    let expected_head = format!("sha256:{}", expected_chain.head_hex());
+
+    let vsock_path = run_dir.join("vsock.socket");
+    let (running, vsock_handle) = start_mock_vsock_server(vsock_path, 1_700_000_000, true);
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_agent_mode(AgentMode::HarnessDriven {
+        commands: commands.clone(),
+    })
+    .with_runner_factory(|spec| Ok(Box::new(FakeRunner::new(spec.role))));
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    let run_dl = NamedDeadline::new("run-agent", 5000);
+    let outcome = infra
+        .run_agent(
+            &agent_handle,
+            &AgentMode::HarnessDriven { commands },
+            &run_dl,
+        )
+        .unwrap();
+    assert_eq!(outcome, AgentOutcome::Completed { exit_code: 0 });
+
+    let shutdown_dl = NamedDeadline::new("shutdown-agent", 5000);
+    let shutdown = infra.shutdown_agent(&agent_handle, &shutdown_dl).unwrap();
+    assert_eq!(shutdown, ShutdownKind::Clean);
+
+    running.store(false, Ordering::SeqCst);
+    let _ = vsock_handle.join();
+
+    let manifest_bytes = fs::read(run_dir.join("world_manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(manifest["harness_command_log_head"], expected_head);
+
+    assert!(run_dir.join("harness_summary.json").exists());
+    let harness_bytes = fs::read(run_dir.join("harness_summary.json")).unwrap();
+    let harness_json: serde_json::Value = serde_json::from_slice(&harness_bytes).unwrap();
+    assert_eq!(harness_json["date_leak_observed"], false);
+    assert_eq!(harness_json["scan_incomplete"], true);
+
+    assert!(run_dir.join("date_sentinel.json").exists());
+    let date_bytes = fs::read(run_dir.join("date_sentinel.json")).unwrap();
+    let date_json: serde_json::Value = serde_json::from_slice(&date_bytes).unwrap();
+    assert_eq!(date_json["date_leak_observed"], false);
+    assert_eq!(date_json["scan_incomplete"], true);
+}
+
+/// Regression: harness commands must use a 300 s timeout, not 30 s.
+/// A mock vsock server records the timeout_ms sent with each exec request.
+/// The test verifies every harness exec uses 300_000.
+#[test]
+fn test_harness_command_timeout_uses_contract_limit() {
+    use std::sync::Mutex;
+
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let commands = vec!["echo hello".to_string()];
+
+    let vsock_path = run_dir.join("vsock.socket");
+    let recorded_timeouts: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_clone = recorded_timeouts.clone();
+
+    // Custom vsock mock that records timeout_ms from exec requests
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    if vsock_path.exists() {
+        let _ = fs::remove_file(&vsock_path);
+    }
+    let listener = UnixListener::bind(&vsock_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let vsock_handle = std::thread::spawn(move || {
+        while running_clone.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut handshake = Vec::new();
+                    let mut b = [0u8];
+                    while let Ok(()) = stream.read_exact(&mut b) {
+                        handshake.push(b[0]);
+                        if b[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    if !handshake.starts_with(b"CONNECT") {
+                        continue;
+                    }
+                    let _ = stream.write_all(b"OK 5000\n");
+
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).is_err() {
+                        continue;
+                    }
+                    let req_len = u32::from_le_bytes(len_buf) as usize;
+                    if req_len > 1_048_576 {
+                        continue;
+                    }
+                    let mut req_bytes = vec![0u8; req_len];
+                    if stream.read_exact(&mut req_bytes).is_err() {
+                        continue;
+                    }
+
+                    if let Ok(req_val) = serde_json::from_slice::<serde_json::Value>(&req_bytes) {
+                        let kind = req_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if kind == "exec" {
+                            if let Some(t) = req_val.get("timeout_ms").and_then(|v| v.as_u64()) {
+                                recorded_clone.lock().unwrap().push(t);
+                            }
+                        }
+                        let resp_val = match kind {
+                            "status" => serde_json::json!({
+                                "type": "status",
+                                "locked": true,
+                                "output_bytes": 0,
+                                "guest_time_unix": 1_700_000_000_i64,
+                            }),
+                            "exec" => serde_json::json!({
+                                "type": "exec",
+                                "code": 0,
+                                "output": [111, 107, 10],
+                                "truncated": false,
+                                "timed_out": false,
+                            }),
+                            "shutdown" => serde_json::json!({ "type": "frozen" }),
+                            _ => serde_json::json!({ "type": "unknown" }),
+                        };
+                        let resp_bytes = serde_json::to_vec(&resp_val).unwrap();
+                        let resp_len = (resp_bytes.len() as u32).to_le_bytes();
+                        let _ = stream.write_all(&resp_len);
+                        let _ = stream.write_all(&resp_bytes);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_agent_mode(AgentMode::HarnessDriven {
+        commands: commands.clone(),
+    })
+    .with_runner_factory(|spec| Ok(Box::new(FakeRunner::new(spec.role))));
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    let run_dl = NamedDeadline::new("run-agent", 5000);
+    let outcome = infra
+        .run_agent(
+            &agent_handle,
+            &AgentMode::HarnessDriven { commands },
+            &run_dl,
+        )
+        .unwrap();
+    assert_eq!(outcome, AgentOutcome::Completed { exit_code: 0 });
+
+    running.store(false, Ordering::SeqCst);
+    let _ = vsock_handle.join();
+
+    let timeouts = recorded_timeouts.lock().unwrap();
+    // The first exec is the clockprobe (30_000), subsequent ones are harness commands (300_000)
+    let harness_timeouts: Vec<_> = timeouts.iter().skip(1).copied().collect();
+    assert!(
+        !harness_timeouts.is_empty(),
+        "expected at least one harness command exec"
+    );
+    for t in &harness_timeouts {
+        assert_eq!(
+            *t, 300_000,
+            "harness command timeout must be 300 s (300_000 ms), got {t} ms"
+        );
+    }
+}
+
+/// Regression: finish_harness_artifacts must propagate manifest write failures.
+/// A Mode H run must not finalize with a stale command-log head.
+#[test]
+fn test_finish_harness_artifacts_propagates_corrupt_manifest_error() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let commands = vec!["echo test".to_string()];
+
+    let vsock_path = run_dir.join("vsock.socket");
+    let (running, vsock_handle) = start_mock_vsock_server(vsock_path, 1_700_000_000, true);
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_agent_mode(AgentMode::HarnessDriven {
+        commands: commands.clone(),
+    })
+    .with_runner_factory(|spec| Ok(Box::new(FakeRunner::new(spec.role))));
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    // Corrupt the manifest so JSON parse fails during finish_harness_artifacts
+    fs::write(run_dir.join("world_manifest.json"), b"NOT VALID JSON {{{").unwrap();
+
+    let run_dl = NamedDeadline::new("run-agent", 5000);
+    let result = infra.run_agent(
+        &agent_handle,
+        &AgentMode::HarnessDriven { commands },
+        &run_dl,
+    );
+    // Must be an error, not Ok with a stale head
+    match result {
+        Err(InfraError::BackendFailure { step, detail }) => {
+            assert_eq!(step, Step::RunAgent);
+            assert!(
+                detail.contains("parse") || detail.contains("world_manifest"),
+                "error should mention parse failure: {detail}"
+            );
+        }
+        other => panic!("expected BackendFailure for corrupt manifest, got {other:?}"),
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = vsock_handle.join();
+}
+
+/// Regression: sentinel summaries must be marked scan_incomplete: true when no
+/// scanner has produced them. An incomplete scan must count as a potential leak.
+#[test]
+fn test_sentinel_summaries_incomplete_when_no_scanner_ran() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let commands = vec!["echo test".to_string()];
+
+    let vsock_path = run_dir.join("vsock.socket");
+    let (running, vsock_handle) = start_mock_vsock_server(vsock_path, 1_700_000_000, true);
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_agent_mode(AgentMode::HarnessDriven {
+        commands: commands.clone(),
+    })
+    .with_runner_factory(|spec| Ok(Box::new(FakeRunner::new(spec.role))));
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    // Ensure no scanner summaries exist before run_agent
+    assert!(!run_dir.join("harness_summary.json").exists());
+    assert!(!run_dir.join("date_sentinel.json").exists());
+
+    let run_dl = NamedDeadline::new("run-agent", 5000);
+    let outcome = infra
+        .run_agent(
+            &agent_handle,
+            &AgentMode::HarnessDriven { commands },
+            &run_dl,
+        )
+        .unwrap();
+    assert_eq!(outcome, AgentOutcome::Completed { exit_code: 0 });
+
+    running.store(false, Ordering::SeqCst);
+    let _ = vsock_handle.join();
+
+    // When no scanner ran, sentinels must report scan_incomplete: true
+    let harness_bytes = fs::read(run_dir.join("harness_summary.json")).unwrap();
+    let harness_json: serde_json::Value = serde_json::from_slice(&harness_bytes).unwrap();
+    assert_eq!(
+        harness_json["scan_incomplete"], true,
+        "harness_summary must be incomplete when no scanner ran"
+    );
+
+    let date_bytes = fs::read(run_dir.join("date_sentinel.json")).unwrap();
+    let date_json: serde_json::Value = serde_json::from_slice(&date_bytes).unwrap();
+    assert_eq!(
+        date_json["scan_incomplete"], true,
+        "date_sentinel must be incomplete when no scanner ran"
+    );
+}
+
+/// Offline test: when a VM step fails (e.g. wait_agent_ready), VmmInfra writes
+/// guest_console.log and firecracker_stderr.log with mode 0600 before teardown.
+#[test]
+fn test_vm_step_failure_writes_mode_0600_console_and_stderr_logs() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let stdout_sample = b"Linux version 6.6.160-hermetic ...\nKernel panic - not syncing: VFS: Unable to mount root fs\n";
+    let stderr_sample = b"[firecracker::main] INFO: firecracker exited with code 1\n";
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_runner_factory({
+        let out = stdout_sample.to_vec();
+        let err = stderr_sample.to_vec();
+        move |spec| {
+            Ok(Box::new(
+                FakeRunner::new(spec.role).with_console(out.clone(), err.clone()),
+            ))
+        }
+    });
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    // Before failure, diagnostic logs must not exist
+    assert!(!run_dir.join("guest_console.log").exists());
+    assert!(!run_dir.join("firecracker_stderr.log").exists());
+
+    // Fail wait_agent_ready with expired deadline
+    let fail_dl = NamedDeadline::new("wait_ready_timeout", 0);
+    let err = infra.wait_agent_ready(&agent_handle, &fail_dl).unwrap_err();
+    assert!(matches!(err, InfraError::DeadlineExceeded { .. }));
+
+    // Both logs must now exist in the run directory
+    let console_file = run_dir.join("guest_console.log");
+    let stderr_file = run_dir.join("firecracker_stderr.log");
+    assert!(
+        console_file.exists(),
+        "guest_console.log must be written on VM failure"
+    );
+    assert!(
+        stderr_file.exists(),
+        "firecracker_stderr.log must be written on VM failure"
+    );
+
+    // Must be mode 0600
+    let console_meta = fs::metadata(&console_file).unwrap();
+    assert_eq!(
+        console_meta.permissions().mode() & 0o777,
+        0o600,
+        "guest_console.log must have mode 0600"
+    );
+    let stderr_meta = fs::metadata(&stderr_file).unwrap();
+    assert_eq!(
+        stderr_meta.permissions().mode() & 0o777,
+        0o600,
+        "firecracker_stderr.log must have mode 0600"
+    );
+
+    // Contents must match captured data
+    assert_eq!(fs::read(&console_file).unwrap(), stdout_sample);
+    assert_eq!(fs::read(&stderr_file).unwrap(), stderr_sample);
+}
+
+/// Offline test: VmmInfra bounds failure logs to MAX_CAPTURE_BYTES (64 KiB).
+#[test]
+fn test_vm_step_failure_logs_bounded_at_max_capture_bytes() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "2020-01-01T00:00:00Z");
+
+    let oversized_stdout = vec![b'K'; 100 * 1024]; // 100 KiB > 64 KiB
+    let oversized_stderr = vec![b'E'; 120 * 1024]; // 120 KiB > 64 KiB
+
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_runner_factory({
+        let out = oversized_stdout.clone();
+        let err = oversized_stderr.clone();
+        move |spec| {
+            Ok(Box::new(
+                FakeRunner::new(spec.role).with_console(out.clone(), err.clone()),
+            ))
+        }
+    });
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    // Trigger failure in wait_agent_ready
+    let fail_dl = NamedDeadline::new("wait_ready_timeout", 0);
+    let _ = infra.wait_agent_ready(&agent_handle, &fail_dl);
+
+    let console_file = run_dir.join("guest_console.log");
+    let stderr_file = run_dir.join("firecracker_stderr.log");
+    assert!(console_file.exists());
+    assert!(stderr_file.exists());
+
+    // Both files must be bounded to MAX_CAPTURE_BYTES (64 KiB)
+    let max_bytes = hermetic_vmm::runner::MAX_CAPTURE_BYTES;
+    assert_eq!(
+        fs::read(&console_file).unwrap().len(),
+        max_bytes,
+        "guest_console.log must be bounded to MAX_CAPTURE_BYTES"
+    );
+    assert_eq!(
+        fs::read(&stderr_file).unwrap().len(),
+        max_bytes,
+        "firecracker_stderr.log must be bounded to MAX_CAPTURE_BYTES"
+    );
+}
+
+/// Offline test: on a successful VM run, guest_console.log and firecracker_stderr.log
+/// are NOT written into the run directory.
+#[test]
+fn test_successful_vm_run_does_not_write_failure_console_logs() {
+    let temp = TempDir::new().unwrap();
+    let (sealed_world, run_dir) = create_test_world(temp.path(), "1700000000");
+
+    let vsock_path = run_dir.join("vsock.socket");
+    let (running, vsock_handle) = start_mock_vsock_server(vsock_path, 1_700_000_000, true);
+
+    let commands = vec!["echo hello".to_string()];
+    let mut infra = VmmInfra::new(
+        temp.path().join("firecracker"),
+        temp.path().join("kernel"),
+        temp.path().join("rootfs"),
+        None,
+        run_dir.clone(),
+        None,
+    )
+    .with_clock(1_700_000_000)
+    .with_agent_mode(AgentMode::HarnessDriven {
+        commands: commands.clone(),
+    })
+    .with_runner_factory(|spec| {
+        Ok(Box::new(FakeRunner::new(spec.role).with_console(
+            b"guest output\n".to_vec(),
+            b"stderr\n".to_vec(),
+        )))
+    });
+
+    let spec = WorldSpec {
+        world_id: "test-task".into(),
+        cutoff_seal: sealed_world.display().to_string(),
+    };
+    let dl = NamedDeadline::new("prepare", 5000);
+    let prepared = infra.prepare_world(&spec, &dl).unwrap();
+
+    let net_vm = VmHandle::new("net-vm-0", VmKind::Net);
+    let start_dl = NamedDeadline::new("start-agent", 5000);
+    let agent_handle = infra.start_agentvm(&prepared, &net_vm, &start_dl).unwrap();
+
+    let ready_dl = NamedDeadline::new("wait_ready", 5000);
+    infra.wait_agent_ready(&agent_handle, &ready_dl).unwrap();
+
+    let run_dl = NamedDeadline::new("run-agent", 5000);
+    let outcome = infra
+        .run_agent(
+            &agent_handle,
+            &AgentMode::HarnessDriven { commands },
+            &run_dl,
+        )
+        .unwrap();
+    assert_eq!(outcome, AgentOutcome::Completed { exit_code: 0 });
+
+    let shutdown_dl = NamedDeadline::new("shutdown-agent", 5000);
+    let shutdown_kind = infra.shutdown_agent(&agent_handle, &shutdown_dl).unwrap();
+    assert_eq!(shutdown_kind, ShutdownKind::Clean);
+
+    running.store(false, Ordering::SeqCst);
+    let _ = vsock_handle.join();
+
+    // On success, no failure logs should exist
+    assert!(
+        !run_dir.join("guest_console.log").exists(),
+        "guest_console.log must not be written on successful VM run"
+    );
+    assert!(
+        !run_dir.join("firecracker_stderr.log").exists(),
+        "firecracker_stderr.log must not be written on successful VM run"
+    );
+}
+
+/// Offline test: guest_console.log and firecracker_stderr.log are never included
+/// in the signed run record.
+#[test]
+fn test_console_and_stderr_logs_never_included_in_signed_record() {
+    let temp = TempDir::new().unwrap();
+    let run_dir = temp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Plant diagnostic logs in the run directory
+    let console_path = run_dir.join("guest_console.log");
+    let stderr_path = run_dir.join("firecracker_stderr.log");
+    fs::write(&console_path, b"secret kernel console messages").unwrap();
+    fs::write(&stderr_path, b"secret firecracker stderr").unwrap();
+    fs::set_permissions(&console_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&stderr_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // The RunRecord schema denies unknown fields. Verify that RunRecord serialization
+    // and deserialization schema contains no console or stderr fields.
+    let record_schema = serde_json::to_string(&serde_json::json!({
+        "task_id": "test",
+        "task_class": "patch",
+        "seal_level": "repo_only",
+        "agent_mode": "harness_driven",
+        "clock": "faked",
+        "grader_isolation": "supervisor",
+        "deployment": "local_dev",
+        "guest_console": "should_be_rejected",
+    }))
+    .unwrap();
+    let res = serde_json::from_str::<hermetic_attest::RunRecord>(&record_schema);
+    assert!(
+        res.is_err(),
+        "RunRecord must deny unknown fields and never include guest_console"
+    );
+
+    let record_schema_stderr = serde_json::to_string(&serde_json::json!({
+        "task_id": "test",
+        "task_class": "patch",
+        "seal_level": "repo_only",
+        "agent_mode": "harness_driven",
+        "clock": "faked",
+        "grader_isolation": "supervisor",
+        "deployment": "local_dev",
+        "firecracker_stderr": "should_be_rejected",
+    }))
+    .unwrap();
+    let res_stderr = serde_json::from_str::<hermetic_attest::RunRecord>(&record_schema_stderr);
+    assert!(
+        res_stderr.is_err(),
+        "RunRecord must deny unknown fields and never include firecracker_stderr"
+    );
 }

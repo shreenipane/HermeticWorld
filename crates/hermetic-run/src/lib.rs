@@ -212,7 +212,13 @@ where
                 step,
                 detail: "infrastructure backend is mutably borrowed".to_string(),
             })?;
-        f(&mut infra, &deadline)
+        // Infrastructure backends take the step's remaining budget as a relative
+        // timeout; the absolute deadline stays here for the checks around the call.
+        let remaining = NamedDeadline::new(
+            deadline.name.clone(),
+            deadline.deadline_ms.saturating_sub(clock.now_ms()),
+        );
+        f(&mut infra, &remaining)
     }?;
     check_deadline(clock, step, &deadline)?;
     Ok(result)

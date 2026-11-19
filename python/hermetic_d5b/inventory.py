@@ -327,7 +327,7 @@ def scan_conda_packages(rootfs: Path | str) -> list[InventoryPackage]:
     return pkgs
 
 
-def scan_rootfs_packages(rootfs: Path | str) -> list[InventoryPackage]:
+def scan_rootfs_packages(rootfs: Path | str, *, allow_empty: bool = False) -> list[InventoryPackage]:
     """Enumerate all installed packages from dpkg, Python, and conda in rootfs."""
     rootfs_path = Path(rootfs).resolve()
     if not rootfs_path.is_dir():
@@ -347,7 +347,10 @@ def scan_rootfs_packages(rootfs: Path | str) -> list[InventoryPackage]:
             seen.add(key)
             unique_pkgs.append(p)
 
-    if not unique_pkgs:
+    if not unique_pkgs and not allow_empty:
+        # An empty result usually means the scan missed the package databases.
+        # Callers that know the rootfs has no package manager (static binaries
+        # only) must say so explicitly with allow_empty=True.
         raise D5bError("empty_rootfs_inventory: no installed packages found in rootfs")
 
     if len(unique_pkgs) > MAX_PACKAGES:
@@ -597,14 +600,18 @@ def build_d5b_inventory(
     exemptions_path: Optional[Path | str] = None,
     metadata_data: Optional[Dict[str, Any]] = None,
     exemptions_data: Any = None,
+    allow_empty: bool = False,
 ) -> Dict[str, Any]:
-    """Produce canonical class-B inventory and release metadata evaluated by D5b."""
+    """Produce canonical class-B inventory and release metadata evaluated by D5b.
+
+    allow_empty: accept a rootfs with no package databases at all. The result then
+    has no substrate entries and substrate_at_t "none" (nothing is claimed)."""
     if mode not in MODES:
         raise D5bError("invalid mode; expected 'strict' or 'repo_only'")
     parse_rfc3339_ns(cutoff)
 
     # 1. Enumerate installed packages from rootfs
-    packages = scan_rootfs_packages(rootfs)
+    packages = scan_rootfs_packages(rootfs, allow_empty=allow_empty)
 
     # 2. Collect release metadata ONLY from local, pinned, digest-checked sources
     full_metadata: Dict[str, Any] = {
