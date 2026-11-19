@@ -90,6 +90,9 @@ h2{font-size:clamp(32px,4.6vw,52px);font-weight:720;letter-spacing:-.035em;margi
 .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:28px;text-align:center}
 .stat .num{font-size:clamp(40px,5vw,60px);font-weight:760;letter-spacing:-.04em;line-height:1;margin-bottom:14px;color:var(--accent)}
 .stat .num small{font-size:.5em;color:var(--muted);font-weight:600}
+/* Counting numbers keep their final width: fixed-width digits, and the width is
+   reserved before the count starts, so centred text does not slide while it counts. */
+.stat .num [data-count]{display:inline-block;font-variant-numeric:tabular-nums;text-align:right}
 .stat p:last-child{margin:0;color:var(--muted);font-size:16px}
 
 /* Features */

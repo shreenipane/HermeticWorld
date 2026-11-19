@@ -156,6 +156,8 @@
     var target = parseFloat(el.getAttribute('data-count'));
     var dec = parseInt(el.getAttribute('data-decimals') || '0', 10);
     var suf = el.getAttribute('data-suffix') || '';
+    // Reserve the final text's width so the layout never moves while counting.
+    el.style.minWidth = el.getBoundingClientRect().width + 'px';
     var start = null, dur = 900;
     function tick(ts) {
       if (start === null) start = ts;
