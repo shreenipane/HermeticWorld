@@ -489,6 +489,329 @@ def test_e2e_seal_symlinked_build_record_fails_d7_recipe(tmp_path, monkeypatch, 
     assert events[-1]["reason"] == "d7_recipe_RecipeSecurityError"
 
 
+def test_e2e_seal_only_one_pkg_flag_fails_closed(tmp_path):
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused")
+    work = tmp_path / "work"
+    some_dir = tmp_path / "dummy"
+    some_dir.mkdir()
+
+    # Only --pkg-closure provided
+    with pytest.raises(e2e.SealError, match="package_closure_and_baseline_both_required"):
+        e2e.run([INSTANCE, str(work), "--sealcheck", str(tool), "--pkg-closure", str(some_dir)])
+
+    # Only --pkg-baseline provided
+    with pytest.raises(e2e.SealError, match="package_closure_and_baseline_both_required"):
+        e2e.run([INSTANCE, str(work), "--sealcheck", str(tool), "--pkg-baseline", str(some_dir)])
+
+
+def test_e2e_seal_package_evidence_integration(tmp_path, monkeypatch, capsys):
+    from tests.test_pkgworld import _create_test_closure, _create_test_baseline
+
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+
+    # Setup valid closure and baseline fixtures
+    cutoff_month = "2014-01"
+    cutoff = f"{cutoff_month}-01T00:00:00Z"
+    pytest_whl = b"PK\x03\x04pytest-7.4.0-wheel-content"
+    sha_pytest = hashlib.sha256(pytest_whl).hexdigest()
+    packages = {
+        "pytest": [
+            {
+                "version": "7.4.0",
+                "upload_time": "2013-12-15T12:00:00Z",
+                "dependencies": [],
+                "files": [
+                    {
+                        "filename": "pytest-7.4.0-py3-none-any.whl",
+                        "sha256": sha_pytest,
+                        "upload_time": "2013-12-15T12:00:00Z",
+                        "size_bytes": len(pytest_whl),
+                        "yanked": False,
+                    }
+                ],
+            }
+        ]
+    }
+    files = {sha_pytest: pytest_whl}
+
+    closure_dir = _create_test_closure(
+        tmp_path / "closure",
+        cutoff,
+        [("pytest", "pytest-7.4.0-py3-none-any.whl", pytest_whl, "allowed_kept")],
+    )
+    baseline_dir = _create_test_baseline(tmp_path / "baseline", cutoff_month, packages, files)
+
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                (task / "task.json").write_text(json.dumps({
+                    "instance_id": INSTANCE,
+                    "cutoffs": {
+                        "t_clock": "2014-01-01T00:00:00Z",
+                        "pkg_cutoff": "2014-01-01T00:00:00Z",
+                    }
+                }))
+            elif action == "rootfs":
+                img = work / "rootfs.img"
+                img.write_bytes(b"\0" * 4096)
+                rep = {
+                    "d4": "pass",
+                    "sha256": hashlib.sha256(b"\0" * 4096).hexdigest(),
+                    "size_bytes": 4096,
+                }
+                (work / "rootfs-report.json").write_text(json.dumps(rep))
+            elif action == "evidence":
+                e2e.prepare_bundle_evidence(work, INSTANCE)
+        if "scan" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}'
+        if "d8" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
+        if "--root" in argv:
+            return (b'{"detector":"D10","findings":[],"verdict":"pass","complete":true,'
+                    b'"provenance":{"verdict":"verified","issues":[]}}')
+        return b""
+
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([
+            INSTANCE,
+            str(work),
+            "--sealcheck",
+            str(tool),
+            "--pkg-closure",
+            str(closure_dir),
+            "--pkg-baseline",
+            str(baseline_dir),
+        ]) == 1
+    finally:
+        os.umask(original_umask)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    pkg_ev = [e for e in events if e.get("step") == "package_evidence"]
+    assert len(pkg_ev) == 1
+    assert pkg_ev[0]["verdict"] == "pass"
+    assert pkg_ev[0]["baseline_month"] == "2014-01"
+    assert pkg_ev[0]["closure_root"].startswith("sha256:")
+    assert pkg_ev[0]["baseline_root"].startswith("sha256:")
+
+    assert (work / "packages.json").is_file()
+    pkg_data = json.loads((work / "packages.json").read_text())
+    assert pkg_data["closure_root"] == pkg_ev[0]["closure_root"]
+    assert pkg_data["baseline_root"] == pkg_ev[0]["baseline_root"]
+
+    bundle_ev = json.loads((work / "bundle-evidence.json").read_text())
+    assert bundle_ev["packages"] == pkg_data
+
+    wm_ev = events[-1]
+    assert wm_ev["step"] == "world_manifest"
+    assert wm_ev["verdict"] == "open"
+    # Replaced package_closure_and_baseline item!
+    assert "package_closure_and_baseline" not in wm_ev["missing"]
+    assert wm_ev["reason"] == "world_manifest_prerequisites_incomplete"
+
+
+def test_e2e_seal_tampered_package_closure_fails_closed(tmp_path, monkeypatch, capsys):
+    from tests.test_pkgworld import _create_test_closure, _create_test_baseline
+
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+
+    cutoff_month = "2014-01"
+    cutoff = f"{cutoff_month}-01T00:00:00Z"
+    pytest_whl = b"PK\x03\x04pytest-7.4.0-wheel-content"
+    sha_pytest = hashlib.sha256(pytest_whl).hexdigest()
+    packages = {
+        "pytest": [
+            {
+                "version": "7.4.0",
+                "upload_time": "2013-12-15T12:00:00Z",
+                "dependencies": [],
+                "files": [
+                    {
+                        "filename": "pytest-7.4.0-py3-none-any.whl",
+                        "sha256": sha_pytest,
+                        "upload_time": "2013-12-15T12:00:00Z",
+                        "size_bytes": len(pytest_whl),
+                        "yanked": False,
+                    }
+                ],
+            }
+        ]
+    }
+    files = {sha_pytest: pytest_whl}
+
+    closure_dir = _create_test_closure(
+        tmp_path / "closure",
+        cutoff,
+        [("pytest", "pytest-7.4.0-py3-none-any.whl", pytest_whl, "allowed_kept")],
+    )
+    baseline_dir = _create_test_baseline(tmp_path / "baseline", cutoff_month, packages, files)
+
+    # Tamper with the artifact in closure
+    art_path = closure_dir / "files" / sha_pytest / "pytest-7.4.0-py3-none-any.whl"
+    art_path.chmod(0o600)
+    art_path.write_bytes(b"tampered content")
+
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                (task / "task.json").write_text(json.dumps({
+                    "cutoffs": {
+                        "t_clock": "2014-01-01T00:00:00Z",
+                        "pkg_cutoff": "2014-01-01T00:00:00Z",
+                    }
+                }))
+        if "scan" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}'
+        if "d8" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
+        if "--root" in argv:
+            return (b'{"detector":"D10","findings":[],"verdict":"pass","complete":true,'
+                    b'"provenance":{"verdict":"verified","issues":[]}}')
+        return b""
+
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([
+            INSTANCE,
+            str(work),
+            "--sealcheck",
+            str(tool),
+            "--pkg-closure",
+            str(closure_dir),
+            "--pkg-baseline",
+            str(baseline_dir),
+        ]) == 1
+    finally:
+        os.umask(original_umask)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["step"] == "package_evidence"
+    assert events[-1]["verdict"] == "fail"
+    assert events[-1]["reason"] == "package_evidence_IntegrityError"
+
+
+def test_e2e_seal_pkg_cutoff_absent_falls_back_to_clock_rejects_mismatched_baseline(tmp_path, monkeypatch, capsys):
+    """Finding 4: When pkg_cutoff is omitted from task cutoffs, expected_pkg_cutoff
+    must fall back to clock (t_world), rejecting a baseline from a different month."""
+    from tests.test_pkgworld import _create_test_closure, _create_test_baseline
+
+    work = tmp_path / "work"
+    tool = tmp_path / "sealcheck"
+    tool.write_bytes(b"unused-in-this-orchestration-test")
+
+    # Baseline has month 2024-05
+    baseline_month = "2024-05"
+    pytest_whl = b"PK\x03\x04pytest-7.4.0-wheel-content"
+    sha_pytest = hashlib.sha256(pytest_whl).hexdigest()
+    packages = {
+        "pytest": [
+            {
+                "version": "7.4.0",
+                "upload_time": "2024-04-15T12:00:00Z",
+                "dependencies": [],
+                "files": [
+                    {
+                        "filename": "pytest-7.4.0-py3-none-any.whl",
+                        "sha256": sha_pytest,
+                        "upload_time": "2024-04-15T12:00:00Z",
+                        "size_bytes": len(pytest_whl),
+                        "yanked": False,
+                    }
+                ],
+            }
+        ]
+    }
+    files = {sha_pytest: pytest_whl}
+
+    # Closure has cutoff in 2024-05 matching baseline month, so only clock fallback (2014-01) rejects
+    closure_dir = _create_test_closure(
+        tmp_path / "closure",
+        "2024-05-01T00:00:00Z",
+        [("pytest", "pytest-7.4.0-py3-none-any.whl", pytest_whl, "allowed_kept")],
+    )
+    baseline_dir = _create_test_baseline(tmp_path / "baseline", baseline_month, packages, files)
+
+    def fake_command(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return e2e.encoded([{"Id": "sha256:" + "a" * 64}])
+        if argv[:2] == ["docker", "create"]:
+            return ("b" * 64 + "\n").encode()
+        if "--worker" in argv:
+            action = argv[argv.index("--worker") + 1]
+            if action == "intake":
+                task = work / "tasks" / INSTANCE
+                task.mkdir(parents=True)
+                # Note: pkg_cutoff is intentionally omitted! Only t_clock (clock) is present.
+                (task / "task.json").write_text(json.dumps({
+                    "instance_id": INSTANCE,
+                    "cutoffs": {
+                        "t_clock": "2014-01-01T00:00:00Z",
+                    }
+                }))
+            elif action == "rootfs":
+                img = work / "rootfs.img"
+                img.write_bytes(b"\0" * 4096)
+                rep = {
+                    "d4": "pass",
+                    "sha256": hashlib.sha256(b"\0" * 4096).hexdigest(),
+                    "size_bytes": 4096,
+                }
+                (work / "rootfs-report.json").write_text(json.dumps(rep))
+            elif action == "evidence":
+                e2e.prepare_bundle_evidence(work, INSTANCE)
+        if "scan" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[],"not_covered":[]}'
+        if "d8" in argv:
+            return b'{"schema":"hermetic-sealcheck/v0","gate":false,"findings":[]}'
+        if "--root" in argv:
+            return (b'{"detector":"D10","findings":[],"verdict":"pass","complete":true,'
+                    b'"provenance":{"verdict":"verified","issues":[]}}')
+        return b""
+
+    monkeypatch.setattr(e2e, "command", fake_command)
+    original_umask = os.umask(0o077)
+    try:
+        assert e2e.run([
+            INSTANCE,
+            str(work),
+            "--sealcheck",
+            str(tool),
+            "--pkg-closure",
+            str(closure_dir),
+            "--pkg-baseline",
+            str(baseline_dir),
+        ]) == 1
+    finally:
+        os.umask(original_umask)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["step"] == "package_evidence"
+    assert events[-1]["verdict"] == "fail"
+    assert events[-1]["reason"] == "package_evidence_CutoffMismatchError"
+
+
+
 def test_e2e_seal_with_d5b_inventory_removes_missing_item(tmp_path, monkeypatch, capsys):
     work = tmp_path / "work"
     tool = tmp_path / "sealcheck"

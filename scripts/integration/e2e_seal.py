@@ -520,6 +520,9 @@ def prepare_bundle_evidence(work, instance):
         evidence["exemption_list_digest"] = "sha256:" + hashlib.sha256(ex_raw).hexdigest()
         exemption_substrate_at_t = "partial" if ex_list else "full"
         evidence["substrate_at_t"] = exemption_substrate_at_t
+    if (work / "packages.json").exists():
+        pkg_raw = read_regular_file_bounded(work / "packages.json", MAX_REPORT_BYTES)
+        evidence["packages"] = parse_json_bytes(pkg_raw, MAX_REPORT_BYTES)
     if (work / "d5b-inventory.json").exists():
         d5b_raw = read_regular_file_bounded(work / "d5b-inventory.json", MAX_REPORT_BYTES)
         d5b_data = parse_json_bytes(d5b_raw, MAX_REPORT_BYTES)
@@ -681,10 +684,17 @@ def run(argv=None):
     parser.add_argument("instance")
     parser.add_argument("work", nargs="?")
     parser.add_argument("--sealcheck", default=os.environ.get("HERMETIC_SEALCHECK_BIN"))
+    parser.add_argument("--pkg-closure", default=None)
+    parser.add_argument("--pkg-baseline", default=None)
     parser.add_argument("--d5b-inventory", dest="d5b_inventory", default=None)
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9]{1,12}", args.instance) or len(args.instance) > 200:
         raise SealError("invalid_instance_id")
+    if (args.pkg_closure is None) != (args.pkg_baseline is None):
+        raise SealError("package_closure_and_baseline_both_required")
+    if args.pkg_closure is not None:
+        validate_path(args.pkg_closure)
+        validate_path(args.pkg_baseline)
     fixture = TOP / "scripts/integration/fixtures/swebench" / (args.instance + ".json")
     raw, row, digest = load_record(fixture, args.instance, fixture.with_suffix(".source.json"))
     if not args.sealcheck:
@@ -810,6 +820,21 @@ def run(argv=None):
             findings = validate_scan_report(step, value)
             atomic_write(work / (step + ".json"), report)
             emit(step, "pass", findings=findings)
+        if args.pkg_closure is not None and args.pkg_baseline is not None:
+            step = "package_evidence"
+            from hermetic_pkgworld.evidence import compute_package_evidence
+            from hermetic_pkgworld.errors import PkgWorldError
+            try:
+                pkg_record = compute_package_evidence(
+                    args.pkg_closure,
+                    args.pkg_baseline,
+                    expected_pkg_cutoff=task["cutoffs"].get("pkg_cutoff") or clock,
+                )
+            except PkgWorldError as exc:
+                raise SealError(f"package_evidence_{type(exc).__name__}") from exc
+            atomic_write(work / "packages.json", encoded(pkg_record))
+            emit(step, "pass", **pkg_record)
+
         step = "bundle_evidence"
         command([sys.executable, "-I", "-B", str(Path(__file__).absolute()), "--worker", "evidence",
                  str(work), args.instance], env=env)
@@ -824,13 +849,18 @@ def run(argv=None):
             "package_closure_and_baseline",
             "installed_world_trust_and_run_spec",
         ]
+        if (work / "packages.json").exists():
+            missing.remove("package_closure_and_baseline")
         if (work / "d5b-inventory.json").exists():
             missing.remove("D5b_inventory_and_release_metadata")
-        emit(step, "open", reason="package_world_and_trust_evidence_unavailable",
+
+        emit(step, "open",
+             reason="package_world_and_trust_evidence_unavailable" if "package_closure_and_baseline" in missing else "world_manifest_prerequisites_incomplete",
              missing=missing,
              detectors={"D7": "not_applicable_without_deep_audit", "D11": "post_run_only",
                         "D12": "requires_runtime_probe"},
-             oracle_inputs="prepared_host_only_not_executed")
+             oracle_inputs="prepared_host_only_not_executed",
+             **({"packages": read_json(work / "packages.json")} if (work / "packages.json").exists() else {}))
         return 1
     except SealError as exc:
         detail = {}

@@ -427,6 +427,15 @@ class BaselineBuilder:
             except OSError as exc:
                 raise StoreIOError(f"Failed writing baseline-manifest.json: {exc}") from exc
 
+            # 5b. Write baseline-plan.json
+            plan_bytes = plan.to_canonical_json().encode("utf-8")
+            try:
+                atomic_write_at(root_fd, "baseline-plan.json", plan_bytes)
+            except BaseUnsafePathError as exc:
+                raise UnsafePathError(f"Unsafe destination for baseline-plan.json: {exc}") from exc
+            except OSError as exc:
+                raise StoreIOError(f"Failed writing baseline-plan.json: {exc}") from exc
+
             # 6. Write .frozen marker
             frozen_info = (
                 json.dumps(

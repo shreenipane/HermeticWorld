@@ -175,6 +175,22 @@ def _check_idempotent_match(out_root: Path, manifest: Manifest) -> bool:
                 if actual_sha != sha:
                     return False
 
+        # 3. Validate manifest.json (must be present for a valid frozen root).
+        manifest_file = out_root / "manifest.json"
+        if not manifest_file.exists():
+            return False
+        st = os.lstat(manifest_file)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return False
+        expected_manifest_bytes = manifest.to_canonical_json()
+        fd = hermetic_safe_io.open_regular(manifest_file, MAX_DIST_FILE_BYTES)
+        try:
+            raw = os.read(fd, len(expected_manifest_bytes) + 1)
+            if raw != expected_manifest_bytes:
+                return False
+        finally:
+            os.close(fd)
+
         return True
     except Exception:
         return False
@@ -283,6 +299,10 @@ def freeze_world(
             _ensure_dir_private(proj_dir)
             json_bytes = _render_frozen_project_json(proj, records)
             hermetic_safe_io.atomic_write(proj_dir / "index.json", json_bytes)
+
+        # 3. Write canonical manifest into staging_dir/manifest.json.
+        manifest_bytes = manifest.to_canonical_json()
+        hermetic_safe_io.atomic_write(staging_dir / "manifest.json", manifest_bytes)
 
         # Atomically publish the staging tree as out_root.
         staging_dir.rename(out_root)
